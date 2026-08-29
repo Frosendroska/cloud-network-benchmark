@@ -1,0 +1,46 @@
+# Copy this file when creating an executable experiment config.
+# Replace TEMPLATE with a stable thesis-side experiment identifier.
+experiment_id: TEMPLATE
+scenario: same_zone
+provider: aws
+
+regions:
+  primary: null
+zones:
+  vm_a: null
+  vm_b: null
+
+vm:
+  count: 2
+  shape:
+    vcpus: 4
+    memory_gib: 16
+  provider_type: null
+  image: null
+
+benchmark:
+  direction: A_to_B
+  tool: flent
+  phases:
+    - name: idle_latency
+      test: ping
+      duration_seconds: null
+    - name: single_flow_tcp
+      test: tcp_1up
+      duration_seconds: null
+      upload_streams: 1
+    - name: aggregate_tcp
+      test: tcp_nup
+      duration_seconds: null
+      upload_streams: 4
+  stream_calibration_candidates: [1, 2, 4, 8]
+
+repetition:
+  observations: null
+  schedule: null
+
+validation:
+  require_raw_flent: true
+  require_vm_static_metadata: true
+  require_tcp_phase_diagnostics: true
+  require_cleanup_evidence: true

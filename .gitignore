@@ -1,0 +1,53 @@
+# macOS and editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pub
+id_rsa*
+id_ed25519*
+credentials*
+secrets*
+
+# Terraform local state and generated files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfplan
+*.tfplan
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Benchmark output
+results/raw/*
+!results/raw/.gitkeep
+results/processed/*
+!results/processed/.gitkeep
+
+# Keep lightweight manifests trackable by default.
+!results/manifests/
+!results/manifests/.gitkeep
