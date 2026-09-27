@@ -1,0 +1,46 @@
+schema_version: 1
+experiment_id: EXP-003
+scheduled_start: "2026-10-01T07:00:00Z"
+selected_providers: [aws, azure, gcp]
+scenario: placement_optimization
+benchmark:
+  idle_latency: {enabled: true, test_name: ping, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
+  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
+  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 60, timeout_seconds: 90, parameters: {upload_streams: 4}}
+  execution_order: [idle_latency, single_flow, multi_flow]
+provider_configs:
+  aws:
+    provider: aws
+    regions: {vm_a: eu-central-1, vm_b: eu-central-1}
+    zones: {vm_a: euc1-az1, vm_b: euc1-az1}
+    vm_shape: m7i.xlarge
+    image: ubuntu-24.04
+    connection_user: ubuntu
+    documented_network_limit: "Up to 12.5 Gbps; interpretation metadata only"
+    placement: {kind: cluster_placement_group, name: exp-003-aws-cluster}
+    provider_options: {instance_market_type: on_demand}
+  azure:
+    provider: azure
+    regions: {vm_a: germanywestcentral, vm_b: germanywestcentral}
+    zones: {vm_a: "1", vm_b: "1"}
+    vm_shape: Standard_D4s_v5
+    image: ubuntu-24_04-lts
+    connection_user: azureuser
+    documented_network_limit: null
+    placement: {kind: proximity_placement_group, name: exp-003-azure-ppg}
+    provider_options: {priority: Regular, eviction_policy: Delete, max_price: -1.0}
+  gcp:
+    provider: gcp
+    regions: {vm_a: europe-west3, vm_b: europe-west3}
+    zones: {vm_a: europe-west3-a, vm_b: europe-west3-a}
+    vm_shape: n2-standard-4
+    image: ubuntu-2404-lts-amd64
+    connection_user: ubuntu
+    documented_network_limit: "Up to 10 Gbps default egress; interpretation metadata only"
+    placement: {kind: compact_placement_policy, name: exp-003-gcp-compact}
+    provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
+options:
+  labels: {purpose: thesis-experiment, scenario_id: S3}
+  provisioning_timeout_seconds: 900
+  readiness_timeout_seconds: 600
+  cleanup_timeout_seconds: 900

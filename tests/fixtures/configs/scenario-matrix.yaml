@@ -1,0 +1,12 @@
+- {provider: aws, scenario: same_zone, region_b: eu-central-1, zone_b: euc1-az1, placement_kind: none, placement_name: null}
+- {provider: aws, scenario: cross_zone, region_b: eu-central-1, zone_b: euc1-az2, placement_kind: none, placement_name: null}
+- {provider: aws, scenario: placement_optimization, region_b: eu-central-1, zone_b: euc1-az1, placement_kind: cluster_placement_group, placement_name: bench}
+- {provider: aws, scenario: inter_region, region_b: eu-west-2, zone_b: euw2-az1, placement_kind: none, placement_name: null}
+- {provider: azure, scenario: same_zone, region_b: germanywestcentral, zone_b: "1", placement_kind: none, placement_name: null}
+- {provider: azure, scenario: cross_zone, region_b: germanywestcentral, zone_b: "2", placement_kind: none, placement_name: null}
+- {provider: azure, scenario: placement_optimization, region_b: germanywestcentral, zone_b: "1", placement_kind: proximity_placement_group, placement_name: bench}
+- {provider: azure, scenario: inter_region, region_b: uksouth, zone_b: "1", placement_kind: none, placement_name: null}
+- {provider: gcp, scenario: same_zone, region_b: europe-west3, zone_b: europe-west3-a, placement_kind: none, placement_name: null}
+- {provider: gcp, scenario: cross_zone, region_b: europe-west3, zone_b: europe-west3-b, placement_kind: none, placement_name: null}
+- {provider: gcp, scenario: placement_optimization, region_b: europe-west3, zone_b: europe-west3-a, placement_kind: compact_placement_policy, placement_name: bench}
+- {provider: gcp, scenario: inter_region, region_b: europe-west2, zone_b: europe-west2-a, placement_kind: none, placement_name: null}

@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloud-network-benchmark.local/contracts/child-run-manifest.schema.json",
+  "title": "Child Run Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_type",
+    "schema_version",
+    "run_id",
+    "campaign_id",
+    "experiment_id",
+    "provider",
+    "scenario",
+    "scheduled_start",
+    "actual_started_at",
+    "actual_finished_at",
+    "config_provenance",
+    "resolved_observation",
+    "execution_state",
+    "cleanup_state",
+    "failure",
+    "cleanup_failure",
+    "vm_metadata",
+    "provider_metadata",
+    "tool_versions",
+    "artifacts",
+    "lifecycle_events",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "manifest_type": { "const": "child_run" },
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "campaign_id": { "type": "string", "minLength": 1 },
+    "experiment_id": { "type": "string", "pattern": "^EXP-[0-9]{3,}$" },
+    "provider": { "$ref": "#/$defs/provider" },
+    "scenario": { "$ref": "#/$defs/scenario" },
+    "scheduled_start": { "type": "string", "format": "date-time" },
+    "actual_started_at": { "type": ["string", "null"], "format": "date-time" },
+    "actual_finished_at": { "type": ["string", "null"], "format": "date-time" },
+    "config_provenance": { "$ref": "#/$defs/config_provenance" },
+    "resolved_observation": { "type": "object" },
+    "execution_state": { "$ref": "#/$defs/execution_state" },
+    "cleanup_state": { "$ref": "#/$defs/cleanup_state" },
+    "failure": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/failure" }
+      ]
+    },
+    "cleanup_failure": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/failure" }
+      ]
+    },
+    "vm_metadata": { "$ref": "#/$defs/structured_evidence" },
+    "provider_metadata": { "$ref": "#/$defs/structured_evidence" },
+    "tool_versions": { "$ref": "#/$defs/structured_evidence" },
+    "artifacts": { "$ref": "#/$defs/artifact_layout" },
+    "lifecycle_events": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/lifecycle_event" }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "provider": { "enum": ["aws", "azure", "gcp"] },
+    "scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ]
+    },
+    "execution_state": {
+      "enum": [
+        "initialized",
+        "provision_ready",
+        "running",
+        "collecting",
+        "validating",
+        "succeeded",
+        "failed",
+        "interrupted"
+      ]
+    },
+    "cleanup_state": {
+      "enum": ["not_started", "not_required", "attempted", "succeeded", "failed"]
+    },
+    "evidence_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unavailable_reason"],
+      "properties": {
+        "value": { "type": ["string", "null"] },
+        "unavailable_reason": { "type": ["string", "null"] }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "value": { "type": "string", "minLength": 1 },
+            "unavailable_reason": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "value": { "type": "null" },
+            "unavailable_reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "structured_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unavailable_reason"],
+      "properties": {
+        "value": { "type": ["object", "null"] },
+        "unavailable_reason": { "type": ["string", "null"] }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "value": { "type": "object", "minProperties": 1 },
+            "unavailable_reason": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "value": { "type": "null" },
+            "unavailable_reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "config_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "sha256",
+        "byte_length",
+        "snapshot_path",
+        "implementation_git_commit",
+        "design_git_commit"
+      ],
+      "properties": {
+        "source_path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "byte_length": { "type": "integer", "minimum": 1 },
+        "snapshot_path": { "type": "string", "minLength": 1 },
+        "implementation_git_commit": { "$ref": "#/$defs/evidence_value" },
+        "design_git_commit": { "$ref": "#/$defs/evidence_value" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "message", "occurred_at", "action_id", "details"],
+      "properties": {
+        "category": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "action_id": { "type": ["string", "null"] },
+        "details": { "type": "object" }
+      }
+    },
+    "artifact_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "config_snapshot",
+        "provider_outputs",
+        "idle_flent",
+        "single_flow_flent",
+        "multi_flow_flent",
+        "single_flow_vm_a_diagnostics",
+        "single_flow_vm_b_diagnostics",
+        "multi_flow_vm_a_diagnostics",
+        "multi_flow_vm_b_diagnostics",
+        "vm_a_metadata",
+        "vm_b_metadata",
+        "validation_result",
+        "validation_summary"
+      ],
+      "properties": {
+        "config_snapshot": { "const": "config.yaml" },
+        "provider_outputs": { "const": "terraform-outputs.json" },
+        "idle_flent": { "const": "flent/idle.flent.gz" },
+        "single_flow_flent": { "const": "flent/single_flow.flent.gz" },
+        "multi_flow_flent": { "const": "flent/multi_flow.flent.gz" },
+        "single_flow_vm_a_diagnostics": { "const": "diagnostics/single_flow/vm_a.json" },
+        "single_flow_vm_b_diagnostics": { "const": "diagnostics/single_flow/vm_b.json" },
+        "multi_flow_vm_a_diagnostics": { "const": "diagnostics/multi_flow/vm_a.json" },
+        "multi_flow_vm_b_diagnostics": { "const": "diagnostics/multi_flow/vm_b.json" },
+        "vm_a_metadata": { "const": "metadata/vm_a.json" },
+        "vm_b_metadata": { "const": "metadata/vm_b.json" },
+        "validation_result": { "const": "validation/result.json" },
+        "validation_summary": { "const": "validation/summary.txt" }
+      }
+    },
+    "lifecycle_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state_domain", "state", "occurred_at", "detail"],
+      "properties": {
+        "state_domain": { "enum": ["execution", "cleanup"] },
+        "state": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "detail": { "type": ["string", "null"] }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "state_domain": { "const": "execution" },
+            "state": { "$ref": "#/$defs/execution_state" }
+          }
+        },
+        {
+          "properties": {
+            "state_domain": { "const": "cleanup" },
+            "state": { "$ref": "#/$defs/cleanup_state" }
+          }
+        }
+      ]
+    }
+  },
+  "$comment": "The runtime contract validates resolved_observation against the typed provider model and enforces state/failure consistency and legal lifecycle transitions."
+}

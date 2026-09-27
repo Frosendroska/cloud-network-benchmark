@@ -1,0 +1,26 @@
+schema_version: 1
+experiment_id: EXP-902
+scheduled_start: "2026-10-01T07:00:00Z"
+selected_providers: [gcp]
+scenario: same_zone
+benchmark:
+  idle_latency: {enabled: true, test_name: ping, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 10, timeout_seconds: 30, parameters: {upload_streams: 1}}
+  execution_order: [idle_latency, single_flow, multi_flow]
+provider_configs:
+  gcp:
+    provider: gcp
+    regions: {vm_a: europe-west3, vm_b: europe-west3}
+    zones: {vm_a: europe-west3-a, vm_b: europe-west3-a}
+    vm_shape: e2-micro
+    image: ubuntu-2404-lts-amd64
+    connection_user: ubuntu
+    documented_network_limit: null
+    placement: {kind: none, name: null}
+    provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
+options:
+  labels: {purpose: framework-smoke-test, provider_under_test: gcp}
+  provisioning_timeout_seconds: 300
+  readiness_timeout_seconds: 300
+  cleanup_timeout_seconds: 300

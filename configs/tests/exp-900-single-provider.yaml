@@ -1,0 +1,26 @@
+schema_version: 1
+experiment_id: EXP-900
+scheduled_start: "2026-10-01T07:00:00Z"
+selected_providers: [aws]
+scenario: same_zone
+benchmark:
+  idle_latency: {enabled: true, test_name: ping, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 10, timeout_seconds: 30, parameters: {upload_streams: 1}}
+  execution_order: [idle_latency, single_flow, multi_flow]
+provider_configs:
+  aws:
+    provider: aws
+    regions: {vm_a: eu-central-1, vm_b: eu-central-1}
+    zones: {vm_a: euc1-az1, vm_b: euc1-az1}
+    vm_shape: t3.small
+    image: ubuntu-24.04
+    connection_user: ubuntu
+    documented_network_limit: null
+    placement: {kind: none, name: null}
+    provider_options: {instance_market_type: on_demand}
+options:
+  labels: {purpose: framework-smoke-test}
+  provisioning_timeout_seconds: 300
+  readiness_timeout_seconds: 300
+  cleanup_timeout_seconds: 300

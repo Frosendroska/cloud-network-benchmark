@@ -1,0 +1,6 @@
+duplicate_key: "A YAML mapping with the same key twice is rejected by UniqueKeyLoader."
+malformed_id: "experiment_id does not match EXP-[0-9]{3,}."
+missing_start: "scheduled_start is required."
+provider_mismatch: "selected_providers differs from provider_configs keys."
+unknown_provider: "Only aws, azure, and gcp are accepted."
+unknown_scenario: "Only the four canonical scenario values are accepted."
