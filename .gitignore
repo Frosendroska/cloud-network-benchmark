@@ -42,6 +42,10 @@ htmlcov/
 .venv/
 venv/
 
+# Local Codex and SpecKit tooling
+.agents/skills/
+.specify/
+
 # Benchmark output
 results/raw/*
 !results/raw/.gitkeep
