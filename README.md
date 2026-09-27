@@ -8,7 +8,7 @@ The sibling repository `../Thesis` remains the source of truth for research ques
 
 ## Current Status
 
-Repository architecture and contracts are established. The benchmarking framework itself is not implemented yet.
+F01, the credential-free contracts and offline harness, is implemented. It validates and resolves campaign YAML, initializes immutable local campaign/child evidence, publishes stable downstream contracts, and renders side-effect-free dry runs. Provider deployment and benchmark execution remain later features.
 
 The current thesis-side design expects a deliberately small framework:
 
@@ -43,7 +43,8 @@ Do not copy thesis documents, analysis, canonical figures, or project trackers i
 ├── AGENTS.md
 ├── README.md
 ├── configs/
-│   └── experiments/
+│   ├── experiments/
+│   └── tests/
 ├── docs/
 ├── scripts/
 ├── terraform/
@@ -59,17 +60,17 @@ Do not copy thesis documents, analysis, canonical figures, or project trackers i
 
 ## Experiment Configs
 
-Executable experiment configuration belongs in `configs/experiments/`.
+Primary executable experiment campaigns belong in `configs/experiments/`. Reduced-cost executable smoke-test campaigns belong in `configs/tests/`. Both use the same schema, explicitly select one or more providers, and map their stable `experiment_id` to the Thesis design in `configs/README.md`.
 
 Each config should include at least:
 
 - `experiment_id`
 - `scenario`
-- `provider`
+- `selected_providers`
 - regions and zones where relevant
 - VM configuration
 - benchmark phases and tool parameters
-- duration and repetition settings
+- configurable phase durations, stream count, and one explicit scheduled start
 
 Config files should remain concise. Long methodological explanations belong in `../Thesis`.
 
@@ -98,8 +99,23 @@ Manifests should be lightweight and should make each result attributable to the 
 
 Raw result bundles may become large and are normally excluded from Git. Manifests are intended to be version-controlled when practical.
 
+Recurring scheduling and campaign sharding are outside this framework. An external reconciler, `tmux` process, or human invokes one campaign command at a time.
+
 ## Development And Testing
 
-No development or test commands are defined yet.
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pytest tests/unit tests/contract tests/integration
+```
 
-When implementation starts, document real commands here only after they exist.
+F01 CLI examples:
+
+```bash
+.venv/bin/python -m cloud_network_benchmark validate --config configs/experiments/exp-001-multi-provider.yaml --format json
+.venv/bin/python -m cloud_network_benchmark resolve --config configs/experiments/exp-001-multi-provider.yaml --format json
+.venv/bin/python -m cloud_network_benchmark dry-run --config configs/tests/exp-900-single-provider.yaml --format human
+.venv/bin/python -m cloud_network_benchmark init --config configs/tests/exp-900-single-provider.yaml --results-root results --format json
+```
+
+These F01 commands do not contact clouds or invoke Terraform, SSH, SCP, or FLENT.

@@ -41,6 +41,10 @@ htmlcov/
 .ruff_cache/
 .venv/
 venv/
+dist/
+build/
+*.egg-info/
+*.tmp
 
 # Local Codex and SpecKit tooling
 .agents/skills/

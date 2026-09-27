@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloud-network-benchmark.local/contracts/campaign-config.schema.json",
+  "title": "Campaign Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "scheduled_start",
+    "selected_providers",
+    "scenario",
+    "benchmark",
+    "provider_configs",
+    "options"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "experiment_id": {
+      "type": "string",
+      "pattern": "^EXP-[0-9]{3,}$"
+    },
+    "scheduled_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "selected_providers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/provider" }
+    },
+    "scenario": { "$ref": "#/$defs/scenario" },
+    "benchmark": { "$ref": "#/$defs/benchmark" },
+    "provider_configs": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 3,
+      "additionalProperties": false,
+      "properties": {
+        "aws": { "$ref": "#/$defs/aws_config" },
+        "azure": { "$ref": "#/$defs/azure_config" },
+        "gcp": { "$ref": "#/$defs/gcp_config" }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "provisioning_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "readiness_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cleanup_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "enum": ["aws", "azure", "gcp"]
+    },
+    "scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ]
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "test_name",
+        "duration_seconds",
+        "timeout_seconds",
+        "parameters"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "test_name": { "type": "string", "minLength": 1 },
+        "duration_seconds": { "type": "integer", "minimum": 1 },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "multi_flow_phase": {
+      "allOf": [
+        { "$ref": "#/$defs/phase" },
+        {
+          "type": "object",
+          "properties": {
+            "parameters": {
+              "type": "object",
+              "required": ["upload_streams"],
+              "properties": {
+                "upload_streams": { "type": "integer", "minimum": 1 }
+              },
+              "additionalProperties": {
+                "type": ["string", "number", "integer", "boolean"]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idle_latency",
+        "single_flow",
+        "multi_flow",
+        "execution_order"
+      ],
+      "properties": {
+        "idle_latency": { "$ref": "#/$defs/phase" },
+        "single_flow": { "$ref": "#/$defs/phase" },
+        "multi_flow": { "$ref": "#/$defs/multi_flow_phase" },
+        "execution_order": {
+          "const": ["idle_latency", "single_flow", "multi_flow"]
+        }
+      }
+    },
+    "regions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vm_a", "vm_b"],
+      "properties": {
+        "vm_a": { "type": "string", "minLength": 1 },
+        "vm_b": { "type": "string", "minLength": 1 }
+      }
+    },
+    "zones": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vm_a", "vm_b"],
+      "properties": {
+        "vm_a": { "type": "string", "minLength": 1 },
+        "vm_b": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provider_options": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    },
+    "provider_base_properties": {
+      "type": "object",
+      "properties": {
+        "regions": { "$ref": "#/$defs/regions" },
+        "zones": { "$ref": "#/$defs/zones" },
+        "vm_shape": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "connection_user": { "type": "string", "minLength": 1 },
+        "documented_network_limit": { "type": ["string", "null"] },
+        "provider_options": { "$ref": "#/$defs/provider_options" }
+      }
+    },
+    "aws_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "regions",
+        "zones",
+        "vm_shape",
+        "image",
+        "connection_user",
+        "documented_network_limit",
+        "placement",
+        "provider_options"
+      ],
+      "properties": {
+        "provider": { "const": "aws" },
+        "regions": { "$ref": "#/$defs/regions" },
+        "zones": { "$ref": "#/$defs/zones" },
+        "vm_shape": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "connection_user": { "type": "string", "minLength": 1 },
+        "documented_network_limit": { "type": ["string", "null"] },
+        "placement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "enum": ["none", "cluster_placement_group"] },
+            "name": { "type": ["string", "null"] }
+          }
+        },
+        "provider_options": { "$ref": "#/$defs/provider_options" }
+      }
+    },
+    "azure_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "regions",
+        "zones",
+        "vm_shape",
+        "image",
+        "connection_user",
+        "documented_network_limit",
+        "placement",
+        "provider_options"
+      ],
+      "properties": {
+        "provider": { "const": "azure" },
+        "regions": { "$ref": "#/$defs/regions" },
+        "zones": { "$ref": "#/$defs/zones" },
+        "vm_shape": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "connection_user": { "type": "string", "minLength": 1 },
+        "documented_network_limit": { "type": ["string", "null"] },
+        "placement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "enum": ["none", "proximity_placement_group"] },
+            "name": { "type": ["string", "null"] }
+          }
+        },
+        "provider_options": { "$ref": "#/$defs/provider_options" }
+      }
+    },
+    "gcp_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "regions",
+        "zones",
+        "vm_shape",
+        "image",
+        "connection_user",
+        "documented_network_limit",
+        "placement",
+        "provider_options"
+      ],
+      "properties": {
+        "provider": { "const": "gcp" },
+        "regions": { "$ref": "#/$defs/regions" },
+        "zones": { "$ref": "#/$defs/zones" },
+        "vm_shape": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "connection_user": { "type": "string", "minLength": 1 },
+        "documented_network_limit": { "type": ["string", "null"] },
+        "placement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "enum": ["none", "compact_placement_policy"] },
+            "name": { "type": ["string", "null"] }
+          }
+        },
+        "provider_options": { "$ref": "#/$defs/provider_options" }
+      }
+    }
+  },
+  "$comment": "Semantic validation additionally requires selected_providers to match provider_configs keys exactly and enforces scenario-specific region, zone, placement, and enabled-phase rules."
+}

@@ -1,0 +1,9 @@
+{
+  "parent_states": ["initialized", "active", "partially_complete", "succeeded", "failed", "interrupted"],
+  "child_execution_states": ["initialized", "provision_ready", "running", "collecting", "validating", "succeeded", "failed", "interrupted"],
+  "cleanup_states": ["not_started", "not_required", "attempted", "succeeded", "failed"],
+  "failure_cases": ["partial_initialization", "execution_failed", "interrupted", "cleanup_failed", "execution_and_cleanup_failed"],
+  "observed_metadata": {"value": {"vm_a": {"mtu": 1500}}, "unavailable_reason": null},
+  "unavailable_metadata": {"value": null, "unavailable_reason": "not observed"},
+  "unavailable_provenance": {"value": null, "unavailable_reason": "repository unavailable"}
+}

@@ -1,0 +1,6 @@
+{
+  "succeeded": {"exit_code": 0, "stdout": "ok", "stderr": ""},
+  "failed": {"exit_code": 2, "stdout": "", "stderr": "failed"},
+  "timed_out": {"exit_code": null, "stdout": "partial", "stderr": "timeout"},
+  "interrupted": {"exit_code": null, "stdout": "", "stderr": "interrupted"}
+}
