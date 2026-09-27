@@ -1,29 +1,29 @@
 schema_version: 1
-experiment_id: EXP-001
+experiment_id: EXP-903
 scheduled_start: "2026-10-01T07:00:00Z"
 selected_providers: [aws, azure, gcp]
 scenario: same_zone
 benchmark:
-  idle_latency: {enabled: true, test_name: ping, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
-  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
-  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 60, timeout_seconds: 90, parameters: {upload_streams: 4}}
+  idle_latency: {enabled: true, test_name: ping, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
+  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 10, timeout_seconds: 30, parameters: {upload_streams: 1}}
   execution_order: [idle_latency, single_flow, multi_flow]
 provider_configs:
   aws:
     provider: aws
     regions: {vm_a: eu-central-1, vm_b: eu-central-1}
     zones: {vm_a: euc1-az1, vm_b: euc1-az1}
-    vm_shape: m7i.xlarge
+    vm_shape: t3.small
     image: ubuntu-24.04
     connection_user: ubuntu
-    documented_network_limit: "Up to 12.5 Gbps; interpretation metadata only"
+    documented_network_limit: null
     placement: {kind: none, name: null}
     provider_options: {instance_market_type: on_demand}
   azure:
     provider: azure
     regions: {vm_a: germanywestcentral, vm_b: germanywestcentral}
     zones: {vm_a: "1", vm_b: "1"}
-    vm_shape: Standard_D4s_v5
+    vm_shape: Standard_B1s
     image: ubuntu-24_04-lts
     connection_user: azureuser
     documented_network_limit: null
@@ -33,14 +33,14 @@ provider_configs:
     provider: gcp
     regions: {vm_a: europe-west3, vm_b: europe-west3}
     zones: {vm_a: europe-west3-a, vm_b: europe-west3-a}
-    vm_shape: n2-standard-4
+    vm_shape: e2-micro
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
     documented_network_limit: null
     placement: {kind: none, name: null}
     provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
 options:
-  labels: {purpose: thesis-experiment, scenario_id: S1}
-  provisioning_timeout_seconds: 900
-  readiness_timeout_seconds: 600
-  cleanup_timeout_seconds: 900
+  labels: {purpose: framework-smoke-test, scope: three-provider}
+  provisioning_timeout_seconds: 300
+  readiness_timeout_seconds: 300
+  cleanup_timeout_seconds: 300

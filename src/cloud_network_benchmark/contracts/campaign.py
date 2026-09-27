@@ -81,6 +81,30 @@ class ProviderConfiguration(StrictModel):
             raise ValueError("placement name must be null when kind is none")
         if self.placement.kind != "none" and not self.placement.name:
             raise ValueError("optimized placement requires a name")
+        provider_options = self.provider_options
+        provider = Provider(self.provider)
+        expected_option_keys = {
+            Provider.AWS: {"instance_market_type"},
+            Provider.AZURE: {"priority", "eviction_policy", "max_price"},
+            Provider.GCP: {"provisioning_model", "instance_termination_action"},
+        }
+        if set(provider_options) != expected_option_keys[provider]:
+            raise ValueError(f"provider_options for {provider.value} must contain exactly {sorted(expected_option_keys[provider])}")
+        if provider == Provider.AWS and provider_options["instance_market_type"] not in {"on_demand", "spot"}:
+            raise ValueError("AWS instance_market_type must be on_demand or spot")
+        if provider == Provider.AZURE:
+            if provider_options["priority"] not in {"Regular", "Spot"}:
+                raise ValueError("Azure priority must be Regular or Spot")
+            if provider_options["eviction_policy"] not in {"Delete", "Deallocate"}:
+                raise ValueError("Azure eviction_policy must be Delete or Deallocate")
+            max_price = provider_options["max_price"]
+            if isinstance(max_price, bool) or not isinstance(max_price, (int, float)):
+                raise ValueError("Azure max_price must be numeric")
+        if provider == Provider.GCP:
+            if provider_options["provisioning_model"] not in {"STANDARD", "SPOT"}:
+                raise ValueError("GCP provisioning_model must be STANDARD or SPOT")
+            if provider_options["instance_termination_action"] not in {"DELETE", "STOP"}:
+                raise ValueError("GCP instance_termination_action must be DELETE or STOP")
         return self
 
 

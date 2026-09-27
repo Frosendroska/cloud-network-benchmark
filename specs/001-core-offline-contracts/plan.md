@@ -6,7 +6,7 @@
 
 ## Summary
 
-Build the credential-free Python foundation that reads campaign YAML from the canonical experiment or smoke-test configuration directories, validates the entire parent campaign before any write or external action, resolves exactly one provider-specific child observation per selected provider, and initializes linked campaign/child manifests plus immutable child result paths. Publish explicit contracts for deployment, remote access, benchmark and diagnostic artifacts, validation inputs, lifecycle state, metadata evidence, and external command execution. Provide an offline CLI with validation, resolution, initialization, and dry-run commands; clocks, identifiers, Git provenance, and external actions are injected and covered by deterministic fakes. Each invocation handles one explicitly started campaign; recurrence, sharding, and automatic triggering remain external.
+Build the credential-free Python foundation that reads campaign YAML from the canonical experiment or smoke-test configuration directories, validates the entire parent campaign before any write or external action, resolves exactly one provider-specific child observation per selected provider, and initializes linked campaign/child manifests plus immutable child result paths. Publish explicit contracts for deployment, remote access, benchmark and diagnostic artifacts, validation inputs, lifecycle state, metadata evidence, provider-native regular/spot purchase options, and external command execution. Provide an offline CLI with validation, resolution, initialization, and dry-run commands; clocks, identifiers, Git provenance, and external actions are injected and covered by deterministic fakes. Each invocation handles one explicitly started campaign; recurrence, sharding, and automatic triggering remain external.
 
 ## Technical Context
 
@@ -115,7 +115,7 @@ tests/
 
 1. Locate an explicitly named YAML file under `configs/experiments/` or `configs/tests/`, or accept an explicit path within one of those roots. The former holds primary campaigns; the latter holds executable, reduced-cost smoke-test campaigns. Both retain documented Thesis-side mappings.
 2. Read bytes with safe YAML parsing, reject duplicate keys, and validate structural plus semantic rules without writing files or invoking commands.
-3. Resolve shared campaign settings into one provider-specific child observation per selected provider. The selected-provider list and provider configuration keys must match exactly.
+3. Resolve shared campaign settings into one provider-specific child observation per selected provider. The selected-provider list and provider configuration keys must match exactly, and provider-native regular/spot purchase fields must validate without cross-cloud normalization.
 4. For validation and resolution, return models or structured errors only. For dry-run, render the resolved campaign, candidate identity/path pattern, artifacts, and planned external action classes without reserving IDs or paths.
 5. For initialization, generate candidate campaign and child IDs through injected clock/ID sources and preflight every destination. Exclusively creating a child manifest is the atomic reservation that assigns its run ID; any later failure preserves or recovers all assigned child manifests with partial-initialization evidence.
 6. Persist the original YAML snapshot and SHA-256 hash for each child bundle. Obtain the implementation commit through an injected Git provenance provider for both experiment and test campaigns; deterministic fakes avoid Git subprocesses in offline tests, and genuinely unavailable provenance is recorded explicitly.
@@ -124,9 +124,9 @@ tests/
 
 ## Test Strategy
 
-- Unit tests cover YAML parsing, duplicate-key rejection, provider/scenario semantics, provisional benchmark values, campaign expansion, IDs, paths, canonical lifecycle transitions, aggregate parent status, artifact naming, manifest round trips, injected Git provenance, command outcomes, and dry-run redaction.
-- Contract tests load every JSON schema, validate representative parent/child/config fixtures, and verify public Pydantic serialization uses the documented field names and enum values.
-- Integration tests exercise `validate`, `resolve`, `init`, and `dry-run` with three-provider experiment and one-provider test fixtures in temporary result roots.
+- Unit tests cover YAML parsing, duplicate-key rejection, provider/scenario semantics, provider-native regular/spot options, the complete S1-S4 and smoke configuration matrices, provisional benchmark values, campaign expansion, IDs, paths, canonical lifecycle transitions, aggregate parent status, artifact naming, manifest round trips, injected Git provenance, command outcomes, and dry-run redaction.
+- Contract tests load every JSON schema, validate every executable campaign config plus representative parent/child fixtures, and verify public Pydantic serialization uses the documented field names and enum values.
+- Integration tests exercise `validate`, `resolve`, `init`, and `dry-run` in temporary result roots; dry-run covers all four three-provider primary campaigns, all three single-provider smoke campaigns, and the reduced three-provider smoke campaign.
 - Failure-injection tests cover every initialization persistence boundary and prove that every assigned run ID retains exactly one manifest, partial initialization is recorded rather than deleted, collisions never overwrite evidence, unavailable Git/metadata evidence stays explicit, fake command failures retain stdout/stderr/status, and cleanup failure never replaces the original failure.
 - A network-denial guard fails tests if F01 attempts sockets or a non-fake subprocess during credential-free scenarios.
 - A lightweight acceptance review checks that a human can understand the dry-run output for every provider/scenario fixture within five minutes; this is recorded validation evidence, not runtime behavior.

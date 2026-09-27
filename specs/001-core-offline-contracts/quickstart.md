@@ -4,6 +4,8 @@ This is the acceptance guide for the implementation produced from this plan. The
 
 Primary executable campaign configurations live under `configs/experiments/`. Reduced-cost executable smoke-test campaigns live under `configs/tests/`. Both use the same schema and retain documented Thesis-side experiment or verification mappings. Each command handles one explicitly started campaign; any recurring trigger is external to F01.
 
+The primary directory contains the complete S1-S4 three-provider matrix. The test directory contains one reduced campaign for each provider and one reduced three-provider campaign. All committed fixtures use regular/on-demand capacity; `configs/README.md` lists the provider-native fields to switch when validating spot capacity.
+
 ## Prerequisites
 
 - Python 3.9 or newer.
@@ -62,7 +64,20 @@ Expected outcome:
 - The report shows candidate identity/path patterns, canonical artifacts, lifecycle steps, validation expectations, and later external action types.
 - No durable ID, manifest, result directory, command execution, credential, or secret value is produced.
 
-## Scenario 3: Initialize Linked Local Evidence
+Repeat the preview with `exp-901-azure-single-provider.yaml` and `exp-902-gcp-single-provider.yaml` to inspect the other provider-specific smoke plans. Use `exp-903-three-provider-smoke.yaml` to inspect the short, cheap coordinated validation campaign.
+
+## Scenario 3: Validate the Executable Matrix
+
+```bash
+.venv/bin/python -m pytest \
+  tests/unit/test_config_resolution.py \
+  tests/contract/test_campaign_config_contract.py \
+  tests/integration/test_dry_run_cli.py
+```
+
+Expected outcome: all four primary campaigns and all four smoke campaigns validate and resolve offline. The primary matrix covers `same_zone`, `cross_zone`, `placement_optimization`, and `inter_region`; the smoke matrix covers each cloud separately and all three together. Provider-native spot values are accepted, preserved, and rejected when misspelled.
+
+## Scenario 4: Initialize Linked Local Evidence
 
 Create an isolated destination, then initialize the three-provider fixture:
 
@@ -85,7 +100,7 @@ Expected outcome:
 
 Run the same command again with deterministic test ID sources in the integration suite. Expected outcome: exit code `4`, with every existing byte unchanged.
 
-## Scenario 4: Reject an Invalid Campaign Before Side Effects
+## Scenario 5: Reject an Invalid Campaign Before Side Effects
 
 ```bash
 .venv/bin/python -m pytest \
@@ -103,7 +118,7 @@ Expected outcome:
 
 The `invalid-cross-zone.yaml` case must identify equal zones as incompatible with `cross_zone`.
 
-## Scenario 5: Verify Lifecycle and Failure Preservation
+## Scenario 6: Verify Lifecycle and Failure Preservation
 
 ```bash
 .venv/bin/python -m pytest \
@@ -118,7 +133,7 @@ Expected outcome:
 - Parent state is never `succeeded` unless every selected child succeeded and met cleanup obligations.
 - Partial and interrupted child outcomes aggregate deterministically.
 
-## Scenario 6: Verify Command Fakes
+## Scenario 7: Verify Command Fakes
 
 ```bash
 .venv/bin/python -m pytest tests/unit/test_execution.py

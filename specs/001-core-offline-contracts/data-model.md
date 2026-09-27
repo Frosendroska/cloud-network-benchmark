@@ -52,13 +52,15 @@ Provider configuration is a discriminated union. Every member has:
 | `connection_user` | string | Required non-secret remote user identity. |
 | `documented_network_limit` | string or null | Interpretation metadata; nullable with no fabricated default. |
 | `placement` | Placement Configuration | Required and explicit even when disabled. |
-| `provider_options` | provider-specific object | Non-secret provider inputs retained without cross-cloud normalization. |
+| `provider_options` | provider-specific object | Non-secret capacity-purchase inputs retained without cross-cloud normalization: AWS `instance_market_type`; Azure `priority`, `eviction_policy`, and `max_price`; GCP `provisioning_model` and `instance_termination_action`. |
 
 Placement kinds are provider-specific:
 
 - AWS: `none` or `cluster_placement_group`.
 - Azure: `none` or `proximity_placement_group`.
 - GCP: `none` or `compact_placement_policy`.
+
+Capacity purchase values are also provider-specific. AWS accepts `on_demand` or `spot`; Azure accepts `Regular` or `Spot` plus its native eviction and price settings; GCP accepts `STANDARD` or `SPOT` plus its native termination action. These values are deployment intent, not a promise of provider capacity.
 
 ### Scenario Validation
 

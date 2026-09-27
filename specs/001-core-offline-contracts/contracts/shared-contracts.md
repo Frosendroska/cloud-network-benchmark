@@ -24,7 +24,8 @@ F05-F07 receive one provider-specific input per child run. Required groups:
 - Identity: `campaign_id`, `run_id`, `experiment_id`, `provider`, `scenario`.
 - Start intent: common `scheduled_start`; F01 processes one explicitly started campaign and leaves recurrence, sharding, and triggering to an external reconciler, `tmux` process, or human.
 - VM intents: exactly two entries, VM A/client and VM B/server, each with provider-native region, zone, shape, image intent, connection user, and role.
-- Placement: provider-specific kind, optional name, and provider options.
+- Placement: provider-specific kind and optional name.
+- Capacity purchase: AWS `instance_market_type`; Azure `priority`, `eviction_policy`, and `max_price`; or GCP `provisioning_model` and `instance_termination_action`. Regular/on-demand and spot values remain provider-native.
 - Bootstrap: template reference and non-secret inputs.
 - Local execution: provider Terraform directory, child result path, provisioning timeout, and cleanup timeout.
 - Provenance: config hash and honest implementation/design commit evidence.

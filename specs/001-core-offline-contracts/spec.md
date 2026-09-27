@@ -24,6 +24,7 @@ A thesis implementer selects an executable campaign configuration and receives e
 2. **Given** a valid test campaign selecting only one provider, **When** the user resolves it, **Then** the system produces one parent campaign specification and exactly one child observation specification for that provider, using the explicitly configured reduced parameters and VM shape intent.
 3. **Given** a configuration with an unsupported scenario name, an empty or unsupported provider selection, a missing experiment ID, missing provider-specific placement data, or contradictory region and zone settings, **When** the user resolves it, **Then** the system rejects the entire campaign with actionable validation messages and does not assign a campaign ID or child run ID or allocate result paths.
 4. **Given** advisor-dependent parameters such as phase duration, aggregate stream count, the campaign's explicit scheduled start, or optional scenario scope, **When** the user resolves a configuration, **Then** those values remain explicit and configurable rather than frozen by the foundation.
+5. **Given** an experiment or smoke-test campaign configured for provider-native spot capacity, **When** the user resolves it, **Then** the selected AWS market type, Azure priority/eviction policy/maximum price, or GCP provisioning model/termination action remains explicit and available to the provider deployment contract.
 
 ---
 
@@ -125,10 +126,11 @@ A thesis implementer can perform a dry run that shows the resolved parent campai
 - **FR-030**: System MUST include VM metadata, cloud/provider metadata, and tool versions in every child manifest, representing each category as observed structured evidence or an explicit unavailable/null value with a reason.
 - **FR-031**: System MUST obtain the implementation Git commit through an injectable provenance provider and record it for primary experiments and smoke-test campaigns; offline tests MUST be able to supply deterministic fake commit data without invoking Git.
 - **FR-032**: System MUST process one explicitly started campaign per command invocation and MUST NOT implement recurring scheduling, campaign sharding, or an internal reconciler in F01.
+- **FR-033**: System MUST validate and preserve provider-native capacity purchase options: AWS `instance_market_type`, Azure `priority`, `eviction_policy`, and `max_price`, and GCP `provisioning_model` and `instance_termination_action`; both regular/on-demand and spot selections MUST remain configurable without flattening their provider-specific semantics.
 
 ### Key Entities *(include if feature involves data)*
 
-- **Campaign Configuration**: User-authored executable description of what should be measured and where. Key attributes include experiment ID, common scheduled start, explicit selected-provider set, scenario intent, provider-specific region or zones, placement settings, VM shape intent, benchmark phases, provisional parameters, and campaign options. Primary configurations live under `configs/experiments/`; smaller verification configurations live under `configs/tests/`.
+- **Campaign Configuration**: User-authored executable description of what should be measured and where. Key attributes include experiment ID, common scheduled start, explicit selected-provider set, scenario intent, provider-specific region or zones, placement settings, VM shape and capacity-purchase intent, benchmark phases, provisional parameters, and campaign options. Primary configurations live under `configs/experiments/`; smaller verification configurations live under `configs/tests/`.
 - **Resolved Campaign Specification**: Validated, side-effect-free parent description of one campaign. It fixes campaign identity, common scheduled start, selected providers, shared benchmark intent, provenance inputs, and the exact child observation set.
 - **Resolved Observation Specification**: Validated, side-effect-free description of one observation to execute. It fixes provider-specific interpretation, VM roles, measurement direction, benchmark settings, placement meaning, and provenance inputs for later features.
 - **Campaign Record**: Parent evidence container for one accepted campaign attempt. It includes campaign ID, experiment ID, selected providers, common scheduled start, configuration provenance, aggregate lifecycle state, parent manifest path, and references to every child run.
@@ -161,6 +163,7 @@ A thesis implementer can perform a dry run that shows the resolved parent campai
 - **SC-011**: Every run ID durably assigned during injected success or failure cases has exactly one preserved child manifest, including failures at each initialization persistence boundary.
 - **SC-012**: Manifest contract tests verify observed and unavailable/null forms for VM metadata, cloud/provider metadata, and tool versions.
 - **SC-013**: Every initialized primary experiment and smoke-test fixture records the deterministic implementation commit supplied by the provenance provider.
+- **SC-014**: The committed executable matrix contains one three-provider primary campaign for each canonical scenario, one reduced single-provider smoke campaign for each supported cloud, and one reduced three-provider smoke campaign; all resolve offline and preserve valid regular or spot purchase options.
 
 ## Assumptions
 
@@ -171,3 +174,4 @@ A thesis implementer can perform a dry run that shows the resolved parent campai
 - Raw benchmark results may become large and are normally excluded from version control; manifests remain lightweight enough to version-control when practical.
 - Thesis interpretation, canonical figures, and research-facing run tracking remain in the sibling Thesis repository and are linked through experiment IDs, run IDs, configuration provenance, commits, manifests, and raw-result references.
 - The current advisor-review design is provisional; F01 must support revision of stream count, duration, the explicitly supplied campaign start, optional placement/inter-region scope, and other methodology-dependent settings. Recurring triggering remains external to this framework.
+- The executable configuration matrix represents the approved S1-S4 design: primary campaigns use the documented experiment shapes and placements, while smoke campaigns use reduced shapes and durations. Committed defaults use regular/on-demand capacity; provider-native spot fields remain configurable for later controlled runs.

@@ -24,6 +24,14 @@
 
 **Alternatives considered**: Automatically adding all supported providers was rejected because provider choice must be explicit. Silently ignoring extra provider blocks was rejected because stale configuration can cause costly surprises. Separate experiment and test schemas were rejected as unnecessary divergence.
 
+## Executable Matrix and Capacity Purchase
+
+**Decision**: Commit one three-provider primary campaign for each approved S1-S4 scenario, three reduced single-provider smoke campaigns, and one reduced three-provider smoke campaign. Preserve provider-native capacity purchase controls: AWS `instance_market_type`, Azure `priority`/`eviction_policy`/`max_price`, and GCP `provisioning_model`/`instance_termination_action`. Defaults use regular/on-demand capacity, while valid spot selections remain configurable.
+
+**Rationale**: The validation plan requires each cloud to be provisioned separately on a cheap shape before a short coordinated three-cloud run. The primary matrix makes every approved scenario executable without embedding multiple scenarios into one campaign. Provider-native purchase fields let later Terraform features evaluate spot instances for short runs without pretending that the three clouds expose identical semantics.
+
+**Alternatives considered**: A single generic `spot: true` flag was rejected because eviction, pricing, and termination behavior differ by provider. Committing spot as the default was rejected because capacity interruptions would make the first smoke-validation path less repeatable. Generating the scenario matrix dynamically was rejected because explicit reviewed YAML is easier to trace to the Thesis design.
+
 ## Validation Boundary
 
 **Decision**: Parse, structurally validate, semantically validate, and fully resolve every selected provider before generating IDs, creating directories, writing manifests, or calling an external action.

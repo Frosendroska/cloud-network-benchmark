@@ -158,10 +158,31 @@
         "vm_b": { "type": "string", "minLength": 1 }
       }
     },
-    "provider_options": {
+    "aws_provider_options": {
       "type": "object",
-      "additionalProperties": {
-        "type": ["string", "number", "integer", "boolean", "null"]
+      "additionalProperties": false,
+      "required": ["instance_market_type"],
+      "properties": {
+        "instance_market_type": { "enum": ["on_demand", "spot"] }
+      }
+    },
+    "azure_provider_options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["priority", "eviction_policy", "max_price"],
+      "properties": {
+        "priority": { "enum": ["Regular", "Spot"] },
+        "eviction_policy": { "enum": ["Delete", "Deallocate"] },
+        "max_price": { "type": "number" }
+      }
+    },
+    "gcp_provider_options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provisioning_model", "instance_termination_action"],
+      "properties": {
+        "provisioning_model": { "enum": ["STANDARD", "SPOT"] },
+        "instance_termination_action": { "enum": ["DELETE", "STOP"] }
       }
     },
     "provider_base_properties": {
@@ -173,7 +194,7 @@
         "image": { "type": "string", "minLength": 1 },
         "connection_user": { "type": "string", "minLength": 1 },
         "documented_network_limit": { "type": ["string", "null"] },
-        "provider_options": { "$ref": "#/$defs/provider_options" }
+        "provider_options": { "type": "object" }
       }
     },
     "aws_config": {
@@ -207,7 +228,7 @@
             "name": { "type": ["string", "null"] }
           }
         },
-        "provider_options": { "$ref": "#/$defs/provider_options" }
+        "provider_options": { "$ref": "#/$defs/aws_provider_options" }
       }
     },
     "azure_config": {
@@ -241,7 +262,7 @@
             "name": { "type": ["string", "null"] }
           }
         },
-        "provider_options": { "$ref": "#/$defs/provider_options" }
+        "provider_options": { "$ref": "#/$defs/azure_provider_options" }
       }
     },
     "gcp_config": {
@@ -275,7 +296,7 @@
             "name": { "type": ["string", "null"] }
           }
         },
-        "provider_options": { "$ref": "#/$defs/provider_options" }
+        "provider_options": { "$ref": "#/$defs/gcp_provider_options" }
       }
     }
   },

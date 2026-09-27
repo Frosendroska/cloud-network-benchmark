@@ -1,8 +1,8 @@
 schema_version: 1
-experiment_id: EXP-001
+experiment_id: EXP-003
 scheduled_start: "2026-10-01T07:00:00Z"
 selected_providers: [aws, azure, gcp]
-scenario: same_zone
+scenario: placement_optimization
 benchmark:
   idle_latency: {enabled: true, test_name: ping, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
   single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
@@ -17,7 +17,7 @@ provider_configs:
     image: ubuntu-24.04
     connection_user: ubuntu
     documented_network_limit: "Up to 12.5 Gbps; interpretation metadata only"
-    placement: {kind: none, name: null}
+    placement: {kind: cluster_placement_group, name: exp-003-aws-cluster}
     provider_options: {instance_market_type: on_demand}
   azure:
     provider: azure
@@ -27,7 +27,7 @@ provider_configs:
     image: ubuntu-24_04-lts
     connection_user: azureuser
     documented_network_limit: null
-    placement: {kind: none, name: null}
+    placement: {kind: proximity_placement_group, name: exp-003-azure-ppg}
     provider_options: {priority: Regular, eviction_policy: Delete, max_price: -1.0}
   gcp:
     provider: gcp
@@ -36,11 +36,11 @@ provider_configs:
     vm_shape: n2-standard-4
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
-    documented_network_limit: null
-    placement: {kind: none, name: null}
+    documented_network_limit: "Up to 10 Gbps default egress; interpretation metadata only"
+    placement: {kind: compact_placement_policy, name: exp-003-gcp-compact}
     provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
 options:
-  labels: {purpose: thesis-experiment, scenario_id: S1}
+  labels: {purpose: thesis-experiment, scenario_id: S3}
   provisioning_timeout_seconds: 900
   readiness_timeout_seconds: 600
   cleanup_timeout_seconds: 900

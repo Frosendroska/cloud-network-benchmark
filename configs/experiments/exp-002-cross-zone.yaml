@@ -1,8 +1,8 @@
 schema_version: 1
-experiment_id: EXP-001
+experiment_id: EXP-002
 scheduled_start: "2026-10-01T07:00:00Z"
 selected_providers: [aws, azure, gcp]
-scenario: same_zone
+scenario: cross_zone
 benchmark:
   idle_latency: {enabled: true, test_name: ping, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
   single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 60, timeout_seconds: 90, parameters: {}}
@@ -12,7 +12,7 @@ provider_configs:
   aws:
     provider: aws
     regions: {vm_a: eu-central-1, vm_b: eu-central-1}
-    zones: {vm_a: euc1-az1, vm_b: euc1-az1}
+    zones: {vm_a: euc1-az1, vm_b: euc1-az2}
     vm_shape: m7i.xlarge
     image: ubuntu-24.04
     connection_user: ubuntu
@@ -22,7 +22,7 @@ provider_configs:
   azure:
     provider: azure
     regions: {vm_a: germanywestcentral, vm_b: germanywestcentral}
-    zones: {vm_a: "1", vm_b: "1"}
+    zones: {vm_a: "1", vm_b: "2"}
     vm_shape: Standard_D4s_v5
     image: ubuntu-24_04-lts
     connection_user: azureuser
@@ -32,15 +32,15 @@ provider_configs:
   gcp:
     provider: gcp
     regions: {vm_a: europe-west3, vm_b: europe-west3}
-    zones: {vm_a: europe-west3-a, vm_b: europe-west3-a}
+    zones: {vm_a: europe-west3-a, vm_b: europe-west3-b}
     vm_shape: n2-standard-4
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
-    documented_network_limit: null
+    documented_network_limit: "Up to 10 Gbps default egress; interpretation metadata only"
     placement: {kind: none, name: null}
     provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
 options:
-  labels: {purpose: thesis-experiment, scenario_id: S1}
+  labels: {purpose: thesis-experiment, scenario_id: S2}
   provisioning_timeout_seconds: 900
   readiness_timeout_seconds: 600
   cleanup_timeout_seconds: 900

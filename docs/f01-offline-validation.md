@@ -27,11 +27,13 @@ python3 -m pytest tests/unit tests/contract tests/integration -q
 python3 -m compileall -q src
 ```
 
-The final complete suite passed **60 tests in 3.73 seconds** on the recorded development host. The performance test separately enforces resolution below one second and local initialization below two seconds, excluding injected filesystem failures.
+The final complete suite passed **71 tests in 1.14 seconds** on the recorded development host. The performance test separately enforces resolution below one second and local initialization below two seconds, excluding injected filesystem failures.
 
 ## Evidence
 
 - The three-provider campaign resolved exactly AWS, Azure, and GCP.
+- All eight executable configurations validated against the same schema and resolved offline: the four three-provider S1-S4 primary campaigns, three provider-specific smoke campaigns, and one reduced three-provider smoke campaign.
+- Provider-native regular/spot fields were preserved for AWS, Azure, and GCP, and invalid purchase values were rejected before side effects.
 - Isolated initialization produced one parent manifest, three child manifests, three immutable child directories, and three byte-identical `config.yaml` snapshots.
 - Every generated parent and child manifest validated against its published Draft 2020-12 JSON Schema.
 - Failure injection covered each child-manifest reservation, result-directory, config-snapshot, and atomic-update boundary.

@@ -62,6 +62,8 @@ Do not copy thesis documents, analysis, canonical figures, or project trackers i
 
 Primary executable experiment campaigns belong in `configs/experiments/`. Reduced-cost executable smoke-test campaigns belong in `configs/tests/`. Both use the same schema, explicitly select one or more providers, and map their stable `experiment_id` to the Thesis design in `configs/README.md`.
 
+The committed primary matrix contains one three-provider campaign for each approved scenario: same-zone, cross-zone, provider-specific placement optimization, and inter-region. The smoke matrix contains separate reduced AWS, Azure, and GCP provisioning campaigns plus one short, reduced three-provider campaign.
+
 Each config should include at least:
 
 - `experiment_id`
@@ -71,6 +73,7 @@ Each config should include at least:
 - VM configuration
 - benchmark phases and tool parameters
 - configurable phase durations, stream count, and one explicit scheduled start
+- provider-native capacity options for regular/on-demand or spot instances
 
 Config files should remain concise. Long methodological explanations belong in `../Thesis`.
 
@@ -80,6 +83,8 @@ Stable experiment IDs should map to thesis-side design entries. Current thesis t
 - `cross_zone`
 - `inter_region`
 - `placement_optimization`
+
+Spot intent stays explicit per provider: AWS uses `instance_market_type`, Azure uses `priority` with eviction and price settings, and GCP uses `provisioning_model` with a termination action. The committed fixtures default to regular/on-demand capacity for repeatable validation.
 
 ## Results And Provenance
 
@@ -115,6 +120,7 @@ F01 CLI examples:
 .venv/bin/python -m cloud_network_benchmark validate --config configs/experiments/exp-001-multi-provider.yaml --format json
 .venv/bin/python -m cloud_network_benchmark resolve --config configs/experiments/exp-001-multi-provider.yaml --format json
 .venv/bin/python -m cloud_network_benchmark dry-run --config configs/tests/exp-900-single-provider.yaml --format human
+.venv/bin/python -m cloud_network_benchmark dry-run --config configs/tests/exp-903-three-provider-smoke.yaml --format human
 .venv/bin/python -m cloud_network_benchmark init --config configs/tests/exp-900-single-provider.yaml --results-root results --format json
 ```
 
