@@ -90,6 +90,10 @@ def _validate_scenario(config: CampaignConfiguration, provider: Provider) -> Non
         raise ValidationError(f"{provider} inter_region requires different regions and placement none")
     if scenario == Scenario.PLACEMENT_OPTIMIZATION and placement == "none":
         raise ValidationError(f"{provider} placement_optimization requires provider placement")
+    if scenario == Scenario.PLACEMENT_OPTIMIZATION and not (same_region and same_zone):
+        raise ValidationError(
+            f"{provider} placement_optimization requires both VMs to share a region and zone"
+        )
 
 
 def resolve_campaign(path: Path, repository_root: Path) -> Tuple[ResolvedCampaign, bytes]:
@@ -130,6 +134,7 @@ def resolve_campaign(path: Path, repository_root: Path) -> Tuple[ResolvedCampaig
                 placement=provider_config.placement,
                 benchmark=config.benchmark,
                 provider_config=provider_config,
+                options=config.options,
             )
         )
     return ResolvedCampaign(
@@ -141,5 +146,6 @@ def resolve_campaign(path: Path, repository_root: Path) -> Tuple[ResolvedCampaig
         scenario=config.scenario,
         selected_providers=selected,
         benchmark=config.benchmark,
+        options=config.options,
         observations=observations,
     ), source

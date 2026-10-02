@@ -28,6 +28,8 @@ def test_resolves_one_observation_per_explicit_provider(repository_root: Path) -
     assert [item.provider for item in resolved.observations] == ["aws", "azure", "gcp"]
     assert all(item.measurement_direction == "vm_a_to_vm_b" for item in resolved.observations)
     assert all(item.vm_a.role == "vm_a" and item.vm_b.role == "vm_b" for item in resolved.observations)
+    assert resolved.options.provisioning_timeout_seconds == 900
+    assert all(item.options == resolved.options for item in resolved.observations)
 
 
 @pytest.mark.parametrize(("filename", "expected"), PRIMARY_MATRIX.items())
@@ -125,3 +127,76 @@ def test_all_scenario_invariants(repository_root: Path, tmp_path: Path, scenario
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     resolved, _ = resolve_campaign(path, root)
     assert resolved.scenario == scenario
+
+
+@pytest.mark.parametrize(
+    ("region_b", "zone_b"),
+    [("eu-west-2", "euw2-az1"), ("eu-central-1", "euc1-az2")],
+)
+def test_placement_optimization_requires_shared_region_and_zone(
+    repository_root: Path, tmp_path: Path, region_b: str, zone_b: str
+) -> None:
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["scenario"] = "placement_optimization"
+    aws = data["provider_configs"]["aws"]
+    aws["regions"]["vm_b"] = region_b
+    aws["zones"]["vm_b"] = zone_b
+    aws["placement"] = {"kind": "cluster_placement_group", "name": "bench"}
+    root = tmp_path / f"{region_b}-{zone_b}"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValidationError, match="share a region and zone"):
+        resolve_campaign(path, root)
+
+
+@pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization"])
+def test_s1_through_s3_require_multi_flow(repository_root: Path, tmp_path: Path, scenario: str) -> None:
+    filename = {
+        "same_zone": "exp-001-multi-provider.yaml",
+        "cross_zone": "exp-002-cross-zone.yaml",
+        "placement_optimization": "exp-003-placement-optimization.yaml",
+    }[scenario]
+    data = yaml.safe_load((repository_root / "configs/experiments" / filename).read_text())
+    data["benchmark"]["multi_flow"]["enabled"] = False
+    data["benchmark"]["multi_flow"]["parameters"] = {}
+    root = tmp_path / scenario
+    path = root / "configs/experiments/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValidationError, match="require multi_flow"):
+        resolve_campaign(path, root)
+
+
+def test_inter_region_may_disable_multi_flow_without_stream_count(repository_root: Path, tmp_path: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-004-inter-region.yaml").read_text())
+    data["benchmark"]["multi_flow"]["parameters"] = {}
+    root = tmp_path / "inter-region"
+    path = root / "configs/experiments/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    resolved, _ = resolve_campaign(path, root)
+    assert resolved.benchmark.multi_flow.enabled is False
+    assert "upload_streams" not in resolved.benchmark.multi_flow.parameters
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "duplicate-key.yaml",
+        "malformed-id.yaml",
+        "missing-start.yaml",
+        "provider-mismatch.yaml",
+        "unknown-provider.yaml",
+        "unknown-scenario.yaml",
+        "contradictory-cross-zone.yaml",
+    ],
+)
+def test_executable_invalid_fixtures_are_rejected(repository_root: Path, tmp_path: Path, fixture: str) -> None:
+    source = repository_root / "tests/fixtures/configs/invalid" / fixture
+    root = tmp_path / fixture
+    path = root / "configs/tests" / fixture
+    path.parent.mkdir(parents=True)
+    path.write_bytes(source.read_bytes())
+    with pytest.raises(ValidationError):
+        resolve_campaign(path, root)

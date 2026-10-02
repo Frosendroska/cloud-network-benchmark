@@ -80,6 +80,12 @@ class CampaignState(StringEnum):
     INTERRUPTED = "interrupted"
 
 
+class LifecycleDomain(StringEnum):
+    CAMPAIGN = "campaign"
+    EXECUTION = "execution"
+    CLEANUP = "cleanup"
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
 
@@ -113,7 +119,18 @@ class FailureEvidence(StrictModel):
 
 
 class LifecycleEvent(StrictModel):
-    state_domain: str
+    state_domain: LifecycleDomain
     state: str
     occurred_at: datetime
     detail: Optional[str] = None
+
+    @model_validator(mode="after")
+    def state_matches_domain(self) -> "LifecycleEvent":
+        allowed = {
+            LifecycleDomain.CAMPAIGN: {item.value for item in CampaignState},
+            LifecycleDomain.EXECUTION: {item.value for item in ExecutionState},
+            LifecycleDomain.CLEANUP: {item.value for item in CleanupState},
+        }
+        if self.state not in allowed[LifecycleDomain(self.state_domain)]:
+            raise ValueError(f"state {self.state!r} is invalid for {self.state_domain} lifecycle events")
+        return self

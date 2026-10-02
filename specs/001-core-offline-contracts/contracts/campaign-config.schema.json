@@ -67,6 +67,30 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "scenario": {
+            "enum": ["same_zone", "cross_zone", "placement_optimization"]
+          }
+        },
+        "required": ["scenario"]
+      },
+      "then": {
+        "properties": {
+          "benchmark": {
+            "properties": {
+              "multi_flow": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "provider": {
       "enum": ["aws", "azure", "gcp"]
@@ -106,16 +130,17 @@
       "allOf": [
         { "$ref": "#/$defs/phase" },
         {
-          "type": "object",
-          "properties": {
-            "parameters": {
-              "type": "object",
-              "required": ["upload_streams"],
-              "properties": {
-                "upload_streams": { "type": "integer", "minimum": 1 }
-              },
-              "additionalProperties": {
-                "type": ["string", "number", "integer", "boolean"]
+          "if": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["upload_streams"],
+                "properties": {
+                  "upload_streams": { "type": "integer", "minimum": 1 }
+                }
               }
             }
           }

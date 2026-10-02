@@ -132,6 +132,14 @@ class CampaignConfiguration(StrictModel):
             raise ValueError("selected_providers must be unique")
         return value
 
+    @model_validator(mode="after")
+    def validate_scenario_phases(self) -> "CampaignConfiguration":
+        if self.scenario != Scenario.INTER_REGION and not self.benchmark.multi_flow.enabled:
+            raise ValueError(
+                "same_zone, cross_zone, and placement_optimization require multi_flow to be enabled"
+            )
+        return self
+
 
 class ConfigProvenance(StrictModel):
     source_path: str
@@ -164,6 +172,7 @@ class ResolvedObservation(StrictModel):
     benchmark: BenchmarkPlan
     artifact_layout: ArtifactLayout = Field(default_factory=ArtifactLayout)
     provider_config: ProviderConfiguration
+    options: CampaignOptions
 
 
 class ResolvedCampaign(StrictModel):
@@ -175,4 +184,5 @@ class ResolvedCampaign(StrictModel):
     scenario: Scenario
     selected_providers: List[Provider]
     benchmark: BenchmarkPlan
+    options: CampaignOptions
     observations: List[ResolvedObservation]

@@ -16,6 +16,13 @@ def test_dry_run_is_complete_and_deterministic(repository_root: Path) -> None:
     human = render_human(report)
     assert "VM A client" in human and "VM B server" in human
     assert "terraform" in human and "cleanup" in human
+    assert "Config:" in human and "Manifest path:" in human
+    assert "vm_a_to_vm_b" in human
+    assert "Benchmark order: idle_latency, single_flow, multi_flow" in human
+    assert "Validator expectations:" in human
+    assert "provisioning_timeout_seconds" in human
+    assert report.config_source == "configs/experiments/exp-001-multi-provider.yaml"
+    assert report.children[0].provider_options["instance_market_type"] == "on_demand"
 
 
 def test_dry_run_does_not_render_secret_bearing_fields(repository_root: Path) -> None:

@@ -4,9 +4,9 @@ import hashlib
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .config import resolve_campaign
 from .contracts.artifacts import ArtifactLayout
@@ -18,11 +18,12 @@ from .contracts.common import (
     FailureEvidence,
     LifecycleEvent,
     Provider,
+    Scenario,
     StringEvidence,
     StrictModel,
     StructuredEvidence,
 )
-from .errors import BenchmarkError, PersistenceError
+from .errors import BenchmarkError, CollisionError, PersistenceError
 from .ids import Clock, TokenSource, candidate_campaign_id, candidate_run_id, random_token, utc_now
 from .paths import (
     FaultInjector,
@@ -34,7 +35,7 @@ from .paths import (
     reserve_json,
     write_exclusive,
 )
-from .lifecycle import transition_cleanup, transition_execution
+from .lifecycle import aggregate_campaign, transition_cleanup, transition_execution
 
 
 class GitProvenanceProvider(Protocol):
@@ -91,13 +92,13 @@ class ChildReference(StrictModel):
 
 
 class ChildRunManifest(StrictModel):
-    manifest_type: str = "child_run"
-    schema_version: int = 1
+    manifest_type: Literal["child_run"] = "child_run"
+    schema_version: Literal[1] = 1
     run_id: str
     campaign_id: str
     experiment_id: str
     provider: Provider
-    scenario: str
+    scenario: Scenario
     scheduled_start: datetime
     actual_started_at: Optional[datetime] = None
     actual_finished_at: Optional[datetime] = None
@@ -115,16 +116,33 @@ class ChildRunManifest(StrictModel):
     created_at: datetime
     updated_at: datetime
 
+    @model_validator(mode="after")
+    def lifecycle_matches_current_state(self) -> "ChildRunManifest":
+        execution_events = [event for event in self.lifecycle_events if event.state_domain == "execution"]
+        cleanup_events = [event for event in self.lifecycle_events if event.state_domain == "cleanup"]
+        if not execution_events or execution_events[-1].state != self.execution_state:
+            raise ValueError("latest execution lifecycle event must match execution_state")
+        if cleanup_events:
+            if cleanup_events[-1].state != self.cleanup_state:
+                raise ValueError("latest cleanup lifecycle event must match cleanup_state")
+        elif self.cleanup_state != CleanupState.NOT_STARTED.value:
+            raise ValueError("non-initial cleanup state requires a cleanup lifecycle event")
+        if self.execution_state == ExecutionState.FAILED.value and self.failure is None:
+            raise ValueError("failed execution state requires failure evidence")
+        if self.cleanup_state == CleanupState.FAILED.value and self.cleanup_failure is None:
+            raise ValueError("failed cleanup state requires cleanup failure evidence")
+        return self
+
 
 class CampaignManifest(StrictModel):
-    manifest_type: str = "campaign"
-    schema_version: int = 1
+    manifest_type: Literal["campaign"] = "campaign"
+    schema_version: Literal[1] = 1
     campaign_id: str
     experiment_id: str
-    configuration_role: str
+    configuration_role: Literal["experiment", "test"]
     scheduled_start: datetime
     selected_providers: List[Provider]
-    scenario: str
+    scenario: Scenario
     config_provenance: ManifestConfigProvenance
     tool_versions: StructuredEvidence
     aggregate_state: CampaignState = CampaignState.INITIALIZED
@@ -133,11 +151,24 @@ class CampaignManifest(StrictModel):
     updated_at: datetime
     lifecycle_events: List[LifecycleEvent]
 
+    @model_validator(mode="after")
+    def lifecycle_matches_aggregate(self) -> "CampaignManifest":
+        if not self.lifecycle_events or self.lifecycle_events[-1].state != self.aggregate_state:
+            raise ValueError("latest campaign lifecycle event must match aggregate_state")
+        return self
+
 
 class InitializedCampaign(StrictModel):
     campaign_id: str
     parent_manifest_path: str
     children: List[ChildReference]
+
+
+class InitializationRecovery(StrictModel):
+    campaign_id: str
+    parent_manifest_path: Optional[str]
+    preserved_child_manifest_paths: List[str]
+    recovery_failures: List[str]
 
 
 def _relative(path: Path, repository_root: Path) -> str:
@@ -164,11 +195,74 @@ def _failed_manifest(manifest: ChildRunManifest, now: datetime, message: str) ->
     )
 
 
+def _parent_manifest_path(child_manifest_path: Path, campaign_id: str) -> Path:
+    return child_manifest_path.parent / f"{campaign_id}.json"
+
+
+def recompute_parent_manifest(
+    parent_manifest_path: Path,
+    occurred_at: datetime,
+    detail: str,
+    fault: FaultInjector = no_fault,
+) -> CampaignManifest:
+    parent = CampaignManifest.model_validate_json(parent_manifest_path.read_text(encoding="utf-8"))
+    children = []
+    for reference in parent.child_runs:
+        child_path = parent_manifest_path.parent / f"{reference.run_id}.json"
+        if not child_path.exists():
+            continue
+        child = ChildRunManifest.model_validate_json(child_path.read_text(encoding="utf-8"))
+        children.append((child.execution_state, child.cleanup_state))
+    aggregate = aggregate_campaign(children) if children else CampaignState.INITIALIZED
+    event = LifecycleEvent(
+        state_domain="campaign",
+        state=aggregate.value,
+        occurred_at=occurred_at,
+        detail=detail,
+    )
+    updated = parent.model_copy(
+        update={
+            "aggregate_state": aggregate,
+            "updated_at": occurred_at,
+            "lifecycle_events": [*parent.lifecycle_events, event],
+        }
+    )
+    atomic_write_json(parent_manifest_path, _manifest_payload(updated), fault)
+    return updated
+
+
+def update_child_evidence(
+    manifest_path: Path,
+    occurred_at: datetime,
+    *,
+    vm_metadata: Optional[StructuredEvidence] = None,
+    provider_metadata: Optional[StructuredEvidence] = None,
+    tool_versions: Optional[StructuredEvidence] = None,
+    fault: FaultInjector = no_fault,
+) -> ChildRunManifest:
+    if vm_metadata is None and provider_metadata is None and tool_versions is None:
+        raise ValueError("at least one evidence field must be supplied")
+    manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    updates: Dict[str, Any] = {"updated_at": occurred_at}
+    for name, value in (
+        ("vm_metadata", vm_metadata),
+        ("provider_metadata", provider_metadata),
+        ("tool_versions", tool_versions),
+    ):
+        if value is not None:
+            updates[name] = value
+    updated = manifest.model_copy(update=updates)
+    atomic_write_json(manifest_path, _manifest_payload(updated), fault)
+    return updated
+
+
 def update_child_execution(
     manifest_path: Path,
     target: ExecutionState,
     occurred_at: datetime,
     failure: Optional[FailureEvidence] = None,
+    parent_manifest_path: Optional[Path] = None,
+    fault: FaultInjector = no_fault,
 ) -> ChildRunManifest:
     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     target = ExecutionState(target)
@@ -185,7 +279,10 @@ def update_child_execution(
     if failure is not None and manifest.failure is None:
         updates["failure"] = failure
     updated = manifest.model_copy(update=updates)
-    atomic_write_json(manifest_path, _manifest_payload(updated))
+    atomic_write_json(manifest_path, _manifest_payload(updated), fault)
+    parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
+    if parent_path.exists():
+        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} execution -> {target.value}", fault)
     return updated
 
 
@@ -194,6 +291,8 @@ def update_child_cleanup(
     target: CleanupState,
     occurred_at: datetime,
     cleanup_failure: Optional[FailureEvidence] = None,
+    parent_manifest_path: Optional[Path] = None,
+    fault: FaultInjector = no_fault,
 ) -> ChildRunManifest:
     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     target = CleanupState(target)
@@ -208,7 +307,10 @@ def update_child_cleanup(
     if cleanup_failure is not None:
         updates["cleanup_failure"] = cleanup_failure
     updated = manifest.model_copy(update=updates)
-    atomic_write_json(manifest_path, _manifest_payload(updated))
+    atomic_write_json(manifest_path, _manifest_payload(updated), fault)
+    parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
+    if parent_path.exists():
+        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} cleanup -> {target.value}", fault)
     return updated
 
 
@@ -234,8 +336,42 @@ def initialize_campaign(
     unavailable = StructuredEvidence(unavailable_reason="not observed during F01 initialization")
     tool_versions = StructuredEvidence(value={"cloud_network_benchmark": "0.1.0", "python": platform.python_version()})
     assigned: List[Tuple[Provider, ChildRunManifest]] = []
+    children = [
+        ChildReference(
+            provider=provider,
+            run_id=run_ids[provider],
+            manifest_path=_relative(paths.child_manifests[provider], repository_root),
+            result_path=_relative(paths.child_results[provider], repository_root),
+        )
+        for provider in run_ids
+    ]
+    parent_provenance = ManifestConfigProvenance(
+        source_path=resolved.config_source.source_path,
+        sha256=resolved.config_source.sha256,
+        byte_length=resolved.config_source.byte_length,
+        snapshot_path=None,
+        implementation_git_commit=implementation,
+        design_git_commit=design,
+    )
+    parent = CampaignManifest(
+        campaign_id=campaign_id,
+        experiment_id=resolved.experiment_id,
+        configuration_role=resolved.configuration_role,
+        scheduled_start=resolved.scheduled_start,
+        selected_providers=resolved.selected_providers,
+        scenario=resolved.scenario,
+        config_provenance=parent_provenance,
+        tool_versions=tool_versions,
+        child_runs=[],
+        lifecycle_events=[LifecycleEvent(state_domain="campaign", state=CampaignState.INITIALIZED.value, occurred_at=now)],
+        created_at=now,
+        updated_at=now,
+    )
 
     try:
+        fault("before_parent_manifest_reservation")
+        reserve_json(paths.campaign_manifest, _manifest_payload(parent), fault)
+        fault("after_parent_manifest_reservation")
         for observation in resolved.observations:
             provider = Provider(observation.provider)
             run_id = run_ids[provider]
@@ -271,45 +407,30 @@ def initialize_campaign(
                 created_at=now,
                 updated_at=now,
             )
+            fault(f"before_child_manifest_reservation:{provider.value}")
             reserve_json(paths.child_manifests[provider], _manifest_payload(manifest), fault)
+            fault(f"after_child_manifest_reservation:{provider.value}")
             assigned.append((provider, manifest))
+            current_parent = CampaignManifest.model_validate_json(paths.campaign_manifest.read_text(encoding="utf-8"))
+            assigned_providers = {item[0] for item in assigned}
+            linked_parent = current_parent.model_copy(
+                update={
+                    "child_runs": [reference for reference in children if Provider(reference.provider) in assigned_providers],
+                    "updated_at": now,
+                }
+            )
+            fault(f"before_parent_child_link_update:{provider.value}")
+            atomic_write_json(paths.campaign_manifest, _manifest_payload(linked_parent), fault)
+            fault(f"after_parent_child_link_update:{provider.value}")
+            fault(f"before_result_directory:{provider.value}")
             create_directory(result_path, fault)
+            fault(f"after_result_directory:{provider.value}")
+            fault(f"before_config_snapshot:{provider.value}")
             write_exclusive(snapshot, source, fault)
+            fault(f"after_config_snapshot:{provider.value}")
             if hashlib.sha256(snapshot.read_bytes()).hexdigest() != resolved.config_source.sha256:
                 raise PersistenceError(f"snapshot hash mismatch for {run_id}")
 
-        children = [
-            ChildReference(
-                provider=provider,
-                run_id=run_ids[provider],
-                manifest_path=_relative(paths.child_manifests[provider], repository_root),
-                result_path=_relative(paths.child_results[provider], repository_root),
-            )
-            for provider in run_ids
-        ]
-        parent_provenance = ManifestConfigProvenance(
-            source_path=resolved.config_source.source_path,
-            sha256=resolved.config_source.sha256,
-            byte_length=resolved.config_source.byte_length,
-            snapshot_path=None,
-            implementation_git_commit=implementation,
-            design_git_commit=design,
-        )
-        parent = CampaignManifest(
-            campaign_id=campaign_id,
-            experiment_id=resolved.experiment_id,
-            configuration_role=resolved.configuration_role,
-            scheduled_start=resolved.scheduled_start,
-            selected_providers=resolved.selected_providers,
-            scenario=resolved.scenario,
-            config_provenance=parent_provenance,
-            tool_versions=tool_versions,
-            child_runs=children,
-            lifecycle_events=[LifecycleEvent(state_domain="campaign", state=CampaignState.INITIALIZED.value, occurred_at=now)],
-            created_at=now,
-            updated_at=now,
-        )
-        reserve_json(paths.campaign_manifest, _manifest_payload(parent), fault)
         return InitializedCampaign(
             campaign_id=campaign_id,
             parent_manifest_path=_relative(paths.campaign_manifest, repository_root),
@@ -317,7 +438,9 @@ def initialize_campaign(
         )
     except Exception as exc:
         recovery_time = clock()
+        recovery_failures: List[str] = []
         assigned_by_provider = {provider: manifest for provider, manifest in assigned}
+        recovered_providers = set(assigned_by_provider)
         for observation in resolved.observations:
             provider = Provider(observation.provider)
             manifest_path = paths.child_manifests[provider]
@@ -325,15 +448,26 @@ def initialize_campaign(
                 continue
             manifest = assigned_by_provider.get(provider)
             if manifest is None:
+                if isinstance(exc, CollisionError):
+                    continue
                 try:
                     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
                 except Exception:
                     continue
+                if manifest.run_id != run_ids[provider] or manifest.campaign_id != campaign_id:
+                    continue
+                recovered_providers.add(provider)
             failed = _failed_manifest(manifest, recovery_time, str(exc))
             try:
-                atomic_write_json(manifest_path, _manifest_payload(failed))
-            except BenchmarkError:
-                pass
+                fault(f"before_recovery_update:{provider.value}")
+                atomic_write_json(manifest_path, _manifest_payload(failed), fault)
+                fault(f"after_recovery_update:{provider.value}")
+            except Exception as recovery_exc:
+                recovery_failures.append(f"{manifest_path}: {recovery_exc}")
+                try:
+                    atomic_write_json(manifest_path, _manifest_payload(failed))
+                except BenchmarkError as fallback_exc:
+                    recovery_failures.append(f"{manifest_path} fallback: {fallback_exc}")
         if paths.campaign_manifest.exists():
             try:
                 parent = CampaignManifest.model_validate_json(paths.campaign_manifest.read_text(encoding="utf-8"))
@@ -346,13 +480,38 @@ def initialize_campaign(
                 failed_parent = parent.model_copy(
                     update={
                         "aggregate_state": CampaignState.FAILED,
+                        "child_runs": [
+                            reference for reference in children
+                            if Provider(reference.provider) in recovered_providers
+                        ],
                         "updated_at": recovery_time,
                         "lifecycle_events": [*parent.lifecycle_events, parent_event],
                     }
                 )
-                atomic_write_json(paths.campaign_manifest, _manifest_payload(failed_parent))
-            except Exception:
-                pass
-        if isinstance(exc, BenchmarkError):
-            raise
-        raise PersistenceError(f"campaign initialization failed: {exc}") from exc
+                fault("before_parent_recovery_update")
+                atomic_write_json(paths.campaign_manifest, _manifest_payload(failed_parent), fault)
+                fault("after_parent_recovery_update")
+            except Exception as recovery_exc:
+                recovery_failures.append(f"{paths.campaign_manifest}: {recovery_exc}")
+                try:
+                    atomic_write_json(paths.campaign_manifest, _manifest_payload(failed_parent))
+                except Exception as fallback_exc:
+                    recovery_failures.append(f"{paths.campaign_manifest} fallback: {fallback_exc}")
+        preserved = []
+        for provider, path in paths.child_manifests.items():
+            if provider in recovered_providers and path.exists():
+                try:
+                    ChildRunManifest.model_validate_json(path.read_text(encoding="utf-8"))
+                    preserved.append(_relative(path, repository_root))
+                except Exception as invalid_exc:
+                    recovery_failures.append(f"{path} invalid after recovery: {invalid_exc}")
+        recovery = InitializationRecovery(
+            campaign_id=campaign_id,
+            parent_manifest_path=_relative(paths.campaign_manifest, repository_root) if paths.campaign_manifest.exists() else None,
+            preserved_child_manifest_paths=preserved,
+            recovery_failures=recovery_failures,
+        )
+        details = recovery.model_dump(mode="json")
+        if isinstance(exc, CollisionError):
+            raise exc
+        raise PersistenceError(f"campaign initialization failed: {exc}", details) from exc

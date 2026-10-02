@@ -32,7 +32,7 @@ Use `../Thesis` to understand what should be measured and why:
 - `../Thesis/experiments/`
 - `../Thesis/tracking/`
 
-Use this repository to define exactly how an approved experiment is executed.
+Use this repository to define exactly how a review-ready experiment is executed. Advisor-dependent durations, stream counts, and optional S3/S4 scope remain provisional and configurable until review and calibration are complete.
 
 Do not copy thesis documents, analysis, canonical figures, or project trackers into this repository. Connect design to implementation with stable experiment IDs, run IDs, config paths, and Git revisions.
 

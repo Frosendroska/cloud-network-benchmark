@@ -26,7 +26,7 @@
 
 ## Executable Matrix and Capacity Purchase
 
-**Decision**: Commit one three-provider primary campaign for each approved S1-S4 scenario, three reduced single-provider smoke campaigns, and one reduced three-provider smoke campaign. Preserve provider-native capacity purchase controls: AWS `instance_market_type`, Azure `priority`/`eviction_policy`/`max_price`, and GCP `provisioning_model`/`instance_termination_action`. Defaults use regular/on-demand capacity, while valid spot selections remain configurable.
+**Decision**: Commit one three-provider primary campaign for each review-ready, provisional S1-S4 scenario, three reduced single-provider smoke campaigns, and one reduced three-provider smoke campaign. Preserve provider-native capacity purchase controls: AWS `instance_market_type`, Azure `priority`/`eviction_policy`/`max_price`, and GCP `provisioning_model`/`instance_termination_action`. Defaults use regular/on-demand capacity, while valid spot selections remain configurable. Durations, stream count, and optional S3/S4 scope are not frozen before advisor review and calibration.
 
 **Rationale**: The validation plan requires each cloud to be provisioned separately on a cheap shape before a short coordinated three-cloud run. The primary matrix makes every approved scenario executable without embedding multiple scenarios into one campaign. Provider-native purchase fields let later Terraform features evaluate spot instances for short runs without pretending that the three clouds expose identical semantics.
 

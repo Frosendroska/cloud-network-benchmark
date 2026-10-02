@@ -30,7 +30,7 @@
     "scheduled_start": { "type": "string", "format": "date-time" },
     "selected_providers": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "maxItems": 3,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/provider" }
