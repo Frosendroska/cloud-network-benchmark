@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -8,7 +9,7 @@ from cloud_network_benchmark.manifests import (
 )
 from cloud_network_benchmark.contracts import LifecycleEvent
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 def test_generated_manifests_match_schemas(repository_root: Path, tmp_path: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str]) -> None:
@@ -96,3 +97,107 @@ def test_schema_valid_manifest_fixtures_cover_canonical_states_and_evidence(repo
     unavailable_provenance["config_provenance"]["design_git_commit"] = cases["unavailable_provenance"]
     Draft202012Validator(parent_schema, format_checker=FormatChecker()).validate(unavailable_provenance)
     CampaignManifest.model_validate(unavailable_provenance)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("sha256", "not-a-hash"), ("byte_length", 0)],
+)
+def test_runtime_and_schema_reject_invalid_manifest_provenance(
+    repository_root: Path, field: str, value: object
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture["config_provenance"][field] = value
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+def test_runtime_and_schema_reject_untyped_resolved_observation(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture["resolved_observation"] = {}
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "failure", "cleanup_state", "cleanup_failure"),
+    [
+        ("failed", None, "not_started", None),
+        ("succeeded", {"category": "x", "message": "x", "occurred_at": "2026-09-27T12:00:00Z", "action_id": None, "details": {}}, "not_started", None),
+        ("initialized", None, "failed", None),
+        ("initialized", None, "succeeded", {"category": "x", "message": "x", "occurred_at": "2026-09-27T12:00:00Z", "action_id": None, "details": {}}),
+    ],
+)
+def test_runtime_and_schema_reject_inconsistent_failure_fields(
+    repository_root: Path,
+    execution_state: str,
+    failure: object,
+    cleanup_state: str,
+    cleanup_failure: object,
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture["execution_state"] = execution_state
+    fixture["failure"] = failure
+    fixture["cleanup_state"] = cleanup_state
+    fixture["cleanup_failure"] = cleanup_failure
+    fixture["lifecycle_events"] = [
+        {"state_domain": "execution", "state": execution_state, "occurred_at": fixture["created_at"], "detail": None}
+    ]
+    if cleanup_state != "not_started":
+        fixture["lifecycle_events"].append(
+            {"state_domain": "cleanup", "state": cleanup_state, "occurred_at": fixture["created_at"], "detail": None}
+        )
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+def test_campaign_manifest_rejects_duplicate_or_unlinked_children(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    duplicate = deepcopy(fixture)
+    duplicate["selected_providers"] = ["aws", "aws"]
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(duplicate)
+    unlinked = deepcopy(fixture)
+    unlinked["child_runs"][0]["provider"] = "gcp"
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(unlinked)
+
+
+@pytest.mark.parametrize("manifest_name", ["initialized-parent.json", "initialized-child.json"])
+def test_manifests_reject_reversed_timestamps(repository_root: Path, manifest_name: str) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests" / manifest_name).read_text())
+    created = datetime.fromisoformat(fixture["created_at"].replace("Z", "+00:00"))
+    fixture["updated_at"] = (created - timedelta(seconds=1)).isoformat()
+    model = CampaignManifest if fixture["manifest_type"] == "campaign" else ChildRunManifest
+    with pytest.raises(ValueError, match="chronological|updated_at"):
+        model.model_validate(fixture)
+
+
+def test_child_manifest_rejects_out_of_order_events_and_actual_times(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture["execution_state"] = "running"
+    fixture["actual_started_at"] = "2026-09-27T12:00:02Z"
+    fixture["updated_at"] = "2026-09-27T12:00:03Z"
+    fixture["lifecycle_events"] = [
+        {"state_domain": "execution", "state": "initialized", "occurred_at": "2026-09-27T12:00:01Z", "detail": None},
+        {"state_domain": "execution", "state": "running", "occurred_at": "2026-09-27T12:00:00Z", "detail": None},
+    ]
+    with pytest.raises(ValueError, match="chronological"):
+        ChildRunManifest.model_validate(fixture)
+
+    fixture["lifecycle_events"].reverse()
+    fixture["actual_finished_at"] = "2026-09-27T12:00:01Z"
+    with pytest.raises(ValueError, match="actual_finished_at"):
+        ChildRunManifest.model_validate(fixture)

@@ -45,9 +45,9 @@ class ProviderDeploymentInput(StrictModel):
     bootstrap_inputs: Dict[str, Any] = Field(default_factory=dict)
     terraform_directory: str
     child_result_path: str
-    provisioning_timeout_seconds: int = Field(gt=0)
-    readiness_timeout_seconds: int = Field(gt=0)
-    cleanup_timeout_seconds: int = Field(gt=0)
+    provisioning_timeout_seconds: Optional[int] = Field(default=None, gt=0)
+    readiness_timeout_seconds: Optional[int] = Field(default=None, gt=0)
+    cleanup_timeout_seconds: Optional[int] = Field(default=None, gt=0)
     config_sha256: str
     implementation_git_commit: StringEvidence
     design_git_commit: StringEvidence
@@ -68,13 +68,6 @@ class ProviderDeploymentInput(StrictModel):
         bootstrap_inputs: Optional[Dict[str, Any]] = None,
     ) -> "ProviderDeploymentInput":
         options = observation.options
-        required_timeouts = (
-            options.provisioning_timeout_seconds,
-            options.readiness_timeout_seconds,
-            options.cleanup_timeout_seconds,
-        )
-        if any(value is None for value in required_timeouts):
-            raise ValueError("deployment requires explicit provisioning, readiness, and cleanup timeouts")
         return cls(
             campaign_id=campaign_id,
             run_id=run_id,

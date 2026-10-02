@@ -89,8 +89,9 @@ def test_invalid_provider_purchase_option_is_rejected(repository_root: Path, tmp
     path = root / "configs/tests/invalid.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    with pytest.raises(ValidationError, match="instance_market_type"):
+    with pytest.raises(ValidationError) as error:
         resolve_campaign(path, root)
+    assert "instance_market_type" in error.value.details["issues"][0]["message"]
 
 
 def test_rejects_selected_provider_mismatch(repository_root: Path, tmp_path: Path) -> None:
@@ -164,8 +165,9 @@ def test_s1_through_s3_require_multi_flow(repository_root: Path, tmp_path: Path,
     path = root / "configs/experiments/campaign.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    with pytest.raises(ValidationError, match="require multi_flow"):
+    with pytest.raises(ValidationError) as error:
         resolve_campaign(path, root)
+    assert "require multi_flow" in error.value.details["issues"][0]["message"]
 
 
 def test_inter_region_may_disable_multi_flow_without_stream_count(repository_root: Path, tmp_path: Path) -> None:

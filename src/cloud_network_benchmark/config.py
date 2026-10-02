@@ -35,6 +35,25 @@ def _construct_mapping(loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bo
 UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
 
 
+def _field_path(location: Tuple[Any, ...]) -> str:
+    return ".".join(["config", *(str(part) for part in location)])
+
+
+def _safe_validation_issues(exc: PydanticValidationError) -> list[Dict[str, str]]:
+    return [
+        {
+            "field_path": _field_path(tuple(issue["loc"])),
+            "message": issue["msg"],
+            "error_type": issue["type"],
+        }
+        for issue in exc.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    ]
+
+
 def _role_and_relative_path(path: Path, repository_root: Path) -> Tuple[str, str]:
     resolved = path.resolve()
     roots = {
@@ -61,13 +80,23 @@ def load_campaign(path: Path, repository_root: Path) -> Tuple[CampaignConfigurat
     except ValidationError:
         raise
     except yaml.YAMLError as exc:
-        raise ValidationError(f"invalid YAML: {exc}", "config") from exc
+        mark = getattr(exc, "problem_mark", None)
+        details = {}
+        if mark is not None:
+            details = {"line": mark.line + 1, "column": mark.column + 1}
+        raise ValidationError("invalid YAML", "config", details) from exc
     if not isinstance(raw, dict):
         raise ValidationError("campaign config must be a mapping", "config")
     try:
         config = CampaignConfiguration.model_validate(raw)
     except PydanticValidationError as exc:
-        raise ValidationError(str(exc), "config") from exc
+        issues = _safe_validation_issues(exc)
+        field = issues[0]["field_path"] if issues else "config"
+        raise ValidationError(
+            "campaign configuration is invalid",
+            field,
+            {"issues": issues},
+        ) from exc
     provenance = ConfigProvenance(
         source_path=relative,
         sha256=hashlib.sha256(source).hexdigest(),

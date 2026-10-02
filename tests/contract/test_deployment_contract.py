@@ -91,6 +91,35 @@ def test_deployment_input_factory_preserves_resolved_options(repository_root: Pa
     assert value.cleanup_timeout_seconds == 300
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        CampaignOptions(),
+        CampaignOptions(labels={"scope": "smoke"}, cleanup_timeout_seconds=120),
+    ],
+)
+def test_deployment_input_factory_preserves_optional_campaign_options(
+    repository_root: Path, options: CampaignOptions
+) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml", repository_root)
+    observation = resolved.observations[0].model_copy(update={"options": options})
+    value = ProviderDeploymentInput.from_observation(
+        observation,
+        campaign_id="campaign",
+        run_id="campaign-aws",
+        bootstrap_template="cloud-init.yaml",
+        terraform_directory="terraform/aws",
+        child_result_path="results/raw/campaign-aws",
+        config_sha256=resolved.config_source.sha256,
+        implementation_git_commit=StringEvidence(value="b" * 40),
+        design_git_commit=StringEvidence(value="c" * 40),
+    )
+    assert value.campaign_options == options
+    assert value.provisioning_timeout_seconds == options.provisioning_timeout_seconds
+    assert value.readiness_timeout_seconds == options.readiness_timeout_seconds
+    assert value.cleanup_timeout_seconds == options.cleanup_timeout_seconds
+
+
 def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> None:
     observed = StructuredEvidence(value={"kind": "none"})
     connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh")

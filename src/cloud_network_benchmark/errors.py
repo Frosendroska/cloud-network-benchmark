@@ -31,8 +31,13 @@ class UsageError(BenchmarkError):
 
 
 class ValidationError(BenchmarkError):
-    def __init__(self, message: str, field: Optional[str] = None) -> None:
-        super().__init__(message, "validation_error", 3, field)
+    def __init__(
+        self,
+        message: str,
+        field: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message, "validation_error", 3, field, details or {})
 
 
 class CollisionError(BenchmarkError):

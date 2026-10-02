@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Any, Dict, Generic, Optional, Sequence, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -134,3 +134,9 @@ class LifecycleEvent(StrictModel):
         if self.state not in allowed[LifecycleDomain(self.state_domain)]:
             raise ValueError(f"state {self.state!r} is invalid for {self.state_domain} lifecycle events")
         return self
+
+
+def validate_event_chronology(events: Sequence[LifecycleEvent]) -> None:
+    for previous, current in zip(events, events[1:]):
+        if current.occurred_at < previous.occurred_at:
+            raise ValueError("lifecycle events must be chronological")

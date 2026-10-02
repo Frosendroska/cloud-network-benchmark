@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import pytest
+import yaml
+
 from cloud_network_benchmark.cli import main
 
 
@@ -38,6 +41,29 @@ def test_malformed_dry_run_has_stable_human_and_json_errors(repository_root: Pat
         assert main(["dry-run", "--config", str(path), "--format", "json"]) == 3
         payload = json.loads(capsys.readouterr().err)
         assert payload["error"]["error_code"] == "validation_error"
-        assert payload["error"]["field_path"] == "config"
+        assert payload["error"]["field_path"] == "config.experiment_id"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("command", ["validate", "resolve", "dry-run"])
+@pytest.mark.parametrize("output_format", ["human", "json"])
+def test_validation_errors_do_not_echo_rejected_secret_values(
+    repository_root: Path, capsys: object, command: str, output_format: str
+) -> None:
+    sentinel = "TOP-SECRET-SENTINEL-4319"
+    path = repository_root / "configs/tests/invalid-secret-temporary.yaml"
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data.update({"private_key": sentinel, "credential": sentinel, "environment": sentinel, "stdin": sentinel})
+    try:
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        assert main([command, "--config", str(path), "--format", output_format]) == 3
+        error = capsys.readouterr().err
+        assert sentinel not in error
+        assert "private_key" in error
+        if output_format == "json":
+            payload = json.loads(error)["error"]
+            assert payload["field_path"].startswith("config.")
+            assert payload["details"]["issues"]
     finally:
         path.unlink(missing_ok=True)

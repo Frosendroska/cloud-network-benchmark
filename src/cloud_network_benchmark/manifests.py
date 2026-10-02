@@ -22,6 +22,7 @@ from .contracts.common import (
     StringEvidence,
     StrictModel,
     StructuredEvidence,
+    validate_event_chronology,
 )
 from .errors import BenchmarkError, CollisionError, PersistenceError
 from .ids import Clock, TokenSource, candidate_campaign_id, candidate_run_id, random_token, utc_now
@@ -76,19 +77,19 @@ class StaticGitProvenance:
 
 
 class ManifestConfigProvenance(StrictModel):
-    source_path: str
-    sha256: str
-    byte_length: int
-    snapshot_path: Optional[str]
+    source_path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    byte_length: int = Field(gt=0)
+    snapshot_path: Optional[str] = Field(min_length=1)
     implementation_git_commit: StringEvidence
     design_git_commit: StringEvidence
 
 
 class ChildReference(StrictModel):
     provider: Provider
-    run_id: str
-    manifest_path: str
-    result_path: str
+    run_id: str = Field(min_length=1)
+    manifest_path: str = Field(min_length=1)
+    result_path: str = Field(min_length=1)
 
 
 class ChildRunManifest(StrictModel):
@@ -103,7 +104,7 @@ class ChildRunManifest(StrictModel):
     actual_started_at: Optional[datetime] = None
     actual_finished_at: Optional[datetime] = None
     config_provenance: ManifestConfigProvenance
-    resolved_observation: Dict[str, Any]
+    resolved_observation: ResolvedObservation
     execution_state: ExecutionState = ExecutionState.INITIALIZED
     cleanup_state: CleanupState = CleanupState.NOT_STARTED
     failure: Optional[FailureEvidence] = None
@@ -118,6 +119,28 @@ class ChildRunManifest(StrictModel):
 
     @model_validator(mode="after")
     def lifecycle_matches_current_state(self) -> "ChildRunManifest":
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not precede created_at")
+        validate_event_chronology(self.lifecycle_events)
+        if any(
+            event.occurred_at < self.created_at or event.occurred_at > self.updated_at
+            for event in self.lifecycle_events
+        ):
+            raise ValueError("lifecycle event time must be between created_at and updated_at")
+        if self.actual_started_at is not None and not (
+            self.created_at <= self.actual_started_at <= self.updated_at
+        ):
+            raise ValueError("actual_started_at must be between created_at and updated_at")
+        if self.actual_finished_at is not None and not (
+            self.created_at <= self.actual_finished_at <= self.updated_at
+        ):
+            raise ValueError("actual_finished_at must be between created_at and updated_at")
+        if (
+            self.actual_started_at is not None
+            and self.actual_finished_at is not None
+            and self.actual_finished_at < self.actual_started_at
+        ):
+            raise ValueError("actual_finished_at must not precede actual_started_at")
         execution_events = [event for event in self.lifecycle_events if event.state_domain == "execution"]
         cleanup_events = [event for event in self.lifecycle_events if event.state_domain == "cleanup"]
         if not execution_events or execution_events[-1].state != self.execution_state:
@@ -129,8 +152,28 @@ class ChildRunManifest(StrictModel):
             raise ValueError("non-initial cleanup state requires a cleanup lifecycle event")
         if self.execution_state == ExecutionState.FAILED.value and self.failure is None:
             raise ValueError("failed execution state requires failure evidence")
+        if self.execution_state not in {
+            ExecutionState.FAILED.value,
+            ExecutionState.INTERRUPTED.value,
+        } and self.failure is not None:
+            raise ValueError("failure evidence is only valid for failed or interrupted execution")
         if self.cleanup_state == CleanupState.FAILED.value and self.cleanup_failure is None:
             raise ValueError("failed cleanup state requires cleanup failure evidence")
+        if self.cleanup_state != CleanupState.FAILED.value and self.cleanup_failure is not None:
+            raise ValueError("cleanup failure evidence requires failed cleanup state")
+        for evidence in (self.failure, self.cleanup_failure):
+            if evidence is not None and not (self.created_at <= evidence.occurred_at <= self.updated_at):
+                raise ValueError("failure evidence time must be between created_at and updated_at")
+        observation = self.resolved_observation
+        if (
+            observation.experiment_id != self.experiment_id
+            or observation.provider != self.provider
+            or observation.scenario != self.scenario
+            or observation.scheduled_start != self.scheduled_start
+        ):
+            raise ValueError("resolved_observation identity must match the child manifest")
+        if self.run_id != candidate_run_id(self.campaign_id, Provider(self.provider)):
+            raise ValueError("run_id must match campaign_id and provider")
         return self
 
 
@@ -141,20 +184,39 @@ class CampaignManifest(StrictModel):
     experiment_id: str
     configuration_role: Literal["experiment", "test"]
     scheduled_start: datetime
-    selected_providers: List[Provider]
+    selected_providers: List[Provider] = Field(min_length=1, max_length=3)
     scenario: Scenario
     config_provenance: ManifestConfigProvenance
     tool_versions: StructuredEvidence
     aggregate_state: CampaignState = CampaignState.INITIALIZED
-    child_runs: List[ChildReference]
+    child_runs: List[ChildReference] = Field(max_length=3)
     created_at: datetime
     updated_at: datetime
     lifecycle_events: List[LifecycleEvent]
 
     @model_validator(mode="after")
     def lifecycle_matches_aggregate(self) -> "CampaignManifest":
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not precede created_at")
+        validate_event_chronology(self.lifecycle_events)
+        if any(
+            event.occurred_at < self.created_at or event.occurred_at > self.updated_at
+            for event in self.lifecycle_events
+        ):
+            raise ValueError("lifecycle event time must be between created_at and updated_at")
         if not self.lifecycle_events or self.lifecycle_events[-1].state != self.aggregate_state:
             raise ValueError("latest campaign lifecycle event must match aggregate_state")
+        if len(set(self.selected_providers)) != len(self.selected_providers):
+            raise ValueError("selected_providers must be unique")
+        child_providers = [reference.provider for reference in self.child_runs]
+        if len(set(child_providers)) != len(child_providers):
+            raise ValueError("child run providers must be unique")
+        selected = set(self.selected_providers)
+        for reference in self.child_runs:
+            if reference.provider not in selected:
+                raise ValueError("child run provider must be selected by the campaign")
+            if reference.run_id != candidate_run_id(self.campaign_id, Provider(reference.provider)):
+                raise ValueError("child run_id must match campaign_id and provider")
         return self
 
 
@@ -182,16 +244,22 @@ def _manifest_payload(model: StrictModel) -> Dict[str, Any]:
     return model.model_dump(mode="json")
 
 
+def _validated_copy(model: StrictModel, updates: Dict[str, Any]) -> Any:
+    candidate = model.model_copy(update=updates)
+    return type(model).model_validate(candidate.model_dump())
+
+
 def _failed_manifest(manifest: ChildRunManifest, now: datetime, message: str) -> ChildRunManifest:
     failure = FailureEvidence(category="initialization", message=message, occurred_at=now, details={"partial_initialization": True})
     event = LifecycleEvent(state_domain="execution", state=ExecutionState.FAILED.value, occurred_at=now, detail=message)
-    return manifest.model_copy(
-        update={
+    return _validated_copy(
+        manifest,
+        {
             "execution_state": ExecutionState.FAILED,
             "failure": failure,
             "updated_at": now,
             "lifecycle_events": [*manifest.lifecycle_events, event],
-        }
+        },
     )
 
 
@@ -205,27 +273,56 @@ def recompute_parent_manifest(
     detail: str,
     fault: FaultInjector = no_fault,
 ) -> CampaignManifest:
-    parent = CampaignManifest.model_validate_json(parent_manifest_path.read_text(encoding="utf-8"))
+    try:
+        parent = CampaignManifest.model_validate_json(parent_manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise PersistenceError("parent manifest is unavailable or invalid") from exc
+    if occurred_at < parent.updated_at:
+        raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
+    references = {Provider(reference.provider): reference for reference in parent.child_runs}
+    selected = {Provider(provider) for provider in parent.selected_providers}
+    if set(references) != selected:
+        raise PersistenceError("parent manifest does not reference every selected provider")
     children = []
-    for reference in parent.child_runs:
+    for provider in parent.selected_providers:
+        reference = references[Provider(provider)]
         child_path = parent_manifest_path.parent / f"{reference.run_id}.json"
         if not child_path.exists():
-            continue
-        child = ChildRunManifest.model_validate_json(child_path.read_text(encoding="utf-8"))
+            raise PersistenceError("referenced child manifest is missing", {"run_id": reference.run_id})
+        try:
+            child = ChildRunManifest.model_validate_json(child_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise PersistenceError(
+                "referenced child manifest is invalid",
+                {"run_id": reference.run_id},
+            ) from exc
+        if (
+            child.run_id != reference.run_id
+            or child.campaign_id != parent.campaign_id
+            or child.provider != reference.provider
+            or child.experiment_id != parent.experiment_id
+            or child.scenario != parent.scenario
+            or child.scheduled_start != parent.scheduled_start
+        ):
+            raise PersistenceError(
+                "referenced child manifest identity does not match its campaign",
+                {"run_id": reference.run_id},
+            )
         children.append((child.execution_state, child.cleanup_state))
-    aggregate = aggregate_campaign(children) if children else CampaignState.INITIALIZED
+    aggregate = aggregate_campaign(children)
     event = LifecycleEvent(
         state_domain="campaign",
         state=aggregate.value,
         occurred_at=occurred_at,
         detail=detail,
     )
-    updated = parent.model_copy(
-        update={
+    updated = _validated_copy(
+        parent,
+        {
             "aggregate_state": aggregate,
             "updated_at": occurred_at,
             "lifecycle_events": [*parent.lifecycle_events, event],
-        }
+        },
     )
     atomic_write_json(parent_manifest_path, _manifest_payload(updated), fault)
     return updated
@@ -243,6 +340,8 @@ def update_child_evidence(
     if vm_metadata is None and provider_metadata is None and tool_versions is None:
         raise ValueError("at least one evidence field must be supplied")
     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    if occurred_at < manifest.updated_at:
+        raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
     updates: Dict[str, Any] = {"updated_at": occurred_at}
     for name, value in (
         ("vm_metadata", vm_metadata),
@@ -251,7 +350,7 @@ def update_child_evidence(
     ):
         if value is not None:
             updates[name] = value
-    updated = manifest.model_copy(update=updates)
+    updated = _validated_copy(manifest, updates)
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     return updated
 
@@ -265,6 +364,8 @@ def update_child_execution(
     fault: FaultInjector = no_fault,
 ) -> ChildRunManifest:
     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    if occurred_at < manifest.updated_at:
+        raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
     target = ExecutionState(target)
     event = transition_execution(ExecutionState(manifest.execution_state), target, occurred_at, failure)
     updates: Dict[str, Any] = {
@@ -278,7 +379,7 @@ def update_child_execution(
         updates["actual_finished_at"] = occurred_at
     if failure is not None and manifest.failure is None:
         updates["failure"] = failure
-    updated = manifest.model_copy(update=updates)
+    updated = _validated_copy(manifest, updates)
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
@@ -295,6 +396,8 @@ def update_child_cleanup(
     fault: FaultInjector = no_fault,
 ) -> ChildRunManifest:
     manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    if occurred_at < manifest.updated_at:
+        raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
     target = CleanupState(target)
     if target == CleanupState.FAILED and cleanup_failure is None:
         raise ValueError("failed cleanup requires cleanup failure evidence")
@@ -306,7 +409,7 @@ def update_child_cleanup(
     }
     if cleanup_failure is not None:
         updates["cleanup_failure"] = cleanup_failure
-    updated = manifest.model_copy(update=updates)
+    updated = _validated_copy(manifest, updates)
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
@@ -413,11 +516,12 @@ def initialize_campaign(
             assigned.append((provider, manifest))
             current_parent = CampaignManifest.model_validate_json(paths.campaign_manifest.read_text(encoding="utf-8"))
             assigned_providers = {item[0] for item in assigned}
-            linked_parent = current_parent.model_copy(
-                update={
+            linked_parent = _validated_copy(
+                current_parent,
+                {
                     "child_runs": [reference for reference in children if Provider(reference.provider) in assigned_providers],
                     "updated_at": now,
-                }
+                },
             )
             fault(f"before_parent_child_link_update:{provider.value}")
             atomic_write_json(paths.campaign_manifest, _manifest_payload(linked_parent), fault)
@@ -477,8 +581,9 @@ def initialize_campaign(
                     occurred_at=recovery_time,
                     detail=f"partial initialization failed: {exc}",
                 )
-                failed_parent = parent.model_copy(
-                    update={
+                failed_parent = _validated_copy(
+                    parent,
+                    {
                         "aggregate_state": CampaignState.FAILED,
                         "child_runs": [
                             reference for reference in children
@@ -486,7 +591,7 @@ def initialize_campaign(
                         ],
                         "updated_at": recovery_time,
                         "lifecycle_events": [*parent.lifecycle_events, parent_event],
-                    }
+                    },
                 )
                 fault("before_parent_recovery_update")
                 atomic_write_json(paths.campaign_manifest, _manifest_payload(failed_parent), fault)

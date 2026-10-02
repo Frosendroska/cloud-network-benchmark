@@ -1,7 +1,9 @@
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, FormatChecker
 
 from cloud_network_benchmark.errors import CollisionError, PersistenceError
 from cloud_network_benchmark.contracts import FailureEvidence
@@ -81,6 +83,10 @@ def test_failure_injection_preserves_every_assigned_manifest(repository_root: Pa
     parent_paths = [path for path in manifest_paths if path not in child_manifests]
     assert len(parent_paths) == 1
     parent = json.loads(parent_paths[0].read_text())
+    parent_schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/campaign-manifest.schema.json").read_text()
+    )
+    Draft202012Validator(parent_schema, format_checker=FormatChecker()).validate(parent)
     assert parent["aggregate_state"] == "failed"
     assert {item["run_id"] for item in parent["child_runs"]} == {
         json.loads(path.read_text())["run_id"] for path in child_manifests
@@ -165,3 +171,69 @@ def test_recovery_fallback_preserves_valid_failed_manifest(repository_root: Path
     child_path = next((root / "manifests").glob("*-aws.json"))
     assert json.loads(child_path.read_text())["execution_state"] == "failed"
     assert caught.value.details["recovery_failures"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "wrong_parent"])
+def test_parent_aggregation_fails_closed_on_invalid_child_evidence(
+    repository_root: Path,
+    tmp_path: Path,
+    frozen_clock: object,
+    deterministic_token: object,
+    fake_git_commits: dict[str, str],
+    damage: str,
+) -> None:
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+
+    result = initialize(repository_root, tmp_path / damage, frozen_clock, deterministic_token, fake_git_commits)
+    child_path = Path(result.children[0].manifest_path)
+    if damage == "missing":
+        child_path.unlink()
+    elif damage == "corrupt":
+        child_path.write_text("{not-json", encoding="utf-8")
+    else:
+        child = json.loads(child_path.read_text())
+        child["campaign_id"] = "different-campaign"
+        child_path.write_text(json.dumps(child), encoding="utf-8")
+    with pytest.raises(PersistenceError):
+        recompute_parent_manifest(Path(result.parent_manifest_path), frozen_clock(), "test invalid child")
+
+
+def test_parent_succeeds_only_after_every_selected_child_succeeds_and_cleans_up(
+    repository_root: Path,
+    tmp_path: Path,
+    frozen_clock: object,
+    deterministic_token: object,
+    fake_git_commits: dict[str, str],
+) -> None:
+    result = initialize(repository_root, tmp_path / "complete", frozen_clock, deterministic_token, fake_git_commits)
+    now = frozen_clock()
+    for child in result.children:
+        path = Path(child.manifest_path)
+        for state in ("provision_ready", "running", "collecting", "validating", "succeeded"):
+            update_child_execution(path, state, now)
+        update_child_cleanup(path, "attempted", now)
+        update_child_cleanup(path, "succeeded", now)
+    parent = json.loads(Path(result.parent_manifest_path).read_text())
+    assert parent["aggregate_state"] == "succeeded"
+
+
+def test_manifest_update_apis_reject_backward_occurrence_times(
+    repository_root: Path,
+    tmp_path: Path,
+    frozen_clock: object,
+    deterministic_token: object,
+    fake_git_commits: dict[str, str],
+) -> None:
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+
+    result = initialize(repository_root, tmp_path / "chronology", frozen_clock, deterministic_token, fake_git_commits)
+    child_path = Path(result.children[0].manifest_path)
+    past = frozen_clock() - timedelta(seconds=1)
+    with pytest.raises(ValueError, match="earlier"):
+        update_child_execution(child_path, "provision_ready", past)
+    with pytest.raises(ValueError, match="earlier"):
+        update_child_evidence(child_path, past, vm_metadata=StructuredEvidence(unavailable_reason="still unavailable"))
+    with pytest.raises(ValueError, match="earlier"):
+        update_child_cleanup(child_path, "attempted", past)
+    with pytest.raises(ValueError, match="earlier"):
+        recompute_parent_manifest(Path(result.parent_manifest_path), past, "backward")
