@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from ipaddress import IPv4Address
 from pathlib import Path
+import re
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import Field, model_validator
@@ -87,11 +89,18 @@ def _connection_from_deployment(deployment: ProviderDeploymentOutput | Connectio
 
 
 def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], timeout: float, action_type: str = "ssh") -> CommandRequest:
-    return CommandRequest(action_id=action_id, action_type=action_type, argv=["ssh", "-p", str(connection.port), connection.host, *argv], cwd=".", environment_classification="contains_secret_references", timeout_seconds=timeout)
+    command = ["ssh", "-p", str(connection.port)]
+    if connection.host_key_reference:
+        command.extend(["-o", f"UserKnownHostsFile={connection.host_key_reference}"])
+    command.extend([f"{connection.user}@{connection.host}", *argv])
+    return CommandRequest(action_id=action_id, action_type=action_type, argv=command, cwd=".", environment_classification="contains_secret_references", timeout_seconds=timeout)
 
 
 def _failure(stage: str, vm: RemoteConnectionData, category: str, result: CommandResult, message: str) -> AccessFailureEvidence:
-    return AccessFailureEvidence(stage=stage, vm_id=vm.host, role=vm.role, category=category, message=message, action_id=result.action_id, occurred_at=result.finished_at, details={"outcome": result.outcome, "exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr})
+    def redact(value: str) -> str:
+        value = re.sub(r"-----BEGIN .*?-----.*?-----END .*?-----", "[REDACTED_KEY]", value, flags=re.DOTALL)
+        return re.sub(r"(?i)(password|token|secret|private[_ -]?key)\s*[=:]\s*\S+", r"\1=[REDACTED]", value)
+    return AccessFailureEvidence(stage=stage, vm_id=vm.host, role=vm.role, category=category, message=message, action_id=result.action_id, occurred_at=result.finished_at, details={"outcome": result.outcome, "exit_code": result.exit_code, "stdout": redact(result.stdout), "stderr": redact(result.stderr)})
 
 
 def validate_connection(value: ConnectionOutput) -> ConnectionOutput:

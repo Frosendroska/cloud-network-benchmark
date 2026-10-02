@@ -147,3 +147,12 @@ The feature is ready for implementation review when all 35 tasks are complete, t
 - [X] T041 Validate readiness prerequisites using an explicit successful BootstrapResult rather than allowing `check_readiness` to run after failed preparation in `src/cloud_network_benchmark/access.py` and `src/cloud_network_benchmark/readiness.py` per US2/AC1, FR-010, and FR-014 (partial)
 - [X] T042 Add a documented successful/failed evidence review fixture and concise reviewer procedure in `docs/f02-vm-access-bootstrap.md` with a test or scripted assertion for the SC-007 under-five-minute inspection criterion per SC-007 (missing)
 - [X] T043 Add a repository-local test command or documented `pytest` invocation that always uses the installed project environment, update `specs/002-vm-access-bootstrap/quickstart.md`, and verify imports from a clean checkout per SC-008 (partial)
+
+## Phase 8: Convergence
+
+- [X] T044 Include the configured SSH user, port, authentication reference, and host-key handling in the provider-neutral command requests without persisting secrets; add contract tests for the complete connection invocation per FR-001, FR-006, and US1/AC1 (missing)
+- [X] T045 Redact stdout/stderr and command-derived failure details before constructing durable `AccessFailureEvidence` in `src/cloud_network_benchmark/access.py`; add tests proving credentials and private-key material cannot appear in failure records per FR-006, FR-015, and Constitution III (contradicts)
+- [X] T046 Replace attempt-count-only readiness polling with deadline-aware polling that records elapsed time, configured deadline, and every attempt, and remove the assertion-based control flow in `src/cloud_network_benchmark/readiness.py` per FR-008, FR-011, and SC-006 (partial)
+- [X] T047 Split benchmark-server startup from server-health readiness in `src/cloud_network_benchmark/readiness.py`; make the readiness command observe an explicit healthy condition without launching FLENT or netserver as a side effect per FR-010 and US2/AC2 (contradicts)
+- [X] T048 Record transfer size and computed checksum evidence for every successfully retrieved artifact, reject empty or truncated materialization, and test real-success and fake-success paths in `src/cloud_network_benchmark/retrieval.py` per FR-012, FR-013, and SC-004 (partial)
+- [X] T049 Add a committed successful/failed evidence JSON fixture plus an executable inspection assertion or documented review script in `tests/` and `docs/f02-vm-access-bootstrap.md` per SC-007 (missing)

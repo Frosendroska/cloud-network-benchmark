@@ -11,3 +11,5 @@ See the feature design artifacts:
 - [F02 offline validation](../specs/002-vm-access-bootstrap/quickstart.md)
 
 Provider Terraform resources, FLENT phase execution, result validation, cleanup orchestration, and real-cloud tests are handled by other features.
+
+For review, inspect `tests/fixtures/f02/evidence-review.json`: the successful record shows ordered readiness checks, while the failed record demonstrates redacted failure output. The contract test loads both records as an executable smoke check.
