@@ -1,13 +1,22 @@
 import json
 from pathlib import Path
 
+import pytest
+import yaml
+
 from cloud_network_benchmark.cli import main
 
 
 def test_validate_and_resolve_without_side_effects(repository_root: Path, tmp_path: Path, capsys: object) -> None:
     before = set((repository_root / "results").rglob("*"))
     assert main(["validate", "--config", "configs/experiments/exp-001-multi-provider.yaml", "--format", "json"]) == 0
-    assert json.loads(capsys.readouterr().out)["valid"] is True
+    validation = json.loads(capsys.readouterr().out)
+    assert validation["valid"] is True
+    assert validation["configuration_role"] == "experiment"
+    assert validation["scenario"] == "same_zone"
+    assert validation["scheduled_start"]
+    assert len(validation["source_sha256"]) == 64
+    assert validation["child_count"] == 3
     assert main(["resolve", "--config", "configs/tests/exp-900-single-provider.yaml", "--format", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["configuration_role"] == "test"
     assert set((repository_root / "results").rglob("*")) == before
@@ -19,5 +28,42 @@ def test_invalid_config_returns_three(repository_root: Path, tmp_path: Path, cap
         path.write_text("schema_version: 1\n", encoding="utf-8")
         assert main(["validate", "--config", str(path), "--format", "json"]) == 3
         assert "validation_error" in capsys.readouterr().err
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_malformed_dry_run_has_stable_human_and_json_errors(repository_root: Path, capsys: object) -> None:
+    path = repository_root / "configs/tests/invalid-temporary.yaml"
+    try:
+        path.write_bytes((repository_root / "tests/fixtures/configs/invalid/malformed-id.yaml").read_bytes())
+        assert main(["dry-run", "--config", str(path), "--format", "human"]) == 3
+        assert "Error [validation_error]" in capsys.readouterr().err
+        assert main(["dry-run", "--config", str(path), "--format", "json"]) == 3
+        payload = json.loads(capsys.readouterr().err)
+        assert payload["error"]["error_code"] == "validation_error"
+        assert payload["error"]["field_path"] == "config.experiment_id"
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("command", ["validate", "resolve", "dry-run"])
+@pytest.mark.parametrize("output_format", ["human", "json"])
+def test_validation_errors_do_not_echo_rejected_secret_values(
+    repository_root: Path, capsys: object, command: str, output_format: str
+) -> None:
+    sentinel = "TOP-SECRET-SENTINEL-4319"
+    path = repository_root / "configs/tests/invalid-secret-temporary.yaml"
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data.update({"private_key": sentinel, "credential": sentinel, "environment": sentinel, "stdin": sentinel})
+    try:
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        assert main([command, "--config", str(path), "--format", output_format]) == 3
+        error = capsys.readouterr().err
+        assert sentinel not in error
+        assert "private_key" in error
+        if output_format == "json":
+            payload = json.loads(error)["error"]
+            assert payload["field_path"].startswith("config.")
+            assert payload["details"]["issues"]
     finally:
         path.unlink(missing_ok=True)

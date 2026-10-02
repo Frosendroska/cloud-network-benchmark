@@ -67,6 +67,30 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "scenario": {
+            "enum": ["same_zone", "cross_zone", "placement_optimization"]
+          }
+        },
+        "required": ["scenario"]
+      },
+      "then": {
+        "properties": {
+          "benchmark": {
+            "properties": {
+              "multi_flow": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "provider": {
       "enum": ["aws", "azure", "gcp"]
@@ -91,7 +115,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "test_name": { "type": "string", "minLength": 1 },
+        "test_name": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "duration_seconds": { "type": "integer", "minimum": 1 },
         "timeout_seconds": { "type": "integer", "minimum": 1 },
         "parameters": {
@@ -106,16 +130,17 @@
       "allOf": [
         { "$ref": "#/$defs/phase" },
         {
-          "type": "object",
-          "properties": {
-            "parameters": {
-              "type": "object",
-              "required": ["upload_streams"],
-              "properties": {
-                "upload_streams": { "type": "integer", "minimum": 1 }
-              },
-              "additionalProperties": {
-                "type": ["string", "number", "integer", "boolean"]
+          "if": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "parameters": {
+                "required": ["upload_streams"],
+                "properties": {
+                  "upload_streams": { "type": "integer", "minimum": 1 }
+                }
               }
             }
           }
@@ -145,8 +170,8 @@
       "additionalProperties": false,
       "required": ["vm_a", "vm_b"],
       "properties": {
-        "vm_a": { "type": "string", "minLength": 1 },
-        "vm_b": { "type": "string", "minLength": 1 }
+        "vm_a": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "vm_b": { "type": "string", "minLength": 1, "pattern": "\\S" }
       }
     },
     "zones": {
@@ -154,8 +179,8 @@
       "additionalProperties": false,
       "required": ["vm_a", "vm_b"],
       "properties": {
-        "vm_a": { "type": "string", "minLength": 1 },
-        "vm_b": { "type": "string", "minLength": 1 }
+        "vm_a": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "vm_b": { "type": "string", "minLength": 1, "pattern": "\\S" }
       }
     },
     "aws_provider_options": {
@@ -190,10 +215,10 @@
       "properties": {
         "regions": { "$ref": "#/$defs/regions" },
         "zones": { "$ref": "#/$defs/zones" },
-        "vm_shape": { "type": "string", "minLength": 1 },
-        "image": { "type": "string", "minLength": 1 },
-        "connection_user": { "type": "string", "minLength": 1 },
-        "documented_network_limit": { "type": ["string", "null"] },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "documented_network_limit": { "type": ["string", "null"], "pattern": "\\S" },
         "provider_options": { "type": "object" }
       }
     },
@@ -215,9 +240,9 @@
         "provider": { "const": "aws" },
         "regions": { "$ref": "#/$defs/regions" },
         "zones": { "$ref": "#/$defs/zones" },
-        "vm_shape": { "type": "string", "minLength": 1 },
-        "image": { "type": "string", "minLength": 1 },
-        "connection_user": { "type": "string", "minLength": 1 },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "documented_network_limit": { "type": ["string", "null"] },
         "placement": {
           "type": "object",
@@ -225,7 +250,7 @@
           "required": ["kind", "name"],
           "properties": {
             "kind": { "enum": ["none", "cluster_placement_group"] },
-            "name": { "type": ["string", "null"] }
+            "name": { "type": ["string", "null"], "pattern": "\\S" }
           }
         },
         "provider_options": { "$ref": "#/$defs/aws_provider_options" }
@@ -249,9 +274,9 @@
         "provider": { "const": "azure" },
         "regions": { "$ref": "#/$defs/regions" },
         "zones": { "$ref": "#/$defs/zones" },
-        "vm_shape": { "type": "string", "minLength": 1 },
-        "image": { "type": "string", "minLength": 1 },
-        "connection_user": { "type": "string", "minLength": 1 },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "documented_network_limit": { "type": ["string", "null"] },
         "placement": {
           "type": "object",
@@ -259,7 +284,7 @@
           "required": ["kind", "name"],
           "properties": {
             "kind": { "enum": ["none", "proximity_placement_group"] },
-            "name": { "type": ["string", "null"] }
+            "name": { "type": ["string", "null"], "pattern": "\\S" }
           }
         },
         "provider_options": { "$ref": "#/$defs/azure_provider_options" }
@@ -283,9 +308,9 @@
         "provider": { "const": "gcp" },
         "regions": { "$ref": "#/$defs/regions" },
         "zones": { "$ref": "#/$defs/zones" },
-        "vm_shape": { "type": "string", "minLength": 1 },
-        "image": { "type": "string", "minLength": 1 },
-        "connection_user": { "type": "string", "minLength": 1 },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "documented_network_limit": { "type": ["string", "null"] },
         "placement": {
           "type": "object",
@@ -293,7 +318,7 @@
           "required": ["kind", "name"],
           "properties": {
             "kind": { "enum": ["none", "compact_placement_policy"] },
-            "name": { "type": ["string", "null"] }
+            "name": { "type": ["string", "null"], "pattern": "\\S" }
           }
         },
         "provider_options": { "$ref": "#/$defs/gcp_provider_options" }
