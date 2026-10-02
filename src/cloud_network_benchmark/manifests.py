@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 
 from pydantic import Field, model_validator
@@ -54,12 +55,39 @@ class RepositoryGitProvenance:
             head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
             if head.startswith("ref: "):
                 ref = head[5:]
-                ref_path = git_dir / ref
-                if ref_path.exists():
-                    head = ref_path.read_text(encoding="utf-8").strip()
+                git_dirs = [git_dir]
+                common_dir_file = git_dir / "commondir"
+                if common_dir_file.is_file():
+                    common_dir = Path(common_dir_file.read_text(encoding="utf-8").strip())
+                    if not common_dir.is_absolute():
+                        common_dir = git_dir / common_dir
+                    resolved_common_dir = common_dir.resolve()
+                    if resolved_common_dir != git_dir:
+                        git_dirs.append(resolved_common_dir)
+
+                for refs_dir in git_dirs:
+                    ref_path = refs_dir / ref
+                    if ref_path.is_file():
+                        head = ref_path.read_text(encoding="utf-8").strip()
+                        break
                 else:
-                    packed = (git_dir / "packed-refs").read_text(encoding="utf-8")
-                    head = next(line.split()[0] for line in packed.splitlines() if line.endswith(f" {ref}"))
+                    for refs_dir in git_dirs:
+                        packed_refs = refs_dir / "packed-refs"
+                        if not packed_refs.is_file():
+                            continue
+                        matching_ref = next(
+                            (
+                                line.split()[0]
+                                for line in packed_refs.read_text(encoding="utf-8").splitlines()
+                                if line and not line.startswith(("#", "^")) and line.split()[-1] == ref
+                            ),
+                            None,
+                        )
+                        if matching_ref is not None:
+                            head = matching_ref
+                            break
+                    else:
+                        raise ValueError(f"Git ref not found: {ref}")
             if not head:
                 raise ValueError("empty Git HEAD")
             return StringEvidence(value=head)
@@ -87,17 +115,31 @@ class ManifestConfigProvenance(StrictModel):
 
 class ChildReference(StrictModel):
     provider: Provider
-    run_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1, pattern=r"^\S+$")
     manifest_path: str = Field(min_length=1)
     result_path: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def normalized_paths(self) -> "ChildReference":
+        for name, value in (("manifest_path", self.manifest_path), ("result_path", self.result_path)):
+            if "\\" in value:
+                raise ValueError(f"{name} must use POSIX separators")
+            parsed = PurePosixPath(value)
+            if parsed.as_posix() != value or any(part in {".", ".."} for part in parsed.parts):
+                raise ValueError(f"{name} must be normalized and must not traverse directories")
+        if PurePosixPath(self.manifest_path).name != f"{self.run_id}.json":
+            raise ValueError("manifest_path must identify the referenced run_id")
+        if PurePosixPath(self.result_path).name.rstrip("/") != self.run_id:
+            raise ValueError("result_path must identify the referenced run_id")
+        return self
 
 
 class ChildRunManifest(StrictModel):
     manifest_type: Literal["child_run"] = "child_run"
     schema_version: Literal[1] = 1
-    run_id: str
-    campaign_id: str
-    experiment_id: str
+    run_id: str = Field(min_length=1, pattern=r"^\S+$")
+    campaign_id: str = Field(min_length=1, pattern=r"^\S+$")
+    experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     provider: Provider
     scenario: Scenario
     scheduled_start: datetime
@@ -119,6 +161,10 @@ class ChildRunManifest(StrictModel):
 
     @model_validator(mode="after")
     def lifecycle_matches_current_state(self) -> "ChildRunManifest":
+        timestamps = [self.scheduled_start, self.created_at, self.updated_at]
+        timestamps.extend(value for value in (self.actual_started_at, self.actual_finished_at) if value is not None)
+        if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
+            raise ValueError("manifest timestamps must include a timezone")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
         validate_event_chronology(self.lifecycle_events)
@@ -180,8 +226,8 @@ class ChildRunManifest(StrictModel):
 class CampaignManifest(StrictModel):
     manifest_type: Literal["campaign"] = "campaign"
     schema_version: Literal[1] = 1
-    campaign_id: str
-    experiment_id: str
+    campaign_id: str = Field(min_length=1, pattern=r"^\S+$")
+    experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     configuration_role: Literal["experiment", "test"]
     scheduled_start: datetime
     selected_providers: List[Provider] = Field(min_length=1, max_length=3)
@@ -196,6 +242,9 @@ class CampaignManifest(StrictModel):
 
     @model_validator(mode="after")
     def lifecycle_matches_aggregate(self) -> "CampaignManifest":
+        timestamps = [self.scheduled_start, self.created_at, self.updated_at]
+        if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
+            raise ValueError("manifest timestamps must include a timezone")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
         validate_event_chronology(self.lifecycle_events)
@@ -217,6 +266,12 @@ class CampaignManifest(StrictModel):
                 raise ValueError("child run provider must be selected by the campaign")
             if reference.run_id != candidate_run_id(self.campaign_id, Provider(reference.provider)):
                 raise ValueError("child run_id must match campaign_id and provider")
+        if len({item.manifest_path for item in self.child_runs}) != len(self.child_runs):
+            raise ValueError("child manifest paths must be unique")
+        if len({item.result_path for item in self.child_runs}) != len(self.child_runs):
+            raise ValueError("child result paths must be unique")
+        if self.aggregate_state == CampaignState.SUCCEEDED.value and set(child_providers) != selected:
+            raise ValueError("succeeded campaign must reference every selected provider exactly once")
         return self
 
 
@@ -231,6 +286,30 @@ class InitializationRecovery(StrictModel):
     parent_manifest_path: Optional[str]
     preserved_child_manifest_paths: List[str]
     recovery_failures: List[str]
+
+
+def thesis_repository_root(repository_root: Path) -> Path:
+    configured = os.environ.get("THESIS_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    git_marker = repository_root / ".git"
+    if git_marker.is_file():
+        pointer = git_marker.read_text(encoding="utf-8").strip()
+        if pointer.startswith("gitdir:"):
+            git_dir = Path(pointer.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = repository_root / git_dir
+            git_dir = git_dir.resolve()
+            common_dir_file = git_dir / "commondir"
+            if common_dir_file.is_file():
+                common_dir = Path(common_dir_file.read_text(encoding="utf-8").strip())
+                if not common_dir.is_absolute():
+                    common_dir = git_dir / common_dir
+                main_git_dir = common_dir.resolve()
+                return main_git_dir.parent.parent / "Thesis"
+
+    return repository_root.parent / "Thesis"
 
 
 def _relative(path: Path, repository_root: Path) -> str:
@@ -267,6 +346,20 @@ def _parent_manifest_path(child_manifest_path: Path, campaign_id: str) -> Path:
     return child_manifest_path.parent / f"{campaign_id}.json"
 
 
+def _resolve_reference_path(parent_manifest_path: Path, reference_path: str) -> Path:
+    path = Path(reference_path)
+    if path.is_absolute():
+        return path
+    if path.parts[:2] != ("results", "manifests"):
+        raise PersistenceError("child manifest reference must be absolute or rooted at results/manifests")
+    results_root = parent_manifest_path.parent.parent
+    if results_root.name == "results":
+        repository_root = results_root.parent
+    else:
+        repository_root = results_root
+    return repository_root.joinpath(*path.parts)
+
+
 def recompute_parent_manifest(
     parent_manifest_path: Path,
     occurred_at: datetime,
@@ -286,7 +379,9 @@ def recompute_parent_manifest(
     children = []
     for provider in parent.selected_providers:
         reference = references[Provider(provider)]
-        child_path = parent_manifest_path.parent / f"{reference.run_id}.json"
+        child_path = _resolve_reference_path(parent_manifest_path, reference.manifest_path)
+        if child_path.name != f"{reference.run_id}.json":
+            raise PersistenceError("referenced child manifest path does not match run_id")
         if not child_path.exists():
             raise PersistenceError("referenced child manifest is missing", {"run_id": reference.run_id})
         try:
@@ -308,6 +403,14 @@ def recompute_parent_manifest(
                 "referenced child manifest identity does not match its campaign",
                 {"run_id": reference.run_id},
             )
+        expected_result_path = child_path.parent.parent / "raw" / reference.run_id
+        stored_result_path = Path(reference.result_path)
+        if stored_result_path.is_absolute():
+            matches_result = stored_result_path == expected_result_path
+        else:
+            matches_result = stored_result_path == Path("results/raw") / reference.run_id
+        if not matches_result:
+            raise PersistenceError("referenced child result path does not match its run_id", {"run_id": reference.run_id})
         children.append((child.execution_state, child.cleanup_state))
     aggregate = aggregate_campaign(children)
     event = LifecycleEvent(
@@ -434,7 +537,7 @@ def initialize_campaign(
     paths = allocate_paths(results_root, campaign_id, run_ids)
     preflight(paths)
     implementation = (implementation_git or RepositoryGitProvenance()).commit(repository_root)
-    design_root = repository_root.parent / "Thesis"
+    design_root = thesis_repository_root(repository_root)
     design = (design_git or RepositoryGitProvenance()).commit(design_root)
     unavailable = StructuredEvidence(unavailable_reason="not observed during F01 initialization")
     tool_versions = StructuredEvidence(value={"cloud_network_benchmark": "0.1.0", "python": platform.python_version()})

@@ -1,3 +1,5 @@
+import pytest
+
 from cloud_network_benchmark.contracts import (
     ARTIFACTS,
     ArtifactExpectation,
@@ -10,6 +12,7 @@ from cloud_network_benchmark.contracts import (
     Provider,
     Scenario,
     VmRole,
+    ArtifactLayout,
 )
 
 
@@ -36,3 +39,8 @@ def test_canonical_artifact_paths() -> None:
     assert ARTIFACTS.idle_flent == "flent/idle.flent.gz"
     assert ARTIFACTS.vm_a_metadata == "metadata/vm_a.json"
     assert ARTIFACTS.validation_summary == "validation/summary.txt"
+
+
+def test_artifact_paths_cannot_be_overridden() -> None:
+    with pytest.raises(ValueError):
+        ArtifactLayout(config_snapshot="../../outside")

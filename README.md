@@ -62,7 +62,7 @@ Do not copy thesis documents, analysis, canonical figures, or project trackers i
 
 Primary executable experiment campaigns belong in `configs/experiments/`. Reduced-cost executable smoke-test campaigns belong in `configs/tests/`. Both use the same schema, explicitly select one or more providers, and map their stable `experiment_id` to the Thesis design in `configs/README.md`.
 
-The committed primary matrix contains one three-provider campaign for each approved scenario: same-zone, cross-zone, provider-specific placement optimization, and inter-region. The smoke matrix contains separate reduced AWS, Azure, and GCP provisioning campaigns plus one short, reduced three-provider campaign.
+The committed primary matrix contains one three-provider campaign for each design-listed scenario: same-zone, cross-zone, provider-specific placement optimization, and inter-region. These configurations and their parameters remain provisional pending review. The smoke matrix contains separate reduced AWS, Azure, and GCP provisioning campaigns plus one short, reduced three-provider campaign.
 
 Each config should include at least:
 

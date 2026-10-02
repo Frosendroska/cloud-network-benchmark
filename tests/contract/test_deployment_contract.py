@@ -29,7 +29,7 @@ def vm(role: str, function: str) -> VmIntent:
 def test_provider_deployment_input_keeps_provider_semantics() -> None:
     value = ProviderDeploymentInput(
         campaign_id="campaign", run_id="campaign-aws", experiment_id="EXP-001", provider="aws", scenario="same_zone",
-        scheduled_start=NOW, vm_a=vm("vm_a", "client"), vm_b=vm("vm_b", "server"),
+        scheduled_start=NOW, vm_a=vm("vm_a", "client_traffic_generator"), vm_b=vm("vm_b", "server_receiver"),
         placement=Placement(kind="none", name=None), bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
         provider_options={"instance_market_type": "spot"},
         campaign_options=CampaignOptions(labels={"purpose": "test"}, provisioning_timeout_seconds=60, readiness_timeout_seconds=45, cleanup_timeout_seconds=60),
@@ -118,6 +118,59 @@ def test_deployment_input_factory_preserves_optional_campaign_options(
     assert value.provisioning_timeout_seconds == options.provisioning_timeout_seconds
     assert value.readiness_timeout_seconds == options.readiness_timeout_seconds
     assert value.cleanup_timeout_seconds == options.cleanup_timeout_seconds
+
+
+@pytest.mark.parametrize("field", ["region", "zone", "vm_shape", "image", "connection_user"])
+def test_deployment_input_rejects_empty_vm_intent_fields(repository_root: Path, field: str) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml", repository_root)
+    value = ProviderDeploymentInput.from_observation(
+        resolved.observations[0], campaign_id="campaign", run_id="campaign-aws",
+        bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
+        child_result_path="results/raw/campaign-aws", config_sha256=resolved.config_source.sha256,
+        implementation_git_commit=StringEvidence(value="b" * 40),
+        design_git_commit=StringEvidence(value="c" * 40),
+    ).model_dump(mode="python")
+    value["vm_a"][field] = ""
+    value["vm_b"][field] = ""
+    with pytest.raises(ValueError):
+        ProviderDeploymentInput.model_validate(value)
+
+
+def test_direct_deployment_input_rejects_mismatched_identity_and_provider_values(repository_root: Path) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml", repository_root)
+    valid = ProviderDeploymentInput.from_observation(
+        resolved.observations[0], campaign_id="campaign", run_id="campaign-aws",
+        bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
+        child_result_path="results/raw/campaign-aws", config_sha256=resolved.config_source.sha256,
+        implementation_git_commit=StringEvidence(value="b" * 40),
+        design_git_commit=StringEvidence(value="c" * 40),
+    ).model_dump(mode="json")
+    for field, value in (
+        ("run_id", "other-azure"),
+        ("experiment_id", "bad"),
+        ("config_sha256", "not-a-hash"),
+        ("provider_options", {"instance_market_type": "invalid"}),
+        ("placement", {"kind": "proximity_placement_group", "name": "group"}),
+    ):
+        candidate = dict(valid)
+        candidate[field] = value
+        with pytest.raises(ValueError):
+            ProviderDeploymentInput.model_validate(candidate)
+
+
+def test_deployment_output_links_connection_roles_and_canonical_path() -> None:
+    observed = StructuredEvidence(value={"kind": "none"})
+    connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh")
+    connection_b = RemoteConnectionData(role="vm_b", host="10.0.0.5", user="ubuntu", authentication_reference="runtime:ssh")
+    vm_a = ProviderVmOutput(role="vm_a", resource_id="i-a", private_ipv4="10.0.0.4", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_a, unavailable=None)
+    vm_b = ProviderVmOutput(role="vm_b", resource_id="i-b", private_ipv4="10.0.0.5", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_b, unavailable=None)
+    base = dict(run_id="campaign-aws", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW, finished_at=NOW, vm_a=vm_a, vm_b=vm_b, provider_metadata=observed, documented_network_limit=observed)
+    with pytest.raises(ValueError, match="connection role"):
+        ProviderDeploymentOutput(**{**base, "vm_a": vm_a.model_copy(update={"connection": connection_b})})
+    with pytest.raises(ValueError, match="output_artifact_path"):
+        ProviderDeploymentOutput(**base, output_artifact_path="other.json")
+    with pytest.raises(ValueError):
+        ProviderDeploymentOutput(**{**base, "apply_action_id": ""})
 
 
 def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> None:

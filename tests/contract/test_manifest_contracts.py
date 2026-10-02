@@ -165,6 +165,7 @@ def test_runtime_and_schema_reject_inconsistent_failure_fields(
 
 def test_campaign_manifest_rejects_duplicate_or_unlinked_children(repository_root: Path) -> None:
     fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    fixture["selected_providers"] = ["aws", "azure"]
     duplicate = deepcopy(fixture)
     duplicate["selected_providers"] = ["aws", "aws"]
     with pytest.raises(ValueError):
@@ -173,6 +174,167 @@ def test_campaign_manifest_rejects_duplicate_or_unlinked_children(repository_roo
     unlinked["child_runs"][0]["provider"] = "gcp"
     with pytest.raises(ValueError):
         CampaignManifest.model_validate(unlinked)
+
+
+@pytest.mark.parametrize("child_mode", ["empty", "subset", "duplicate", "tampered"])
+def test_succeeded_campaign_requires_complete_matching_child_references(
+    repository_root: Path, child_mode: str
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    fixture["selected_providers"] = ["aws", "azure"]
+    fixture["aggregate_state"] = "succeeded"
+    fixture["lifecycle_events"] = [
+        {"state_domain": "campaign", "state": "succeeded", "occurred_at": fixture["created_at"], "detail": None}
+    ]
+    if child_mode == "empty":
+        fixture["child_runs"] = []
+    elif child_mode == "subset":
+        fixture["child_runs"] = fixture["child_runs"][:1]
+    elif child_mode == "duplicate":
+        fixture["child_runs"].append(deepcopy(fixture["child_runs"][0]))
+    else:
+        fixture["child_runs"][0]["provider"] = "azure"
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/campaign-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("experiment_id", "bad"),
+        ("scheduled_start", "2026-09-27T12:00:00"),
+        ("vm_metadata", {"value": {}, "unavailable_reason": None}),
+    ],
+)
+def test_manifest_runtime_and_schema_reject_invalid_child_evidence_fields(
+    repository_root: Path, field: str, value: object
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture[field] = value
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize("manifest_name", ["initialized-parent.json", "initialized-child.json"])
+def test_manifest_runtime_and_schema_reject_consistently_malformed_experiment_id(
+    repository_root: Path, manifest_name: str
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests" / manifest_name).read_text())
+    fixture["experiment_id"] = "bad"
+    schema_name = "campaign-manifest.schema.json" if manifest_name == "initialized-parent.json" else "child-run-manifest.schema.json"
+    if manifest_name == "initialized-child.json":
+        fixture["resolved_observation"]["experiment_id"] = "bad"
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts" / schema_name).read_text()
+    )
+    model = CampaignManifest if manifest_name == "initialized-parent.json" else ChildRunManifest
+    with pytest.raises(ValueError):
+        model.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize(
+    ("intent_field", "provider_field"),
+    [
+        ("region", "regions"),
+        ("zone", "zones"),
+        ("vm_shape", "vm_shape"),
+        ("image", "image"),
+        ("connection_user", "connection_user"),
+    ],
+)
+def test_child_manifest_schema_and_runtime_reject_whitespace_vm_intent(
+    repository_root: Path, intent_field: str, provider_field: str
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    observation = fixture["resolved_observation"]
+    observation["vm_a"][intent_field] = " \t "
+    if provider_field in {"regions", "zones"}:
+        observation["provider_config"][provider_field]["vm_a"] = " \t "
+    else:
+        observation["provider_config"][provider_field] = " \t "
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize("manifest_name", ["initialized-parent.json", "initialized-child.json"])
+def test_manifest_schema_and_runtime_reject_empty_campaign_id(
+    repository_root: Path, manifest_name: str
+) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests" / manifest_name).read_text())
+    fixture["campaign_id"] = ""
+    schema_name = "campaign-manifest.schema.json" if manifest_name == "initialized-parent.json" else "child-run-manifest.schema.json"
+    if manifest_name == "initialized-parent.json":
+        fixture["child_runs"][0].update(
+            run_id="-aws",
+            manifest_path="results/manifests/-aws.json",
+            result_path="results/raw/-aws",
+        )
+    else:
+        fixture["run_id"] = "-aws"
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts" / schema_name).read_text()
+    )
+    model = CampaignManifest if manifest_name == "initialized-parent.json" else ChildRunManifest
+    with pytest.raises(ValueError):
+        model.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+def test_empty_string_provenance_evidence_is_rejected(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-child.json").read_text())
+    fixture["config_provenance"]["implementation_git_commit"] = {
+        "value": "",
+        "unavailable_reason": None,
+    }
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/child-run-manifest.schema.json").read_text()
+    )
+    with pytest.raises(ValueError):
+        ChildRunManifest.model_validate(fixture)
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+@pytest.mark.parametrize("field", ["manifest_path", "result_path"])
+def test_child_reference_rejects_directory_traversal(repository_root: Path, field: str) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    fixture["child_runs"][0][field] = "results/raw/../outside"
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(fixture)
+
+
+def test_child_reference_filename_shape_is_rejected_by_schema_and_runtime(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    fixture["child_runs"][0]["manifest_path"] = "results/manifests/run-output.txt"
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(fixture)
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/campaign-manifest.schema.json").read_text()
+    )
+    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
+
+
+def test_child_reference_cross_field_filename_link_is_runtime_enforced(repository_root: Path) -> None:
+    fixture = json.loads((repository_root / "tests/fixtures/manifests/initialized-parent.json").read_text())
+    fixture["child_runs"][0]["manifest_path"] = "results/manifests/different-aws.json"
+    with pytest.raises(ValueError):
+        CampaignManifest.model_validate(fixture)
+    schema = json.loads(
+        (repository_root / "specs/001-core-offline-contracts/contracts/campaign-manifest.schema.json").read_text()
+    )
+    assert not list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(fixture))
 
 
 @pytest.mark.parametrize("manifest_name", ["initialized-parent.json", "initialized-child.json"])

@@ -1,13 +1,16 @@
 import json
+import shutil
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
-from cloud_network_benchmark.errors import CollisionError, PersistenceError
-from cloud_network_benchmark.contracts import FailureEvidence
+from cloud_network_benchmark.errors import CollisionError, PersistenceError, ValidationError
+from cloud_network_benchmark.contracts import FailureEvidence, StringEvidence
 from cloud_network_benchmark.manifests import (
+    RepositoryGitProvenance,
     StaticGitProvenance,
     initialize_campaign,
     update_child_cleanup,
@@ -38,6 +41,16 @@ class FailEachOnce:
             raise OSError(f"injected failure at {point}")
 
 
+class CaptureProvenance:
+    def __init__(self, commit: str) -> None:
+        self.commit_value = commit
+        self.repositories: list[Path] = []
+
+    def commit(self, repository: Path) -> StringEvidence:
+        self.repositories.append(repository)
+        return StringEvidence(value=self.commit_value)
+
+
 def initialize(repository_root: Path, root: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str], fault: object = lambda _: None):
     return initialize_campaign(
         repository_root / "configs/experiments/exp-001-multi-provider.yaml",
@@ -59,6 +72,127 @@ def test_initializes_linked_three_provider_evidence(repository_root: Path, tmp_p
     source = (repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_bytes()
     for child in result.children:
         assert (Path(child.result_path) / "config.yaml").read_bytes() == source
+
+
+@pytest.mark.parametrize(
+    ("path", "placement_scenario"),
+    [
+        (("provider_configs", "aws", "regions", "vm_a"), False),
+        (("provider_configs", "aws", "zones", "vm_b"), False),
+        (("provider_configs", "aws", "vm_shape"), False),
+        (("provider_configs", "aws", "image"), False),
+        (("provider_configs", "aws", "connection_user"), False),
+        (("provider_configs", "aws", "placement", "name"), True),
+    ],
+)
+def test_whitespace_provider_values_fail_before_id_or_result_allocation(
+    repository_root: Path, tmp_path: Path, path: tuple[str, ...], placement_scenario: bool
+) -> None:
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    if placement_scenario:
+        data["scenario"] = "placement_optimization"
+        data["provider_configs"]["aws"]["placement"] = {
+            "kind": "cluster_placement_group",
+            "name": " \t ",
+        }
+    else:
+        target = data
+        for component in path[:-1]:
+            target = target[component]
+        target[path[-1]] = " \t "
+
+    root = tmp_path / "repo"
+    config_path = root / "configs/tests/whitespace.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    results_root = tmp_path / "results"
+
+    def unexpected_allocation() -> object:
+        raise AssertionError("invalid config reached ID allocation")
+
+    with pytest.raises(ValidationError):
+        initialize_campaign(
+            config_path,
+            root,
+            results_root,
+            clock=unexpected_allocation,
+            token_source=unexpected_allocation,
+        )
+    assert not results_root.exists()
+
+
+def test_initialization_resolves_thesis_root_from_linked_worktree(
+    repository_root: Path, tmp_path: Path, frozen_clock: object, deterministic_token: object,
+    fake_git_commits: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("THESIS_ROOT", raising=False)
+    main_root = tmp_path / "main" / "cloud-network-benchmark"
+    common_git = main_root / ".git"
+    worktree_root = tmp_path / "managed-worktree" / "cloud-network-benchmark"
+    linked_git = common_git / "worktrees" / "feature"
+    linked_git.mkdir(parents=True)
+    worktree_root.mkdir(parents=True)
+    (worktree_root / ".git").write_text(f"gitdir: {linked_git}\n", encoding="utf-8")
+    (linked_git / "commondir").write_text("../..\n", encoding="utf-8")
+    config_relative = Path("configs/experiments/exp-001-multi-provider.yaml")
+    config_path = worktree_root / config_relative
+    config_path.parent.mkdir(parents=True)
+    shutil.copyfile(repository_root / config_relative, config_path)
+    thesis_root = tmp_path / "main" / "Thesis"
+    thesis_root.mkdir()
+    design_git = CaptureProvenance(fake_git_commits["design"])
+
+    result = initialize_campaign(
+        config_path, worktree_root, tmp_path / "results", frozen_clock, deterministic_token,
+        StaticGitProvenance(fake_git_commits["implementation"]), design_git,
+    )
+
+    assert design_git.repositories == [thesis_root]
+    parent = json.loads(Path(result.parent_manifest_path).read_text())
+    assert parent["config_provenance"]["design_git_commit"]["value"] == fake_git_commits["design"]
+
+
+def test_thesis_root_environment_override_takes_precedence(
+    repository_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cloud_network_benchmark.manifests import thesis_repository_root
+
+    configured = tmp_path / "configured-thesis"
+    monkeypatch.setenv("THESIS_ROOT", str(configured))
+    assert thesis_repository_root(repository_root) == configured
+
+
+@pytest.mark.parametrize("ref_storage", ["loose", "packed"])
+def test_implementation_provenance_reads_shared_linked_worktree_ref(tmp_path: Path, ref_storage: str) -> None:
+    repository = tmp_path / "worktree"
+    common_git = tmp_path / "main" / ".git"
+    linked_git = common_git / "worktrees" / "feature"
+    repository.mkdir()
+    linked_git.mkdir(parents=True)
+    (repository / ".git").write_text(f"gitdir: {linked_git}\n", encoding="utf-8")
+    (linked_git / "HEAD").write_text("ref: refs/heads/feature\n", encoding="utf-8")
+    (linked_git / "commondir").write_text("../..\n", encoding="utf-8")
+    expected_commit = "a" * 40
+    if ref_storage == "loose":
+        (common_git / "refs/heads").mkdir(parents=True)
+        (common_git / "refs/heads/feature").write_text(f"{expected_commit}\n", encoding="utf-8")
+    else:
+        (common_git / "packed-refs").write_text(
+            f"# pack-refs with: peeled fully-peeled\n{expected_commit} refs/heads/feature\n",
+            encoding="utf-8",
+        )
+
+    evidence = RepositoryGitProvenance().commit(repository)
+
+    assert evidence.value == expected_commit
+    assert evidence.unavailable_reason is None
+
+
+def test_implementation_provenance_reports_genuinely_unavailable_repository(tmp_path: Path) -> None:
+    evidence = RepositoryGitProvenance().commit(tmp_path / "not-a-repository")
+
+    assert evidence.value is None
+    assert evidence.unavailable_reason.startswith("Git commit unavailable:")
 
 
 @pytest.mark.parametrize(
@@ -196,6 +330,25 @@ def test_parent_aggregation_fails_closed_on_invalid_child_evidence(
         child_path.write_text(json.dumps(child), encoding="utf-8")
     with pytest.raises(PersistenceError):
         recompute_parent_manifest(Path(result.parent_manifest_path), frozen_clock(), "test invalid child")
+
+
+def test_parent_aggregation_resolves_the_recorded_manifest_path(
+    repository_root: Path,
+    tmp_path: Path,
+    frozen_clock: object,
+    deterministic_token: object,
+    fake_git_commits: dict[str, str],
+) -> None:
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+
+    result = initialize(repository_root, tmp_path / "manifest-reference", frozen_clock, deterministic_token, fake_git_commits)
+    parent_path = Path(result.parent_manifest_path)
+    parent = json.loads(parent_path.read_text())
+    child_ref = parent["child_runs"][0]
+    child_ref["manifest_path"] = str(parent_path.parent / "missing" / Path(child_ref["manifest_path"]).name)
+    parent_path.write_text(json.dumps(parent), encoding="utf-8")
+    with pytest.raises(PersistenceError, match="missing"):
+        recompute_parent_manifest(parent_path, frozen_clock(), "must follow stored path")
 
 
 def test_parent_succeeds_only_after_every_selected_child_succeeds_and_cleans_up(

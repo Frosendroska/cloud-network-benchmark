@@ -1,9 +1,11 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 import yaml
 
 from cloud_network_benchmark.config import resolve_campaign
+from cloud_network_benchmark.contracts import ResolvedCampaign, ResolvedObservation
 from cloud_network_benchmark.errors import ValidationError
 
 
@@ -30,6 +32,30 @@ def test_resolves_one_observation_per_explicit_provider(repository_root: Path) -
     assert all(item.vm_a.role == "vm_a" and item.vm_b.role == "vm_b" for item in resolved.observations)
     assert resolved.options.provisioning_timeout_seconds == 900
     assert all(item.options == resolved.options for item in resolved.observations)
+
+
+def test_resolved_models_enforce_parent_child_and_vm_role_invariants(repository_root: Path) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/experiments/exp-001-multi-provider.yaml", repository_root)
+    bad_set = resolved.model_dump(mode="json")
+    bad_set["selected_providers"] = ["aws"]
+    with pytest.raises(ValueError):
+        ResolvedCampaign.model_validate(bad_set)
+    bad_role = resolved.observations[0].model_dump(mode="json")
+    bad_role["vm_a"]["role"] = "vm_b"
+    with pytest.raises(ValueError):
+        ResolvedObservation.model_validate(bad_role)
+
+
+def test_resolved_timestamps_are_normalized_to_utc(repository_root: Path, tmp_path: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["scheduled_start"] = "2026-09-27T14:00:00+02:00"
+    root = tmp_path / "offset"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    resolved, _ = resolve_campaign(path, root)
+    assert resolved.scheduled_start == datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    assert resolved.observations[0].scheduled_start == resolved.scheduled_start
 
 
 @pytest.mark.parametrize(("filename", "expected"), PRIMARY_MATRIX.items())

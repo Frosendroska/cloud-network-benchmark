@@ -103,6 +103,10 @@ class Evidence(StrictModel, Generic[T]):
             raise ValueError("exactly one of value or unavailable_reason is required")
         if self.unavailable_reason is not None and not self.unavailable_reason.strip():
             raise ValueError("unavailable_reason must not be empty")
+        if isinstance(self.value, str) and not self.value.strip():
+            raise ValueError("observed string evidence must not be empty")
+        if isinstance(self.value, dict) and not self.value:
+            raise ValueError("observed structured evidence must not be empty")
         return self
 
 
@@ -117,6 +121,12 @@ class FailureEvidence(StrictModel):
     action_id: Optional[str] = None
     details: Dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def timestamp_is_aware(self) -> "FailureEvidence":
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must include a timezone")
+        return self
+
 
 class LifecycleEvent(StrictModel):
     state_domain: LifecycleDomain
@@ -126,6 +136,8 @@ class LifecycleEvent(StrictModel):
 
     @model_validator(mode="after")
     def state_matches_domain(self) -> "LifecycleEvent":
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must include a timezone")
         allowed = {
             LifecycleDomain.CAMPAIGN: {item.value for item in CampaignState},
             LifecycleDomain.EXECUTION: {item.value for item in ExecutionState},

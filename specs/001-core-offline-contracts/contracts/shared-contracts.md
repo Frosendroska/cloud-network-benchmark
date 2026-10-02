@@ -103,6 +103,10 @@ F01 defines locations and expectations only. F08 owns integrity checks, content 
 
 A child run ID is a candidate until its initial child manifest is exclusively created. That create is the atomic reservation that assigns the ID. Every later initialization failure preserves or recovers each assigned child manifest with `execution_state: failed` and partial-initialization failure evidence; assigned manifests are never rolled back or deleted.
 
+Manifest and result references use normalized POSIX paths. References inside the repository are repository-relative; isolated result roots outside the repository use absolute paths. Parent aggregation resolves and verifies the recorded child manifest and result paths rather than reconstructing paths from IDs alone.
+
+The JSON Schema validates the `manifests/` and `raw/` path segments, filename extension, and provider suffix for repository-relative and isolated absolute references. Exact equality between a child reference's `run_id` and the manifest filename is a runtime cross-property invariant because standard JSON Schema cannot compare values from sibling properties.
+
 Child manifests always contain `vm_metadata`, `provider_metadata`, and `tool_versions` structured-evidence fields. Each has either an object `value` and null `unavailable_reason`, or a null `value` and a non-empty reason. Campaign manifests also carry controller/runtime `tool_versions` evidence.
 
 Implementation commit provenance is obtained through an injectable provider for both primary and smoke-test campaigns. Offline tests inject deterministic commits and do not invoke Git through the command runner or a subprocess.
