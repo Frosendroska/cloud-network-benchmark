@@ -79,6 +79,7 @@ class ProviderVmOutput(StrictModel):
 class ProviderDeploymentOutput(StrictModel):
     run_id: str
     provider: Provider
+    scenario: Optional[Scenario] = None
     apply_action_id: str
     started_at: datetime
     finished_at: datetime

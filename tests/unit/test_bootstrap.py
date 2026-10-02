@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from cloud_network_benchmark import BootstrapConfig, ConnectionOutput, TimeoutPolicy, prepare
+from cloud_network_benchmark.bootstrap import render_commands
 from cloud_network_benchmark.contracts.deployment import RemoteConnectionData
 from cloud_network_benchmark.contracts.execution import CommandResult, ScriptedCommandRunner
 
@@ -28,3 +29,9 @@ def test_bootstrap_runs_both_roles() -> None:
     outcome = prepare(conn(), config, Runner())
     assert outcome.succeeded is True
     assert len(outcome.actions) == 10
+
+
+def test_bootstrap_commands_are_shell_free():
+    commands = render_commands(BootstrapConfig(flent_version="2.2.0", netperf_version="2.7.0", linux_tools=["iproute2"]), "vm_a")
+    assert all(command[0] != "bash" for command in commands)
+    assert ["python3", "-m", "pip", "install", "flent==2.2.0"] in commands

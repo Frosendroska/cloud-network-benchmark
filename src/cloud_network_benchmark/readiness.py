@@ -13,6 +13,7 @@ class ReadinessConfig(StrictModel):
     server_health_command: List[str] = Field(default_factory=lambda: ["netserver", "-D"])
     success_output: str = "ready"
     poll_attempts: int = Field(default=1, ge=1)
+    bootstrap_succeeded: bool = True
 
 
 class ReadinessResult(StrictModel):
@@ -24,6 +25,9 @@ class ReadinessResult(StrictModel):
 
 def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner: CommandRunner) -> ReadinessResult:
     actions: List[RemoteActionEvidence] = []
+    if not config.bootstrap_succeeded:
+        from datetime import datetime, timezone
+        return ReadinessResult(ready=False, attempts=0, failure=AccessFailureEvidence(stage="readiness", category="bootstrap_failed", message="readiness requires successful bootstrap", occurred_at=datetime.now(timezone.utc)))
     checks = [("ssh-vm-a", connection.vm_a, ["true"], connection.timeouts.ssh_seconds), ("ssh-vm-b", connection.vm_b, ["true"], connection.timeouts.ssh_seconds), ("private-path", connection.vm_a, [*config.private_path_command, connection.private_ipv4_b], connection.timeouts.private_path_seconds), ("server-health", connection.vm_b, config.server_health_command, connection.timeouts.server_seconds)]
     attempts = 0
     for name, vm, argv, timeout in checks:

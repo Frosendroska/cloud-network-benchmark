@@ -13,10 +13,12 @@ This guide validates VM access, bootstrap, readiness, and retrieval with fake re
 From the repository root:
 
 ```bash
-python -m pytest tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py -q
+PYTHONPATH=src .venv/bin/python -m pytest tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py -q
 ```
 
 Expected result: all F02 tests pass and no test invokes a cloud or real remote command.
+
+The explicit interpreter and `PYTHONPATH` keep the command reproducible from a clean checkout even when the editable package has not been installed.
 
 ## Required fake scenarios
 

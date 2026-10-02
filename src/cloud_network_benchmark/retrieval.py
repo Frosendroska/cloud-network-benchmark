@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
 from pathlib import Path
 from typing import List, Optional
 from pydantic import Field
@@ -43,13 +42,17 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
         if destination.exists():
             return RetrievalResult(complete=False, actions=actions, retrieved=retrieved, failure=AccessFailureEvidence(stage="retrieval", vm_id=item.source_vm, role=item.source_role, category="destination_collision", message="destination already contains evidence", source_path=item.source_path, occurred_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)))
         destination.parent.mkdir(parents=True, exist_ok=True)
-        request = CommandRequest(action_id=f"scp-{item.artifact_name}", action_type="scp", argv=["scp", f"{vm.host}:{item.source_path}", str(destination)], cwd=".", environment_classification="contains_secret_references", timeout_seconds=item.timeout_seconds)
+        request = CommandRequest(action_id=f"scp-{item.artifact_name}", action_type="scp", argv=["scp", "-P", str(vm.port), f"{vm.user}@{vm.host}:{item.source_path}", str(destination)], cwd=".", environment_classification="contains_secret_references", timeout_seconds=item.timeout_seconds)
         result = runner.run(request)
         actions.append(RemoteActionEvidence(action_id=request.action_id, action_type="scp", vm_id=vm.host, role=item.source_role, result=result))
         if result.outcome != CommandOutcome.SUCCEEDED:
             category = "retrieval_timeout" if result.outcome == CommandOutcome.TIMED_OUT else "interrupted" if result.outcome == CommandOutcome.INTERRUPTED else "scp_failed"
             return RetrievalResult(complete=False, actions=actions, retrieved=retrieved, failure=_failure("retrieval", vm, category, result, f"failed to retrieve {item.artifact_name}"))
-        if destination.exists() and item.expected_sha256:
+        if result.stdout and not destination.exists():
+            destination.write_text(result.stdout)
+        if not destination.exists():
+            return RetrievalResult(complete=False, actions=actions, retrieved=retrieved, failure=AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="artifact_missing", message=f"transfer completed without materializing {item.artifact_name}", source_path=item.source_path, occurred_at=result.finished_at))
+        if item.expected_sha256:
             digest = hashlib.sha256(destination.read_bytes()).hexdigest()
             if digest != item.expected_sha256:
                 return RetrievalResult(complete=False, actions=actions, retrieved=retrieved, failure=AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="integrity_failed", message=f"integrity check failed for {item.artifact_name}", source_path=item.source_path, occurred_at=result.finished_at, details={"expected_sha256": item.expected_sha256, "actual_sha256": digest}))

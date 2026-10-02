@@ -7,24 +7,24 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import Field, model_validator
 
-from .contracts.common import CommandOutcome, FailureEvidence, StrictModel, VmRole
+from .contracts.common import CommandOutcome, FailureEvidence, Scenario, StrictModel, VmRole
 from .contracts.deployment import ProviderDeploymentOutput, RemoteConnectionData
 from .contracts.execution import CommandRequest, CommandResult, CommandRunner
 
 
 class TimeoutPolicy(StrictModel):
-    ssh_seconds: float = Field(gt=0)
-    command_seconds: float = Field(gt=0)
-    cloud_init_seconds: float = Field(gt=0)
-    private_path_seconds: float = Field(gt=0)
-    server_seconds: float = Field(gt=0)
-    transfer_seconds: float = Field(gt=0)
+    ssh_seconds: float = Field(gt=0, le=3600)
+    command_seconds: float = Field(gt=0, le=3600)
+    cloud_init_seconds: float = Field(gt=0, le=3600)
+    private_path_seconds: float = Field(gt=0, le=3600)
+    server_seconds: float = Field(gt=0, le=3600)
+    transfer_seconds: float = Field(gt=0, le=3600)
 
 
 class ConnectionOutput(StrictModel):
     run_id: str = Field(min_length=1)
     provider: str = Field(min_length=1)
-    scenario: str = Field(min_length=1)
+    scenario: Scenario
     vm_a: RemoteConnectionData
     vm_b: RemoteConnectionData
     private_ipv4_a: str
@@ -45,11 +45,13 @@ class ConnectionOutput(StrictModel):
 
     @classmethod
     def from_deployment(cls, deployment: ProviderDeploymentOutput, timeouts: TimeoutPolicy) -> "ConnectionOutput":
+        if deployment.scenario is None:
+            raise ValueError("deployment output is missing scenario metadata")
         if deployment.vm_a.connection is None or deployment.vm_b.connection is None:
             raise ValueError("deployment output is missing SSH connection data")
         if deployment.vm_a.private_ipv4 is None or deployment.vm_b.private_ipv4 is None:
             raise ValueError("deployment output is missing private IPv4 data")
-        return cls(run_id=deployment.run_id, provider=deployment.provider, scenario="unknown", vm_a=deployment.vm_a.connection, vm_b=deployment.vm_b.connection, private_ipv4_a=deployment.vm_a.private_ipv4, private_ipv4_b=deployment.vm_b.private_ipv4, timeouts=timeouts)
+        return cls(run_id=deployment.run_id, provider=deployment.provider, scenario=deployment.scenario, vm_a=deployment.vm_a.connection, vm_b=deployment.vm_b.connection, private_ipv4_a=deployment.vm_a.private_ipv4, private_ipv4_b=deployment.vm_b.private_ipv4, timeouts=timeouts)
 
 
 class RemoteActionEvidence(StrictModel):
@@ -84,8 +86,8 @@ def _connection_from_deployment(deployment: ProviderDeploymentOutput | Connectio
     return ConnectionOutput.from_deployment(deployment, timeouts)
 
 
-def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], timeout: float) -> CommandRequest:
-    return CommandRequest(action_id=action_id, action_type="ssh", argv=["ssh", connection.host, *argv], cwd=".", environment_classification="contains_secret_references", timeout_seconds=timeout)
+def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], timeout: float, action_type: str = "ssh") -> CommandRequest:
+    return CommandRequest(action_id=action_id, action_type=action_type, argv=["ssh", "-p", str(connection.port), connection.host, *argv], cwd=".", environment_classification="contains_secret_references", timeout_seconds=timeout)
 
 
 def _failure(stage: str, vm: RemoteConnectionData, category: str, result: CommandResult, message: str) -> AccessFailureEvidence:

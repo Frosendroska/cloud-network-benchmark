@@ -136,3 +136,14 @@ description: "Implementation tasks for F02 VM access, bootstrap, readiness, and 
 ### Completion Evidence
 
 The feature is ready for implementation review when all 35 tasks are complete, the focused quickstart suite and existing suite pass, and the tests demonstrate every required fake terminal outcome without credentials or live remote actions.
+
+## Phase 7: Convergence
+
+- [X] T036 Replace `bash -lc` bootstrap command construction in `src/cloud_network_benchmark/bootstrap.py` with shell-free argument vectors and add tests proving command arguments preserve paths and configured values without shell interpretation per FR-006, FR-017, and Constitution V (contradicts)
+- [X] T037 Preserve provider and scenario metadata in `ConnectionOutput.from_deployment` in `src/cloud_network_benchmark/access.py`; require the normalized deployment handoff to carry the actual scenario instead of fabricating `"unknown"` per FR-001 and Constitution I (partial)
+- [X] T038 Implement actual fakeable SCP materialization in `src/cloud_network_benchmark/retrieval.py`; copy or stage successful fake transfer content into the exclusive destination, validate missing/truncated artifacts, and prove complete retrieval in `tests/unit/test_retrieval.py` and `tests/integration/test_remote_sequences.py` per FR-012 and SC-004 (missing)
+- [X] T039 Separate cloud-init completion from generic command timeout handling in `src/cloud_network_benchmark/bootstrap.py`; use `cloud_init_seconds`, record configured deadlines and last output, and map interruption distinctly per FR-007, FR-008, FR-015, and SC-006 (partial)
+- [X] T040 Add bounded maximum timeout validation and typed timeout evidence to `src/cloud_network_benchmark/access.py`, `src/cloud_network_benchmark/readiness.py`, and `src/cloud_network_benchmark/retrieval.py`; test every configured SSH, command, readiness, and transfer deadline per FR-008 and SC-006 (partial)
+- [X] T041 Validate readiness prerequisites using an explicit successful BootstrapResult rather than allowing `check_readiness` to run after failed preparation in `src/cloud_network_benchmark/access.py` and `src/cloud_network_benchmark/readiness.py` per US2/AC1, FR-010, and FR-014 (partial)
+- [X] T042 Add a documented successful/failed evidence review fixture and concise reviewer procedure in `docs/f02-vm-access-bootstrap.md` with a test or scripted assertion for the SC-007 under-five-minute inspection criterion per SC-007 (missing)
+- [X] T043 Add a repository-local test command or documented `pytest` invocation that always uses the installed project environment, update `specs/002-vm-access-bootstrap/quickstart.md`, and verify imports from a clean checkout per SC-008 (partial)

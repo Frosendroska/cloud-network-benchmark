@@ -13,8 +13,8 @@ class BootstrapConfig(StrictModel):
     netperf_version: str = Field(min_length=1)
     linux_tools: List[str] = Field(min_length=1)
     cloud_init_probe: str = Field(default="cloud-init status --wait")
-    client_setup: List[str] = Field(default_factory=list)
-    server_setup: List[str] = Field(default_factory=list)
+    client_setup: List[List[str]] = Field(default_factory=list)
+    server_setup: List[List[str]] = Field(default_factory=list)
 
 
 class BootstrapResult(StrictModel):
@@ -25,20 +25,21 @@ class BootstrapResult(StrictModel):
 
 
 def render_commands(config: BootstrapConfig, role: str) -> List[List[str]]:
-    commands = [["bash", "-lc", "sudo", "apt-get", "update"]]
-    commands.append(["bash", "-lc", "sudo", "apt-get", "install", "-y", *config.linux_tools])
-    commands.append(["bash", "-lc", "python3", "-m", "pip", "install", f"flent=={config.flent_version}"])
-    commands.append(["bash", "-lc", "netperf", "--version", config.netperf_version])
-    commands.extend([["bash", "-lc", command] for command in (config.client_setup if role == "vm_a" else config.server_setup)])
-    commands.append(["bash", "-lc", config.cloud_init_probe])
+    commands = [["sudo", "apt-get", "update"]]
+    commands.append(["sudo", "apt-get", "install", "-y", *config.linux_tools])
+    commands.append(["python3", "-m", "pip", "install", f"flent=={config.flent_version}"])
+    commands.append(["netperf", "--version", config.netperf_version])
+    commands.extend(config.client_setup if role == "vm_a" else config.server_setup)
+    commands.append(config.cloud_init_probe.split())
     return commands
 
 
 def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner) -> BootstrapResult:
     actions: List[RemoteActionEvidence] = []
-    for vm, role, timeout in ((connection.vm_a, "vm_a", connection.timeouts.command_seconds), (connection.vm_b, "vm_b", connection.timeouts.command_seconds)):
+    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
         for index, argv in enumerate(render_commands(config, role)):
             action_id = f"bootstrap-{role}-{index}"
+            timeout = connection.timeouts.cloud_init_seconds if index == len(render_commands(config, role)) - 1 else connection.timeouts.command_seconds
             result = runner.run(_request(action_id, vm, argv, timeout))
             actions.append(RemoteActionEvidence(action_id=action_id, action_type="ssh", vm_id=vm.host, role=role, result=result))
             if result.outcome != CommandOutcome.SUCCEEDED:
