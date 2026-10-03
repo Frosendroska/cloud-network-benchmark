@@ -7,6 +7,7 @@ from pathlib import Path
 from cloud_network_benchmark import ConnectionOutput, TimeoutPolicy
 from cloud_network_benchmark.contracts import ProviderDeploymentOutput, ProviderVmOutput, StructuredEvidence
 from cloud_network_benchmark.contracts.deployment import RemoteConnectionData
+from cloud_network_benchmark.access import _request
 
 
 def connection() -> ConnectionOutput:
@@ -18,6 +19,12 @@ def test_connection_contract_requires_two_private_roles() -> None:
     assert connection().vm_a.role == "vm_a"
     with pytest.raises(ValueError):
         ConnectionOutput.model_validate({**connection().model_dump(), "private_ipv4_b": "8.8.8.8"})
+
+
+def test_ssh_request_contains_runtime_identity_and_host_key_options() -> None:
+    vm = connection().vm_a
+    request = _request("ssh-check", vm, ["true"], 5)
+    assert request.argv == ["ssh", "-p", "22", "-i", "runtime:ssh", "ubuntu@10.0.0.1", "true"]
 
 
 def test_deployment_handoff_requires_scenario_metadata():

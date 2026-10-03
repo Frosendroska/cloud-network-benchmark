@@ -156,3 +156,7 @@ The feature is ready for implementation review when all 35 tasks are complete, t
 - [X] T047 Split benchmark-server startup from server-health readiness in `src/cloud_network_benchmark/readiness.py`; make the readiness command observe an explicit healthy condition without launching FLENT or netserver as a side effect per FR-010 and US2/AC2 (contradicts)
 - [X] T048 Record transfer size and computed checksum evidence for every successfully retrieved artifact, reject empty or truncated materialization, and test real-success and fake-success paths in `src/cloud_network_benchmark/retrieval.py` per FR-012, FR-013, and SC-004 (partial)
 - [X] T049 Add a committed successful/failed evidence JSON fixture plus an executable inspection assertion or documented review script in `tests/` and `docs/f02-vm-access-bootstrap.md` per SC-007 (missing)
+
+## Phase 9: Convergence
+
+- [X] T050 Pass the configured SSH `authentication_reference` as the runtime identity option in `_request()` in `src/cloud_network_benchmark/access.py`, while retaining secret-reference redaction, and add an exact argv contract test per FR-001, FR-006, and T044 (partial)

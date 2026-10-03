@@ -90,6 +90,7 @@ def _connection_from_deployment(deployment: ProviderDeploymentOutput | Connectio
 
 def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], timeout: float, action_type: str = "ssh") -> CommandRequest:
     command = ["ssh", "-p", str(connection.port)]
+    command.extend(["-i", connection.authentication_reference])
     if connection.host_key_reference:
         command.extend(["-o", f"UserKnownHostsFile={connection.host_key_reference}"])
     command.extend([f"{connection.user}@{connection.host}", *argv])
