@@ -1,0 +1,174 @@
+{
+  "actual_finished_at": null,
+  "actual_started_at": null,
+  "artifacts": {
+    "config_snapshot": "config.yaml",
+    "idle_flent": "flent/idle.flent.gz",
+    "multi_flow_flent": "flent/multi_flow.flent.gz",
+    "multi_flow_vm_a_diagnostics": "diagnostics/multi_flow/vm_a.json",
+    "multi_flow_vm_b_diagnostics": "diagnostics/multi_flow/vm_b.json",
+    "provider_outputs": "terraform-outputs.json",
+    "single_flow_flent": "flent/single_flow.flent.gz",
+    "single_flow_vm_a_diagnostics": "diagnostics/single_flow/vm_a.json",
+    "single_flow_vm_b_diagnostics": "diagnostics/single_flow/vm_b.json",
+    "validation_result": "validation/result.json",
+    "validation_summary": "validation/summary.txt",
+    "vm_a_metadata": "metadata/vm_a.json",
+    "vm_b_metadata": "metadata/vm_b.json"
+  },
+  "campaign_id": "20260927T120000Z-exp-900-fixture",
+  "cleanup_failure": null,
+  "cleanup_state": "not_started",
+  "config_provenance": {
+    "byte_length": 1039,
+    "design_git_commit": {
+      "unavailable_reason": null,
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "implementation_git_commit": {
+      "unavailable_reason": null,
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "sha256": "ab07322a9833bdc3a7bd5ee041653ea0404914fc720db277bd23bccf129d8462",
+    "snapshot_path": "results/raw/20260927T120000Z-exp-900-fixture-aws/config.yaml",
+    "source_path": "configs/tests/exp-900-single-provider.yaml"
+  },
+  "created_at": "2026-09-27T12:00:00Z",
+  "execution_state": "initialized",
+  "experiment_id": "EXP-900",
+  "failure": null,
+  "lifecycle_events": [
+    {
+      "detail": "child manifest reserved",
+      "occurred_at": "2026-09-27T12:00:00Z",
+      "state": "initialized",
+      "state_domain": "execution"
+    }
+  ],
+  "manifest_type": "child_run",
+  "provider": "aws",
+  "provider_metadata": {
+    "unavailable_reason": "not observed during F01 initialization",
+    "value": null
+  },
+  "resolved_observation": {
+    "artifact_layout": {
+      "config_snapshot": "config.yaml",
+      "idle_flent": "flent/idle.flent.gz",
+      "multi_flow_flent": "flent/multi_flow.flent.gz",
+      "multi_flow_vm_a_diagnostics": "diagnostics/multi_flow/vm_a.json",
+      "multi_flow_vm_b_diagnostics": "diagnostics/multi_flow/vm_b.json",
+      "provider_outputs": "terraform-outputs.json",
+      "single_flow_flent": "flent/single_flow.flent.gz",
+      "single_flow_vm_a_diagnostics": "diagnostics/single_flow/vm_a.json",
+      "single_flow_vm_b_diagnostics": "diagnostics/single_flow/vm_b.json",
+      "validation_result": "validation/result.json",
+      "validation_summary": "validation/summary.txt",
+      "vm_a_metadata": "metadata/vm_a.json",
+      "vm_b_metadata": "metadata/vm_b.json"
+    },
+    "benchmark": {
+      "execution_order": [
+        "idle_latency",
+        "single_flow",
+        "multi_flow"
+      ],
+      "idle_latency": {
+        "duration_seconds": 10,
+        "enabled": true,
+        "parameters": {},
+        "test_name": "ping",
+        "timeout_seconds": 30
+      },
+      "multi_flow": {
+        "duration_seconds": 10,
+        "enabled": true,
+        "parameters": {
+          "upload_streams": 1
+        },
+        "test_name": "tcp_nup",
+        "timeout_seconds": 30
+      },
+      "single_flow": {
+        "duration_seconds": 10,
+        "enabled": true,
+        "parameters": {},
+        "test_name": "tcp_1up",
+        "timeout_seconds": 30
+      }
+    },
+    "experiment_id": "EXP-900",
+    "measurement_direction": "vm_a_to_vm_b",
+    "options": {
+      "cleanup_timeout_seconds": 300,
+      "labels": {
+        "purpose": "framework-smoke-test"
+      },
+      "provisioning_timeout_seconds": 300,
+      "readiness_timeout_seconds": 300
+    },
+    "placement": {
+      "kind": "none",
+      "name": null
+    },
+    "provider": "aws",
+    "provider_config": {
+      "connection_user": "ubuntu",
+      "documented_network_limit": null,
+      "image": "ubuntu-24.04",
+      "placement": {
+        "kind": "none",
+        "name": null
+      },
+      "provider": "aws",
+      "provider_options": {
+        "instance_market_type": "on_demand"
+      },
+      "regions": {
+        "vm_a": "eu-central-1",
+        "vm_b": "eu-central-1"
+      },
+      "vm_shape": "t3.small",
+      "zones": {
+        "vm_a": "euc1-az1",
+        "vm_b": "euc1-az1"
+      }
+    },
+    "scenario": "same_zone",
+    "scheduled_start": "2026-10-01T07:00:00Z",
+    "vm_a": {
+      "connection_user": "ubuntu",
+      "function": "client_traffic_generator",
+      "image": "ubuntu-24.04",
+      "region": "eu-central-1",
+      "role": "vm_a",
+      "vm_shape": "t3.small",
+      "zone": "euc1-az1"
+    },
+    "vm_b": {
+      "connection_user": "ubuntu",
+      "function": "server_receiver",
+      "image": "ubuntu-24.04",
+      "region": "eu-central-1",
+      "role": "vm_b",
+      "vm_shape": "t3.small",
+      "zone": "euc1-az1"
+    }
+  },
+  "run_id": "20260927T120000Z-exp-900-fixture-aws",
+  "scenario": "same_zone",
+  "scheduled_start": "2026-10-01T07:00:00Z",
+  "schema_version": 1,
+  "tool_versions": {
+    "unavailable_reason": null,
+    "value": {
+      "cloud_network_benchmark": "0.1.0",
+      "python": "3.9.2"
+    }
+  },
+  "updated_at": "2026-09-27T12:00:00Z",
+  "vm_metadata": {
+    "unavailable_reason": "not observed during F01 initialization",
+    "value": null
+  }
+}

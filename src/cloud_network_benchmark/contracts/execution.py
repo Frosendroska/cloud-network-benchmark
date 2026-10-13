@@ -36,18 +36,33 @@ class CommandResult(StrictModel):
     exit_code: Optional[int]
     stdout: str
     stderr: str
-    redactions: List[str] = Field(default_factory=list)
+    redactions: List[str] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="after")
     def consistent(self) -> "CommandResult":
         if self.finished_at < self.started_at:
             raise ValueError("finished_at precedes started_at")
+        if self.started_at.tzinfo is None or self.finished_at.tzinfo is None:
+            raise ValueError("command timestamps must include a timezone")
+        elapsed = (self.finished_at - self.started_at).total_seconds()
+        if abs(elapsed - self.duration_seconds) > 0.001:
+            raise ValueError("duration_seconds must match command timestamps")
         outcome = CommandOutcome(self.outcome)
         if outcome == CommandOutcome.SUCCEEDED and self.exit_code != 0:
             raise ValueError("succeeded requires exit code 0")
         if outcome == CommandOutcome.FAILED and (self.exit_code is None or self.exit_code == 0):
             raise ValueError("failed requires non-zero exit code")
+        if outcome in {CommandOutcome.TIMED_OUT, CommandOutcome.INTERRUPTED} and self.exit_code is not None:
+            raise ValueError(f"{outcome.value} requires a null exit code")
         return self
+
+    def durable_view(self) -> Dict[str, object]:
+        payload = self.model_dump(mode="json")
+        for secret in sorted((item for item in self.redactions if item), key=len, reverse=True):
+            payload["stdout"] = payload["stdout"].replace(secret, "[REDACTED]")
+            payload["stderr"] = payload["stderr"].replace(secret, "[REDACTED]")
+        payload["redactions_applied"] = bool(self.redactions)
+        return payload
 
 
 class CommandRunner(Protocol):
@@ -101,6 +116,8 @@ class ScriptedCommandRunner:
         expected, result = self._script[0]
         if request != expected:
             raise AssertionError(f"command mismatch: expected {expected}, got {request}")
+        if result.action_id != request.action_id:
+            raise ValueError("result action_id must match request action_id")
         self._script.pop(0)
         self.requests.append(request)
         return result

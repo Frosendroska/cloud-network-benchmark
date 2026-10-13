@@ -40,7 +40,32 @@ def test_scripted_runner_detects_mismatch_and_unconsumed() -> None:
         runner.assert_exhausted()
 
 
-@pytest.mark.parametrize(("outcome", "exit_code"), [("succeeded", 1), ("failed", 0), ("failed", None)])
+def test_scripted_runner_rejects_result_for_another_action() -> None:
+    runner = ScriptedCommandRunner([(request(), result("different-action"))])
+    with pytest.raises(ValueError, match="action_id"):
+        runner.run(request())
+
+
+def test_command_result_checks_elapsed_time_and_secret_redaction() -> None:
+    with pytest.raises(ValueError, match="duration"):
+        CommandResult(
+            action_id="terraform-plan", outcome="succeeded", started_at=NOW,
+            finished_at=NOW.replace(second=2), duration_seconds=1, exit_code=0,
+            stdout="ok", stderr="",
+        )
+    safe = CommandResult(
+        action_id="terraform-plan", outcome="succeeded", started_at=NOW,
+        finished_at=NOW, duration_seconds=0, exit_code=0,
+        stdout="token=secret-value", stderr="", redactions=["secret-value"],
+    ).durable_view()
+    assert "secret-value" not in str(safe)
+    assert "[REDACTED]" in safe["stdout"]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "exit_code"),
+    [("succeeded", 1), ("failed", 0), ("failed", None), ("timed_out", 0), ("interrupted", 130)],
+)
 def test_result_consistency(outcome: str, exit_code: object) -> None:
     with pytest.raises(ValueError):
         result(outcome=outcome, exit_code=exit_code)

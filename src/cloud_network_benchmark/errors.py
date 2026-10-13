@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Dict, Optional
 
 
@@ -10,14 +10,18 @@ class BenchmarkError(Exception):
     code: str = "benchmark_error"
     exit_code: int = 1
     field: Optional[str] = None
+    details: Dict[str, Any] = dataclass_field(default_factory=dict)
 
     def __str__(self) -> str:
         return self.message
 
     def as_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"code": self.code, "message": self.message}
-        if self.field is not None:
-            payload["field"] = self.field
+        payload: Dict[str, Any] = {
+            "error_code": self.code,
+            "message": self.message,
+            "field_path": self.field,
+            "details": self.details,
+        }
         return {"error": payload}
 
 
@@ -27,8 +31,13 @@ class UsageError(BenchmarkError):
 
 
 class ValidationError(BenchmarkError):
-    def __init__(self, message: str, field: Optional[str] = None) -> None:
-        super().__init__(message, "validation_error", 3, field)
+    def __init__(
+        self,
+        message: str,
+        field: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message, "validation_error", 3, field, details or {})
 
 
 class CollisionError(BenchmarkError):
@@ -37,5 +46,5 @@ class CollisionError(BenchmarkError):
 
 
 class PersistenceError(BenchmarkError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, "persistence_error", 5)
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message, "persistence_error", 5, details=details or {})

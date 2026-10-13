@@ -4,6 +4,30 @@
   "title": "Child Run Manifest",
   "type": "object",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "execution_state": { "const": "failed" } },
+        "required": ["execution_state"]
+      },
+      "then": { "properties": { "failure": { "$ref": "#/$defs/failure" } } },
+      "else": {
+        "if": {
+          "properties": { "execution_state": { "not": { "const": "interrupted" } } },
+          "required": ["execution_state"]
+        },
+        "then": { "properties": { "failure": { "type": "null" } } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "cleanup_state": { "const": "failed" } },
+        "required": ["cleanup_state"]
+      },
+      "then": { "properties": { "cleanup_failure": { "$ref": "#/$defs/failure" } } },
+      "else": { "properties": { "cleanup_failure": { "type": "null" } } }
+    }
+  ],
   "required": [
     "manifest_type",
     "schema_version",
@@ -32,16 +56,16 @@
   "properties": {
     "manifest_type": { "const": "child_run" },
     "schema_version": { "const": 1 },
-    "run_id": { "type": "string", "minLength": 1 },
-    "campaign_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
+    "campaign_id": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
     "experiment_id": { "type": "string", "pattern": "^EXP-[0-9]{3,}$" },
     "provider": { "$ref": "#/$defs/provider" },
     "scenario": { "$ref": "#/$defs/scenario" },
-    "scheduled_start": { "type": "string", "format": "date-time" },
-    "actual_started_at": { "type": ["string", "null"], "format": "date-time" },
-    "actual_finished_at": { "type": ["string", "null"], "format": "date-time" },
+    "scheduled_start": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
+    "actual_started_at": { "type": ["string", "null"], "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
+    "actual_finished_at": { "type": ["string", "null"], "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
     "config_provenance": { "$ref": "#/$defs/config_provenance" },
-    "resolved_observation": { "type": "object" },
+    "resolved_observation": { "$ref": "#/$defs/resolved_observation" },
     "execution_state": { "$ref": "#/$defs/execution_state" },
     "cleanup_state": { "$ref": "#/$defs/cleanup_state" },
     "failure": {
@@ -65,8 +89,8 @@
       "minItems": 1,
       "items": { "$ref": "#/$defs/lifecycle_event" }
     },
-    "created_at": { "type": "string", "format": "date-time" },
-    "updated_at": { "type": "string", "format": "date-time" }
+    "created_at": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
+    "updated_at": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" }
   },
   "$defs": {
     "provider": { "enum": ["aws", "azure", "gcp"] },
@@ -166,9 +190,129 @@
       "properties": {
         "category": { "type": "string", "minLength": 1 },
         "message": { "type": "string", "minLength": 1 },
-        "occurred_at": { "type": "string", "format": "date-time" },
+        "occurred_at": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
         "action_id": { "type": ["string", "null"] },
         "details": { "type": "object" }
+      }
+    },
+    "vm_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "function", "region", "zone", "vm_shape", "image", "connection_user"],
+      "properties": {
+        "role": { "enum": ["vm_a", "vm_b"] },
+        "function": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "region": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "zone": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" }
+      }
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "name": { "type": ["string", "null"], "pattern": "\\S" }
+      }
+    },
+    "phase_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "test_name", "duration_seconds", "timeout_seconds", "parameters"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "test_name": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "duration_seconds": { "type": "integer", "minimum": 1 },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "parameters": { "type": "object", "additionalProperties": { "type": ["string", "number", "integer", "boolean"] } }
+      }
+    },
+    "benchmark_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idle_latency", "single_flow", "multi_flow", "execution_order"],
+      "properties": {
+        "idle_latency": { "$ref": "#/$defs/phase_configuration" },
+        "single_flow": { "$ref": "#/$defs/phase_configuration" },
+        "multi_flow": {
+          "allOf": [
+            { "$ref": "#/$defs/phase_configuration" },
+            {
+              "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+              "then": { "properties": { "parameters": { "required": ["upload_streams"], "properties": { "upload_streams": { "type": "integer", "minimum": 1 } } } } }
+            }
+          ]
+        },
+        "execution_order": { "const": ["idle_latency", "single_flow", "multi_flow"] }
+      }
+    },
+    "campaign_options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "provisioning_timeout_seconds": { "type": ["integer", "null"], "minimum": 1 },
+        "readiness_timeout_seconds": { "type": ["integer", "null"], "minimum": 1 },
+        "cleanup_timeout_seconds": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "provider_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "regions", "zones", "vm_shape", "image", "connection_user", "documented_network_limit", "placement", "provider_options"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "regions": { "$ref": "#/$defs/region_pair" },
+        "zones": { "$ref": "#/$defs/zone_pair" },
+        "vm_shape": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "image": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "connection_user": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "documented_network_limit": { "type": ["string", "null"], "pattern": "\\S" },
+        "placement": { "$ref": "#/$defs/placement" },
+        "provider_options": { "type": "object", "minProperties": 1 }
+      }
+    },
+    "region_pair": {
+      "type": "object", "additionalProperties": false, "required": ["vm_a", "vm_b"],
+      "properties": { "vm_a": { "type": "string", "minLength": 1, "pattern": "\\S" }, "vm_b": { "type": "string", "minLength": 1, "pattern": "\\S" } }
+    },
+    "zone_pair": {
+      "type": "object", "additionalProperties": false, "required": ["vm_a", "vm_b"],
+      "properties": { "vm_a": { "type": "string", "minLength": 1, "pattern": "\\S" }, "vm_b": { "type": "string", "minLength": 1, "pattern": "\\S" } }
+    },
+    "resolved_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "experiment_id",
+        "provider",
+        "scenario",
+        "scheduled_start",
+        "vm_a",
+        "vm_b",
+        "measurement_direction",
+        "placement",
+        "benchmark",
+        "artifact_layout",
+        "provider_config",
+        "options"
+      ],
+      "properties": {
+        "experiment_id": { "type": "string", "pattern": "^EXP-[0-9]{3,}$" },
+        "provider": { "$ref": "#/$defs/provider" },
+        "scenario": { "$ref": "#/$defs/scenario" },
+        "scheduled_start": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
+        "vm_a": { "$ref": "#/$defs/vm_intent" },
+        "vm_b": { "$ref": "#/$defs/vm_intent" },
+        "measurement_direction": { "const": "vm_a_to_vm_b" },
+        "placement": { "$ref": "#/$defs/placement" },
+        "benchmark": { "$ref": "#/$defs/benchmark_plan" },
+        "artifact_layout": { "$ref": "#/$defs/artifact_layout" },
+        "provider_config": { "$ref": "#/$defs/provider_configuration" },
+        "options": { "$ref": "#/$defs/campaign_options" }
       }
     },
     "artifact_layout": {
@@ -212,7 +356,7 @@
       "properties": {
         "state_domain": { "enum": ["execution", "cleanup"] },
         "state": { "type": "string", "minLength": 1 },
-        "occurred_at": { "type": "string", "format": "date-time" },
+        "occurred_at": { "type": "string", "format": "date-time", "pattern": "(Z|[+-][0-9]{2}:[0-9]{2})$" },
         "detail": { "type": ["string", "null"] }
       },
       "oneOf": [
@@ -231,5 +375,5 @@
       ]
     }
   },
-  "$comment": "The runtime contract validates resolved_observation against the typed provider model and enforces state/failure consistency and legal lifecycle transitions."
+  "$comment": "Runtime validation additionally enforces cross-field identity, chronology, and legal lifecycle transitions that JSON Schema cannot express directly."
 }

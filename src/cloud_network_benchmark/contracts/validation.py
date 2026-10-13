@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .artifacts import ArtifactLayout
 from .common import (
     ArtifactExpectation,
+    BenchmarkPhase,
     CleanupState,
     ExecutionState,
     FailureEvidence,
+    MeasurementDirection,
     Provider,
     Scenario,
     StringEvidence,
     StrictModel,
     StructuredEvidence,
+    VmRole,
 )
 
 
@@ -31,6 +34,9 @@ class ValidatorInput(StrictModel):
     config_sha256: str
     provider: Provider
     scenario: Scenario
+    enabled_phases: List[BenchmarkPhase]
+    expected_vm_roles: List[VmRole]
+    measurement_direction: MeasurementDirection
     artifacts: Dict[str, ArtifactInput]
     execution_state: ExecutionState
     cleanup_state: CleanupState
@@ -41,6 +47,14 @@ class ValidatorInput(StrictModel):
     tool_versions: StructuredEvidence
     implementation_git_commit: StringEvidence
     design_git_commit: StringEvidence
+
+    @model_validator(mode="after")
+    def canonical_roles(self) -> "ValidatorInput":
+        if self.expected_vm_roles != [VmRole.VM_A.value, VmRole.VM_B.value]:
+            raise ValueError("expected_vm_roles must be [vm_a, vm_b]")
+        if len(set(self.enabled_phases)) != len(self.enabled_phases):
+            raise ValueError("enabled_phases must be unique")
+        return self
 
 
 def artifact_inputs(layout: ArtifactLayout, multi_flow_enabled: bool = True) -> Dict[str, ArtifactInput]:

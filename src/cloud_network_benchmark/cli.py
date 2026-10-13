@@ -45,8 +45,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command in {"validate", "resolve"}:
             resolved, _ = resolve_campaign(config_path, root)
             if args.command == "validate":
-                payload = {"valid": True, "experiment_id": resolved.experiment_id, "providers": resolved.selected_providers}
-                print(_json(payload) if args.format == "json" else f"Valid campaign {resolved.experiment_id}: {', '.join(resolved.selected_providers)}")
+                payload = {
+                    "valid": True,
+                    "experiment_id": resolved.experiment_id,
+                    "configuration_role": resolved.configuration_role,
+                    "scenario": resolved.scenario,
+                    "scheduled_start": resolved.scheduled_start.isoformat(),
+                    "providers": resolved.selected_providers,
+                    "source_sha256": resolved.config_source.sha256,
+                    "child_count": len(resolved.observations),
+                }
+                if args.format == "json":
+                    print(_json(payload))
+                else:
+                    print(
+                        f"Valid {payload['configuration_role']} campaign {payload['experiment_id']} "
+                        f"for {payload['scenario']} at {payload['scheduled_start']}"
+                    )
+                    print(f"Providers ({payload['child_count']}): {', '.join(payload['providers'])}")
+                    print(f"Source SHA-256: {payload['source_sha256']}")
             else:
                 print(_json(resolved) if args.format == "json" else f"Resolved {resolved.experiment_id} into {len(resolved.observations)} provider observation(s)")
             return 0
@@ -67,7 +84,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     except BenchmarkError as exc:
         output_format = getattr(locals().get("args", None), "format", "human")
-        print(_json(exc.as_dict()) if output_format == "json" else f"Error: {exc}", file=sys.stderr)
+        if output_format == "json":
+            print(_json(exc.as_dict()), file=sys.stderr)
+        else:
+            print(f"Error [{exc.code}]: {exc}", file=sys.stderr)
+            if exc.field is not None:
+                print(f"Field: {exc.field}", file=sys.stderr)
+            if exc.details:
+                print("Details:", file=sys.stderr)
+                for key, value in exc.details.items():
+                    print(f"  {key}: {value}", file=sys.stderr)
         return exc.exit_code
 
 

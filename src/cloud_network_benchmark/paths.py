@@ -49,16 +49,22 @@ def preflight(paths: AllocatedPaths) -> None:
 
 def reserve_json(path: Path, payload: Dict[str, Any], fault: FaultInjector = no_fault) -> None:
     fault("before_manifest_reservation")
+    temp_name = None
     try:
-        with path.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-            handle.write("\n")
+        serialized = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temp_name = handle.name
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
+        os.link(temp_name, path)
     except FileExistsError as exc:
         raise CollisionError(f"occupied destination: {path}") from exc
     except OSError as exc:
         raise PersistenceError(f"cannot reserve manifest {path}: {exc}") from exc
+    finally:
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
     fault("after_manifest_reservation")
 
 

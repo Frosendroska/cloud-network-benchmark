@@ -4,7 +4,7 @@
 
 - All serialized field names use `snake_case`.
 - All timestamps are RFC 3339 strings with an explicit offset and are normalized to UTC when resolved.
-- All paths stored in manifests are repository-relative POSIX paths; runtime code resolves them against an injected repository root.
+- Config and source paths stored in manifests are repository-relative POSIX paths. Manifest and result references are repository-relative POSIX paths when their result root is inside the checkout; an isolated `--results-root` outside the checkout is recorded as an absolute, normalized POSIX path so the reference still identifies the written evidence. Relative references resolve against the repository root; absolute references resolve directly.
 - Enums serialize to the exact lowercase values shown here.
 - Resolved specifications and command requests are immutable value objects.
 - Optional or unavailable evidence is represented as `null` plus an explanatory field where required; placeholder values are forbidden.
@@ -33,7 +33,7 @@ The loader derives `configuration_role` as `experiment` or `test` from the canon
 | --- | --- | --- |
 | `idle_latency` | Phase Configuration | Required and enabled for every campaign. |
 | `single_flow` | Phase Configuration | Required and enabled for every campaign. |
-| `multi_flow` | Multi-flow Phase Configuration | Required as an explicit object; may be disabled only where the approved scenario/config scope permits it. |
+| `multi_flow` | Multi-flow Phase Configuration | Required as an explicit object; may be disabled only where the provisional scenario/config scope permits it. |
 | `execution_order` | list | Must equal `idle_latency`, `single_flow`, `multi_flow`; disabled phases remain declared but are skipped. |
 
 Each phase carries `enabled`, `test_name`, `duration_seconds`, `timeout_seconds`, and a string-to-scalar `parameters` map. Durations and timeouts are positive. `multi_flow.parameters.upload_streams` is a positive integer when enabled and is never inferred from vCPU count.

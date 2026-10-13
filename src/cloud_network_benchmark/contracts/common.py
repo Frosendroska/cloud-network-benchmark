@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Any, Dict, Generic, Optional, Sequence, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -80,6 +80,12 @@ class CampaignState(StringEnum):
     INTERRUPTED = "interrupted"
 
 
+class LifecycleDomain(StringEnum):
+    CAMPAIGN = "campaign"
+    EXECUTION = "execution"
+    CLEANUP = "cleanup"
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
 
@@ -97,6 +103,10 @@ class Evidence(StrictModel, Generic[T]):
             raise ValueError("exactly one of value or unavailable_reason is required")
         if self.unavailable_reason is not None and not self.unavailable_reason.strip():
             raise ValueError("unavailable_reason must not be empty")
+        if isinstance(self.value, str) and not self.value.strip():
+            raise ValueError("observed string evidence must not be empty")
+        if isinstance(self.value, dict) and not self.value:
+            raise ValueError("observed structured evidence must not be empty")
         return self
 
 
@@ -111,9 +121,34 @@ class FailureEvidence(StrictModel):
     action_id: Optional[str] = None
     details: Dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def timestamp_is_aware(self) -> "FailureEvidence":
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must include a timezone")
+        return self
+
 
 class LifecycleEvent(StrictModel):
-    state_domain: str
+    state_domain: LifecycleDomain
     state: str
     occurred_at: datetime
     detail: Optional[str] = None
+
+    @model_validator(mode="after")
+    def state_matches_domain(self) -> "LifecycleEvent":
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must include a timezone")
+        allowed = {
+            LifecycleDomain.CAMPAIGN: {item.value for item in CampaignState},
+            LifecycleDomain.EXECUTION: {item.value for item in ExecutionState},
+            LifecycleDomain.CLEANUP: {item.value for item in CleanupState},
+        }
+        if self.state not in allowed[LifecycleDomain(self.state_domain)]:
+            raise ValueError(f"state {self.state!r} is invalid for {self.state_domain} lifecycle events")
+        return self
+
+
+def validate_event_chronology(events: Sequence[LifecycleEvent]) -> None:
+    for previous, current in zip(events, events[1:]):
+        if current.occurred_at < previous.occurred_at:
+            raise ValueError("lifecycle events must be chronological")

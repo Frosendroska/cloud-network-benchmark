@@ -1,9 +1,11 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 import yaml
 
 from cloud_network_benchmark.config import resolve_campaign
+from cloud_network_benchmark.contracts import ResolvedCampaign, ResolvedObservation
 from cloud_network_benchmark.errors import ValidationError
 
 
@@ -28,6 +30,32 @@ def test_resolves_one_observation_per_explicit_provider(repository_root: Path) -
     assert [item.provider for item in resolved.observations] == ["aws", "azure", "gcp"]
     assert all(item.measurement_direction == "vm_a_to_vm_b" for item in resolved.observations)
     assert all(item.vm_a.role == "vm_a" and item.vm_b.role == "vm_b" for item in resolved.observations)
+    assert resolved.options.provisioning_timeout_seconds == 900
+    assert all(item.options == resolved.options for item in resolved.observations)
+
+
+def test_resolved_models_enforce_parent_child_and_vm_role_invariants(repository_root: Path) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/experiments/exp-001-multi-provider.yaml", repository_root)
+    bad_set = resolved.model_dump(mode="json")
+    bad_set["selected_providers"] = ["aws"]
+    with pytest.raises(ValueError):
+        ResolvedCampaign.model_validate(bad_set)
+    bad_role = resolved.observations[0].model_dump(mode="json")
+    bad_role["vm_a"]["role"] = "vm_b"
+    with pytest.raises(ValueError):
+        ResolvedObservation.model_validate(bad_role)
+
+
+def test_resolved_timestamps_are_normalized_to_utc(repository_root: Path, tmp_path: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["scheduled_start"] = "2026-09-27T14:00:00+02:00"
+    root = tmp_path / "offset"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    resolved, _ = resolve_campaign(path, root)
+    assert resolved.scheduled_start == datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+    assert resolved.observations[0].scheduled_start == resolved.scheduled_start
 
 
 @pytest.mark.parametrize(("filename", "expected"), PRIMARY_MATRIX.items())
@@ -87,8 +115,9 @@ def test_invalid_provider_purchase_option_is_rejected(repository_root: Path, tmp
     path = root / "configs/tests/invalid.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    with pytest.raises(ValidationError, match="instance_market_type"):
+    with pytest.raises(ValidationError) as error:
         resolve_campaign(path, root)
+    assert "instance_market_type" in error.value.details["issues"][0]["message"]
 
 
 def test_rejects_selected_provider_mismatch(repository_root: Path, tmp_path: Path) -> None:
@@ -125,3 +154,77 @@ def test_all_scenario_invariants(repository_root: Path, tmp_path: Path, scenario
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     resolved, _ = resolve_campaign(path, root)
     assert resolved.scenario == scenario
+
+
+@pytest.mark.parametrize(
+    ("region_b", "zone_b"),
+    [("eu-west-2", "euw2-az1"), ("eu-central-1", "euc1-az2")],
+)
+def test_placement_optimization_requires_shared_region_and_zone(
+    repository_root: Path, tmp_path: Path, region_b: str, zone_b: str
+) -> None:
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["scenario"] = "placement_optimization"
+    aws = data["provider_configs"]["aws"]
+    aws["regions"]["vm_b"] = region_b
+    aws["zones"]["vm_b"] = zone_b
+    aws["placement"] = {"kind": "cluster_placement_group", "name": "bench"}
+    root = tmp_path / f"{region_b}-{zone_b}"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValidationError, match="share a region and zone"):
+        resolve_campaign(path, root)
+
+
+@pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization"])
+def test_s1_through_s3_require_multi_flow(repository_root: Path, tmp_path: Path, scenario: str) -> None:
+    filename = {
+        "same_zone": "exp-001-multi-provider.yaml",
+        "cross_zone": "exp-002-cross-zone.yaml",
+        "placement_optimization": "exp-003-placement-optimization.yaml",
+    }[scenario]
+    data = yaml.safe_load((repository_root / "configs/experiments" / filename).read_text())
+    data["benchmark"]["multi_flow"]["enabled"] = False
+    data["benchmark"]["multi_flow"]["parameters"] = {}
+    root = tmp_path / scenario
+    path = root / "configs/experiments/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValidationError) as error:
+        resolve_campaign(path, root)
+    assert "require multi_flow" in error.value.details["issues"][0]["message"]
+
+
+def test_inter_region_may_disable_multi_flow_without_stream_count(repository_root: Path, tmp_path: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-004-inter-region.yaml").read_text())
+    data["benchmark"]["multi_flow"]["parameters"] = {}
+    root = tmp_path / "inter-region"
+    path = root / "configs/experiments/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    resolved, _ = resolve_campaign(path, root)
+    assert resolved.benchmark.multi_flow.enabled is False
+    assert "upload_streams" not in resolved.benchmark.multi_flow.parameters
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "duplicate-key.yaml",
+        "malformed-id.yaml",
+        "missing-start.yaml",
+        "provider-mismatch.yaml",
+        "unknown-provider.yaml",
+        "unknown-scenario.yaml",
+        "contradictory-cross-zone.yaml",
+    ],
+)
+def test_executable_invalid_fixtures_are_rejected(repository_root: Path, tmp_path: Path, fixture: str) -> None:
+    source = repository_root / "tests/fixtures/configs/invalid" / fixture
+    root = tmp_path / fixture
+    path = root / "configs/tests" / fixture
+    path.parent.mkdir(parents=True)
+    path.write_bytes(source.read_bytes())
+    with pytest.raises(ValidationError):
+        resolve_campaign(path, root)

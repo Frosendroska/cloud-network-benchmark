@@ -20,4 +20,5 @@ def test_all_commands_remain_offline(repository_root: Path, tmp_path: Path, caps
 def test_json_errors_have_stable_shape(repository_root: Path, capsys: object) -> None:
     assert main(["validate", "--config", "configs/tests/does-not-exist.yaml", "--format", "json"]) == 3
     payload = json.loads(capsys.readouterr().err)
-    assert set(payload["error"]) >= {"code", "message", "field"}
+    assert set(payload["error"]) == {"error_code", "message", "field_path", "details"}
+    assert payload["error"]["error_code"] == "validation_error"
