@@ -1,0 +1,4 @@
+{
+  "successful": {"stage": "readiness", "role": "vm_a", "status": "ready", "actions": ["ssh-vm-a", "ssh-vm-b", "private-path", "server-health"]},
+  "failed": {"stage": "bootstrap", "role": "vm_b", "category": "bootstrap_failed", "message": "package install failed", "stdout": "password=[REDACTED]"}
+}

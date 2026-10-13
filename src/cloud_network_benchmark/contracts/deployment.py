@@ -190,8 +190,8 @@ class ProviderVmOutput(StrictModel):
 class ProviderDeploymentOutput(StrictModel):
     run_id: str = Field(min_length=1)
     provider: Provider
-    scenario: Scenario
-    apply_action_id: str = Field(min_length=1)
+    scenario: Optional[Scenario] = None
+    apply_action_id: str
     started_at: datetime
     finished_at: datetime
     vm_a: ProviderVmOutput
