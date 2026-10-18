@@ -160,3 +160,7 @@ The feature is ready for implementation review when all 35 tasks are complete, t
 ## Phase 9: Convergence
 
 - [X] T050 Pass the configured SSH `authentication_reference` as the runtime identity option in `_request()` in `src/cloud_network_benchmark/access.py`, while retaining secret-reference redaction, and add an exact argv contract test per FR-001, FR-006, and T044 (partial)
+
+## Phase 10: Convergence follow-up
+
+- [X] T051 [US2] Align the default benchmark-server readiness command and healthy-output predicate so a successful default `systemctl` health check can reach ready state; add a fake-backed regression test for default readiness success while preserving explicit configured healthy conditions per FR-010 and FR-011 (partial)
