@@ -11,8 +11,10 @@ from .contracts.execution import CommandRunner
 
 class ReadinessConfig(StrictModel):
     private_path_command: List[str] = Field(default_factory=lambda: ["ping", "-c", "1"])
-    server_health_command: List[str] = Field(default_factory=lambda: ["systemctl", "is-active", "--quiet", "netserver"])
-    success_output: str | None = "ready"
+    server_health_command: List[str] = Field(default_factory=lambda: ["systemctl", "is-active", "netserver"])
+    success_output: str | None = None
+    private_path_success_output: str | None = None
+    server_success_output: str | None = "active"
     poll_attempts: int = Field(default=1, ge=1)
     bootstrap_succeeded: bool = True
 
@@ -38,14 +40,20 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
             attempts += 1
             result = runner.run(_request(name, vm, argv, timeout))
             actions.append(RemoteActionEvidence(action_id=name, action_type="ssh", vm_id=vm.host, role=vm.role, result=result))
-            healthy = config.success_output is None or result.stdout.strip() == config.success_output
+            expected_output = config.success_output
+            if expected_output is None:
+                expected_output = config.private_path_success_output if name == "private-path" else config.server_success_output if name == "server-health" else None
+            healthy = expected_output is None or result.stdout.strip() == expected_output
             if result.outcome == CommandOutcome.SUCCEEDED and (name not in {"private-path", "server-health"} or healthy):
                 break
             if time.monotonic() >= deadline:
                 break
         if result is None:
             raise RuntimeError("readiness runner returned no result")
-        healthy = config.success_output is None or result.stdout.strip() == config.success_output
+        expected_output = config.success_output
+        if expected_output is None:
+            expected_output = config.private_path_success_output if name == "private-path" else config.server_success_output if name == "server-health" else None
+        healthy = expected_output is None or result.stdout.strip() == expected_output
         if result.outcome != CommandOutcome.SUCCEEDED or (name in {"private-path", "server-health"} and not healthy):
             category = "readiness_timeout" if result.outcome == CommandOutcome.TIMED_OUT else ("private_path_failed" if name == "private-path" else "server_not_ready" if name == "server-health" else "ssh_failed")
             failure = _failure("readiness", vm, category, result, f"{name} readiness failed")
