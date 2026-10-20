@@ -26,4 +26,13 @@ No cloud, credential, Terraform, or benchmark operation was run. Historical `spe
 
 ## Implementation validation
 
-Results will be recorded here with the exact tested source HEAD, commands, exit codes and limitations after the implementation tasks are complete. Schema export/check, the quickstart CLI routes, `git diff --check`, and required CI status have not yet been run.
+Foundation checkpoint (source HEAD is the implementation worktree state after T004):
+
+```bash
+PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_v2_common.py tests/unit/test_v2_admission_artifacts.py
+```
+
+Exit 0: **14 passed**. This checks common identity/status/evidence rules, schedule/admission shapes,
+provider expiry semantics, safe artifact paths, symlink containment and verification evidence.
+The full suite is not yet run after implementation changes. Schema export/check, quickstart CLI
+routes, `git diff --check` for the final delivery head, and required CI status remain pending.

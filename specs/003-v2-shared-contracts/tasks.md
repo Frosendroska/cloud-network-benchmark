@@ -12,13 +12,13 @@ Data-model.md and contracts/shared-contracts.md are normative for every listed f
 
 ## Phase 1: Setup
 
-- [ ] T001 Record the base/environment and known 203-pass/3-failure baseline in docs/f01r-offline-validation.md; keep specs/001-core-offline-contracts/ and specs/002-vm-access-bootstrap/ byte-identical (FR-001, FR-024).
+- [X] T001 Record the base/environment and known 203-pass/3-failure baseline in docs/f01r-offline-validation.md; keep specs/001-core-offline-contracts/ and specs/002-vm-access-bootstrap/ byte-identical (FR-001, FR-024).
 
 ## Phase 2: Foundational contracts
 
-- [ ] T002 Add V2 common enums/identity/status records in src/cloud_network_benchmark/contracts/common.py and exports in src/cloud_network_benchmark/contracts/__init__.py, with `schema_version: 2` on public envelopes, identifier pattern `^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$`, finite Evidence values, explicit pending statuses and preserved existing execution/cleanup enum values; add focused tests/unit/test_v2_common.py (FR-001, FR-010, FR-017).
-- [ ] T003 Define strict ScheduleEntry and AdmissionRequirements in src/cloud_network_benchmark/contracts/admission.py: config-id pattern `^[a-z0-9][a-z0-9_-]{0,63}$`, aware-or-null scheduled time, original row/header/hash evidence, exact 1200/1800/87600-second caps, `$300`/`$50`, dated source evidence and scenario/mode-derived prerequisites; validate fields only, no CSV reader/budget admission (FR-002, FR-008, FR-009, FR-019).
-- [ ] T004 Define mode-aware ArtifactLayout/ArtifactInput declarations in src/cloud_network_benchmark/contracts/artifacts.py using contracts/shared-contracts.md paths, normalized root-contained POSIX destinations, producer/unit identity and `required/optional/not_expected`; separate concrete path from dynamic chunk template and remove FLENT slots (FR-003, FR-014).
+- [X] T002 Add V2 common enums/identity/status records in src/cloud_network_benchmark/contracts/common.py and exports in src/cloud_network_benchmark/contracts/__init__.py, with `schema_version: 2` on public envelopes, identifier pattern `^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$`, finite Evidence values, explicit pending statuses and preserved existing execution/cleanup enum values; add focused tests/unit/test_v2_common.py (FR-001, FR-010, FR-017).
+- [X] T003 Define strict ScheduleEntry and AdmissionRequirements in src/cloud_network_benchmark/contracts/admission.py: config-id pattern `^[a-z0-9][a-z0-9_-]{0,63}$`, aware-or-null scheduled time, original row/header/hash evidence, exact 1200/1800/87600-second caps, `$300`/`$50`, dated source evidence and scenario/mode-derived prerequisites; validate fields only, no CSV reader/budget admission (FR-002, FR-008, FR-009, FR-019).
+- [X] T004 Define mode-aware ArtifactLayout/ArtifactInput declarations in src/cloud_network_benchmark/contracts/artifacts.py using contracts/shared-contracts.md paths, normalized root-contained POSIX destinations, producer/unit identity and `required/optional/not_expected`; separate concrete path from dynamic chunk template and remove FLENT slots (FR-003, FR-014).
 
 ## Phase 3: User Story 1 - Describe V2 intent (Priority: P1, MVP)
 

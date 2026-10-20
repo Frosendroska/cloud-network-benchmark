@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 from pydantic import Field, model_validator
 
-from .artifacts import ArtifactLayout
+from .artifacts import ArtifactInput, ArtifactLayout
 from .common import (
     ArtifactExpectation,
     BenchmarkPhase,
@@ -19,11 +19,6 @@ from .common import (
     StructuredEvidence,
     VmRole,
 )
-
-
-class ArtifactInput(StrictModel):
-    path: str
-    expectation: ArtifactExpectation
 
 
 class ValidatorInput(StrictModel):
