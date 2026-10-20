@@ -48,7 +48,10 @@ build/
 
 # Local Codex and SpecKit tooling
 .agents/skills/
-.specify/
+.specify/*
+!.specify/memory/
+.specify/memory/*
+!.specify/memory/constitution.md
 
 # Benchmark output
 results/raw/*
@@ -59,3 +62,8 @@ results/processed/*
 # Keep lightweight manifests trackable by default.
 !results/manifests/
 !results/manifests/.gitkeep
+
+
+# Local autonomous coordinator checkpoints and logs (recover from Git/PRs as needed).
+.codex/autonomous-state.json
+.codex/autonomous-evidence/
