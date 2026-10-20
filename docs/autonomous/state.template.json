@@ -1,0 +1,114 @@
+{
+  "workflow": "offline-v2",
+  "status": "ready",
+  "coordinator_thread_id": null,
+  "coordinator_checkout": null,
+  "heartbeat_id": null,
+  "updated_at": null,
+  "sources": {},
+  "models": {
+    "coordinator": [
+      "gpt-6.1-sol",
+      "medium"
+    ],
+    "planner": [
+      "gpt-6.1-sol",
+      "high"
+    ],
+    "implementer": [
+      "gpt-6-luna",
+      "medium"
+    ],
+    "converger": [
+      "gpt-6.1-sol",
+      "medium"
+    ]
+  },
+  "next_action": "Preflight and start R00 only when KICKOFF is invoked.",
+  "features": {
+    "R00": {
+      "depends_on": [],
+      "stage": "pending"
+    },
+    "F01R": {
+      "depends_on": [
+        "R00"
+      ],
+      "stage": "pending"
+    },
+    "F02R": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F03": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F04": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F05": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F06": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F07": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F08": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F11": {
+      "depends_on": [
+        "F01R"
+      ],
+      "stage": "pending"
+    },
+    "F12": {
+      "depends_on": [
+        "F08"
+      ],
+      "stage": "pending"
+    },
+    "F09": {
+      "depends_on": [
+        "F02R",
+        "F03",
+        "F04",
+        "F05",
+        "F06",
+        "F07",
+        "F08",
+        "F11"
+      ],
+      "stage": "pending"
+    },
+    "F10": {
+      "depends_on": [
+        "F09",
+        "F12"
+      ],
+      "stage": "pending"
+    }
+  }
+}

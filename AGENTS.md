@@ -95,3 +95,18 @@ surface the exact mismatch. Do not silently choose a different research design.
 - Do not add object storage, remote state, agents, databases, queues, Packer, containers, or
   telemetry platforms unless the user explicitly changes the design.
 - Implementation changes belong in this repository; thesis interpretation and canonical figures do not.
+
+
+## Autonomous implementation workflow
+
+For an explicitly launched autonomous V2 implementation, follow
+`docs/autonomous/WORKFLOW.md` and use `docs/autonomous/KICKOFF.md` to start.
+The coordinator may delegate eligible feature stages to model-configured subagents;
+each feature still has one branch/worktree and one writer at a time. The coordinator
+owns dependency scheduling, merges and factual Thesis progress updates. Under the
+user's explicit workflow authorization, agent artifact checks replace routine human
+review pauses; the constitution, research boundaries and tool permissions remain.
+
+The setup is not execution evidence. R00 must reconcile the legacy FLENT governance
+with the current V2 sources before any V2 benchmark feature implementation. Do not
+silently bypass that source conflict or run paid experiments.
