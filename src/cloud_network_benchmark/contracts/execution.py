@@ -19,11 +19,15 @@ class CommandRequest(StrictModel):
     environment_classification: Literal["none", "non_secret", "contains_secret_references"] = "none"
     timeout_seconds: float = Field(gt=0)
     stdin: Optional[str] = Field(default=None, exclude=True)
+    redactions: List[str] = Field(default_factory=list, exclude=True)
 
     def durable_view(self) -> Dict[str, object]:
         payload = self.model_dump()
         payload["environment_keys"] = sorted(self.environment)
         payload["stdin_supplied"] = self.stdin is not None
+        for secret in sorted((item for item in self.redactions if item), key=len, reverse=True):
+            payload["argv"] = [item.replace(secret, "[REDACTED]") for item in payload["argv"]]
+            payload["cwd"] = payload["cwd"].replace(secret, "[REDACTED]")
         return payload
 
 
@@ -61,6 +65,7 @@ class CommandResult(StrictModel):
         for secret in sorted((item for item in self.redactions if item), key=len, reverse=True):
             payload["stdout"] = payload["stdout"].replace(secret, "[REDACTED]")
             payload["stderr"] = payload["stderr"].replace(secret, "[REDACTED]")
+            payload["argv"] = [item.replace(secret, "[REDACTED]") for item in payload.get("argv", [])]
         payload["redactions_applied"] = bool(self.redactions)
         return payload
 
@@ -102,6 +107,7 @@ class SubprocessCommandRunner:
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
+            redactions=request.redactions,
         )
 
 

@@ -1,26 +1,103 @@
-schema_version: 1
-experiment_id: EXP-990
-selected_providers: [aws]
-scenario: same_zone
+admission:
+  cost_input_id: 2026-10-14-provider-price-inputs
+  cost_input_sha256:
+    unavailable_reason: linked Thesis run-register Sheet snapshot hash is not present
+      in this repository
+  estimated_cost_usd:
+    unavailable_reason: scenario-specific estimate is resolved by F11 from the dated
+      run register
+  hard_budget_usd: 300
+  lifetime_cap_seconds: 1200
+  prices_checked_on: '2026-10-14'
+  priority: P0
+  protected_buffer_usd: 50
+  requires_common_n: false
+  requires_expiry: true
+  requires_primary_review: false
+  requires_schedule: false
 benchmark:
-  idle_latency: {enabled: true, test_name: ping, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
-  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
-  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 10, timeout_seconds: 30, parameters: {upload_streams: 1}}
-  execution_order: [idle_latency, single_flow, multi_flow]
-provider_configs:
-  aws:
-    provider: aws
-    regions: {vm_a: eu-central-1, vm_b: eu-central-1}
-    zones: {vm_a: euc1-az1, vm_b: euc1-az1}
-    vm_shape: t3.small
-    image: ubuntu-24.04
-    connection_user: ubuntu
-    documented_network_limit: null
-    placement: {kind: none, name: null}
-    provider_options: {instance_market_type: on_demand}
+  common_n:
+    common_n: null
+    plateau_found: null
+    source_campaign_id: null
+    source_sha256: null
+    state: pending
+  full_rtt: true
+  measured_seconds: 10
+  no_rdtsc: true
+  pause_seconds: 10
+  probe_bytes: 64
+  probe_chunk_seconds: null
+  probe_lead_seconds: 2
+  probe_mps: 1000
+  reply_every: 1
+  sample_interval_seconds: 1
+  stabilization_seconds: 60
+  tcp_buffer_bytes: 131072
+  tcp_congestion_control: cubic
+  tcp_zerocopy: true
+  warmup_seconds: 5
+config_id: exp-900-acceptance
+context: failure_check
+experiment_id: EXP-900
+mode: acceptance
 options:
-  labels: {purpose: invalid-fixture}
+  cleanup_timeout_seconds: 300
+  labels:
+    purpose: framework-smoke-test
   provisioning_timeout_seconds: 300
   readiness_timeout_seconds: 300
-  cleanup_timeout_seconds: 300
-
+provider_configs:
+  aws:
+    acceleration:
+      kind: ena
+    connection_user: ubuntu
+    disk:
+      kind: gp3
+      size_gib: 32
+    documented_network_limit: null
+    image: ubuntu-24.04
+    network:
+      address_spaces:
+        eu-central-1: 10.60.0.0/16
+      default_offloads: true
+      dscp: 0
+      ecn: false
+      mtu: 1460
+      private_ipv4: true
+      public_ipv4_per_vm: 1
+      subnets:
+        eu-central-1:
+        - 10.60.1.0/24
+      tcp_congestion_control: cubic
+    os:
+      architecture: amd64
+      distribution: ubuntu
+      release: '24.04'
+    placement:
+      kind: none
+      name: null
+    provider: aws
+    provider_options:
+      instance_market_type: on_demand
+    regions:
+      vm_a: eu-central-1
+      vm_b: eu-central-1
+    security:
+      batch_mode: true
+      benchmark_source: vm_a_private
+      controller_cidr:
+        unavailable_reason: controller public IPv4 /32 not observed at configuration
+          authoring
+      iperf3_tcp_port: 5201
+      sockperf_udp_port: 11111
+      strict_host_key_checking: true
+    vm_shape: t3.small
+    zones:
+      vm_a: eu-central-1a
+      vm_b: eu-central-1a
+scenario: same_zone
+scheduled_start: tomorrow
+schema_version: 2
+selected_providers:
+- aws

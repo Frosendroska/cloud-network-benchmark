@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 def test_ssh_alone_does_not_grant_readiness():
     t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
+    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
     class Runner:
         def run(self, request):
             now = datetime.now(timezone.utc)
@@ -19,7 +19,7 @@ def test_ssh_alone_does_not_grant_readiness():
 
 def test_default_readiness_accepts_successful_private_path_and_active_server():
     t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
+    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
 
     class Runner:
         def run(self, request):

@@ -1,0 +1,1318 @@
+{
+  "$defs": {
+    "AccelerationIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "ena",
+            "accelerated_networking",
+            "gvnic"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "AccelerationIntent",
+      "type": "object"
+    },
+    "AdmissionRequirements": {
+      "additionalProperties": false,
+      "properties": {
+        "cost_input_id": {
+          "minLength": 1,
+          "title": "Cost Input Id",
+          "type": "string"
+        },
+        "cost_input_sha256": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "estimated_cost_usd": {
+          "$ref": "#/$defs/Evidence_float_"
+        },
+        "hard_budget_usd": {
+          "const": 300,
+          "default": 300,
+          "title": "Hard Budget Usd",
+          "type": "integer"
+        },
+        "lifetime_cap_seconds": {
+          "enum": [
+            1200,
+            1800,
+            87600
+          ],
+          "title": "Lifetime Cap Seconds",
+          "type": "integer"
+        },
+        "prices_checked_on": {
+          "format": "date",
+          "title": "Prices Checked On",
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "title": "Priority",
+          "type": "string"
+        },
+        "protected_buffer_usd": {
+          "const": 50,
+          "default": 50,
+          "title": "Protected Buffer Usd",
+          "type": "integer"
+        },
+        "requires_common_n": {
+          "title": "Requires Common N",
+          "type": "boolean"
+        },
+        "requires_expiry": {
+          "title": "Requires Expiry",
+          "type": "boolean"
+        },
+        "requires_primary_review": {
+          "title": "Requires Primary Review",
+          "type": "boolean"
+        },
+        "requires_schedule": {
+          "title": "Requires Schedule",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "priority",
+        "lifetime_cap_seconds",
+        "cost_input_id",
+        "prices_checked_on",
+        "cost_input_sha256",
+        "estimated_cost_usd",
+        "requires_common_n",
+        "requires_schedule",
+        "requires_primary_review",
+        "requires_expiry"
+      ],
+      "title": "AdmissionRequirements",
+      "type": "object"
+    },
+    "CampaignOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "cleanup_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cleanup Timeout Seconds"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "provisioning_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provisioning Timeout Seconds"
+        },
+        "readiness_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readiness Timeout Seconds"
+        }
+      },
+      "title": "CampaignOptions",
+      "type": "object"
+    },
+    "DiskIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "gp3",
+            "StandardSSD_LRS_E4",
+            "pd-balanced"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "size_gib": {
+          "const": 32,
+          "default": 32,
+          "title": "Size Gib",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "DiskIntent",
+      "type": "object"
+    },
+    "Evidence_Dict_str__Any__": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "minProperties": 1,
+                  "type": "object"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[Dict[str, Any]]",
+      "type": "object"
+    },
+    "Evidence_ExpiryEvidence_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ExpiryEvidence"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpiryEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Evidence[ExpiryEvidence]",
+      "type": "object"
+    },
+    "Evidence_ReservationEvidence_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReservationEvidence"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReservationEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Evidence[ReservationEvidence]",
+      "type": "object"
+    },
+    "Evidence_datetime_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[datetime]",
+      "type": "object"
+    },
+    "Evidence_float_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "number"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[float]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "ExperimentMode": {
+      "enum": [
+        "acceptance",
+        "calibration",
+        "short_study",
+        "diagnostic_day"
+      ],
+      "title": "ExperimentMode",
+      "type": "string"
+    },
+    "ExpiryEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "stop",
+            "deallocate"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "deployment_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Evidence_datetime_"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "provider_metadata": {
+          "$ref": "#/$defs/Evidence_Dict_str__Any__"
+        },
+        "registered_at": {
+          "$ref": "#/$defs/Evidence_datetime_"
+        },
+        "registration_id": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "not_registered",
+            "registered",
+            "failed",
+            "cancelled",
+            "triggered"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "target_selector": {
+          "minLength": 1,
+          "title": "Target Selector",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "deployment_id",
+        "provider",
+        "action",
+        "state",
+        "registration_id",
+        "registered_at",
+        "expires_at",
+        "target_selector",
+        "provider_metadata"
+      ],
+      "title": "ExpiryEvidence",
+      "type": "object"
+    },
+    "FailureEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Id"
+        },
+        "category": {
+          "minLength": 1,
+          "title": "Category",
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "message",
+        "occurred_at"
+      ],
+      "title": "FailureEvidence",
+      "type": "object"
+    },
+    "NetworkIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "address_spaces": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Address Spaces",
+          "type": "object"
+        },
+        "default_offloads": {
+          "const": true,
+          "default": true,
+          "title": "Default Offloads",
+          "type": "boolean"
+        },
+        "dscp": {
+          "const": 0,
+          "default": 0,
+          "title": "Dscp",
+          "type": "integer"
+        },
+        "ecn": {
+          "const": false,
+          "default": false,
+          "title": "Ecn",
+          "type": "boolean"
+        },
+        "mtu": {
+          "const": 1460,
+          "default": 1460,
+          "title": "Mtu",
+          "type": "integer"
+        },
+        "private_ipv4": {
+          "const": true,
+          "default": true,
+          "title": "Private Ipv4",
+          "type": "boolean"
+        },
+        "public_ipv4_per_vm": {
+          "const": 1,
+          "default": 1,
+          "title": "Public Ipv4 Per Vm",
+          "type": "integer"
+        },
+        "subnets": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Subnets",
+          "type": "object"
+        },
+        "tcp_congestion_control": {
+          "const": "cubic",
+          "default": "cubic",
+          "title": "Tcp Congestion Control",
+          "type": "string"
+        }
+      },
+      "required": [
+        "address_spaces",
+        "subnets"
+      ],
+      "title": "NetworkIntent",
+      "type": "object"
+    },
+    "OperatingSystemIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "const": "amd64",
+          "default": "amd64",
+          "title": "Architecture",
+          "type": "string"
+        },
+        "distribution": {
+          "const": "ubuntu",
+          "default": "ubuntu",
+          "title": "Distribution",
+          "type": "string"
+        },
+        "release": {
+          "const": "24.04",
+          "default": "24.04",
+          "title": "Release",
+          "type": "string"
+        }
+      },
+      "title": "OperatingSystemIntent",
+      "type": "object"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "properties": {
+        "collocated": {
+          "default": false,
+          "title": "Collocated",
+          "type": "boolean"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_distance": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Distance"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "title": "Placement",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "ReservationEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "campaign_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Campaign Id",
+          "type": "string"
+        },
+        "cap_start_policy_id": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "cap_started_at": {
+          "$ref": "#/$defs/Evidence_datetime_"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Evidence_datetime_"
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "reservation_id": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "reserved_cost_usd": {
+          "$ref": "#/$defs/Evidence_float_"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source_path": {
+          "minLength": 1,
+          "title": "Source Path",
+          "type": "string"
+        },
+        "source_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Source Sha256",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "not_evaluated",
+            "reserved",
+            "rejected",
+            "released"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "campaign_id",
+        "reservation_id",
+        "state",
+        "reserved_cost_usd",
+        "cap_started_at",
+        "expires_at",
+        "cap_start_policy_id",
+        "source_path",
+        "source_sha256"
+      ],
+      "title": "ReservationEvidence",
+      "type": "object"
+    },
+    "Scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ],
+      "title": "Scenario",
+      "type": "string"
+    },
+    "SecurityIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "batch_mode": {
+          "const": true,
+          "default": true,
+          "title": "Batch Mode",
+          "type": "boolean"
+        },
+        "benchmark_source": {
+          "const": "vm_a_private",
+          "default": "vm_a_private",
+          "title": "Benchmark Source",
+          "type": "string"
+        },
+        "controller_cidr": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "iperf3_tcp_port": {
+          "const": 5201,
+          "default": 5201,
+          "title": "Iperf3 Tcp Port",
+          "type": "integer"
+        },
+        "sockperf_udp_port": {
+          "const": 11111,
+          "default": 11111,
+          "title": "Sockperf Udp Port",
+          "type": "integer"
+        },
+        "strict_host_key_checking": {
+          "const": true,
+          "default": true,
+          "title": "Strict Host Key Checking",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "controller_cidr"
+      ],
+      "title": "SecurityIntent",
+      "type": "object"
+    },
+    "VmIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "acceleration": {
+          "$ref": "#/$defs/AccelerationIntent"
+        },
+        "connection_user": {
+          "minLength": 1,
+          "title": "Connection User",
+          "type": "string"
+        },
+        "disk": {
+          "$ref": "#/$defs/DiskIntent"
+        },
+        "function": {
+          "minLength": 1,
+          "title": "Function",
+          "type": "string"
+        },
+        "image": {
+          "minLength": 1,
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntent"
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystemIntent"
+        },
+        "region": {
+          "minLength": 1,
+          "title": "Region",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/VmRole"
+        },
+        "security": {
+          "$ref": "#/$defs/SecurityIntent"
+        },
+        "vm_shape": {
+          "minLength": 1,
+          "title": "Vm Shape",
+          "type": "string"
+        },
+        "zone": {
+          "minLength": 1,
+          "title": "Zone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "function",
+        "region",
+        "zone",
+        "vm_shape",
+        "image",
+        "connection_user",
+        "disk",
+        "network",
+        "security",
+        "acceleration"
+      ],
+      "title": "VmIntent",
+      "type": "object"
+    },
+    "VmRole": {
+      "enum": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "VmRole",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "admission": {
+      "$ref": "#/$defs/AdmissionRequirements"
+    },
+    "bootstrap_inputs": {
+      "additionalProperties": true,
+      "title": "Bootstrap Inputs",
+      "type": "object"
+    },
+    "bootstrap_template": {
+      "title": "Bootstrap Template",
+      "type": "string"
+    },
+    "campaign_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "campaign_options": {
+      "$ref": "#/$defs/CampaignOptions"
+    },
+    "child_result_path": {
+      "title": "Child Result Path",
+      "type": "string"
+    },
+    "cleanup_timeout_seconds": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cleanup Timeout Seconds"
+    },
+    "config_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "title": "Config Id",
+      "type": "string"
+    },
+    "config_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Config Sha256",
+      "type": "string"
+    },
+    "context": {
+      "enum": [
+        "standard",
+        "failure_check",
+        "replacement"
+      ],
+      "title": "Context",
+      "type": "string"
+    },
+    "deployment_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "design_git_commit": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "experiment_id": {
+      "pattern": "^EXP-[0-9]{3,}$",
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "expiry": {
+      "$ref": "#/$defs/Evidence_ExpiryEvidence_"
+    },
+    "implementation_git_commit": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExperimentMode"
+    },
+    "observation_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Observation Id",
+      "type": "string"
+    },
+    "placement": {
+      "$ref": "#/$defs/Placement"
+    },
+    "provider": {
+      "$ref": "#/$defs/Provider"
+    },
+    "provider_options": {
+      "additionalProperties": true,
+      "title": "Provider Options",
+      "type": "object"
+    },
+    "provisioning_timeout_seconds": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Provisioning Timeout Seconds"
+    },
+    "readiness_timeout_seconds": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Readiness Timeout Seconds"
+    },
+    "replaces_run_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Replaces Run Id"
+    },
+    "reservation": {
+      "$ref": "#/$defs/Evidence_ReservationEvidence_"
+    },
+    "resolved_sha256": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scenario": {
+      "$ref": "#/$defs/Scenario"
+    },
+    "scheduled_start": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scheduled Start"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "terraform_directory": {
+      "title": "Terraform Directory",
+      "type": "string"
+    },
+    "vm_a": {
+      "$ref": "#/$defs/VmIntent"
+    },
+    "vm_b": {
+      "$ref": "#/$defs/VmIntent"
+    }
+  },
+  "required": [
+    "schema_version",
+    "config_id",
+    "mode",
+    "context",
+    "observation_id",
+    "deployment_id",
+    "campaign_id",
+    "run_id",
+    "experiment_id",
+    "provider",
+    "scenario",
+    "scheduled_start",
+    "vm_a",
+    "vm_b",
+    "placement",
+    "provider_options",
+    "campaign_options",
+    "bootstrap_template",
+    "terraform_directory",
+    "child_result_path",
+    "config_sha256",
+    "implementation_git_commit",
+    "design_git_commit",
+    "admission"
+  ],
+  "title": "ProviderDeploymentInput",
+  "type": "object"
+}

@@ -8,7 +8,7 @@ from cloud_network_benchmark.contracts.execution import CommandResult, ScriptedC
 
 def conn() -> ConnectionOutput:
     t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    return ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
+    return ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
 
 
 def result(action: str) -> CommandResult:

@@ -1,0 +1,329 @@
+{
+  "$defs": {
+    "Evidence_Dict_str__Any__": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "minProperties": 1,
+                  "type": "object"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[Dict[str, Any]]",
+      "type": "object"
+    },
+    "Evidence_int_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[int]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "VmRole": {
+      "enum": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "VmRole",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acceleration": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "actual_shape": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "congestion_control": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "cpu_model": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "deployment_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "documented_network_limit": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
+    },
+    "image": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "kernel": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "mtu": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "nic_driver": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "observed_region": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "observed_zone": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "physical_zone_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "provider": {
+      "$ref": "#/$defs/Provider"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_builds": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
+    },
+    "tool_versions": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
+    },
+    "vm_role": {
+      "$ref": "#/$defs/VmRole"
+    }
+  },
+  "required": [
+    "schema_version",
+    "deployment_id",
+    "vm_role",
+    "provider",
+    "cpu_model",
+    "nic_driver",
+    "acceleration",
+    "image",
+    "kernel",
+    "congestion_control",
+    "tool_versions",
+    "source_builds",
+    "documented_network_limit",
+    "mtu",
+    "observed_region",
+    "observed_zone",
+    "physical_zone_id",
+    "actual_shape"
+  ],
+  "title": "VmMetadata",
+  "type": "object"
+}

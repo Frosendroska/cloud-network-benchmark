@@ -35,10 +35,12 @@ def test_stable_enum_values() -> None:
 
 def test_canonical_artifact_paths() -> None:
     assert ARTIFACTS.config_snapshot == "config.yaml"
-    assert ARTIFACTS.provider_outputs == "terraform-outputs.json"
-    assert ARTIFACTS.idle_flent == "flent/idle.flent.gz"
+    assert ARTIFACTS.resolved_snapshot == "config.resolved.json"
+    assert ARTIFACTS.provider_outputs == "terraform-outputs.redacted.json"
+    assert ARTIFACTS.day_probe_csv_template == "measurements/day/probes/{chunk_id}.csv"
     assert ARTIFACTS.vm_a_metadata == "metadata/vm_a.json"
     assert ARTIFACTS.validation_summary == "validation/summary.txt"
+    assert not any("flent" in key.lower() for key in ARTIFACTS.model_dump())
 
 
 def test_artifact_paths_cannot_be_overridden() -> None:

@@ -1,0 +1,264 @@
+{
+  "$defs": {
+    "Evidence_float_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "number"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[float]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "ExperimentMode": {
+      "enum": [
+        "acceptance",
+        "calibration",
+        "short_study",
+        "diagnostic_day"
+      ],
+      "title": "ExperimentMode",
+      "type": "string"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "active_reserved_usd": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "campaign_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "config_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "title": "Config Id",
+      "type": "string"
+    },
+    "estimated_cost_usd": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "incurred_cost_usd": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "lifetime_cap_seconds": {
+      "enum": [
+        1200,
+        1800,
+        87600
+      ],
+      "title": "Lifetime Cap Seconds",
+      "type": "integer"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExperimentMode"
+    },
+    "outstanding_cleanup": {
+      "title": "Outstanding Cleanup",
+      "type": "boolean"
+    },
+    "priority": {
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "schedule_entry_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "selected_providers": {
+      "items": {
+        "$ref": "#/$defs/Provider"
+      },
+      "minItems": 1,
+      "title": "Selected Providers",
+      "type": "array"
+    },
+    "source_path": {
+      "minLength": 1,
+      "title": "Source Path",
+      "type": "string"
+    },
+    "source_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Source Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "campaign_id",
+    "config_id",
+    "schedule_entry_id",
+    "selected_providers",
+    "mode",
+    "priority",
+    "lifetime_cap_seconds",
+    "estimated_cost_usd",
+    "source_path",
+    "source_sha256",
+    "incurred_cost_usd",
+    "active_reserved_usd",
+    "outstanding_cleanup"
+  ],
+  "title": "ReservationRequest",
+  "type": "object"
+}

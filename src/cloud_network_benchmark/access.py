@@ -92,7 +92,7 @@ def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], 
     command = ["ssh", "-p", str(connection.port)]
     command.extend(["-i", connection.authentication_reference])
     if connection.host_key_reference:
-        command.extend(["-o", f"UserKnownHostsFile={connection.host_key_reference}"])
+        command.extend(["-o", f"UserKnownHostsFile={connection.host_key_reference}", "-o", "StrictHostKeyChecking=yes"])
     command.extend([f"{connection.user}@{connection.host}", *argv])
     return CommandRequest(action_id=action_id, action_type=action_type, argv=command, cwd=".", environment_classification="contains_secret_references", timeout_seconds=timeout)
 

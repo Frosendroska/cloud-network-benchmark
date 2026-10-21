@@ -1,84 +1,70 @@
-import json
+from __future__ import annotations
+
 from pathlib import Path
 
-import yaml
 import pytest
-from jsonschema import Draft202012Validator, FormatChecker
+import yaml
 
 from cloud_network_benchmark.contracts import CampaignConfiguration
 
 
-def test_all_executable_configs_validate_with_schema_and_runtime(repository_root: Path) -> None:
-    schema = json.loads((repository_root / "specs/001-core-offline-contracts/contracts/campaign-config.schema.json").read_text())
+def test_all_ten_configs_are_strict_v2_contracts(repository_root: Path) -> None:
     paths = sorted((repository_root / "configs/experiments").glob("*.yaml")) + sorted((repository_root / "configs/tests").glob("*.yaml"))
-    assert len(paths) == 8
+    assert len(paths) == 10
+    identities = set()
     for path in paths:
-        data = yaml.safe_load(path.read_text())
-        Draft202012Validator(schema, format_checker=FormatChecker()).validate(data)
-        runtime = CampaignConfiguration.model_validate(data)
-        assert runtime.model_dump(mode="json") == data
-
-
-@pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization"])
-def test_schema_and_runtime_reject_disabled_multi_flow_for_s1_to_s3(repository_root: Path, scenario: str) -> None:
-    schema = json.loads((repository_root / "specs/001-core-offline-contracts/contracts/campaign-config.schema.json").read_text())
-    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
-    data["scenario"] = scenario
-    data["benchmark"]["multi_flow"]["enabled"] = False
-    data["benchmark"]["multi_flow"]["parameters"] = {}
-    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(data))
-    with pytest.raises(ValueError):
-        CampaignConfiguration.model_validate(data)
-
-
-def test_schema_and_runtime_accept_disabled_multi_flow_without_streams_for_s4(repository_root: Path) -> None:
-    schema = json.loads((repository_root / "specs/001-core-offline-contracts/contracts/campaign-config.schema.json").read_text())
-    data = yaml.safe_load((repository_root / "configs/experiments/exp-004-inter-region.yaml").read_text())
-    data["benchmark"]["multi_flow"]["parameters"] = {}
-    Draft202012Validator(schema, format_checker=FormatChecker()).validate(data)
-    assert CampaignConfiguration.model_validate(data).benchmark.multi_flow.parameters == {}
-
-
-def test_schema_and_runtime_require_positive_streams_when_multi_flow_is_enabled(repository_root: Path) -> None:
-    schema = json.loads((repository_root / "specs/001-core-offline-contracts/contracts/campaign-config.schema.json").read_text())
-    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
-    data["benchmark"]["multi_flow"]["parameters"] = {}
-    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(data))
-    with pytest.raises(ValueError):
-        CampaignConfiguration.model_validate(data)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        config = CampaignConfiguration.model_validate(data)
+        assert config.schema_version == 2
+        assert config.config_id not in identities
+        identities.add(config.config_id)
+        assert set(config.selected_providers) == set(config.provider_configs)
+        assert config.admission.hard_budget_usd == 300
+        assert config.admission.protected_buffer_usd == 50
+        assert config.admission.estimated_cost_usd.value is None
+        assert config.scheduled_start is None
 
 
 @pytest.mark.parametrize(
-    "path",
-    [
-        ("provider_configs", "aws", "regions", "vm_a"),
-        ("provider_configs", "aws", "regions", "vm_b"),
-        ("provider_configs", "aws", "zones", "vm_a"),
-        ("provider_configs", "aws", "zones", "vm_b"),
-        ("provider_configs", "aws", "vm_shape"),
-        ("provider_configs", "aws", "image"),
-        ("provider_configs", "aws", "connection_user"),
-        ("benchmark", "idle_latency", "test_name"),
-        ("provider_configs", "aws", "placement", "name"),
-    ],
+    ("mode", "duration", "pause", "chunks"),
+    [("acceptance", 10, 10, None), ("short_study", 60, 10, None),
+     ("calibration", 60, 10, None), ("diagnostic_day", 86400, 0, 300)],
 )
-def test_campaign_schema_and_runtime_reject_whitespace_only_required_strings(
-    repository_root: Path, path: tuple[str, ...]
-) -> None:
-    schema = json.loads((repository_root / "specs/001-core-offline-contracts/contracts/campaign-config.schema.json").read_text())
-    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
-    if path[-2:] == ("placement", "name"):
-        data["scenario"] = "placement_optimization"
-        data["provider_configs"]["aws"]["placement"] = {
-            "kind": "cluster_placement_group",
-            "name": " ",
-        }
-    else:
-        target = data
-        for component in path[:-1]:
-            target = target[component]
-        target[path[-1]] = " \t "
+def test_fixed_mode_settings_are_runtime_contracts(repository_root: Path, mode: str, duration: int, pause: int, chunks) -> None:
+    candidates = sorted((repository_root / "configs/experiments").glob("*.yaml")) + sorted((repository_root / "configs/tests").glob("*.yaml"))
+    path = next(path for path in candidates if yaml.safe_load(path.read_text())["mode"] == mode)
+    data = yaml.safe_load(path.read_text())
+    config = CampaignConfiguration.model_validate(data)
+    assert config.benchmark.measured_seconds == duration
+    assert config.benchmark.pause_seconds == pause
+    assert config.benchmark.probe_chunk_seconds == chunks
+    assert config.benchmark.warmup_seconds == 5
+    assert config.benchmark.stabilization_seconds == 60
 
-    assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(data))
+
+def test_legacy_protocol_fields_unknown_options_and_spot_are_rejected(repository_root: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["benchmark"]["idle_latency"] = {"enabled": True, "test_name": "flent", "duration_seconds": 60}
     with pytest.raises(ValueError):
         CampaignConfiguration.model_validate(data)
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["provider_configs"]["aws"]["provider_options"]["instance_market_type"] = "spot"
+    with pytest.raises(ValueError):
+        CampaignConfiguration.model_validate(data)
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["unexpected"] = True
+    with pytest.raises(ValueError):
+        CampaignConfiguration.model_validate(data)
+
+
+def test_common_n_requires_source_evidence_and_fallback_consistency(repository_root: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["benchmark"]["common_n"] = {
+        "state": "frozen", "common_n": 4, "source_campaign_id": "calibration",
+        "source_sha256": "a" * 64, "plateau_found": False,
+    }
+    with pytest.raises(ValueError, match="fallback common_n=8"):
+        CampaignConfiguration.model_validate(data)
+    data["benchmark"]["common_n"]["common_n"] = 8
+    config = CampaignConfiguration.model_validate(data)
+    assert config.benchmark.common_n.common_n == 8

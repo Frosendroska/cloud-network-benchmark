@@ -44,28 +44,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config_path = args.config if args.config.is_absolute() else root / args.config
         if args.command in {"validate", "resolve"}:
             resolved, _ = resolve_campaign(config_path, root)
+            report = build_dry_run(resolved)
             if args.command == "validate":
-                payload = {
-                    "valid": True,
-                    "experiment_id": resolved.experiment_id,
-                    "configuration_role": resolved.configuration_role,
-                    "scenario": resolved.scenario,
-                    "scheduled_start": resolved.scheduled_start.isoformat(),
-                    "providers": resolved.selected_providers,
-                    "source_sha256": resolved.config_source.sha256,
-                    "child_count": len(resolved.observations),
-                }
+                payload = report.model_dump(mode="json")
+                payload["valid"] = True
                 if args.format == "json":
                     print(_json(payload))
                 else:
-                    print(
-                        f"Valid {payload['configuration_role']} campaign {payload['experiment_id']} "
-                        f"for {payload['scenario']} at {payload['scheduled_start']}"
-                    )
-                    print(f"Providers ({payload['child_count']}): {', '.join(payload['providers'])}")
-                    print(f"Source SHA-256: {payload['source_sha256']}")
+                    print("Valid campaign configuration")
+                    print(render_human(report))
             else:
-                print(_json(resolved) if args.format == "json" else f"Resolved {resolved.experiment_id} into {len(resolved.observations)} provider observation(s)")
+                print(render_json(report) if args.format == "json" else render_human(report))
             return 0
         if args.command == "dry-run":
             resolved, _ = resolve_campaign(config_path, root)
@@ -78,6 +67,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(_json(initialized))
         else:
             print(f"Initialized campaign {initialized.campaign_id}")
+            print(f"Config/mode/context: {initialized.config_id} / {initialized.mode} / {initialized.context}")
+            print(f"Validation status: {initialized.validation_status.data_validity} / {initialized.validation_status.comparison_eligibility}")
+            print(f"Admission: priority {initialized.admission.priority}; reservation pending")
+            print(f"Schedule row: {initialized.schedule_evidence.get('state')}; SHA-256 {initialized.schedule_evidence.get('row_sha256') or 'pending'}")
+            print(f"Launch blockers: {', '.join(initialized.launch_blockers) or 'none'}")
             print(f"Parent manifest: {initialized.parent_manifest_path}")
             for child in initialized.children:
                 print(f"{child.provider}: {child.run_id} -> {child.result_path}")
