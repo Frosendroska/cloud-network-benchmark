@@ -1,0 +1,52 @@
+# F02R offline implementation record
+
+This record tracks implementation of the reviewed F02R migration. It does not claim real SSH,
+SCP, builds, cloud firewall enforcement or provider cleanup evidence.
+
+## Baseline and ownership
+
+- Base: `cef838e42fc620f90b5943f5a8d1528ddc0b0724` (merged F01R).
+- Planning head: `44ea1ececafe8a4008a9342757a3e76afe5089c2` on `codex/f02r-v2-remote-access`.
+- Migration targets: existing `access.py`, `bootstrap.py`, `readiness.py`, `retrieval.py` and their
+  focused tests. Frozen shared contracts and schemas are not owned by this feature.
+- Historical `specs/001-*` and `specs/002-*` are preserved.
+- Initial command: `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` — exit 0, 422 passed.
+
+## Implementation evidence
+
+The implementation is limited to the four existing remote modules, their narrow root exports,
+F02R-owned synthetic fixtures/tests, and this record. Shared F01R contract/schema files and
+historical specs 001/002 have no diff from the merged F01R base.
+
+- Tested implementation SHA: `a434ab9c1c76a64d9129a7ff4b21ad70addbec87`.
+- Focused command from `quickstart.md`: exit 0, **40 passed**.
+- Full regression command from `quickstart.md`: exit 0, **451 passed** (422 at baseline).
+- `git diff --check`: exit 0.
+- Ownership/frozen-contract/historical-spec diff inspection against `cef838e42fc620f90b5943f5a8d1528ddc0b0724`: no changes found in shared contracts, schemas, or specs 001/002.
+- No CLI/schema command is specified by the feature quickstart, and F02R changes no Terraform files.
+
+Focused command:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py tests/integration/test_v2_remote_access.py
+```
+
+Full regression command:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+```
+
+## Assumptions and limits
+
+- The caller supplies the original `RemoteDeadline`, matching deployment identity, closed producer
+  inventory, and provider-approved pinned source URLs/references/digests. F02R consumes these
+  records; it does not register expiry, create VMs, start a measurement, renew a cap, or clean up.
+- Retrieval completion means all required declared files were physically copied and matched to the
+  supplied remote size/hash. It does not validate benchmark semantics or change eligibility.
+- Every source URL, compiler output, listener response, identity file, and transferred byte used in
+  tests is synthetic. Tests invoke no real SSH/SCP, download/build tool, benchmark, cloud API, or
+  provider firewall. Real source availability/build behavior, authenticated transport, guest ACL
+  enforcement, cloud networking and cleanup remain unrun and require the later authorized stages.
+- No Thesis file, cloud resource, credential, secret, Terraform state/plan, or raw result bundle was
+  changed or created.
