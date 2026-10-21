@@ -70,33 +70,91 @@ def iperf3_argv(address: str, streams: int, seconds: int, *, day: bool = False) 
     return common + ["-J", "--get-server-output"]
 
 
+def _native_objects(text: str) -> Iterable[Mapping[str, object]]:
+    """Yield iperf3 JSON objects from either -J output or --json-stream lines."""
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        # --json-stream writes one {event, data} object per line. Ignore a final
+        # truncated record while retaining preceding complete native events.
+        for line in text.splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                yield value
+        return
+    if isinstance(value, dict):
+        yield value
+
+
+def receiver_timing(payload: bytes | str) -> tuple[Optional[float], Optional[float]]:
+    """Return native receiver seconds and requested omit from iperf's JSON evidence."""
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, None
+    duration: Optional[float] = None
+    omitted: Optional[float] = None
+    for item in _native_objects(payload):
+        event = item.get("event")
+        data = item.get("data") if isinstance(item.get("data"), dict) else item
+        candidates: list[object] = [item, data]
+        if event == "server_output_json":
+            candidates.insert(0, data)
+        elif isinstance(data, dict):
+            candidates.extend((data.get("server_output_json"), data.get("server_output")))
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                try:
+                    candidate = json.loads(candidate)
+                except ValueError:
+                    continue
+            if not isinstance(candidate, dict):
+                continue
+            start = candidate.get("start")
+            if isinstance(start, dict):
+                test_start = start.get("test_start")
+                if isinstance(test_start, dict):
+                    value = test_start.get("omit")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                        omitted = float(value)
+            end = candidate.get("end")
+            if isinstance(end, dict):
+                summary = end.get("sum_received")
+                if isinstance(summary, dict):
+                    value = summary.get("seconds")
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                        duration = float(value)
+    return duration, omitted
+
+
 def receiver_duration(payload: bytes | str) -> Optional[float]:
     """Read only receiver-side iperf duration; sender summaries are never a substitute."""
-    try:
-        data = json.loads(payload)
-    except (TypeError, ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    server = data.get("server_output")
-    if isinstance(server, str):
+    return receiver_timing(payload)[0]
+
+
+def _receiver_timing_file(path: Path, *, json_stream: bool) -> tuple[Optional[float], Optional[float]]:
+    if not json_stream:
         try:
-            server = json.loads(server)
-        except ValueError:
-            server = None
-    candidates = [server, data]
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        end = candidate.get("end")
-        if not isinstance(end, dict):
-            continue
-        summary = end.get("sum_received")
-        if isinstance(summary, dict):
-            seconds = summary.get("seconds")
-            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
-                return float(seconds)
-    return None
+            return receiver_timing(path.read_bytes())
+        except OSError:
+            return None, None
+    duration: Optional[float] = None
+    omitted: Optional[float] = None
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                current_duration, current_omitted = receiver_timing(line)
+                if current_duration is not None:
+                    duration = current_duration
+                if current_omitted is not None:
+                    omitted = current_omitted
+    except (OSError, UnicodeError):
+        return duration, omitted
+    return duration, omitted
 
 
 def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -150,6 +208,56 @@ def conservative_measurement_bounds(process_started: float, process_finished: fl
         return None
     bounds = process_started + omitted_seconds, process_finished - receiver_duration_seconds
     return bounds if bounds[1] >= bounds[0] else None
+
+
+def _iperf_3171_omission_semantics(context: MeasurementContext) -> bool:
+    """Only apply the inspected 3.17.1 omit/receiver-duration source semantics."""
+    source = context.tool_identity.get("iperf3")
+    value = source.value if source is not None else None
+    return isinstance(value, str) and re.search(r"(?<![0-9.])3\.17\.1(?![0-9.])", value) is not None
+
+
+def _sockperf_310_semantics(context: MeasurementContext) -> bool:
+    """The inspected Sockperf 3.10 full-log summary measures s_endTime - s_startTime."""
+    source = context.tool_identity.get("sockperf")
+    value = source.value if source is not None else None
+    return isinstance(value, str) and re.search(r"(?<![0-9.])3\.10(?![0-9.])", value) is not None
+
+
+def _sockperf_full_log_timing(path: Path) -> tuple[Optional[float], Optional[float]]:
+    """Extract source-native run and valid-sample spans; these are not coverage windows."""
+    total: Optional[float] = None
+    valid: Optional[float] = None
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                match = re.search(r"\[Total Run\] RunTime=([0-9]+(?:\.[0-9]+)?) sec", line)
+                if match:
+                    total = float(match.group(1))
+                match = re.search(r"\[Valid Duration\] RunTime=([0-9]+(?:\.[0-9]+)?) sec", line)
+                if match:
+                    valid = float(match.group(1))
+    except (OSError, UnicodeError, ValueError):
+        return None, None
+    return total, valid
+
+
+def conservative_sockperf_run_start_bounds(process_started: float, process_finished: float,
+                                            native_runtime_seconds: Optional[float], *,
+                                            semantics_verified: bool) -> Optional[tuple[float, float]]:
+    """Bound Sockperf's full test run start using its rounded native [Total Run] span.
+
+    Sockperf 3.10 prints this duration to milliseconds. The full process lifetime
+    encloses s_start/s_end; the rounded duration supplies only a conservative bound
+    for when the test run began, not a measured sample/coverage interval.
+    """
+    if (not semantics_verified or native_runtime_seconds is None or
+            not all(math.isfinite(value) for value in (process_started, process_finished, native_runtime_seconds)) or
+            native_runtime_seconds < 0 or process_finished < process_started):
+        return None
+    lower = process_started
+    upper = process_finished - max(0.0, native_runtime_seconds - 0.0005)
+    return (lower, upper) if upper >= lower else None
 
 
 def _validate(observation: ResolvedObservation, context: MeasurementContext, clock: MeasurementClock) -> Path:
@@ -353,6 +461,8 @@ class _Runner:
         tcp_req = None
         tcp_handle = None
         tcp_mono = None
+        tcp_finish_mono = None
+        probe_finish_mono = None
         tcp_utc = None
         notification: Optional[ProcessEvent] = None
         primary: Optional[BaseException] = None
@@ -384,6 +494,10 @@ class _Runner:
                     if result is not None and handle not in recorded:
                         req = requests[handle]
                         finish_mono, _ = self._finish_times(handle, result)
+                        if handle is tcp_handle:
+                            tcp_finish_mono = finish_mono
+                        else:
+                            probe_finish_mono = finish_mono
                         self.commands.append(_record(req, result, self.context, unit.unit_id,
                             started_monotonic=pmono if handle is probe else tcp_mono, finished_monotonic=finish_mono))
                         recorded.add(handle)
@@ -408,17 +522,36 @@ class _Runner:
                 tcp_started=None, omitted=5, idle=not tcp,
                 clocks=self.context.clock_mappings))
             observed_receiver_seconds = None
+            observed_omit_seconds = None
             if tcp and p["iperf3"].is_file():
-                try:
-                    observed_receiver_seconds = receiver_duration(p["iperf3"].read_bytes())
-                except OSError as exc:
-                    self.notes.append({"unit_id": unit.unit_id, "receiver_duration": "unavailable",
-                                       "reason": f"cannot read closed receiver output: {type(exc).__name__}"})
+                observed_receiver_seconds, observed_omit_seconds = _receiver_timing_file(p["iperf3"], json_stream=False)
+            probe_runtime, probe_valid_duration = _sockperf_full_log_timing(p["sockperf"])
+            probe_bounds = None
+            if pmono is not None and probe_finish_mono is not None:
+                probe_bounds = conservative_sockperf_run_start_bounds(
+                    pmono, probe_finish_mono, probe_runtime,
+                    semantics_verified=_sockperf_310_semantics(self.context))
+            bounds = None
+            if tcp and tcp_mono is not None and tcp_finish_mono is not None:
+                bounds = conservative_measurement_bounds(tcp_mono, tcp_finish_mono,
+                    observed_receiver_seconds, seconds, 5,
+                    omission_verified=(observed_omit_seconds == 5 and _iperf_3171_omission_semantics(self.context)))
             self.notes.append({"unit_id": unit.unit_id, "measured_window": "unavailable",
                 "requested_receiver_seconds": seconds if tcp else None,
                 "observed_receiver_seconds": observed_receiver_seconds,
-                "conservative_bounds": "unavailable",
-                "reason": "native Sockperf acquisition windows and verified omission semantics are required to bound coverage"})
+                "observed_omit_seconds": observed_omit_seconds,
+                "iperf_source_semantics_verified": _iperf_3171_omission_semantics(self.context),
+                "conservative_tcp_start_bounds_monotonic": list(bounds) if bounds else None,
+                "probe_process_monotonic": [pmono, probe_finish_mono],
+                "sockperf_source_semantics_verified": _sockperf_310_semantics(self.context),
+                "sockperf_native_total_run_seconds": probe_runtime,
+                "sockperf_native_valid_duration_seconds": probe_valid_duration,
+                "sockperf_test_start_bounds_monotonic": list(probe_bounds) if probe_bounds else None,
+                "notification_monotonic": notification.monotonic if notification else None,
+                "tcp_process_monotonic": [tcp_mono, tcp_finish_mono] if tcp else None,
+                "probe_active_coverage": "unavailable",
+                "reason": ("Sockperf 3.10 full-log contains only valid filtered samples, not continuous acquisition intervals; exact probe coverage remains unavailable"
+                           if tcp else "Sockperf process/native samples do not establish full idle acquisition coverage")})
             timing_recorded = True
         except BaseException as exc:
             primary = exc
@@ -523,12 +656,15 @@ class _Runner:
         tcp_handle: Optional[object] = None
         tcp_result: Optional[CommandResult] = None
         tcp_mono: Optional[float] = None
+        tcp_finish_mono: Optional[float] = None
         chunk_no = 0
         probe_handle: Optional[object] = None
         probe_req: Optional[CommandRequest] = None
         probe_id: Optional[str] = None
         probe_start: Optional[float] = None
+        previous_probe_finish: Optional[float] = None
         notification: Optional[ProcessEvent] = None
+        initial_notification_monotonic: Optional[float] = None
         first = True
         try:
             while True:
@@ -557,6 +693,7 @@ class _Runner:
                     if first:
                         notification = self._wait_notification(probe_handle, deadline)
                         self._lead(probe_handle, notification)
+                        initial_notification_monotonic = notification.monotonic
                         if self.clock.monotonic() + 86405 > deadline:
                             raise MeasurementError("diagnostic TCP duration and shutdown grace no longer fit the deadline", "deadline")
                         tcp_handle = self._start(tcp_req, tcp_path, tcp_err)
@@ -583,8 +720,22 @@ class _Runner:
                     self.executed.append(probe_id)
                     if probe_done.outcome != CommandOutcome.SUCCEEDED:
                         self._failure(MeasurementError(f"Sockperf chunk exited {probe_done.exit_code}", "probe_chunk_failure"), probe_req.action_id)
-                    self.notes.append({"unit_id": probe_id, "probe_gap_endpoints": "unavailable",
+                    native_runtime, native_valid = _sockperf_full_log_timing(csv_path)
+                    native_start_bounds = conservative_sockperf_run_start_bounds(
+                        probe_start, fm, native_runtime,
+                        semantics_verified=_sockperf_310_semantics(self.context))
+                    self.notes.append({"unit_id": probe_id, "parent_unit_id": parent.unit_id,
+                                       "probe_process_monotonic": [probe_start, fm],
+                                       "sockperf_source_semantics_verified": _sockperf_310_semantics(self.context),
+                                       "sockperf_native_total_run_seconds": native_runtime,
+                                       "sockperf_native_valid_duration_seconds": native_valid,
+                                       "sockperf_test_start_bounds_monotonic": list(native_start_bounds) if native_start_bounds else None,
+                                       "notification_monotonic": notification.monotonic if notification else None,
+                                       "process_rotation_gap_seconds": (max(0.0, probe_start - previous_probe_finish)
+                                           if previous_probe_finish is not None and probe_start is not None else None),
+                                       "probe_gap_endpoints": "unavailable",
                                        "reason": "native probe timing does not establish exact acquisition endpoints"})
+                    previous_probe_finish = fm
                     probe_handle = None
                     probe_req = None
                     probe_id = None
@@ -600,6 +751,7 @@ class _Runner:
             if tcp_result is None:
                 raise MeasurementError("diagnostic TCP exited without a completed result", "tcp_failure")
             fm, _ = self._finish_times(tcp_handle, tcp_result)
+            tcp_finish_mono = fm
             self.commands.append(_record(tcp_req, tcp_result, self.context, parent.unit_id,
                 started_monotonic=tcp_mono, finished_monotonic=fm))
             if tcp_result.outcome != CommandOutcome.SUCCEEDED:
@@ -607,6 +759,21 @@ class _Runner:
             self.executed.append(parent.unit_id)
             self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,
                 omitted=5, clocks=self.context.clock_mappings))
+            receiver_seconds, omitted_seconds = _receiver_timing_file(tcp_path, json_stream=True)
+            bounds = None
+            if tcp_mono is not None and tcp_finish_mono is not None:
+                bounds = conservative_measurement_bounds(tcp_mono, tcp_finish_mono,
+                    receiver_seconds, 86400, 5,
+                    omission_verified=(omitted_seconds == 5 and _iperf_3171_omission_semantics(self.context)))
+            self.notes.append({"unit_id": parent.unit_id, "measured_window": "unavailable",
+                "requested_receiver_seconds": 86400, "observed_receiver_seconds": receiver_seconds,
+                "observed_omit_seconds": omitted_seconds,
+                "iperf_source_semantics_verified": _iperf_3171_omission_semantics(self.context),
+                "conservative_tcp_start_bounds_monotonic": list(bounds) if bounds else None,
+                "tcp_process_monotonic": [tcp_mono, tcp_finish_mono],
+                "initial_notification_monotonic": initial_notification_monotonic,
+                "probe_active_coverage": "unavailable",
+                "reason": "Sockperf full-log rows are filtered valid samples rather than continuous acquisition intervals; exact day probe coverage remains unavailable"})
         except BaseException as exc:
             self._failure(exc, category=getattr(exc, "category", "measurement"))
             raise
@@ -629,7 +796,10 @@ class _Runner:
                 if handle is probe_handle and unit_id is not None and not any(t.unit_id == unit_id for t in self.timings):
                     self.timings.append(_timing(unit_id, self.context, notification=None, tcp_started=None,
                         omitted=0, clocks=self.context.clock_mappings))
-                    self.notes.append({"unit_id": unit_id, "probe_gap_endpoints": "unavailable",
+                    self.notes.append({"unit_id": unit_id, "parent_unit_id": parent.unit_id,
+                                       "probe_process_monotonic": [probe_start, getattr(handle, "finished_monotonic", None)],
+                                       "process_rotation_gap_seconds": None,
+                                       "probe_gap_endpoints": "unavailable",
                                        "reason": "probe chunk was interrupted before native timing could bound its acquisition"})
             if not any(t.unit_id == parent.unit_id for t in self.timings):
                 self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,

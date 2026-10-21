@@ -184,7 +184,10 @@ class LocalMeasurementProcesses:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
-                proc.wait(timeout=remaining)
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired as exc:
+                    raise TimeoutError("measurement process could not be reaped before deadline") from exc
         finally:
             for thread in item.threads:
                 thread.join(timeout=max(0.0, deadline_monotonic - self.clock.monotonic()))
@@ -204,7 +207,7 @@ class LocalMeasurementProcesses:
         item.finished_at = finished_at
         item.finished_monotonic = self.clock.monotonic()
         if item.stream_errors:
-            stderr = (stderr + "\n" + "\n".join(item.stream_errors))[-self.preview_limit:]
+            stderr = (stderr + "\n" + "\n".join(item.stream_errors))[-self.preview_bytes:]
             if outcome == CommandOutcome.SUCCEEDED:
                 outcome, code = CommandOutcome.FAILED, 125
         for secret in sorted((s for s in item.request.redactions if s), key=len, reverse=True):
