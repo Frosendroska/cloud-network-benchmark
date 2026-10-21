@@ -7,6 +7,11 @@ The local checks use replaceable fake processes and clocks only; no SSH, credent
 cloud API or benchmark executable is invoked.
 
 `timing-cases.json` and `day-events.json` describe timing-boundary and probe-rotation
-cases. The focused command is listed in
-`specs/005-v2-measurement-runner/quickstart.md`; the full regression command there
-must also be run before the feature handoff.
+cases. Exact offline validation commands, tested SHA and limitations are recorded in
+`docs/validation/f03-v2-measurement.md`. From the repository root, the focused and full
+regression commands are:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+```
