@@ -172,6 +172,32 @@ T062 is checked off and reviewer-owned checklist markers remain unchanged. No cl
 Terraform apply, benchmark or remote action was run. The final validation-record commit follows the
 tested source commit above.
 
+## Convergence pass 6
+
+T063 is implemented at source/test/schema commit
+`74d221a147bc2436a750d782274f1e06d685ffc6`. The standard provider-scope schema condition now
+requires the `context` property before checking for subset contexts, so an omitted context follows
+the same all-cloud rule as runtime's default `standard`. Explicit `failure_check` and valid
+single-provider `replacement` scopes remain covered.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_resolved_protocol_contract.py
+```
+
+Exit 0: **175 passed in 11.39s**. This includes exp-900 with omitted and explicit standard context,
+and the omitted/explicit context × one/two/three-provider source matrix.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q --tb=short
+```
+
+Exit 0: **422 passed in 23.06s**. Schema export and drift check both exited 0. Acceptance validate
+JSON and the short-study, calibration and day dry-runs exited 0. `git diff --check` exited 0; the
+historical specs 001/002 comparison against dependency base
+`e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7` was empty. T063 is checked and reviewer-owned checklist
+markers remain unchanged. No cloud, credentials, Terraform apply, benchmark or remote action was
+run. The validation-record commit follows the tested source commit above.
+
 ## Delivery boundary
 
 Schema V2, configuration/native intent, provenance snapshots, manifests, handoff DTOs, deterministic schema export, validation/timing/artifact contracts, and human/machine dry-run previews are implemented in the assigned F01R scope. Source prices/cost snapshot hash remain unavailable because no exact workbook snapshot was supplied; no value was inferred or fabricated. F01R completion does not establish cloud readiness or authorize paid work. Next stage is Spec Kit convergence against the delivered feature artifacts, then coordinator review/merge before dependent features consume these contracts.
