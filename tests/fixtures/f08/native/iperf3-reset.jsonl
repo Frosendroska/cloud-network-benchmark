@@ -1,0 +1,3 @@
+{"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":1}}}
+{"event":"interval","data":{"sum":{"start":6.0,"end":7.0,"seconds":1.0,"bytes":125000000,"sender":false,"omitted":false}}}
+{"event":"interval","data":{"sum":{"start":5.0,"end":6.0,"seconds":1.0,"bytes":125000000,"sender":false,"omitted":false}}}

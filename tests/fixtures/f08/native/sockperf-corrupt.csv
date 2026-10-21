@@ -1,0 +1,7 @@
+[Total Run] RunTime=2.000 sec; Warm up time=5000 msec; SentMessages=2000; ReceivedMessages=2
+------------------------------
+packet, txTime(sec), rxTime(sec), rtt(usec)
+0, 1.000000000, 1.000001000, 1.000
+bad, truncated
+1, 1.100000000, 1.100002000, 2.000
+------------------------------

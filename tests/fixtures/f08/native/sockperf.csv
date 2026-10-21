@@ -1,0 +1,7 @@
+sockperf: test output
+[Total Run] RunTime=2.000 sec; Warm up time=5000 msec; SentMessages=2000; ReceivedMessages=2
+------------------------------
+packet, txTime(sec), rxTime(sec), rtt(usec)
+0, 1.000000, 1.000001, 1.000
+1, 1.100000, 1.100002, 2.000
+------------------------------
