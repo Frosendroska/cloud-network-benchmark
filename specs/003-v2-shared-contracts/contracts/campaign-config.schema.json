@@ -1144,12 +1144,29 @@
             "const": "short_study"
           },
           "replacement_context": {
+            "additionalProperties": false,
             "properties": {
+              "observation_id": {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+                "type": "string"
+              },
               "replaces_run_id": {
-                "pattern": "-(aws|azure|gcp)$",
+                "allOf": [
+                  {
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$"
+                  },
+                  {
+                    "pattern": "-(aws|azure|gcp)$"
+                  }
+                ],
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "observation_id",
+              "replaces_run_id"
+            ],
+            "type": "object"
           }
         },
         "required": [

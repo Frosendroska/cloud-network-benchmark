@@ -636,7 +636,16 @@ def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = Fa
         "if": {"properties": {"context": {"const": "replacement"}}, "required": ["context"]},
         "then": {"required": ["replacement_context"], "properties": {
             "mode": {"const": "short_study"},
-            "replacement_context": {"properties": {"replaces_run_id": {"type": "string", "pattern": "-(aws|azure|gcp)$"}}},
+            "replacement_context": {
+                "type": "object", "additionalProperties": False,
+                "required": ["observation_id", "replaces_run_id"],
+                "properties": {
+                    "observation_id": {"type": "string", "pattern": IDENTIFIER_PATTERN},
+                    "replaces_run_id": {"type": "string", "allOf": [
+                        {"pattern": IDENTIFIER_PATTERN}, {"pattern": "-(aws|azure|gcp)$"}
+                    ]},
+                },
+            },
         }},
         "else": {"properties": {"replacement_context": {"type": "null"}}},
     }

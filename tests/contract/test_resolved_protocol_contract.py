@@ -136,6 +136,80 @@ def test_source_replacement_link_must_name_the_selected_provider(repository_root
     assert not Draft202012Validator(CampaignConfiguration.model_json_schema()).is_valid(data)
 
 
+@pytest.mark.parametrize("context", ["standard", "failure_check", "replacement"])
+@pytest.mark.parametrize("provider", ["aws", "azure", "gcp"])
+@pytest.mark.parametrize("metadata_case", ["omitted", "null", "empty", "incomplete", "valid"])
+def test_replacement_metadata_presence_matches_source_and_resolved_schemas(
+    repository_root, tmp_path, context, provider, metadata_case
+):
+    mode = "acceptance" if context == "failure_check" else "short_study"
+    scenario_file = "exp-001-multi-provider.yaml"
+    source_data = _source_case(repository_root, scenario_file, mode, "standard", "same_zone")
+    source_data["context"] = context
+    if context != "standard":
+        source_data["selected_providers"] = [provider]
+        source_data["provider_configs"] = {provider: source_data["provider_configs"][provider]}
+    replacement = {"observation_id": "stable-observation", "replaces_run_id": f"prior-{provider}"}
+    supplied = {
+        "null": None,
+        "empty": {},
+        "incomplete": {"observation_id": "stable-observation"},
+        "valid": replacement,
+    }
+    if metadata_case == "omitted":
+        source_data.pop("replacement_context", None)
+    else:
+        source_data["replacement_context"] = supplied[metadata_case]
+
+    expected_valid = (context != "replacement" and metadata_case in {"omitted", "null"}) or (
+        context == "replacement" and metadata_case == "valid")
+    source_schema = Draft202012Validator(CampaignConfiguration.model_json_schema())
+    if expected_valid:
+        CampaignConfiguration.model_validate(source_data)
+        assert source_schema.is_valid(source_data)
+    else:
+        with pytest.raises(ValidationError):
+            CampaignConfiguration.model_validate(source_data)
+        assert not source_schema.is_valid(source_data)
+
+    resolved = _resolved_case(repository_root, tmp_path, scenario_file, mode, "same_zone")
+    target = next(item for item in resolved.observations if item.provider == provider)
+    observation_data = json.loads(target.model_dump_json())
+    observation_data["context"] = context
+    campaign_data = json.loads(resolved.model_dump_json())
+    campaign_data["context"] = context
+    if context != "standard":
+        campaign_data["selected_providers"] = [provider]
+        campaign_data["observations"] = [observation_data]
+    else:
+        campaign_data["observations"] = [
+            json.loads(item.model_dump_json()) for item in resolved.observations
+        ]
+        for child in campaign_data["observations"]:
+            child["context"] = context
+    if metadata_case == "omitted":
+        campaign_data.pop("replacement_context", None)
+        observation_data.pop("replacement_context", None)
+        for child in campaign_data["observations"]:
+            child.pop("replacement_context", None)
+    else:
+        value = supplied[metadata_case]
+        campaign_data["replacement_context"] = value
+        observation_data["replacement_context"] = value
+        for child in campaign_data["observations"]:
+            child["replacement_context"] = value
+
+    for payload, model in ((campaign_data, ResolvedCampaign), (observation_data, ResolvedObservation)):
+        schema_valid = Draft202012Validator(model.model_json_schema()).is_valid(payload)
+        if expected_valid:
+            model.model_validate(payload)
+            assert schema_valid
+        else:
+            with pytest.raises(ValidationError):
+                model.model_validate(payload)
+            assert not schema_valid
+
+
 @pytest.mark.parametrize("mode", ["calibration", "diagnostic_day"])
 def test_resolved_entry_points_reject_non_same_zone_with_consistent_admission(repository_root, mode):
     filename = "exp-001-calibration.yaml" if mode == "calibration" else "exp-001-diagnostic-day.yaml"
