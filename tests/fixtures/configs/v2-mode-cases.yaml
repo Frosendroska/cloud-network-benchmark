@@ -1,0 +1,18 @@
+modes:
+  acceptance: {config: tests/exp-903-three-provider-smoke.yaml, measured_seconds: 10, units: 3}
+  short_study: {config: experiments/exp-001-multi-provider.yaml, measured_seconds: 60, units: 3}
+  calibration: {config: experiments/exp-001-calibration.yaml, measured_seconds: 60, units: 12}
+  diagnostic_day: {config: experiments/exp-001-diagnostic-day.yaml, measured_seconds: 86400, units: 1}
+calibration_streams: [1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4]
+fixed:
+  warmup_seconds: 5
+  pause_seconds: 10
+  day_pause_seconds: 0
+  stabilization_seconds: 60
+  probe_lead_seconds: 2
+  probe_bytes: 64
+  probe_mps: 1000
+  tcp_congestion_control: cubic
+  tcp_zerocopy: true
+  tcp_buffer_bytes: 131072
+  sample_interval_seconds: 1

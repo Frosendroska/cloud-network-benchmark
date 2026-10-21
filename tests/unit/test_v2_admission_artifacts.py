@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import hashlib
 
 import pytest
 from pydantic import ValidationError
@@ -14,12 +15,14 @@ def test_schedule_entry_keeps_exact_row_and_hash_identity() -> None:
     entry = ScheduleEntry(
         entry_id="row-1", config_id="exp_001", experiment_id="EXP-001",
         scheduled_start=datetime(2026, 10, 21, tzinfo=timezone.utc), window_label="morning",
-        source_path="tracking/runs.csv", source_sha256="a" * 64, row_sha256="b" * 64,
+        source_path="tracking/runs.csv", source_sha256="a" * 64, row_sha256=hashlib.sha256(b"row-1,exp_001").hexdigest(),
         original_header="id,config", original_row="row-1,exp_001", columns=["id", "config"], priority="P0",
     )
     assert entry.original_row == "row-1,exp_001"
     with pytest.raises(ValidationError):
         ScheduleEntry(**{**entry.model_dump(), "config_id": "EXP-001"})
+    with pytest.raises(ValidationError):
+        ScheduleEntry(**{**entry.model_dump(), "row_sha256": "b" * 64})
     with pytest.raises(ValidationError):
         ScheduleEntry(**{**entry.model_dump(), "scheduled_start": datetime(2026, 10, 21)})
 
@@ -27,8 +30,8 @@ def test_schedule_entry_keeps_exact_row_and_hash_identity() -> None:
 def test_admission_requirements_use_only_declared_caps_and_source_evidence() -> None:
     expected = AdmissionRequirements.expected_for("diagnostic_day", "same_zone")
     assert expected == {
-        "priority": "P0", "lifetime_cap_seconds": 87600, "requires_common_n": False,
-        "requires_schedule": True, "requires_primary_review": True, "requires_expiry": True,
+        "priority": "P0", "lifetime_cap_seconds": 87600, "requires_common_n": True,
+        "requires_schedule": True, "requires_primary_review": False, "requires_expiry": True,
     }
     requirements = AdmissionRequirements(
         **expected, hard_budget_usd=300, protected_buffer_usd=50, cost_input_id="input-2026-10-20",

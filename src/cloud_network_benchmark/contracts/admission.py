@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import hashlib
 from math import isfinite
 from typing import Literal, Optional
 
@@ -50,6 +51,8 @@ class ScheduleEntry(StrictModel):
             raise ValueError("columns must be unique nonblank header names")
         if not self.original_header and not self.original_row:
             raise ValueError("original row and header evidence cannot both be empty")
+        if hashlib.sha256(self.original_row.encode("utf-8")).hexdigest() != self.row_sha256:
+            raise ValueError("row_sha256 must hash the exact UTF-8 original_row bytes")
         return self
 
 
@@ -86,9 +89,9 @@ class AdmissionRequirements(StrictModel):
         return {
             "priority": priority,
             "lifetime_cap_seconds": cap,
-            "requires_common_n": mode == ExperimentMode.SHORT_STUDY,
+            "requires_common_n": mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.DIAGNOSTIC_DAY},
             "requires_schedule": scheduled,
-            "requires_primary_review": scheduled and priority in {"P0", "P1"},
+            "requires_primary_review": scheduled and priority in {"P2", "P3"},
             "requires_expiry": True,
         }
 

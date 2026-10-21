@@ -1,26 +1,107 @@
-schema_version: 1
+schema_version: 2
 experiment_id: EXP-902
-scheduled_start: "2026-10-01T07:00:00Z"
-selected_providers: [gcp]
+scheduled_start: null
+selected_providers:
+- gcp
 scenario: same_zone
 benchmark:
-  idle_latency: {enabled: true, test_name: ping, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
-  single_flow: {enabled: true, test_name: tcp_1up, duration_seconds: 10, timeout_seconds: 30, parameters: {}}
-  multi_flow: {enabled: true, test_name: tcp_nup, duration_seconds: 10, timeout_seconds: 30, parameters: {upload_streams: 1}}
-  execution_order: [idle_latency, single_flow, multi_flow]
+  measured_seconds: 10
+  warmup_seconds: 5
+  pause_seconds: 10
+  stabilization_seconds: 60
+  probe_lead_seconds: 2
+  probe_bytes: 64
+  probe_mps: 1000
+  reply_every: 1
+  full_rtt: true
+  no_rdtsc: true
+  tcp_congestion_control: cubic
+  tcp_zerocopy: true
+  tcp_buffer_bytes: 131072
+  sample_interval_seconds: 1
+  probe_chunk_seconds: null
+  common_n:
+    state: pending
+    common_n: null
+    source_campaign_id: null
+    source_sha256: null
+    plateau_found: null
 provider_configs:
   gcp:
     provider: gcp
-    regions: {vm_a: europe-west3, vm_b: europe-west3}
-    zones: {vm_a: europe-west3-a, vm_b: europe-west3-a}
+    regions:
+      vm_a: europe-west3
+      vm_b: europe-west3
+    zones:
+      vm_a: europe-west3-a
+      vm_b: europe-west3-a
     vm_shape: e2-micro
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
     documented_network_limit: null
-    placement: {kind: none, name: null}
-    provider_options: {provisioning_model: STANDARD, instance_termination_action: DELETE}
+    provider_options:
+      provisioning_model: STANDARD
+      instance_termination_action: DELETE
+    placement:
+      kind: none
+      name: null
+      collocated: false
+      max_distance: null
+    os:
+      distribution: ubuntu
+      release: '24.04'
+      architecture: amd64
+    disk:
+      size_gib: 32
+      kind: pd-balanced
+    network:
+      private_ipv4: true
+      public_ipv4_per_vm: 1
+      mtu: 1460
+      tcp_congestion_control: cubic
+      dscp: 0
+      ecn: false
+      default_offloads: true
+      address_spaces:
+        europe-west3: 10.80.1.0/24
+      subnets:
+        europe-west3:
+        - 10.80.1.0/24
+    security:
+      controller_cidr:
+        unavailable_reason: controller public IPv4 /32 not observed at configuration
+          authoring
+      sockperf_udp_port: 11111
+      iperf3_tcp_port: 5201
+      benchmark_source: vm_a_private
+      strict_host_key_checking: true
+      batch_mode: true
+    acceleration:
+      kind: gvnic
 options:
-  labels: {purpose: framework-smoke-test, provider_under_test: gcp}
+  labels:
+    purpose: framework-smoke-test
+    provider_under_test: gcp
   provisioning_timeout_seconds: 300
   readiness_timeout_seconds: 300
   cleanup_timeout_seconds: 300
+config_id: exp_902_gcp_validation
+mode: acceptance
+context: failure_check
+admission:
+  priority: P0
+  lifetime_cap_seconds: 1200
+  hard_budget_usd: 300
+  protected_buffer_usd: 50
+  cost_input_id: 2026-10-14-provider-price-inputs
+  prices_checked_on: '2026-10-14'
+  cost_input_sha256:
+    unavailable_reason: linked Thesis run-register Sheet snapshot hash is not present
+      in this repository
+  estimated_cost_usd:
+    unavailable_reason: scenario-specific estimate is resolved by F11 from the dated
+      run register
+  requires_common_n: false
+  requires_schedule: false
+  requires_primary_review: false
+  requires_expiry: true
