@@ -407,6 +407,8 @@ def test_replacement_keeps_observation_id_but_uses_new_attempt_paths(
     path = root / "configs/experiments/replacement.yaml"
     path.parent.mkdir(parents=True)
     data = yaml.safe_load((Path(__file__).parents[2] / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["selected_providers"] = ["aws"]
+    data["provider_configs"] = {"aws": data["provider_configs"]["aws"]}
     data["context"] = "replacement"
     data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "earlier-aws"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")

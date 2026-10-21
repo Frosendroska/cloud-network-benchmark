@@ -366,17 +366,8 @@ class CampaignConfiguration(StrictModel):
         if providers != configs or len(providers) != len(self.provider_configs):
             raise ValueError("provider_configs keys must exactly match selected_providers")
         all_clouds = providers == {Provider.AWS, Provider.AZURE, Provider.GCP}
-        if self.context == "standard" and (not all_clouds or mode == ExperimentMode.ACCEPTANCE and not all_clouds):
-            raise ValueError("standard contexts require AWS, Azure, and GCP")
-        if self.context == "failure_check" and mode != ExperimentMode.ACCEPTANCE:
-            raise ValueError("failure_check context is reserved for registered acceptance validation")
-        if self.context == "replacement":
-            if mode != ExperimentMode.SHORT_STUDY or not self.replacement_context:
-                raise ValueError("replacement context requires short_study and replacement metadata")
-        elif self.replacement_context is not None:
-            raise ValueError("replacement metadata requires context=replacement")
-        if mode in {ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY} and self.scenario != Scenario.SAME_ZONE:
-            raise ValueError("calibration and diagnostic_day require same_zone")
+        _validate_protocol_scope(mode, self.context, self.replacement_context, providers, self.scenario,
+                                 complete_campaign=True)
         admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario))
         for name, expected in admission_expected.items():
             if getattr(self.admission, name) != expected:
@@ -444,6 +435,7 @@ class CampaignConfiguration(StrictModel):
              }}}}}
             for mode, values in mode_specs.items()
         ]
+        _add_protocol_scope_schema(schema)
         return schema
 
 
@@ -509,6 +501,7 @@ class ResolvedObservation(StrictModel):
         _validate_resolved_protocol(
             config_id=self.config_id, experiment_id=self.experiment_id, mode=self.mode, context=self.context,
             replacement_context=self.replacement_context, provider_set=[self.provider], scenario=self.scenario,
+            observation_provider=Provider(self.provider),
             scheduled_start=self.scheduled_start, schedule_entry=self.schedule_entry.value,
             benchmark=self.benchmark, measurement_units=self.measurement_units, admission=self.admission,
         )
@@ -596,9 +589,92 @@ def derive_measurement_units(mode: ExperimentMode, benchmark: BenchmarkPlan) -> 
                                streams=benchmark.common_n.common_n)]
 
 
+def _validate_protocol_scope(
+    mode: ExperimentMode,
+    context: str,
+    replacement_context: Optional[ReplacementContext],
+    providers: list[Provider],
+    scenario: Scenario,
+    *,
+    observation_provider: Optional[Provider] = None,
+    complete_campaign: bool = False,
+) -> None:
+    mode = ExperimentMode(mode)
+    context = str(getattr(context, "value", context))
+    scenario = Scenario(scenario)
+    if mode in {ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY} and scenario != Scenario.SAME_ZONE:
+        raise ValueError("calibration and diagnostic_day require same_zone")
+    if complete_campaign and context == "standard" and set(providers) != {Provider.AWS, Provider.AZURE, Provider.GCP}:
+        raise ValueError("standard contexts require AWS, Azure, and GCP")
+    if context == "failure_check" and mode != ExperimentMode.ACCEPTANCE:
+        raise ValueError("failure_check context is reserved for registered acceptance validation")
+    if (context == "replacement") != (replacement_context is not None):
+        raise ValueError("replacement context metadata must match context")
+    if context != "replacement":
+        return
+    if mode != ExperimentMode.SHORT_STUDY:
+        raise ValueError("replacement context requires short_study mode")
+    run_provider = replacement_context.replaces_run_id.rsplit("-", 1)[-1]
+    try:
+        replacement_provider = Provider(run_provider)
+    except ValueError as exc:
+        raise ValueError("replacement run identity must name a provider") from exc
+    if observation_provider is not None:
+        if replacement_provider != Provider(observation_provider):
+            raise ValueError("replacement provider must match observation provider")
+    elif providers and replacement_provider not in {Provider(item) for item in providers}:
+        raise ValueError("replacement provider must be selected by the resolved campaign")
+    if complete_campaign and set(providers) != {replacement_provider}:
+        raise ValueError("replacement context must select only the replaced provider")
+
+
+def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = False) -> None:
+    same_zone = {"if": {"properties": {"mode": {"enum": ["calibration", "diagnostic_day"]}},
+                         "required": ["mode"]},
+                 "then": {"properties": {"scenario": {"const": "same_zone"}}}}
+    replacement = {
+        "if": {"properties": {"context": {"const": "replacement"}}, "required": ["context"]},
+        "then": {"required": ["replacement_context"], "properties": {
+            "mode": {"const": "short_study"},
+            "replacement_context": {"properties": {"replaces_run_id": {"type": "string", "pattern": "-(aws|azure|gcp)$"}}},
+        }},
+        "else": {"properties": {"replacement_context": {"type": "null"}}},
+    }
+    failure_check = {"if": {"properties": {"context": {"const": "failure_check"}}, "required": ["context"]},
+                     "then": {"properties": {"mode": {"const": "acceptance"}}}}
+    schema.setdefault("allOf", []).extend([same_zone, replacement, failure_check])
+    if observation:
+        # Provider-specific suffix validation is emitted as one conditional per provider.
+        for provider in ("aws", "azure", "gcp"):
+            schema["allOf"].append({
+                "if": {"properties": {"provider": {"const": provider}, "context": {"const": "replacement"}},
+                      "required": ["provider", "context"]},
+                "then": {"properties": {"replacement_context": {"properties": {
+                    "replaces_run_id": {"pattern": f"-{provider}$"}
+                }}}},
+            })
+    else:
+        schema["allOf"].append({
+            "if": {"not": {"properties": {"context": {"enum": ["failure_check", "replacement"]}}}},
+            "then": {"properties": {"selected_providers": {
+                "minItems": 3, "maxItems": 3,
+                "allOf": [{"contains": {"const": provider}} for provider in ("aws", "azure", "gcp")],
+            }}}
+        })
+        for provider in ("aws", "azure", "gcp"):
+            schema["allOf"].append({
+                "if": {"properties": {"context": {"const": "replacement"}, "replacement_context": {
+                    "properties": {"replaces_run_id": {"pattern": f"-{provider}$"}}, "required": ["replaces_run_id"]}},
+                      "required": ["context", "replacement_context"]},
+                "then": {"properties": {"selected_providers": {"minItems": 1, "maxItems": 1,
+                                                                      "contains": {"const": provider}}}},
+            })
+
+
 def _validate_resolved_protocol(
     *, config_id: str, experiment_id: str, mode: ExperimentMode, context: str,
     replacement_context: Optional[ReplacementContext], provider_set: list[Provider], scenario: Scenario,
+    observation_provider: Optional[Provider] = None,
     scheduled_start: Optional[datetime], schedule_entry: Optional[ScheduleEntry], benchmark: BenchmarkPlan,
     measurement_units: list[PhaseConfiguration], admission: AdmissionRequirements,
     launch_blockers: Optional[list[str]] = None,
@@ -606,23 +682,14 @@ def _validate_resolved_protocol(
     normalized_mode = ExperimentMode(mode)
     normalized_context = str(getattr(context, "value", context))
     benchmark.validate_mode(normalized_mode)
+    _validate_protocol_scope(normalized_mode, context, replacement_context, provider_set, scenario,
+                             observation_provider=observation_provider,
+                             complete_campaign=observation_provider is None)
     if measurement_units != derive_measurement_units(normalized_mode, benchmark):
         raise ValueError("resolved measurement units must be derived from benchmark mode and N state")
     for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario).items():
         if getattr(admission, name) != expected:
             raise ValueError(f"resolved identity admission.{name} must match mode and scenario")
-    if (normalized_context == "replacement") != (replacement_context is not None):
-        raise ValueError("replacement context metadata must match context")
-    if normalized_context == "replacement":
-        if normalized_mode != ExperimentMode.SHORT_STUDY:
-            raise ValueError("replacement context requires short_study mode")
-        replaced_provider = replacement_context.replaces_run_id.rsplit("-", 1)[-1]
-        if replaced_provider not in {provider.value for provider in Provider}:
-            raise ValueError("replacement run identity must name a provider")
-        if len(provider_set) > 1 and not any(replacement_context.replaces_run_id.endswith(f"-{Provider(provider).value}") for provider in provider_set):
-            raise ValueError("replacement provider must be selected by the resolved campaign")
-    if normalized_context == "failure_check" and normalized_mode != ExperimentMode.ACCEPTANCE:
-        raise ValueError("failure_check context is reserved for acceptance mode")
     if scheduled_start is not None and (scheduled_start.tzinfo is None or scheduled_start.utcoffset() is None):
         raise ValueError("resolved scheduled_start must include a timezone")
     if schedule_entry is not None:
@@ -673,6 +740,7 @@ def _unit_json_schema(
 
 
 def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    _add_protocol_scope_schema(schema, observation="provider" in schema.get("properties", {}))
     mode_values = {
         "acceptance": (10, 10, None), "short_study": (60, 10, None),
         "calibration": (60, 10, None), "diagnostic_day": (86400, 0, 300),
@@ -751,9 +819,16 @@ def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
             schema_constraints.append(pending_constraint)
             for common_n in (2, 4, 8):
                 stream_constraint = {
-                    "if": {"allOf": [mode_condition["if"], {"properties": {"benchmark": {"properties": {
-                        "common_n": {"properties": {"state": {"const": "frozen"}, "common_n": {"const": common_n}},
-                                      "required": ["state", "common_n"]}}}}}]},
+                    "if": {"allOf": [
+                        mode_condition["if"],
+                        {"properties": {"benchmark": {
+                            "required": ["common_n"],
+                            "properties": {"common_n": {
+                                "properties": {"state": {"const": "frozen"}, "common_n": {"const": common_n}},
+                                "required": ["state", "common_n"],
+                            }},
+                        }}}
+                    ]},
                     "then": {"properties": {"measurement_units": {"prefixItems": [
                         {} for _ in range(stream_value_index)
                     ] + [{"properties": {"streams": {"const": common_n}}}]}}},

@@ -1277,6 +1277,165 @@
           "if": {
             "properties": {
               "mode": {
+                "enum": [
+                  "calibration",
+                  "diagnostic_day"
+                ]
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "else": {
+            "properties": {
+              "replacement_context": {
+                "type": "null"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "context": {
+                "const": "replacement"
+              }
+            },
+            "required": [
+              "context"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "short_study"
+              },
+              "replacement_context": {
+                "properties": {
+                  "replaces_run_id": {
+                    "pattern": "-(aws|azure|gcp)$",
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "required": [
+              "replacement_context"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "failure_check"
+              }
+            },
+            "required": [
+              "context"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "acceptance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "replacement"
+              },
+              "provider": {
+                "const": "aws"
+              }
+            },
+            "required": [
+              "provider",
+              "context"
+            ]
+          },
+          "then": {
+            "properties": {
+              "replacement_context": {
+                "properties": {
+                  "replaces_run_id": {
+                    "pattern": "-aws$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "replacement"
+              },
+              "provider": {
+                "const": "azure"
+              }
+            },
+            "required": [
+              "provider",
+              "context"
+            ]
+          },
+          "then": {
+            "properties": {
+              "replacement_context": {
+                "properties": {
+                  "replaces_run_id": {
+                    "pattern": "-azure$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "replacement"
+              },
+              "provider": {
+                "const": "gcp"
+              }
+            },
+            "required": [
+              "provider",
+              "context"
+            ]
+          },
+          "then": {
+            "properties": {
+              "replacement_context": {
+                "properties": {
+                  "replaces_run_id": {
+                    "pattern": "-gcp$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
                 "const": "acceptance"
               }
             },
@@ -1727,7 +1886,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -1782,7 +1944,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -1837,7 +2002,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -2315,7 +2483,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -2370,7 +2541,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -2425,7 +2599,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -3522,7 +3699,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -3575,7 +3755,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -3628,7 +3811,10 @@
                           "common_n"
                         ]
                       }
-                    }
+                    },
+                    "required": [
+                      "common_n"
+                    ]
                   }
                 }
               }
@@ -4027,6 +4213,225 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "calibration",
+              "diagnostic_day"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "scenario": {
+            "const": "same_zone"
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "properties": {
+          "replacement_context": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "context": {
+            "const": "replacement"
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mode": {
+            "const": "short_study"
+          },
+          "replacement_context": {
+            "properties": {
+              "replaces_run_id": {
+                "pattern": "-(aws|azure|gcp)$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "replacement_context"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "failure_check"
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "mode": {
+            "const": "acceptance"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "context": {
+              "enum": [
+                "failure_check",
+                "replacement"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "selected_providers": {
+            "allOf": [
+              {
+                "contains": {
+                  "const": "aws"
+                }
+              },
+              {
+                "contains": {
+                  "const": "azure"
+                }
+              },
+              {
+                "contains": {
+                  "const": "gcp"
+                }
+              }
+            ],
+            "maxItems": 3,
+            "minItems": 3
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "replacement"
+          },
+          "replacement_context": {
+            "properties": {
+              "replaces_run_id": {
+                "pattern": "-aws$"
+              }
+            },
+            "required": [
+              "replaces_run_id"
+            ]
+          }
+        },
+        "required": [
+          "context",
+          "replacement_context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected_providers": {
+            "contains": {
+              "const": "aws"
+            },
+            "maxItems": 1,
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "replacement"
+          },
+          "replacement_context": {
+            "properties": {
+              "replaces_run_id": {
+                "pattern": "-azure$"
+              }
+            },
+            "required": [
+              "replaces_run_id"
+            ]
+          }
+        },
+        "required": [
+          "context",
+          "replacement_context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected_providers": {
+            "contains": {
+              "const": "azure"
+            },
+            "maxItems": 1,
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "replacement"
+          },
+          "replacement_context": {
+            "properties": {
+              "replaces_run_id": {
+                "pattern": "-gcp$"
+              }
+            },
+            "required": [
+              "replaces_run_id"
+            ]
+          }
+        },
+        "required": [
+          "context",
+          "replacement_context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected_providers": {
+            "contains": {
+              "const": "gcp"
+            },
+            "maxItems": 1,
+            "minItems": 1
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -4481,7 +4886,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -4536,7 +4944,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -4591,7 +5002,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -5069,7 +5483,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -5124,7 +5541,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -5179,7 +5599,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -6276,7 +6699,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -6329,7 +6755,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
@@ -6382,7 +6811,10 @@
                       "common_n"
                     ]
                   }
-                }
+                },
+                "required": [
+                  "common_n"
+                ]
               }
             }
           }
