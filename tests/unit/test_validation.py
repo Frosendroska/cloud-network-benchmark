@@ -7,7 +7,7 @@ import pytest
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts import IdentityContext, ValidatorInput, artifact_inputs
 from cloud_network_benchmark.contracts.campaign import derive_measurement_units
-from cloud_network_benchmark.contracts.common import ComparisonEligibility, DataValidity, Evidence, ExperimentMode, ValidationStatus
+from cloud_network_benchmark.contracts.common import ComparisonEligibility, DataValidity, Evidence, ExperimentMode, FailureEvidence, ValidationStatus
 from cloud_network_benchmark.contracts.measurements import ClockMapping, CommandEvidence, MeasurementTiming, TimingGap
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
@@ -74,6 +74,8 @@ def test_empty_materialized_bundle_is_unavailable_and_explains_missing_evidence(
     assert result.validation_status.data_validity == "unavailable"
     assert result.validation_status.comparison_eligibility == "unavailable"
     assert any(f.code == "artifact.missing" for f in result.findings)
+    assert any(f.code == "identity.campaign_manifest_missing" for f in result.findings)
+    assert any(f.code == "identity.child_manifest_missing" for f in result.findings)
     assert result.metrics.value["execution"]["bundle_complete"] is True
     assert len(result.metrics.value["units"]) == 3
 
@@ -141,6 +143,14 @@ def test_comparison_skew_boundaries(repository_root, skew, eligibility, degraded
     assert all(item.validation_status.comparison_eligibility == eligibility for item in output.values())
     assert all(any(f.code == "comparison.start_target_degraded" for f in item.findings) == degraded
                for item in output.values())
+
+
+def test_comparison_missing_actual_start_is_unavailable(repository_root):
+    values = [make_input(repository_root, p) for p in ("aws", "azure", "gcp")]
+    missing = values[1].timings[1].model_copy(update={"measured_started_at": Evidence[datetime](unavailable_reason="not captured")})
+    values[1] = values[1].model_copy(update={"timings":[*values[1].timings[:1], missing, *values[1].timings[2:]]})
+    output = evaluate_comparison(values, [good_result(value) for value in values])
+    assert all(item.validation_status.comparison_eligibility == "unavailable" for item in output.values())
 
 
 def _coverage_inputs(repository_root, *, duration=60.0, gap_seconds=0.0):
@@ -236,6 +246,25 @@ def test_materialized_artifact_integrity_and_symlink_escape_are_reported(reposit
     target.symlink_to(outside)
     findings, _, _ = _validate_artifacts(materialized)
     assert any(item.code == "artifact.path_or_read" for item in findings)
+
+
+def test_not_expected_artifact_and_execution_cleanup_failures_remain_distinct(repository_root):
+    value = make_input(repository_root)
+    declaration = value.artifacts["schedule_snapshot"]
+    unexpected = ArtifactRecord(artifact_id="schedule_snapshot", path=declaration.path, kind=declaration.kind,
+        producer=declaration.producer, unit_id=None, deployment_id=value.identity.deployment_id,
+        closed=True, size_bytes={"value": 0}, sha256={"value":"a" * 64}, retrieval_state="verified")
+    findings, _, _ = _validate_artifacts(value.model_copy(update={"artifact_records":[unexpected]}))
+    assert any(item.code == "artifact.unexpected" for item in findings)
+    failed = value.model_copy(update={"execution_state":"failed", "cleanup_state":"failed",
+        "failure":FailureEvidence(category="measurement", message="offline fixture failure", occurred_at=NOW),
+        "cleanup_failure":FailureEvidence(category="cleanup", message="offline cleanup failure", occurred_at=NOW)})
+    result = validate_bundle(failed, evaluated_at=NOW)
+    assert result.metrics.value["execution"]["execution_state"] == "failed"
+    assert result.metrics.value["execution"]["cleanup_state"] == "failed"
+    assert result.metrics.value["execution"]["primary_failure"]["message"] == "offline fixture failure"
+    assert result.metrics.value["execution"]["cleanup_failure"]["message"] == "offline cleanup failure"
+    assert result.metrics.value["execution"]["bundle_complete"] is False
 
 
 def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_extras(repository_root):
