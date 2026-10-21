@@ -136,6 +136,45 @@ def test_source_replacement_link_must_name_the_selected_provider(repository_root
     assert not Draft202012Validator(CampaignConfiguration.model_json_schema()).is_valid(data)
 
 
+@pytest.mark.parametrize("context_case", ["omitted", "standard", "failure_check", "replacement"])
+@pytest.mark.parametrize("provider_count", [1, 2, 3])
+def test_source_provider_scope_defaults_match_runtime_schema(repository_root, context_case, provider_count):
+    mode = "short_study" if context_case == "replacement" else "acceptance"
+    explicit_context = None if context_case == "omitted" else context_case
+    data = _source_case(repository_root, "exp-001-multi-provider.yaml", mode, "standard", "same_zone")
+    if explicit_context is not None:
+        data["context"] = explicit_context
+    providers = ["aws", "azure", "gcp"][:provider_count]
+    data["selected_providers"] = providers
+    data["provider_configs"] = {provider: data["provider_configs"][provider] for provider in providers}
+    if context_case == "omitted":
+        data.pop("context", None)
+    if context_case == "replacement":
+        data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "prior-aws"}
+    expected_valid = (context_case in {"omitted", "standard"} and provider_count == 3) or (
+        context_case == "failure_check") or (context_case == "replacement" and provider_count == 1)
+    schema = Draft202012Validator(CampaignConfiguration.model_json_schema())
+    if expected_valid:
+        CampaignConfiguration.model_validate(data)
+        assert schema.is_valid(data)
+    else:
+        with pytest.raises(ValidationError):
+            CampaignConfiguration.model_validate(data)
+        assert not schema.is_valid(data)
+
+
+@pytest.mark.parametrize("context_case", ["omitted", "standard"])
+def test_exp900_single_provider_defaults_to_standard_and_is_rejected(repository_root, context_case):
+    data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
+    if context_case == "omitted":
+        data.pop("context")
+    else:
+        data["context"] = "standard"
+    with pytest.raises(ValidationError, match="standard contexts require"):
+        CampaignConfiguration.model_validate(data)
+    assert not Draft202012Validator(CampaignConfiguration.model_json_schema()).is_valid(data)
+
+
 @pytest.mark.parametrize("context", ["standard", "failure_check", "replacement"])
 @pytest.mark.parametrize("provider", ["aws", "azure", "gcp"])
 @pytest.mark.parametrize("metadata_case", ["omitted", "null", "empty", "incomplete", "valid"])

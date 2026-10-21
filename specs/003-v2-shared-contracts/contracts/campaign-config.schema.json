@@ -1203,7 +1203,10 @@
                 "replacement"
               ]
             }
-          }
+          },
+          "required": [
+            "context"
+          ]
         }
       },
       "then": {

@@ -664,7 +664,8 @@ def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = Fa
             })
     else:
         schema["allOf"].append({
-            "if": {"not": {"properties": {"context": {"enum": ["failure_check", "replacement"]}}}},
+            "if": {"not": {"properties": {"context": {"enum": ["failure_check", "replacement"]}},
+                             "required": ["context"]}},
             "then": {"properties": {"selected_providers": {
                 "minItems": 3, "maxItems": 3,
                 "allOf": [{"contains": {"const": provider}} for provider in ("aws", "azure", "gcp")],
