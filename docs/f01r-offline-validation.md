@@ -66,6 +66,43 @@ git diff e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7 -- specs/001-core-offline-cont
 
 Both exited 0; the historical-spec diff was empty. Local CI configuration was not run or inspected as a remote CI result. Terraform static checks are not applicable/not run because F01R does not change Terraform. No cloud, SSH/SCP, benchmark, F10, or real expiry/readiness operation was run; this work is credential-free contract and CLI validation only. The final validation-record commit is recorded separately from tested code head `c676b3587f134590ef554fa33ae7ff61061da336`.
 
+## Convergence pass 3
+
+The final assigned convergence tasks T058–T059 are implemented at source/test commit
+`ea02fa993efa6f8bb66bd88e3be78b20876f6651`. T058 caps planned `probe_chunk` units at 300
+seconds in runtime validation and the public schema. T059 validates protocol settings, derived
+units, admission intent, schedule linkage, replacement context and blockers at both resolved DTO
+deserialization boundaries; exported resolved campaign schemas enforce mode-specific durations,
+units, stream state and admission values. Pending N remains pending, and acceptance still resolves
+its aggregate measurement units to four streams.
+
+Verification at that source commit:
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_resolved_protocol_contract.py
+```
+
+Exit 0: **15 passed**.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+```
+
+Exit 0: **262 passed in 10.95s**.
+
+Schema export/drift check exited 0, and all four required CLI checks exited 0: acceptance
+`validate --format json`, and short-study/calibration/day `dry-run` (JSON for the first two,
+human-readable for day). The commands used were the same as listed in the preceding section. The
+first integrated full-suite run had three failures: an existing replacement-boundary error message,
+a scenario-tampering error message, and stale exported schemas. After preserving the two established
+error paths and regenerating the schemas, the targeted cases and full suite passed as recorded.
+
+`git diff --check` exited 0. Comparing historical specs 001 and 002 with dependency base
+`e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7` produced an empty diff. Reviewer-owned checklist files
+remain unchanged; T058 and T059 are checked off in `tasks.md`. No cloud, credential, Terraform
+apply, benchmark, F10, or remote action was run. The validation-record-only commit follows the
+tested source commit above.
+
 ## Delivery boundary
 
 Schema V2, configuration/native intent, provenance snapshots, manifests, handoff DTOs, deterministic schema export, validation/timing/artifact contracts, and human/machine dry-run previews are implemented in the assigned F01R scope. Source prices/cost snapshot hash remain unavailable because no exact workbook snapshot was supplied; no value was inferred or fabricated. F01R completion does not establish cloud readiness or authorize paid work. Next stage is Spec Kit convergence against the delivered feature artifacts, then coordinator review/merge before dependent features consume these contracts.
