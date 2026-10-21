@@ -40,6 +40,19 @@ def test_source_digest_mismatch_stops_before_extract_or_other_vm(tmp_path):
     assert not any("vm_b" in x.action_id for x in result.actions)
 
 
+def test_build_failure_stops_before_binary_observation_or_other_vm(tmp_path):
+    c=connection(tmp_path)
+    class FailedBuild(BootstrapRunner):
+        def run(self,request):
+            if request.action_id=="f02r-vm_a-sockperf-4":
+                from fixtures.f02r.support import result
+                return result(request.action_id,success=False,stderr="synthetic compiler failure")
+            return super().run(request)
+    runner=FailedBuild(); outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="source_build_failed"
+    assert not any(request.action_id.endswith("sockperf-5") or "vm_b" in request.action_id for request in runner.requests)
+
+
 def test_explicit_https_and_digest_are_required():
     with pytest.raises(Exception): SourceBuild(tool="sockperf",source_url="http://bad",source_reference="src",archive_name="a.tar",source_sha256="x")
 

@@ -42,6 +42,15 @@ def test_wildcard_listener_never_satisfies_private_bind_predicate(tmp_path):
     assert not _predicate("socket-iperf3",'LISTEN 0 4096 *:5201 *:* users:(("iperf3",pid=21,fd=3))',c,prep)
 
 
+def test_wrong_private_target_service_binary_and_acl_are_unhealthy(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    assert not _predicate("private-icmp","64 bytes from 203.0.113.4",c,prep)
+    wrong_service="LoadState=loaded\nActiveState=active\nExecStart={ path=/tmp/iperf3; argv[]=/tmp/iperf3 -s -B 10.0.0.2 -p 5201 --json-stream --forceflush; }\nStandardOutput=append:/var/lib/cnb/work/server-logs/iperf3-server.jsonl\nStandardError=append:/var/lib/cnb/work/server-logs/iperf3-server.err\nRestart=no\n"
+    assert not _predicate("service-iperf3",wrong_service,c,prep)
+    assert not _predicate("guest-acl","hook input policy accept 0.0.0.0/0 10.0.0.2 11111 5201 drop",c,prep)
+
+
 def test_slow_checks_shrink_budgets_and_stop_at_deadline(tmp_path):
     from datetime import datetime,timedelta,timezone
     from fixtures.f02r.helpers import FakeClock

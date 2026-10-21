@@ -34,6 +34,18 @@ def test_retrieval_verifies_materialized_bytes_and_final_record(tmp_path):
     assert runner.requests[-1].action_type=="scp" and "StrictHostKeyChecking=yes" in runner.requests[-1].argv
 
 
+def test_observed_zero_byte_native_file_is_verifiable(tmp_path):
+    c=connection(tmp_path); payload=b""
+    class Runner:
+        def run(self,request):
+            if request.action_type=="ssh": out=f"0 {hashlib.sha256(payload).hexdigest()}"
+            else: Path(request.argv[-1]).write_bytes(payload); out=""
+            return result(request.action_id,out)
+    outcome=run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=lambda:100)
+    assert outcome.complete and outcome.records[0].size_bytes.value==0
+    assert outcome.records[0].sha256.value==hashlib.sha256(payload).hexdigest()
+
+
 def test_stdout_does_not_fabricate_missing_transfer_file(tmp_path):
     c=connection(tmp_path); payload=b"native"
     class Runner:
@@ -62,6 +74,13 @@ def test_symlink_destination_parent_is_rejected_without_copy(tmp_path):
     outcome=run_retrieval(c,manifest(c),lambda req: (_ for _ in ()).throw(AssertionError("transfer started")),tmp_path,deadline=deadline(),clock=lambda:100)
     assert not outcome.complete and outcome.failure.category=="destination_invalid"
     assert not list(outside.iterdir())
+
+
+def test_cleanup_reserve_exhaustion_stops_before_remote_observation(tmp_path):
+    c=connection(tmp_path); runner=lambda req: (_ for _ in ()).throw(AssertionError("copy started after cleanup reserve"))
+    outcome=run_retrieval(c,manifest(c),runner,tmp_path,deadline=deadline(),clock=lambda:291)
+    assert not outcome.complete and outcome.cleanup_required
+    assert outcome.failure.category=="cleanup_allowance_reached" and not outcome.actions
 
 
 def test_remote_workspace_and_declaration_mismatches_are_rejected(tmp_path):

@@ -34,6 +34,19 @@ def test_missing_strict_identity_file_fails_before_runner(tmp_path):
         _request("x",c.vm_a,["true"],1)
 
 
+def test_empty_identity_files_and_remote_control_values_are_rejected(tmp_path):
+    c=connection(tmp_path)
+    empty=tmp_path/"empty-known-hosts"; empty.touch()
+    object.__setattr__(c.vm_a,"host_key_reference",str(empty))
+    with pytest.raises(ValueError,match="nonempty readable"):
+        _request("empty",c.vm_a,["true"],1)
+    object.__setattr__(c.vm_a,"host_key_reference",str(tmp_path/"known-hosts"))
+    with pytest.raises(ValueError,match="safe string tokens"):
+        _request("control",c.vm_a,["printf","bad\nvalue"],1)
+    with pytest.raises(ValueError,match="safe string tokens"):
+        _request("nul",c.vm_a,["printf","bad\x00value"],1)
+
+
 def test_deadline_rejects_nonfinite_and_readiness_after_overall(tmp_path):
     from datetime import datetime,timedelta,timezone
     now=datetime.now(timezone.utc)

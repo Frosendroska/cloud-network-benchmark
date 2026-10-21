@@ -150,7 +150,7 @@ def _readable_reference(path: str, label: str) -> None:
 
 
 def _remote_argv(argv: List[str]) -> str:
-    if not argv or any(not isinstance(v, str) or "\x00" in v for v in argv):
+    if not argv or any(not isinstance(v, str) or any(ord(char) < 32 or ord(char) == 127 for char in v) for v in argv):
         raise ValueError("remote argv must contain safe string tokens")
     return shlex.join(argv)
 

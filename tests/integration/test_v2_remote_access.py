@@ -69,3 +69,16 @@ def test_caller_cap_order_is_evidence_and_f02r_only_consumes_deadlines(tmp_path)
     cap=datetime.now(timezone.utc); registered=cap+timedelta(seconds=1); created=registered+timedelta(seconds=1)
     assert cap<=registered<=created
     assert "expiry" not in run_bootstrap.__code__.co_names
+
+
+def test_retrieval_failure_stays_secondary_to_caller_owned_measurement_failure(tmp_path):
+    from cloud_network_benchmark.contracts.common import FailureEvidence
+    root=tmp_path/"partial"; root.mkdir(); c=connection(root); payload=b"native"
+    primary=FailureEvidence(category="measurement_failed",message="Sockperf failed",occurred_at=datetime.now(timezone.utc))
+    class LostSource:
+        def run(self,request):
+            if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            return result(request.action_id,success=False,stderr="synthetic source unavailable")
+    secondary=run_retrieval(c,_manifest(c,"short_study",payload),LostSource(),root,deadline=deadline(),clock=lambda:100)
+    assert primary.category=="measurement_failed"
+    assert not secondary.complete and secondary.cleanup_required and secondary.failure.category=="copy_failed"
