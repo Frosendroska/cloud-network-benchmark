@@ -27,23 +27,24 @@ No cloud, credential, Terraform, or benchmark operation was run. Historical `spe
 
 ## Final implementation validation
 
-The exact quickstart full-suite command passed at repair source commit
-`95c149d` (`95c149d` is the tested code head before this validation-record-only commit):
+Pass 1 checkpoint `95c149d` passed 232 tests. Pass 2 adds T051–T057 and supersedes that result.
+The final quickstart full-suite command passed at repair source commit
+`c676b3587f134590ef554fa33ae7ff61061da336` (before this validation-record-only commit):
 
 ```bash
 PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q --tb=short
 ```
 
-Exit 0: **232 passed in 11.11s**. This includes all original baseline migration cases, local Git provenance scenarios, V2 manifests and failure preservation, deployment/access handoffs, cross-record validation/artifact/timing constraints, schema/runtime consistency, and pending/frozen acceptance stream resolution.
+Exit 0: **247 passed in 9.86s**. This includes all original baseline migration cases, local Git provenance scenarios, V2 manifests and failure preservation, deployment/access handoffs, cross-record validation/artifact/timing constraints, schema/runtime consistency, pending/frozen acceptance stream resolution, malformed commit fallback, secret-bearing CSV header rejection, partial metadata, and retained day probe chunks.
 
-Schema export and drift check both exited 0 at the repair source head:
+Schema export and drift check both exited 0 at the final repair source head:
 
 ```bash
 PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts
 PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check
 ```
 
-All four quickstart CLI routes exited 0 without launching external actions at the repair source head:
+All four quickstart CLI routes exited 0 without launching external actions at the final repair source head:
 
 ```bash
 PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark validate --config configs/tests/exp-903-three-provider-smoke.yaml --format json
@@ -54,7 +55,7 @@ PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchma
 
 The acceptance preview preserves pending common-N state while resolving multi-flow to four streams; a focused test also verifies a frozen N is used after calibration. Research pending N remains null and blocking. The three-provider research preview remains pending admission/calibration. Calibration renders twelve ordered units and the day mode renders one continuous unit with its probe chunk template.
 
-The appended convergence tasks T034–T050 are implemented and checked in `tasks.md`; reviewer-owned checklist markers remain unchanged. The final integrated validation also ran focused manifest/deployment/schema checks (**50 passed**), and the schema drift check was repeated after the final source changes.
+Convergence tasks T034–T057 are implemented and checked in `tasks.md`; reviewer-owned checklist markers remain unchanged. Final focused validation of validation, deployment, schema, admission, Git provenance and the new secret/Git initialization regressions passed (**66 passed**). The schema drift check was repeated after final source changes.
 
 Final hygiene checks at the repair source head:
 
@@ -63,7 +64,7 @@ git diff --check
 git diff e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7 -- specs/001-core-offline-contracts specs/002-vm-access-bootstrap
 ```
 
-Both exited 0; the historical-spec diff was empty. Local CI configuration was not run or inspected as a remote CI result. Terraform static checks are not applicable/not run because F01R does not change Terraform. No cloud, SSH/SCP, benchmark, F10, or real expiry/readiness operation was run; this work is credential-free contract and CLI validation only. The final validation-record commit is recorded separately from tested code head `95c149d`.
+Both exited 0; the historical-spec diff was empty. Local CI configuration was not run or inspected as a remote CI result. Terraform static checks are not applicable/not run because F01R does not change Terraform. No cloud, SSH/SCP, benchmark, F10, or real expiry/readiness operation was run; this work is credential-free contract and CLI validation only. The final validation-record commit is recorded separately from tested code head `c676b3587f134590ef554fa33ae7ff61061da336`.
 
 ## Delivery boundary
 
