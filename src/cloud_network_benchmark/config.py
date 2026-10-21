@@ -219,7 +219,7 @@ def resolve_campaign(
             vm_b=vm_intent(VmRole.VM_B, provider_config),
             placement=provider_config.placement,
             benchmark=config.benchmark,
-            artifact_layout=ArtifactLayout(),
+            artifact_layout=ArtifactLayout.for_mode(config.mode, units),
             provider_config=provider_config,
             options=config.options,
         ))

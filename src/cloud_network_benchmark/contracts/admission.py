@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import hashlib
+import csv
+import io
 from math import isfinite
 import re
 from typing import Literal, Optional
@@ -50,7 +52,12 @@ class ScheduleEntry(StrictModel):
     @model_validator(mode="after")
     def row_evidence_is_lossless(self) -> "ScheduleEntry":
         supplied_text = [self.original_header, self.original_row, self.source_path, *self.columns]
-        if any(_contains_secret_text(value) for value in supplied_text):
+        header_names = list(self.columns)
+        try:
+            header_names.extend(next(csv.reader(io.StringIO(self.original_header))))
+        except (csv.Error, StopIteration):
+            pass
+        if any(_contains_secret_text(value) for value in supplied_text) or any(_is_secret_field_name(value) for value in header_names):
             raise ValueError("schedule evidence contains a secret-bearing field; remove it before supplying the row")
         if len(self.columns) != len(set(self.columns)) or any(not name for name in self.columns):
             raise ValueError("columns must be unique nonblank header names")
@@ -66,10 +73,17 @@ class ScheduleEntry(StrictModel):
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?:password|passwd|token|secret|credential|private[_-]?key|access[_-]?key|secret[_-]?key)\s*[:=]"
 )
+_SECRET_FIELD_NAME = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:password|passwd|token|secret|credential|credentials|private[_-]?key|access[_-]?key|secret[_-]?key)(?:$|[^a-z0-9])"
+)
 
 
 def _contains_secret_text(value: str) -> bool:
     return ("-----BEGIN " in value and "PRIVATE KEY-----" in value) or bool(_SECRET_ASSIGNMENT.search(value))
+
+
+def _is_secret_field_name(value: str) -> bool:
+    return bool(_SECRET_FIELD_NAME.search(value.strip()))
 
 
 class AdmissionRequirements(StrictModel):

@@ -23,6 +23,8 @@ from cloud_network_benchmark.contracts import (
     StructuredEvidence,
     StringEvidence,
     VmIntent,
+    ExpiryEvidence,
+    ReservationEvidence,
 )
 
 
@@ -157,6 +159,14 @@ def test_deployment_input_factory_preserves_replacement_and_safety_evidence(repo
     assert value.provisioning_timeout_seconds == resolved.options.provisioning_timeout_seconds
     assert value.readiness_timeout_seconds == resolved.options.readiness_timeout_seconds
     assert value.cleanup_timeout_seconds == resolved.options.cleanup_timeout_seconds
+    with pytest.raises(ValueError, match="source observation"):
+        ProviderDeploymentInput.from_observation(
+            observation, campaign_id="campaign", run_id="campaign-aws", bootstrap_template="cloud-init.yaml",
+            terraform_directory="terraform/aws", child_result_path="results/raw/campaign-aws",
+            config_sha256=resolved.config_source.sha256,
+            implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40),
+            replacement_context=ReplacementContext(observation_id="other-observation", replaces_run_id="prior-aws"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -224,6 +234,64 @@ def test_direct_deployment_input_rejects_mismatched_identity_and_provider_values
         candidate[field] = value
         with pytest.raises(ValueError):
             ProviderDeploymentInput.model_validate(candidate)
+
+
+def test_deployment_input_rejects_replacement_link_without_replacement_context(repository_root: Path) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/experiments/exp-001-multi-provider.yaml", repository_root)
+    value = ProviderDeploymentInput.from_observation(
+        resolved.observations[0], campaign_id="campaign", run_id="campaign-aws",
+        bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
+        child_result_path="results/raw/campaign-aws", config_sha256=resolved.config_source.sha256,
+        implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40),
+    ).model_dump(mode="python")
+    value["replaces_run_id"] = "earlier-aws"
+    with pytest.raises(ValueError, match="replacement context"):
+        ProviderDeploymentInput.model_validate(value)
+
+
+def test_supplied_expiry_must_precede_apply_and_reserved_cap(repository_root: Path) -> None:
+    resolved, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml", repository_root)
+    output_identity = IdentityContext(
+        experiment_id="EXP-900", config_id="exp-900-acceptance", campaign_id="campaign",
+        observation_id="campaign-aws-observation", run_id="campaign-aws",
+        deployment_id="campaign-aws-deployment", provider="aws",
+    )
+    missing = StructuredEvidence(unavailable_reason="partial apply")
+    expiry = ExpiryEvidence(
+        schema_version=2, run_id="campaign-aws", deployment_id="campaign-aws-deployment", provider="aws", action="stop",
+        state="registered", registration_id={"value":"expiry-1"}, registered_at={"value":NOW.replace(minute=10)},
+        expires_at={"value":NOW.replace(day=28)}, target_selector="run-tag", provider_metadata={"value":{"tag":"run"}},
+    )
+    with pytest.raises(ValueError, match="provider apply start"):
+        ProviderDeploymentOutput(
+            schema_version=2, identity=output_identity, run_id="campaign-aws", deployment_id="campaign-aws-deployment",
+            mode="acceptance", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW,
+            finished_at=NOW, vm_a=ProviderVmOutput(role="vm_a", resource_id=None, private_ipv4=None, image_identity=None,
+                actual_shape=None, region=None, zone=None, placement_metadata=missing, connection=None, unavailable=missing),
+            vm_b=ProviderVmOutput(role="vm_b", resource_id=None, private_ipv4=None, image_identity=None,
+                actual_shape=None, region=None, zone=None, placement_metadata=missing, connection=None, unavailable=missing),
+            provider_metadata=missing, documented_network_limit=missing, expiry={"value":expiry},
+        )
+
+    request = ProviderDeploymentInput.from_observation(
+        resolved.observations[0], campaign_id="campaign", run_id="campaign-aws",
+        bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
+        child_result_path="results/raw/campaign-aws", config_sha256=resolved.config_source.sha256,
+        implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40),
+    )
+    reservation = ReservationEvidence(
+        schema_version=2, campaign_id="campaign", reservation_id={"value":"reservation-1"}, state="reserved",
+        reserved_cost_usd={"value":10.0}, cap_started_at={"value":NOW.replace(minute=10)},
+        expires_at={"value":NOW.replace(day=28)}, cap_start_policy_id={"value":"apply-start"},
+        source_path="prices.csv", source_sha256="a"*64,
+    )
+    prior_expiry = expiry.model_copy(update={"registered_at":Evidence[datetime](value=NOW.replace(minute=5))})
+    with pytest.raises(ValueError, match="reserved cap start"):
+        ProviderDeploymentInput.model_validate({
+            **request.model_dump(mode="python"),
+            "reservation":Evidence[ReservationEvidence](value=reservation),
+            "expiry":Evidence[ExpiryEvidence](value=prior_expiry),
+        })
 
 
 def test_deployment_output_links_connection_roles_and_canonical_path() -> None:

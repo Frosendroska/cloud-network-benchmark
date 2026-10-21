@@ -148,8 +148,16 @@ class CommonNState(StrictModel):
             {"if": {"properties": {"state": {"const": "pending"}}, "required": ["state"]},
              "then": {"properties": {"common_n": {"type": "null"}, "source_campaign_id": {"type": "null"},
                                        "source_sha256": {"type": "null"}, "plateau_found": {"type": "null"}}}},
+            {"if": {"not": {"required": ["state"]}},
+             "then": {"properties": {"common_n": {"type": "null"}, "source_campaign_id": {"type": "null"},
+                                       "source_sha256": {"type": "null"}, "plateau_found": {"type": "null"}}}},
             {"if": {"properties": {"state": {"const": "frozen"}}, "required": ["state"]},
-             "then": {"required": ["common_n", "source_campaign_id", "source_sha256", "plateau_found"]}},
+             "then": {"required": ["common_n", "source_campaign_id", "source_sha256", "plateau_found"],
+                      "properties": {"common_n": {"enum": [2, 4, 8]}, "source_campaign_id": {"type": "string", "minLength": 1},
+                                     "source_sha256": {"type": "string", "pattern": SHA256_PATTERN}, "plateau_found": {"type": "boolean"}}}},
+            {"if": {"properties": {"state": {"const": "frozen"}, "plateau_found": {"const": False}},
+                    "required": ["state", "plateau_found"]},
+             "then": {"properties": {"common_n": {"const": 8}}}},
         ]
         return schema
 
@@ -172,12 +180,23 @@ class PhaseConfiguration(StrictModel):
     def phase_stream_consistency(self) -> "PhaseConfiguration":
         if self.phase == BenchmarkPhase.IDLE_LATENCY and self.streams is not None:
             raise ValueError("idle_latency does not use TCP streams")
+        if self.kind == "phase":
+            if self.trial_index is not None or self.parent_unit_id is not None:
+                raise ValueError("phase units cannot declare a trial or parent unit")
+            if self.phase == BenchmarkPhase.SINGLE_FLOW and self.streams != 1:
+                raise ValueError("single_flow requires exactly one stream")
         if self.kind == "calibration_trial" and self.trial_index is None:
             raise ValueError("calibration trial requires trial_index")
+        if self.kind == "calibration_trial" and (self.phase != BenchmarkPhase.MULTI_FLOW or self.streams is None or self.parent_unit_id is not None):
+            raise ValueError("calibration trials require multi_flow streams and no parent unit")
         if self.kind != "calibration_trial" and self.trial_index is not None:
             raise ValueError("trial_index is only valid for calibration_trial")
+        if self.kind == "continuous_day" and (self.phase != BenchmarkPhase.MULTI_FLOW or self.measured_seconds != 86400 or self.parent_unit_id is not None):
+            raise ValueError("continuous_day requires one 86400-second multi_flow unit without a parent")
         if self.kind == "probe_chunk" and self.parent_unit_id is None:
             raise ValueError("probe_chunk requires a parent unit")
+        if self.kind == "probe_chunk" and (self.phase != BenchmarkPhase.MULTI_FLOW or self.parent_unit_id == self.unit_id):
+            raise ValueError("probe_chunk must reference a distinct retained multi_flow parent unit")
         return self
 
 
@@ -478,6 +497,11 @@ class ResolvedObservation(StrictModel):
             raise ValueError("VM intent must match provider configuration")
         if self.scheduled_start is not None and (self.scheduled_start.tzinfo is None or self.scheduled_start.utcoffset() is None):
             raise ValueError("scheduled_start must include a timezone")
+        expected_layout = ArtifactLayout.for_mode(self.mode, self.measurement_units)
+        if self.artifact_layout.mode is None:
+            object.__setattr__(self, "artifact_layout", expected_layout)
+        elif self.artifact_layout != expected_layout:
+            raise ValueError("artifact_layout must be derived from observation mode and units")
         return self
 
 

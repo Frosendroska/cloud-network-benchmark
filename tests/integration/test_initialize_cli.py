@@ -478,3 +478,45 @@ def test_secret_bearing_schedule_entry_is_rejected_before_any_result_write(
                             schedule_entry=unsafe)
     assert "synthetic-secret" not in str(caught.value)
     assert not (root / "results").exists()
+
+
+def test_model_copy_schedule_header_secret_is_rejected_before_any_result_write(
+    tmp_path: Path, frozen_clock: object, deterministic_token: object,
+) -> None:
+    root = tmp_path / "repo-model-copy"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    shutil.copy(Path(__file__).parents[2] / "configs/tests/exp-900-single-provider.yaml", path)
+    opaque_row = "exp-900-acceptance,opaque-value"
+    safe = ScheduleEntry.model_construct(
+        schema_version=2, entry_id="row-1", config_id="exp-900-acceptance", experiment_id="EXP-900",
+        scheduled_start=None, window_label=None, source_path="tracking/run-register.csv",
+        source_sha256="a" * 64, row_sha256=hashlib.sha256(opaque_row.encode()).hexdigest(),
+        original_header="config_id,value", original_row=opaque_row, columns=["config_id", "value"], priority="P0",
+        replaces_run_id=None,
+    )
+    bypassed = safe.model_copy(update={
+        "original_header": "config_id,api_token", "columns": ["config_id", "api_token"],
+    })
+    with pytest.raises(ValidationError, match="secret-bearing") as caught:
+        initialize_campaign(path, root, root / "results", frozen_clock, deterministic_token,
+                            schedule_entry=bypassed)
+    assert "opaque-value" not in str(caught.value) and "api_token" not in str(caught.value)
+    assert not (root / "results").exists()
+
+
+def test_initialization_preserves_malformed_git_commit_as_unavailable(
+    repository_root: Path, tmp_path: Path, frozen_clock: object, deterministic_token: object,
+) -> None:
+    results = tmp_path / "results"
+    initialized = initialize_campaign(
+        repository_root / "configs/tests/exp-900-single-provider.yaml", repository_root, results,
+        frozen_clock, deterministic_token,
+        StaticGitProvenance("malformed"), StaticGitProvenance("c" * 40),
+    )
+    parent = CampaignManifest.model_validate_json(Path(initialized.parent_manifest_path).read_text())
+    snapshot = parent.config_provenance.implementation_git
+    assert snapshot.commit.value is None
+    assert "malformed" in (snapshot.commit.unavailable_reason or "")
+    assert parent.config_provenance.implementation_git_commit.value is None
+    assert snapshot.dirty.value is None and snapshot.diff_sha256.value is None

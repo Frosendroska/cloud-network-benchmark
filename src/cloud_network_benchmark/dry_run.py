@@ -75,7 +75,7 @@ def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
                 measurement_direction=getattr(observation.measurement_direction, "value", observation.measurement_direction),
                 placement=observation.placement.model_dump(mode="json"),
                 benchmark=observation.benchmark.model_dump(mode="json"),
-                artifacts=layout.model_dump(),
+                artifacts=layout.as_mapping(),
                 validation_inputs={name: value.model_dump(mode="json") for name, value in artifact_inputs(
                     layout, mode=resolved.mode,
                     measurement_units=resolved.measurement_units, schedule_supplied=resolved.schedule_entry.value is not None,

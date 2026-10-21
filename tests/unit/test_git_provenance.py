@@ -114,3 +114,16 @@ def test_raced_snapshot_becomes_explicitly_unavailable(tmp_path: Path) -> None:
     snapshot = RacedSnapshot().snapshot(repo)
     assert snapshot.dirty.value is None
     assert "RuntimeError" in (snapshot.dirty.unavailable_reason or "")
+
+
+def test_malformed_observed_commit_becomes_unavailable_evidence(tmp_path: Path) -> None:
+    class MalformedCommit(RepositoryGitProvenance):
+        def commit(self, repository: Path):
+            del repository
+            from cloud_network_benchmark.contracts import StringEvidence
+            return StringEvidence(value="malformed")
+
+    snapshot = MalformedCommit().snapshot(tmp_path)
+    assert snapshot.commit.value is None
+    assert "malformed" in (snapshot.commit.unavailable_reason or "")
+    assert snapshot.dirty.value is None and snapshot.diff_sha256.value is None

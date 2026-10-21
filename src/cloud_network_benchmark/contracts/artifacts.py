@@ -8,7 +8,7 @@ from typing import Dict, Literal, Optional
 
 from pydantic import Field, model_validator
 
-from .common import ArtifactExpectation, FailureEvidence, IDENTIFIER_PATTERN, StrictModel, StringEvidence, Evidence, VmRole
+from .common import ArtifactExpectation, ExperimentMode, FailureEvidence, IDENTIFIER_PATTERN, StrictModel, StringEvidence, Evidence, VmRole
 
 
 def _normalized_relative_path(value: str) -> str:
@@ -92,6 +92,8 @@ class ArtifactRecord(StrictModel):
 
 
 class ArtifactLayout(StrictModel):
+    mode: Optional[ExperimentMode] = None
+    measurement_unit_ids: list[str] = Field(default_factory=list)
     config_snapshot: str = "config.yaml"
     resolved_snapshot: str = "config.resolved.json"
     schedule_snapshot: str = "schedule.csv"
@@ -112,12 +114,15 @@ class ArtifactLayout(StrictModel):
 
     @model_validator(mode="after")
     def safe_paths(self) -> "ArtifactLayout":
-        for value in self.model_dump().values():
+        for name, value in self.model_dump().items():
+            if name in {"mode", "measurement_unit_ids"}:
+                continue
             _normalized_relative_path(value)
         return self
 
     def as_mapping(self) -> Dict[str, str]:
-        return self.model_dump()
+        return {name: value for name, value in self.model_dump().items()
+                if name not in {"mode", "measurement_unit_ids"}}
 
     def unit_paths(self, unit_id: str) -> Dict[str, str]:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}", unit_id):
@@ -133,10 +138,31 @@ class ArtifactLayout(StrictModel):
             "iperf3": f"{root}/iperf3.json",
         }
 
-    def for_mode(self, mode: str, measurement_units: list[object], *, schedule_supplied: bool = False) -> list[ArtifactInput]:
+    @classmethod
+    def for_mode(cls, mode: str, measurement_units: list[object]) -> "ArtifactLayout":
+        normalized_mode = ExperimentMode(mode)
+        unit_ids = [str(getattr(unit, "unit_id")) for unit in measurement_units]
+        if len(unit_ids) != len(set(unit_ids)):
+            raise ValueError("mode-derived artifact layout requires unique measurement unit IDs")
+        return cls(mode=normalized_mode, measurement_unit_ids=unit_ids)
+
+    def declarations_for_mode(self, mode: str, measurement_units: list[object], *, schedule_supplied: bool = False) -> list[ArtifactInput]:
         from .common import ExperimentMode
 
         mode = ExperimentMode(mode)
+        if self.mode is not None and ExperimentMode(self.mode) != mode:
+            raise ValueError("artifact layout mode must match requested mode")
+        unit_ids = [str(getattr(unit, "unit_id")) for unit in measurement_units]
+        if self.measurement_unit_ids and self.measurement_unit_ids != unit_ids:
+            day_chunks_extend_layout = (
+                mode == ExperimentMode.DIAGNOSTIC_DAY
+                and unit_ids[:len(self.measurement_unit_ids)] == self.measurement_unit_ids
+                and all(getattr(unit, "kind", None) == "probe_chunk"
+                        and getattr(unit, "parent_unit_id", None) in self.measurement_unit_ids
+                        for unit in measurement_units[len(self.measurement_unit_ids):])
+            )
+            if not day_chunks_extend_layout:
+                raise ValueError("artifact layout unit IDs must match requested measurement units")
         declarations: list[ArtifactInput] = []
         global_paths = [
             ("config_snapshot", self.config_snapshot, "configuration", "controller", ArtifactExpectation.REQUIRED),

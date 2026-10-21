@@ -95,17 +95,22 @@ class ValidatorInput(StrictModel):
         if len(unit_ids) != len(set(unit_ids)):
             raise ValueError("measurement unit IDs must be unique")
         if ExperimentMode(self.mode) in {ExperimentMode.ACCEPTANCE, ExperimentMode.SHORT_STUDY}:
-            if [item.phase for item in self.measurement_units] != [BenchmarkPhase.IDLE_LATENCY, BenchmarkPhase.SINGLE_FLOW, BenchmarkPhase.MULTI_FLOW]:
+            if [item.phase for item in self.measurement_units] != [BenchmarkPhase.IDLE_LATENCY, BenchmarkPhase.SINGLE_FLOW, BenchmarkPhase.MULTI_FLOW] or any(item.kind != "phase" for item in self.measurement_units):
                 raise ValueError("short and acceptance units must contain the ordered three phases")
             expected_duration = 10 if ExperimentMode(self.mode) == ExperimentMode.ACCEPTANCE else 60
             if any(item.measured_seconds != expected_duration for item in self.measurement_units):
                 raise ValueError("short and acceptance unit durations must match mode")
         elif ExperimentMode(self.mode) == ExperimentMode.CALIBRATION:
             expected_streams = [1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4]
-            if len(self.measurement_units) != 12 or any(item.phase != BenchmarkPhase.MULTI_FLOW or item.trial_index != index or item.streams != expected_streams[index-1] or item.measured_seconds != 60 for index, item in enumerate(self.measurement_units, 1)):
+            if len(self.measurement_units) != 12 or any(item.kind != "calibration_trial" or item.phase != BenchmarkPhase.MULTI_FLOW or item.trial_index != index or item.streams != expected_streams[index-1] or item.measured_seconds != 60 for index, item in enumerate(self.measurement_units, 1)):
                 raise ValueError("calibration units must contain twelve ordered aggregate trials")
-        elif len(self.measurement_units) != 1 or self.measurement_units[0].kind != "continuous_day" or self.measurement_units[0].measured_seconds != 86400:
-            raise ValueError("diagnostic_day requires one 86400-second continuous unit")
+        else:
+            day_units = [item for item in self.measurement_units if item.kind == "continuous_day"]
+            chunks = [item for item in self.measurement_units if item.kind == "probe_chunk"]
+            if (len(day_units) != 1 or day_units[0].phase != BenchmarkPhase.MULTI_FLOW or day_units[0].measured_seconds != 86400
+                    or any(item.parent_unit_id != day_units[0].unit_id for item in chunks)
+                    or len(chunks) + 1 != len(self.measurement_units)):
+                raise ValueError("diagnostic_day requires one retained 86400-second multi_flow unit and only its declared probe chunks")
         unit_set = set(unit_ids)
         if list(dict.fromkeys(item.phase for item in self.measurement_units)) != self.enabled_phases:
             raise ValueError("enabled_phases must match measurement unit phases")
@@ -117,11 +122,10 @@ class ValidatorInput(StrictModel):
             raise ValueError("diagnostic evidence must match deployment")
         if any(item.deployment_id != self.identity.deployment_id for item in self.vm_metadata_records):
             raise ValueError("VM metadata must match deployment")
-        if self.vm_metadata_records and ({item.vm_role for item in self.vm_metadata_records} != {VmRole.VM_A, VmRole.VM_B}
-                                         or any(item.provider != self.provider for item in self.vm_metadata_records)):
-            raise ValueError("VM metadata must cover both roles for the selected provider")
-        if self.diagnostics and {item.vm_role for item in self.diagnostics} != {VmRole.VM_A, VmRole.VM_B}:
-            raise ValueError("diagnostic evidence must cover both VM roles")
+        if len({item.vm_role for item in self.vm_metadata_records}) != len(self.vm_metadata_records):
+            raise ValueError("VM metadata may contain at most one record per available role")
+        if self.vm_metadata_records and any(item.provider != self.provider for item in self.vm_metadata_records):
+            raise ValueError("VM metadata must match the selected provider")
         record_ids = [(item.artifact_id, item.path, item.unit_id) for item in self.artifact_records]
         if len(record_ids) != len(set(record_ids)):
             raise ValueError("artifact records must have unique concrete identity")
@@ -137,8 +141,11 @@ class ValidatorInput(StrictModel):
                 path_matches = re.fullmatch(pattern, record.path) is not None
             else:
                 path_matches = record.path == expected_path
-            if not path_matches or (record.kind, record.producer, record.unit_id) != (
-                declaration.kind, declaration.producer, declaration.unit_id
+            dynamic_day_record = (record.artifact_id in {"day-probe-csv", "day-probe-log"}
+                                  and declaration.path_template is not None
+                                  and record.unit_id == next((unit.unit_id for unit in self.measurement_units if unit.kind == "continuous_day"), None))
+            if not path_matches or record.kind != declaration.kind or record.producer != declaration.producer or (
+                record.unit_id != declaration.unit_id and not dynamic_day_record
             ):
                 raise ValueError("artifact evidence must match its declared input")
             expected_hash = {
@@ -180,9 +187,9 @@ class ValidatorInput(StrictModel):
 
 
 class ValidationFinding(StrictModel):
-    code: str = Field(min_length=1)
+    code: str = Field(min_length=1, pattern=r"\S")
     severity: Literal["info", "warning", "error"]
-    message: str = Field(min_length=1)
+    message: str = Field(min_length=1, pattern=r"\S")
     unit_id: Optional[str] = None
     artifact_id: Optional[str] = None
 
@@ -213,7 +220,7 @@ def artifact_inputs(
     schedule_supplied: bool = False,
 ) -> Dict[str, ArtifactInput]:
     result: Dict[str, ArtifactInput] = {}
-    declarations = layout.for_mode(mode, measurement_units, schedule_supplied=schedule_supplied)
+    declarations = layout.declarations_for_mode(mode, measurement_units, schedule_supplied=schedule_supplied)
     for declaration in declarations:
         name = declaration.artifact_id
         result[name] = ArtifactInput(

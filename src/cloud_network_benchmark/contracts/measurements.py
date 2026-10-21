@@ -80,7 +80,7 @@ class ClockMapping(StrictModel):
 class TimingGap(StrictModel):
     started_at: datetime
     finished_at: datetime
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, pattern=r"\S")
 
     @model_validator(mode="after")
     def valid_gap(self) -> "TimingGap":

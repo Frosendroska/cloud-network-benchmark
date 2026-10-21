@@ -19,12 +19,31 @@ def test_schedule_entry_keeps_exact_row_and_hash_identity() -> None:
         original_header="id,config", original_row="row-1,exp_001", columns=["id", "config"], priority="P0",
     )
     assert entry.original_row == "row-1,exp_001"
+    assert entry.original_row.encode("utf-8") == b"row-1,exp_001"
     with pytest.raises(ValidationError):
         ScheduleEntry(**{**entry.model_dump(), "config_id": "EXP-001"})
     with pytest.raises(ValidationError):
         ScheduleEntry(**{**entry.model_dump(), "row_sha256": "b" * 64})
     with pytest.raises(ValidationError):
         ScheduleEntry(**{**entry.model_dump(), "scheduled_start": datetime(2026, 10, 21)})
+
+
+@pytest.mark.parametrize("header,columns,row", [
+    ("config_id,password", ["config_id", "password"], "exp_001,opaque"),
+    ("config_id,api_token", ["config_id", "api_token"], "exp_001,opaque"),
+    ("config_id,credentials_blob", ["config_id", "credentials_blob"], "exp_001,opaque"),
+    ("config_id,private_key_path", ["config_id", "private_key_path"], "exp_001,opaque"),
+    ("config_id,value", ["config_id", "value"], "exp_001,token=opaque"),
+    ("config_id,value", ["config_id", "value"], "-----BEGIN PRIVATE KEY-----opaque"),
+])
+def test_schedule_entry_rejects_sensitive_field_names_and_values(header, columns, row) -> None:
+    with pytest.raises(ValidationError, match="secret-bearing"):
+        ScheduleEntry(
+            schema_version=2, entry_id="row-1", config_id="exp_001", experiment_id="EXP-001",
+            scheduled_start=None, window_label=None, source_path="tracking/run-register.csv",
+            source_sha256="a" * 64, row_sha256=hashlib.sha256(row.encode()).hexdigest(),
+            original_header=header, original_row=row, columns=columns, priority="P0",
+        )
 
 
 def test_admission_requirements_use_only_declared_caps_and_source_evidence() -> None:

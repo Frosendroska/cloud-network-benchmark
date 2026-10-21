@@ -261,17 +261,30 @@ class ValidationStatus(StrictModel):
             raise ValueError("status reasons must be nonblank")
         return self
 
+    @field_validator("data_reasons", "comparison_reasons")
+    @classmethod
+    def reasons_are_nonblank(cls, values: list[str]) -> list[str]:
+        if any(not item.strip() for item in values):
+            raise ValueError("status reasons must be nonblank")
+        return values
+
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
         schema = handler(core_schema)
         schema["allOf"] = [
             {"if": {"properties": {"comparison_eligibility": {"const": "eligible"}}, "required": ["comparison_eligibility"]},
-             "then": {"properties": {"data_validity": {"const": "valid"}}}},
+             "then": {"required": ["data_validity"], "properties": {"data_validity": {"const": "valid"}}}},
+            {"if": {"not": {"required": ["data_validity"]}},
+             "then": {"properties": {"data_reasons": {"minItems": 1}}}},
             {"if": {"properties": {"data_validity": {"enum": ["not_validated", "partial", "invalid", "unavailable"]}}},
              "then": {"properties": {"data_reasons": {"minItems": 1}}}},
+            {"if": {"not": {"required": ["comparison_eligibility"]}},
+             "then": {"properties": {"comparison_reasons": {"minItems": 1}}}},
             {"if": {"properties": {"comparison_eligibility": {"enum": ["not_evaluated", "ineligible", "unavailable"]}}},
              "then": {"properties": {"comparison_reasons": {"minItems": 1}}}},
         ]
+        for name in ("data_reasons", "comparison_reasons"):
+            schema.get("properties", {}).get(name, {}).setdefault("items", {}).update({"minLength": 1, "pattern": r"\S"})
         return schema
 
 

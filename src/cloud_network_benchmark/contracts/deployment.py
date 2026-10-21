@@ -94,6 +94,10 @@ class ProviderDeploymentInput(StrictModel):
     ) -> "ProviderDeploymentInput":
         options = observation.options
         replacement = replacement_context or observation.replacement_context
+        if observation.replacement_context is not None and replacement != observation.replacement_context:
+            raise ValueError("supplied replacement metadata must match the source observation")
+        if (observation.context == "replacement") != (replacement is not None):
+            raise ValueError("replacement metadata presence must match the source observation context")
         if replacement is not None:
             replacement = ReplacementContext.model_validate(replacement)
             if observation.mode != ExperimentMode.SHORT_STUDY or observation.context != "replacement":
@@ -152,6 +156,10 @@ class ProviderDeploymentInput(StrictModel):
             raise ValueError("observation_id must be nonblank")
         if self.replaces_run_id is not None and not self.replaces_run_id.endswith(f"-{provider.value}"):
             raise ValueError("replaces_run_id provider suffix must match deployment provider")
+        if (self.context == "replacement") != (self.replaces_run_id is not None):
+            raise ValueError("replacement context and replaces_run_id must be supplied together")
+        if self.context == "replacement" and ExperimentMode(self.mode) != ExperimentMode.SHORT_STUDY:
+            raise ValueError("replacement deployments are only valid for short_study mode")
         for name, expected in AdmissionRequirements.expected_for(self.mode, self.scenario).items():
             if getattr(self.admission, name) != expected:
                 raise ValueError(f"admission.{name} must match deployment mode and scenario")
@@ -202,6 +210,9 @@ class ProviderDeploymentInput(StrictModel):
         if reservation is not None and expiry is not None and reservation.expires_at.value is not None and expiry.expires_at.value is not None:
             if expiry.expires_at.value > reservation.expires_at.value:
                 raise ValueError("provider expiry must not exceed reserved lifetime cap")
+        if reservation is not None and expiry is not None and reservation.cap_started_at.value is not None and expiry.registered_at.value is not None:
+            if expiry.registered_at.value < reservation.cap_started_at.value:
+                raise ValueError("expiry registration must not precede reserved cap start")
         region_equal = self.vm_a.region == self.vm_b.region
         zone_equal = self.vm_a.zone == self.vm_b.zone
         if self.scenario == Scenario.SAME_ZONE and not (region_equal and zone_equal and self.placement.kind == "none"):
@@ -312,4 +323,6 @@ class ProviderDeploymentOutput(StrictModel):
             or self.expiry.value.provider != self.provider
         ):
             raise ValueError("deployment expiry identity must match output run, deployment and provider")
+        if self.expiry.value is not None and self.expiry.value.registered_at.value is not None and self.expiry.value.registered_at.value > self.started_at:
+            raise ValueError("expiry registration must precede provider apply start")
         return self

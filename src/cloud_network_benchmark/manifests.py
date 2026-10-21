@@ -62,10 +62,22 @@ class GitProvenanceProvider(Protocol):
 def _snapshot_or_unavailable(provider: GitProvenanceProvider, repository: Path, commit: StringEvidence) -> GitSnapshot:
     snapshotter = getattr(provider, "snapshot", None)
     if callable(snapshotter):
-        return snapshotter(repository)
+        snapshot = snapshotter(repository)
+        if snapshot.commit.value is not None and not _valid_git_commit(snapshot.commit.value):
+            reason = "Git commit unavailable: observed commit metadata is malformed"
+            return GitSnapshot(commit=StringEvidence(unavailable_reason=reason), dirty=Evidence[bool](unavailable_reason=reason),
+                               diff_sha256=StringEvidence(unavailable_reason=reason))
+        return snapshot
     reason = "provider implements commit() only; working-tree evidence unavailable"
+    if commit.value is not None and not _valid_git_commit(commit.value):
+        reason = "Git commit unavailable: observed commit metadata is malformed"
+        commit = StringEvidence(unavailable_reason=reason)
     return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=reason),
                        diff_sha256=StringEvidence(unavailable_reason=reason))
+
+
+def _valid_git_commit(value: str) -> bool:
+    return len(value) in {40, 64} and all(character in "0123456789abcdefABCDEF" for character in value)
 
 
 class RepositoryGitProvenance:
@@ -141,6 +153,10 @@ class RepositoryGitProvenance:
 
     def snapshot(self, repository: Path) -> GitSnapshot:
         commit = self.commit(repository)
+        if commit.value is not None and not _valid_git_commit(commit.value):
+            reason = "Git commit unavailable: observed commit metadata is malformed"
+            return GitSnapshot(commit=StringEvidence(unavailable_reason=reason), dirty=Evidence[bool](unavailable_reason=reason),
+                               diff_sha256=StringEvidence(unavailable_reason=reason))
         if commit.value is None:
             unavailable = commit.unavailable_reason or "Git commit unavailable"
             return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=unavailable),
@@ -155,6 +171,8 @@ class RepositoryGitProvenance:
             return GitSnapshot(commit=commit, dirty=Evidence[bool](value=dirty), diff_sha256=StringEvidence(value=digest))
         except Exception as exc:
             reason = f"Git working-tree snapshot unavailable: {type(exc).__name__}"
+            if commit.value is not None and not _valid_git_commit(commit.value):
+                commit = StringEvidence(unavailable_reason="Git commit unavailable: observed commit metadata is malformed")
             return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=reason),
                                diff_sha256=StringEvidence(unavailable_reason=reason))
 
@@ -169,7 +187,11 @@ class StaticGitProvenance:
 
     def snapshot(self, repository: Path) -> GitSnapshot:
         del repository
-        return GitSnapshot(commit=StringEvidence(value=self._commit), dirty=Evidence[bool](value=False),
+        commit = StringEvidence(value=self._commit) if _valid_git_commit(self._commit) else StringEvidence(unavailable_reason="Git commit unavailable: observed commit metadata is malformed")
+        if commit.value is None:
+            reason = commit.unavailable_reason or "Git commit unavailable"
+            return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=reason), diff_sha256=StringEvidence(unavailable_reason=reason))
+        return GitSnapshot(commit=commit, dirty=Evidence[bool](value=False),
                            diff_sha256=StringEvidence(value=hashlib.sha256(
                                b"staged\0" + (0).to_bytes(8, "big") + b"unstaged\0" + (0).to_bytes(8, "big")
                            ).hexdigest()))
@@ -738,10 +760,12 @@ def initialize_campaign(
     implementation_provider = implementation_git or RepositoryGitProvenance()
     implementation = implementation_provider.commit(repository_root)
     implementation_snapshot = _snapshot_or_unavailable(implementation_provider, repository_root, implementation)
+    implementation = implementation_snapshot.commit
     design_root = thesis_repository_root(repository_root)
     design_provider = design_git or RepositoryGitProvenance()
     design = design_provider.commit(design_root)
     design_snapshot = _snapshot_or_unavailable(design_provider, design_root, design)
+    design = design_snapshot.commit
     unavailable = StructuredEvidence(unavailable_reason="not observed during F01 initialization")
     tool_versions = StructuredEvidence(value={"cloud_network_benchmark": "0.1.0", "python": platform.python_version()})
     assigned: List[Tuple[Provider, ChildRunManifest]] = []
@@ -839,6 +863,7 @@ def initialize_campaign(
                 measurement_units=resolved.measurement_units,
                 config_provenance=provenance,
                 resolved_observation=observation.model_dump(mode="json"),
+                artifacts=observation.artifact_layout,
                 vm_metadata=unavailable,
                 provider_metadata=unavailable,
                 tool_versions=tool_versions,

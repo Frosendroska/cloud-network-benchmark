@@ -1866,6 +1866,7 @@
         },
         "reason": {
           "minLength": 1,
+          "pattern": "\\S",
           "title": "Reason",
           "type": "string"
         },
@@ -1902,6 +1903,25 @@
               "data_validity": {
                 "const": "valid"
               }
+            },
+            "required": [
+              "data_validity"
+            ]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "data_validity"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "data_reasons": {
+                "minItems": 1
+              }
             }
           }
         },
@@ -1921,6 +1941,22 @@
           "then": {
             "properties": {
               "data_reasons": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "comparison_eligibility"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison_reasons": {
                 "minItems": 1
               }
             }
@@ -1954,6 +1990,8 @@
         },
         "comparison_reasons": {
           "items": {
+            "minLength": 1,
+            "pattern": "\\S",
             "type": "string"
           },
           "title": "Comparison Reasons",
@@ -1961,6 +1999,8 @@
         },
         "data_reasons": {
           "items": {
+            "minLength": 1,
+            "pattern": "\\S",
             "type": "string"
           },
           "title": "Data Reasons",
