@@ -40,3 +40,28 @@ def test_jsonl_malformed_tail_keeps_prior_receiver_intervals(tmp_path):
     assert len(parsed.receiver_intervals)==1
     assert parsed.receiver_intervals[0].bytes==125000000
     assert any(item.code=="native.iperf3.jsonl" for item in parsed.findings)
+
+
+def test_materialized_native_replay_keeps_mode_unit_deployment_and_status_inputs_separate():
+    root=Path(__file__).parents[1]/"fixtures"/"f08"/"native"
+    csv_path, log_path, tcp_path = root/"sockperf.csv", root/"sockperf.log", root/"iperf3.json"
+    before={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (csv_path,log_path,tcp_path)}
+    replay_shape={"acceptance":["idle_latency","single_flow","multi_flow"],
+        "short_study":["idle_latency","single_flow","multi_flow"],
+        "calibration":[f"trial_{index:02d}" for index in range(1,13)],
+        "diagnostic_day":["probe_chunk_001"]}
+    for mode, unit_ids in replay_shape.items():
+        for unit_id in unit_ids:
+            ref=SourceRef("sockperf-csv",csv_path.name,before[csv_path.name],unit_id,
+                          f"{mode}-deployment","vm_a","3.10")
+            parsed=parse_sockperf(csv_path,log_path,source=ref,
+                log_source=SourceRef("sockperf-log",log_path.name,before[log_path.name],unit_id,
+                                     f"{mode}-deployment","vm_a","3.10"))
+            assert parsed.samples and all(sample.source.unit_id==unit_id for sample in parsed.samples)
+            assert all(sample.source.deployment_id==f"{mode}-deployment" for sample in parsed.samples)
+        if mode in {"acceptance","short_study","calibration"}:
+            ref=SourceRef("iperf3_receiver",tcp_path.name,before[tcp_path.name],unit_ids[-1],
+                          f"{mode}-deployment","vm_b","3.17.1")
+            tcp=parse_iperf3(tcp_path,source=ref,format="json")
+            assert tcp.receiver_intervals and all(item.source.unit_id==unit_ids[-1] for item in tcp.receiver_intervals)
+    assert before=={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (csv_path,log_path,tcp_path)}

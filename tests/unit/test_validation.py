@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import pytest
 
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts import IdentityContext, ValidatorInput, artifact_inputs
-from cloud_network_benchmark.contracts.campaign import derive_measurement_units
+from cloud_network_benchmark.contracts.campaign import PhaseConfiguration, derive_measurement_units
 from cloud_network_benchmark.contracts.common import ComparisonEligibility, DataValidity, Evidence, ExperimentMode, FailureEvidence, ValidationStatus
 from cloud_network_benchmark.contracts.measurements import ClockMapping, CommandEvidence, MeasurementTiming, TimingGap
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _command_findings, _coverage, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
@@ -33,11 +34,20 @@ def make_input(repository_root, provider="aws", campaign="camp", *, config_name=
                                campaign_id=campaign, observation_id=f"{campaign}-{provider}-obs",
                                run_id=run_id, deployment_id=deployment, provider=provider)
     start = NOW
-    timings = [MeasurementTiming(unit_id=unit.unit_id, deployment_id=deployment,
-                probe_test_started_at={"value": start}, tcp_started_at={"value": start},
-                measured_started_at={"value": start}, measured_finished_at={"value": start + timedelta(seconds=60)},
-                monotonic_started={"value": 1.0}, monotonic_finished={"value": 61.0}, omitted_seconds=5,
-                overlap_seconds={"value": 60}) for unit in units]
+    timings = []
+    elapsed = 0
+    for unit in units:
+        probe_start = start + timedelta(seconds=elapsed)
+        measured_offset = 5 if unit.phase == "idle_latency" else 10
+        measured_start = probe_start + timedelta(seconds=measured_offset)
+        timings.append(MeasurementTiming(unit_id=unit.unit_id, deployment_id=deployment,
+            probe_test_started_at={"value":probe_start},
+            tcp_started_at=(Evidence[datetime](unavailable_reason="no TCP client in idle phase") if unit.phase == "idle_latency"
+                            else Evidence[datetime](value=probe_start + timedelta(seconds=7))),
+            measured_started_at={"value":measured_start}, measured_finished_at={"value":measured_start + timedelta(seconds=unit.measured_seconds)},
+            monotonic_started={"value":float(elapsed + 1)}, monotonic_finished={"value":float(elapsed + unit.measured_seconds + 1)},
+            omitted_seconds=5, overlap_seconds={"value":unit.measured_seconds}))
+        elapsed += unit.measured_seconds + (5 if unit.phase == "idle_latency" else 10) + 10
     row = "slot-one,EXP-001,P0"
     schedule = ScheduleEntry(schema_version=2, entry_id="slot-one", config_id=resolved.config_id,
         experiment_id=resolved.experiment_id, scheduled_start=NOW, window_label="morning",
@@ -193,6 +203,113 @@ def test_coverage_requires_full_receiver_duration_and_exact_99_percent(repositor
     assert result["active_probe_ratio"]["value"] == pytest.approx(ratio, abs=1e-9)
 
 
+@pytest.mark.parametrize(("command_finish", "expected", "available"), [
+    (165, 60.0, True),   # exact admissible measured-start bracket
+    (225, 0.0, True),    # broad bracket includes a start after the probe window
+    (164, None, False),  # command cannot contain omission plus receiver duration
+])
+def test_conservative_command_native_bracket_uses_worst_case_overlap(repository_root, command_finish, expected, available):
+    value, unit, sock, tcp = _coverage_inputs(repository_root)
+    ref = SourceRef("iperf3_receiver", "iperf3.json", "e" * 64)
+    tcp = NativeParse(receiver_intervals=(
+        ReceiverInterval("1", 0, 5, 5, 0, True, False, ref, 1),
+        *tcp.receiver_intervals))
+    timing = value.timings[0].model_copy(update={
+        "unit_id": unit.unit_id,
+        "probe_test_started_at": Evidence[datetime](value=NOW),
+        "measured_started_at": Evidence[datetime](unavailable_reason="not captured"),
+        "measured_finished_at": Evidence[datetime](unavailable_reason="not captured"),
+        "clock_mappings": [ClockMapping(vm_role="vm_a", monotonic_seconds=100, utc_timestamp=NOW,
+            estimated_error_ms={"value": 0}, synchronization_source={"value": "offline fixture"})],
+    })
+    command = CommandEvidence(schema_version=2,
+        request={"argv":["iperf3", "-c", "10.0.0.2"]}, result={"outcome":"succeeded"},
+        producer="vm_a", deployment_id=value.identity.deployment_id, unit_id=unit.unit_id,
+        binary_version={"value":"3.17.1"}, source_identity={"value":"fixture build"},
+        monotonic_started={"value":100}, monotonic_finished={"value":command_finish})
+    value = value.model_copy(update={"timings":[timing], "commands":[command]})
+    result = _coverage(value, unit, sock, tcp)
+    assert result["active_probe_seconds"]["value"] == expected
+    assert (result["tcp_start_bracket"].get("exact_utc_start_available") is False) if available else \
+        result["tcp_start_bracket"]["unavailable_reason"]
+
+
+def test_frozen_common_n_consistency_and_inflation_are_bound_to_same_short_deployment(repository_root, monkeypatch):
+    value = make_input(repository_root)
+    idle = value.measurement_units[0].unit_id
+    loaded = value.measurement_units[1].unit_id
+    parses = {}
+    for unit_id, samples in ((idle, (10.0, 12.0)), (loaded, (14.0, 16.0))):
+        ref = SourceRef("sockperf-csv", f"{unit_id}.csv", "f" * 64, unit_id,
+                        value.identity.deployment_id, "vm_a", "3.10")
+        from cloud_network_benchmark.native import RttSample
+        parses[unit_id] = NativeParse(samples=tuple(RttSample(i, i, i + sample / 1_000_000,
+            sample, ref, i + 1) for i, sample in enumerate(samples)))
+    import cloud_network_benchmark.validation as module
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+                        (parses.get(unit.unit_id, NativeParse()), None))
+    result = module.validate_bundle(value, evaluated_at=NOW)
+    inflation = result.metrics.value["units"][1]["rtt"]["latency_inflation_us"]["value"]
+    assert inflation == 4.0
+    assert result.metrics.value["common_n"]["state"] == "pending"
+
+
+def test_frozen_common_n_snapshot_contradiction_is_invalid_and_explicit(repository_root, tmp_path):
+    value = make_input(repository_root)
+    resolved, _ = resolve_campaign(repository_root / "configs/experiments/exp-001-multi-provider.yaml", repository_root)
+    snapshot = resolved.model_dump(mode="json")
+    snapshot["benchmark"]["common_n"] = {"state":"frozen", "common_n":4,
+        "source_campaign_id":"calibration-campaign", "source_sha256":"d" * 64, "plateau_found":True}
+    snapshot["launch_blockers"].remove("calibration_pending")
+    for unit in snapshot["measurement_units"]:
+        if unit["phase"] == "multi_flow":
+            unit["streams"] = 4
+    # The resolved snapshot freezes N=4; the supplied native attempt claims N=2.
+    for observation in snapshot["observations"]:
+        observation["benchmark"]["common_n"] = snapshot["benchmark"]["common_n"]
+        for unit in observation["measurement_units"]:
+            if unit["phase"] == "multi_flow":
+                unit["streams"] = 4
+    path = tmp_path / "resolved.json"
+    payload = json.dumps(snapshot, sort_keys=True).encode()
+    path.write_bytes(payload)
+    record = ArtifactRecord(artifact_id="resolved_snapshot", path="resolved.json", kind="resolved_configuration",
+        producer="controller", unit_id=None, deployment_id=value.identity.deployment_id, closed=True,
+        size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()}, retrieval_state="verified")
+    units = [unit.model_copy(update={"streams":2}) if unit.phase == "multi_flow" else unit
+             for unit in value.measurement_units]
+    changed = value.model_copy(update={"measurement_units":units, "child_result_root":str(tmp_path),
+        "resolved_snapshot_path":"resolved.json", "resolved_sha256":Evidence[str](value=hashlib.sha256(payload).hexdigest()),
+        "artifact_records":[record]})
+    result = validate_bundle(changed, evaluated_at=NOW)
+    codes = {finding.code for finding in result.findings}
+    assert "identity.resolved_units" in codes, codes
+    assert "calibration.frozen_n_mismatch" in codes, codes
+    assert result.validation_status.data_validity == "invalid"
+
+
+def test_materialized_diagnostic_chunks_extend_resolved_day_without_redefining_it(repository_root, tmp_path):
+    value = make_input(repository_root, config_name="exp-001-diagnostic-day.yaml")
+    day = value.measurement_units[0]
+    chunk = PhaseConfiguration(unit_id="probe-chunk-001", kind="probe_chunk", phase="multi_flow",
+        measured_seconds=300, streams=4, parent_unit_id=day.unit_id)
+    resolved, _ = resolve_campaign(repository_root / "configs/experiments/exp-001-diagnostic-day.yaml", repository_root)
+    payload = json.dumps(resolved.model_dump(mode="json"), sort_keys=True).encode()
+    (tmp_path / "resolved.json").write_bytes(payload)
+    record = ArtifactRecord(artifact_id="resolved_snapshot", path="resolved.json", kind="resolved_configuration",
+        producer="controller", unit_id=None, deployment_id=value.identity.deployment_id, closed=True,
+        size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()}, retrieval_state="verified")
+    extended = value.model_copy(update={"measurement_units":[day, chunk], "child_result_root":str(tmp_path),
+        "resolved_snapshot_path":"resolved.json", "artifact_records":[record]})
+    findings, raw = _resolved_snapshot_findings(extended)
+    assert raw
+    assert not any(item.code in {"identity.resolved_units", "identity.resolved_chunks"} for item in findings)
+    invalid_chunk = chunk.model_copy(update={"parent_unit_id":"other-day"})
+    extended = extended.model_copy(update={"measurement_units":[day, invalid_chunk]})
+    findings, _ = _resolved_snapshot_findings(extended)
+    assert any(item.code == "identity.resolved_chunks" for item in findings)
+
+
 @pytest.mark.parametrize(("sent", "below"), [(949, True), (950, False), (951, False)])
 def test_generation_ratio_uses_native_sent_and_runtime(repository_root, monkeypatch, sent, below):
     value = make_input(repository_root)
@@ -271,7 +388,7 @@ def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_e
     value = make_input(repository_root)
     unit = value.measurement_units[1]
     valid = CommandEvidence(schema_version=2,
-        request={"argv":["iperf3", "-c", "10.0.0.2", "-p=5201", "-Z", "-C", "cubic", "-P", "1", "-t", "60", "-O", "5", "-l", "131072", "-i", "1", "--json"]},
+        request={"argv":["iperf3", "-c", "10.0.0.2", "-p=5201", "-Z", "-C", "cubic", "-P", "1", "-t", "60", "-O", "5", "-l", "131072", "-i", "1", "--json", "--get-server-output"]},
         result={"outcome":"succeeded"}, producer="vm_a", deployment_id=value.identity.deployment_id,
         unit_id=unit.unit_id, binary_version={"value":"3.17.1"}, source_identity={"value":"fixture build"},
         monotonic_started={"value":1}, monotonic_finished={"value":61})
@@ -283,3 +400,36 @@ def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_e
     udp = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], "-u"]}})
     assert any(item.code == "command.protocol_extra" for item in
                _command_findings(value.model_copy(update={"commands":[udp]})))
+
+
+def test_commands_require_private_targets_and_persistent_private_bound_listeners(repository_root):
+    value = make_input(repository_root)
+    unit = value.measurement_units[1]
+    base = dict(schema_version=2, result={"outcome":"succeeded"}, deployment_id=value.identity.deployment_id,
+        unit_id=unit.unit_id, binary_version={"value":"3.17.1"}, source_identity={"value":"fixture"},
+        monotonic_started={"value":1}, monotonic_finished={"value":61})
+    commands = [
+        CommandEvidence(request={"argv":["sockperf", "server", "-i", "10.0.0.2", "-p", "11111"]},
+            producer="vm_b", **base),
+        CommandEvidence(request={"argv":["iperf3", "-s", "-B", "10.0.0.2", "-p", "5201", "--json-stream", "--forceflush"]},
+            producer="vm_b", **base),
+    ]
+    findings = _command_findings(value.model_copy(update={"commands":commands}))
+    assert not any(item.severity == "error" for item in findings)
+    bad = commands[1].model_copy(update={"request":{"argv":["iperf3", "-s", "-B", "8.8.8.8", "-p", "5201"]}})
+    findings = _command_findings(value.model_copy(update={"commands":[commands[0], bad]}))
+    assert {item.code for item in findings} >= {"command.listener_bind", "command.streaming"}
+
+
+def test_sequence_requires_actual_sockperf_runtime_and_ten_second_pause(repository_root):
+    value = make_input(repository_root)
+    first, second = value.measurement_units[:2]
+    counts = ProbeCounts(sent=Evidence[int](value=65000), received=Evidence[int](value=65000),
+        dropped=Evidence[int](value=0), duplicated=Evidence[int](value=0), out_of_order=Evidence[int](value=0),
+        skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=65),
+        reporting_scope="one Sockperf invocation", source=SourceRef("sockperf-log", "sockperf.log", "d" * 64))
+    too_early = value.timings[1].model_copy(update={"probe_test_started_at":Evidence[datetime](
+        value=value.timings[0].probe_test_started_at.value + timedelta(seconds=74))})
+    value = value.model_copy(update={"timings":[value.timings[0], too_early, *value.timings[2:]]})
+    findings = _sequence_timing_findings(value, {first.unit_id:NativeParse(probe_counts=(counts,))})
+    assert any(item.code == "timing.phase_pause" and item.unit_id == second.unit_id for item in findings)

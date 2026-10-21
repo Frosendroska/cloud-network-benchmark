@@ -122,6 +122,9 @@ def test_iperf3_jsonl_parses_events_and_keeps_receiver_interval():
 
 
 def test_quantiles_match_numpy_linear_and_sample_standard_deviation():
+    pair = rtt_statistics([1, 2])
+    assert pair["median_us"].value == 1.5
+    assert pair["sample_stddev_us"].value == pytest.approx(2 ** -0.5)
     result = rtt_statistics([1, 2, 3, 4])
     assert result["median_us"].value == 2.5
     assert result["p95_us"].unavailable_reason

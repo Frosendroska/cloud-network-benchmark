@@ -9,6 +9,21 @@
     "execution state",
     "cleanup state"
   ],
+  "source_contract": {
+    "identity_models": ["F01R CampaignManifest", "F01R ChildRunManifest", "F01R ValidatorInput"],
+    "resolved_snapshot": "F01R ResolvedCampaign/ResolvedObservation serialized by the existing resolver",
+    "schedule": "F01R ScheduleEntry with original header/row, source path/hash and row hash",
+    "commands": "F01R CommandEvidence durable redacted argv/result, producer, unit/deployment, monotonic bounds and tool identity",
+    "timing": "F01R MeasurementTiming notification, TCP launch, measured interval, monotonic bounds, clock mappings and gaps",
+    "materialization": "F01R ArtifactLayout declarations and closed verified ArtifactRecord size/SHA-256 using safe child-root paths",
+    "provenance": "F01R configuration/resolved/schedule SHA-256, implementation/design commits, tool versions, VM metadata and provider outputs",
+    "source_boundary": "synthetic examples of source-documented Sockperf 3.10 and iperf3 3.17.1 grammar; no run or cloud evidence"
+  },
+  "native_artifact_paths": {
+    "short_study_and_acceptance": "measurements/{unit_id}/sockperf.csv and measurements/{unit_id}/iperf3.json for loaded units",
+    "calibration": "measurements/{unit_id}/sockperf.csv and measurements/{unit_id}/iperf3.json for each of twelve trials",
+    "diagnostic_day": "day-iperf3-client.jsonl and measurements/probes/{chunk_id}.sockperf.csv/.sockperf.log; each chunk <=300 seconds"
+  },
   "mode_expectations": {
     "acceptance": {
       "measured_seconds": 10,

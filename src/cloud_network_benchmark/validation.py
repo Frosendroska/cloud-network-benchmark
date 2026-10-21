@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 from copy import deepcopy
@@ -166,8 +167,17 @@ def _resolved_snapshot_findings(value: ValidatorInput) -> tuple[list[ValidationF
             findings.append(_finding("identity.resolved_snapshot_contradiction", "error", "resolved snapshot identity/provider contradicts ValidatorInput", artifact="resolved_snapshot"))
         if not observations:
             findings.append(_finding("identity.resolved_provider_missing", "error", "resolved snapshot has no observation for this provider", artifact="resolved_snapshot"))
-        elif observations[0].measurement_units != value.measurement_units:
-            findings.append(_finding("identity.resolved_units", "error", "resolved snapshot measurement units contradict supplied units", artifact="resolved_snapshot"))
+        else:
+            supplied = value.measurement_units
+            declared_chunks = [unit for unit in supplied if unit.kind == "probe_chunk"]
+            base_units = [unit for unit in supplied if unit.kind != "probe_chunk"]
+            if observations[0].measurement_units != base_units:
+                findings.append(_finding("identity.resolved_units", "error", "resolved snapshot measurement units contradict supplied units", artifact="resolved_snapshot"))
+            day_units = [unit for unit in base_units if unit.kind == "continuous_day"]
+            if declared_chunks and (value.mode != "diagnostic_day" or len(day_units) != 1
+                    or any(chunk.parent_unit_id != day_units[0].unit_id or chunk.measured_seconds > 300
+                           for chunk in declared_chunks)):
+                findings.append(_finding("identity.resolved_chunks", "error", "materialized probe chunks must belong to the retained diagnostic-day unit and be at most 300 seconds", artifact="resolved_snapshot"))
         return findings, raw
     except (OSError, ValueError, TypeError) as exc:
         findings.append(_finding("provenance.resolved_snapshot_invalid", "error", f"resolved snapshot is not a valid F01R JSON record: {exc}", artifact="resolved_snapshot"))
@@ -250,8 +260,8 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
         lower = [token.lower() for token in argv]
         joined = " ".join(lower)
         forbidden = {"--reverse", "-r", "--bidir", "--bidirectional", "--rate", "-b", "--udp", "-u"}
-        for token in lower:
-            if token in forbidden:
+        for token in argv:
+            if token == "-b" or token.lower() in forbidden - {"-b"}:
                 findings.append(_finding("command.protocol_extra", "error", f"unsupported protocol/rate option {token}", unit=command.unit_id))
         if lower and "iperf3" in lower[0] and command.producer == "vm_a":
             if "-c" not in lower:
@@ -273,6 +283,13 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                         findings.append(_finding("command.setting", "error", f"iperf3 {flag} must be {expected}, observed {observed!r}", unit=unit.unit_id))
             if not ("-cubic" in joined or ("-c" in lower and "cubic" in lower)):
                 findings.append(_finding("command.congestion", "error", "iperf3 CUBIC setting is missing", unit=command.unit_id))
+            if unit and unit.kind == "continuous_day":
+                if "--json-stream" not in lower or "--forceflush" not in lower:
+                    findings.append(_finding("command.streaming", "error", "diagnostic-day iperf3 must stream flushed JSON Lines", unit=unit.unit_id))
+            elif "-j" not in lower and "--json" not in lower:
+                findings.append(_finding("command.output", "error", "short iperf3 command must preserve native JSON output", unit=command.unit_id))
+            elif "--get-server-output" not in lower:
+                findings.append(_finding("command.server_output", "error", "short iperf3 output must include the receiver server result", unit=command.unit_id))
         elif command.producer == "vm_a" and any("sockperf" in token for token in lower) and "under-load" in lower:
             if not any("full-rtt" in token for token in lower):
                 findings.append(_finding("command.full_rtt", "error", "Sockperf full-RTT setting is missing", unit=command.unit_id))
@@ -288,10 +305,52 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                 findings.append(_finding("command.port", "error", "Sockperf probe port must be UDP 11111", unit=command.unit_id))
             unit = next((u for u in value.measurement_units if u.unit_id == command.unit_id), None)
             expected_duration = unit.measured_seconds + (5 if unit and unit.phase == "idle_latency" else 10) if unit else None
-            if expected_duration is not None and _option(argv, "-t") != str(expected_duration) and unit.kind != "probe_chunk":
+            if expected_duration is not None and _option(argv, "-t") != str(expected_duration) and unit.kind not in {"probe_chunk", "continuous_day"}:
                 findings.append(_finding("command.duration", "error", f"Sockperf duration must be {expected_duration} seconds including warm-up/coordination", unit=unit.unit_id))
             if "--full-log" not in lower:
                 findings.append(_finding("command.output", "error", "Sockperf native full-log output is required", unit=command.unit_id))
+            target = _option(argv, "-i")
+            try:
+                address = ipaddress.ip_address(target or "")
+                private_target = address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local)
+            except ValueError:
+                private_target = False
+            if not private_target:
+                findings.append(_finding("command.target", "error", "Sockperf must target VM B's private IPv4 address", unit=command.unit_id))
+        elif command.producer == "vm_a" and lower and "iperf3" in lower[0] and "-c" in lower:
+            target = _option(argv, "-c")
+            try:
+                address = ipaddress.ip_address(target or "")
+                private_target = address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local)
+            except ValueError:
+                private_target = False
+            if not private_target:
+                findings.append(_finding("command.target", "error", "iperf3 must target VM B's private IPv4 address", unit=command.unit_id))
+        elif command.producer == "vm_b":
+            if lower and "sockperf" in lower[0] and "server" in lower:
+                target = _option(argv, "-i")
+                try:
+                    address = ipaddress.ip_address(target or "")
+                    private_bind = address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local)
+                except ValueError:
+                    private_bind = False
+                if not private_bind:
+                    findings.append(_finding("command.listener_bind", "error", "Sockperf listener must bind VM B's private IPv4 address", unit=command.unit_id))
+                if _option(argv, "-p") != "11111":
+                    findings.append(_finding("command.port", "error", "Sockperf server must listen on UDP 11111", unit=command.unit_id))
+            if lower and "iperf3" in lower[0] and "-s" in lower:
+                target = _option(argv, "-B")
+                try:
+                    address = ipaddress.ip_address(target or "")
+                    private_bind = address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local)
+                except ValueError:
+                    private_bind = False
+                if not private_bind:
+                    findings.append(_finding("command.listener_bind", "error", "iperf3 listener must bind VM B's private IPv4 address", unit=command.unit_id))
+                if _option(argv, "-p") != "5201":
+                    findings.append(_finding("command.port", "error", "iperf3 server must listen on TCP 5201", unit=command.unit_id))
+                if "--json-stream" not in lower or "--forceflush" not in lower:
+                    findings.append(_finding("command.streaming", "error", "iperf3 server must preserve incremental JSON Lines output", unit=command.unit_id))
     for unit in value.measurement_units:
         relevant = [command for command in value.commands if command.unit_id == unit.unit_id]
         if not relevant:
@@ -300,6 +359,27 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             outcome = command.result.get("outcome")
             if outcome not in {None, "succeeded"}:
                 findings.append(_finding("command.failed", "warning", f"command outcome is {outcome}", unit=unit.unit_id))
+    for role, program in (("vm_b", "sockperf"), ("vm_b", "iperf3")):
+        present = any(command.producer == role and isinstance(command.request.get("argv"), list)
+                      and command.request["argv"] and program in str(command.request["argv"][0]).lower()
+                      and ("server" in command.request["argv"] if program == "sockperf"
+                           else "-s" in command.request["argv"])
+                      for command in value.commands)
+        if not present:
+            findings.append(_finding("command.listener_evidence_missing", "warning",
+                                     f"VM B {program} server command evidence is unavailable"))
+    for unit in value.measurement_units:
+        if unit.phase not in {"single_flow", "multi_flow"} or unit.kind == "continuous_day":
+            continue
+        timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
+        if timing and timing.probe_test_started_at.value and timing.tcp_started_at.value:
+            delay = (timing.tcp_started_at.value - timing.probe_test_started_at.value).total_seconds()
+            if delay < 2:
+                findings.append(_finding("command.probe_notification_delay", "error",
+                                         "TCP must start at least two seconds after Sockperf test-start notification", unit=unit.unit_id))
+        else:
+            findings.append(_finding("command.probe_notification_delay_unavailable", "warning",
+                                     "test-start notification to TCP launch delay is unavailable", unit=unit.unit_id))
     return findings
 
 
@@ -462,6 +542,38 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
             "unavailable_reason": reason}
 
 
+def _sequence_timing_findings(value: ValidatorInput, parsed: dict[str, NativeParse]) -> list[ValidationFinding]:
+    if value.mode not in {ExperimentMode.ACCEPTANCE, ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION}:
+        return []
+    findings: list[ValidationFinding] = []
+    pause_seconds = 10
+    ordered = value.measurement_units
+    for previous, current in zip(ordered, ordered[1:]):
+        previous_timing = next((item for item in value.timings if item.unit_id == previous.unit_id), None)
+        current_timing = next((item for item in value.timings if item.unit_id == current.unit_id), None)
+        previous_start = previous_timing.probe_test_started_at.value if previous_timing else None
+        current_start = current_timing.probe_test_started_at.value if current_timing else None
+        if previous_start is None or current_start is None:
+            findings.append(_finding("timing.phase_order_unavailable", "warning",
+                                     "ordered phase/trial starts are unavailable", unit=current.unit_id))
+            continue
+        if current_start <= previous_start:
+            findings.append(_finding("timing.phase_order", "error", "phase/trial start order contradicts the declared protocol", unit=current.unit_id))
+            continue
+        runtimes = [item.runtime_seconds.value for item in parsed.get(previous.unit_id, NativeParse()).probe_counts
+                    if item.runtime_seconds.value is not None]
+        if len(runtimes) != 1:
+            findings.append(_finding("timing.phase_pause_unavailable", "warning",
+                                     "preceding Sockperf runtime is unavailable to corroborate the inter-phase pause", unit=previous.unit_id))
+            continue
+        minimum_next_start = previous_start.timestamp() + runtimes[0] + pause_seconds
+        if current_start.timestamp() < minimum_next_start:
+            findings.append(_finding("timing.phase_pause", "error",
+                                     "next phase/trial starts before the measured Sockperf runtime plus the required 10-second pause",
+                                     unit=current.unit_id))
+    return findings
+
+
 def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> ValidationResult:
     if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
         raise ValueError("evaluated_at must be timezone-aware")
@@ -474,8 +586,10 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     any_measurement = False
     all_complete = True
     global_samples: list[Any] = []
+    parsed_sock: dict[str, NativeParse] = {}
     for unit in value.measurement_units:
         sock, tcp = _parse_unit(value, unit, records)
+        parsed_sock[unit.unit_id] = sock
         findings.extend(sock.findings)
         if tcp:
             findings.extend(tcp.findings)
@@ -524,6 +638,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
                           "clock_error_ms": alignment_errors},
             "findings": [f.model_dump(mode="json") for f in (*sock.findings, *(tcp.findings if tcp else ()))],
         })
+    findings.extend(_sequence_timing_findings(value, parsed_sock))
     if not value.resolved_sha256.value or not value.implementation_git.commit.value or not value.design_git.commit.value:
         findings.append(_finding("provenance.incomplete", "warning", "configuration/design/implementation provenance is incomplete"))
         all_complete = False
