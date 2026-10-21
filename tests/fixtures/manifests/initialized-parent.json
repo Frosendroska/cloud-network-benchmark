@@ -29,7 +29,7 @@
       "run_id": "20260927T120000Z-exp-900-abc123-aws"
     }
   ],
-  "config_id": "exp_900_aws_validation",
+  "config_id": "exp-900-acceptance",
   "config_provenance": {
     "byte_length": 2515,
     "design_git": {

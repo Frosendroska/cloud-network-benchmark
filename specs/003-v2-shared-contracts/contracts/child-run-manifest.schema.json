@@ -197,7 +197,7 @@
       "additionalProperties": false,
       "properties": {
         "artifact_id": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Artifact Id",
           "type": "string"
         },
@@ -206,7 +206,7 @@
           "type": "boolean"
         },
         "deployment_id": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Deployment Id",
           "type": "string"
         },
@@ -222,7 +222,7 @@
           "default": null
         },
         "kind": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Kind",
           "type": "string"
         },
@@ -261,6 +261,7 @@
         "unit_id": {
           "anyOf": [
             {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
               "type": "string"
             },
             {
@@ -510,7 +511,7 @@
           "$ref": "#/$defs/Evidence_str_"
         },
         "deployment_id": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Deployment Id",
           "type": "string"
         },
@@ -547,7 +548,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -560,6 +560,7 @@
         "unit_id": {
           "anyOf": [
             {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
               "type": "string"
             },
             {
@@ -571,6 +572,7 @@
         }
       },
       "required": [
+        "schema_version",
         "request",
         "result",
         "producer",
@@ -585,6 +587,56 @@
     },
     "CommonNState": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "pending"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "common_n": {
+                "type": "null"
+              },
+              "plateau_found": {
+                "type": "null"
+              },
+              "source_campaign_id": {
+                "type": "null"
+              },
+              "source_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "frozen"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "common_n",
+              "source_campaign_id",
+              "source_sha256",
+              "plateau_found"
+            ]
+          }
+        }
+      ],
       "properties": {
         "common_n": {
           "anyOf": [
@@ -702,6 +754,50 @@
     },
     "Evidence_Dict_str__Any__": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "minProperties": 1,
+                  "type": "object"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -734,6 +830,47 @@
     },
     "Evidence_ExpiryEvidence_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ExpiryEvidence"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -764,6 +901,47 @@
     },
     "Evidence_ReservationEvidence_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReservationEvidence"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -794,6 +972,47 @@
     },
     "Evidence_ScheduleEntry_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScheduleEntry"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -824,6 +1043,48 @@
     },
     "Evidence_bool_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -855,6 +1116,51 @@
     },
     "Evidence_datetime_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -887,6 +1193,48 @@
     },
     "Evidence_float_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "number"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -918,6 +1266,48 @@
     },
     "Evidence_int_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -949,6 +1339,50 @@
     },
     "Evidence_str_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -1051,7 +1485,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1073,6 +1506,7 @@
         }
       },
       "required": [
+        "schema_version",
         "run_id",
         "deployment_id",
         "provider",
@@ -1295,7 +1729,7 @@
           "type": "array"
         },
         "deployment_id": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Deployment Id",
           "type": "string"
         },
@@ -1333,7 +1767,7 @@
           "$ref": "#/$defs/Evidence_datetime_"
         },
         "unit_id": {
-          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Unit Id",
           "type": "string"
         }
@@ -1695,6 +2129,27 @@
       "title": "ProviderConfiguration",
       "type": "object"
     },
+    "ReplacementContext": {
+      "additionalProperties": false,
+      "properties": {
+        "observation_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "replaces_run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Replaces Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_id",
+        "replaces_run_id"
+      ],
+      "title": "ReplacementContext",
+      "type": "object"
+    },
     "ReservationEvidence": {
       "additionalProperties": false,
       "properties": {
@@ -1727,7 +2182,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1753,6 +2207,7 @@
         }
       },
       "required": [
+        "schema_version",
         "campaign_id",
         "reservation_id",
         "state",
@@ -1823,6 +2278,17 @@
         "provider_config": {
           "$ref": "#/$defs/ProviderConfiguration"
         },
+        "replacement_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplacementContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "scenario": {
           "$ref": "#/$defs/Scenario"
         },
@@ -1843,7 +2309,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1855,6 +2320,7 @@
         }
       },
       "required": [
+        "schema_version",
         "config_id",
         "experiment_id",
         "mode",
@@ -1961,7 +2427,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1995,6 +2460,7 @@
         }
       },
       "required": [
+        "schema_version",
         "entry_id",
         "config_id",
         "experiment_id",
@@ -2082,6 +2548,68 @@
     },
     "ValidationStatus": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "comparison_eligibility": {
+                "const": "eligible"
+              }
+            },
+            "required": [
+              "comparison_eligibility"
+            ]
+          },
+          "then": {
+            "properties": {
+              "data_validity": {
+                "const": "valid"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "data_validity": {
+                "enum": [
+                  "not_validated",
+                  "partial",
+                  "invalid",
+                  "unavailable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data_reasons": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "comparison_eligibility": {
+                "enum": [
+                  "not_evaluated",
+                  "ineligible",
+                  "unavailable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison_reasons": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "comparison_eligibility": {
           "$ref": "#/$defs/ComparisonEligibility",
@@ -2226,8 +2754,7 @@
       "$ref": "#/$defs/ArtifactLayout"
     },
     "campaign_id": {
-      "minLength": 1,
-      "pattern": "^\\S+$",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
       "title": "Campaign Id",
       "type": "string"
     },
@@ -2276,7 +2803,7 @@
       "type": "string"
     },
     "deployment_id": {
-      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
       "title": "Deployment Id",
       "type": "string"
     },
@@ -2327,7 +2854,7 @@
       "$ref": "#/$defs/ExperimentMode"
     },
     "observation_id": {
-      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
       "title": "Observation Id",
       "type": "string"
     },
@@ -2340,6 +2867,7 @@
     "replaces_run_id": {
       "anyOf": [
         {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "type": "string"
         },
         {
@@ -2367,8 +2895,7 @@
       "default": null
     },
     "run_id": {
-      "minLength": 1,
-      "pattern": "^\\S+$",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
       "title": "Run Id",
       "type": "string"
     },
@@ -2392,7 +2919,6 @@
     },
     "schema_version": {
       "const": 2,
-      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },
@@ -2419,6 +2945,7 @@
     }
   },
   "required": [
+    "schema_version",
     "config_id",
     "mode",
     "context",

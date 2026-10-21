@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import PurePosixPath
 from pathlib import Path
+import hashlib
 import re
 from typing import Dict, Literal, Optional
 
 from pydantic import Field, model_validator
 
-from .common import ArtifactExpectation, FailureEvidence, StrictModel, StringEvidence, Evidence, VmRole
+from .common import ArtifactExpectation, FailureEvidence, IDENTIFIER_PATTERN, StrictModel, StringEvidence, Evidence, VmRole
 
 
 def _normalized_relative_path(value: str) -> str:
@@ -32,12 +33,12 @@ def resolve_artifact_path(child_root: Path, relative_path: str) -> Path:
 
 
 class ArtifactInput(StrictModel):
-    artifact_id: str = Field(min_length=1)
+    artifact_id: str = Field(pattern=IDENTIFIER_PATTERN)
     path: Optional[str] = None
     path_template: Optional[str] = None
-    kind: str = Field(min_length=1)
+    kind: str = Field(pattern=IDENTIFIER_PATTERN)
     producer: VmRole | Literal["controller"]
-    unit_id: Optional[str] = None
+    unit_id: Optional[str] = Field(default=None, pattern=IDENTIFIER_PATTERN)
     expectation: ArtifactExpectation
 
     @model_validator(mode="after")
@@ -54,12 +55,12 @@ class ArtifactInput(StrictModel):
 
 
 class ArtifactRecord(StrictModel):
-    artifact_id: str = Field(min_length=1)
+    artifact_id: str = Field(pattern=IDENTIFIER_PATTERN)
     path: str = Field(min_length=1)
-    kind: str = Field(min_length=1)
+    kind: str = Field(pattern=IDENTIFIER_PATTERN)
     producer: VmRole | Literal["controller"]
-    unit_id: Optional[str]
-    deployment_id: str = Field(min_length=1)
+    unit_id: Optional[str] = Field(pattern=IDENTIFIER_PATTERN)
+    deployment_id: str = Field(pattern=IDENTIFIER_PATTERN)
     closed: bool
     size_bytes: Evidence[int]
     sha256: StringEvidence
@@ -78,6 +79,16 @@ class ArtifactRecord(StrictModel):
         if self.retrieval_state == "failed" and self.failure is None:
             raise ValueError("failed retrieval requires failure evidence")
         return self
+
+    def verify_materialized_file(self, child_root: Path) -> None:
+        """Verify a claimed closed artifact against bytes present under the child root."""
+        if self.retrieval_state != "verified" or not self.closed:
+            raise ValueError("only closed verified artifacts can be checked for integrity")
+        payload = resolve_artifact_path(child_root, self.path).read_bytes()
+        if self.size_bytes.value != len(payload):
+            raise ValueError("materialized artifact size does not match recorded size")
+        if self.sha256.value != hashlib.sha256(payload).hexdigest():
+            raise ValueError("materialized artifact hash does not match recorded SHA-256")
 
 
 class ArtifactLayout(StrictModel):
@@ -127,34 +138,44 @@ class ArtifactLayout(StrictModel):
 
         mode = ExperimentMode(mode)
         declarations: list[ArtifactInput] = []
-        global_paths = {
-            "config_snapshot": (self.config_snapshot, "configuration", ArtifactExpectation.REQUIRED),
-            "resolved_snapshot": (self.resolved_snapshot, "resolved_configuration", ArtifactExpectation.REQUIRED),
-            "schedule_snapshot": (self.schedule_snapshot, "schedule_row", ArtifactExpectation.REQUIRED if schedule_supplied else ArtifactExpectation.NOT_EXPECTED),
-            "provider_outputs": (self.provider_outputs, "provider_outputs", ArtifactExpectation.OPTIONAL),
-            "checksums": (self.checksums, "checksums", ArtifactExpectation.OPTIONAL),
-            "vm_a_metadata": (self.vm_a_metadata, "vm_metadata", ArtifactExpectation.OPTIONAL),
-            "vm_b_metadata": (self.vm_b_metadata, "vm_metadata", ArtifactExpectation.OPTIONAL),
-            "vm_a_diagnostics": (self.vm_a_diagnostics, "diagnostics", ArtifactExpectation.OPTIONAL),
-            "vm_b_diagnostics": (self.vm_b_diagnostics, "diagnostics", ArtifactExpectation.OPTIONAL),
-            "validation_result": (self.validation_result, "validation_result", ArtifactExpectation.OPTIONAL),
-            "validation_summary": (self.validation_summary, "validation_summary", ArtifactExpectation.OPTIONAL),
-        }
-        for name, (path, kind, expectation) in global_paths.items():
+        global_paths = [
+            ("config_snapshot", self.config_snapshot, "configuration", "controller", ArtifactExpectation.REQUIRED),
+            ("resolved_snapshot", self.resolved_snapshot, "resolved_configuration", "controller", ArtifactExpectation.REQUIRED),
+            ("schedule_snapshot", self.schedule_snapshot, "schedule_row", "controller", ArtifactExpectation.REQUIRED if schedule_supplied else ArtifactExpectation.NOT_EXPECTED),
+            ("provider_outputs", self.provider_outputs, "provider_outputs", "controller", ArtifactExpectation.OPTIONAL),
+            ("checksums", self.checksums, "checksums", "controller", ArtifactExpectation.OPTIONAL),
+            ("vm_a_metadata", self.vm_a_metadata, "vm_metadata", VmRole.VM_A, ArtifactExpectation.REQUIRED),
+            ("vm_b_metadata", self.vm_b_metadata, "vm_metadata", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("vm_a_diagnostics", self.vm_a_diagnostics, "diagnostics", VmRole.VM_A, ArtifactExpectation.REQUIRED),
+            ("vm_b_diagnostics", self.vm_b_diagnostics, "diagnostics", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("sockperf_server_log", self.sockperf_server_log, "sockperf-server-log", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("iperf3_server_log", self.iperf3_server_log, "iperf3-server-jsonl", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("iperf3_server_error", self.iperf3_server_error, "iperf3-server-error", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("validation_result", self.validation_result, "validation_result", "controller", ArtifactExpectation.OPTIONAL),
+            ("validation_summary", self.validation_summary, "validation_summary", "controller", ArtifactExpectation.OPTIONAL),
+        ]
+        for name, path, kind, producer, expectation in global_paths:
             declarations.append(ArtifactInput(artifact_id=name, path=path, kind=kind,
-                                              producer="controller", unit_id=None, expectation=expectation))
+                                              producer=producer, unit_id=None, expectation=expectation))
         for unit in measurement_units:
             unit_id = str(getattr(unit, "unit_id"))
             phase_value = getattr(unit, "phase", "")
             phase = str(getattr(phase_value, "value", phase_value))
-            for artifact, path in self.unit_paths(unit_id).items():
-                if artifact == "iperf3" and phase == "idle_latency":
-                    continue
-                declarations.append(ArtifactInput(
-                    artifact_id=f"{unit_id}-{artifact}", path=path, kind=artifact,
-                    producer=VmRole.VM_A if artifact in {"sockperf", "iperf3", "stdout", "stderr"} else "controller",
-                    unit_id=unit_id, expectation=ArtifactExpectation.REQUIRED,
-                ))
+            paths = self.unit_paths(unit_id)
+            unit_files = {"commands": (paths["commands"], "command_evidence", "controller"),
+                          "timing": (paths["timing"], "measurement_timing", "controller")}
+            if mode != ExperimentMode.DIAGNOSTIC_DAY:
+                unit_files.update({
+                    "sockperf": (paths["sockperf"], "sockperf-csv", VmRole.VM_A),
+                    "stdout": (paths["stdout"], "stdout", "controller"),
+                    "stderr": (paths["stderr"], "stderr", "controller"),
+                })
+                if phase != "idle_latency":
+                    unit_files["iperf3"] = (paths["iperf3"], "iperf3-json", VmRole.VM_A)
+            for artifact, (path, kind, producer) in unit_files.items():
+                declarations.append(ArtifactInput(artifact_id=f"{unit_id}-{artifact}", path=path, kind=kind,
+                                                  producer=producer, unit_id=unit_id,
+                                                  expectation=ArtifactExpectation.REQUIRED))
         if mode == ExperimentMode.DIAGNOSTIC_DAY:
             declarations.extend([
                 ArtifactInput(artifact_id="day-iperf3-client", path=self.day_iperf3_client, kind="iperf3-client-jsonl", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),

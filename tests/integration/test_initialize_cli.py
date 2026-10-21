@@ -402,6 +402,7 @@ def test_manifest_update_apis_reject_backward_occurrence_times(
 def test_replacement_keeps_observation_id_but_uses_new_attempt_paths(
     tmp_path: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str]
 ) -> None:
+    from cloud_network_benchmark.contracts.campaign import ReplacementContext
     root = tmp_path / "repo"
     path = root / "configs/experiments/replacement.yaml"
     path.parent.mkdir(parents=True)
@@ -409,9 +410,14 @@ def test_replacement_keeps_observation_id_but_uses_new_attempt_paths(
     data["context"] = "replacement"
     data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "earlier-aws"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="must match resolved configuration"):
+        initialize_campaign(path, root, root / "results", frozen_clock, deterministic_token,
+                            replacement_context=ReplacementContext(observation_id="stable-observation", replaces_run_id="earlier-gcp"))
+    assert not (root / "results").exists()
     result = initialize_campaign(path, root, root / "results", frozen_clock, deterministic_token,
                                  StaticGitProvenance(fake_git_commits["implementation"]),
-                                 StaticGitProvenance(fake_git_commits["design"]))
+                                 StaticGitProvenance(fake_git_commits["design"]),
+                                 replacement_context=ReplacementContext(observation_id="stable-observation", replaces_run_id="earlier-aws"))
     for child in result.children:
         manifest = json.loads((root / child.manifest_path).read_text())
         assert manifest["observation_id"] == "stable-observation"
@@ -431,9 +437,9 @@ def test_supplied_schedule_row_is_snapshotted_byte_for_byte_with_hashes(
     data["scheduled_start"] = "2026-09-27T12:00:00Z"
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     header = "config_id,experiment_id,scheduled_start"
-    row = "exp_900_aws_validation,EXP-900,2026-09-27T12:00:00Z"
-    entry = ScheduleEntry(
-        entry_id="row-1", config_id="exp_900_aws_validation", experiment_id="EXP-900",
+    row = "exp-900-acceptance,EXP-900,2026-09-27T12:00:00Z"
+    entry = ScheduleEntry(schema_version=2,
+        entry_id="row-1", config_id="exp-900-acceptance", experiment_id="EXP-900",
         scheduled_start="2026-09-27T12:00:00Z", source_path="tracking/run-register.csv",
         source_sha256="a" * 64, row_sha256=hashlib.sha256(row.encode()).hexdigest(),
         original_header=header, original_row=row, columns=header.split(","), priority="P0",
@@ -450,3 +456,25 @@ def test_supplied_schedule_row_is_snapshotted_byte_for_byte_with_hashes(
     manifest = json.loads((root / child.manifest_path).read_text())
     assert manifest["config_provenance"]["schedule_sha256"]["value"] == hashlib.sha256(expected).hexdigest()
     assert manifest["schedule_entry"]["value"]["row_sha256"] == entry.row_sha256
+
+
+def test_secret_bearing_schedule_entry_is_rejected_before_any_result_write(
+    tmp_path: Path, frozen_clock: object, deterministic_token: object,
+) -> None:
+    root = tmp_path / "repo"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    shutil.copy(Path(__file__).parents[2] / "configs/tests/exp-900-single-provider.yaml", path)
+    row = "config_id,password=synthetic-secret"
+    unsafe = ScheduleEntry.model_construct(
+        schema_version=2, entry_id="row-1", config_id="exp-900-acceptance", experiment_id="EXP-900",
+        scheduled_start=None, window_label=None, source_path="tracking/run-register.csv",
+        source_sha256="a" * 64, row_sha256=hashlib.sha256(row.encode()).hexdigest(),
+        original_header="config_id,password", original_row=row, columns=["config_id", "password"], priority="P0",
+        replaces_run_id=None,
+    )
+    with pytest.raises(ValidationError, match="secret-bearing") as caught:
+        initialize_campaign(path, root, root / "results", frozen_clock, deterministic_token,
+                            schedule_entry=unsafe)
+    assert "synthetic-secret" not in str(caught.value)
+    assert not (root / "results").exists()

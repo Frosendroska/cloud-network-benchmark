@@ -1,6 +1,46 @@
 {
-  "succeeded": {"exit_code": 0, "stdout": "ok", "stderr": ""},
-  "failed": {"exit_code": 2, "stdout": "", "stderr": "failed"},
-  "timed_out": {"exit_code": null, "stdout": "partial", "stderr": "timeout"},
-  "interrupted": {"exit_code": null, "stdout": "", "stderr": "interrupted"}
+  "succeeded": {
+    "exit_code": 0,
+    "stdout": "ok",
+    "stderr": "",
+    "materialized_files": [
+      {
+        "path": "measurements/unit-1/sockperf.csv",
+        "content": "time,latency_ns\n1,20\n"
+      }
+    ]
+  },
+  "failed": {
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "failed",
+    "materialized_files": [
+      {
+        "path": "measurements/unit-1/stderr.log",
+        "content": "failed\n"
+      }
+    ]
+  },
+  "timed_out": {
+    "exit_code": null,
+    "stdout": "partial",
+    "stderr": "timeout",
+    "materialized_files": [
+      {
+        "path": "measurements/day/iperf3-client.jsonl",
+        "content": "{\"interval\":1}\n"
+      }
+    ]
+  },
+  "interrupted": {
+    "exit_code": null,
+    "stdout": "",
+    "stderr": "interrupted",
+    "materialized_files": [
+      {
+        "path": "measurements/unit-1/stdout.log",
+        "content": "before interrupt\n"
+      }
+    ]
+  }
 }

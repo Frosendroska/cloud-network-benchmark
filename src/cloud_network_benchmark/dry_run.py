@@ -9,6 +9,7 @@ from .contracts.artifacts import ArtifactLayout
 from .contracts.campaign import ResolvedCampaign
 from .contracts.common import StrictModel
 from .contracts.validation import artifact_inputs
+from .contracts.common import ValidationStatus
 
 
 class DryRunChild(StrictModel):
@@ -32,6 +33,7 @@ class DryRunChild(StrictModel):
 
 
 class DryRunReport(StrictModel):
+    config_id: str
     mode: str
     context: str
     experiment_id: str
@@ -39,6 +41,9 @@ class DryRunReport(StrictModel):
     config_sha256: str
     config_source: str
     scheduled_start: str | None
+    schedule_evidence: Dict[str, Any]
+    admission: Dict[str, Any]
+    validation_status: Dict[str, Any]
     measurement_units: List[Dict[str, Any]]
     launch_blockers: List[str]
     scenario: str
@@ -72,7 +77,7 @@ def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
                 benchmark=observation.benchmark.model_dump(mode="json"),
                 artifacts=layout.model_dump(),
                 validation_inputs={name: value.model_dump(mode="json") for name, value in artifact_inputs(
-                    layout, True, mode=resolved.mode,
+                    layout, mode=resolved.mode,
                     measurement_units=resolved.measurement_units, schedule_supplied=resolved.schedule_entry.value is not None,
                 ).items()},
                 provider_options=observation.provider_config.provider_options,
@@ -81,6 +86,7 @@ def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
             )
         )
     return DryRunReport(
+        config_id=resolved.config_id,
         mode=str(resolved.mode),
         context=resolved.context,
         experiment_id=resolved.experiment_id,
@@ -88,6 +94,15 @@ def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
         config_sha256=resolved.config_source.sha256,
         config_source=resolved.config_source.source_path,
         scheduled_start=resolved.scheduled_start.isoformat() if resolved.scheduled_start else None,
+        schedule_evidence=(
+            {"state":"observed", "entry_id":resolved.schedule_entry.value.entry_id,
+             "row_sha256":resolved.schedule_entry.value.row_sha256,
+             "source_path":resolved.schedule_entry.value.source_path,
+             "source_sha256":resolved.schedule_entry.value.source_sha256}
+            if resolved.schedule_entry.value is not None else {"state":"pending", "row_sha256":None}
+        ),
+        admission=resolved.admission.model_dump(mode="json"),
+        validation_status=ValidationStatus().model_dump(mode="json"),
         measurement_units=[item.model_dump(mode="json") for item in resolved.measurement_units],
         launch_blockers=resolved.launch_blockers,
         scenario=str(resolved.scenario),
@@ -104,9 +119,13 @@ def render_json(report: DryRunReport) -> str:
 def render_human(report: DryRunReport) -> str:
     lines = [
         f"Campaign {report.experiment_id} ({report.configuration_role})",
+        f"Config ID: {report.config_id}",
         f"Mode/context: {report.mode} / {report.context}",
         f"Config: {report.config_source} (sha256 {report.config_sha256})",
         f"Scheduled start: {report.scheduled_start or 'pending'}",
+        f"Schedule row: {report.schedule_evidence.get('state')}; SHA-256 {report.schedule_evidence.get('row_sha256') or 'pending'}",
+        f"Admission: priority {report.admission['priority']}; lifetime cap {report.admission['lifetime_cap_seconds']}s; reservation pending",
+        f"Validation status: {report.validation_status['data_validity']} / {report.validation_status['comparison_eligibility']}",
         f"Measurement units: {len(report.measurement_units)}; blockers: {', '.join(report.launch_blockers) or 'none'}",
         f"Scenario: {report.scenario}",
         f"Providers: {', '.join(report.selected_providers)}",

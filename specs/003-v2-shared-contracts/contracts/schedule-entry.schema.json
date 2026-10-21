@@ -75,7 +75,6 @@
     },
     "schema_version": {
       "const": 2,
-      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },
@@ -109,6 +108,7 @@
     }
   },
   "required": [
+    "schema_version",
     "entry_id",
     "config_id",
     "experiment_id",

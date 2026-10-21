@@ -25,7 +25,7 @@
   "cleanup_failure": null,
   "cleanup_state": "not_started",
   "commands": [],
-  "config_id": "exp_900_aws_validation",
+  "config_id": "exp-900-acceptance",
   "config_provenance": {
     "byte_length": 2515,
     "design_git": {
@@ -202,7 +202,7 @@
       "tcp_zerocopy": true,
       "warmup_seconds": 5
     },
-    "config_id": "exp_900_aws_validation",
+    "config_id": "exp-900-acceptance",
     "context": "failure_check",
     "experiment_id": "EXP-900",
     "measurement_direction": "vm_a_to_vm_b",

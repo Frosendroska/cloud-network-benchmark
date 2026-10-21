@@ -64,14 +64,15 @@ def test_primary_experiment_matrix(repository_root: Path, filename: str, expecte
 
 def test_smoke_campaign_matrix(repository_root: Path) -> None:
     cases = {
-        "exp-900-single-provider.yaml": (["aws"], ["t3.small"]),
-        "exp-901-azure-single-provider.yaml": (["azure"], ["Standard_B1s"]),
-        "exp-902-gcp-single-provider.yaml": (["gcp"], ["e2-micro"]),
-        "exp-903-three-provider-smoke.yaml": (["aws", "azure", "gcp"], ["t3.small", "Standard_B1s", "e2-micro"]),
+        "exp-900-single-provider.yaml": (["aws"], ["m7i.xlarge"]),
+        "exp-901-azure-single-provider.yaml": (["azure"], ["Standard_D4s_v5"]),
+        "exp-902-gcp-single-provider.yaml": (["gcp"], ["n2-standard-4"]),
+        "exp-903-three-provider-smoke.yaml": (["aws", "azure", "gcp"], ["m7i.xlarge", "Standard_D4s_v5", "n2-standard-4"]),
     }
     for filename, (providers, shapes) in cases.items():
         resolved, _ = resolve_campaign(repository_root / "configs/tests" / filename, repository_root)
-        assert resolved.mode == "acceptance" and resolved.context == "failure_check"
+        expected_context = "standard" if filename == "exp-903-three-provider-smoke.yaml" else "failure_check"
+        assert resolved.mode == "acceptance" and resolved.context == expected_context
         assert resolved.selected_providers == providers
         assert [item.provider_config.vm_shape for item in resolved.observations] == shapes
         assert [item.measured_seconds for item in resolved.measurement_units] == [10, 10, 10]

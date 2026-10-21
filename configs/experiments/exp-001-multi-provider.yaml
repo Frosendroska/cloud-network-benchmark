@@ -185,7 +185,7 @@ options:
   provisioning_timeout_seconds: 900
   readiness_timeout_seconds: 600
   cleanup_timeout_seconds: 900
-config_id: exp_001_s1
+config_id: exp-001-short
 mode: short_study
 context: standard
 admission:

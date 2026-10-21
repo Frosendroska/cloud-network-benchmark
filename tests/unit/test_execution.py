@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 import pytest
 
@@ -82,3 +84,21 @@ def test_result_consistency(outcome: str, exit_code: object) -> None:
 @pytest.mark.parametrize(("outcome", "exit_code"), [("succeeded", 0), ("failed", 2), ("timed_out", None), ("interrupted", None)])
 def test_all_scripted_outcomes_are_representable(outcome: str, exit_code: object) -> None:
     assert result(outcome=outcome, exit_code=exit_code).outcome == outcome
+
+
+def test_scripted_outcome_fixture_materializes_and_preserves_partial_files(tmp_path: Path) -> None:
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/commands/outcomes.json").read_text())
+    for outcome, details in fixture.items():
+        command = request(outcome)
+        expected = CommandResult(action_id=outcome, outcome=outcome, started_at=NOW, finished_at=NOW,
+                                 duration_seconds=0, exit_code=details["exit_code"], stdout=details["stdout"],
+                                 stderr=details["stderr"])
+        runner = ScriptedCommandRunner([(command, expected)])
+        observed = runner.run(command)
+        runner.assert_exhausted()
+        assert observed.stdout == details["stdout"] and observed.stderr == details["stderr"]
+        for item in details["materialized_files"]:
+            path = tmp_path / outcome / item["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(item["content"])
+            assert path.read_text() == item["content"]

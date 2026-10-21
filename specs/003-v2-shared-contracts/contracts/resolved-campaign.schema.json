@@ -369,6 +369,56 @@
     },
     "CommonNState": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "pending"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "common_n": {
+                "type": "null"
+              },
+              "plateau_found": {
+                "type": "null"
+              },
+              "source_campaign_id": {
+                "type": "null"
+              },
+              "source_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "frozen"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "required": [
+              "common_n",
+              "source_campaign_id",
+              "source_sha256",
+              "plateau_found"
+            ]
+          }
+        }
+      ],
       "properties": {
         "common_n": {
           "anyOf": [
@@ -516,6 +566,47 @@
     },
     "Evidence_ScheduleEntry_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScheduleEntry"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -546,6 +637,48 @@
     },
     "Evidence_float_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "type": "number"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -577,6 +710,50 @@
     },
     "Evidence_str_": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -1043,6 +1220,17 @@
         "provider_config": {
           "$ref": "#/$defs/ProviderConfiguration"
         },
+        "replacement_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplacementContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "scenario": {
           "$ref": "#/$defs/Scenario"
         },
@@ -1063,7 +1251,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1075,6 +1262,7 @@
         }
       },
       "required": [
+        "schema_version",
         "config_id",
         "experiment_id",
         "mode",
@@ -1181,7 +1369,6 @@
         },
         "schema_version": {
           "const": 2,
-          "default": 2,
           "title": "Schema Version",
           "type": "integer"
         },
@@ -1215,6 +1402,7 @@
         }
       },
       "required": [
+        "schema_version",
         "entry_id",
         "config_id",
         "experiment_id",
@@ -1452,7 +1640,6 @@
     },
     "schema_version": {
       "const": 2,
-      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },
@@ -1465,6 +1652,7 @@
     }
   },
   "required": [
+    "schema_version",
     "config_id",
     "experiment_id",
     "mode",

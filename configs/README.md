@@ -7,16 +7,16 @@ configurations describe intent only and do not authorize admission or resource c
 
 | Configuration | Config ID | Experiment ID | Mode / scenario | Thesis mapping |
 | --- | --- | --- | --- | --- |
-| `experiments/exp-001-multi-provider.yaml` | `exp_001_s1` | `EXP-001` | short_study / same_zone (P0) | [EXP-001 row](../Thesis/experiments/EXPERIMENTS.md#L30) |
-| `experiments/exp-002-cross-zone.yaml` | `exp_002_s2` | `EXP-002` | short_study / cross_zone (P2) | [EXP-002 row](../Thesis/experiments/EXPERIMENTS.md#L32) |
-| `experiments/exp-003-placement-optimization.yaml` | `exp_003_s3` | `EXP-003` | short_study / placement_optimization (P1) | [EXP-003 row](../Thesis/experiments/EXPERIMENTS.md#L31) |
-| `experiments/exp-004-inter-region.yaml` | `exp_004_s4` | `EXP-004` | short_study / inter_region (P3) | [EXP-004 row](../Thesis/experiments/EXPERIMENTS.md#L33) |
-| `experiments/exp-001-calibration.yaml` | `exp_001_calibration` | `EXP-001` | calibration / same_zone (P0) | [EXP-001 retained modes](../Thesis/experiments/EXPERIMENTS.md#L30) |
-| `experiments/exp-001-diagnostic-day.yaml` | `exp_001_diagnostic_day` | `EXP-001` | diagnostic_day / same_zone (P0) | [DAY stage](../Thesis/experiments/EXPERIMENTS.md#L17) |
-| `tests/exp-900-single-provider.yaml` | `exp_900_aws_validation` | `EXP-900` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
-| `tests/exp-901-azure-single-provider.yaml` | `exp_901_azure_validation` | `EXP-901` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
-| `tests/exp-902-gcp-single-provider.yaml` | `exp_902_gcp_validation` | `EXP-902` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
-| `tests/exp-903-three-provider-smoke.yaml` | `exp_903_three_cloud_validation` | `EXP-903` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `experiments/exp-001-multi-provider.yaml` | `exp-001-short` | `EXP-001` | short_study / same_zone (P0) | [EXP-001 row](../Thesis/experiments/EXPERIMENTS.md#L30) |
+| `experiments/exp-002-cross-zone.yaml` | `exp-002-short` | `EXP-002` | short_study / cross_zone (P2) | [EXP-002 row](../Thesis/experiments/EXPERIMENTS.md#L32) |
+| `experiments/exp-003-placement-optimization.yaml` | `exp-003-short` | `EXP-003` | short_study / placement_optimization (P1) | [EXP-003 row](../Thesis/experiments/EXPERIMENTS.md#L31) |
+| `experiments/exp-004-inter-region.yaml` | `exp-004-short` | `EXP-004` | short_study / inter_region (P3) | [EXP-004 row](../Thesis/experiments/EXPERIMENTS.md#L33) |
+| `experiments/exp-001-calibration.yaml` | `exp-001-calibration` | `EXP-001` | calibration / same_zone (P0) | [EXP-001 retained modes](../Thesis/experiments/EXPERIMENTS.md#L30) |
+| `experiments/exp-001-diagnostic-day.yaml` | `exp-001-day` | `EXP-001` | diagnostic_day / same_zone (P0) | [DAY stage](../Thesis/experiments/EXPERIMENTS.md#L17) |
+| `tests/exp-900-single-provider.yaml` | `exp-900-acceptance` | `EXP-900` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-901-azure-single-provider.yaml` | `exp-901-acceptance` | `EXP-901` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-902-gcp-single-provider.yaml` | `exp-902-acceptance` | `EXP-902` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-903-three-provider-smoke.yaml` | `exp-903-acceptance` | `EXP-903` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 
 The four ordinary research configs select AWS, Azure and GCP. Acceptance validation configs are
 registered `failure_check` cases and may exercise one selected provider. S1/P0 and S3/P1 remain

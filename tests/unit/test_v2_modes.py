@@ -21,6 +21,20 @@ def test_ten_configs_cover_four_modes_and_complete_scenario_matrix(repository_ro
     assert len(paths) == 10
     configs = [CampaignConfiguration.model_validate(yaml.safe_load(path.read_text())) for path in paths]
     assert len({config.config_id for config in configs}) == 10
+    expected_ids = {
+        "exp-001-multi-provider.yaml": "exp-001-short",
+        "exp-002-cross-zone.yaml": "exp-002-short",
+        "exp-003-placement-optimization.yaml": "exp-003-short",
+        "exp-004-inter-region.yaml": "exp-004-short",
+        "exp-001-calibration.yaml": "exp-001-calibration",
+        "exp-001-diagnostic-day.yaml": "exp-001-day",
+        "exp-900-single-provider.yaml": "exp-900-acceptance",
+        "exp-901-azure-single-provider.yaml": "exp-901-acceptance",
+        "exp-902-gcp-single-provider.yaml": "exp-902-acceptance",
+        "exp-903-three-provider-smoke.yaml": "exp-903-acceptance",
+    }
+    assert {path.name: config.config_id for path, config in zip(paths, configs)} == expected_ids
+    assert configs[-1].context == "standard"
     assert {config.mode for config in configs} == {"acceptance", "short_study", "calibration", "diagnostic_day"}
     assert {config.scenario for config in configs if config.mode == "short_study"} == {
         "same_zone", "cross_zone", "placement_optimization", "inter_region"
@@ -60,7 +74,7 @@ def test_mode_unit_resolution_matches_fixed_protocol(repository_root: Path) -> N
     assert acceptance.benchmark.common_n.state == "pending"
     frozen_benchmark = acceptance.benchmark.model_copy(update={
         "common_n": CommonNState(
-            state="frozen", common_n=8, source_campaign_id="exp_001_s1",
+            state="frozen", common_n=8, source_campaign_id="exp-001-short",
             source_sha256="a" * 64, plateau_found=True,
         )
     })
@@ -107,19 +121,19 @@ def test_source_hash_is_exact_resolved_hash_is_semantic(repository_root: Path, t
 
 def test_schedule_entry_must_match_config_identity_and_timestamp(repository_root: Path) -> None:
     path = repository_root / "configs/experiments/exp-001-multi-provider.yaml"
-    entry = ScheduleEntry(
-        entry_id="slot-1", config_id="exp_001_s1", experiment_id="EXP-001",
+    entry = ScheduleEntry(schema_version=2,
+        entry_id="slot-1", config_id="exp-001-short", experiment_id="EXP-001",
         scheduled_start=datetime(2026, 10, 22, tzinfo=timezone.utc), window_label="morning",
         source_path="runs.csv", source_sha256="a" * 64,
-        row_sha256=hashlib.sha256(b"slot-1,exp_001_s1").hexdigest(),
-        original_header="entry,config", original_row="slot-1,exp_001_s1", columns=["entry", "config"], priority="P0",
+        row_sha256=hashlib.sha256(b"slot-1,exp-001-short").hexdigest(),
+        original_header="entry,config", original_row="slot-1,exp-001-short", columns=["entry", "config"], priority="P0",
     )
-    resolved, _ = resolve_campaign(path, repository_root, entry)
+    resolved, _ = resolve_campaign(path, repository_root, schedule_entry=entry)
     assert resolved.scheduled_start == entry.scheduled_start
     assert resolved.schedule_entry.value == entry
-    bad = entry.model_copy(update={"config_id": "exp_002_s2"})
+    bad = entry.model_copy(update={"config_id": "exp-002-short"})
     with pytest.raises(ValidationError, match="different configuration"):
-        resolve_campaign(path, repository_root, bad)
+        resolve_campaign(path, repository_root, schedule_entry=bad)
 
 
 @pytest.mark.parametrize("version", [None, 1, 3])

@@ -37,7 +37,7 @@ benchmark:
   tcp_congestion_control: cubic
   tcp_zerocopy: true
   warmup_seconds: 5
-config_id: exp_900_aws_validation
+config_id: exp-900-acceptance
 context: failure_check
 experiment_id: EXP-900
 mode: acceptance

@@ -1,7 +1,51 @@
 {
   "$defs": {
-    "Evidence_float_": {
+    "Evidence_Annotated_float__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0___Le_le_100_____": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "maximum": 100,
+                  "minimum": 0,
+                  "type": "number"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -18,6 +62,8 @@
         "value": {
           "anyOf": [
             {
+              "maximum": 100,
+              "minimum": 0,
               "type": "number"
             },
             {
@@ -28,11 +74,54 @@
           "title": "Value"
         }
       },
-      "title": "Evidence[float]",
+      "title": "Evidence[Annotated[float, FieldInfo(annotation=NoneType, required=True, metadata=[Ge(ge=0), Le(le=100)])]]",
       "type": "object"
     },
-    "Evidence_int_": {
+    "Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
       "properties": {
         "unavailable_reason": {
           "anyOf": [
@@ -49,6 +138,7 @@
         "value": {
           "anyOf": [
             {
+              "minimum": 0,
               "type": "integer"
             },
             {
@@ -59,7 +149,7 @@
           "title": "Value"
         }
       },
-      "title": "Evidence[int]",
+      "title": "Evidence[Annotated[int, FieldInfo(annotation=NoneType, required=True, metadata=[Ge(ge=0)])]]",
       "type": "object"
     },
     "VmRole": {
@@ -75,16 +165,16 @@
   "additionalProperties": false,
   "properties": {
     "cpu_max_core_percent": {
-      "$ref": "#/$defs/Evidence_float_"
+      "$ref": "#/$defs/Evidence_Annotated_float__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0___Le_le_100_____"
     },
     "cpu_steal_percent": {
-      "$ref": "#/$defs/Evidence_float_"
+      "$ref": "#/$defs/Evidence_Annotated_float__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0___Le_le_100_____"
     },
     "cpu_total_percent": {
-      "$ref": "#/$defs/Evidence_float_"
+      "$ref": "#/$defs/Evidence_Annotated_float__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0___Le_le_100_____"
     },
     "deployment_id": {
-      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
       "title": "Deployment Id",
       "type": "string"
     },
@@ -101,16 +191,16 @@
       "title": "Gap Reason"
     },
     "interface_rx_drops": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "interface_rx_errors": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "interface_tx_drops": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "interface_tx_errors": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "interval_seconds": {
       "exclusiveMinimum": 0,
@@ -130,7 +220,7 @@
       "type": "array"
     },
     "rx_bytes": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "sampled_at": {
       "format": "date-time",
@@ -139,21 +229,21 @@
     },
     "schema_version": {
       "const": 2,
-      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },
     "tcp_retransmissions": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "tx_bytes": {
-      "$ref": "#/$defs/Evidence_int_"
+      "$ref": "#/$defs/Evidence_Annotated_int__FieldInfo_annotation_NoneType__required_True__metadata__Ge_ge_0_____"
     },
     "vm_role": {
       "$ref": "#/$defs/VmRole"
     }
   },
   "required": [
+    "schema_version",
     "deployment_id",
     "vm_role",
     "sampled_at",

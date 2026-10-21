@@ -163,8 +163,15 @@ def _secret_paths(value: Any, prefix: str = "config") -> list[str]:
 def resolve_campaign(
     path: Path,
     repository_root: Path,
+    *,
     schedule_entry: ScheduleEntry | None = None,
 ) -> Tuple[ResolvedCampaign, bytes]:
+    if schedule_entry is not None:
+        try:
+            # Revalidate supplied instances too: callers may have used model_construct/copy.
+            schedule_entry = ScheduleEntry.model_validate(schedule_entry.model_dump(mode="python"))
+        except (PydanticValidationError, AttributeError) as exc:
+            raise ValidationError("schedule entry contains invalid or secret-bearing evidence", "schedule_entry") from exc
     config, source, provenance, role = load_campaign(path, repository_root)
     selected = [Provider(value) for value in config.selected_providers]
     if set(selected) != set(config.provider_configs):
@@ -176,6 +183,12 @@ def resolve_campaign(
             raise ValidationError("schedule timestamp does not match configuration", "config.scheduled_start")
         if schedule_entry.priority != config.admission.priority:
             raise ValidationError("schedule priority does not match admission requirements", "config.schedule_entry.priority")
+        if schedule_entry.replaces_run_id != (config.replacement_context.replaces_run_id if config.replacement_context else None):
+            raise ValidationError("schedule replacement link does not match configuration", "config.schedule_entry.replaces_run_id")
+    if config.replacement_context is not None:
+        replaced_provider = config.replacement_context.replaces_run_id.rsplit("-", 1)[-1]
+        if replaced_provider not in {provider.value for provider in selected}:
+            raise ValidationError("replacement run provider must be among selected providers", "config.replacement_context.replaces_run_id")
     scheduled_start = config.scheduled_start or (schedule_entry.scheduled_start if schedule_entry else None)
     units = derive_measurement_units(ExperimentMode(config.mode), config.benchmark)
     blockers = ["admission_not_evaluated"]
@@ -190,10 +203,12 @@ def resolve_campaign(
             raise ValidationError(f"provider discriminator mismatch for {provider}")
         _validate_scenario(config, provider)
         observations.append(ResolvedObservation(
+            schema_version=2,
             config_id=config.config_id,
             experiment_id=config.experiment_id,
             mode=config.mode,
             context=config.context,
+            replacement_context=config.replacement_context,
             provider=provider,
             scenario=config.scenario,
             scheduled_start=scheduled_start,

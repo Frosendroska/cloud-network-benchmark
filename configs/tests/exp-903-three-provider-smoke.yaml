@@ -37,7 +37,7 @@ provider_configs:
     zones:
       vm_a: eu-central-1a
       vm_b: eu-central-1a
-    vm_shape: t3.small
+    vm_shape: m7i.xlarge
     image: ubuntu-24.04
     connection_user: ubuntu
     documented_network_limit: null
@@ -85,7 +85,7 @@ provider_configs:
     zones:
       vm_a: '1'
       vm_b: '1'
-    vm_shape: Standard_B1s
+    vm_shape: Standard_D4s_v5
     image: ubuntu-24_04-lts
     connection_user: azureuser
     documented_network_limit: null
@@ -135,7 +135,7 @@ provider_configs:
     zones:
       vm_a: europe-west3-a
       vm_b: europe-west3-a
-    vm_shape: e2-micro
+    vm_shape: n2-standard-4
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
     documented_network_limit: null
@@ -185,9 +185,9 @@ options:
   provisioning_timeout_seconds: 300
   readiness_timeout_seconds: 300
   cleanup_timeout_seconds: 300
-config_id: exp_903_three_cloud_validation
+config_id: exp-903-acceptance
 mode: acceptance
-context: failure_check
+context: standard
 admission:
   priority: P0
   lifetime_cap_seconds: 1200

@@ -35,7 +35,7 @@ provider_configs:
     zones:
       vm_a: eu-central-1a
       vm_b: eu-central-1a
-    vm_shape: t3.small
+    vm_shape: m7i.xlarge
     image: ubuntu-24.04
     connection_user: ubuntu
     documented_network_limit: null
@@ -81,7 +81,7 @@ options:
   provisioning_timeout_seconds: 300
   readiness_timeout_seconds: 300
   cleanup_timeout_seconds: 300
-config_id: exp_900_aws_validation
+config_id: exp-900-acceptance
 mode: acceptance
 context: failure_check
 admission:

@@ -35,7 +35,7 @@ provider_configs:
     zones:
       vm_a: europe-west3-a
       vm_b: europe-west3-a
-    vm_shape: e2-micro
+    vm_shape: n2-standard-4
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
     documented_network_limit: null
@@ -85,7 +85,7 @@ options:
   provisioning_timeout_seconds: 300
   readiness_timeout_seconds: 300
   cleanup_timeout_seconds: 300
-config_id: exp_902_gcp_validation
+config_id: exp-902-acceptance
 mode: acceptance
 context: failure_check
 admission:

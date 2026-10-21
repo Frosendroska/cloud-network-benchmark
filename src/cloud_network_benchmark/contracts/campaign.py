@@ -141,6 +141,18 @@ class CommonNState(StrictModel):
             raise ValueError("no common plateau requires fallback common_n=8")
         return self
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        schema = handler(core_schema)
+        schema["allOf"] = [
+            {"if": {"properties": {"state": {"const": "pending"}}, "required": ["state"]},
+             "then": {"properties": {"common_n": {"type": "null"}, "source_campaign_id": {"type": "null"},
+                                       "source_sha256": {"type": "null"}, "plateau_found": {"type": "null"}}}},
+            {"if": {"properties": {"state": {"const": "frozen"}}, "required": ["state"]},
+             "then": {"required": ["common_n", "source_campaign_id", "source_sha256", "plateau_found"]}},
+        ]
+        return schema
+
 
 class ReplacementContext(StrictModel):
     observation_id: str = Field(pattern=IDENTIFIER_PATTERN)
@@ -353,10 +365,10 @@ class CampaignConfiguration(StrictModel):
             }[scenario]
             if not valid:
                 raise ValueError(f"{provider.value} locality/placement does not match {scenario.value}")
-            if mode != ExperimentMode.ACCEPTANCE and item.vm_shape != {
+            if item.vm_shape != {
                 Provider.AWS: "m7i.xlarge", Provider.AZURE: "Standard_D4s_v5", Provider.GCP: "n2-standard-4"
             }[provider]:
-                raise ValueError(f"{provider.value} research VM shape does not match the selected design")
+                raise ValueError(f"{provider.value} VM shape does not match the selected design")
             expected_locality = {
                 Provider.AWS: {
                     Scenario.SAME_ZONE: (("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a")),
@@ -384,6 +396,26 @@ class CampaignConfiguration(StrictModel):
                 raise ValueError("GCP placement intent must use COLLOCATED only for placement_optimization")
         return self
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        schema = handler(core_schema)
+        mode_specs = {
+            "acceptance": {"measured_seconds": 10, "pause_seconds": 10, "probe_chunk_seconds": None},
+            "short_study": {"measured_seconds": 60, "pause_seconds": 10, "probe_chunk_seconds": None},
+            "calibration": {"measured_seconds": 60, "pause_seconds": 10, "probe_chunk_seconds": None},
+            "diagnostic_day": {"measured_seconds": 86400, "pause_seconds": 0, "probe_chunk_seconds": 300},
+        }
+        schema["allOf"] = [
+            {"if": {"properties": {"mode": {"const": mode}}, "required": ["mode"]},
+             "then": {"properties": {"benchmark": {"properties": {
+                 "measured_seconds": {"const": values["measured_seconds"]},
+                 "pause_seconds": {"const": values["pause_seconds"]},
+                 "probe_chunk_seconds": {"type": "null"} if values["probe_chunk_seconds"] is None else {"const": values["probe_chunk_seconds"]},
+             }}}}}
+            for mode, values in mode_specs.items()
+        ]
+        return schema
+
 
 class ConfigProvenance(StrictModel):
     source_path: str
@@ -409,11 +441,12 @@ class VmIntent(StrictModel):
 
 
 class ResolvedObservation(StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2]
     config_id: str = Field(pattern=CONFIG_ID_PATTERN)
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     mode: ExperimentMode
     context: Literal["standard", "failure_check", "replacement"]
+    replacement_context: Optional[ReplacementContext] = None
     provider: Provider
     scenario: Scenario
     scheduled_start: Optional[datetime]
@@ -449,7 +482,7 @@ class ResolvedObservation(StrictModel):
 
 
 class ResolvedCampaign(StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2]
     config_id: str = Field(pattern=CONFIG_ID_PATTERN)
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     mode: ExperimentMode

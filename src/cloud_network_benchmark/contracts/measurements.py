@@ -2,20 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime
 from math import isfinite
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
 
-from .common import Evidence, Provider, StrictModel, StringEvidence, VmRole, utc_datetime
+from .common import Evidence, IDENTIFIER_PATTERN, Provider, StrictModel, StringEvidence, StructuredEvidence, VmRole, utc_datetime
 
 
 class CommandEvidence(StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2]
     request: dict[str, object]
     result: dict[str, object]
     producer: VmRole | Literal["controller"]
-    deployment_id: str = Field(min_length=1)
-    unit_id: Optional[str] = None
+    deployment_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    unit_id: Optional[str] = Field(default=None, pattern=IDENTIFIER_PATTERN)
     binary_version: StringEvidence
     source_identity: StringEvidence
     monotonic_started: Evidence[float]
@@ -88,12 +88,14 @@ class TimingGap(StrictModel):
             raise ValueError("gap timestamps must include a timezone")
         if self.finished_at < self.started_at:
             raise ValueError("gap finish must not precede start")
+        object.__setattr__(self, "started_at", utc_datetime(self.started_at))
+        object.__setattr__(self, "finished_at", utc_datetime(self.finished_at))
         return self
 
 
 class MeasurementTiming(StrictModel):
-    unit_id: str = Field(min_length=1)
-    deployment_id: str = Field(min_length=1)
+    unit_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    deployment_id: str = Field(pattern=IDENTIFIER_PATTERN)
     probe_test_started_at: Evidence[datetime]
     tcp_started_at: Evidence[datetime]
     measured_started_at: Evidence[datetime]
@@ -136,26 +138,30 @@ class MeasurementTiming(StrictModel):
             raise ValueError("observed measurement timestamps must include a timezone")
         if any(current < previous for previous, current in zip(available, available[1:])):
             raise ValueError("observed measurement chronology is invalid")
+        for name in ("probe_test_started_at", "tcp_started_at", "measured_started_at", "measured_finished_at"):
+            evidence = getattr(self, name)
+            if evidence.value is not None:
+                object.__setattr__(evidence, "value", utc_datetime(evidence.value))
         return self
 
 
 class DiagnosticSample(StrictModel):
-    schema_version: Literal[2] = 2
-    deployment_id: str = Field(min_length=1)
+    schema_version: Literal[2]
+    deployment_id: str = Field(pattern=IDENTIFIER_PATTERN)
     vm_role: VmRole
     sampled_at: datetime
     monotonic_seconds: float = Field(ge=0)
     interval_seconds: float = Field(gt=0)
-    cpu_total_percent: Evidence[float]
-    cpu_max_core_percent: Evidence[float]
-    cpu_steal_percent: Evidence[float]
-    tcp_retransmissions: Evidence[int]
-    interface_rx_drops: Evidence[int]
-    interface_tx_drops: Evidence[int]
-    interface_rx_errors: Evidence[int]
-    interface_tx_errors: Evidence[int]
-    rx_bytes: Evidence[int]
-    tx_bytes: Evidence[int]
+    cpu_total_percent: Evidence[Annotated[float, Field(ge=0, le=100)]]
+    cpu_max_core_percent: Evidence[Annotated[float, Field(ge=0, le=100)]]
+    cpu_steal_percent: Evidence[Annotated[float, Field(ge=0, le=100)]]
+    tcp_retransmissions: Evidence[Annotated[int, Field(ge=0)]]
+    interface_rx_drops: Evidence[Annotated[int, Field(ge=0)]]
+    interface_tx_drops: Evidence[Annotated[int, Field(ge=0)]]
+    interface_rx_errors: Evidence[Annotated[int, Field(ge=0)]]
+    interface_tx_errors: Evidence[Annotated[int, Field(ge=0)]]
+    rx_bytes: Evidence[Annotated[int, Field(ge=0)]]
+    tx_bytes: Evidence[Annotated[int, Field(ge=0)]]
     reset_fields: list[str] = Field(default_factory=list)
     gap_reason: Optional[str] = None
 
@@ -197,8 +203,8 @@ class DiagnosticSample(StrictModel):
 
 
 class VmMetadata(StrictModel):
-    schema_version: Literal[2] = 2
-    deployment_id: str = Field(min_length=1)
+    schema_version: Literal[2]
+    deployment_id: str = Field(pattern=IDENTIFIER_PATTERN)
     vm_role: VmRole
     provider: Provider
     cpu_model: StringEvidence
@@ -207,9 +213,9 @@ class VmMetadata(StrictModel):
     image: StringEvidence
     kernel: StringEvidence
     congestion_control: StringEvidence
-    tool_versions: StringEvidence
-    source_builds: StringEvidence
-    documented_network_limit: StringEvidence
+    tool_versions: StructuredEvidence
+    source_builds: StructuredEvidence
+    documented_network_limit: StructuredEvidence
     mtu: Evidence[int]
     observed_region: StringEvidence
     observed_zone: StringEvidence
