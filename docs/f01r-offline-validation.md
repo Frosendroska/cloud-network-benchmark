@@ -103,6 +103,46 @@ remain unchanged; T058 and T059 are checked off in `tasks.md`. No cloud, credent
 apply, benchmark, F10, or remote action was run. The validation-record-only commit follows the
 tested source commit above.
 
+## Convergence pass 4
+
+The final assigned convergence tasks T060–T061 are implemented at source/test commit
+`a9541a0be04cafb668c1d28920fe1f99f5667633`. Shared source-intent validation now keeps
+calibration and diagnostic-day campaigns in `same_zone`, constrains replacement mode and selected
+provider consistently across source, campaign and observation DTOs, and exports the matching
+context/scenario/provider rules. Common-N schema conditionals now treat omitted state/evidence as
+pending defaults and only apply frozen-N stream constraints when the nested frozen record is
+present. Pending research N and calibration/schedule blockers remain evidence-driven.
+
+The focused convergence corpus covers all 4 modes × 4 scenarios × 3 contexts at the source DTO
+boundary, both retained modes across all scenarios and failure/replacement contexts at resolved DTO
+boundaries, each provider's replacement linkage, and omitted `common_n`, omitted state, explicit
+pending/frozen values, malformed frozen evidence and stream mismatches through both resolved DTO
+schemas and runtime validators.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_resolved_protocol_contract.py
+```
+
+Exit 0: **116 passed in 6.15s**.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q --tb=short
+```
+
+Exit 0: **363 passed in 16.44s**. The first integrated run before schema regeneration had 362
+passed and one expected schema-drift failure; after exporting the updated campaign, resolved
+campaign and child manifest schemas, the repeated full run passed.
+
+Schema export and drift check both exited 0. All four required CLI checks exited 0: acceptance
+`validate --format json`, short-study and calibration `dry-run --format json`, and diagnostic-day
+`dry-run --format human`.
+
+`git diff --check` exited 0; the historical-spec comparison against
+`e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7` was empty. Reviewer checklist markers and historical
+specs remain unchanged; T060 and T061 are checked in `tasks.md`. No cloud, credential, Terraform
+apply, benchmark, F10 or remote action was run. The final validation-record commit is recorded
+separately from the tested source commit above.
+
 ## Delivery boundary
 
 Schema V2, configuration/native intent, provenance snapshots, manifests, handoff DTOs, deterministic schema export, validation/timing/artifact contracts, and human/machine dry-run previews are implemented in the assigned F01R scope. Source prices/cost snapshot hash remain unavailable because no exact workbook snapshot was supplied; no value was inferred or fabricated. F01R completion does not establish cloud readiness or authorize paid work. Next stage is Spec Kit convergence against the delivered feature artifacts, then coordinator review/merge before dependent features consume these contracts.
