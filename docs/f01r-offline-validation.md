@@ -9,7 +9,7 @@
 - Python: `/private/tmp/cnb-offline-venv/bin/python`
 - Host: Darwin arm64
 - Test import path: `PYTHONPATH=src`; Thesis source root: `/Users/katya/Desktop/University/Masters/Thesis`
-- Delivery source commit: recorded after the implementation commit; this documentation-only update follows it.
+- Source-code test commit: `7d3f6ca5a54d68cb465bd6579e5cd80b599bc917`. Schema export/check ran against that worktree; this metadata/artifact follow-up adds the generated schema files and this exact reference.
 
 Baseline command:
 

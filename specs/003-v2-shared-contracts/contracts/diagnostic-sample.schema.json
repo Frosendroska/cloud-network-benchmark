@@ -1,0 +1,175 @@
+{
+  "$defs": {
+    "Evidence_float_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[float]",
+      "type": "object"
+    },
+    "Evidence_int_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[int]",
+      "type": "object"
+    },
+    "VmRole": {
+      "enum": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "VmRole",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cpu_max_core_percent": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "cpu_steal_percent": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "cpu_total_percent": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "deployment_id": {
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "gap_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gap Reason"
+    },
+    "interface_rx_drops": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "interface_rx_errors": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "interface_tx_drops": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "interface_tx_errors": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "interval_seconds": {
+      "exclusiveMinimum": 0,
+      "title": "Interval Seconds",
+      "type": "number"
+    },
+    "monotonic_seconds": {
+      "minimum": 0,
+      "title": "Monotonic Seconds",
+      "type": "number"
+    },
+    "reset_fields": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Reset Fields",
+      "type": "array"
+    },
+    "rx_bytes": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "sampled_at": {
+      "format": "date-time",
+      "title": "Sampled At",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "tcp_retransmissions": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "tx_bytes": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "vm_role": {
+      "$ref": "#/$defs/VmRole"
+    }
+  },
+  "required": [
+    "deployment_id",
+    "vm_role",
+    "sampled_at",
+    "monotonic_seconds",
+    "interval_seconds",
+    "cpu_total_percent",
+    "cpu_max_core_percent",
+    "cpu_steal_percent",
+    "tcp_retransmissions",
+    "interface_rx_drops",
+    "interface_tx_drops",
+    "interface_rx_errors",
+    "interface_tx_errors",
+    "rx_bytes",
+    "tx_bytes"
+  ],
+  "title": "DiagnosticSample",
+  "type": "object"
+}

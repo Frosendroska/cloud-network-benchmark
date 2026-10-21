@@ -1,0 +1,168 @@
+{
+  "$defs": {
+    "Evidence_datetime_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[datetime]",
+      "type": "object"
+    },
+    "Evidence_float_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[float]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "campaign_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "cap_start_policy_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "cap_started_at": {
+      "$ref": "#/$defs/Evidence_datetime_"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/Evidence_datetime_"
+    },
+    "reasons": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Reasons",
+      "type": "array"
+    },
+    "reservation_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "reserved_cost_usd": {
+      "$ref": "#/$defs/Evidence_float_"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_path": {
+      "minLength": 1,
+      "title": "Source Path",
+      "type": "string"
+    },
+    "source_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Source Sha256",
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "not_evaluated",
+        "reserved",
+        "rejected",
+        "released"
+      ],
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "campaign_id",
+    "reservation_id",
+    "state",
+    "reserved_cost_usd",
+    "cap_started_at",
+    "expires_at",
+    "cap_start_policy_id",
+    "source_path",
+    "source_sha256"
+  ],
+  "title": "ReservationEvidence",
+  "type": "object"
+}

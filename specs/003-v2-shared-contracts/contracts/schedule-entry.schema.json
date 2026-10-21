@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "columns": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Columns",
+      "type": "array"
+    },
+    "config_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "title": "Config Id",
+      "type": "string"
+    },
+    "entry_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Entry Id",
+      "type": "string"
+    },
+    "experiment_id": {
+      "pattern": "^EXP-[0-9]{3,}$",
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "original_header": {
+      "title": "Original Header",
+      "type": "string"
+    },
+    "original_row": {
+      "title": "Original Row",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "replaces_run_id": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Replaces Run Id"
+    },
+    "row_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Row Sha256",
+      "type": "string"
+    },
+    "scheduled_start": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scheduled Start"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_path": {
+      "minLength": 1,
+      "title": "Source Path",
+      "type": "string"
+    },
+    "source_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "title": "Source Sha256",
+      "type": "string"
+    },
+    "window_label": {
+      "anyOf": [
+        {
+          "enum": [
+            "night",
+            "morning",
+            "afternoon",
+            "evening"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Window Label"
+    }
+  },
+  "required": [
+    "entry_id",
+    "config_id",
+    "experiment_id",
+    "scheduled_start",
+    "source_path",
+    "source_sha256",
+    "row_sha256",
+    "original_header",
+    "original_row",
+    "columns",
+    "priority"
+  ],
+  "title": "ScheduleEntry",
+  "type": "object"
+}

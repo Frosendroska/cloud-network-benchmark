@@ -1,0 +1,879 @@
+{
+  "$defs": {
+    "AccelerationIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "ena",
+            "accelerated_networking",
+            "gvnic"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "AccelerationIntent",
+      "type": "object"
+    },
+    "AdmissionRequirements": {
+      "additionalProperties": false,
+      "properties": {
+        "cost_input_id": {
+          "minLength": 1,
+          "title": "Cost Input Id",
+          "type": "string"
+        },
+        "cost_input_sha256": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "estimated_cost_usd": {
+          "$ref": "#/$defs/Evidence_float_"
+        },
+        "hard_budget_usd": {
+          "const": 300,
+          "default": 300,
+          "title": "Hard Budget Usd",
+          "type": "integer"
+        },
+        "lifetime_cap_seconds": {
+          "enum": [
+            1200,
+            1800,
+            87600
+          ],
+          "title": "Lifetime Cap Seconds",
+          "type": "integer"
+        },
+        "prices_checked_on": {
+          "format": "date",
+          "title": "Prices Checked On",
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "title": "Priority",
+          "type": "string"
+        },
+        "protected_buffer_usd": {
+          "const": 50,
+          "default": 50,
+          "title": "Protected Buffer Usd",
+          "type": "integer"
+        },
+        "requires_common_n": {
+          "title": "Requires Common N",
+          "type": "boolean"
+        },
+        "requires_expiry": {
+          "title": "Requires Expiry",
+          "type": "boolean"
+        },
+        "requires_primary_review": {
+          "title": "Requires Primary Review",
+          "type": "boolean"
+        },
+        "requires_schedule": {
+          "title": "Requires Schedule",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "priority",
+        "lifetime_cap_seconds",
+        "cost_input_id",
+        "prices_checked_on",
+        "cost_input_sha256",
+        "estimated_cost_usd",
+        "requires_common_n",
+        "requires_schedule",
+        "requires_primary_review",
+        "requires_expiry"
+      ],
+      "title": "AdmissionRequirements",
+      "type": "object"
+    },
+    "BenchmarkPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "common_n": {
+          "$ref": "#/$defs/CommonNState"
+        },
+        "full_rtt": {
+          "const": true,
+          "default": true,
+          "title": "Full Rtt",
+          "type": "boolean"
+        },
+        "measured_seconds": {
+          "exclusiveMinimum": 0,
+          "title": "Measured Seconds",
+          "type": "integer"
+        },
+        "no_rdtsc": {
+          "const": true,
+          "default": true,
+          "title": "No Rdtsc",
+          "type": "boolean"
+        },
+        "pause_seconds": {
+          "enum": [
+            0,
+            10
+          ],
+          "title": "Pause Seconds",
+          "type": "integer"
+        },
+        "probe_bytes": {
+          "const": 64,
+          "default": 64,
+          "title": "Probe Bytes",
+          "type": "integer"
+        },
+        "probe_chunk_seconds": {
+          "anyOf": [
+            {
+              "const": 300,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Chunk Seconds"
+        },
+        "probe_lead_seconds": {
+          "const": 2,
+          "default": 2,
+          "title": "Probe Lead Seconds",
+          "type": "integer"
+        },
+        "probe_mps": {
+          "const": 1000,
+          "default": 1000,
+          "title": "Probe Mps",
+          "type": "integer"
+        },
+        "reply_every": {
+          "const": 1,
+          "default": 1,
+          "title": "Reply Every",
+          "type": "integer"
+        },
+        "sample_interval_seconds": {
+          "const": 1,
+          "default": 1,
+          "title": "Sample Interval Seconds",
+          "type": "integer"
+        },
+        "stabilization_seconds": {
+          "const": 60,
+          "default": 60,
+          "title": "Stabilization Seconds",
+          "type": "integer"
+        },
+        "tcp_buffer_bytes": {
+          "const": 131072,
+          "default": 131072,
+          "title": "Tcp Buffer Bytes",
+          "type": "integer"
+        },
+        "tcp_congestion_control": {
+          "const": "cubic",
+          "default": "cubic",
+          "title": "Tcp Congestion Control",
+          "type": "string"
+        },
+        "tcp_zerocopy": {
+          "const": true,
+          "default": true,
+          "title": "Tcp Zerocopy",
+          "type": "boolean"
+        },
+        "warmup_seconds": {
+          "const": 5,
+          "default": 5,
+          "title": "Warmup Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "measured_seconds",
+        "pause_seconds"
+      ],
+      "title": "BenchmarkPlan",
+      "type": "object"
+    },
+    "CampaignOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "cleanup_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cleanup Timeout Seconds"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "provisioning_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provisioning Timeout Seconds"
+        },
+        "readiness_timeout_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readiness Timeout Seconds"
+        }
+      },
+      "title": "CampaignOptions",
+      "type": "object"
+    },
+    "CommonNState": {
+      "additionalProperties": false,
+      "properties": {
+        "common_n": {
+          "anyOf": [
+            {
+              "enum": [
+                2,
+                4,
+                8
+              ],
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Common N"
+        },
+        "plateau_found": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plateau Found"
+        },
+        "source_campaign_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Campaign Id"
+        },
+        "source_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Sha256"
+        },
+        "state": {
+          "default": "pending",
+          "enum": [
+            "pending",
+            "frozen"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "title": "CommonNState",
+      "type": "object"
+    },
+    "DiskIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "gp3",
+            "StandardSSD_LRS_E4",
+            "pd-balanced"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "size_gib": {
+          "const": 32,
+          "default": 32,
+          "title": "Size Gib",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "DiskIntent",
+      "type": "object"
+    },
+    "Evidence_float_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[float]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "ExperimentMode": {
+      "enum": [
+        "acceptance",
+        "calibration",
+        "short_study",
+        "diagnostic_day"
+      ],
+      "title": "ExperimentMode",
+      "type": "string"
+    },
+    "NetworkIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "address_spaces": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Address Spaces",
+          "type": "object"
+        },
+        "default_offloads": {
+          "const": true,
+          "default": true,
+          "title": "Default Offloads",
+          "type": "boolean"
+        },
+        "dscp": {
+          "const": 0,
+          "default": 0,
+          "title": "Dscp",
+          "type": "integer"
+        },
+        "ecn": {
+          "const": false,
+          "default": false,
+          "title": "Ecn",
+          "type": "boolean"
+        },
+        "mtu": {
+          "const": 1460,
+          "default": 1460,
+          "title": "Mtu",
+          "type": "integer"
+        },
+        "private_ipv4": {
+          "const": true,
+          "default": true,
+          "title": "Private Ipv4",
+          "type": "boolean"
+        },
+        "public_ipv4_per_vm": {
+          "const": 1,
+          "default": 1,
+          "title": "Public Ipv4 Per Vm",
+          "type": "integer"
+        },
+        "subnets": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Subnets",
+          "type": "object"
+        },
+        "tcp_congestion_control": {
+          "const": "cubic",
+          "default": "cubic",
+          "title": "Tcp Congestion Control",
+          "type": "string"
+        }
+      },
+      "required": [
+        "address_spaces",
+        "subnets"
+      ],
+      "title": "NetworkIntent",
+      "type": "object"
+    },
+    "OperatingSystemIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "const": "amd64",
+          "default": "amd64",
+          "title": "Architecture",
+          "type": "string"
+        },
+        "distribution": {
+          "const": "ubuntu",
+          "default": "ubuntu",
+          "title": "Distribution",
+          "type": "string"
+        },
+        "release": {
+          "const": "24.04",
+          "default": "24.04",
+          "title": "Release",
+          "type": "string"
+        }
+      },
+      "title": "OperatingSystemIntent",
+      "type": "object"
+    },
+    "Pair": {
+      "additionalProperties": false,
+      "properties": {
+        "vm_a": {
+          "minLength": 1,
+          "title": "Vm A",
+          "type": "string"
+        },
+        "vm_b": {
+          "minLength": 1,
+          "title": "Vm B",
+          "type": "string"
+        }
+      },
+      "required": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "Pair",
+      "type": "object"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "properties": {
+        "collocated": {
+          "default": false,
+          "title": "Collocated",
+          "type": "boolean"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_distance": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Distance"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "title": "Placement",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "ProviderConfiguration": {
+      "additionalProperties": false,
+      "properties": {
+        "acceleration": {
+          "$ref": "#/$defs/AccelerationIntent"
+        },
+        "connection_user": {
+          "minLength": 1,
+          "title": "Connection User",
+          "type": "string"
+        },
+        "disk": {
+          "$ref": "#/$defs/DiskIntent"
+        },
+        "documented_network_limit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Documented Network Limit"
+        },
+        "image": {
+          "minLength": 1,
+          "title": "Image",
+          "type": "string"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkIntent"
+        },
+        "os": {
+          "$ref": "#/$defs/OperatingSystemIntent"
+        },
+        "placement": {
+          "$ref": "#/$defs/Placement"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "provider_options": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Provider Options",
+          "type": "object"
+        },
+        "regions": {
+          "$ref": "#/$defs/Pair"
+        },
+        "security": {
+          "$ref": "#/$defs/SecurityIntent"
+        },
+        "vm_shape": {
+          "minLength": 1,
+          "title": "Vm Shape",
+          "type": "string"
+        },
+        "zones": {
+          "$ref": "#/$defs/Pair"
+        }
+      },
+      "required": [
+        "provider",
+        "regions",
+        "zones",
+        "vm_shape",
+        "image",
+        "connection_user",
+        "documented_network_limit",
+        "placement",
+        "provider_options",
+        "disk",
+        "network",
+        "security",
+        "acceleration"
+      ],
+      "title": "ProviderConfiguration",
+      "type": "object"
+    },
+    "ReplacementContext": {
+      "additionalProperties": false,
+      "properties": {
+        "observation_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "replaces_run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Replaces Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_id",
+        "replaces_run_id"
+      ],
+      "title": "ReplacementContext",
+      "type": "object"
+    },
+    "Scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ],
+      "title": "Scenario",
+      "type": "string"
+    },
+    "SecurityIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "batch_mode": {
+          "const": true,
+          "default": true,
+          "title": "Batch Mode",
+          "type": "boolean"
+        },
+        "benchmark_source": {
+          "const": "vm_a_private",
+          "default": "vm_a_private",
+          "title": "Benchmark Source",
+          "type": "string"
+        },
+        "controller_cidr": {
+          "$ref": "#/$defs/Evidence_str_"
+        },
+        "iperf3_tcp_port": {
+          "const": 5201,
+          "default": 5201,
+          "title": "Iperf3 Tcp Port",
+          "type": "integer"
+        },
+        "sockperf_udp_port": {
+          "const": 11111,
+          "default": 11111,
+          "title": "Sockperf Udp Port",
+          "type": "integer"
+        },
+        "strict_host_key_checking": {
+          "const": true,
+          "default": true,
+          "title": "Strict Host Key Checking",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "controller_cidr"
+      ],
+      "title": "SecurityIntent",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "admission": {
+      "$ref": "#/$defs/AdmissionRequirements"
+    },
+    "benchmark": {
+      "$ref": "#/$defs/BenchmarkPlan"
+    },
+    "config_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "title": "Config Id",
+      "type": "string"
+    },
+    "context": {
+      "default": "standard",
+      "enum": [
+        "standard",
+        "failure_check",
+        "replacement"
+      ],
+      "title": "Context",
+      "type": "string"
+    },
+    "experiment_id": {
+      "pattern": "^EXP-[0-9]{3,}$",
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExperimentMode"
+    },
+    "options": {
+      "$ref": "#/$defs/CampaignOptions"
+    },
+    "provider_configs": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderConfiguration"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/Provider"
+      },
+      "title": "Provider Configs",
+      "type": "object"
+    },
+    "replacement_context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReplacementContext"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "scenario": {
+      "$ref": "#/$defs/Scenario"
+    },
+    "scheduled_start": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scheduled Start"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "selected_providers": {
+      "items": {
+        "$ref": "#/$defs/Provider"
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "title": "Selected Providers",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "config_id",
+    "experiment_id",
+    "mode",
+    "scheduled_start",
+    "selected_providers",
+    "scenario",
+    "benchmark",
+    "provider_configs",
+    "options",
+    "admission"
+  ],
+  "title": "CampaignConfiguration",
+  "type": "object"
+}

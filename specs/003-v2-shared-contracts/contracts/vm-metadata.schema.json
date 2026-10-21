@@ -1,0 +1,167 @@
+{
+  "$defs": {
+    "Evidence_int_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[int]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "VmRole": {
+      "enum": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "VmRole",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acceleration": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "actual_shape": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "congestion_control": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "cpu_model": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "deployment_id": {
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "documented_network_limit": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "image": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "kernel": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "mtu": {
+      "$ref": "#/$defs/Evidence_int_"
+    },
+    "nic_driver": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "observed_region": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "observed_zone": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "physical_zone_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "provider": {
+      "$ref": "#/$defs/Provider"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_builds": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "tool_versions": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "vm_role": {
+      "$ref": "#/$defs/VmRole"
+    }
+  },
+  "required": [
+    "deployment_id",
+    "vm_role",
+    "provider",
+    "cpu_model",
+    "nic_driver",
+    "acceleration",
+    "image",
+    "kernel",
+    "congestion_control",
+    "tool_versions",
+    "source_builds",
+    "documented_network_limit",
+    "mtu",
+    "observed_region",
+    "observed_zone",
+    "physical_zone_id",
+    "actual_shape"
+  ],
+  "title": "VmMetadata",
+  "type": "object"
+}

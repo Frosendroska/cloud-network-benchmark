@@ -1,0 +1,135 @@
+{
+  "$defs": {
+    "Evidence_datetime_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[datetime]",
+      "type": "object"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "enum": [
+        "stop",
+        "deallocate"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "deployment_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/Evidence_datetime_"
+    },
+    "provider": {
+      "$ref": "#/$defs/Provider"
+    },
+    "reservation_id": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "resource_namespace": {
+      "minLength": 1,
+      "title": "Resource Namespace",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "target_selector": {
+      "minLength": 1,
+      "title": "Target Selector",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "deployment_id",
+    "provider",
+    "action",
+    "expires_at",
+    "reservation_id",
+    "resource_namespace",
+    "target_selector"
+  ],
+  "title": "ExpiryRequest",
+  "type": "object"
+}

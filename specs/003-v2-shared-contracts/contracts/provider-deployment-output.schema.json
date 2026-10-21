@@ -1,0 +1,440 @@
+{
+  "$defs": {
+    "Evidence_Dict_str__Any__": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[Dict[str, Any]]",
+      "type": "object"
+    },
+    "ExperimentMode": {
+      "enum": [
+        "acceptance",
+        "calibration",
+        "short_study",
+        "diagnostic_day"
+      ],
+      "title": "ExperimentMode",
+      "type": "string"
+    },
+    "FailureEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Id"
+        },
+        "category": {
+          "minLength": 1,
+          "title": "Category",
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": true,
+          "title": "Details",
+          "type": "object"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "message",
+        "occurred_at"
+      ],
+      "title": "FailureEvidence",
+      "type": "object"
+    },
+    "IdentityContext": {
+      "additionalProperties": false,
+      "properties": {
+        "campaign_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Campaign Id",
+          "type": "string"
+        },
+        "config_id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Config Id",
+          "type": "string"
+        },
+        "deployment_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "experiment_id": {
+          "pattern": "^EXP-[0-9]{3,}$",
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "observation_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provider"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "replaces_run_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replaces Run Id"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "experiment_id",
+        "config_id",
+        "campaign_id",
+        "observation_id",
+        "run_id",
+        "deployment_id"
+      ],
+      "title": "IdentityContext",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "ProviderVmOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "actual_shape": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Actual Shape"
+        },
+        "connection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteConnectionData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "image_identity": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Image Identity"
+        },
+        "placement_metadata": {
+          "$ref": "#/$defs/Evidence_Dict_str__Any__"
+        },
+        "private_ipv4": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Private Ipv4"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Region"
+        },
+        "resource_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Resource Id"
+        },
+        "role": {
+          "$ref": "#/$defs/VmRole"
+        },
+        "unavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Evidence_Dict_str__Any__"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "zone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Zone"
+        }
+      },
+      "required": [
+        "role",
+        "resource_id",
+        "private_ipv4",
+        "image_identity",
+        "actual_shape",
+        "region",
+        "zone",
+        "placement_metadata",
+        "connection"
+      ],
+      "title": "ProviderVmOutput",
+      "type": "object"
+    },
+    "RemoteConnectionData": {
+      "additionalProperties": false,
+      "properties": {
+        "authentication_reference": {
+          "minLength": 1,
+          "title": "Authentication Reference",
+          "type": "string"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "host": {
+          "minLength": 1,
+          "title": "Host",
+          "type": "string"
+        },
+        "host_key_reference": {
+          "minLength": 1,
+          "title": "Host Key Reference",
+          "type": "string"
+        },
+        "port": {
+          "default": 22,
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "readiness_expectations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Readiness Expectations",
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/VmRole"
+        },
+        "user": {
+          "minLength": 1,
+          "title": "User",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "host",
+        "user",
+        "authentication_reference",
+        "host_key_reference"
+      ],
+      "title": "RemoteConnectionData",
+      "type": "object"
+    },
+    "Scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ],
+      "title": "Scenario",
+      "type": "string"
+    },
+    "VmRole": {
+      "enum": [
+        "vm_a",
+        "vm_b"
+      ],
+      "title": "VmRole",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "apply_action_id": {
+      "minLength": 1,
+      "title": "Apply Action Id",
+      "type": "string"
+    },
+    "deployment_id": {
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "documented_network_limit": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
+    },
+    "finished_at": {
+      "format": "date-time",
+      "title": "Finished At",
+      "type": "string"
+    },
+    "identity": {
+      "$ref": "#/$defs/IdentityContext"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExperimentMode"
+    },
+    "output_artifact_path": {
+      "default": "terraform-outputs.redacted.json",
+      "title": "Output Artifact Path",
+      "type": "string"
+    },
+    "provider": {
+      "$ref": "#/$defs/Provider"
+    },
+    "provider_metadata": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
+    },
+    "run_id": {
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "scenario": {
+      "$ref": "#/$defs/Scenario"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    },
+    "vm_a": {
+      "$ref": "#/$defs/ProviderVmOutput"
+    },
+    "vm_b": {
+      "$ref": "#/$defs/ProviderVmOutput"
+    }
+  },
+  "required": [
+    "identity",
+    "run_id",
+    "deployment_id",
+    "mode",
+    "provider",
+    "scenario",
+    "apply_action_id",
+    "started_at",
+    "finished_at",
+    "vm_a",
+    "vm_b",
+    "provider_metadata",
+    "documented_network_limit"
+  ],
+  "title": "ProviderDeploymentOutput",
+  "type": "object"
+}

@@ -1,0 +1,266 @@
+{
+  "$defs": {
+    "ComparisonEligibility": {
+      "enum": [
+        "not_evaluated",
+        "eligible",
+        "ineligible",
+        "unavailable"
+      ],
+      "title": "ComparisonEligibility",
+      "type": "string"
+    },
+    "DataValidity": {
+      "enum": [
+        "not_validated",
+        "valid",
+        "partial",
+        "invalid",
+        "unavailable"
+      ],
+      "title": "DataValidity",
+      "type": "string"
+    },
+    "Evidence_str_": {
+      "additionalProperties": false,
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[str]",
+      "type": "object"
+    },
+    "ExperimentMode": {
+      "enum": [
+        "acceptance",
+        "calibration",
+        "short_study",
+        "diagnostic_day"
+      ],
+      "title": "ExperimentMode",
+      "type": "string"
+    },
+    "IdentityContext": {
+      "additionalProperties": false,
+      "properties": {
+        "campaign_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Campaign Id",
+          "type": "string"
+        },
+        "config_id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Config Id",
+          "type": "string"
+        },
+        "deployment_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "experiment_id": {
+          "pattern": "^EXP-[0-9]{3,}$",
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "observation_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provider"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "replaces_run_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replaces Run Id"
+        },
+        "run_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "experiment_id",
+        "config_id",
+        "campaign_id",
+        "observation_id",
+        "run_id",
+        "deployment_id"
+      ],
+      "title": "IdentityContext",
+      "type": "object"
+    },
+    "Provider": {
+      "enum": [
+        "aws",
+        "azure",
+        "gcp"
+      ],
+      "title": "Provider",
+      "type": "string"
+    },
+    "ValidationFinding": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Id"
+        },
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "unit_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit Id"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "message"
+      ],
+      "title": "ValidationFinding",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_records": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Artifact Records",
+      "type": "array"
+    },
+    "comparison_eligibility": {
+      "$ref": "#/$defs/ComparisonEligibility"
+    },
+    "comparison_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Comparison Reasons",
+      "type": "array"
+    },
+    "data_reasons": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Data Reasons",
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/ValidationFinding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "identity": {
+      "$ref": "#/$defs/IdentityContext"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExperimentMode"
+    },
+    "resolved_sha256": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "schema_version": {
+      "const": 2,
+      "default": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_sha256": {
+      "$ref": "#/$defs/Evidence_str_"
+    },
+    "status": {
+      "$ref": "#/$defs/DataValidity"
+    }
+  },
+  "required": [
+    "identity",
+    "mode",
+    "status",
+    "comparison_eligibility",
+    "source_sha256",
+    "resolved_sha256"
+  ],
+  "title": "ValidationResult",
+  "type": "object"
+}
