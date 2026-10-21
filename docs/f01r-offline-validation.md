@@ -143,6 +143,35 @@ specs remain unchanged; T060 and T061 are checked in `tasks.md`. No cloud, crede
 apply, benchmark, F10 or remote action was run. The final validation-record commit is recorded
 separately from the tested source commit above.
 
+## Convergence pass 5
+
+T062 is implemented at source/test/schema commit
+`e3986eeb3bf43826c84ac81e6ab0f02b34d393a9`. In replacement contexts, the public schemas now
+require a non-null object containing both `observation_id` and `replaces_run_id`, with the same
+identifier and provider-suffix constraints enforced by runtime validators. Standard and
+failure-check contexts continue to accept omitted or null replacement metadata.
+
+The focused corpus exercises omitted, null, empty, incomplete and valid replacement metadata for
+standard, failure-check and replacement contexts across AWS, Azure and GCP, against source config,
+ResolvedCampaign and ResolvedObservation runtime and JSON Schema validation.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_resolved_protocol_contract.py
+```
+
+Exit 0: **161 passed in 11.15s**.
+
+```bash
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q --tb=short
+```
+
+Exit 0: **408 passed in 21.43s**. Schema export and drift check both exited 0. Acceptance validate
+JSON and short-study, calibration and day dry-runs exited 0. `git diff --check` exited 0; specs
+001 and 002 remain byte-identical to dependency base `e7fc15ff1a7d6a4aa43dfebe5209592689a87fa7`.
+T062 is checked off and reviewer-owned checklist markers remain unchanged. No cloud, credentials,
+Terraform apply, benchmark or remote action was run. The final validation-record commit follows the
+tested source commit above.
+
 ## Delivery boundary
 
 Schema V2, configuration/native intent, provenance snapshots, manifests, handoff DTOs, deterministic schema export, validation/timing/artifact contracts, and human/machine dry-run previews are implemented in the assigned F01R scope. Source prices/cost snapshot hash remain unavailable because no exact workbook snapshot was supplied; no value was inferred or fabricated. F01R completion does not establish cloud readiness or authorize paid work. Next stage is Spec Kit convergence against the delivered feature artifacts, then coordinator review/merge before dependent features consume these contracts.
