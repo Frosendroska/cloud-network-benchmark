@@ -1,62 +1,154 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import math
+import re
 import time
-from typing import List
-from pydantic import Field
+from typing import Callable, List
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, _failure, _request
+from pydantic import Field, model_validator
+
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _request
+from .bootstrap import BootstrapResult
 from .contracts.common import CommandOutcome, StrictModel
 from .contracts.execution import CommandRunner
 
 
 class ReadinessConfig(StrictModel):
-    private_path_command: List[str] = Field(default_factory=lambda: ["ping", "-c", "1"])
-    server_health_command: List[str] = Field(default_factory=lambda: ["systemctl", "is-active", "netserver"])
-    success_output: str | None = None
-    private_path_success_output: str | None = None
-    server_success_output: str | None = "active"
-    poll_attempts: int = Field(default=1, ge=1)
-    bootstrap_succeeded: bool = True
+    poll_interval_seconds: float = Field(gt=0, le=60)
+    attempt_ceiling: int = Field(ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def finite_poll(self):
+        if not math.isfinite(self.poll_interval_seconds):
+            raise ValueError("poll interval must be finite")
+        return self
 
 
 class ReadinessResult(StrictModel):
     ready: bool
     attempts: int
     actions: List[RemoteActionEvidence] = Field(default_factory=list)
+    observations: List[dict] = Field(default_factory=list)
+    deadline: RemoteDeadline
+    elapsed_seconds: float
+    remaining_seconds: float
     failure: AccessFailureEvidence | None = None
 
 
-def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner: CommandRunner) -> ReadinessResult:
+def _bootstrap_matches(connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
+    return bool(prepared.succeeded and prepared.deployment_id == connection.deployment_id
+                and prepared.identity.run_id == connection.run_id
+                and len(prepared.builds) == 4
+                and {(x.role, x.tool) for x in prepared.builds} == {(r, t) for r in ("vm_a", "vm_b") for t in ("sockperf", "iperf3")}
+                and {(x.tool, x.protocol, x.port, x.address, x.allowed_source) for x in prepared.listeners}
+                    == {("sockperf", "udp", 11111, connection.private_ipv4_b, f"{connection.private_ipv4_a}/32"),
+                        ("iperf3", "tcp", 5201, connection.private_ipv4_b, f"{connection.private_ipv4_a}/32")}
+                and all(x.state == "active" for x in prepared.listeners))
+
+
+def _systemd_healthy(stdout: str, connection: ConnectionOutput, prepared: BootstrapResult, tool: str) -> bool:
+    fields = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+    listener = next((item for item in prepared.listeners if item.tool == tool), None)
+    if listener is None:
+        return False
+    exec_start = fields.get("ExecStart", "")
+    expected = [listener.binary_path, connection.private_ipv4_b,
+                "11111" if tool == "sockperf" else "5201"]
+    if tool == "iperf3":
+        expected.extend(("--json-stream", "--forceflush"))
+    else:
+        expected.append("server")
+    return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
+            and fields.get("Restart") == "no" and all(token in exec_start for token in expected)
+            and listener.stdout_path in fields.get("StandardOutput", "")
+            and listener.stderr_path in fields.get("StandardError", ""))
+
+
+def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
+    if name in {"ssh-vm-a", "ssh-vm-b"}:
+        return True
+    if name.startswith("cloud-init"):
+        return stdout.strip().lower() == "status: done" or stdout.strip().lower() == "done"
+    if name == "private-icmp":
+        return connection.private_ipv4_b in stdout
+    if name == "private-tcp":
+        return True
+    if name.startswith("service-"):
+        return _systemd_healthy(stdout, connection, prepared, name.removeprefix("service-"))
+    if name == "socket-sockperf":
+        return f"{connection.private_ipv4_b}:11111" in stdout and "sockperf" in stdout.lower() and "0.0.0.0:11111" not in stdout and "*:11111" not in stdout
+    if name == "socket-iperf3":
+        return f"{connection.private_ipv4_b}:5201" in stdout and "iperf3" in stdout.lower() and "0.0.0.0:5201" not in stdout and "*:5201" not in stdout
+    if name == "guest-acl":
+        return (f"{connection.private_ipv4_a}/32" in stdout and connection.private_ipv4_b in stdout
+                and "11111" in stdout and "5201" in stdout and "drop" in stdout.lower()
+                and "hook input" in stdout.lower())
+    return False
+
+
+def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner: CommandRunner, *, prepared: BootstrapResult, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> ReadinessResult:
+    start = clock()
     actions: List[RemoteActionEvidence] = []
-    if not config.bootstrap_succeeded:
-        from datetime import datetime, timezone
-        return ReadinessResult(ready=False, attempts=0, failure=AccessFailureEvidence(stage="readiness", category="bootstrap_failed", message="readiness requires successful bootstrap", occurred_at=datetime.now(timezone.utc)))
-    checks = [("ssh-vm-a", connection.vm_a, ["true"], connection.timeouts.ssh_seconds), ("ssh-vm-b", connection.vm_b, ["true"], connection.timeouts.ssh_seconds), ("private-path", connection.vm_a, [*config.private_path_command, connection.private_ipv4_b], connection.timeouts.private_path_seconds), ("server-health", connection.vm_b, config.server_health_command, connection.timeouts.server_seconds)]
+    observations: List[dict] = []
     attempts = 0
-    for name, vm, argv, timeout in checks:
-        result = None
-        deadline = time.monotonic() + timeout
-        for attempt in range(config.poll_attempts):
+    if not _bootstrap_matches(connection, prepared):
+        failure = AccessFailureEvidence(stage="readiness", category="bootstrap_evidence_mismatch", message="readiness requires matching successful preparation evidence", occurred_at=datetime.now(timezone.utc))
+        return ReadinessResult(ready=False, attempts=0, actions=[], observations=[], deadline=deadline,
+            elapsed_seconds=0, remaining_seconds=deadline.remaining(clock, readiness=True), failure=failure)
+    chain = "cnb_" + re.sub(r"[^A-Za-z0-9_]", "_", connection.deployment_id)[:32]
+    checks = [
+        ("ssh-vm-a", connection.vm_a, ["true"], connection.timeouts.ssh_seconds),
+        ("ssh-vm-b", connection.vm_b, ["true"], connection.timeouts.ssh_seconds),
+        ("cloud-init-vm-a", connection.vm_a, ["cloud-init", "status", "--wait"], connection.timeouts.cloud_init_seconds),
+        ("cloud-init-vm-b", connection.vm_b, ["cloud-init", "status", "--wait"], connection.timeouts.cloud_init_seconds),
+        ("private-icmp", connection.vm_a, ["ping", "-c", "1", "-W", "1", connection.private_ipv4_b], connection.timeouts.private_path_seconds),
+        ("private-tcp", connection.vm_a, ["nc", "-z", "-w", "1", connection.private_ipv4_b, "5201"], connection.timeouts.private_path_seconds),
+        ("service-sockperf", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-sockperf", "--property=LoadState,ActiveState,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
+        ("service-iperf3", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-iperf3", "--property=LoadState,ActiveState,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
+        ("socket-sockperf", connection.vm_b, ["ss", "-H", "-lunp"], connection.timeouts.server_seconds),
+        ("socket-iperf3", connection.vm_b, ["ss", "-H", "-ltnp"], connection.timeouts.server_seconds),
+        ("guest-acl", connection.vm_b, ["sudo", "nft", "list", "chain", "inet", "cnb_f02r", chain], connection.timeouts.server_seconds),
+    ]
+    for name, vm, argv, ceiling in checks:
+        last = None
+        for attempt in range(1, config.attempt_ceiling + 1):
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                break
             attempts += 1
-            result = runner.run(_request(name, vm, argv, timeout))
-            actions.append(RemoteActionEvidence(action_id=name, action_type="ssh", vm_id=vm.host, role=vm.role, result=result))
-            expected_output = config.success_output
-            if expected_output is None:
-                expected_output = config.private_path_success_output if name == "private-path" else config.server_success_output if name == "server-health" else None
-            healthy = expected_output is None or result.stdout.strip() == expected_output
-            if result.outcome == CommandOutcome.SUCCEEDED and (name not in {"private-path", "server-health"} or healthy):
+            request = _request(f"f02r-ready-{name}-{attempt}", vm, argv, min(ceiling, remaining))
+            result = runner.run(request)
+            actions.append(_action(request.action_id, "ssh", vm, request, result))
+            healthy = result.outcome == CommandOutcome.SUCCEEDED and _predicate(name, result.stdout, connection, prepared)
+            last = {"predicate": name, "outcome": str(result.outcome), "healthy": healthy,
+                    "observation": result.stdout, "remaining_seconds": deadline.remaining(clock, readiness=True)}
+            observations.append(last)
+            if healthy:
                 break
-            if time.monotonic() >= deadline:
+            if result.outcome == CommandOutcome.INTERRUPTED:
+                failure = AccessFailureEvidence(stage="readiness", vm_id=vm.host, role=str(vm.role), category="readiness_interrupted",
+                    message=f"readiness predicate {name} was interrupted", action_id=request.action_id,
+                    occurred_at=result.finished_at, details={"last_observation": last})
+                return ReadinessResult(ready=False, attempts=attempts, actions=actions, observations=observations,
+                    deadline=deadline, elapsed_seconds=max(0, clock()-start),
+                    remaining_seconds=deadline.remaining(clock, readiness=True), failure=failure)
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0 or attempt == config.attempt_ceiling:
                 break
-        if result is None:
-            raise RuntimeError("readiness runner returned no result")
-        expected_output = config.success_output
-        if expected_output is None:
-            expected_output = config.private_path_success_output if name == "private-path" else config.server_success_output if name == "server-health" else None
-        healthy = expected_output is None or result.stdout.strip() == expected_output
-        if result.outcome != CommandOutcome.SUCCEEDED or (name in {"private-path", "server-health"} and not healthy):
-            category = "readiness_timeout" if result.outcome == CommandOutcome.TIMED_OUT else ("private_path_failed" if name == "private-path" else "server_not_ready" if name == "server-health" else "ssh_failed")
-            failure = _failure("readiness", vm, category, result, f"{name} readiness failed")
-            failure = failure.model_copy(update={"details": {**failure.details, "attempts": attempts, "deadline_seconds": timeout, "elapsed_seconds": max(0.0, timeout - max(0.0, deadline - time.monotonic()))}})
-            return ReadinessResult(ready=False, attempts=attempts, actions=actions, failure=failure)
-    return ReadinessResult(ready=True, attempts=attempts, actions=actions)
+            wait = min(config.poll_interval_seconds, remaining)
+            clock_wait = getattr(clock, "wait", None)
+            if clock_wait is not None:
+                clock_wait(wait)
+            else:
+                time.sleep(wait)
+        if last is None or not last["healthy"]:
+            now_remaining = deadline.remaining(clock, readiness=True)
+            category = "readiness_deadline_exhausted" if now_remaining <= 0 else "readiness_predicate_failed"
+            failure = AccessFailureEvidence(stage="readiness", vm_id=vm.host, role=str(vm.role), category=category,
+                message=f"readiness predicate {name} was not observed", action_id=actions[-1].action_id if actions else None,
+                occurred_at=datetime.now(timezone.utc), details={"last_observation": last or {}, "elapsed_seconds": max(0, clock()-start), "remaining_seconds": now_remaining})
+            return ReadinessResult(ready=False, attempts=attempts, actions=actions, observations=observations,
+                deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=now_remaining, failure=failure)
+    return ReadinessResult(ready=True, attempts=attempts, actions=actions, observations=observations,
+        deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=deadline.remaining(clock, readiness=True))
