@@ -1991,6 +1991,27 @@
     },
     "PhaseConfiguration": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "probe_chunk"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "measured_seconds": {
+                "maximum": 300
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "kind": {
           "enum": [
@@ -2309,6 +2330,2385 @@
     },
     "ResolvedObservation": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "acceptance"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "benchmark": {
+                "properties": {
+                  "measured_seconds": {
+                    "const": 10
+                  },
+                  "pause_seconds": {
+                    "const": 10
+                  },
+                  "probe_chunk_seconds": {
+                    "type": "null"
+                  }
+                }
+              },
+              "measurement_units": {
+                "items": false,
+                "maxItems": 3,
+                "minItems": 3,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 10
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "idle_latency"
+                      },
+                      "streams": {
+                        "type": "null"
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "idle_latency"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 10
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "single_flow"
+                      },
+                      "streams": {
+                        "const": 1
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "single_flow"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 10
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "enum": [
+                              2,
+                              4,
+                              8
+                            ]
+                          }
+                        ]
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "multi_flow"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "same_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P0"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "cross_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P2"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "placement_optimization"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P1"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "inter_region"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P3"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "properties": {
+                              "state": {
+                                "const": "pending"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "not": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 2
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 4
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "acceptance"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 8
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 8
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "short_study"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "benchmark": {
+                "properties": {
+                  "measured_seconds": {
+                    "const": 60
+                  },
+                  "pause_seconds": {
+                    "const": 10
+                  },
+                  "probe_chunk_seconds": {
+                    "type": "null"
+                  }
+                }
+              },
+              "measurement_units": {
+                "items": false,
+                "maxItems": 3,
+                "minItems": 3,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "idle_latency"
+                      },
+                      "streams": {
+                        "type": "null"
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "idle_latency"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "single_flow"
+                      },
+                      "streams": {
+                        "const": 1
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "single_flow"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "phase"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "enum": [
+                              2,
+                              4,
+                              8
+                            ]
+                          }
+                        ]
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "multi_flow"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "same_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P0"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "cross_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P2"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "placement_optimization"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P1"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "inter_region"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  },
+                  "priority": {
+                    "const": "P3"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "properties": {
+                              "state": {
+                                "const": "pending"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "not": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": null
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 2
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 4
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "short_study"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 8
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {},
+                  {},
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 8
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "calibration"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "benchmark": {
+                "properties": {
+                  "measured_seconds": {
+                    "const": 60
+                  },
+                  "pause_seconds": {
+                    "const": 10
+                  },
+                  "probe_chunk_seconds": {
+                    "type": "null"
+                  }
+                }
+              },
+              "measurement_units": {
+                "items": false,
+                "maxItems": 12,
+                "minItems": 12,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 1
+                      },
+                      "trial_index": {
+                        "const": 1
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-01"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 4
+                      },
+                      "trial_index": {
+                        "const": 2
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-02"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 2
+                      },
+                      "trial_index": {
+                        "const": 3
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-03"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 8
+                      },
+                      "trial_index": {
+                        "const": 4
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-04"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 8
+                      },
+                      "trial_index": {
+                        "const": 5
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-05"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 2
+                      },
+                      "trial_index": {
+                        "const": 6
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-06"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 4
+                      },
+                      "trial_index": {
+                        "const": 7
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-07"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 1
+                      },
+                      "trial_index": {
+                        "const": 8
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-08"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 2
+                      },
+                      "trial_index": {
+                        "const": 9
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-09"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 8
+                      },
+                      "trial_index": {
+                        "const": 10
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-10"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 1
+                      },
+                      "trial_index": {
+                        "const": 11
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-11"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "calibration_trial"
+                      },
+                      "measured_seconds": {
+                        "const": 60
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "const": 4
+                      },
+                      "trial_index": {
+                        "const": 12
+                      },
+                      "unit_id": {
+                        "const": "calibration-trial-12"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams",
+                      "trial_index"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "calibration"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "same_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1800
+                  },
+                  "priority": {
+                    "const": "P0"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "calibration"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "cross_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1800
+                  },
+                  "priority": {
+                    "const": "P2"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "calibration"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "placement_optimization"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1800
+                  },
+                  "priority": {
+                    "const": "P1"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "calibration"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "inter_region"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1800
+                  },
+                  "priority": {
+                    "const": "P3"
+                  },
+                  "requires_common_n": {
+                    "const": false
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "diagnostic_day"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "benchmark": {
+                "properties": {
+                  "measured_seconds": {
+                    "const": 86400
+                  },
+                  "pause_seconds": {
+                    "const": 0
+                  },
+                  "probe_chunk_seconds": {
+                    "const": 300
+                  }
+                }
+              },
+              "measurement_units": {
+                "items": {
+                  "properties": {
+                    "kind": {
+                      "const": "probe_chunk"
+                    },
+                    "measured_seconds": {
+                      "maximum": 300,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "parent_unit_id": {
+                      "const": "diagnostic-day"
+                    },
+                    "phase": {
+                      "const": "multi_flow"
+                    },
+                    "streams": {
+                      "type": "null"
+                    },
+                    "trial_index": {
+                      "type": "null"
+                    },
+                    "unit_id": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "unit_id",
+                    "kind",
+                    "phase",
+                    "measured_seconds",
+                    "parent_unit_id"
+                  ],
+                  "type": "object"
+                },
+                "minItems": 1,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "continuous_day"
+                      },
+                      "measured_seconds": {
+                        "const": 86400
+                      },
+                      "parent_unit_id": {
+                        "type": "null"
+                      },
+                      "phase": {
+                        "const": "multi_flow"
+                      },
+                      "streams": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "enum": [
+                              2,
+                              4,
+                              8
+                            ]
+                          }
+                        ]
+                      },
+                      "trial_index": {
+                        "type": "null"
+                      },
+                      "unit_id": {
+                        "const": "diagnostic-day"
+                      }
+                    },
+                    "required": [
+                      "unit_id",
+                      "kind",
+                      "phase",
+                      "measured_seconds",
+                      "streams"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "same_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 87600
+                  },
+                  "priority": {
+                    "const": "P0"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "cross_zone"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 87600
+                  },
+                  "priority": {
+                    "const": "P2"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "placement_optimization"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 87600
+                  },
+                  "priority": {
+                    "const": "P1"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": false
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "scenario": {
+                    "const": "inter_region"
+                  }
+                },
+                "required": [
+                  "scenario"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 87600
+                  },
+                  "priority": {
+                    "const": "P3"
+                  },
+                  "requires_common_n": {
+                    "const": true
+                  },
+                  "requires_expiry": {
+                    "const": true
+                  },
+                  "requires_primary_review": {
+                    "const": true
+                  },
+                  "requires_schedule": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "properties": {
+                              "state": {
+                                "const": "pending"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "benchmark": {
+                        "properties": {
+                          "common_n": {
+                            "not": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": null
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 2
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 4
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": {
+                  "mode": {
+                    "const": "diagnostic_day"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              },
+              {
+                "properties": {
+                  "benchmark": {
+                    "properties": {
+                      "common_n": {
+                        "properties": {
+                          "common_n": {
+                            "const": 8
+                          },
+                          "state": {
+                            "const": "frozen"
+                          }
+                        },
+                        "required": [
+                          "state",
+                          "common_n"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "measurement_units": {
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "streams": {
+                        "const": 8
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "admission": {
           "$ref": "#/$defs/AdmissionRequirements"

@@ -1567,6 +1567,27 @@
     },
     "PhaseConfiguration": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "probe_chunk"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "measured_seconds": {
+                "maximum": 300
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "kind": {
           "enum": [

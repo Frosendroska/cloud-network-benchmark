@@ -197,7 +197,18 @@ class PhaseConfiguration(StrictModel):
             raise ValueError("probe_chunk requires a parent unit")
         if self.kind == "probe_chunk" and (self.phase != BenchmarkPhase.MULTI_FLOW or self.parent_unit_id == self.unit_id):
             raise ValueError("probe_chunk must reference a distinct retained multi_flow parent unit")
+        if self.kind == "probe_chunk" and self.measured_seconds > 300:
+            raise ValueError("planned probe chunks must not exceed 300 seconds")
         return self
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        schema = handler(core_schema)
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"kind": {"const": "probe_chunk"}}, "required": ["kind"]},
+            "then": {"properties": {"measured_seconds": {"maximum": 300}}},
+        })
+        return schema
 
 
 class BenchmarkPlan(StrictModel):
@@ -495,14 +506,22 @@ class ResolvedObservation(StrictModel):
             raise ValueError("placement must match provider_config placement")
         if self.vm_a != vm_intent(VmRole.VM_A, self.provider_config) or self.vm_b != vm_intent(VmRole.VM_B, self.provider_config):
             raise ValueError("VM intent must match provider configuration")
-        if self.scheduled_start is not None and (self.scheduled_start.tzinfo is None or self.scheduled_start.utcoffset() is None):
-            raise ValueError("scheduled_start must include a timezone")
+        _validate_resolved_protocol(
+            config_id=self.config_id, experiment_id=self.experiment_id, mode=self.mode, context=self.context,
+            replacement_context=self.replacement_context, provider_set=[self.provider], scenario=self.scenario,
+            scheduled_start=self.scheduled_start, schedule_entry=self.schedule_entry.value,
+            benchmark=self.benchmark, measurement_units=self.measurement_units, admission=self.admission,
+        )
         expected_layout = ArtifactLayout.for_mode(self.mode, self.measurement_units)
         if self.artifact_layout.mode is None:
             object.__setattr__(self, "artifact_layout", expected_layout)
         elif self.artifact_layout != expected_layout:
             raise ValueError("artifact_layout must be derived from observation mode and units")
         return self
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        return _resolved_protocol_schema(handler(core_schema))
 
 
 class ResolvedCampaign(StrictModel):
@@ -528,21 +547,32 @@ class ResolvedCampaign(StrictModel):
 
     @model_validator(mode="after")
     def observations_match_campaign(self) -> "ResolvedCampaign":
-        if (self.context == "replacement") != (self.replacement_context is not None):
-            raise ValueError("replacement context metadata must match context")
         providers = [Provider(provider) for provider in self.selected_providers]
         if not providers or len(providers) != len(set(providers)):
             raise ValueError("selected_providers must be non-empty and unique")
+        _validate_resolved_protocol(
+            config_id=self.config_id, experiment_id=self.experiment_id, mode=self.mode, context=self.context,
+            replacement_context=self.replacement_context, provider_set=providers, scenario=self.scenario,
+            scheduled_start=self.scheduled_start, schedule_entry=self.schedule_entry.value,
+            benchmark=self.benchmark, measurement_units=self.measurement_units, admission=self.admission,
+            launch_blockers=self.launch_blockers,
+        )
+        if self.context == "standard" and set(providers) != {Provider.AWS, Provider.AZURE, Provider.GCP}:
+            raise ValueError("standard resolved campaigns require AWS, Azure, and GCP")
         observation_providers = [Provider(item.provider) for item in self.observations]
         if len(observation_providers) != len(set(observation_providers)) or set(observation_providers) != set(providers):
             raise ValueError("observations must match selected_providers exactly once")
         for item in self.observations:
-            if (item.config_id, item.experiment_id, item.mode, item.context, item.scenario, item.scheduled_start,
-                item.measurement_units, item.admission, item.benchmark, item.options) != (
-                self.config_id, self.experiment_id, self.mode, self.context, self.scenario, self.scheduled_start,
-                self.measurement_units, self.admission, self.benchmark, self.options):
+            if (item.config_id, item.experiment_id, item.mode, item.context, item.replacement_context, item.scenario, item.scheduled_start,
+                item.schedule_entry, item.measurement_units, item.admission, item.benchmark, item.options) != (
+                self.config_id, self.experiment_id, self.mode, self.context, self.replacement_context, self.scenario, self.scheduled_start,
+                self.schedule_entry, self.measurement_units, self.admission, self.benchmark, self.options):
                 raise ValueError("observation shared intent must match campaign")
         return self
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        return _resolved_protocol_schema(handler(core_schema))
 
 
 def derive_measurement_units(mode: ExperimentMode, benchmark: BenchmarkPlan) -> list[PhaseConfiguration]:
@@ -564,6 +594,173 @@ def derive_measurement_units(mode: ExperimentMode, benchmark: BenchmarkPlan) -> 
     return [PhaseConfiguration(unit_id="diagnostic-day", kind="continuous_day",
                                phase=BenchmarkPhase.MULTI_FLOW, measured_seconds=benchmark.measured_seconds,
                                streams=benchmark.common_n.common_n)]
+
+
+def _validate_resolved_protocol(
+    *, config_id: str, experiment_id: str, mode: ExperimentMode, context: str,
+    replacement_context: Optional[ReplacementContext], provider_set: list[Provider], scenario: Scenario,
+    scheduled_start: Optional[datetime], schedule_entry: Optional[ScheduleEntry], benchmark: BenchmarkPlan,
+    measurement_units: list[PhaseConfiguration], admission: AdmissionRequirements,
+    launch_blockers: Optional[list[str]] = None,
+) -> None:
+    normalized_mode = ExperimentMode(mode)
+    normalized_context = str(getattr(context, "value", context))
+    benchmark.validate_mode(normalized_mode)
+    if measurement_units != derive_measurement_units(normalized_mode, benchmark):
+        raise ValueError("resolved measurement units must be derived from benchmark mode and N state")
+    for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario).items():
+        if getattr(admission, name) != expected:
+            raise ValueError(f"resolved identity admission.{name} must match mode and scenario")
+    if (normalized_context == "replacement") != (replacement_context is not None):
+        raise ValueError("replacement context metadata must match context")
+    if normalized_context == "replacement":
+        if normalized_mode != ExperimentMode.SHORT_STUDY:
+            raise ValueError("replacement context requires short_study mode")
+        replaced_provider = replacement_context.replaces_run_id.rsplit("-", 1)[-1]
+        if replaced_provider not in {provider.value for provider in Provider}:
+            raise ValueError("replacement run identity must name a provider")
+        if len(provider_set) > 1 and not any(replacement_context.replaces_run_id.endswith(f"-{Provider(provider).value}") for provider in provider_set):
+            raise ValueError("replacement provider must be selected by the resolved campaign")
+    if normalized_context == "failure_check" and normalized_mode != ExperimentMode.ACCEPTANCE:
+        raise ValueError("failure_check context is reserved for acceptance mode")
+    if scheduled_start is not None and (scheduled_start.tzinfo is None or scheduled_start.utcoffset() is None):
+        raise ValueError("resolved scheduled_start must include a timezone")
+    if schedule_entry is not None:
+        if schedule_entry.config_id != config_id or schedule_entry.experiment_id != experiment_id:
+            raise ValueError("schedule entry identity must match resolved config")
+        if schedule_entry.scheduled_start != scheduled_start:
+            raise ValueError("schedule entry time must match resolved scheduled_start")
+        if schedule_entry.priority != admission.priority:
+            raise ValueError("schedule priority must match resolved admission")
+        expected_replacement = replacement_context.replaces_run_id if replacement_context else None
+        if schedule_entry.replaces_run_id != expected_replacement:
+            raise ValueError("schedule replacement link must match resolved context")
+    if launch_blockers is not None:
+        expected_blockers = ["admission_not_evaluated"]
+        if scheduled_start is None or (admission.requires_schedule and schedule_entry is None):
+            expected_blockers.append("schedule_pending")
+        if benchmark.common_n.state == "pending" and normalized_mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.DIAGNOSTIC_DAY}:
+            expected_blockers.append("calibration_pending")
+        if launch_blockers != expected_blockers:
+            raise ValueError("resolved launch blockers must preserve pending admission, schedule and calibration state")
+
+
+def _unit_json_schema(
+    unit_id: str, kind: str, phase: str, duration: int, *,
+    streams: object = None, trial_index: Optional[int] = None, parent_unit_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {
+        "unit_id": {"const": unit_id}, "kind": {"const": kind}, "phase": {"const": phase},
+        "measured_seconds": {"const": duration},
+    }
+    required = ["unit_id", "kind", "phase", "measured_seconds"]
+    if streams is None:
+        properties["streams"] = {"type": "null"}
+    else:
+        properties["streams"] = streams if isinstance(streams, dict) else {"const": streams}
+        required.append("streams")
+    if trial_index is None:
+        properties["trial_index"] = {"type": "null"}
+    else:
+        properties["trial_index"] = {"const": trial_index}
+        required.append("trial_index")
+    if parent_unit_id is None:
+        properties["parent_unit_id"] = {"type": "null"}
+    else:
+        properties["parent_unit_id"] = {"const": parent_unit_id}
+        required.append("parent_unit_id")
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    mode_values = {
+        "acceptance": (10, 10, None), "short_study": (60, 10, None),
+        "calibration": (60, 10, None), "diagnostic_day": (86400, 0, 300),
+    }
+    schema_constraints: list[Dict[str, Any]] = []
+    for mode, (duration, pause, chunk_seconds) in mode_values.items():
+        if mode in {"acceptance", "short_study"}:
+            n_streams: object = {"anyOf": [{"type": "null"}, {"enum": [2, 4, 8]}]}
+            units = [
+                _unit_json_schema("idle_latency", "phase", "idle_latency", duration),
+                _unit_json_schema("single_flow", "phase", "single_flow", duration, streams=1),
+                _unit_json_schema("multi_flow", "phase", "multi_flow", duration, streams=n_streams),
+            ]
+            unit_array: Dict[str, Any] = {"minItems": 3, "maxItems": 3, "prefixItems": units, "items": False}
+            n_index = 2
+        elif mode == "calibration":
+            streams_order = (1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4)
+            units = [_unit_json_schema(f"calibration-trial-{index:02d}", "calibration_trial", "multi_flow", duration,
+                                       streams=streams, trial_index=index)
+                     for index, streams in enumerate(streams_order, 1)]
+            unit_array = {"minItems": 12, "maxItems": 12, "prefixItems": units, "items": False}
+            n_index = -1
+        else:
+            streams_schema = {"anyOf": [{"type": "null"}, {"enum": [2, 4, 8]}]}
+            units = [_unit_json_schema("diagnostic-day", "continuous_day", "multi_flow", duration, streams=streams_schema)]
+            chunk = {
+                "type": "object", "required": ["unit_id", "kind", "phase", "measured_seconds", "parent_unit_id"],
+                "properties": {"unit_id": {"type": "string", "minLength": 1}, "kind": {"const": "probe_chunk"},
+                               "phase": {"const": "multi_flow"}, "measured_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+                               "parent_unit_id": {"const": "diagnostic-day"}, "streams": {"type": "null"}, "trial_index": {"type": "null"}},
+            }
+            unit_array = {"minItems": 1, "prefixItems": units, "items": chunk}
+            n_index = 0
+        mode_condition = {
+            "if": {"properties": {"mode": {"const": mode}}, "required": ["mode"]},
+            "then": {"properties": {
+                "benchmark": {"properties": {
+                    "measured_seconds": {"const": duration}, "pause_seconds": {"const": pause},
+                    "probe_chunk_seconds": {"type": "null"} if chunk_seconds is None else {"const": chunk_seconds},
+                }},
+                "measurement_units": unit_array,
+            }},
+        }
+        schema_constraints.append(mode_condition)
+        for scenario, priority in (("same_zone", "P0"), ("cross_zone", "P2"),
+                                  ("placement_optimization", "P1"), ("inter_region", "P3")):
+            scheduled = mode in {"short_study", "calibration", "diagnostic_day"}
+            admission_values = {
+                "priority": priority,
+                "lifetime_cap_seconds": 1200 if mode in {"acceptance", "short_study"} else 1800 if mode == "calibration" else 87600,
+                "requires_common_n": mode in {"short_study", "diagnostic_day"},
+                "requires_schedule": scheduled,
+                "requires_primary_review": scheduled and priority in {"P2", "P3"},
+                "requires_expiry": True,
+            }
+            schema_constraints.append({
+                "if": {"allOf": [mode_condition["if"], {"properties": {"scenario": {"const": scenario}}, "required": ["scenario"]}]},
+                "then": {"properties": {"admission": {"properties": {
+                    key: {"const": value} for key, value in admission_values.items()
+                }}}},
+            })
+        if n_index >= 0:
+            stream_value_index = n_index
+            # Runtime defaults an omitted CommonNState.state to pending.
+            pending_or_omitted = {"anyOf": [
+                {"properties": {"benchmark": {"properties": {"common_n": {"properties": {"state": {"const": "pending"}}, "required": ["state"]}}}}},
+                {"properties": {"benchmark": {"properties": {"common_n": {"not": {"required": ["state"]}}}}}},
+            ]}
+            pending_stream = 4 if mode == "acceptance" else None
+            pending_constraint = {
+                "if": {"allOf": [mode_condition["if"], pending_or_omitted]},
+                "then": {"properties": {"measurement_units": {"prefixItems": [
+                    {} for _ in range(stream_value_index)
+                ] + [{"properties": {"streams": {"const": pending_stream}}}]}}},
+            }
+            schema_constraints.append(pending_constraint)
+            for common_n in (2, 4, 8):
+                stream_constraint = {
+                    "if": {"allOf": [mode_condition["if"], {"properties": {"benchmark": {"properties": {
+                        "common_n": {"properties": {"state": {"const": "frozen"}, "common_n": {"const": common_n}},
+                                      "required": ["state", "common_n"]}}}}}]},
+                    "then": {"properties": {"measurement_units": {"prefixItems": [
+                        {} for _ in range(stream_value_index)
+                    ] + [{"properties": {"streams": {"const": common_n}}}]}}},
+                }
+                schema_constraints.append(stream_constraint)
+    schema.setdefault("allOf", []).extend(schema_constraints)
+    return schema
 
 
 def vm_intent(role: VmRole, config: ProviderConfiguration) -> VmIntent:
