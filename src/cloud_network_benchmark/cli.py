@@ -47,10 +47,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.command == "validate":
                 payload = {
                     "valid": True,
+                    "mode": resolved.mode,
+                    "context": resolved.context,
+                    "launch_blockers": resolved.launch_blockers,
                     "experiment_id": resolved.experiment_id,
                     "configuration_role": resolved.configuration_role,
                     "scenario": resolved.scenario,
-                    "scheduled_start": resolved.scheduled_start.isoformat(),
+                    "scheduled_start": resolved.scheduled_start.isoformat() if resolved.scheduled_start else None,
                     "providers": resolved.selected_providers,
                     "source_sha256": resolved.config_source.sha256,
                     "child_count": len(resolved.observations),
@@ -60,9 +63,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else:
                     print(
                         f"Valid {payload['configuration_role']} campaign {payload['experiment_id']} "
-                        f"for {payload['scenario']} at {payload['scheduled_start']}"
+                        f"for {payload['scenario']} at {payload['scheduled_start'] or 'pending'}"
                     )
                     print(f"Providers ({payload['child_count']}): {', '.join(payload['providers'])}")
+                    print(f"Mode/context: {payload['mode']} / {payload['context']}")
+                    print(f"Launch blockers: {', '.join(payload['launch_blockers']) or 'none'}")
                     print(f"Source SHA-256: {payload['source_sha256']}")
             else:
                 print(_json(resolved) if args.format == "json" else f"Resolved {resolved.experiment_id} into {len(resolved.observations)} provider observation(s)")

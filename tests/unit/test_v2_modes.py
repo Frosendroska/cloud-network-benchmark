@@ -9,7 +9,7 @@ import yaml
 
 from cloud_network_benchmark.config import load_campaign, resolve_campaign
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
-from cloud_network_benchmark.contracts.campaign import CampaignConfiguration, CommonNState
+from cloud_network_benchmark.contracts.campaign import CampaignConfiguration, CommonNState, derive_measurement_units
 from cloud_network_benchmark.contracts.common import Evidence
 from cloud_network_benchmark.errors import ValidationError
 
@@ -57,6 +57,14 @@ def test_mode_unit_resolution_matches_fixed_protocol(repository_root: Path) -> N
     assert study.measurement_units[0].streams is None
     acceptance, _ = resolve_campaign(repository_root / "configs/tests/exp-903-three-provider-smoke.yaml", repository_root)
     assert [unit.streams for unit in acceptance.measurement_units] == [None, 1, 4]
+    assert acceptance.benchmark.common_n.state == "pending"
+    frozen_benchmark = acceptance.benchmark.model_copy(update={
+        "common_n": CommonNState(
+            state="frozen", common_n=8, source_campaign_id="exp_001_s1",
+            source_sha256="a" * 64, plateau_found=True,
+        )
+    })
+    assert [unit.streams for unit in derive_measurement_units(acceptance.mode, frozen_benchmark)] == [None, 1, 8]
 
 
 def test_all_provider_scenario_intent_is_explicit(repository_root: Path) -> None:

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -8,8 +9,9 @@ import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
 from cloud_network_benchmark.errors import CollisionError, PersistenceError, ValidationError
-from cloud_network_benchmark.contracts import FailureEvidence, StringEvidence
+from cloud_network_benchmark.contracts import FailureEvidence, ScheduleEntry, StringEvidence
 from cloud_network_benchmark.manifests import (
+    CampaignManifest,
     RepositoryGitProvenance,
     StaticGitProvenance,
     initialize_campaign,
@@ -72,6 +74,14 @@ def test_initializes_linked_three_provider_evidence(repository_root: Path, tmp_p
     source = (repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_bytes()
     for child in result.children:
         assert (Path(child.result_path) / "config.yaml").read_bytes() == source
+        resolved_bytes = (Path(child.result_path) / "config.resolved.json").read_bytes()
+        record = json.loads(Path(child.manifest_path).read_text())
+        assert record["observation_id"] == f"{child.run_id}-observation"
+        assert record["deployment_id"] == f"{child.run_id}-deployment"
+        assert record["config_provenance"]["sha256"] == hashlib.sha256(source).hexdigest()
+        assert record["config_provenance"]["resolved_snapshot_sha256"]["value"] == hashlib.sha256(resolved_bytes).hexdigest()
+        assert record["config_provenance"]["schedule_sha256"]["value"] is None
+        assert not (Path(child.result_path) / "schedule.csv").exists()
 
 
 @pytest.mark.parametrize(
@@ -217,10 +227,7 @@ def test_failure_injection_preserves_every_assigned_manifest(repository_root: Pa
     parent_paths = [path for path in manifest_paths if path not in child_manifests]
     assert len(parent_paths) == 1
     parent = json.loads(parent_paths[0].read_text())
-    parent_schema = json.loads(
-        (repository_root / "specs/001-core-offline-contracts/contracts/campaign-manifest.schema.json").read_text()
-    )
-    Draft202012Validator(parent_schema, format_checker=FormatChecker()).validate(parent)
+    CampaignManifest.model_validate(parent)
     assert parent["aggregate_state"] == "failed"
     assert {item["run_id"] for item in parent["child_runs"]} == {
         json.loads(path.read_text())["run_id"] for path in child_manifests
@@ -390,3 +397,56 @@ def test_manifest_update_apis_reject_backward_occurrence_times(
         update_child_cleanup(child_path, "attempted", past)
     with pytest.raises(ValueError, match="earlier"):
         recompute_parent_manifest(Path(result.parent_manifest_path), past, "backward")
+
+
+def test_replacement_keeps_observation_id_but_uses_new_attempt_paths(
+    tmp_path: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str]
+) -> None:
+    root = tmp_path / "repo"
+    path = root / "configs/experiments/replacement.yaml"
+    path.parent.mkdir(parents=True)
+    data = yaml.safe_load((Path(__file__).parents[2] / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["context"] = "replacement"
+    data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "earlier-aws"}
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    result = initialize_campaign(path, root, root / "results", frozen_clock, deterministic_token,
+                                 StaticGitProvenance(fake_git_commits["implementation"]),
+                                 StaticGitProvenance(fake_git_commits["design"]))
+    for child in result.children:
+        manifest = json.loads((root / child.manifest_path).read_text())
+        assert manifest["observation_id"] == "stable-observation"
+        assert manifest["replaces_run_id"] == "earlier-aws"
+        assert manifest["run_id"].endswith(f"-{manifest['provider']}")
+        assert manifest["deployment_id"] == f"{manifest['run_id']}-deployment"
+        assert (root / child.result_path).exists()
+
+
+def test_supplied_schedule_row_is_snapshotted_byte_for_byte_with_hashes(
+    tmp_path: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str]
+) -> None:
+    root = tmp_path / "repo"
+    path = root / "configs/tests/campaign.yaml"
+    path.parent.mkdir(parents=True)
+    data = yaml.safe_load((Path(__file__).parents[2] / "configs/tests/exp-900-single-provider.yaml").read_text())
+    data["scheduled_start"] = "2026-09-27T12:00:00Z"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    header = "config_id,experiment_id,scheduled_start"
+    row = "exp_900_aws_validation,EXP-900,2026-09-27T12:00:00Z"
+    entry = ScheduleEntry(
+        entry_id="row-1", config_id="exp_900_aws_validation", experiment_id="EXP-900",
+        scheduled_start="2026-09-27T12:00:00Z", source_path="tracking/run-register.csv",
+        source_sha256="a" * 64, row_sha256=hashlib.sha256(row.encode()).hexdigest(),
+        original_header=header, original_row=row, columns=header.split(","), priority="P0",
+    )
+    result = initialize_campaign(
+        path, root, root / "results", frozen_clock, deterministic_token,
+        StaticGitProvenance(fake_git_commits["implementation"]),
+        StaticGitProvenance(fake_git_commits["design"]), schedule_entry=entry,
+    )
+    child = result.children[0]
+    result_root = root / child.result_path
+    expected = (header + "\n" + row + "\n").encode()
+    assert (result_root / "schedule.csv").read_bytes() == expected
+    manifest = json.loads((root / child.manifest_path).read_text())
+    assert manifest["config_provenance"]["schedule_sha256"]["value"] == hashlib.sha256(expected).hexdigest()
+    assert manifest["schedule_entry"]["value"]["row_sha256"] == entry.row_sha256

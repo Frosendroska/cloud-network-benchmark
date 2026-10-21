@@ -22,6 +22,14 @@ def test_durable_request_excludes_secrets() -> None:
     assert durable["environment_keys"] == ["TOKEN"]
 
 
+def test_durable_request_redacts_secret_argv_and_cwd_values() -> None:
+    secret = CommandRequest(action_id="x", action_type="test", argv=["tool", "--token", "sentinel"],
+                           cwd="/tmp/sentinel", timeout_seconds=1, redactions=["sentinel"])
+    durable = secret.durable_view()
+    assert "sentinel" not in str(durable)
+    assert "[REDACTED]" in str(durable)
+
+
 def test_scripted_runner_records_exact_order() -> None:
     expected = request()
     runner = ScriptedCommandRunner([(expected, result())])

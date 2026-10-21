@@ -9,12 +9,12 @@ from cloud_network_benchmark.manifests import StaticGitProvenance, initialize_ca
 
 
 def test_all_schemas_are_valid_draft_2020_12(repository_root: Path) -> None:
-    for path in (repository_root / "specs/001-core-offline-contracts/contracts").glob("*.schema.json"):
+    for path in (repository_root / "specs/003-v2-shared-contracts/contracts").glob("*.schema.json"):
         Draft202012Validator.check_schema(json.loads(path.read_text()))
 
 
 def test_runtime_serialization_validates_against_published_schemas(repository_root: Path, tmp_path: Path, frozen_clock: object, deterministic_token: object) -> None:
-    contracts = repository_root / "specs/001-core-offline-contracts/contracts"
+    contracts = repository_root / "specs/003-v2-shared-contracts/contracts"
     config_data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider.yaml").read_text())
     serialized = CampaignConfiguration.model_validate(config_data).model_dump(mode="json")
     Draft202012Validator(json.loads((contracts / "campaign-config.schema.json").read_text()), format_checker=FormatChecker()).validate(serialized)

@@ -20,6 +20,16 @@ class CommandEvidence(StrictModel):
     source_identity: StringEvidence
     monotonic_started: Evidence[float]
     monotonic_finished: Evidence[float]
+    started_at: Evidence[datetime] = Field(default_factory=lambda: Evidence[datetime](unavailable_reason="not captured"))
+    finished_at: Evidence[datetime] = Field(default_factory=lambda: Evidence[datetime](unavailable_reason="not captured"))
+
+    @model_validator(mode="after")
+    def durable_only_views(self) -> "CommandEvidence":
+        if "environment" in self.request or "stdin" in self.request or "redactions" in self.request:
+            raise ValueError("command request must use the redacted durable view")
+        if "redactions" in self.result:
+            raise ValueError("command result must use the redacted durable view")
+        return self
 
     @model_validator(mode="after")
     def ordered_monotonic(self) -> "CommandEvidence":
@@ -30,6 +40,13 @@ class CommandEvidence(StrictModel):
             raise ValueError("monotonic finish must be finite and nonnegative")
         if start is not None and finish is not None and finish < start:
             raise ValueError("monotonic finish must not precede start")
+        utc_start, utc_finish = self.started_at.value, self.finished_at.value
+        if utc_start is not None and (utc_start.tzinfo is None or utc_start.utcoffset() is None):
+            raise ValueError("command UTC start must be timezone-aware")
+        if utc_finish is not None and (utc_finish.tzinfo is None or utc_finish.utcoffset() is None):
+            raise ValueError("command UTC finish must be timezone-aware")
+        if utc_start is not None and utc_finish is not None and utc_finish < utc_start:
+            raise ValueError("command UTC finish must not precede start")
         return self
 
 
@@ -106,6 +123,19 @@ class MeasurementTiming(StrictModel):
             raise ValueError("measured finish must be timezone-aware")
         if self.overlap_seconds.value is not None and (self.overlap_seconds.value < 0 or not isfinite(self.overlap_seconds.value)):
             raise ValueError("overlap_seconds must be finite and nonnegative")
+        for name in ("monotonic_started", "monotonic_finished"):
+            value = getattr(self, name).value
+            if value is not None and (not isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        monotonic_start, monotonic_end = self.monotonic_started.value, self.monotonic_finished.value
+        if monotonic_start is not None and monotonic_end is not None and monotonic_end < monotonic_start:
+            raise ValueError("monotonic finish must not precede start")
+        chronology = [self.probe_test_started_at.value, self.tcp_started_at.value, start, end]
+        available = [item for item in chronology if item is not None]
+        if any(item.tzinfo is None or item.utcoffset() is None for item in available):
+            raise ValueError("observed measurement timestamps must include a timezone")
+        if any(current < previous for previous, current in zip(available, available[1:])):
+            raise ValueError("observed measurement chronology is invalid")
         return self
 
 

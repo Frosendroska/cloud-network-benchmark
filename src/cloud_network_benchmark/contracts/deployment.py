@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from ipaddress import IPv4Address
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from .campaign import CampaignOptions, Placement, ResolvedObservation, VmIntent
-from .common import FailureEvidence, Provider, Scenario, StrictModel, StringEvidence, StructuredEvidence, VmRole
+from .common import ExperimentMode, FailureEvidence, IdentityContext, Provider, Scenario, StrictModel, StringEvidence, StructuredEvidence, VmRole
 
 
 class RemoteConnectionData(StrictModel):
@@ -16,7 +16,7 @@ class RemoteConnectionData(StrictModel):
     port: int = Field(default=22, ge=1, le=65535)
     user: str = Field(min_length=1)
     authentication_reference: str = Field(min_length=1)
-    host_key_reference: Optional[str] = None
+    host_key_reference: str = Field(min_length=1)
     readiness_expectations: List[str] = Field(default_factory=list)
     failure: Optional[FailureEvidence] = None
 
@@ -30,12 +30,16 @@ class RemoteConnectionData(StrictModel):
 
 
 class ProviderDeploymentInput(StrictModel):
+    schema_version: Literal[2] = 2
+    identity: IdentityContext
+    mode: ExperimentMode
+    context: Literal["standard", "failure_check", "replacement"]
     campaign_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     provider: Provider
     scenario: Scenario
-    scheduled_start: datetime
+    scheduled_start: Optional[datetime]
     vm_a: VmIntent
     vm_b: VmIntent
     placement: Placement
@@ -71,6 +75,13 @@ class ProviderDeploymentInput(StrictModel):
         return cls(
             campaign_id=campaign_id,
             run_id=run_id,
+            identity=IdentityContext(
+                experiment_id=observation.experiment_id, config_id=observation.config_id,
+                campaign_id=campaign_id, observation_id=f"{run_id}-observation", run_id=run_id,
+                deployment_id=f"{run_id}-deployment", provider=observation.provider,
+            ),
+            mode=observation.mode,
+            context=observation.context,
             experiment_id=observation.experiment_id,
             provider=observation.provider,
             scenario=observation.scenario,
@@ -118,9 +129,9 @@ class ProviderDeploymentInput(StrictModel):
         if (self.placement.kind == "none") != (self.placement.name is None):
             raise ValueError("placement name must be null only when placement is none")
         purchase_values = {
-            Provider.AWS: {"instance_market_type": {"on_demand", "spot"}},
-            Provider.AZURE: {"priority": {"Regular", "Spot"}, "eviction_policy": {"Delete", "Deallocate"}},
-            Provider.GCP: {"provisioning_model": {"STANDARD", "SPOT"}, "instance_termination_action": {"DELETE", "STOP"}},
+            Provider.AWS: {"instance_market_type": {"on_demand"}},
+            Provider.AZURE: {"priority": {"Regular"}, "eviction_policy": {"Delete"}},
+            Provider.GCP: {"provisioning_model": {"STANDARD"}, "instance_termination_action": {"DELETE"}},
         }
         for name, allowed in purchase_values[provider].items():
             if self.provider_options.get(name) not in allowed:
@@ -129,8 +140,10 @@ class ProviderDeploymentInput(StrictModel):
             price = self.provider_options.get("max_price")
             if isinstance(price, bool) or not isinstance(price, (int, float)):
                 raise ValueError("Azure max_price must be numeric")
-        if self.scheduled_start.tzinfo is None or self.scheduled_start.utcoffset() is None:
+        if self.scheduled_start is not None and (self.scheduled_start.tzinfo is None or self.scheduled_start.utcoffset() is None):
             raise ValueError("scheduled_start must include a timezone")
+        if (self.identity.campaign_id, self.identity.run_id, self.identity.provider) != (self.campaign_id, self.run_id, self.provider):
+            raise ValueError("deployment input identity must match campaign, run and provider")
         region_equal = self.vm_a.region == self.vm_b.region
         zone_equal = self.vm_a.zone == self.vm_b.zone
         if self.scenario == Scenario.SAME_ZONE and not (region_equal and zone_equal and self.placement.kind == "none"):
@@ -188,17 +201,21 @@ class ProviderVmOutput(StrictModel):
 
 
 class ProviderDeploymentOutput(StrictModel):
+    schema_version: Literal[2] = 2
+    identity: IdentityContext
     run_id: str = Field(min_length=1)
+    deployment_id: str = Field(min_length=1)
+    mode: ExperimentMode
     provider: Provider
-    scenario: Optional[Scenario] = None
-    apply_action_id: str
+    scenario: Scenario
+    apply_action_id: str = Field(min_length=1)
     started_at: datetime
     finished_at: datetime
     vm_a: ProviderVmOutput
     vm_b: ProviderVmOutput
     provider_metadata: StructuredEvidence
     documented_network_limit: StructuredEvidence
-    output_artifact_path: str = "terraform-outputs.json"
+    output_artifact_path: str = "terraform-outputs.redacted.json"
 
     @model_validator(mode="after")
     def roles_and_time(self) -> "ProviderDeploymentOutput":
@@ -210,6 +227,10 @@ class ProviderDeploymentOutput(StrictModel):
             raise ValueError("deployment output requires VM A and VM B")
         if self.run_id.rsplit("-", 1)[-1] != Provider(self.provider).value:
             raise ValueError("run_id provider suffix must match deployment provider")
-        if self.output_artifact_path != "terraform-outputs.json":
-            raise ValueError("output_artifact_path must be terraform-outputs.json")
+        if self.output_artifact_path != "terraform-outputs.redacted.json":
+            raise ValueError("output_artifact_path must be terraform-outputs.redacted.json")
+        if self.deployment_id != f"{self.run_id}-deployment":
+            raise ValueError("deployment_id must identify this provider attempt")
+        if self.identity.run_id != self.run_id or self.identity.deployment_id != self.deployment_id:
+            raise ValueError("deployment output identity must match run and deployment IDs")
         return self

@@ -15,6 +15,8 @@ class DryRunChild(StrictModel):
     provider: str
     scenario: str
     candidate_run_id: str
+    candidate_observation_id: str
+    candidate_deployment_id: str
     manifest_path: str
     result_path: str
     vm_a: Dict[str, Any]
@@ -30,11 +32,15 @@ class DryRunChild(StrictModel):
 
 
 class DryRunReport(StrictModel):
+    mode: str
+    context: str
     experiment_id: str
     configuration_role: str
     config_sha256: str
     config_source: str
-    scheduled_start: str
+    scheduled_start: str | None
+    measurement_units: List[Dict[str, Any]]
+    launch_blockers: List[str]
     scenario: str
     selected_providers: List[str]
     campaign_options: Dict[str, Any]
@@ -46,15 +52,17 @@ class DryRunReport(StrictModel):
 
 def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
     children = []
-    layout = ArtifactLayout()
     for observation in resolved.observations:
         provider = str(observation.provider)
         candidate = f"<campaign-id>-{provider}"
+        layout = observation.artifact_layout
         children.append(
             DryRunChild(
                 provider=provider,
                 scenario=str(observation.scenario),
                 candidate_run_id=candidate,
+                candidate_observation_id=resolved.replacement_context.observation_id if resolved.replacement_context else f"{candidate}-observation",
+                candidate_deployment_id=f"{candidate}-deployment",
                 manifest_path=f"results/manifests/{candidate}.json",
                 result_path=f"results/raw/{candidate}/",
                 vm_a=observation.vm_a.model_dump(mode="json"),
@@ -63,18 +71,25 @@ def build_dry_run(resolved: ResolvedCampaign) -> DryRunReport:
                 placement=observation.placement.model_dump(mode="json"),
                 benchmark=observation.benchmark.model_dump(mode="json"),
                 artifacts=layout.model_dump(),
-                validation_inputs={name: value.model_dump(mode="json") for name, value in artifact_inputs(layout, observation.benchmark.multi_flow.enabled).items()},
+                validation_inputs={name: value.model_dump(mode="json") for name, value in artifact_inputs(
+                    layout, True, mode=resolved.mode,
+                    measurement_units=resolved.measurement_units, schedule_supplied=resolved.schedule_entry.value is not None,
+                ).items()},
                 provider_options=observation.provider_config.provider_options,
                 campaign_options=observation.options.model_dump(mode="json"),
-                external_actions=["terraform", "ssh", "scp", "flent", "validation", "cleanup"],
+                external_actions=["Terraform provisioning", "SSH readiness", "Sockperf latency", "iperf3 throughput", "SCP retrieval", "validation", "provider cleanup"],
             )
         )
     return DryRunReport(
+        mode=str(resolved.mode),
+        context=resolved.context,
         experiment_id=resolved.experiment_id,
         configuration_role=resolved.configuration_role,
         config_sha256=resolved.config_source.sha256,
         config_source=resolved.config_source.source_path,
-        scheduled_start=resolved.scheduled_start.isoformat(),
+        scheduled_start=resolved.scheduled_start.isoformat() if resolved.scheduled_start else None,
+        measurement_units=[item.model_dump(mode="json") for item in resolved.measurement_units],
+        launch_blockers=resolved.launch_blockers,
         scenario=str(resolved.scenario),
         selected_providers=[str(provider) for provider in resolved.selected_providers],
         campaign_options=resolved.options.model_dump(mode="json"),
@@ -89,8 +104,10 @@ def render_json(report: DryRunReport) -> str:
 def render_human(report: DryRunReport) -> str:
     lines = [
         f"Campaign {report.experiment_id} ({report.configuration_role})",
+        f"Mode/context: {report.mode} / {report.context}",
         f"Config: {report.config_source} (sha256 {report.config_sha256})",
-        f"Scheduled start: {report.scheduled_start}",
+        f"Scheduled start: {report.scheduled_start or 'pending'}",
+        f"Measurement units: {len(report.measurement_units)}; blockers: {', '.join(report.launch_blockers) or 'none'}",
         f"Scenario: {report.scenario}",
         f"Providers: {', '.join(report.selected_providers)}",
         f"Candidate campaign ID: {report.candidate_campaign_id}",
@@ -106,13 +123,15 @@ def render_human(report: DryRunReport) -> str:
             f"  Images: VM A {child.vm_a['image']}; VM B {child.vm_b['image']}",
             f"  Direction: {child.measurement_direction}",
             f"  Placement: {child.placement['kind']}",
+            "  Benchmark order: " + ", ".join(dict.fromkeys(unit["phase"] for unit in report.measurement_units)),
             f"  Provider options: {json.dumps(child.provider_options, sort_keys=True)}",
             f"  Campaign options: {json.dumps(child.campaign_options, sort_keys=True)}",
-            f"  Benchmark order: {', '.join(child.benchmark['execution_order'])}",
-            "  Benchmark phases: " + "; ".join(
-                f"{name} enabled={phase['enabled']} test={phase['test_name']} duration={phase['duration_seconds']}s timeout={phase['timeout_seconds']}s parameters={json.dumps(phase['parameters'], sort_keys=True)}"
-                for name, phase in child.benchmark.items() if name != "execution_order"
+            "  Benchmark units: " + ", ".join(
+                f"{unit['unit_id']} ({unit['phase']}, {unit['measured_seconds']}s"
+                f"{', ' + str(unit['streams']) + ' streams' if unit['streams'] is not None else ''})"
+                for unit in report.measurement_units
             ),
+            f"  Benchmark settings: {json.dumps(child.benchmark, sort_keys=True)}",
             f"  Manifest path: {child.manifest_path}",
             f"  Result path: {child.result_path}",
             f"  Artifacts: {', '.join(child.artifacts.values())}",

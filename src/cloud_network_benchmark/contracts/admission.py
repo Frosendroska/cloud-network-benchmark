@@ -119,6 +119,15 @@ class ReservationRequest(StrictModel):
     active_reserved_usd: Evidence[float]
     outstanding_cleanup: bool
 
+    @model_validator(mode="after")
+    def unique_providers_and_costs(self) -> "ReservationRequest":
+        if len(set(self.selected_providers)) != len(self.selected_providers):
+            raise ValueError("selected_providers must be unique")
+        for evidence in (self.estimated_cost_usd, self.incurred_cost_usd, self.active_reserved_usd):
+            if evidence.value is not None and (not isfinite(evidence.value) or evidence.value < 0):
+                raise ValueError("cost evidence must be finite and nonnegative")
+        return self
+
 
 class ReservationEvidence(StrictModel):
     schema_version: Literal[2] = 2
@@ -135,6 +144,8 @@ class ReservationEvidence(StrictModel):
 
     @model_validator(mode="after")
     def reserved_is_complete(self) -> "ReservationEvidence":
+        if self.reserved_cost_usd.value is not None and (not isfinite(self.reserved_cost_usd.value) or self.reserved_cost_usd.value < 0):
+            raise ValueError("reserved cost must be finite and nonnegative")
         if self.state == "reserved":
             if any(item.value is None for item in (self.reservation_id, self.reserved_cost_usd, self.cap_started_at, self.expires_at, self.cap_start_policy_id)):
                 raise ValueError("reserved evidence requires observed reservation, cost, cap times and policy")
@@ -161,6 +172,10 @@ class ExpiryRequest(StrictModel):
         expected = "deallocate" if Provider(self.provider) == Provider.AZURE else "stop"
         if self.action != expected:
             raise ValueError(f"{self.provider} expiry action must be {expected}")
+        if not self.run_id.endswith(f"-{Provider(self.provider).value}"):
+            raise ValueError("run_id provider suffix must match expiry provider")
+        if self.deployment_id != f"{self.run_id}-deployment":
+            raise ValueError("deployment_id must match expiry attempt")
         return self
 
 
@@ -185,6 +200,11 @@ class ExpiryEvidence(StrictModel):
             raise ValueError(f"{self.provider} expiry action must be {expected}")
         if self.state == "registered" and any(item.value is None for item in (self.registration_id, self.registered_at, self.expires_at)):
             raise ValueError("registered expiry requires observed ID and timestamps")
+        for evidence in (self.registered_at, self.expires_at):
+            if evidence.value is not None and (evidence.value.tzinfo is None or evidence.value.utcoffset() is None):
+                raise ValueError("expiry evidence timestamps must include a timezone")
+        if self.registered_at.value is not None and self.expires_at.value is not None and self.expires_at.value <= self.registered_at.value:
+            raise ValueError("expiry must follow registration")
         if self.state == "failed" and self.failure is None:
             raise ValueError("failed expiry requires failure evidence")
         return self

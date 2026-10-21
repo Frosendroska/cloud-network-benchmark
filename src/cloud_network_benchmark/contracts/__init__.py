@@ -73,6 +73,6 @@ from .measurements import (
     TimingGap,
     VmMetadata,
 )
-from .validation import ValidatorInput, artifact_inputs
+from .validation import ValidationFinding, ValidationResult, ValidatorInput, artifact_inputs
 
 __all__ = [name for name in globals() if not name.startswith("_")]

@@ -5,7 +5,7 @@ import pytest
 
 from cloud_network_benchmark.contracts import Provider
 from cloud_network_benchmark.errors import CollisionError
-from cloud_network_benchmark.ids import candidate_campaign_id, candidate_run_id
+from cloud_network_benchmark.ids import candidate_campaign_id, candidate_deployment_id, candidate_observation_id, candidate_run_id
 from cloud_network_benchmark.paths import allocate_paths, preflight, reserve_json
 
 
@@ -13,6 +13,9 @@ def test_deterministic_candidate_ids(frozen_clock: object, deterministic_token: 
     campaign_id = candidate_campaign_id("EXP-001", frozen_clock, deterministic_token)
     assert campaign_id == "20260927T120000Z-exp-001-abc123"
     assert candidate_run_id(campaign_id, Provider.AWS) == f"{campaign_id}-aws"
+    run_id = candidate_run_id(campaign_id, Provider.AWS)
+    assert candidate_observation_id(run_id) == f"{run_id}-observation"
+    assert candidate_deployment_id(run_id) == f"{run_id}-deployment"
 
 
 def test_manifest_reservation_is_exclusive(results_root: Path) -> None:

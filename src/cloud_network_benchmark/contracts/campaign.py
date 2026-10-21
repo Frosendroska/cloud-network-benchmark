@@ -454,6 +454,7 @@ class ResolvedCampaign(StrictModel):
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     mode: ExperimentMode
     context: Literal["standard", "failure_check", "replacement"]
+    replacement_context: Optional[ReplacementContext] = None
     configuration_role: Literal["experiment", "test"]
     config_source: ConfigProvenance
     resolved_sha256: str = Field(pattern=SHA256_PATTERN)
@@ -470,6 +471,8 @@ class ResolvedCampaign(StrictModel):
 
     @model_validator(mode="after")
     def observations_match_campaign(self) -> "ResolvedCampaign":
+        if (self.context == "replacement") != (self.replacement_context is not None):
+            raise ValueError("replacement context metadata must match context")
         providers = [Provider(provider) for provider in self.selected_providers]
         if not providers or len(providers) != len(set(providers)):
             raise ValueError("selected_providers must be non-empty and unique")

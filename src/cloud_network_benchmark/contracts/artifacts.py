@@ -122,11 +122,27 @@ class ArtifactLayout(StrictModel):
             "iperf3": f"{root}/iperf3.json",
         }
 
-    def for_mode(self, mode: str, measurement_units: list[object]) -> list[ArtifactInput]:
+    def for_mode(self, mode: str, measurement_units: list[object], *, schedule_supplied: bool = False) -> list[ArtifactInput]:
         from .common import ExperimentMode
 
         mode = ExperimentMode(mode)
         declarations: list[ArtifactInput] = []
+        global_paths = {
+            "config_snapshot": (self.config_snapshot, "configuration", ArtifactExpectation.REQUIRED),
+            "resolved_snapshot": (self.resolved_snapshot, "resolved_configuration", ArtifactExpectation.REQUIRED),
+            "schedule_snapshot": (self.schedule_snapshot, "schedule_row", ArtifactExpectation.REQUIRED if schedule_supplied else ArtifactExpectation.NOT_EXPECTED),
+            "provider_outputs": (self.provider_outputs, "provider_outputs", ArtifactExpectation.OPTIONAL),
+            "checksums": (self.checksums, "checksums", ArtifactExpectation.OPTIONAL),
+            "vm_a_metadata": (self.vm_a_metadata, "vm_metadata", ArtifactExpectation.OPTIONAL),
+            "vm_b_metadata": (self.vm_b_metadata, "vm_metadata", ArtifactExpectation.OPTIONAL),
+            "vm_a_diagnostics": (self.vm_a_diagnostics, "diagnostics", ArtifactExpectation.OPTIONAL),
+            "vm_b_diagnostics": (self.vm_b_diagnostics, "diagnostics", ArtifactExpectation.OPTIONAL),
+            "validation_result": (self.validation_result, "validation_result", ArtifactExpectation.OPTIONAL),
+            "validation_summary": (self.validation_summary, "validation_summary", ArtifactExpectation.OPTIONAL),
+        }
+        for name, (path, kind, expectation) in global_paths.items():
+            declarations.append(ArtifactInput(artifact_id=name, path=path, kind=kind,
+                                              producer="controller", unit_id=None, expectation=expectation))
         for unit in measurement_units:
             unit_id = str(getattr(unit, "unit_id"))
             phase_value = getattr(unit, "phase", "")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
+import subprocess
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
@@ -10,23 +12,30 @@ from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 from pydantic import Field, model_validator
 
 from .config import resolve_campaign
-from .contracts.artifacts import ArtifactLayout
-from .contracts.campaign import ResolvedCampaign, ResolvedObservation
+from .contracts.artifacts import ArtifactLayout, ArtifactRecord
+from .contracts.admission import AdmissionRequirements, ExpiryEvidence, ReservationEvidence, ScheduleEntry
+from .contracts.campaign import PhaseConfiguration, ResolvedCampaign, ResolvedObservation
 from .contracts.common import (
     CampaignState,
     CleanupState,
     ExecutionState,
+    ExperimentMode,
+    Evidence,
     FailureEvidence,
+    GitSnapshot,
     LifecycleEvent,
     Provider,
     Scenario,
+    ValidationStatus,
+    CommandOutcome,
     StringEvidence,
     StrictModel,
     StructuredEvidence,
     validate_event_chronology,
 )
 from .errors import BenchmarkError, CollisionError, PersistenceError
-from .ids import Clock, TokenSource, candidate_campaign_id, candidate_run_id, random_token, utc_now
+from .contracts.measurements import CommandEvidence, MeasurementTiming
+from .ids import Clock, TokenSource, candidate_campaign_id, candidate_deployment_id, candidate_observation_id, candidate_run_id, random_token, utc_now
 from .paths import (
     FaultInjector,
     allocate_paths,
@@ -43,6 +52,18 @@ from .lifecycle import aggregate_campaign, transition_cleanup, transition_execut
 class GitProvenanceProvider(Protocol):
     def commit(self, repository: Path) -> StringEvidence:
         ...
+
+    def snapshot(self, repository: Path) -> GitSnapshot:
+        ...
+
+
+def _snapshot_or_unavailable(provider: GitProvenanceProvider, repository: Path, commit: StringEvidence) -> GitSnapshot:
+    snapshotter = getattr(provider, "snapshot", None)
+    if callable(snapshotter):
+        return snapshotter(repository)
+    reason = "provider implements commit() only; working-tree evidence unavailable"
+    return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=reason),
+                       diff_sha256=StringEvidence(unavailable_reason=reason))
 
 
 class RepositoryGitProvenance:
@@ -94,6 +115,38 @@ class RepositoryGitProvenance:
         except Exception as exc:
             return StringEvidence(unavailable_reason=f"Git commit unavailable: {exc}")
 
+    def snapshot(self, repository: Path) -> GitSnapshot:
+        commit = self.commit(repository)
+        if commit.value is None:
+            unavailable = commit.unavailable_reason or "Git commit unavailable"
+            return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=unavailable),
+                               diff_sha256=StringEvidence(unavailable_reason=unavailable))
+        try:
+            def git(*args: str) -> bytes:
+                return subprocess.run(["git", "-C", str(repository), *args], check=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+            tracked = git("diff", "HEAD", "--binary")
+            names = git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+            pieces = [b"tracked\0", len(tracked).to_bytes(8, "big"), tracked]
+            untracked = []
+            for name in sorted(item for item in names if item):
+                path = repository / os.fsdecode(name)
+                try:
+                    content = path.read_bytes()
+                except OSError as exc:
+                    raise OSError(f"untracked file changed or unreadable: {os.fsdecode(name)}") from exc
+                untracked.append((name, content))
+            for name, content in untracked:
+                pieces.extend((b"untracked\0", len(name).to_bytes(8, "big"), name,
+                               len(content).to_bytes(8, "big"), content))
+            digest = hashlib.sha256(b"".join(pieces)).hexdigest()
+            dirty = bool(tracked or untracked)
+            return GitSnapshot(commit=commit, dirty=Evidence[bool](value=dirty), diff_sha256=StringEvidence(value=digest))
+        except Exception as exc:
+            reason = f"Git working-tree snapshot unavailable: {type(exc).__name__}"
+            return GitSnapshot(commit=commit, dirty=Evidence[bool](unavailable_reason=reason),
+                               diff_sha256=StringEvidence(unavailable_reason=reason))
+
 
 class StaticGitProvenance:
     def __init__(self, commit: str) -> None:
@@ -103,14 +156,33 @@ class StaticGitProvenance:
         del repository
         return StringEvidence(value=self._commit)
 
+    def snapshot(self, repository: Path) -> GitSnapshot:
+        del repository
+        return GitSnapshot(commit=StringEvidence(value=self._commit), dirty=Evidence[bool](value=False),
+                           diff_sha256=StringEvidence(value=hashlib.sha256(b"tracked\0" + (0).to_bytes(8, "big")).hexdigest()))
+
 
 class ManifestConfigProvenance(StrictModel):
     source_path: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     byte_length: int = Field(gt=0)
     snapshot_path: Optional[str] = Field(min_length=1)
+    resolved_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    resolved_snapshot_sha256: StringEvidence
+    resolved_snapshot_path: Optional[str] = Field(min_length=1)
+    schedule_sha256: StringEvidence = Field(default_factory=lambda: StringEvidence(unavailable_reason="no schedule row supplied"))
     implementation_git_commit: StringEvidence
     design_git_commit: StringEvidence
+    implementation_git: GitSnapshot = Field(default_factory=lambda: GitSnapshot(
+        commit=StringEvidence(unavailable_reason="not captured"),
+        dirty=Evidence[bool](unavailable_reason="not captured"),
+        diff_sha256=StringEvidence(unavailable_reason="not captured"),
+    ))
+    design_git: GitSnapshot = Field(default_factory=lambda: GitSnapshot(
+        commit=StringEvidence(unavailable_reason="not captured"),
+        dirty=Evidence[bool](unavailable_reason="not captured"),
+        diff_sha256=StringEvidence(unavailable_reason="not captured"),
+    ))
 
 
 class ChildReference(StrictModel):
@@ -136,13 +208,27 @@ class ChildReference(StrictModel):
 
 class ChildRunManifest(StrictModel):
     manifest_type: Literal["child_run"] = "child_run"
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
+    config_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    mode: ExperimentMode
+    context: Literal["standard", "failure_check", "replacement"]
     run_id: str = Field(min_length=1, pattern=r"^\S+$")
     campaign_id: str = Field(min_length=1, pattern=r"^\S+$")
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     provider: Provider
     scenario: Scenario
-    scheduled_start: datetime
+    observation_id: str = Field(min_length=1)
+    deployment_id: str = Field(min_length=1)
+    replaces_run_id: Optional[str] = None
+    scheduled_start: Optional[datetime]
+    schedule_entry: Evidence[ScheduleEntry]
+    measurement_units: List[PhaseConfiguration] = Field(default_factory=list)
+    validation_status: ValidationStatus = Field(default_factory=ValidationStatus)
+    commands: List[CommandEvidence] = Field(default_factory=list)
+    timings: List[MeasurementTiming] = Field(default_factory=list)
+    artifact_records: List[ArtifactRecord] = Field(default_factory=list)
+    reservation: Evidence[ReservationEvidence] = Field(default_factory=lambda: Evidence[ReservationEvidence](unavailable_reason="not evaluated during local initialization"))
+    expiry: Evidence[ExpiryEvidence] = Field(default_factory=lambda: Evidence[ExpiryEvidence](unavailable_reason="not registered during local initialization"))
     actual_started_at: Optional[datetime] = None
     actual_finished_at: Optional[datetime] = None
     config_provenance: ManifestConfigProvenance
@@ -150,6 +236,7 @@ class ChildRunManifest(StrictModel):
     execution_state: ExecutionState = ExecutionState.INITIALIZED
     cleanup_state: CleanupState = CleanupState.NOT_STARTED
     failure: Optional[FailureEvidence] = None
+    retrieval_failure: Optional[FailureEvidence] = None
     cleanup_failure: Optional[FailureEvidence] = None
     vm_metadata: StructuredEvidence
     provider_metadata: StructuredEvidence
@@ -161,7 +248,9 @@ class ChildRunManifest(StrictModel):
 
     @model_validator(mode="after")
     def lifecycle_matches_current_state(self) -> "ChildRunManifest":
-        timestamps = [self.scheduled_start, self.created_at, self.updated_at]
+        timestamps = [self.created_at, self.updated_at]
+        if self.scheduled_start is not None:
+            timestamps.append(self.scheduled_start)
         timestamps.extend(value for value in (self.actual_started_at, self.actual_finished_at) if value is not None)
         if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
             raise ValueError("manifest timestamps must include a timezone")
@@ -196,8 +285,8 @@ class ChildRunManifest(StrictModel):
                 raise ValueError("latest cleanup lifecycle event must match cleanup_state")
         elif self.cleanup_state != CleanupState.NOT_STARTED.value:
             raise ValueError("non-initial cleanup state requires a cleanup lifecycle event")
-        if self.execution_state == ExecutionState.FAILED.value and self.failure is None:
-            raise ValueError("failed execution state requires failure evidence")
+        if self.execution_state in {ExecutionState.FAILED.value, ExecutionState.INTERRUPTED.value} and self.failure is None:
+            raise ValueError("failed or interrupted execution state requires failure evidence")
         if self.execution_state not in {
             ExecutionState.FAILED.value,
             ExecutionState.INTERRUPTED.value,
@@ -212,7 +301,10 @@ class ChildRunManifest(StrictModel):
                 raise ValueError("failure evidence time must be between created_at and updated_at")
         observation = self.resolved_observation
         if (
-            observation.experiment_id != self.experiment_id
+            observation.config_id != self.config_id
+            or observation.experiment_id != self.experiment_id
+            or observation.mode != self.mode
+            or observation.context != self.context
             or observation.provider != self.provider
             or observation.scenario != self.scenario
             or observation.scheduled_start != self.scheduled_start
@@ -220,16 +312,35 @@ class ChildRunManifest(StrictModel):
             raise ValueError("resolved_observation identity must match the child manifest")
         if self.run_id != candidate_run_id(self.campaign_id, Provider(self.provider)):
             raise ValueError("run_id must match campaign_id and provider")
+        if self.observation_id == self.run_id or not self.observation_id.endswith("-observation"):
+            raise ValueError("observation_id must identify a stable observation unit")
+        if self.deployment_id != f"{self.run_id}-deployment":
+            raise ValueError("deployment_id must be unique to this attempt")
+        if self.replaces_run_id is not None and self.context != "replacement":
+            raise ValueError("replaces_run_id requires replacement context")
+        identities = [(item.artifact_id, item.path, item.unit_id) for item in self.artifact_records]
+        if len(identities) != len(set(identities)):
+            raise ValueError("artifact records must have unique concrete identity")
+        if any(item.deployment_id != self.deployment_id for item in self.artifact_records):
+            raise ValueError("artifact records must match child deployment_id")
+        if any(item.deployment_id != self.deployment_id for item in self.timings):
+            raise ValueError("timings must match child deployment_id")
         return self
 
 
 class CampaignManifest(StrictModel):
     manifest_type: Literal["campaign"] = "campaign"
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
+    config_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    mode: ExperimentMode
+    context: Literal["standard", "failure_check", "replacement"]
     campaign_id: str = Field(min_length=1, pattern=r"^\S+$")
     experiment_id: str = Field(pattern=r"^EXP-[0-9]{3,}$")
     configuration_role: Literal["experiment", "test"]
-    scheduled_start: datetime
+    scheduled_start: Optional[datetime]
+    schedule_entry: Evidence[ScheduleEntry]
+    admission: AdmissionRequirements
+    reservation: Evidence[ReservationEvidence] = Field(default_factory=lambda: Evidence[ReservationEvidence](unavailable_reason="not evaluated during local initialization"))
     selected_providers: List[Provider] = Field(min_length=1, max_length=3)
     scenario: Scenario
     config_provenance: ManifestConfigProvenance
@@ -242,7 +353,9 @@ class CampaignManifest(StrictModel):
 
     @model_validator(mode="after")
     def lifecycle_matches_aggregate(self) -> "CampaignManifest":
-        timestamps = [self.scheduled_start, self.created_at, self.updated_at]
+        timestamps = [self.created_at, self.updated_at]
+        if self.scheduled_start is not None:
+            timestamps.append(self.scheduled_start)
         if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
             raise ValueError("manifest timestamps must include a timezone")
         if self.updated_at < self.created_at:
@@ -397,6 +510,9 @@ def recompute_parent_manifest(
             or child.provider != reference.provider
             or child.experiment_id != parent.experiment_id
             or child.scenario != parent.scenario
+            or child.config_id != parent.config_id
+            or child.mode != parent.mode
+            or child.context != parent.context
             or child.scheduled_start != parent.scheduled_start
         ):
             raise PersistenceError(
@@ -529,16 +645,33 @@ def initialize_campaign(
     implementation_git: Optional[GitProvenanceProvider] = None,
     design_git: Optional[GitProvenanceProvider] = None,
     fault: FaultInjector = no_fault,
+    schedule_entry: Optional[ScheduleEntry] = None,
 ) -> InitializedCampaign:
-    resolved, source = resolve_campaign(config_path, repository_root)
+    resolved, source = resolve_campaign(config_path, repository_root, schedule_entry)
+    if schedule_entry is not None and (
+        schedule_entry.config_id != resolved.config_id
+        or schedule_entry.experiment_id != resolved.experiment_id
+        or schedule_entry.scheduled_start != resolved.scheduled_start
+    ):
+        raise ValueError("supplied schedule entry must match resolved config identity and time")
+    if resolved.schedule_entry.value is not None and schedule_entry != resolved.schedule_entry.value:
+        raise ValueError("supplied schedule entry must equal the config schedule entry")
+    schedule_entry = schedule_entry or resolved.schedule_entry.value
+    resolved_bytes = json.dumps(resolved.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    schedule_bytes = ((schedule_entry.original_header + "\n" + schedule_entry.original_row + "\n").encode("utf-8")
+                      if schedule_entry else None)
     now = clock()
     campaign_id = candidate_campaign_id(resolved.experiment_id, clock, token_source)
     run_ids = {Provider(provider): candidate_run_id(campaign_id, Provider(provider)) for provider in resolved.selected_providers}
     paths = allocate_paths(results_root, campaign_id, run_ids)
     preflight(paths)
-    implementation = (implementation_git or RepositoryGitProvenance()).commit(repository_root)
+    implementation_provider = implementation_git or RepositoryGitProvenance()
+    implementation = implementation_provider.commit(repository_root)
+    implementation_snapshot = _snapshot_or_unavailable(implementation_provider, repository_root, implementation)
     design_root = thesis_repository_root(repository_root)
-    design = (design_git or RepositoryGitProvenance()).commit(design_root)
+    design_provider = design_git or RepositoryGitProvenance()
+    design = design_provider.commit(design_root)
+    design_snapshot = _snapshot_or_unavailable(design_provider, design_root, design)
     unavailable = StructuredEvidence(unavailable_reason="not observed during F01 initialization")
     tool_versions = StructuredEvidence(value={"cloud_network_benchmark": "0.1.0", "python": platform.python_version()})
     assigned: List[Tuple[Provider, ChildRunManifest]] = []
@@ -555,15 +688,27 @@ def initialize_campaign(
         source_path=resolved.config_source.source_path,
         sha256=resolved.config_source.sha256,
         byte_length=resolved.config_source.byte_length,
-        snapshot_path=None,
+        snapshot_path=_relative(paths.child_results[Provider(resolved.selected_providers[0])] / "config.yaml", repository_root),
+        resolved_sha256=resolved.resolved_sha256,
+        resolved_snapshot_sha256=StringEvidence(value=hashlib.sha256(resolved_bytes).hexdigest()),
+        resolved_snapshot_path=_relative(paths.child_results[Provider(resolved.selected_providers[0])] / "config.resolved.json", repository_root),
+        schedule_sha256=StringEvidence(value=hashlib.sha256(schedule_bytes).hexdigest()) if schedule_bytes else StringEvidence(unavailable_reason="no schedule row supplied"),
         implementation_git_commit=implementation,
         design_git_commit=design,
+        implementation_git=implementation_snapshot,
+        design_git=design_snapshot,
     )
     parent = CampaignManifest(
+        config_id=resolved.config_id,
+        mode=resolved.mode,
+        context=resolved.context,
         campaign_id=campaign_id,
         experiment_id=resolved.experiment_id,
         configuration_role=resolved.configuration_role,
         scheduled_start=resolved.scheduled_start,
+        schedule_entry=Evidence[ScheduleEntry](value=schedule_entry) if schedule_entry else Evidence[ScheduleEntry](unavailable_reason="no schedule row supplied"),
+        admission=resolved.admission,
+        reservation=Evidence[ReservationEvidence](unavailable_reason="local initialization does not reserve budget"),
         selected_providers=resolved.selected_providers,
         scenario=resolved.scenario,
         config_provenance=parent_provenance,
@@ -583,13 +728,21 @@ def initialize_campaign(
             run_id = run_ids[provider]
             result_path = paths.child_results[provider]
             snapshot = result_path / "config.yaml"
+            resolved_snapshot = result_path / "config.resolved.json"
+            schedule_snapshot = result_path / "schedule.csv"
             provenance = ManifestConfigProvenance(
                 source_path=resolved.config_source.source_path,
                 sha256=resolved.config_source.sha256,
                 byte_length=resolved.config_source.byte_length,
                 snapshot_path=_relative(snapshot, repository_root),
+                resolved_sha256=resolved.resolved_sha256,
+                resolved_snapshot_sha256=StringEvidence(value=hashlib.sha256(resolved_bytes).hexdigest()),
+                resolved_snapshot_path=_relative(resolved_snapshot, repository_root),
+                schedule_sha256=StringEvidence(value=hashlib.sha256(schedule_bytes).hexdigest()) if schedule_bytes else StringEvidence(unavailable_reason="no schedule row supplied"),
                 implementation_git_commit=implementation,
                 design_git_commit=design,
+                implementation_git=implementation_snapshot,
+                design_git=design_snapshot,
             )
             initial_event = LifecycleEvent(
                 state_domain="execution",
@@ -598,12 +751,20 @@ def initialize_campaign(
                 detail="child manifest reserved",
             )
             manifest = ChildRunManifest(
+                config_id=resolved.config_id,
+                mode=resolved.mode,
+                context=resolved.context,
                 run_id=run_id,
                 campaign_id=campaign_id,
                 experiment_id=resolved.experiment_id,
                 provider=provider,
                 scenario=resolved.scenario,
                 scheduled_start=resolved.scheduled_start,
+                observation_id=resolved.replacement_context.observation_id if resolved.replacement_context else candidate_observation_id(run_id),
+                deployment_id=candidate_deployment_id(run_id),
+                replaces_run_id=resolved.replacement_context.replaces_run_id if resolved.replacement_context else (schedule_entry.replaces_run_id if schedule_entry else None),
+                schedule_entry=Evidence[ScheduleEntry](value=schedule_entry) if schedule_entry else Evidence[ScheduleEntry](unavailable_reason="no schedule row supplied"),
+                measurement_units=resolved.measurement_units,
                 config_provenance=provenance,
                 resolved_observation=observation.model_dump(mode="json"),
                 vm_metadata=unavailable,
@@ -637,6 +798,13 @@ def initialize_campaign(
             fault(f"after_config_snapshot:{provider.value}")
             if hashlib.sha256(snapshot.read_bytes()).hexdigest() != resolved.config_source.sha256:
                 raise PersistenceError(f"snapshot hash mismatch for {run_id}")
+            write_exclusive(resolved_snapshot, resolved_bytes, fault)
+            if hashlib.sha256(resolved_snapshot.read_bytes()).hexdigest() != provenance.resolved_snapshot_sha256.value:
+                raise PersistenceError(f"resolved snapshot hash mismatch for {run_id}")
+            if schedule_bytes:
+                write_exclusive(schedule_snapshot, schedule_bytes, fault)
+                if hashlib.sha256(schedule_snapshot.read_bytes()).hexdigest() != provenance.schedule_sha256.value:
+                    raise PersistenceError(f"schedule snapshot hash mismatch for {run_id}")
 
         return InitializedCampaign(
             campaign_id=campaign_id,

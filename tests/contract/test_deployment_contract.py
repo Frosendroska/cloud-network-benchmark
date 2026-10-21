@@ -5,10 +5,17 @@ import pytest
 import yaml
 
 from cloud_network_benchmark.config import resolve_campaign
+from cloud_network_benchmark.errors import ValidationError
 
 from cloud_network_benchmark.contracts import (
+    IdentityContext,
     Placement,
     CampaignOptions,
+    DiskIntent,
+    NetworkIntent,
+    SecurityIntent,
+    AccelerationIntent,
+    Evidence,
     ProviderDeploymentInput,
     ProviderDeploymentOutput,
     ProviderVmOutput,
@@ -23,15 +30,17 @@ NOW = datetime(2026, 9, 27, tzinfo=timezone.utc)
 
 
 def vm(role: str, function: str) -> VmIntent:
-    return VmIntent(role=role, function=function, region="eu-central-1", zone="euc1-az1", vm_shape="m7i.xlarge", image="ubuntu", connection_user="ubuntu")
+    return VmIntent(role=role, function=function, region="eu-central-1", zone="euc1-az1", vm_shape="m7i.xlarge", image="ubuntu", connection_user="ubuntu", disk=DiskIntent(size_gib=32, kind="gp3"), network=NetworkIntent(address_spaces={"eu-central-1":"10.60.0.0/16"}, subnets={"eu-central-1":["10.60.1.0/24"]}), security=SecurityIntent(controller_cidr=Evidence[str](unavailable_reason="not observed")), acceleration=AccelerationIntent(kind="ena"))
 
 
 def test_provider_deployment_input_keeps_provider_semantics() -> None:
     value = ProviderDeploymentInput(
+        identity=IdentityContext(experiment_id="EXP-001",config_id="exp_001",campaign_id="campaign",observation_id="campaign-aws-observation",run_id="campaign-aws",deployment_id="campaign-aws-deployment",provider="aws"),
+        mode="acceptance", context="standard",
         campaign_id="campaign", run_id="campaign-aws", experiment_id="EXP-001", provider="aws", scenario="same_zone",
         scheduled_start=NOW, vm_a=vm("vm_a", "client_traffic_generator"), vm_b=vm("vm_b", "server_receiver"),
         placement=Placement(kind="none", name=None), bootstrap_template="cloud-init.yaml", terraform_directory="terraform/aws",
-        provider_options={"instance_market_type": "spot"},
+        provider_options={"instance_market_type": "on_demand"},
         campaign_options=CampaignOptions(labels={"purpose": "test"}, provisioning_timeout_seconds=60, readiness_timeout_seconds=45, cleanup_timeout_seconds=60),
         child_result_path="results/raw/campaign-aws", provisioning_timeout_seconds=60, readiness_timeout_seconds=45, cleanup_timeout_seconds=60,
         config_sha256="a" * 64, implementation_git_commit=StringEvidence(value="b" * 40),
@@ -39,21 +48,22 @@ def test_provider_deployment_input_keeps_provider_semantics() -> None:
     )
     assert value.provider == "aws"
     assert value.vm_a.role == "vm_a"
-    assert value.provider_options == {"instance_market_type": "spot"}
+    assert value.provider_options == {"instance_market_type": "on_demand"}
     assert value.campaign_options.labels == {"purpose": "test"}
 
 
 def test_remote_connection_requires_private_ipv4() -> None:
-    connection = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh")
+    connection = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
     assert connection.port == 22
     with pytest.raises(ValueError):
-        RemoteConnectionData(role="vm_a", host="8.8.8.8", user="ubuntu", authentication_reference="runtime:ssh")
+        RemoteConnectionData(role="vm_a", host="8.8.8.8", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
 
 
 def test_partial_provider_output_represents_unavailable_data() -> None:
     missing = StructuredEvidence(unavailable_reason="apply failed")
     output = ProviderDeploymentOutput(
-        run_id="campaign-aws", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW, finished_at=NOW,
+        identity=IdentityContext(experiment_id="EXP-001",config_id="exp_001",campaign_id="campaign",observation_id="campaign-aws-observation",run_id="campaign-aws",deployment_id="campaign-aws-deployment",provider="aws"),
+        run_id="campaign-aws", deployment_id="campaign-aws-deployment", mode="acceptance", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW, finished_at=NOW,
         vm_a=ProviderVmOutput(role="vm_a", resource_id=None, private_ipv4=None, image_identity=None, actual_shape=None, region=None, zone=None, placement_metadata=missing, connection=None, unavailable=missing),
         vm_b=ProviderVmOutput(role="vm_b", resource_id=None, private_ipv4=None, image_identity=None, actual_shape=None, region=None, zone=None, placement_metadata=missing, connection=None, unavailable=missing),
         provider_metadata=missing, documented_network_limit=missing,
@@ -160,11 +170,12 @@ def test_direct_deployment_input_rejects_mismatched_identity_and_provider_values
 
 def test_deployment_output_links_connection_roles_and_canonical_path() -> None:
     observed = StructuredEvidence(value={"kind": "none"})
-    connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh")
-    connection_b = RemoteConnectionData(role="vm_b", host="10.0.0.5", user="ubuntu", authentication_reference="runtime:ssh")
+    connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
+    connection_b = RemoteConnectionData(role="vm_b", host="10.0.0.5", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
     vm_a = ProviderVmOutput(role="vm_a", resource_id="i-a", private_ipv4="10.0.0.4", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_a, unavailable=None)
     vm_b = ProviderVmOutput(role="vm_b", resource_id="i-b", private_ipv4="10.0.0.5", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_b, unavailable=None)
-    base = dict(run_id="campaign-aws", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW, finished_at=NOW, vm_a=vm_a, vm_b=vm_b, provider_metadata=observed, documented_network_limit=observed)
+    identity = IdentityContext(experiment_id="EXP-001",config_id="exp_001",campaign_id="campaign",observation_id="campaign-aws-observation",run_id="campaign-aws",deployment_id="campaign-aws-deployment",provider="aws")
+    base = dict(identity=identity, run_id="campaign-aws", deployment_id="campaign-aws-deployment", mode="acceptance", provider="aws", scenario="same_zone", apply_action_id="apply", started_at=NOW, finished_at=NOW, vm_a=vm_a, vm_b=vm_b, provider_metadata=observed, documented_network_limit=observed)
     with pytest.raises(ValueError, match="connection role"):
         ProviderDeploymentOutput(**{**base, "vm_a": vm_a.model_copy(update={"connection": connection_b})})
     with pytest.raises(ValueError, match="output_artifact_path"):
@@ -175,10 +186,11 @@ def test_deployment_output_links_connection_roles_and_canonical_path() -> None:
 
 def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> None:
     observed = StructuredEvidence(value={"kind": "none"})
-    connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh")
-    connection_b = RemoteConnectionData(role="vm_b", host="10.0.0.5", user="ubuntu", authentication_reference="runtime:ssh")
+    connection_a = RemoteConnectionData(role="vm_a", host="10.0.0.4", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
+    connection_b = RemoteConnectionData(role="vm_b", host="10.0.0.5", user="ubuntu", authentication_reference="runtime:ssh", host_key_reference="runtime:known-hosts")
     output = ProviderDeploymentOutput(
-        run_id="campaign-aws", provider="aws", scenario="same_zone", apply_action_id="apply",
+        identity=IdentityContext(experiment_id="EXP-001",config_id="exp_001",campaign_id="campaign",observation_id="campaign-aws-observation",run_id="campaign-aws",deployment_id="campaign-aws-deployment",provider="aws"),
+        run_id="campaign-aws", deployment_id="campaign-aws-deployment", mode="acceptance", provider="aws", scenario="same_zone", apply_action_id="apply",
         started_at=NOW, finished_at=NOW,
         vm_a=ProviderVmOutput(role="vm_a", resource_id="i-a", private_ipv4="10.0.0.4", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_a, unavailable=None),
         vm_b=ProviderVmOutput(role="vm_b", resource_id="i-b", private_ipv4="10.0.0.5", image_identity="ami-1", actual_shape="m7i.xlarge", region="eu-central-1", zone="euc1-az1", placement_metadata=observed, connection=connection_b, unavailable=None),
@@ -190,18 +202,18 @@ def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> No
 
 
 @pytest.mark.parametrize(
-    ("provider", "provider_options"),
+    ("provider", "provider_options", "allowed"),
     [
-        ("aws", {"instance_market_type": "on_demand"}),
-        ("aws", {"instance_market_type": "spot"}),
-        ("azure", {"priority": "Regular", "eviction_policy": "Delete", "max_price": -1.0}),
-        ("azure", {"priority": "Spot", "eviction_policy": "Delete", "max_price": -1.0}),
-        ("gcp", {"provisioning_model": "STANDARD", "instance_termination_action": "DELETE"}),
-        ("gcp", {"provisioning_model": "SPOT", "instance_termination_action": "DELETE"}),
+        ("aws", {"instance_market_type": "on_demand"}, True),
+        ("aws", {"instance_market_type": "spot"}, False),
+        ("azure", {"priority": "Regular", "eviction_policy": "Delete", "max_price": -1.0}, True),
+        ("azure", {"priority": "Spot", "eviction_policy": "Delete", "max_price": -1.0}, False),
+        ("gcp", {"provisioning_model": "STANDARD", "instance_termination_action": "DELETE"}, True),
+        ("gcp", {"provisioning_model": "SPOT", "instance_termination_action": "DELETE"}, False),
     ],
 )
 def test_deployment_input_serializes_provider_native_purchase_options(
-    repository_root: Path, tmp_path: Path, provider: str, provider_options: dict[str, object]
+    repository_root: Path, tmp_path: Path, provider: str, provider_options: dict[str, object], allowed: bool
 ) -> None:
     data = yaml.safe_load((repository_root / "configs/tests/exp-903-three-provider-smoke.yaml").read_text())
     data["selected_providers"] = [provider]
@@ -211,6 +223,10 @@ def test_deployment_input_serializes_provider_native_purchase_options(
     path = root / "configs/tests/spot.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    if not allowed:
+        with pytest.raises(ValidationError):
+            resolve_campaign(path, root)
+        return
     resolved, _ = resolve_campaign(path, root)
     value = ProviderDeploymentInput.from_observation(
         resolved.observations[0], campaign_id="campaign", run_id=f"campaign-{provider}",

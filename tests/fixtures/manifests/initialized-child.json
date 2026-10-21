@@ -1,41 +1,92 @@
 {
   "actual_finished_at": null,
   "actual_started_at": null,
+  "artifact_records": [],
   "artifacts": {
+    "checksums": "checksums.sha256",
     "config_snapshot": "config.yaml",
-    "idle_flent": "flent/idle.flent.gz",
-    "multi_flow_flent": "flent/multi_flow.flent.gz",
-    "multi_flow_vm_a_diagnostics": "diagnostics/multi_flow/vm_a.json",
-    "multi_flow_vm_b_diagnostics": "diagnostics/multi_flow/vm_b.json",
-    "provider_outputs": "terraform-outputs.json",
-    "single_flow_flent": "flent/single_flow.flent.gz",
-    "single_flow_vm_a_diagnostics": "diagnostics/single_flow/vm_a.json",
-    "single_flow_vm_b_diagnostics": "diagnostics/single_flow/vm_b.json",
+    "day_iperf3_client": "measurements/day/iperf3-client.jsonl",
+    "day_probe_csv_template": "measurements/day/probes/{chunk_id}.csv",
+    "day_probe_log_template": "measurements/day/probes/{chunk_id}.log",
+    "iperf3_server_error": "server-logs/iperf3-server.err",
+    "iperf3_server_log": "server-logs/iperf3-server.jsonl",
+    "provider_outputs": "terraform-outputs.redacted.json",
+    "resolved_snapshot": "config.resolved.json",
+    "schedule_snapshot": "schedule.csv",
+    "sockperf_server_log": "server-logs/sockperf.log",
     "validation_result": "validation/result.json",
     "validation_summary": "validation/summary.txt",
+    "vm_a_diagnostics": "diagnostics/vm_a.jsonl",
     "vm_a_metadata": "metadata/vm_a.json",
+    "vm_b_diagnostics": "diagnostics/vm_b.jsonl",
     "vm_b_metadata": "metadata/vm_b.json"
   },
-  "campaign_id": "20260927T120000Z-exp-900-fixture",
+  "campaign_id": "20260927T120000Z-exp-900-abc123",
   "cleanup_failure": null,
   "cleanup_state": "not_started",
+  "commands": [],
+  "config_id": "exp_900_aws_validation",
   "config_provenance": {
-    "byte_length": 1039,
+    "byte_length": 2515,
+    "design_git": {
+      "commit": {
+        "unavailable_reason": null,
+        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "diff_sha256": {
+        "unavailable_reason": null,
+        "value": "412164a7ee054406b8be0331d19ae4c16d3b8897888b3a54e52d331d90e64144"
+      },
+      "dirty": {
+        "unavailable_reason": null,
+        "value": false
+      }
+    },
     "design_git_commit": {
       "unavailable_reason": null,
       "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "implementation_git": {
+      "commit": {
+        "unavailable_reason": null,
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "diff_sha256": {
+        "unavailable_reason": null,
+        "value": "412164a7ee054406b8be0331d19ae4c16d3b8897888b3a54e52d331d90e64144"
+      },
+      "dirty": {
+        "unavailable_reason": null,
+        "value": false
+      }
     },
     "implementation_git_commit": {
       "unavailable_reason": null,
       "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "sha256": "ab07322a9833bdc3a7bd5ee041653ea0404914fc720db277bd23bccf129d8462",
-    "snapshot_path": "results/raw/20260927T120000Z-exp-900-fixture-aws/config.yaml",
+    "resolved_sha256": "2cd60a4efc8d3a2e2b8ba5e18f568052e1703b6036fea76a5d501f3153647c11",
+    "resolved_snapshot_path": "/private/var/folders/15/gp82yk6d61v0ldtfbgbcwlzw0000gp/T/tmpg8d4s0qd/results/raw/20260927T120000Z-exp-900-abc123-aws/config.resolved.json",
+    "resolved_snapshot_sha256": {
+      "unavailable_reason": null,
+      "value": "f8cdc460ad993594f515cae1ccd3f19e6df36158666d136f4b4e286f72710e5b"
+    },
+    "schedule_sha256": {
+      "unavailable_reason": "no schedule row supplied",
+      "value": null
+    },
+    "sha256": "496d7079f82d429519c9505d6060885cd58cf222601afc28fa31b01e028dd577",
+    "snapshot_path": "/private/var/folders/15/gp82yk6d61v0ldtfbgbcwlzw0000gp/T/tmpg8d4s0qd/results/raw/20260927T120000Z-exp-900-abc123-aws/config.yaml",
     "source_path": "configs/tests/exp-900-single-provider.yaml"
   },
+  "context": "failure_check",
   "created_at": "2026-09-27T12:00:00Z",
+  "deployment_id": "20260927T120000Z-exp-900-abc123-aws-deployment",
   "execution_state": "initialized",
   "experiment_id": "EXP-900",
+  "expiry": {
+    "unavailable_reason": "not registered during local initialization",
+    "value": null
+  },
   "failure": null,
   "lifecycle_events": [
     {
@@ -46,59 +97,145 @@
     }
   ],
   "manifest_type": "child_run",
+  "measurement_units": [
+    {
+      "kind": "phase",
+      "measured_seconds": 10,
+      "parent_unit_id": null,
+      "phase": "idle_latency",
+      "streams": null,
+      "trial_index": null,
+      "unit_id": "idle_latency"
+    },
+    {
+      "kind": "phase",
+      "measured_seconds": 10,
+      "parent_unit_id": null,
+      "phase": "single_flow",
+      "streams": 1,
+      "trial_index": null,
+      "unit_id": "single_flow"
+    },
+    {
+      "kind": "phase",
+      "measured_seconds": 10,
+      "parent_unit_id": null,
+      "phase": "multi_flow",
+      "streams": 4,
+      "trial_index": null,
+      "unit_id": "multi_flow"
+    }
+  ],
+  "mode": "acceptance",
+  "observation_id": "20260927T120000Z-exp-900-abc123-aws-observation",
   "provider": "aws",
   "provider_metadata": {
     "unavailable_reason": "not observed during F01 initialization",
     "value": null
   },
+  "replaces_run_id": null,
+  "reservation": {
+    "unavailable_reason": "not evaluated during local initialization",
+    "value": null
+  },
   "resolved_observation": {
+    "admission": {
+      "cost_input_id": "2026-10-14-provider-price-inputs",
+      "cost_input_sha256": {
+        "unavailable_reason": "linked Thesis run-register Sheet snapshot hash is not present in this repository",
+        "value": null
+      },
+      "estimated_cost_usd": {
+        "unavailable_reason": "scenario-specific estimate is resolved by F11 from the dated run register",
+        "value": null
+      },
+      "hard_budget_usd": 300,
+      "lifetime_cap_seconds": 1200,
+      "prices_checked_on": "2026-10-14",
+      "priority": "P0",
+      "protected_buffer_usd": 50,
+      "requires_common_n": false,
+      "requires_expiry": true,
+      "requires_primary_review": false,
+      "requires_schedule": false
+    },
     "artifact_layout": {
+      "checksums": "checksums.sha256",
       "config_snapshot": "config.yaml",
-      "idle_flent": "flent/idle.flent.gz",
-      "multi_flow_flent": "flent/multi_flow.flent.gz",
-      "multi_flow_vm_a_diagnostics": "diagnostics/multi_flow/vm_a.json",
-      "multi_flow_vm_b_diagnostics": "diagnostics/multi_flow/vm_b.json",
-      "provider_outputs": "terraform-outputs.json",
-      "single_flow_flent": "flent/single_flow.flent.gz",
-      "single_flow_vm_a_diagnostics": "diagnostics/single_flow/vm_a.json",
-      "single_flow_vm_b_diagnostics": "diagnostics/single_flow/vm_b.json",
+      "day_iperf3_client": "measurements/day/iperf3-client.jsonl",
+      "day_probe_csv_template": "measurements/day/probes/{chunk_id}.csv",
+      "day_probe_log_template": "measurements/day/probes/{chunk_id}.log",
+      "iperf3_server_error": "server-logs/iperf3-server.err",
+      "iperf3_server_log": "server-logs/iperf3-server.jsonl",
+      "provider_outputs": "terraform-outputs.redacted.json",
+      "resolved_snapshot": "config.resolved.json",
+      "schedule_snapshot": "schedule.csv",
+      "sockperf_server_log": "server-logs/sockperf.log",
       "validation_result": "validation/result.json",
       "validation_summary": "validation/summary.txt",
+      "vm_a_diagnostics": "diagnostics/vm_a.jsonl",
       "vm_a_metadata": "metadata/vm_a.json",
+      "vm_b_diagnostics": "diagnostics/vm_b.jsonl",
       "vm_b_metadata": "metadata/vm_b.json"
     },
     "benchmark": {
-      "execution_order": [
-        "idle_latency",
-        "single_flow",
-        "multi_flow"
-      ],
-      "idle_latency": {
-        "duration_seconds": 10,
-        "enabled": true,
-        "parameters": {},
-        "test_name": "ping",
-        "timeout_seconds": 30
+      "common_n": {
+        "common_n": null,
+        "plateau_found": null,
+        "source_campaign_id": null,
+        "source_sha256": null,
+        "state": "pending"
       },
-      "multi_flow": {
-        "duration_seconds": 10,
-        "enabled": true,
-        "parameters": {
-          "upload_streams": 1
-        },
-        "test_name": "tcp_nup",
-        "timeout_seconds": 30
-      },
-      "single_flow": {
-        "duration_seconds": 10,
-        "enabled": true,
-        "parameters": {},
-        "test_name": "tcp_1up",
-        "timeout_seconds": 30
-      }
+      "full_rtt": true,
+      "measured_seconds": 10,
+      "no_rdtsc": true,
+      "pause_seconds": 10,
+      "probe_bytes": 64,
+      "probe_chunk_seconds": null,
+      "probe_lead_seconds": 2,
+      "probe_mps": 1000,
+      "reply_every": 1,
+      "sample_interval_seconds": 1,
+      "stabilization_seconds": 60,
+      "tcp_buffer_bytes": 131072,
+      "tcp_congestion_control": "cubic",
+      "tcp_zerocopy": true,
+      "warmup_seconds": 5
     },
+    "config_id": "exp_900_aws_validation",
+    "context": "failure_check",
     "experiment_id": "EXP-900",
     "measurement_direction": "vm_a_to_vm_b",
+    "measurement_units": [
+      {
+        "kind": "phase",
+        "measured_seconds": 10,
+        "parent_unit_id": null,
+        "phase": "idle_latency",
+        "streams": null,
+        "trial_index": null,
+        "unit_id": "idle_latency"
+      },
+      {
+        "kind": "phase",
+        "measured_seconds": 10,
+        "parent_unit_id": null,
+        "phase": "single_flow",
+        "streams": 1,
+        "trial_index": null,
+        "unit_id": "single_flow"
+      },
+      {
+        "kind": "phase",
+        "measured_seconds": 10,
+        "parent_unit_id": null,
+        "phase": "multi_flow",
+        "streams": 4,
+        "trial_index": null,
+        "unit_id": "multi_flow"
+      }
+    ],
+    "mode": "acceptance",
     "options": {
       "cleanup_timeout_seconds": 300,
       "labels": {
@@ -108,16 +245,49 @@
       "readiness_timeout_seconds": 300
     },
     "placement": {
+      "collocated": false,
       "kind": "none",
+      "max_distance": null,
       "name": null
     },
     "provider": "aws",
     "provider_config": {
+      "acceleration": {
+        "kind": "ena"
+      },
       "connection_user": "ubuntu",
+      "disk": {
+        "kind": "gp3",
+        "size_gib": 32
+      },
       "documented_network_limit": null,
       "image": "ubuntu-24.04",
+      "network": {
+        "address_spaces": {
+          "eu-central-1": "10.60.0.0/16"
+        },
+        "default_offloads": true,
+        "dscp": 0,
+        "ecn": false,
+        "mtu": 1460,
+        "private_ipv4": true,
+        "public_ipv4_per_vm": 1,
+        "subnets": {
+          "eu-central-1": [
+            "10.60.1.0/24"
+          ]
+        },
+        "tcp_congestion_control": "cubic"
+      },
+      "os": {
+        "architecture": "amd64",
+        "distribution": "ubuntu",
+        "release": "24.04"
+      },
       "placement": {
+        "collocated": false,
         "kind": "none",
+        "max_distance": null,
         "name": null
       },
       "provider": "aws",
@@ -128,45 +298,157 @@
         "vm_a": "eu-central-1",
         "vm_b": "eu-central-1"
       },
+      "security": {
+        "batch_mode": true,
+        "benchmark_source": "vm_a_private",
+        "controller_cidr": {
+          "unavailable_reason": "controller public IPv4 /32 not observed at configuration authoring",
+          "value": null
+        },
+        "iperf3_tcp_port": 5201,
+        "sockperf_udp_port": 11111,
+        "strict_host_key_checking": true
+      },
       "vm_shape": "t3.small",
       "zones": {
-        "vm_a": "euc1-az1",
-        "vm_b": "euc1-az1"
+        "vm_a": "eu-central-1a",
+        "vm_b": "eu-central-1a"
       }
     },
     "scenario": "same_zone",
-    "scheduled_start": "2026-10-01T07:00:00Z",
+    "schedule_entry": {
+      "unavailable_reason": "no executed schedule row supplied",
+      "value": null
+    },
+    "scheduled_start": null,
+    "schema_version": 2,
     "vm_a": {
+      "acceleration": {
+        "kind": "ena"
+      },
       "connection_user": "ubuntu",
+      "disk": {
+        "kind": "gp3",
+        "size_gib": 32
+      },
       "function": "client_traffic_generator",
       "image": "ubuntu-24.04",
+      "network": {
+        "address_spaces": {
+          "eu-central-1": "10.60.0.0/16"
+        },
+        "default_offloads": true,
+        "dscp": 0,
+        "ecn": false,
+        "mtu": 1460,
+        "private_ipv4": true,
+        "public_ipv4_per_vm": 1,
+        "subnets": {
+          "eu-central-1": [
+            "10.60.1.0/24"
+          ]
+        },
+        "tcp_congestion_control": "cubic"
+      },
+      "os": {
+        "architecture": "amd64",
+        "distribution": "ubuntu",
+        "release": "24.04"
+      },
       "region": "eu-central-1",
       "role": "vm_a",
+      "security": {
+        "batch_mode": true,
+        "benchmark_source": "vm_a_private",
+        "controller_cidr": {
+          "unavailable_reason": "controller public IPv4 /32 not observed at configuration authoring",
+          "value": null
+        },
+        "iperf3_tcp_port": 5201,
+        "sockperf_udp_port": 11111,
+        "strict_host_key_checking": true
+      },
       "vm_shape": "t3.small",
-      "zone": "euc1-az1"
+      "zone": "eu-central-1a"
     },
     "vm_b": {
+      "acceleration": {
+        "kind": "ena"
+      },
       "connection_user": "ubuntu",
+      "disk": {
+        "kind": "gp3",
+        "size_gib": 32
+      },
       "function": "server_receiver",
       "image": "ubuntu-24.04",
+      "network": {
+        "address_spaces": {
+          "eu-central-1": "10.60.0.0/16"
+        },
+        "default_offloads": true,
+        "dscp": 0,
+        "ecn": false,
+        "mtu": 1460,
+        "private_ipv4": true,
+        "public_ipv4_per_vm": 1,
+        "subnets": {
+          "eu-central-1": [
+            "10.60.1.0/24"
+          ]
+        },
+        "tcp_congestion_control": "cubic"
+      },
+      "os": {
+        "architecture": "amd64",
+        "distribution": "ubuntu",
+        "release": "24.04"
+      },
       "region": "eu-central-1",
       "role": "vm_b",
+      "security": {
+        "batch_mode": true,
+        "benchmark_source": "vm_a_private",
+        "controller_cidr": {
+          "unavailable_reason": "controller public IPv4 /32 not observed at configuration authoring",
+          "value": null
+        },
+        "iperf3_tcp_port": 5201,
+        "sockperf_udp_port": 11111,
+        "strict_host_key_checking": true
+      },
       "vm_shape": "t3.small",
-      "zone": "euc1-az1"
+      "zone": "eu-central-1a"
     }
   },
-  "run_id": "20260927T120000Z-exp-900-fixture-aws",
+  "retrieval_failure": null,
+  "run_id": "20260927T120000Z-exp-900-abc123-aws",
   "scenario": "same_zone",
-  "scheduled_start": "2026-10-01T07:00:00Z",
-  "schema_version": 1,
+  "schedule_entry": {
+    "unavailable_reason": "no schedule row supplied",
+    "value": null
+  },
+  "scheduled_start": null,
+  "schema_version": 2,
+  "timings": [],
   "tool_versions": {
     "unavailable_reason": null,
     "value": {
       "cloud_network_benchmark": "0.1.0",
-      "python": "3.9.2"
+      "python": "3.11.13"
     }
   },
   "updated_at": "2026-09-27T12:00:00Z",
+  "validation_status": {
+    "comparison_eligibility": "not_evaluated",
+    "comparison_reasons": [
+      "not evaluated"
+    ],
+    "data_reasons": [
+      "not validated"
+    ],
+    "data_validity": "not_validated"
+  },
   "vm_metadata": {
     "unavailable_reason": "not observed during F01 initialization",
     "value": null

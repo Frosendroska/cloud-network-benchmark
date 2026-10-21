@@ -14,7 +14,8 @@ def test_validate_and_resolve_without_side_effects(repository_root: Path, tmp_pa
     assert validation["valid"] is True
     assert validation["configuration_role"] == "experiment"
     assert validation["scenario"] == "same_zone"
-    assert validation["scheduled_start"]
+    assert validation["scheduled_start"] is None
+    assert "schedule_pending" in validation["launch_blockers"]
     assert len(validation["source_sha256"]) == 64
     assert validation["child_count"] == 3
     assert main(["resolve", "--config", "configs/tests/exp-900-single-provider.yaml", "--format", "json"]) == 0
@@ -41,7 +42,7 @@ def test_malformed_dry_run_has_stable_human_and_json_errors(repository_root: Pat
         assert main(["dry-run", "--config", str(path), "--format", "json"]) == 3
         payload = json.loads(capsys.readouterr().err)
         assert payload["error"]["error_code"] == "validation_error"
-        assert payload["error"]["field_path"] == "config.experiment_id"
+        assert payload["error"]["field_path"] == "config.config_id"
     finally:
         path.unlink(missing_ok=True)
 

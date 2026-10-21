@@ -98,7 +98,11 @@ def load_campaign(path: Path, repository_root: Path) -> Tuple[CampaignConfigurat
         raise ValidationError("unsupported schema version", "config.schema_version", {"reason": "unsupported_schema_version"})
     secret_paths = _secret_paths(raw)
     if secret_paths:
-        raise ValidationError("secret-bearing configuration is not safe to snapshot", secret_paths[0])
+        secret_paths.sort(key=lambda item: (0 if "private_key" in item.lower() or "private-key" in item.lower() else 1, item))
+        raise ValidationError(
+            "secret-bearing configuration is not safe to snapshot", secret_paths[0],
+            {"issues": [{"field_path": item, "message": "secret-bearing field is not permitted", "error_type": "secret_field"} for item in secret_paths]},
+        )
     try:
         config = CampaignConfiguration.model_validate(raw)
     except PydanticValidationError as exc:
@@ -170,10 +174,12 @@ def resolve_campaign(
             raise ValidationError("schedule entry references a different configuration", "config.schedule_entry")
         if config.scheduled_start is not None and schedule_entry.scheduled_start != config.scheduled_start:
             raise ValidationError("schedule timestamp does not match configuration", "config.scheduled_start")
+        if schedule_entry.priority != config.admission.priority:
+            raise ValidationError("schedule priority does not match admission requirements", "config.schedule_entry.priority")
     scheduled_start = config.scheduled_start or (schedule_entry.scheduled_start if schedule_entry else None)
     units = derive_measurement_units(ExperimentMode(config.mode), config.benchmark)
     blockers = ["admission_not_evaluated"]
-    if scheduled_start is None:
+    if scheduled_start is None or (config.admission.requires_schedule and schedule_entry is None):
         blockers.append("schedule_pending")
     if config.benchmark.common_n.state == "pending" and config.mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.DIAGNOSTIC_DAY}:
         blockers.append("calibration_pending")
@@ -207,6 +213,7 @@ def resolve_campaign(
         "experiment_id": config.experiment_id,
         "mode": config.mode,
         "context": config.context,
+        "replacement_context": config.replacement_context.model_dump(mode="json") if config.replacement_context else None,
         "scenario": config.scenario,
         "selected_providers": selected,
         "scheduled_start": scheduled_start,
@@ -226,6 +233,7 @@ def resolve_campaign(
         experiment_id=config.experiment_id,
         mode=config.mode,
         context=config.context,
+        replacement_context=config.replacement_context,
         configuration_role=role,
         config_source=resolved_provenance,
         resolved_sha256=resolved_sha256,
