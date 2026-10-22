@@ -158,6 +158,14 @@ def test_native_command_rejects_projection_disagreement(mutation: dict[str, obje
         native_command(mutate_result=mutation)
 
 
+@pytest.mark.parametrize("field", ["duration_seconds", "finished_at", "stdout"])
+def test_native_monotonic_projection_rejects_missing_result_fields(field: str) -> None:
+    payload = native_command().model_dump(mode="python")
+    del payload["result"][field]
+    with pytest.raises((ValidationError, ValueError)):
+        CommandEvidence.model_validate(payload)
+
+
 def test_native_command_durable_json_round_trip_keeps_timing_provenance_and_redaction() -> None:
     evidence = native_command()
     durable = evidence.model_dump(mode="json")
