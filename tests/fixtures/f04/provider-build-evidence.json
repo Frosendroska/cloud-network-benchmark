@@ -1,0 +1,9 @@
+{
+  "provider": "aws",
+  "region": {"value": "eu-central-1", "unavailable_reason": null},
+  "zone": {"value": "eu-central-1a", "unavailable_reason": null},
+  "physical_zone_id": {"value": "euc1-az2", "unavailable_reason": null},
+  "actual_shape": {"value": "synthetic-shape", "unavailable_reason": null},
+  "documented_network_limit": {"value": {"source": "provider-documentation-fixture", "checked": "2026-10-22", "baseline_mbps": 10000}, "unavailable_reason": null},
+  "builds": {"sockperf": {"source_reference": "fixture-ref", "compiler_version": "fixture-compiler", "binary_version": "fixture-version", "binary_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+}
