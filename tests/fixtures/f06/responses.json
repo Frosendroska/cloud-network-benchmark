@@ -1,7 +1,10 @@
 {
+  "runbook_draft": {"properties": {"state": "Draft"}},
   "runbook_published": {"properties": {"state": "Published"}},
-  "schedule_enabled": {"properties": {"frequency": "OneTime", "isEnabled": true}},
-  "job_binding": {"properties": {"parameters": {"vmaresourceid": "vm-a", "vmbresourceid": "vm-b"}}},
-  "late_targets": {"a": "absent", "b": "creating"},
-  "cleanup_inventory": {"complete": false, "resources": ["unknown"]}
+  "schedule_enabled": {"properties": {"frequency": "OneTime", "timeZone": "UTC", "isEnabled": true, "startTime": "2030-01-01T00:20:00Z"}},
+  "job_binding": {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06/providers/Microsoft.Automation/automationAccounts/f06-auto/jobSchedules/00000000-0000-0000-0000-000000000099", "properties": {"runbook": {"name": "f06-deallocate"}, "schedule": {"name": "f06-once"}, "parameters": {"vmaresourceid": "vm-a", "vmbresourceid": "vm-b", "subscriptionid": "00000000-0000-0000-0000-000000000001", "resourcegroupname": "f06", "deploymentid": "f06-deployment", "retryendat": "2030-01-01T00:30:00Z", "pollseconds": "15"}}},
+  "role_assignment": {"principalId": "00000000-0000-0000-0000-000000000003", "scope": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06"},
+  "automation_module": {"properties": {"provisioningState": "Succeeded", "version": "3.0.0"}},
+  "target_observations": {"a": ["404", "PowerState/running", "accepted-202", "PowerState/deallocated"], "b": ["PowerState/creating", "accepted-202", "PowerState/deallocated"]},
+  "cleanup_inventory": {"complete": false, "resources": [{"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06/providers/Microsoft.Network/networkInterfaces/unknown", "type": "Microsoft.Network/networkInterfaces"}]}
 }

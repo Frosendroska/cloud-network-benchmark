@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 
 import pytest
 
 from cloud_network_benchmark.config import resolve_campaign
-from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, build_pair_inputs, _command, _workspace
+from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, build_pair_inputs, _command, _workspace, _slug
 from cloud_network_benchmark.contracts import Evidence, ProviderDeploymentInput, StringEvidence
 from cloud_network_benchmark.contracts.admission import ReservationEvidence
 
@@ -61,6 +62,18 @@ def test_invalid_azure_shape_and_explicit_host_identity_are_rejected(repository_
         AzureRuntimeOptions.model_validate({**options(tmp_path).model_dump(), "controller_cidr":"192.0.2.0/24"})
 
 
+@pytest.mark.parametrize("image", [
+    "Canonical:ubuntu-24_04-lts:server:latest",
+    "Contoso:ubuntu-24_04-lts:server:24.04.20261001",
+    "Canonical:debian:bookworm:12.0",
+    "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/images/providers/Microsoft.Compute/galleries/ubuntu/images/ubuntu2404/versions/latest",
+])
+def test_only_concrete_canonical_ubuntu_2404_image_inputs_are_accepted(repository_root: Path, tmp_path: Path, image):
+    value=options(tmp_path).model_dump(); value["selected_image"]=image
+    with pytest.raises(ValueError,match="selected_image"):
+        AzureRuntimeOptions.model_validate(value)
+
+
 def test_private_action_journal_redacts_auth_reference_public_key_and_private_pem(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); o=options(tmp_path); root,journal=_workspace(o,d)
     from cloud_network_benchmark.contracts.common import CommandOutcome
@@ -75,3 +88,54 @@ def test_private_action_journal_redacts_auth_reference_public_key_and_private_pe
     assert o.authentication_reference not in raw and o.ssh_public_key not in raw
     assert "sentinel-----END RSA PRIVATE KEY" not in raw and "[REDACTED]" in raw
     assert root.stat().st_mode & 0o777==0o700 and journal.stat().st_mode & 0o777==0o600
+
+
+def test_two_same_cidr_attempts_have_private_nonoverwriting_workspaces(repository_root: Path, tmp_path: Path):
+    first=deployment(repository_root); second=first.model_copy(update={"run_id":"f06-campaign-next-azure","deployment_id":"f06-campaign-next-azure-deployment"})
+    first_options=options(tmp_path/"one",first.admission.priority); second_options=options(tmp_path/"two",second.admission.priority)
+    first_root,first_journal=_workspace(first_options,first); second_root,second_journal=_workspace(second_options,second)
+    assert first_root!=second_root and first_journal!=second_journal
+    assert _slug(first)!=_slug(second)
+    assert first_journal.read_text()!=second_journal.read_text()
+
+
+def test_command_requests_clip_deadline_and_separate_root_data_dirs(repository_root: Path,tmp_path:Path):
+    d=deployment(repository_root); o=options(tmp_path)
+    from cloud_network_benchmark.contracts.common import CommandOutcome
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    root,_=_workspace(o,d); requests=[]
+    class Runner:
+        def run(self,request):
+            requests.append(request); now=datetime.now(UTC)
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout="",stderr="")
+    runner=Runner()
+    _command(runner,o,root,["terraform","-chdir=terraform/azure/pair","validate"],"pair_validate",lambda:1)
+    _command(runner,o,root,["terraform","-chdir=terraform/azure/expiry","validate"],"expiry_validate",lambda:1)
+    _command(runner,o,root,["terraform","-chdir=terraform/azure/pair","validate"],"near_deadline",lambda:3599)
+    assert all(request.timeout_seconds==60 for request in requests[:2])
+    assert requests[2].timeout_seconds==1
+    assert requests[0].environment["TF_DATA_DIR"] != requests[1].environment["TF_DATA_DIR"]
+    assert all(str(root) in request.environment["TF_DATA_DIR"] for request in requests)
+
+
+def test_foreign_or_symlinked_attempt_workspaces_are_never_adopted(repository_root: Path,tmp_path:Path):
+    d=deployment(repository_root); o=options(tmp_path); root,journal=_workspace(o,d)
+    state=json.loads(journal.read_text()); state["deployment_id"]="foreign-deployment"; journal.write_text(json.dumps(state))
+    with pytest.raises(FileExistsError,match="another deployment"):
+        _workspace(o,d)
+    linked=options(tmp_path/"link"); linked.attempt_root.parent.mkdir(parents=True,exist_ok=True)
+    linked.attempt_root.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(FileExistsError,match="symlink"):
+        _workspace(linked,d)
+
+
+def test_interrupted_command_is_journaled_unknown_with_redacted_error(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); o=options(tmp_path); root,journal=_workspace(o,d)
+    class InterruptedRunner:
+        def run(self,request): raise RuntimeError(f"controller interruption {o.authentication_reference} {o.ssh_public_key}")
+    with pytest.raises(RuntimeError):
+        _command(InterruptedRunner(),o,root,["az","test",o.authentication_reference,o.ssh_public_key],"interrupt",lambda:1)
+    contents=journal.read_text()
+    state=json.loads(contents)
+    assert state["actions"][-1]["outcome"]=="unknown"
+    assert o.authentication_reference not in contents and o.ssh_public_key not in contents

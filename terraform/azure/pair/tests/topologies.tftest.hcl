@@ -32,6 +32,10 @@ run "same_zone" {
     error_message = "exactly two VMs are required"
   }
   assert {
+    condition     = length(local.vnets) == 1 && local.network.a.vnet_key == local.network.b.vnet_key
+    error_message = "same-region pair must share one private VNet/subnet"
+  }
+  assert {
     condition     = azurerm_linux_virtual_machine.pair["a"].priority == "Regular"
     error_message = "must use Regular purchase"
   }
@@ -78,6 +82,10 @@ run "cross_zone" {
     condition     = azurerm_linux_virtual_machine.pair["a"].zone == "1" && azurerm_linux_virtual_machine.pair["b"].zone == "2"
     error_message = "cross_zone must preserve Azure logical zones"
   }
+  assert {
+    condition     = length(local.vnets) == 1 && local.network.a.vnet_key == local.network.b.vnet_key
+    error_message = "cross-zone VMs share a subnet while retaining distinct logical zones"
+  }
 }
 
 run "placement_optimization" {
@@ -109,6 +117,10 @@ run "inter_region" {
   assert {
     condition     = length(azurerm_virtual_network_peering.a_to_b) == 1 && length(azurerm_virtual_network_peering.b_to_a) == 1
     error_message = "Global VNet peering must be bidirectional"
+  }
+  assert {
+    condition     = length(local.vnets) == 2 && local.network.a.vnet_key != local.network.b.vnet_key
+    error_message = "inter_region pair uses distinct Frankfurt and London private networks"
   }
 }
 

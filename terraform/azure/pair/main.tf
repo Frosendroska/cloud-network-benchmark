@@ -3,9 +3,15 @@ locals {
   london          = var.region_b == "uksouth"
   image_parts     = split(":", var.selected_image)
   image_reference = length(local.image_parts) == 4 ? local.image_parts : ["", "", "", ""]
+  vnets = local.london ? {
+    a = { location = var.region_a, prefix = "10.70.0.0/16", subnet = "10.70.0.0/24" }
+    b = { location = var.region_b, prefix = "10.71.0.0/16", subnet = "10.71.0.0/24" }
+    } : {
+    a = { location = var.region_a, prefix = "10.70.0.0/16", subnet = "10.70.0.0/24" }
+  }
   network = {
-    a = { location = var.region_a, prefix = "10.70.0.0/16", subnet = "10.70.0.0/24", ip = var.private_a, zone = var.zone_a }
-    b = { location = var.region_b, prefix = local.london ? "10.71.0.0/16" : "10.70.0.0/16", subnet = local.london ? "10.71.0.0/24" : "10.70.0.0/24", ip = var.private_b, zone = var.zone_b }
+    a = { location = var.region_a, ip = var.private_a, zone = var.zone_a, vnet_key = "a" }
+    b = { location = var.region_b, ip = var.private_b, zone = var.zone_b, vnet_key = local.london ? "b" : "a" }
   }
 }
 
@@ -23,7 +29,7 @@ resource "azurerm_proximity_placement_group" "pair" {
 }
 
 resource "azurerm_virtual_network" "pair" {
-  for_each            = local.network
+  for_each            = local.vnets
   name                = "${var.resource_group_name}-${each.key}-vnet"
   location            = each.value.location
   resource_group_name = data.azurerm_resource_group.pair.name
@@ -32,7 +38,7 @@ resource "azurerm_virtual_network" "pair" {
 }
 
 resource "azurerm_subnet" "pair" {
-  for_each             = local.network
+  for_each             = local.vnets
   name                 = "benchmark"
   resource_group_name  = data.azurerm_resource_group.pair.name
   virtual_network_name = azurerm_virtual_network.pair[each.key].name
@@ -135,7 +141,7 @@ resource "azurerm_network_interface" "pair" {
   accelerated_networking_enabled = true
   ip_configuration {
     name                          = "private"
-    subnet_id                     = azurerm_subnet.pair[each.key].id
+    subnet_id                     = azurerm_subnet.pair[each.value.vnet_key].id
     private_ip_address_allocation = "Static"
     private_ip_address            = each.value.ip
     public_ip_address_id          = azurerm_public_ip.pair[each.key].id

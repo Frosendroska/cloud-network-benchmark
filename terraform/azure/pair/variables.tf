@@ -11,8 +11,13 @@ variable "ssh_public_key" {
 variable "selected_image" {
   type = string
   validation {
-    condition     = startswith(var.selected_image, "/") || (length(split(":", var.selected_image)) == 4 && !can(regex("(?i)latest", var.selected_image)))
-    error_message = "Select a concrete gallery image ID or four-part publisher:offer:sku:version; latest aliases are not reproducible."
+    condition = (
+      can(regex("(?i)(ubuntu-24_04|ubuntu-24\\.04|ubuntu2404|noble)", var.selected_image)) &&
+      !can(regex("(?i)latest", var.selected_image)) &&
+      ((startswith(var.selected_image, "/") && can(regex("(?i)/versions/[^/]+$", var.selected_image))) ||
+      (!startswith(var.selected_image, "/") && length(split(":", var.selected_image)) == 4 && lower(split(":", var.selected_image)[0]) == "canonical"))
+    )
+    error_message = "Select a concrete Canonical Ubuntu 24.04 marketplace version or versioned gallery image ID; latest aliases are not reproducible."
   }
 }
 

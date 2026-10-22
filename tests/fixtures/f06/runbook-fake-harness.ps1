@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$RunbookPath)
+param([Parameter(Mandatory=$true)][string]$RunbookPath, [ValidateSet('late','fail-a-once','deny-a-once')][string]$Mode='late')
 $ErrorActionPreference = 'Stop'
 $global:vmReads = @{ a = 0; b = 0 }
 $global:viewReads = @{ a = 0; b = 0 }
@@ -10,7 +10,9 @@ function Invoke-AzRestMethod {
     $role = if ($Path -match '/f06-run-a(?:/|\?|$)') { 'a' } elseif ($Path -match '/f06-run-b(?:/|\?|$)') { 'b' } else { throw "unexpected target path: $Path" }
     if ($Method -eq 'GET' -and $Path -notmatch '/instanceView') {
         $global:vmReads[$role]++
-        if ($role -eq 'a' -and $global:vmReads[$role] -eq 1) { return [pscustomobject]@{ StatusCode = 404; Content = '{}' } }
+        if ($role -eq 'a' -and $global:vmReads[$role] -eq 1 -and $Mode -eq 'late') { return [pscustomobject]@{ StatusCode = 404; Content = '{}' } }
+        if ($role -eq 'a' -and $global:vmReads[$role] -eq 1 -and $Mode -eq 'fail-a-once') { throw 'injected transport failure for A' }
+        if ($role -eq 'a' -and $global:vmReads[$role] -eq 1 -and $Mode -eq 'deny-a-once') { return [pscustomobject]@{ StatusCode = 403; Content = '{}' } }
         return [pscustomobject]@{ StatusCode = 200; Content = '{}' }
     }
     if ($Method -eq 'GET' -and $Path -match '/instanceView') {

@@ -13,6 +13,7 @@ import base64
 import struct
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import date
 from datetime import datetime, timedelta, timezone
@@ -91,6 +92,12 @@ class AzureRuntimeOptions(StrictModel):
             raise ValueError("selected_image must be a concrete Ubuntu 24.04 image version or ARM image ID")
         if not (v.startswith("/") or len(v.split(":")) == 4):
             raise ValueError("selected_image must be an ARM image ID or publisher:offer:sku:version")
+        if not re.search(r"(?i)(ubuntu-24_04|ubuntu-24\.04|ubuntu2404|noble)",v):
+            raise ValueError("selected_image must identify Ubuntu 24.04")
+        if v.startswith("/") and ("/versions/" not in v.lower() or v.rstrip("/").split("/")[-1].lower()=="latest"):
+            raise ValueError("gallery ARM image ID must identify a concrete image version")
+        if not v.startswith("/") and v.split(":")[0].lower()!="canonical":
+            raise ValueError("Ubuntu 24.04 marketplace images must use the Canonical publisher")
         return v
 
     @model_validator(mode="after")
@@ -162,7 +169,7 @@ class AzureCleanupResult(StrictModel):
 def _slug(d: ProviderDeploymentInput) -> str:
     stem = re.sub(r"[^a-z0-9-]", "-", f"cnb-{d.campaign_id}-{d.deployment_id}".lower()).strip("-")
     suffix = hashlib.sha256(f"{d.campaign_id}\0{d.deployment_id}".encode()).hexdigest()[:8]
-    return stem[:41].rstrip("-") + "-" + suffix
+    return stem[:36].rstrip("-") + "-" + suffix
 
 
 def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: datetime,
@@ -224,6 +231,12 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
             raise ValueError("expiry evidence does not match reservation and deployment")
         if expiry.registered_at.value is None or expiry.registered_at.value > now or expiry.registered_at.value < reservation.cap_started_at.value:
             raise ValueError("expiry registration chronology is invalid")
+        metadata=expiry.provider_metadata.value or {}
+        if (metadata.get("reservation_id") != reservation.reservation_id.value
+                or metadata.get("source_sha256") != reservation.source_sha256):
+            raise ValueError("registered expiry metadata is not bound to this reservation source")
+        if expiry.expires_at.value >= o.retry_end_at or (o.retry_end_at-expiry.expires_at.value).total_seconds() > float(o.expiry_cost_input["job_minutes_bound"])*60:
+            raise ValueError("registered expiry trigger or retry window no longer matches the bound price")
         if (expiry.expires_at.value-now).total_seconds() < o.post_registration_workflow_seconds:
             raise ValueError("post-registration workflow no longer fits before expiry")
     return _slug(d), [f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}/providers/Microsoft.Compute/virtualMachines/{name}" for name in (_slug(d)+"-a", _slug(d)+"-b")]
@@ -256,7 +269,33 @@ def _safe_result_view(options: AzureRuntimeOptions, result: CommandResult) -> di
     view=result.durable_view()
     view["stdout"]=_redact(options,view["stdout"])
     view["stderr"]=_redact(options,view["stderr"])
+    for field in ("stdout","stderr"):
+        if len(view[field])>65536:
+            view[field]=view[field][:65536]+"[TRUNCATED]"
     return view
+
+
+def _journal_actions(journal: Path) -> list[dict[str, Any]]:
+    if not journal.is_file() or journal.is_symlink():
+        return []
+    return json.loads(journal.read_text(encoding="utf-8")).get("actions",[])
+
+
+def _write_output_artifact(root: Path, output: ProviderDeploymentOutput) -> None:
+    path=root/"terraform-outputs.redacted.json"
+    if path.exists() or path.is_symlink():
+        raise FileExistsError("redacted output artifact already exists; refusing overwrite")
+    vms={}
+    for role,vm in (("a",output.vm_a),("b",output.vm_b)):
+        vms[role]={key:getattr(vm,key) for key in ("resource_id","private_ipv4","image_identity","actual_shape","region","zone")}
+        vms[role]["public_ipv4"]=vm.public_ipv4.model_dump(mode="json")
+        vms[role]["placement_metadata"]=vm.placement_metadata.model_dump(mode="json")
+        vms[role]["physical_zone_id"]=vm.physical_zone_id.model_dump(mode="json")
+    expiry=output.expiry.value
+    payload={"provider":"azure","run_id":output.run_id,"deployment_id":output.deployment_id,"scenario":str(output.scenario),
+        "vms":vms,"documented_network_limit":output.documented_network_limit.model_dump(mode="json"),
+        "expiry":{"action":expiry.action,"state":expiry.state,"registration_id":expiry.registration_id.model_dump(mode="json"),"expires_at":expiry.expires_at.model_dump(mode="json")} if expiry else None}
+    _atomic_private(path,payload)
 
 
 def _workspace(o: AzureRuntimeOptions, d: ProviderDeploymentInput) -> tuple[Path, Path]:
@@ -334,6 +373,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         state.setdefault("actions", []).append({"request":req.durable_view(),"result":_safe_result_view(options,result)})
         _atomic_private(journal,state)
     if result.outcome != "succeeded": raise RuntimeError(_redact(options,f"{action} failed with {result.outcome}: {result.stderr[:1000]}"))
+    if len(result.stdout.encode("utf-8"))>1_000_000 or len(result.stderr.encode("utf-8"))>1_000_000:
+        raise RuntimeError(f"{action} produced output above the 1 MiB bounded-response limit")
     return result
 
 
@@ -377,7 +418,8 @@ def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None) ->
 
 
 def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRequest, options: AzureRuntimeOptions,
-                    runner: CommandRunner, *, clock: Callable[[], float], utc_now: Callable[[], datetime]) -> ExpiryEvidence:
+                    runner: CommandRunner, *, clock: Callable[[], float], utc_now: Callable[[], datetime],
+                    sleep: Callable[[float], None]) -> ExpiryEvidence:
     """Prepare/read back Automation and bind one UTC job before pair creation."""
     now = utc_now().astimezone(UTC); mono = clock()
     name, ids = _validate_request(deployment, options, now, mono)
@@ -428,7 +470,17 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     _command(runner, options, root, _azure_rest("PUT", base, runbook), "runbook_draft", clock)
     _command(runner, options, root, ["az", "rest", "--method", "PUT", "--url", f"{account}/runbooks/{rb}/draft/content?api-version={AUTOMATION_API}", "--headers", "Content-Type=text/powershell", "--body", script], "runbook_content", clock)
     _command(runner, options, root, _azure_rest("POST", f"{account}/runbooks/{rb}/publish?api-version={AUTOMATION_API}"), "runbook_publish", clock)
-    published = json.loads(_command(runner, options, root, _azure_rest("GET", base), "runbook_readback", clock).stdout or "{}")
+    publish_wall_deadline=time.monotonic()+options.command_timeout_seconds
+    publish_mono_deadline=min(options.cap_deadline_monotonic,mono+options.command_timeout_seconds)
+    published={}
+    while True:
+        published = json.loads(_command(runner, options, root, _azure_rest("GET", base), "runbook_readback", clock).stdout or "{}")
+        if published.get("properties", {}).get("state") == "Published":
+            break
+        remaining=min(publish_mono_deadline-clock(),publish_wall_deadline-time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("runbook publication did not reach Published within the original command deadline")
+        sleep(min(options.poll_seconds,remaining))
     content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{rb}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "published_content_readback", clock)
     digest = hashlib.sha256(content.stdout.encode()).hexdigest()
     if published.get("properties", {}).get("state") != "Published" or digest != hashlib.sha256(script.encode()).hexdigest():
@@ -467,7 +519,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     roles = json.loads(_command(runner, options, root, ["az", "role", "definition", "list", "--name", name+"-deallocate-only", "--output", "json"], "role_definition_readback", clock).stdout or "[]")
     role = next((x for x in roles if x.get("id", "").lower() == expiry_ids["role_definition_id"].lower()), None)
     permissions = role.get("permissions", []) if role else []
-    if (role is None or role.get("assignableScopes") != [expiry_ids["resource_group_id"]]
+    if (role is None or [scope.lower() for scope in role.get("assignableScopes",[])] != [expiry_ids["resource_group_id"].lower()]
             or len(permissions) != 1 or sorted(permissions[0].get("actions", [])) != sorted(ROLE_ACTIONS)
             or permissions[0].get("notActions", []) or permissions[0].get("dataActions", [])
             or permissions[0].get("notDataActions", [])):
@@ -481,6 +533,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     if trigger <= registered_at + timedelta(seconds=options.post_registration_workflow_seconds):
         raise ValueError("post-registration workflow no longer fits actual trigger")
     metadata = {"mechanism":"azure_automation_once_deallocate","api_version":AUTOMATION_API,"resource_group":name,
+        "reservation_id":reservation.reservation_id.value,"source_sha256":reservation.source_sha256,
         "runbook":rb,"schedule":sched,"job_schedule_id":job_id,"trigger":trigger.isoformat(),"target_ids":ids,
         "published_content_sha256":digest,"runtime":"PowerShell 5.1","module":{"name":"Az.Accounts","version":module_props["version"]},
         "managed_identity_principal_id":expiry_ids["principal_id"],"role_assignment_id":expiry_ids["role_assignment_id"],
@@ -508,7 +561,13 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     expected_account = f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
     if (account != expected_account or m.get("resource_group") != _slug(deployment)
             or m.get("target_ids") is None or m.get("role_actions") != ROLE_ACTIONS
-            or m.get("role_scope") != m.get("resource_group_id")):
+            or m.get("role_scope") != m.get("resource_group_id")
+            or m.get("reservation_id") != deployment.reservation.value.reservation_id.value
+            or m.get("source_sha256") != deployment.reservation.value.source_sha256
+            or m.get("retry_end_at") != options.retry_end_at.isoformat()
+            or m.get("price_input") != options.expiry_cost_input
+            or datetime.fromisoformat(m.get("trigger","").replace("Z","+00:00")).astimezone(UTC) != expiry.expires_at.value
+            or expiry.registration_id.value != f"{account}/jobSchedules/{m.get('job_schedule_id')}?api-version={AUTOMATION_API}"):
         raise ValueError("expiry account, exact targets or narrow permission evidence is missing")
     expected_ids = [f"/subscriptions/{options.subscription_id}/resourceGroups/{m['resource_group']}/providers/Microsoft.Compute/virtualMachines/{m['resource_group']}-{role}" for role in ("a", "b")]
     if m.get("target_ids") != expected_ids or expiry.target_selector != ";".join(expected_ids):
@@ -528,17 +587,20 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
         raise RuntimeError("registered expiry schedule is disabled or has changed")
     job_url = f"{account}/jobSchedules/{m['job_schedule_id']}?api-version={AUTOMATION_API}"
     job = json.loads(_command(runner, options, root, _azure_rest("GET", job_url), "expiry_binding_recheck", clock).stdout or "{}")
-    params = {key.lower():value for key,value in job.get("properties", {}).get("parameters", {}).items()}
-    if params != m.get("binding_readback") or job.get("properties", {}).get("runbook", {}).get("name") != m.get("runbook") or job.get("properties", {}).get("schedule", {}).get("name") != m.get("schedule"):
+    if (job.get("id","").lower()!=job_url.split("?",1)[0].lower()
+            or job.get("properties", {}).get("parameters", {}) != m.get("binding_readback")
+            or job.get("properties", {}).get("runbook", {}).get("name") != m.get("runbook")
+            or job.get("properties", {}).get("schedule", {}).get("name") != m.get("schedule")):
         raise RuntimeError("registered expiry job binding changed")
     assignments = json.loads(_command(runner, options, root, ["az", "role", "assignment", "list", "--scope", m["resource_group_id"], "--all", "--output", "json"], "expiry_role_recheck", clock).stdout or "[]")
     assignment = next((x for x in assignments if x.get("id", "").lower() == m.get("role_assignment_id", "").lower()), None)
-    if assignment is None or assignment.get("principalId", "").lower() != m.get("managed_identity_principal_id", "").lower():
+    if (assignment is None or assignment.get("principalId", "").lower() != m.get("managed_identity_principal_id", "").lower()
+            or assignment.get("scope","").lower()!=m.get("resource_group_id","").lower()):
         raise RuntimeError("registered expiry role assignment is absent or changed")
     roles = json.loads(_command(runner, options, root, ["az", "role", "definition", "list", "--name", m["resource_group"]+"-deallocate-only", "--output", "json"], "expiry_role_definition_recheck", clock).stdout or "[]")
     role = next((x for x in roles if x.get("id", "").lower() == m.get("role_definition_id", "").lower()), None)
     permissions = role.get("permissions", []) if role else []
-    if (role is None or role.get("assignableScopes") != [m["resource_group_id"]] or len(permissions) != 1
+    if (role is None or [scope.lower() for scope in role.get("assignableScopes",[])] != [m["resource_group_id"].lower()] or len(permissions) != 1
             or sorted(permissions[0].get("actions", [])) != sorted(ROLE_ACTIONS)
             or permissions[0].get("notActions", []) or permissions[0].get("dataActions", [])
             or permissions[0].get("notDataActions", [])):
@@ -548,7 +610,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
 
 
 def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest, options: AzureRuntimeOptions,
-                    runner: CommandRunner, *, clock: Callable[[], float], utc_now: Callable[[], datetime]) -> ExpiryEvidence:
+                    runner: CommandRunner, *, clock: Callable[[], float], utc_now: Callable[[], datetime],
+                    sleep: Callable[[float], None] = time.sleep) -> ExpiryEvidence:
     """Register expiry and convert post-mutation failures into durable failed evidence."""
     now = utc_now().astimezone(UTC)
     mono = clock()
@@ -575,7 +638,7 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
     try:
-        return _register_expiry_impl(deployment, request, options, runner, clock=clock, utc_now=utc_now)
+        return _register_expiry_impl(deployment, request, options, runner, clock=clock, utc_now=utc_now, sleep=sleep)
     except Exception as exc:
         root = options.attempt_root
         journal = root / "recovery.json"
@@ -628,7 +691,7 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
     now=utc_now().astimezone(UTC); mono=clock(); name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
         raise ValueError("Azure expiry price input date cannot be in the future")
-    root,journal=_workspace(options,deployment); state=json.loads(journal.read_text()); failures=[]; results=[]
+    root,journal=_workspace(options,deployment); state=json.loads(journal.read_text()); failures=[]; results=[]; apply=None; outputs=None; valid_outputs={}
     variables=build_pair_inputs(deployment,options)
     try:
         _verify_registered_expiry(deployment,options,root,runner,clock,now)
@@ -641,10 +704,11 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         outputs=json.loads(out.stdout)
         vms=[]; key_lines=[]
         for role in ("a","b"):
-            data=outputs["vm_"+role]["value"]
+            data=_validate_vm_output_data(deployment,options,role,outputs["vm_"+role]["value"],ids[0 if role=="a" else 1])
+            valid_outputs[role]=data
             command=_command(runner,options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts","cat /etc/ssh/ssh_host_ed25519_key.pub","--output","json"],"host_key_identity",clock)
             action=json.loads(command.stdout)
-            if action.get("resourceId") and action["resourceId"].lower() != ids[0 if role=="a" else 1].lower():
+            if not isinstance(action.get("resourceId"),str) or action["resourceId"].lower() != ids[0 if role=="a" else 1].lower():
                 raise ValueError("Run Command response resource identity mismatch")
             statuses=action.get("value",[])
             if not any(str(x.get("code", "")).lower().endswith("/succeeded") for x in statuses):
@@ -666,12 +730,23 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
             provider_metadata=StructuredEvidence(value={"purchase":"Regular","resource_group":name,"scenario":Scenario(deployment.scenario).value}),
             documented_network_limit=StructuredEvidence(value={"value":12500,"unit":"Mbps","kind":"maximum_aggregate","source":"Azure Dsv5 documentation","not_measured":True}),
             expiry=deployment.expiry)
-        return AzureProviderResult(deployment=output,expiry=deployment.expiry.value,actions=results,failures=[],recovery_reference=str(journal),cleanup_required=True)
+        _write_output_artifact(root,output)
+        return AzureProviderResult(deployment=output,expiry=deployment.expiry.value,actions=_journal_actions(journal),failures=[],recovery_reference=str(journal),cleanup_required=True)
     except Exception as exc:
         failures.append(FailureEvidence(category="azure_provision",message=_redact(options,exc)[:1000],occurred_at=utc_now(),details={"primary":True}))
         state=json.loads(journal.read_text()); state["failures"].append({"category":"azure_provision","message":_redact(options,exc)[:1000]}); _atomic_private(journal,state)
         expiry=deployment.expiry.value
-        return AzureProviderResult(expiry=expiry,actions=results,failures=failures,recovery_reference=str(journal),cleanup_required=True)
+        partial=None
+        if apply is not None and valid_outputs:
+            reason=_redact(options,exc)
+            vm_a=_partial_vm_output("a",valid_outputs["a"],reason) if "a" in valid_outputs else _partial_empty_vm("a",reason)
+            vm_b=_partial_vm_output("b",valid_outputs["b"],reason) if "b" in valid_outputs else _partial_empty_vm("b",reason)
+            partial=ProviderDeploymentOutput(schema_version=2,identity=_identity(deployment),run_id=deployment.run_id,deployment_id=deployment.deployment_id,
+                mode=deployment.mode,provider=Provider.AZURE,scenario=Scenario(deployment.scenario),apply_action_id=apply.action_id,
+                started_at=apply.started_at,finished_at=max(apply.finished_at,utc_now().astimezone(UTC)),vm_a=vm_a,vm_b=vm_b,
+                provider_metadata=StructuredEvidence(value={"purchase":"Regular","resource_group":name,"partial_failure":True}),
+                documented_network_limit=StructuredEvidence(value={"value":12500,"unit":"Mbps","kind":"maximum_aggregate","source":"Azure Dsv5 documentation","not_measured":True}),expiry=deployment.expiry)
+        return AzureProviderResult(deployment=partial,expiry=expiry,actions=_journal_actions(journal),failures=failures,recovery_reference=str(journal),cleanup_required=True)
 
 
 def _identity(d: ProviderDeploymentInput) -> IdentityContext:
@@ -686,6 +761,47 @@ def _vm_output(d: ProviderDeploymentInput, role: str, data: dict[str,Any], key: 
     return ProviderVmOutput(role=vmrole,resource_id=data["id"],private_ipv4=data["private_ipv4"],image_identity=data["image"],actual_shape=data["size"],
         region=data["region"],zone=str(data["zone"]),placement_metadata=StructuredEvidence(value={"ppg":data.get("ppg") or "none","accelerated_networking":data["accelerated_networking"]}),
         connection=conn,public_ipv4=Evidence(value=data["public_ipv4"]),physical_zone_id=StringEvidence(unavailable_reason="Azure logical zones do not establish cross-subscription physical identity"))
+
+
+def _validate_vm_output_data(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, role: str,
+                             data: object, expected_id: str) -> dict[str, Any]:
+    if not isinstance(data,dict): raise ValueError(f"Terraform output for VM {role.upper()} is missing or malformed")
+    intent=deployment.vm_a if role=="a" else deployment.vm_b
+    expected_private="10.71.0.4" if role=="b" and intent.region=="uksouth" else ("10.70.0.4" if role=="a" else "10.70.0.5")
+    if not isinstance(data.get("id"),str) or data["id"].lower()!=expected_id.lower():
+        raise ValueError(f"Terraform output VM {role.upper()} resource identity mismatch")
+    if data.get("size")!="Standard_D4s_v5" or data.get("region")!=intent.region or str(data.get("zone"))!=intent.zone:
+        raise ValueError(f"Terraform output VM {role.upper()} shape or locality mismatch")
+    if data.get("image")!=options.selected_image or data.get("accelerated_networking") is not True:
+        raise ValueError(f"Terraform output VM {role.upper()} image or Accelerated Networking evidence mismatch")
+    expected_ppg=deployment.placement.name if deployment.scenario==Scenario.PLACEMENT_OPTIMIZATION else None
+    if data.get("ppg")!=expected_ppg:
+        raise ValueError(f"Terraform output VM {role.upper()} placement evidence mismatch")
+    private=ipaddress.ip_address(data.get("private_ipv4", ""))
+    public=ipaddress.ip_address(data.get("public_ipv4", ""))
+    if private.version!=4 or not private.is_private or str(private)!=expected_private:
+        raise ValueError(f"Terraform output VM {role.upper()} private address mismatch")
+    if public.version!=4 or public.is_private or public.is_reserved or public.is_loopback or public.is_multicast:
+        raise ValueError(f"Terraform output VM {role.upper()} public address is invalid")
+    return data
+
+
+def _partial_vm_output(role: str, data: dict[str,Any], reason: str) -> ProviderVmOutput:
+    vmrole=VmRole.VM_A if role=="a" else VmRole.VM_B
+    resource_id=data["id"]
+    public=data.get("public_ipv4")
+    return ProviderVmOutput(role=vmrole,resource_id=resource_id,private_ipv4=data.get("private_ipv4"),image_identity=data.get("image"),
+        actual_shape=data.get("size"),region=data.get("region"),zone=str(data["zone"]) if data.get("zone") is not None else None,
+        placement_metadata=StructuredEvidence(value={"ppg":data.get("ppg"),"accelerated_networking":data.get("accelerated_networking")}),
+        connection=None,unavailable=StructuredEvidence(value={"reason":reason}),
+        public_ipv4=Evidence(value=public) if public else Evidence(unavailable_reason="public IPv4 was not returned"))
+
+
+def _partial_empty_vm(role: str, reason: str) -> ProviderVmOutput:
+    vmrole=VmRole.VM_A if role=="a" else VmRole.VM_B
+    return ProviderVmOutput(role=vmrole,resource_id=None,private_ipv4=None,image_identity=None,actual_shape=None,region=None,zone=None,
+        placement_metadata=StructuredEvidence(unavailable_reason="provider output unavailable"),connection=None,
+        unavailable=StructuredEvidence(value={"reason":reason}),public_ipv4=Evidence(unavailable_reason="provider output unavailable"))
 
 
 def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
@@ -711,12 +827,18 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         inventory=_command(runner,options,root,["az","resource","list","--resource-group",state["resource_group"],"--output","json"],"pair_inventory",clock)
         actions.append(inventory.durable_view())
         found=json.loads(inventory.stdout or "[]")
-        allowed_expiry_types={"microsoft.automation/automationaccounts","microsoft.authorization/roleassignments","microsoft.authorization/roledefinitions"}
+        metadata=state.get("expiry",{}).get("metadata",{})
+        allowed_expiry_ids={str(metadata.get(k,"")).lower() for k in ("automation_account_id","role_assignment_id","role_definition_id")}
+        if metadata:
+            account=str(metadata.get("automation_account_id",""))
+            for collection,key in (("runbooks","runbook"),("schedules","schedule"),("jobSchedules","job_schedule_id")):
+                if account and metadata.get(key):
+                    allowed_expiry_ids.add(f"{account}/{collection}/{metadata[key]}".lower())
         residual=[]
         for item in found:
             resource={"id":item.get("id"),"type":item.get("type"),"state":"present","source":inventory.action_id}
             resources.append(resource)
-            if str(item.get("type","")).lower() not in allowed_expiry_types:
+            if str(item.get("id","")).lower() not in allowed_expiry_ids:
                 residual.append(item.get("id", "unknown"))
         if residual:
             raise RuntimeError("VMs or pair resources remain after pair destroy: " + ", ".join(str(x) for x in residual))
