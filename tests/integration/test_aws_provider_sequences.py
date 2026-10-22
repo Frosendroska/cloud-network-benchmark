@@ -11,7 +11,7 @@ from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRe
 from cloud_network_benchmark.contracts.common import CommandOutcome, Evidence, StringEvidence, StructuredEvidence
 from cloud_network_benchmark.contracts.deployment import ProviderDeploymentInput
 from cloud_network_benchmark.contracts.execution import CommandResult
-from cloud_network_benchmark.providers.aws import AwsProviderDriver, AwsRuntimeSettings
+from cloud_network_benchmark.providers.aws import AwsProviderDriver, AwsProviderError, AwsRuntimeSettings
 
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -75,11 +75,12 @@ class RegistrationRunner:
             }
             document_name = f"expiry-{role_suffix}"
             stdout = json.dumps({"AutomationExecution": {
+                "AutomationExecutionId": f"exec-{region}",
                 "DocumentName": document_name, "DocumentVersion": "1",
                 "AutomationExecutionStatus": "InProgress", "CurrentAction": "aws:sleep",
                 "CurrentStepName": "waitUntilExpiry", "Parameters": parameters,
                 "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
-                    "StepStatus": "InProgress", "Inputs": {"Timestamp": parameters["ExpiryTriggerUtc"]}}],
+                    "StepStatus": "InProgress", "Inputs": {"Timestamp": parameters["ExpiryTriggerUtc"][0]}}],
             }})
         elif action.startswith("aws-expiry-read-terminal-"):
             stdout = json.dumps({"AutomationExecution": {"AutomationExecutionStatus": "Cancelled"}})
@@ -149,16 +150,17 @@ def test_lost_expiry_start_recovers_only_one_exact_inprogress_match(tmp_path):
         "DocumentName": "cnb-expiry",
         "DocumentVersion": "1",
         "AutomationExecutionStatus": "InProgress",
+        "AutomationExecutionId": "exec-1",
         "CurrentAction": "aws:sleep",
         "CurrentStepName": "waitUntilExpiry",
         "Parameters": params,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": ["2026-10-22T12:14:00Z"]}}],
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": "2026-10-22T12:14:00Z"}}],
     }
     described = {"AutomationExecutionMetadataList": [{"AutomationExecutionId": "exec-1"}]}
     runner = QueueRunner([
         (1, "", "response lost"),
         (0, json.dumps(described), ""),
-        (0, json.dumps({"AutomationExecution": {**execution, "Parameters": {**params, "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "Region": ["eu-central-1"]}}}), ""),
+        (0, json.dumps({"AutomationExecution": {**execution, "AutomationExecutionId": "exec-1", "Parameters": {**params, "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "Region": ["eu-central-1"]}}}), ""),
     ])
     driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
     recovered = driver._start_or_recover_automation(
@@ -254,9 +256,18 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
         def run(self, request):
             self.actions.append(request.action_id)
             outcome = apply_outcome if request.action_id == "aws-pair-apply" else CommandOutcome.SUCCEEDED
+            stdout = json.dumps({"AutomationExecution": {"AutomationExecutionStatus": "Cancelled"}}) if "expiry-read-terminal" in request.action_id or "expiry-confirm-cancel" in request.action_id else ""
+            if "aws-expiry-document-absence" in request.action_id:
+                outcome = CommandOutcome.FAILED
+                stderr = "An error occurred (InvalidDocument)"
+            elif "aws-expiry-role-absence" in request.action_id:
+                outcome = CommandOutcome.FAILED
+                stderr = "An error occurred (NoSuchEntity)"
+            else:
+                stderr = "apply failed" if outcome != CommandOutcome.SUCCEEDED else ""
             return CommandResult(action_id=request.action_id, outcome=outcome, started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=1 if outcome == CommandOutcome.FAILED else None if outcome != CommandOutcome.SUCCEEDED else 0,
-                stdout="", stderr="apply failed" if outcome != CommandOutcome.SUCCEEDED else "")
+                stdout=stdout, stderr=stderr)
 
     runner = TimeoutRunner()
     driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
@@ -266,15 +277,17 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
         registration_id=Evidence[str](value="aws-ssm:campaign-aws-deployment"),
         registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
         expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
-        target_selector="account=123456789012;regions=eu-central-1,eu-west-2;tags=attempt",
-        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {}}),
+        target_selector=driver._target_selector(deployment, ["eu-central-1", "eu-west-2"]),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {"eu-central-1": "exec-eu-central-1", "eu-west-2": "exec-eu-west-2"}}),
     )
     deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry)})
     attempt = driver._attempt_dir(deployment)
     driver._save_journal(attempt, {
         "schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
         "registered": True, "regions": ["eu-central-1", "eu-west-2"], "registered_regions": ["eu-central-1", "eu-west-2"],
-        "executions": {}, "safety": {}, "expiry_evidence": expiry.model_dump(mode="json"),
+        "executions": {"eu-central-1": "exec-eu-central-1", "eu-west-2": "exec-eu-west-2"}, "safety": {region: {"document_name": f"expiry-{region}", "document_version": "1", "role_arn": f"arn:aws:iam::123456789012:role/expiry-{region}"} for region in ("eu-central-1", "eu-west-2")}, "expiry_evidence": expiry.model_dump(mode="json"),
+        "reservation_id": deployment.reservation.value.reservation_id.value,
+        "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expiry.expires_at.value.isoformat(),
     })
     driver._confirm_automation = lambda *_args: {}
     driver._inventory_region = lambda _deployment, _region, _failures: {"complete": True, "remaining": {}, "resources": {}}
@@ -284,7 +297,8 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
         assert "apply failed" in str(exc)
     else:
         raise AssertionError("timed-out apply must preserve its primary failure")
-    assert runner.actions == ["aws-pair-apply", "aws-pair-destroy"]
+    assert runner.actions[:2] == ["aws-pair-apply", "aws-pair-destroy"]
+    assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == "terraform_apply"
     assert journal["cleanup_state"] == "succeeded"
@@ -308,8 +322,13 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
                     finished_at=NOW, duration_seconds=0,
                     exit_code=1 if output_outcome == CommandOutcome.FAILED else None if output_outcome != CommandOutcome.SUCCEEDED else 0,
                     stdout="{}", stderr="output failed")
+            stdout = json.dumps({"AutomationExecution": {"AutomationExecutionStatus": "Cancelled"}}) if "expiry-read-terminal" in request.action_id or "expiry-confirm-cancel" in request.action_id else ""
+            if "aws-expiry-document-absence" in request.action_id:
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW, finished_at=NOW, duration_seconds=0, exit_code=254, stdout="", stderr="An error occurred (InvalidDocument)")
+            if "aws-expiry-role-absence" in request.action_id:
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW, finished_at=NOW, duration_seconds=0, exit_code=254, stdout="", stderr="An error occurred (NoSuchEntity)")
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
 
     runner = OutputFailureRunner()
     driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
@@ -319,16 +338,18 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
         registration_id=Evidence[str](value="aws-ssm:campaign-aws-deployment"),
         registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
         expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
-        target_selector="account=123456789012;regions=eu-central-1,eu-west-2;tags=attempt",
-        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {}}),
+        target_selector=driver._target_selector(deployment, ["eu-central-1", "eu-west-2"]),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {"eu-central-1": "exec-eu-central-1", "eu-west-2": "exec-eu-west-2"}}),
     )
     deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry)})
     attempt = driver._attempt_dir(deployment)
     driver._save_journal(attempt, {
         "schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
         "registered": True, "regions": ["eu-central-1", "eu-west-2"],
-        "registered_regions": ["eu-central-1", "eu-west-2"], "executions": {}, "safety": {},
+        "registered_regions": ["eu-central-1", "eu-west-2"], "executions": {"eu-central-1": "exec-eu-central-1", "eu-west-2": "exec-eu-west-2"}, "safety": {region: {"document_name": f"expiry-{region}", "document_version": "1", "role_arn": f"arn:aws:iam::123456789012:role/expiry-{region}"} for region in ("eu-central-1", "eu-west-2")},
         "expiry_evidence": expiry.model_dump(mode="json"),
+        "reservation_id": deployment.reservation.value.reservation_id.value,
+        "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expiry.expires_at.value.isoformat(),
     })
     driver._confirm_automation = lambda *_args: {}
     driver._inventory_region = lambda _deployment, _region, _failures: {"complete": True, "remaining": {}, "resources": {}}
@@ -341,7 +362,8 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
             assert "AWS pair Terraform output failed" in str(exc)
     else:
         raise AssertionError("missing output must fail the attempt")
-    assert runner.actions == ["aws-pair-apply", "aws-pair-output", "aws-pair-destroy"]
+    assert runner.actions[:3] == ["aws-pair-apply", "aws-pair-output", "aws-pair-destroy"]
+    assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == ("output_invalid" if output_outcome == CommandOutcome.SUCCEEDED else "terraform_output")
     assert journal["cleanup_state"] == "succeeded"
@@ -401,7 +423,7 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
         registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
         expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
         target_selector=driver._target_selector(deployment, regions),
-        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {}}),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: f"exec-{region}" for region in regions}}),
     )
     deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry)})
     attempt = driver._attempt_dir(deployment)
@@ -413,6 +435,8 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
         "safety": {region: {"document_name": f"expiry-{region}", "document_version": "1",
             "role_arn": f"arn:aws:iam::123456789012:role/expiry-{region}"} for region in regions},
         "expiry_evidence": expiry.model_dump(mode="json"),
+        "reservation_id": deployment.reservation.value.reservation_id.value,
+        "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expiry.expires_at.value.isoformat(),
     })
     driver._confirm_automation = lambda region, *_args: sequence.append(f"expiry-confirm-{region}")
     driver._verify_observed_instance = lambda expected, *_args: expected
@@ -511,3 +535,71 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
     retried = driver.cleanup(deployment)
     assert retried.cleanup_state == "succeeded"
     assert runner.destroy_attempts == 2
+
+
+def test_cleanup_records_cancelled_terminal_state_and_action_outputs(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
+
+    class TerminalRunner:
+        def run(self, request):
+            if request.action_id.startswith("aws-expiry-read-terminal-"):
+                output = {"AutomationExecution": {"AutomationExecutionStatus": "Cancelled", "Outputs": {"stop_requests": ["i-one"]}}}
+            else:
+                output = {}
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=json.dumps(output), stderr="")
+
+    driver = AwsProviderDriver(TerminalRunner(), settings, clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    regions = driver._regions(deployment)
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
+        provider="aws", action="stop", state="registered",
+        registration_id=Evidence[str](value=f"aws-ssm:{deployment.deployment_id}"),
+        registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
+        expires_at=Evidence[datetime](value=NOW + timedelta(seconds=600)),
+        target_selector=driver._target_selector(deployment, regions),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {regions[0]: "exec-one"}}))
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
+        "executions": {regions[0]: "exec-one"}, "safety": {},
+        "expiry_evidence": expiry.model_dump(mode="json")})
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.expiry.value.state == "cancelled"
+    assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["action_outputs"] == {"stop_requests": ["i-one"]}
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_provision_revalidates_registered_evidence_and_time_after_readback(tmp_path, tamper):
+    deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
+    region = "eu-central-1"
+    driver_clock = [NOW]
+    runner = RegistrationRunner()
+    driver = AwsProviderDriver(runner, settings, clock=lambda: driver_clock[0])
+    expires = NOW + timedelta(seconds=840)
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
+        provider="aws", action="stop", state="registered",
+        registration_id=Evidence[str](value=f"aws-ssm:{deployment.deployment_id}"),
+        registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
+        expires_at=Evidence[datetime](value=expires),
+        target_selector=driver._target_selector(deployment, [region]),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: f"exec-{region}"}}))
+    deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry)})
+    attempt = driver._attempt_dir(deployment)
+    safety = {region: {"document_name": f"expiry-{region}", "document_version": "1", "role_arn": f"arn:aws:iam::123456789012:role/expiry-{region}"}}
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "registered": True, "regions": [region], "registered_regions": [region],
+        "executions": {region: f"exec-{region}"}, "safety": safety,
+        "reservation_id": deployment.reservation.value.reservation_id.value,
+        "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(),
+        "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expires.isoformat(),
+        "expiry_evidence": expiry.model_dump(mode="json")})
+    driver._confirm_automation = lambda *_args: (driver_clock.__setitem__(0, expires) if not tamper else None) or {}
+    if tamper:
+        deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry.model_copy(update={"target_selector": "other-attempt"}))})
+    with pytest.raises(AwsProviderError, match="differs|no longer fits"):
+        driver.provision(deployment)
+    assert not any(action == "aws-pair-apply" for action in runner.actions)

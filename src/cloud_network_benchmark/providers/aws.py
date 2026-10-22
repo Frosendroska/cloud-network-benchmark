@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import ipaddress
 import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,11 +148,15 @@ class AwsProviderDriver:
         self.clock = clock
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
+        self._registration_deadline: float | None = None
+        self._precreate_deadline: float | None = None
+        self._active_primary_failure: FailureEvidence | None = None
 
     def register_expiry(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ExpiryEvidence:
         """Create and read back protection in all regions before any pair command."""
         _validate_deployment(deployment)
         try:
+            self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
             regions, reservation, trigger = self._validate_registration(deployment, request)
             attempt = self._attempt_dir(deployment)
             self._active_attempt = attempt
@@ -168,6 +172,7 @@ class AwsProviderDriver:
             journal.update({
                 "cap_started_at": reservation.cap_started_at.value.isoformat(),
                 "cap_expires_at": reservation.expires_at.value.isoformat(),
+                "reservation_id": reservation.reservation_id.value,
                 "expiry_trigger": trigger.isoformat(),
                 "regions": regions,
                 "registered_regions": [],
@@ -203,7 +208,13 @@ class AwsProviderDriver:
                         )
                     journal["executions"][region] = execution_id
                     self._save_journal(attempt, journal)
-                self._confirm_automation(region, execution_id, outputs[region], expected)
+                execution = self._confirm_automation(region, execution_id, outputs[region], expected)
+                journal.setdefault("regional_expiry_outcomes", {})[region] = {
+                    "execution_id": execution_id,
+                    "state": execution.get("AutomationExecutionStatus"),
+                    "current_action": execution.get("CurrentAction"),
+                    "current_step": execution.get("CurrentStepName"),
+                }
                 if region not in journal["registered_regions"]:
                     journal["registered_regions"].append(region)
                 self._save_journal(attempt, journal)
@@ -290,18 +301,39 @@ class AwsProviderDriver:
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         self._active_commands = []
+        self._active_primary_failure = None
         journal = self._load_journal(attempt, deployment)
         self._block_on_residual_cleanup(deployment)
         if not journal.get("registered") or set(journal.get("registered_regions", [])) != set(self._regions(deployment)):
             raise AwsProviderError("private expiry journal does not confirm every involved region", category="expiry_required")
+        registered = self._expiry_from_journal(deployment, journal)
+        if registered is None or deployment.expiry.value is None or registered.model_dump(mode="json") != deployment.expiry.value.model_dump(mode="json"):
+            raise AwsProviderError("supplied expiry evidence differs from the private registered evidence", category="expiry_identity_mismatch")
+        reservation = deployment.reservation.value
+        regions = self._regions(deployment)
+        if reservation is None or journal.get("reservation_id") != reservation.reservation_id.value or journal.get("cap_started_at") != reservation.cap_started_at.value.isoformat() or journal.get("cap_expires_at") != reservation.expires_at.value.isoformat() or set(journal.get("executions", {})) != set(regions):
+            raise AwsProviderError("reservation or exact regional execution identity changed after registration", category="expiry_identity_mismatch")
+        metadata = registered.provider_metadata.value or {}
+        if registered.registration_id.value != f"aws-ssm:{deployment.deployment_id}" or metadata.get("regional_execution_ids") != journal.get("executions"):
+            raise AwsProviderError("registration ID or regional execution IDs differ from the protected journal", category="expiry_identity_mismatch")
+        if registered.target_selector != self._target_selector(deployment, regions) or registered.expires_at.value is None or registered.expires_at.value.isoformat() != journal.get("expiry_trigger"):
+            raise AwsProviderError("expiry selector or trigger differs from the registered journal", category="expiry_identity_mismatch")
         now = self.clock().astimezone(timezone.utc)
         trigger = deployment.expiry.value.expires_at.value
         if trigger is None or now >= trigger:
             raise AwsProviderError("AWS expiry trigger has passed", category="cap_expired")
         if self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
             raise AwsProviderError("complete remaining workflow does not fit before the earlier expiry trigger", category="cap_insufficient")
+        slack = (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds
+        if slack <= 0:
+            raise AwsProviderError("no command budget remains before reserving the complete workflow", category="cap_insufficient")
+        self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
         for region, execution_id in journal["executions"].items():
             self._confirm_automation(region, execution_id, journal["safety"][region], self._automation_parameters(deployment, region, trigger, journal["safety"][region]["role_arn"]))
+        now = self.clock().astimezone(timezone.utc)
+        if now >= trigger or self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
+            raise AwsProviderError("complete remaining workflow no longer fits after expiry readback", category="cap_insufficient")
+        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds)
 
         variables = self._pair_variables(deployment)
         vars_path = attempt / "pair.tfvars.json"
@@ -316,7 +348,7 @@ class AwsProviderDriver:
             apply_result = self._run(
                 "aws-pair-apply",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-                self.settings.command_timeout_seconds,
+                max(1, min(self.settings.command_timeout_seconds, int((trigger - self.clock().astimezone(timezone.utc)).total_seconds()))),
                 cwd=attempt,
             )
             _restrict_private_file(Path(state_path))
@@ -334,6 +366,8 @@ class AwsProviderDriver:
             output = raw.get("deployment", {}).get("value")
             if not isinstance(output, dict):
                 raise AwsProviderError("Terraform output is missing deployment.value", category="output_invalid")
+            journal["known_resource_ids"] = _known_resource_ids(output)
+            self._save_journal(attempt, journal)
             normalized = self._normalize_output(deployment, output, apply_result.started_at, apply_result.finished_at)
             self._write_private(attempt / "terraform-outputs.redacted.json", json.dumps(_redacted_output(output), indent=2, sort_keys=True).encode())
             journal["provisioned"] = True
@@ -346,10 +380,25 @@ class AwsProviderDriver:
                 _restrict_private_file(Path(state_path))
             except (OSError, AwsProviderError):
                 pass
-            journal["primary_failure"] = _failure(exc, self.clock()).model_dump(mode="json")
-            self._save_journal(attempt, journal)
+            self._active_primary_failure = _failure(exc, self.clock())
+            journal["primary_failure"] = self._active_primary_failure.model_dump(mode="json")
+            try:
+                self._save_journal(attempt, journal)
+            except Exception as journal_exc:
+                journal.setdefault("secondary_failures", []).append(_failure(journal_exc, self.clock()).model_dump(mode="json"))
+                journal["cleanup_state"] = "failed"
+                journal["launch_blocked"] = True
             # Once an apply could have started, every failure path invokes normal cleanup.
-            self.cleanup(deployment)
+            try:
+                self.cleanup(deployment)
+            except Exception as cleanup_exc:
+                try:
+                    journal.setdefault("secondary_failures", []).append(_failure(cleanup_exc, self.clock()).model_dump(mode="json"))
+                    journal["cleanup_state"] = "failed"
+                    journal["launch_blocked"] = True
+                    self._save_journal(attempt, journal)
+                except Exception:
+                    pass
             raise
 
     def cleanup(self, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
@@ -358,7 +407,7 @@ class AwsProviderDriver:
         self._active_commands = []
         journal = self._load_journal(attempt, deployment)
         failures: list[FailureEvidence] = []
-        primary = FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None
+        primary = FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else self._active_primary_failure
         inventory_by_region: dict[str, Any] = {}
         regions = journal.get("regions") or self._regions(deployment)
 
@@ -366,16 +415,23 @@ class AwsProviderDriver:
             state_path = Path(journal.get("pair_state_path", attempt / "pair.tfstate"))
             vars_path = attempt / "pair.tfvars.json"
             if vars_path.exists():
-                result = self._run(
-                    "aws-pair-destroy",
-                    [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "destroy", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-                    self.settings.command_timeout_seconds,
-                    cwd=attempt,
-                )
-                if not _succeeded(result):
-                    failures.append(_failure(AwsProviderError("AWS pair Terraform destroy failed", category="terraform_destroy", action_id="aws-pair-destroy"), self.clock()))
+                try:
+                    result = self._run(
+                        "aws-pair-destroy",
+                        [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "destroy", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
+                        self.settings.command_timeout_seconds,
+                        cwd=attempt,
+                    )
+                    if not _succeeded(result):
+                        failures.append(_failure(AwsProviderError("AWS pair Terraform destroy failed", category="terraform_destroy", action_id="aws-pair-destroy"), self.clock()))
+                except Exception as exc:
+                    failures.append(_failure(exc, self.clock()))
             for region in regions:
-                inventory_by_region[region] = self._inventory_region(deployment, region, failures)
+                try:
+                    inventory_by_region[region] = self._inventory_region(deployment, region, failures)
+                except Exception as exc:
+                    failures.append(_failure(exc, self.clock()))
+                    inventory_by_region[region] = {"complete": False, "remaining": {"inventory": ["inventory_unknown"]}, "resources": {}}
             if any(not item.get("complete") or item.get("remaining") for item in inventory_by_region.values()):
                 failure = _failure(AwsProviderError("AWS resource inventory is unknown or contains leftovers", category="inventory_incomplete"), self.clock())
                 return self._failed_cleanup(inventory_by_region, failures, primary, failure, deployment)
@@ -385,9 +441,18 @@ class AwsProviderDriver:
             execution_id = journal.get("executions", {}).get(region)
             if execution_id:
                 try:
-                    self._cancel_or_confirm_terminal(region, execution_id)
+                    outcome = self._cancel_or_confirm_terminal(region, execution_id)
+                    state = outcome["state"]
+                    journal.setdefault("regional_expiry_outcomes", {})[region] = {"execution_id": execution_id, **outcome}
+                    if state == "Cancelled":
+                        journal["expiry_cancelled_regions"] = sorted(set(journal.get("expiry_cancelled_regions", [])) | {region})
                 except Exception as exc:
                     failures.append(_failure(exc, self.clock()))
+        journal["commands"] = list(self._active_commands)
+        try:
+            self._save_journal(attempt, journal)
+        except Exception as exc:
+            failures.append(_failure(exc, self.clock()))
         if failures:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
@@ -396,14 +461,22 @@ class AwsProviderDriver:
             if region not in journal.get("safety", {}):
                 safety_absent[region] = True
                 continue
-            result = self._run(
+            try:
+                result = self._run(
                 f"aws-safety-destroy-{region}",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "destroy", "-input=false", "-auto-approve", f"-state={attempt / f'safety-{region}.tfstate'}", f"-var-file={attempt / f'safety-{region}.tfvars.json'}"],
                 self.settings.command_timeout_seconds,
                 cwd=attempt,
-            )
-            terraform_destroyed = _succeeded(result)
-            safety_absent[region] = self._verify_safety_absent(region, journal["safety"][region])
+                )
+                terraform_destroyed = _succeeded(result)
+            except Exception as exc:
+                failures.append(_failure(exc, self.clock()))
+                terraform_destroyed = False
+            try:
+                safety_absent[region] = self._verify_safety_absent(region, journal["safety"][region])
+            except Exception as exc:
+                failures.append(_failure(exc, self.clock()))
+                safety_absent[region] = False
             if not terraform_destroyed:
                 failures.append(_failure(AwsProviderError(f"AWS safety Terraform cleanup failed in {region}", category="safety_destroy", action_id=f"aws-safety-destroy-{region}"), self.clock()))
             if not safety_absent[region]:
@@ -411,11 +484,19 @@ class AwsProviderDriver:
         journal["last_cleanup_inventory"] = inventory_by_region
         journal["commands"] = list(self._active_commands)
         journal["cleanup_attempted_at"] = self.clock().astimezone(timezone.utc).isoformat()
-        self._save_journal(attempt, journal)
+        try:
+            self._save_journal(attempt, journal)
+        except Exception as exc:
+            failures.append(_failure(exc, self.clock()))
         if failures:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
         expiry = self._expiry_from_journal(deployment, journal)
+        if expiry and journal.get("regional_expiry_outcomes"):
+            outcomes = journal["regional_expiry_outcomes"]
+            state = "cancelled" if all(item.get("state") == "Cancelled" for item in outcomes.values()) else "triggered"
+            expiry = expiry.model_copy(update={"state": state, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
+            journal["expiry_evidence"] = expiry.model_dump(mode="json")
         result = AwsCleanupResult(
             cleanup_state=CleanupState.SUCCEEDED if journal.get("creation_may_have_started") else CleanupState.NOT_REQUIRED,
             inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "complete": True}),
@@ -423,7 +504,11 @@ class AwsProviderDriver:
             primary_failure=primary,
         )
         journal["cleanup_state"] = result.cleanup_state.value if hasattr(result.cleanup_state, "value") else result.cleanup_state
-        self._save_journal(attempt, journal)
+        try:
+            self._save_journal(attempt, journal)
+        except Exception as exc:
+            failure = _failure(exc, self.clock())
+            return self._failed_cleanup(inventory_by_region, [*failures, failure], primary, failure, deployment)
         return result
 
     def _verify_safety_absent(self, region: str, safety: dict[str, str]) -> bool:
@@ -609,7 +694,7 @@ class AwsProviderDriver:
             )
             if _succeeded(result):
                 try:
-                    if _automation_matches(_json_execution(result.stdout), safety, params):
+                    if _automation_matches(_json_execution(result.stdout), safety, params, str(execution_id)):
                         matches.append(str(execution_id))
                 except (ValueError, AwsProviderError):
                     # A malformed candidate cannot establish ownership or permit pair creation.
@@ -617,17 +702,23 @@ class AwsProviderDriver:
         return matches[0] if len(matches) == 1 else None
 
     def _confirm_automation(self, region: str, execution_id: str, safety: dict[str, str], params: dict[str, list[str]]) -> dict[str, Any]:
-        result = self._run(
+        for _ in range(6):
+            result = self._run(
             f"aws-expiry-confirm-{region}",
             [self.settings.aws_cli, "ssm", "get-automation-execution", "--automation-execution-id", execution_id, "--region", region, "--output", "json"],
             self.settings.registration_timeout_seconds,
         )
-        if not _succeeded(result):
-            raise AwsProviderError(f"AWS expiry readback failed in {region}", category="expiry_readback", action_id=result.action_id)
-        execution = _json_execution(result.stdout)
-        if not _automation_matches(execution, safety, params):
-            raise AwsProviderError(f"AWS expiry readback is not confirmed running the expected sleep in {region}", category="expiry_readback_mismatch")
-        return execution
+            if not _succeeded(result):
+                raise AwsProviderError(f"AWS expiry readback failed in {region}", category="expiry_readback", action_id=result.action_id)
+            execution = _json_execution(result.stdout)
+            if execution.get("AutomationExecutionId") != execution_id:
+                raise AwsProviderError(f"AWS expiry readback execution ID differs in {region}", category="expiry_readback_mismatch")
+            if _automation_matches(execution, safety, params, execution_id):
+                return execution
+            if execution.get("AutomationExecutionStatus") != "Pending" or self._registration_deadline is not None and time.monotonic() >= self._registration_deadline:
+                raise AwsProviderError(f"AWS expiry readback is not confirmed running the expected sleep in {region}", category="expiry_readback_mismatch")
+            time.sleep(min(1, max(0, (self._registration_deadline or time.monotonic() + 1) - time.monotonic())))
+        raise AwsProviderError(f"AWS expiry remained Pending in {region}", category="expiry_readback_timeout")
 
     def _pair_variables(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
         scenario = str(deployment.scenario)
@@ -747,16 +838,22 @@ class AwsProviderDriver:
 
     def _verify_host_key(self, detail: dict[str, Any]) -> dict[str, str]:
         region, instance_id = detail["region"], detail["instance_id"]
-        response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region)
+        response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region, "--output", "json")
         if response.get("InstanceId") != instance_id:
             raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
-        try:
-            console = base64.b64decode(response.get("Output", ""), validate=True).decode("utf-8", "replace")
-        except (ValueError, TypeError):
+        console = response.get("Output")
+        if not isinstance(console, str):
             raise AwsProviderError("console output is malformed", category="host_identity_unavailable")
-        expected_boot = re.search(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
+        boots = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
         fingerprints = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", console)
-        if expected_boot is None or len(fingerprints) != 1:
+        timestamp = response.get("Timestamp")
+        launch_time = detail.get("launch_time")
+        try:
+            timestamp_value = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            launch_value = launch_time if isinstance(launch_time, datetime) else datetime.fromisoformat(str(launch_time).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            timestamp_value = launch_value = None
+        if timestamp_value is None or launch_value is None or timestamp_value < launch_value or len(boots) != 1 or len(fingerprints) != 1:
             raise AwsProviderError("authenticated console lacks one current boot and ED25519 host fingerprint", category="host_identity_unavailable")
         keyscan = self._run(
             f"aws-host-keyscan-{instance_id}",
@@ -782,7 +879,9 @@ class AwsProviderDriver:
         if not host_lines:
             raise AwsProviderError("keyscan produced no host key", category="host_keyscan")
         self._write_private(known_hosts, ("\n".join(host_lines) + "\n").encode())
-        return {"known_hosts_path": str(known_hosts), "boot_id": expected_boot.group(1), "fingerprint": fingerprints[0]}
+        trust = {"known_hosts_path": str(known_hosts), "boot_id": boots[0], "fingerprint": fingerprints[0], "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(timestamp)}
+        self._write_private(private_dir / f"{instance_id}.host-trust.json", json.dumps(trust, sort_keys=True).encode())
+        return trust
 
     def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str) -> dict[str, Any]:
         region = expected["region"]
@@ -867,6 +966,7 @@ class AwsProviderDriver:
             "image_owner_id": image["OwnerId"],
             "architecture": image["Architecture"],
             "shape": type_data["InstanceType"],
+            "launch_time": instance.get("LaunchTime"),
             "network_interface_count": len(networks),
             "root_volume_ids": [mapping.get("Ebs", {}).get("VolumeId") for mapping in mappings if mapping.get("Ebs", {}).get("VolumeId")],
             "ena_support": image.get("EnaSupport"),
@@ -912,16 +1012,21 @@ class AwsProviderDriver:
         }
         entries: dict[str, Any] = {}
         complete = True
+        known = self._load_journal(self._attempt_dir(deployment), deployment).get("known_resource_ids", {})
         for name, argv in queries.items():
             try:
                 data = self._aws_json(*argv)
-                values = data.get(response_fields[name], [])
+                if not isinstance(data, dict) or response_fields[name] not in data or not isinstance(data[response_fields[name]], list):
+                    raise AwsProviderError(f"{name} inventory response omitted a valid collection", category="inventory_incomplete")
+                values = data[response_fields[name]]
                 if data.get("NextToken") or data.get("nextToken"):
                     complete = False
                     failures.append(_failure(AwsProviderError(f"{name} inventory response is truncated", category="inventory_truncated"), self.clock()))
                 # EC2 instance response is one extra nesting level.
                 if name == "instances":
-                    values = [instance for reservation in values for instance in reservation.get("Instances", [])]
+                    if any(not isinstance(reservation, dict) or not isinstance(reservation.get("Instances"), list) for reservation in values):
+                        raise AwsProviderError("instances inventory has malformed reservation collection", category="inventory_incomplete")
+                    values = [instance for reservation in values for instance in reservation["Instances"]]
                 if any(not _has_exact_ownership_tags(item, deployment.run_id, deployment.deployment_id) for item in values):
                     complete = False
                     failures.append(_failure(AwsProviderError(f"{name} inventory returned a resource without the exact run/deployment tags", category="inventory_identity_mismatch"), self.clock()))
@@ -930,9 +1035,38 @@ class AwsProviderDriver:
                 complete = False
                 failures.append(_failure(exc, self.clock()))
                 entries[name] = None
+        known_remaining = self._verify_known_resource_ids(known, region, failures)
+        if known_remaining:
+            complete = False
+            entries["known_ids"] = known_remaining
         return {"complete": complete, "remaining": _remaining_inventory(entries), "resources": entries}
 
-    def _cancel_or_confirm_terminal(self, region: str, execution_id: str) -> None:
+    def _verify_known_resource_ids(self, known: dict[str, Any], region: str, failures: list[FailureEvidence]) -> dict[str, Any]:
+        remaining: dict[str, Any] = {}
+        for resource_type, ids in known.items():
+            regional_ids = ids.get(region, []) if isinstance(ids, dict) else []
+            for resource_id in regional_ids:
+                operation = {"instance": "describe-instances", "volume": "describe-volumes", "network_interface": "describe-network-interfaces"}.get(resource_type)
+                if operation is None:
+                    continue
+                try:
+                    response = self._aws_json("ec2", operation, "--instance-ids" if resource_type == "instance" else "--volume-ids" if resource_type == "volume" else "--network-interface-ids", str(resource_id), "--region", region, "--output", "json")
+                    field = {"instance": "Reservations", "volume": "Volumes", "network_interface": "NetworkInterfaces"}[resource_type]
+                    if not isinstance(response, dict) or not isinstance(response.get(field), list):
+                        raise AwsProviderError("known-ID inventory omitted its response collection", category="inventory_incomplete")
+                    found = response[field]
+                    if resource_type == "instance":
+                        if any(not isinstance(res, dict) or not isinstance(res.get("Instances"), list) for res in found):
+                            raise AwsProviderError("known instance-ID inventory is malformed", category="inventory_incomplete")
+                        found = [inst for res in found for inst in res["Instances"] if inst.get("State", {}).get("Name") != "terminated"]
+                    if found:
+                        remaining.setdefault(resource_type, []).extend(found)
+                except Exception as exc:
+                    failures.append(_failure(exc, self.clock()))
+                    remaining.setdefault(resource_type, []).append("inventory_unknown")
+        return remaining
+
+    def _cancel_or_confirm_terminal(self, region: str, execution_id: str) -> dict[str, Any]:
         current = self._run(
             f"aws-expiry-read-terminal-{region}",
             [self.settings.aws_cli, "ssm", "get-automation-execution", "--automation-execution-id", execution_id, "--region", region, "--output", "json"],
@@ -957,9 +1091,11 @@ class AwsProviderDriver:
             )
             if not _succeeded(current):
                 raise AwsProviderError(f"expiry cancellation readback failed in {region}", category="expiry_cancel_unverified", action_id=current.action_id)
-            state = _json_execution(current.stdout).get("AutomationExecutionStatus")
+            execution = _json_execution(current.stdout)
+            state = execution.get("AutomationExecutionStatus")
         if state not in TERMINAL_AUTOMATION_STATES:
             raise AwsProviderError(f"expiry execution remains nonterminal in {region}: {state}", category="expiry_cancel_unverified")
+        return {"state": str(state), "action_outputs": execution.get("Outputs"), "failure_message": execution.get("FailureMessage")}
 
     def _expiry_from_journal(self, deployment: ProviderDeploymentInput, journal: dict[str, Any]) -> ExpiryEvidence | None:
         value = journal.get("expiry_evidence")
@@ -987,6 +1123,14 @@ class AwsProviderDriver:
     def _failed_cleanup(self, inventory: dict[str, Any], secondary: list[FailureEvidence], primary: FailureEvidence | None, failure: FailureEvidence, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
         journal = self._load_journal(self._attempt_dir(deployment), deployment)
         expiry = self._expiry_from_journal(deployment, journal)
+        journal["cleanup_state"] = "failed"
+        journal["launch_blocked"] = True
+        journal["cleanup_failure"] = failure.model_dump(mode="json")
+        journal["secondary_failures"] = [item.model_dump(mode="json") for item in secondary]
+        try:
+            self._save_journal(self._attempt_dir(deployment), journal)
+        except Exception as journal_exc:
+            secondary = [*secondary, _failure(journal_exc, self.clock())]
         return AwsCleanupResult(
             cleanup_state=CleanupState.FAILED,
             cleanup_failure=failure,
@@ -1056,6 +1200,16 @@ class AwsProviderDriver:
                 temp.unlink()
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
+        if self._registration_deadline is not None and action_id.startswith("aws-expiry-"):
+            remaining = int(self._registration_deadline - time.monotonic())
+            if remaining <= 0:
+                raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
+            timeout = min(timeout, remaining)
+        if self._precreate_deadline is not None and action_id == "aws-pair-apply":
+            remaining = int(self._precreate_deadline - time.monotonic())
+            if remaining <= 0:
+                raise AwsProviderError("pair apply admission budget expired immediately before creation", category="cap_insufficient", action_id=action_id)
+            timeout = min(timeout, remaining)
         request = CommandRequest(
             action_id=action_id,
             action_type="aws_provider_control",
@@ -1161,7 +1315,7 @@ def _json_execution(stdout: str) -> dict[str, Any]:
     return execution
 
 
-def _automation_matches(execution: dict[str, Any], safety: dict[str, str], parameters: dict[str, list[str]]) -> bool:
+def _automation_matches(execution: dict[str, Any], safety: dict[str, str], parameters: dict[str, list[str]], execution_id: str | None = None) -> bool:
     steps = execution.get("StepExecutions") or []
     sleep_step = next((step for step in steps if step.get("StepName") == "waitUntilExpiry"), None)
     inputs = (sleep_step or {}).get("Inputs") or {}
@@ -1174,8 +1328,28 @@ def _automation_matches(execution: dict[str, Any], safety: dict[str, str], param
         and execution.get("Parameters") == parameters
         and (sleep_step or {}).get("Action") == "aws:sleep"
         and (sleep_step or {}).get("StepStatus") == "InProgress"
-        and inputs.get("Timestamp") == parameters["ExpiryTriggerUtc"]
+        and _ssm_scalar(inputs.get("Timestamp")) == parameters["ExpiryTriggerUtc"][0]
+        and (execution_id is None or execution.get("AutomationExecutionId") == execution_id)
     )
+
+
+def _ssm_scalar(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _known_resource_ids(output: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    result: dict[str, dict[str, list[str]]] = {kind: {} for kind in ("instance", "volume", "network_interface")}
+    for vm in output.get("vms", {}).values() if isinstance(output.get("vms"), dict) else []:
+        if not isinstance(vm, dict):
+            continue
+        region = vm.get("region")
+        if not isinstance(region, str):
+            continue
+        for kind, key in (("instance", "instance_id"), ("volume", "boot_volume_id"), ("network_interface", "network_interface_id")):
+            value = vm.get(key)
+            if isinstance(value, str) and value:
+                result[kind].setdefault(region, []).append(value)
+    return result
 
 
 def _failure(exc: Exception, occurred_at: datetime) -> FailureEvidence:

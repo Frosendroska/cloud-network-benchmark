@@ -9,6 +9,7 @@ output "deployment" {
     vms = {
       vm_a = {
         instance_id              = aws_instance.vm_a.id
+        network_interface_id     = aws_instance.vm_a.primary_network_interface_id
         private_ipv4             = aws_instance.vm_a.private_ip
         public_ipv4              = aws_instance.vm_a.public_ip
         region                   = "eu-central-1"
@@ -24,6 +25,7 @@ output "deployment" {
       }
       vm_b = {
         instance_id              = local.instance_b.id
+        network_interface_id     = local.instance_b.primary_network_interface_id
         private_ipv4             = local.instance_b.private_ip
         public_ipv4              = local.instance_b.public_ip
         region                   = local.inter_region ? "eu-west-2" : "eu-central-1"

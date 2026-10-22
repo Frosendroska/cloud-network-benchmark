@@ -17,7 +17,7 @@ locals {
   inter_region            = var.scenario == "inter_region"
   cross_zone              = var.scenario == "cross_zone"
   placement               = var.scenario == "placement_optimization"
-  subnet_b_frankfurt_cidr = local.cross_zone ? "10.60.2.0/24" : "10.60.1.0/24"
+  subnet_b_frankfurt_cidr = "10.60.2.0/24"
   subnet_b_frankfurt_ip   = local.cross_zone ? "10.60.2.10" : "10.60.1.11"
   zone_a                  = "eu-central-1a"
   zone_b_frankfurt        = local.cross_zone ? "eu-central-1b" : "eu-central-1a"
@@ -65,7 +65,7 @@ resource "aws_subnet" "a" {
 }
 
 resource "aws_subnet" "b_frankfurt" {
-  count                   = local.inter_region ? 0 : 1
+  count                   = local.cross_zone ? 1 : 0
   vpc_id                  = aws_vpc.frankfurt.id
   cidr_block              = local.subnet_b_frankfurt_cidr
   availability_zone       = local.zone_b_frankfurt
@@ -79,7 +79,7 @@ resource "aws_route_table_association" "a" {
 }
 
 resource "aws_route_table_association" "b_frankfurt" {
-  count          = local.inter_region ? 0 : 1
+  count          = local.cross_zone ? 1 : 0
   subnet_id      = aws_subnet.b_frankfurt[0].id
   route_table_id = aws_route_table.frankfurt.id
 }
@@ -297,6 +297,7 @@ resource "aws_instance" "vm_a" {
     volume_size           = 32
     volume_type           = "gp3"
     delete_on_termination = true
+    tags                  = local.tags
   }
   tags = merge(local.tags, { Name = "${var.resource_namespace}-vm-a", cnb_role = "vm_a" })
   lifecycle {
@@ -311,7 +312,7 @@ resource "aws_instance" "vm_b_frankfurt" {
   count                       = local.inter_region ? 0 : 1
   ami                         = var.image_id_frankfurt
   instance_type               = "m7i.xlarge"
-  subnet_id                   = aws_subnet.b_frankfurt[0].id
+  subnet_id                   = local.cross_zone ? aws_subnet.b_frankfurt[0].id : aws_subnet.a.id
   private_ip                  = local.subnet_b_frankfurt_ip
   vpc_security_group_ids      = [aws_security_group.vm_b_frankfurt[0].id]
   associate_public_ip_address = true
@@ -326,6 +327,7 @@ resource "aws_instance" "vm_b_frankfurt" {
     volume_size           = 32
     volume_type           = "gp3"
     delete_on_termination = true
+    tags                  = local.tags
   }
   tags = merge(local.tags, { Name = "${var.resource_namespace}-vm-b", cnb_role = "vm_b" })
   lifecycle {
@@ -355,6 +357,7 @@ resource "aws_instance" "vm_b_london" {
     volume_size           = 32
     volume_type           = "gp3"
     delete_on_termination = true
+    tags                  = local.tags
   }
   tags = merge(local.tags, { Name = "${var.resource_namespace}-vm-b", cnb_role = "vm_b" })
   lifecycle {
@@ -363,4 +366,48 @@ resource "aws_instance" "vm_b_london" {
       error_message = "Attempt AWS account does not match the authenticated provider account."
     }
   }
+}
+
+# RunInstances creates implicit primary ENIs; tag them explicitly so fallback
+# inventory still identifies the interface if instance tags are unavailable.
+resource "aws_ec2_tag" "eni_a" {
+  resource_id = aws_instance.vm_a.primary_network_interface_id
+  key         = "cnb_run_id"
+  value       = var.run_id
+}
+
+resource "aws_ec2_tag" "eni_a_deployment" {
+  resource_id = aws_instance.vm_a.primary_network_interface_id
+  key         = "cnb_deployment_id"
+  value       = var.deployment_id
+}
+
+resource "aws_ec2_tag" "eni_b_frankfurt" {
+  count       = local.inter_region ? 0 : 1
+  resource_id = aws_instance.vm_b_frankfurt[0].primary_network_interface_id
+  key         = "cnb_run_id"
+  value       = var.run_id
+}
+
+resource "aws_ec2_tag" "eni_b_frankfurt_deployment" {
+  count       = local.inter_region ? 0 : 1
+  resource_id = aws_instance.vm_b_frankfurt[0].primary_network_interface_id
+  key         = "cnb_deployment_id"
+  value       = var.deployment_id
+}
+
+resource "aws_ec2_tag" "eni_b_london" {
+  count       = local.inter_region ? 1 : 0
+  provider    = aws.london
+  resource_id = aws_instance.vm_b_london[0].primary_network_interface_id
+  key         = "cnb_run_id"
+  value       = var.run_id
+}
+
+resource "aws_ec2_tag" "eni_b_london_deployment" {
+  count       = local.inter_region ? 1 : 0
+  provider    = aws.london
+  resource_id = aws_instance.vm_b_london[0].primary_network_interface_id
+  key         = "cnb_deployment_id"
+  value       = var.deployment_id
 }

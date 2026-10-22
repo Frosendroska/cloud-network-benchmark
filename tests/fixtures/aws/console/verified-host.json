@@ -2,6 +2,8 @@
   "account_id": "123456789012",
   "region": "eu-central-1",
   "instance_id": "i-0123456789abcdef0",
+  "launch_time": "2026-10-22T11:58:00Z",
+  "console_timestamp": "2026-10-22T11:59:00Z",
   "boot_id": "f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a",
   "console_fingerprint": "SHA256:6vY5WQn8o6vthzV3rnmaHhNHw0pYp9aF9Vw5c9y1QwA",
   "candidate_keyscan_fingerprint": "SHA256:6vY5WQn8o6vthzV3rnmaHhNHw0pYp9aF9Vw5c9y1QwA",

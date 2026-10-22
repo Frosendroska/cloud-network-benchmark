@@ -172,6 +172,29 @@ def test_expiry_observes_pending_to_running_to_stopped_and_ignores_terminated():
     assert result["instances_seen"]["i-transition"] == "stopped"
     assert result["unresolved_instance_ids"] == []
 
+
+def test_expiry_stops_pagination_at_deadline_and_reports_action_budget():
+    now = [0.0]
+
+    class SlowPaginator:
+        def paginate(self, *, Filters):
+            yield {"Reservations": [{"Instances": [instance("i-before-deadline")]}]}
+            now[0] = 301.0
+            yield {"Reservations": [{"Instances": [instance("i-after-deadline")]}]}
+
+    class SlowEc2(FakeEc2):
+        def get_paginator(self, operation):
+            assert operation == "describe_instances"
+            return SlowPaginator()
+
+    result = aws_expiry.stop_owned_instances(
+        {"run_id": "run-aws", "deployment_id": "run-aws-deployment", "region": "eu-central-1"},
+        ec2=SlowEc2(), clock=lambda: now[0], sleep=lambda _seconds: None,
+    )
+    assert result["instances_seen"] == {"i-before-deadline": "running"}
+    assert result["action_timeout_seconds"] == 330
+    assert result["discovery_seconds"] == 300
+
     terminated = FakeEc2([instance("i-terminated", "terminated")])
     result = execute(terminated)
     assert terminated.stop_calls == []

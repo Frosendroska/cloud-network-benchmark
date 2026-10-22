@@ -58,8 +58,23 @@ def stop_owned_instances(
         try:
             paginator = ec2.get_paginator("describe_instances")
             for page in paginator.paginate(Filters=selector):
+                if clock() >= deadline:
+                    break
+                if not isinstance(page, dict) or not isinstance(page.get("Reservations"), list):
+                    errors.append({"instance_id": "*", "code": "MalformedDescribeInstancesResponse"})
+                    break
                 for reservation in page.get("Reservations", []):
+                    if clock() >= deadline:
+                        break
+                    if not isinstance(reservation, dict) or not isinstance(reservation.get("Instances"), list):
+                        errors.append({"instance_id": "*", "code": "MalformedReservation"})
+                        continue
                     for instance in reservation.get("Instances", []):
+                        if clock() >= deadline:
+                            break
+                        if not isinstance(instance, dict) or not isinstance(instance.get("Tags"), list):
+                            errors.append({"instance_id": "*", "code": "MalformedInstance"})
+                            continue
                         tags = {tag.get("Key"): tag.get("Value") for tag in instance.get("Tags", [])}
                         if tags.get("cnb_run_id") != run_id or tags.get("cnb_deployment_id") != deployment_id:
                             continue
@@ -90,6 +105,7 @@ def stop_owned_instances(
         "run_id": run_id,
         "deployment_id": deployment_id,
         "discovery_seconds": HORIZON_SECONDS,
+        "action_timeout_seconds": 330,
         "instances_seen": dict(sorted(seen.items())),
         "stop_requests": sorted(stop_requests),
         "errors": errors,

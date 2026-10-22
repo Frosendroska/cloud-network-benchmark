@@ -1,9 +1,10 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  safe_namespace = substr(replace(var.resource_namespace, ".", "-"), 0, 40)
-  role_name      = "cnb-expiry-${local.safe_namespace}"
-  document_name  = "cnb-expiry-${local.safe_namespace}"
+  safe_namespace = substr(replace(var.resource_namespace, ".", "-"), 0, 24)
+  attempt_digest = substr(sha256("${var.run_id}:${var.deployment_id}:${var.region}"), 0, 24)
+  role_name      = "cnb-expiry-${local.safe_namespace}-${local.attempt_digest}"
+  document_name  = "cnb-expiry-${local.safe_namespace}-${local.attempt_digest}"
   script_source  = file("${path.module}/expiry.py")
 }
 
@@ -18,7 +19,7 @@ resource "aws_iam_role" "expiry" {
       Action    = "sts:AssumeRole"
       Condition = {
         StringEquals = { "aws:SourceAccount" = var.account_id }
-        ArnLike      = { "aws:SourceArn" = "arn:aws:ssm:${var.region}:${var.account_id}:automation-definition:${local.document_name}:*" }
+        ArnLike      = { "aws:SourceArn" = "arn:aws:ssm:${var.region}:${var.account_id}:automation-execution/*" }
       }
     }]
   })
@@ -85,7 +86,8 @@ resource "aws_ssm_document" "expiry" {
             region        = "{{ Region }}"
           }
         }
-        timeoutSeconds = 300
+        # Discovery runs for 300 seconds; 30 seconds remain for API response handling.
+        timeoutSeconds = 330
       }
     ]
   })

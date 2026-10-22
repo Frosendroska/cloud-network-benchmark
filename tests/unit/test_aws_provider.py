@@ -25,6 +25,7 @@ from cloud_network_benchmark.providers.aws import (
     AwsRuntimeSettings,
     _automation_matches,
     _has_exact_ownership_tags,
+    _known_resource_ids,
     _remaining_inventory,
     _validate_deployment,
 )
@@ -235,7 +236,7 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
                 stdout = f"256 SHA256:{fingerprint} host (ED25519)\n"
             else:
                 console = f"CNB_HOSTKEY_BOOT_ID={fixture['boot_id']}\nCNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}\n"
-                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Output": base64.b64encode(console.encode()).decode()})
+                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Output": console, "Timestamp": fixture["console_timestamp"]})
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
 
@@ -245,7 +246,7 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     deployment = make_deployment()
     driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
     driver._active_attempt = driver._attempt_dir(deployment)
-    detail = {"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8"}
+    detail = {"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]}
     if expected_error:
         with pytest.raises(AwsProviderError, match=expected_error):
             driver._verify_host_key(detail)
@@ -255,6 +256,9 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
         assert observed["boot_id"] == fixture["boot_id"]
         assert Path(observed["known_hosts_path"]).is_file()
     assert all(KEY not in " ".join(argv) for argv in runner.commands)
+    if not expected_error:
+        trust = json.loads(Path(observed["known_hosts_path"]).with_name(f"{fixture['instance_id']}.host-trust.json").read_text())
+        assert trust["account_id"] == "123456789012" and trust["region"] == fixture["region"]
 
 
 @pytest.mark.parametrize("mutation,match", [
@@ -352,6 +356,21 @@ def test_console_rejects_wrong_instance_or_missing_current_boot(response, match,
         driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0", "public_ipv4": "8.8.8.8"})
 
 
+@pytest.mark.parametrize("timestamp,boots", [
+    ("2026-10-22T11:57:00Z", ["f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a"]),
+    ("2026-10-22T11:59:00Z", ["f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a", "a429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a"]),
+])
+def test_console_rejects_stale_timestamp_and_replayed_boot_markers(tmp_path, timestamp, boots):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    console = "\n".join([*(f"CNB_HOSTKEY_BOOT_ID={boot}" for boot in boots), f"CNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}"])
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._aws_json = lambda *_args: {"InstanceId": fixture["instance_id"], "Output": console, "Timestamp": timestamp}
+    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+        driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+
+
 def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_preserved(tmp_path):
     class Runner:
         def __init__(self):
@@ -380,6 +399,62 @@ def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_prese
     assert result.cleanup_state == "failed"
     assert result.primary_failure.category == "terraform_apply"
     assert result.cleanup_failure.category == "inventory_incomplete"
+
+
+def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
+    class Runner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, request):
+            self.actions.append(request.action_id)
+            if request.action_id == "aws-pair-destroy":
+                raise OSError("fake command transport failed")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    primary = FailureEvidence(category="terraform_apply", message="original apply error", occurred_at=NOW)
+    driver._save_journal(attempt, {
+        "schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": True, "pair_state_path": str(attempt / "pair.tfstate"),
+        "primary_failure": primary.model_dump(mode="json"), "regions": ["eu-central-1"], "executions": {},
+    })
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    result = driver.cleanup(deployment)
+    journal = driver._load_journal(attempt, deployment)
+    assert runner.actions == ["aws-pair-destroy"]
+    assert result.cleanup_state == "failed"
+    assert result.primary_failure.category == "terraform_apply"
+    assert journal["launch_blocked"] is True
+    assert journal["cleanup_failure"]["details"]["exception_type"] == "OSError"
+
+
+def test_cleanup_returns_failed_evidence_when_final_journal_write_raises(tmp_path):
+    class Runner:
+        def run(self, request):
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    deployment = make_deployment()
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": ["eu-central-1"], "executions": {}, "safety": {}})
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    driver._save_journal = lambda *_args: (_ for _ in ()).throw(OSError("journal disk full"))
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category == "aws_provider"
+    assert result.secondary_failures[0].message == "journal disk full"
+    # The durable pre-cleanup journal still says creation may have started and has no
+    # succeeded marker, so _block_on_residual_cleanup remains fail-closed.
 
 
 def test_safety_support_absence_requires_not_found_from_both_apis(tmp_path):
@@ -483,7 +558,7 @@ def test_ambiguous_automation_readback_never_authorizes_creation():
     response = {
         "DocumentName": "expiry", "DocumentVersion": "1", "AutomationExecutionStatus": "InProgress",
         "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry", "Parameters": params,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"]}}],
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}],
     }
     assert _automation_matches(response, safety, params)
     response["AutomationExecutionStatus"] = "Pending"
@@ -505,7 +580,7 @@ def test_automation_readback_rejects_truncated_or_mismatched_execution(change):
     execution = {
         "DocumentName": "expiry", "DocumentVersion": "1", "AutomationExecutionStatus": "InProgress",
         "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry", "Parameters": params,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"]}}],
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}],
     }
     safety = {"document_name": "expiry", "document_version": "1"}
     assert _automation_matches(execution, safety, params)
@@ -555,6 +630,60 @@ def test_pair_hcl_keeps_exact_two_vm_topologies_and_private_ingress():
     assert "spot" not in main.lower()
     assert "aws_nat_gateway" not in main
     assert "aws_efa" not in main
+
+
+def test_aws_safety_role_trust_scope_and_regional_names_are_execution_safe():
+    main = (ROOT / "terraform/aws/safety/main.tf").read_text()
+    assert 'automation-execution/*' in main
+    assert 'automation-definition:${local.document_name}' not in main
+    assert 'aws:SourceAccount" = var.account_id' in main
+    assert 'substr(sha256("${var.run_id}:${var.deployment_id}:${var.region}"), 0, 24)' in main
+    assert 'document_name  = "cnb-expiry-${local.safe_namespace}-${local.attempt_digest}"' in main
+    assert 'ec2:StopInstances' in main and 'ec2:ResourceTag/cnb_run_id' in main and 'ec2:ResourceTag/cnb_deployment_id' in main
+
+
+def test_aws_scenario_subnets_do_not_create_duplicate_same_zone_cidrs():
+    main = (ROOT / "terraform/aws/pair/main.tf").read_text()
+    assert 'cidr_block              = "10.60.1.0/24"' in main
+    assert 'count                   = local.cross_zone ? 1 : 0' in main
+    assert 'subnet_id                   = local.cross_zone ? aws_subnet.b_frankfurt[0].id : aws_subnet.a.id' in main
+    assert 'cidr_block              = local.subnet_b_frankfurt_cidr' in main
+    assert 'subnet_b_frankfurt_cidr = "10.60.2.0/24"' in main
+
+
+def test_known_resource_inventory_finds_an_untagged_detached_boot_disk(tmp_path):
+    class Runner:
+        def run(self, request):
+            operation = request.argv[2]
+            fields = {
+                "describe-instances": "Reservations", "describe-volumes": "Volumes",
+                "describe-network-interfaces": "NetworkInterfaces", "describe-security-groups": "SecurityGroups",
+                "describe-subnets": "Subnets", "describe-route-tables": "RouteTables",
+                "describe-internet-gateways": "InternetGateways", "describe-vpcs": "Vpcs",
+                "describe-vpc-peering-connections": "VpcPeeringConnections", "describe-placement-groups": "PlacementGroups",
+                "describe-key-pairs": "KeyPairs", "describe-addresses": "Addresses",
+            }
+            if operation == "describe-volumes" and "--volume-ids" in request.argv:
+                payload = {"Volumes": [{"VolumeId": "vol-detached", "State": "available", "Tags": []}]}
+            else:
+                payload = {fields[operation]: []}
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
+
+    deployment = make_deployment()
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    driver._save_journal(attempt, {
+        "schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "known_resource_ids": {"instance": {}, "volume": {"eu-central-1": ["vol-detached"]}, "network_interface": {}},
+    })
+    failures = []
+    inventory = driver._inventory_region(deployment, "eu-central-1", failures)
+    assert inventory["complete"] is False
+    assert inventory["remaining"]["known_ids"]["volume"][0]["VolumeId"] == "vol-detached"
+    assert not failures
+    ids = _known_resource_ids({"vms": {"vm_a": {"region": "eu-central-1", "instance_id": "i-known", "boot_volume_id": "vol-known", "network_interface_id": "eni-known"}}})
+    assert ids == {"instance": {"eu-central-1": ["i-known"]}, "volume": {"eu-central-1": ["vol-known"]}, "network_interface": {"eu-central-1": ["eni-known"]}}
 
 
 def test_cleanup_inventory_never_claims_unknown_resources_absent():
