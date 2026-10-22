@@ -329,9 +329,15 @@ def _record(request: CommandRequest, result: CommandResult, context: Measurement
         deployment_id=context.identity.deployment_id, unit_id=unit_id,
         binary_version=context.tool_identity.get(request.argv[0], StringEvidence(unavailable_reason="tool identity not supplied")),
         source_identity=context.tool_identity.get(request.argv[0], StringEvidence(unavailable_reason="source identity not supplied")),
-        monotonic_started=_evidence(started_monotonic, "process start not captured"),
-        monotonic_finished=_evidence(finished_monotonic, "process finish not captured"),
+        monotonic_started=_evidence(
+            result.monotonic_started if result.duration_basis == "monotonic" else started_monotonic,
+            "process start not captured"),
+        monotonic_finished=_evidence(
+            result.monotonic_finished if result.duration_basis == "monotonic" else finished_monotonic,
+            "process finish not captured"),
         started_at=Evidence(value=result.started_at), finished_at=Evidence(value=result.finished_at),
+        duration_basis=result.duration_basis,
+        utc_elapsed_discrepancy_seconds=result.utc_elapsed_discrepancy_seconds,
     )
 
 

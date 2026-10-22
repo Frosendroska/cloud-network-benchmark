@@ -225,11 +225,13 @@ class LocalMeasurementProcesses:
             if not getattr(stream, "closed", False):
                 stream.close()
         finished_at = self.clock.utc_now()
-        duration = max(0.0, (finished_at - item.started_at).total_seconds())
+        finished_monotonic = self.clock.monotonic()
+        duration = finished_monotonic - item.started_monotonic
+        utc_elapsed = (finished_at - item.started_at).total_seconds()
         stdout = bytes(item.preview["stdout"]).decode("utf-8", errors="replace")
         stderr = bytes(item.preview["stderr"]).decode("utf-8", errors="replace")
         item.finished_at = finished_at
-        item.finished_monotonic = self.clock.monotonic()
+        item.finished_monotonic = finished_monotonic
         if item.stream_errors:
             stderr = (stderr + "\n" + "\n".join(item.stream_errors))[-self.preview_bytes:]
             if outcome == CommandOutcome.SUCCEEDED:
@@ -239,7 +241,9 @@ class LocalMeasurementProcesses:
             stderr = stderr.replace(secret, "[REDACTED]")
         item.result = CommandResult(
             action_id=item.request.action_id, outcome=outcome, started_at=item.started_at,
-            finished_at=finished_at, duration_seconds=duration, exit_code=code,
+            finished_at=finished_at, duration_seconds=duration, duration_basis="monotonic",
+            monotonic_started=item.started_monotonic, monotonic_finished=finished_monotonic,
+            utc_elapsed_discrepancy_seconds=utc_elapsed - duration, exit_code=code,
             stdout=stdout, stderr=stderr, redactions=item.request.redactions,
         )
         return item.result

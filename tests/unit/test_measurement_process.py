@@ -1,13 +1,16 @@
 from io import BytesIO
 from pathlib import Path
 import subprocess
+import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cloud_network_benchmark.contracts import CommandRequest
+from cloud_network_benchmark.contracts import CommandEvidence, CommandRequest
+from cloud_network_benchmark.measurement import _record
 from cloud_network_benchmark.measurement_process import LocalMeasurementProcesses, ProcessEvent, SystemMeasurementClock
+from f03_support import context, observation
 
 
 def test_local_process_boundary_is_replaceable_and_exclusive(tmp_path, monkeypatch):
@@ -236,3 +239,118 @@ def test_fake_clock_utc_adjustment_does_not_change_monotonic_wait():
     clock.wait_until(clock.monotonic() + 2)
     assert (after_adjustment - before).total_seconds() == 3600
     assert clock.monotonic() == 1002
+
+
+class AdjustableProcessClock:
+    def __init__(self):
+        self.value = 1000.0
+        self.origin = datetime(2026, 10, 21, tzinfo=timezone.utc)
+        self.adjustment = timedelta(0)
+
+    def monotonic(self):
+        return self.value
+
+    def utc_now(self):
+        return self.origin + timedelta(seconds=self.value - 1000) + self.adjustment
+
+    def wait_until(self, deadline_monotonic):
+        self.value = deadline_monotonic
+
+
+class BlockingFakePopen:
+    def __init__(self, argv, **kwargs):
+        self.stdout, self.stderr, self.stdin = BytesIO(b"native stdout"), BytesIO(b"native stderr"), None
+        self.returncode = None
+        self.exited = threading.Event()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if not self.exited.wait(timeout):
+            raise subprocess.TimeoutExpired("fake-tool", timeout)
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        self.returncode = -9
+        self.exited.set()
+
+
+@pytest.mark.parametrize("adjustment_seconds,exit_code,expected_outcome", [
+    (-3600, 0, "succeeded"), (3600, 0, "succeeded"),
+    (-3600, 7, "failed"), (3600, 7, "failed"),
+])
+def test_production_adapter_uses_monotonic_elapsed_and_projects_real_utc_jumps(
+        tmp_path, monkeypatch, repository_root, adjustment_seconds, exit_code, expected_outcome):
+    from cloud_network_benchmark.contracts import CommandOutcome
+
+    clock = AdjustableProcessClock()
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", BlockingFakePopen)
+    runner = LocalMeasurementProcesses(clock)
+    request = CommandRequest(action_id="clock-jump", action_type="measurement", argv=["fake-tool"],
+                            cwd=str(tmp_path), timeout_seconds=5)
+    item = observation(repository_root, "acceptance")
+    handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    clock.value += 2.0
+    clock.adjustment = timedelta(seconds=adjustment_seconds)
+    handle.process.returncode = exit_code
+    handle.process.exited.set()
+    for thread in handle.threads:
+        thread.join(timeout=1)
+
+    result = runner.poll(handle)
+    assert result is not None
+    assert result.outcome == CommandOutcome(expected_outcome)
+    assert result.duration_basis == "monotonic"
+    assert result.duration_seconds == 2.0
+    assert result.monotonic_started == 1000.0
+    assert result.monotonic_finished == 1002.0
+    assert result.utc_elapsed_discrepancy_seconds == float(adjustment_seconds)
+    assert result.finished_at == clock.origin + timedelta(seconds=2 + adjustment_seconds)
+    assert (tmp_path / "out").read_bytes() == b"native stdout"
+    assert (tmp_path / "err").read_bytes() == b"native stderr"
+
+    evidence = _record(request, result, context(item, tmp_path), item.measurement_units[0].unit_id)
+    projection = CommandEvidence.model_validate(evidence.model_dump(mode="json"))
+    assert projection.duration_basis == "monotonic"
+    assert projection.result["duration_basis"] == "monotonic"
+    assert projection.monotonic_started.value == projection.result["monotonic_started"] == result.monotonic_started
+    assert projection.monotonic_finished.value == projection.result["monotonic_finished"] == result.monotonic_finished
+    assert projection.utc_elapsed_discrepancy_seconds == projection.result["utc_elapsed_discrepancy_seconds"] == result.utc_elapsed_discrepancy_seconds
+    assert projection.started_at.value == result.started_at
+    assert projection.finished_at.value == result.finished_at
+
+
+def test_production_adapter_preserves_monotonic_duration_on_kill_cancellation(
+        tmp_path, monkeypatch, repository_root):
+    clock = AdjustableProcessClock()
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", BlockingFakePopen)
+    runner = LocalMeasurementProcesses(clock)
+    request = CommandRequest(action_id="cancel-clock-jump", action_type="measurement", argv=["fake-tool"],
+                            cwd=str(tmp_path), timeout_seconds=5)
+    handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    clock.value += 1.25
+    clock.adjustment = timedelta(seconds=-3600)
+    result = runner.stop(handle, clock.value)
+    assert handle.process.returncode == -9
+    assert result.outcome == "interrupted"
+    assert result.exit_code is None
+    assert result.duration_basis == "monotonic"
+    assert result.duration_seconds == 1.25
+    assert result.monotonic_started == 1000.0 and result.monotonic_finished == 1001.25
+    assert result.utc_elapsed_discrepancy_seconds == -3600.0
+    assert result.finished_at < result.started_at
+    item = observation(repository_root, "acceptance")
+    evidence = _record(request, result, context(item, tmp_path), item.measurement_units[0].unit_id)
+    projection = CommandEvidence.model_validate(evidence.model_dump(mode="json"))
+    assert projection.result["outcome"] == "interrupted"
+    assert projection.duration_basis == projection.result["duration_basis"] == "monotonic"
+    assert projection.monotonic_started.value == projection.result["monotonic_started"]
+    assert projection.monotonic_finished.value == projection.result["monotonic_finished"]
+    assert projection.utc_elapsed_discrepancy_seconds == projection.result["utc_elapsed_discrepancy_seconds"]
+    assert handle.stdout_file.closed and handle.stderr_file.closed
+    assert (tmp_path / "out").read_bytes() == b"native stdout"
+    assert (tmp_path / "err").read_bytes() == b"native stderr"
