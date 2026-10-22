@@ -40,6 +40,22 @@ Final actionable findings: **0**. No constitution alignment issue, unresolved so
 
 All shell calls used assigned absolute cwd, login:false and PWD assertion. Spec Kit scripts received explicit `GIT_BRANCH_NAME=codex/f01r-clock-evidence SPECIFY_FEATURE_DIRECTORY=specs/015-command-clock-evidence`. Extension configuration was absent, so no before/after hooks were registered for any stage.
 
+### Implementation evidence (2026-10-22)
+
+| Task | Command / inspection | Exit/result |
+| --- | --- | --- |
+| T001 | `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py tests/contract/test_v2_handoffs.py tests/contract/test_v2_schema_export.py` at `0bcd1bb06f584acb8a41fea361dcdc5e8b0943ea` | 0; 26 passed in 0.76 s; assigned clean worktree/branch and merge-base `cef838e42fc620f90b5943f5a8d1528ddc0b0724` verified |
+| T002 | Inspected `execution.py`, `measurements.py`, active schema registry/exports and declared ownership | Existing result enforces ordered UTC and duration=UTC delta; runner samples UTC only. Native evidence independently enforces ordered UTC/monotonic values but has no basis/discrepancy or result projection checks. Only child-run-manifest and validator-input schemas embed CommandEvidence. No sibling API/import or schema registry change is needed. |
+
+Baseline is F01R's unchanged focused suite. Initial regression tests were then added before runtime implementation. They exercise monotonic/UTC disagreement, strict legacy mode, malformed values and all returned subprocess outcomes; their expected red state is recorded with the post-edit test command below before implementing the models/runner.
+
+| Task | Command/action | Exit/result |
+| --- | --- | --- |
+| T003 expected red | `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py` after adding the contract tests and before implementation | 1; 10 expected failures and 38 passed, because the fields and monotonic clock capture did not yet exist |
+| T007 | `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py` after implementation | 0; 48 passed, including all four outcome paths, backwards/forwards UTC, strict compatibility, malformed timing and redaction |
+
+The implementation keeps the pre-existing `subprocess.run` call arguments and outcome/partial-output handling. Controlled clock fakes supply both actual UTC samples and monotonic bounds; no real benchmark process or network was started.
+
 | Command/action | Exit/result | Meaning |
 | --- | --- | --- |
 | `bash .specify/scripts/bash/resolve-template.sh spec-template` | 0 | Active spec template resolved and read; spec follows mandatory section order |
@@ -56,13 +72,28 @@ All shell calls used assigned absolute cwd, login:false and PWD assertion. Spec 
 
 The read-only lint covered required artifacts and quality/coverage syntax; semantic analysis separately reviewed duplication, ambiguity, data/contract consistency, task ordering, acceptance scope and all constitutional gates. analysis.md is the subsequent durable workflow record, not a mutation performed during the read-only analysis command.
 
-## Not run / not established
+## Planning-stage not run / not established
 
-- New monotonic/clock-step implementation tests: not written or run; all 14 implementation tasks remain unchecked.
-- Full regression suite at this planning stage: not run; required at implementation T013.
-- Schema regeneration: not run; runtime models and active exports unchanged.
-- Application code changes, real subprocess timing proof, scientific synchronization/overlap proof: not delivered by planning.
+- New monotonic/clock-step tests at the F01R baseline: not present then. Implementation-stage expected-red and green results are recorded below.
+- Full regression suite at the planning stage: not run. Its implementation-stage result is recorded below.
+- Schema regeneration at planning: not run. Its implementation-stage result is recorded below.
+- Application code and controlled-fake subprocess timing were outside the planning stage and are now implemented/tested below. Fakes do not establish scientific synchronization or measurement overlap.
 - Cloud, SSH, benchmark traffic, paid acceptance, PR/merge and Thesis/shared runtime writes: not performed.
+
+## Implementation completion and validation
+
+All 14 tasks are complete and marked `[X]`. Final tested implementation head: `2b67b8876a3488807e8c5e6e8ade972b4b521ae6`.
+
+| Command/action | Exit/result | Tested revision |
+| --- | --- | --- |
+| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py tests/contract/test_v2_handoffs.py tests/contract/test_v2_schema_export.py` | 0; 94 passed | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| `env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | 0; 490 passed, no skips | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts` | 0; generated only the two affected nested exports at the unchanged model content in commit `cd4e64d4ae66167135fb552d9ad932931c8b04b0` | `cd4e64d4ae66167135fb552d9ad932931c8b04b0` |
+| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | 0; deterministic exports current | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| `git diff --check` | 0 | Final evidence update; source/tests already committed at the tested revision |
+| Ownership/history audit | The implementation range from planning head `0bcd1bb06f584acb8a41fea361dcdc5e8b0943ea` changes only the two contract modules, three assigned test modules, two active schemas and existing shared-contract reference. No historical `specs/001-*` or `specs/002-*` path changed. Schema registry and V2 version are unchanged. `git diff --check` exited 0. | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+
+The active requirements checklist remains 16/16 checked and the custom clock-contract checklist remains 12/12 checked; no checklist markers were edited. No check remains unrun within this feature's offline acceptance set. Cloud, SSH, benchmark traffic, paid acceptance and cross-repository writes remain intentionally unrun and are not established by this stage.
 
 ## Handoff
 
