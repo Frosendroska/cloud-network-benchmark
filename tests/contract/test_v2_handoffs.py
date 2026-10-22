@@ -64,8 +64,8 @@ def test_artifact_success_requires_materialized_integrity_evidence() -> None:
                       sha256=Evidence[str](unavailable_reason="not materialized"), retrieval_state="verified")
 
 
-def test_artifact_file_verification_checks_real_size_and_hash(tmp_path) -> None:
-    payload = b"native synthetic bytes\n"
+def test_artifact_file_verification_streams_real_size_and_hash(tmp_path, monkeypatch) -> None:
+    payload = b"native synthetic bytes\n" * 150000
     path = tmp_path / "measurements/unit/sockperf.csv"
     path.parent.mkdir(parents=True)
     path.write_bytes(payload)
@@ -73,6 +73,13 @@ def test_artifact_file_verification_checks_real_size_and_hash(tmp_path) -> None:
                             producer="vm_a", unit_id="unit", deployment_id="campaign-aws-deployment",
                             closed=True, size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()},
                             retrieval_state="verified")
+
+    original_read_bytes = type(path).read_bytes
+    def forbid_materialized_read_bytes(candidate):
+        if candidate == path:
+            raise AssertionError("materialized verification must stream instead of reading the whole file")
+        return original_read_bytes(candidate)
+    monkeypatch.setattr(type(path), "read_bytes", forbid_materialized_read_bytes)
     record.verify_materialized_file(tmp_path)
     with pytest.raises(ValueError, match="size"):
         record.model_copy(update={"size_bytes":Evidence[int](value=len(payload)+1)}).verify_materialized_file(tmp_path)
@@ -81,6 +88,25 @@ def test_artifact_file_verification_checks_real_size_and_hash(tmp_path) -> None:
     missing = record.model_copy(update={"path":"measurements/unit/missing.csv"})
     with pytest.raises(FileNotFoundError):
         missing.verify_materialized_file(tmp_path)
+
+
+def test_artifact_file_verification_checks_budget_between_stream_chunks(tmp_path) -> None:
+    payload = b"x" * (3 * 1024 * 1024)
+    path = tmp_path / "measurements/unit/sockperf.csv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    record = ArtifactRecord(artifact_id="unit-sockperf", path="measurements/unit/sockperf.csv", kind="sockperf-csv",
+                            producer="vm_a", unit_id="unit", deployment_id="campaign-aws-deployment",
+                            closed=True, size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()},
+                            retrieval_state="verified")
+    observed = []
+    def stop_after_one_chunk(size, digest):
+        observed.append((size, digest))
+        if size >= 1024 * 1024:
+            raise RuntimeError("caller budget exhausted")
+    with pytest.raises(RuntimeError, match="caller budget exhausted"):
+        record.verify_materialized_file(tmp_path, budget_check=stop_after_one_chunk)
+    assert observed[-1] == (1024 * 1024, hashlib.sha256(payload[:1024 * 1024]).hexdigest())
 
 
 def test_command_handoff_rejects_raw_environment_and_stdin_fields() -> None:

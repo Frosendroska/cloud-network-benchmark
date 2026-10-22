@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "tcp_processes": 1,
+  "probe_limit_seconds": 300,
+  "initial_tcp_omission_seconds": 5,
+  "subsequent_probe_omission_seconds": 0,
+  "probe_failure_policy": "continue_with_next_unique_chunk",
+  "tcp_failure_policy": "stop_and_preserve_partial_evidence"
+}

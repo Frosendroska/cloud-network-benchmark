@@ -1,18 +1,26 @@
-from cloud_network_benchmark import BootstrapConfig, ConnectionOutput, ReadinessConfig, TimeoutPolicy, check_readiness, prepare
-from cloud_network_benchmark.contracts.deployment import RemoteConnectionData
-from cloud_network_benchmark.contracts.execution import CommandResult
-from datetime import datetime, timezone
+from pathlib import Path
+import sys
+sys.path.insert(0,str(Path(__file__).parents[1]))
+from fixtures.f02r.support import BootstrapRunner,bootstrap_config,connection,deadline,result
+from cloud_network_benchmark.bootstrap import run_bootstrap
 
 
-def test_failed_bootstrap_stops_before_next_vm():
-    t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
-    calls = []
-    class Runner:
-        def run(self, request):
-            calls.append(request.action_id)
-            now = datetime.now(timezone.utc)
-            return CommandResult(action_id=request.action_id, outcome="failed", started_at=now, finished_at=now, duration_seconds=0, exit_code=1, stdout="", stderr="install failed")
-    result = prepare(c, BootstrapConfig(flent_version="1", netperf_version="1", linux_tools=["iproute2"]), Runner())
-    assert result.succeeded is False
-    assert not any("vm_b" in action for action in calls)
+def test_failed_cloud_init_stops_before_other_vm(tmp_path):
+    c=connection(tmp_path); runner=BootstrapRunner(fail_action="f02r-vm_a-cloud-init")
+    outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="cloud_init_failed"
+    assert len(outcome.actions)==1
+    assert not any("vm_b" in item.action_id for item in outcome.actions)
+
+
+def test_preparation_deadline_is_consumed_cumulatively(tmp_path):
+    c=connection(tmp_path); calls=[]
+    class Slow:
+        def run(self,request):
+            calls.append(request)
+            from fixtures.f02r.support import BootstrapRunner
+            return BootstrapRunner().run(request)
+    clock=lambda:200
+    outcome=run_bootstrap(c,bootstrap_config(),Slow(),deadline=deadline(),clock=clock)
+    assert not outcome.succeeded and outcome.failure.category=="readiness_deadline_exhausted"
+    assert calls==[]

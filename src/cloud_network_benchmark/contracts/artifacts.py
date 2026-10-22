@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 from pathlib import Path
 import hashlib
 import re
-from typing import Dict, Literal, Optional
+from typing import Callable, Dict, Literal, Optional
 
 from pydantic import Field, model_validator
 
@@ -80,14 +80,29 @@ class ArtifactRecord(StrictModel):
             raise ValueError("failed retrieval requires failure evidence")
         return self
 
-    def verify_materialized_file(self, child_root: Path) -> None:
+    def verify_materialized_file(
+        self, child_root: Path, *, budget_check: Callable[[int, str], None] | None = None,
+    ) -> None:
         """Verify a claimed closed artifact against bytes present under the child root."""
         if self.retrieval_state != "verified" or not self.closed:
             raise ValueError("only closed verified artifacts can be checked for integrity")
-        payload = resolve_artifact_path(child_root, self.path).read_bytes()
-        if self.size_bytes.value != len(payload):
+        path = resolve_artifact_path(child_root, self.path)
+        size = 0
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                if budget_check is not None:
+                    budget_check(size, digest.hexdigest())
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+                if budget_check is not None:
+                    budget_check(size, digest.hexdigest())
+        if self.size_bytes.value != size:
             raise ValueError("materialized artifact size does not match recorded size")
-        if self.sha256.value != hashlib.sha256(payload).hexdigest():
+        if self.sha256.value != digest.hexdigest():
             raise ValueError("materialized artifact hash does not match recorded SHA-256")
 
 
