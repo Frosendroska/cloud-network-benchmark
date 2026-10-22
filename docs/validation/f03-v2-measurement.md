@@ -1,6 +1,6 @@
 # F03 offline validation
 
-Implementation commit tested: `cab7a295fd68dde2ae7b141bc0bdcdb507d3a3dd` on
+Implementation commit tested: `3182b2364a7d1421d6382fe90f27672f8a13b722` on
 `codex/f03-v2-measurement`, based on merged F01R
 `cef838e42fc620f90b5943f5a8d1528ddc0b0724`. Environment: Python 3.11.13 at
 `/private/tmp/cnb-offline-venv/bin/python`, repository root `/private/tmp/cnb-f03`,
@@ -12,11 +12,32 @@ Implementation commit tested: `cab7a295fd68dde2ae7b141bc0bdcdb507d3a3dd` on
 | Command | Result |
 | --- | --- |
 | `GIT_BRANCH_NAME=codex/f03-v2-measurement SPECIFY_FEATURE_DIRECTORY=specs/005-v2-measurement-runner bash .specify/scripts/bash/check-prerequisites.sh --json --require-spec --require-tasks --include-tasks` | Exit 0; feature directory and required specification/task artifacts found. |
-| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py` | Exit 0; 47 passed. |
-| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 469 passed. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py` | Exit 0; 52 passed, including stale prior-process exit, simultaneous day-process completion and failed shutdown stream closure cases. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 474 passed. |
 | `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_schema_integrity.py tests/contract/test_v2_schema_export.py` | Exit 0; 6 passed. |
 | `git diff --check` | Exit 0; no whitespace errors. |
-| `git diff cef838e42fc620f90b5943f5a8d1528ddc0b0724 cab7a295fd68dde2ae7b141bc0bdcdb507d3a3dd -- specs/001-core-offline-contracts specs/002-vm-access-bootstrap` | Exit 0; no changes to historical F01/F02 specifications. |
+| `git diff cef838e42fc620f90b5943f5a8d1528ddc0b0724 -- specs/001-core-offline-contracts specs/002-vm-access-bootstrap` | Exit 0; no changes to historical F01/F02 specifications. |
+
+## Convergence repairs and remaining contract dependency
+
+T022–T024 are implemented and checked at `3182b23`: process events are interpreted only
+for currently awaited handles; diagnostic probes that finish alongside TCP are recorded
+once with their command, timing and native references; and bounded shutdown closes both
+owned output streams after attempting termination, kill, reaping and drain joins. The
+offline regressions exercise queued previous-unit exit events in acceptance and calibration,
+current-probe early exit, simultaneous day completion, day finalization errors, and terminate,
+kill and reap failures while retaining partial bytes.
+
+T025 remains open for the coordinator's F01R clock-evidence amendment. The current shared
+`CommandResult` validator in `src/cloud_network_benchmark/contracts/execution.py` requires
+`duration_seconds` to equal `(finished_at - started_at).total_seconds()` and rejects
+`finished_at < started_at`; `CommandEvidence` also rejects backward UTC chronology. For a
+two-second monotonic process interval with a forward UTC step of one hour, the actual UTC
+delta is 3,602 seconds, so the shared model cannot represent the required monotonic duration.
+With the same interval and a backward step of one hour, the actual UTC finish precedes its
+start and validation rejects the completion entirely. F03 did not alter these shared
+contracts, synthesize timestamps, or add a permanently failing test. The production-adapter
+clock-jump tests and T025 implementation await the coordinator's shared amendment.
 
 ## Interface and evidence boundary
 
