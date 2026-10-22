@@ -92,6 +92,37 @@ def test_probe_exit_exactly_at_notification_lead_boundary_blocks_tcp(repository_
     assert any(row.request.get("action_id") == action for row in result.command_evidence)
 
 
+def test_probe_cancellation_event_during_lead_blocks_tcp(repository_root, tmp_path):
+    from datetime import timedelta
+    from cloud_network_benchmark.measurement_process import ProcessEvent
+
+    item = observation(repository_root, "acceptance")
+    target = item.measurement_units[1]
+    action = f"sockperf-{target.unit_id}"
+    clock = FakeClock()
+
+    class CancellationDuringLead(FakeProcesses):
+        notification_seen = False
+
+        def next_event(self, handles, deadline_monotonic):
+            event = super().next_event(handles, deadline_monotonic)
+            if event is not None and event.channel == "stdout" and event.handle.request.action_id == action:
+                self.notification_seen = True
+                return event
+            if self.notification_seen and any(handle.request.action_id == action for handle in handles):
+                clock.value = deadline_monotonic
+                return ProcessEvent(handles[0], "cancel", "", deadline_monotonic,
+                                    clock.utc_now() + timedelta(seconds=deadline_monotonic-clock.monotonic()))
+            return event
+
+    processes = CancellationDuringLead(clock)
+    result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
+    assert result.outcome == "failed"
+    assert not any(handle.request.argv[0] == "iperf3" and handle.request.action_id == action.replace("sockperf-", "iperf3-")
+                   for handle in processes.handles)
+    assert any("terminal cancel" in failure.message for failure in result.failures)
+
+
 def test_failed_calibration_trial_preserves_evidence_and_stops_later_units(repository_root, tmp_path):
     item = observation(repository_root, "calibration")
     clock = FakeClock()

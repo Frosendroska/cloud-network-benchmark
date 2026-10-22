@@ -433,7 +433,11 @@ class _Runner:
             deadline = min(until, self.context.deadline_monotonic - self.context.shutdown_grace_seconds)
             if self.clock.monotonic() >= deadline:
                 raise MeasurementError("deadline during the probe lead", "deadline")
-            self._event_until([probe], min(until, deadline))
+            event = self._event_until([probe], min(until, deadline))
+            if event is not None and event.channel in {"exit", "cancel", "cancellation"}:
+                raise MeasurementError(
+                    f"Sockperf emitted terminal {event.channel} during the two-second probe lead",
+                    "probe_exit")
         if self.clock.monotonic() < until:
             raise MeasurementError("measurement clock did not reach probe lead deadline", "deadline")
         # The exit can land exactly on the lead boundary, after the loop's last
