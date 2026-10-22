@@ -622,6 +622,57 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["outputs"] == {"stop_requests": ["i-one"]}
 
 
+def test_cleanup_preserves_mixed_s4_expiry_outcomes_as_failed_evidence(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    driver = AwsProviderDriver(object(), settings, clock=lambda: NOW)
+    regions = driver._regions(deployment)
+    trigger = "2026-10-22T12:14:00Z"
+    statuses = {"eu-central-1": "Success", "eu-west-2": "Failed"}
+    parameters = {
+        region: {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
+            "ExpiryTriggerUtc": [trigger], "RunId": [deployment.run_id],
+            "DeploymentId": [deployment.deployment_id], "Region": [region]}
+        for region in regions
+    }
+
+    class MixedRunner:
+        def run(self, request):
+            region = next((item for item in regions if request.action_id.endswith(item)), regions[0])
+            if request.action_id.startswith("aws-expiry-read-terminal-"):
+                return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0,
+                    stdout=json.dumps(terminal_automation(f"exec-{region}", f"expiry-{region}",
+                        parameters[region], status=statuses[region])), stderr="")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    driver.runner = MixedRunner()
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
+        provider="aws", action="stop", state="registered",
+        registration_id=Evidence[str](value=f"aws-ssm:{deployment.deployment_id}"),
+        registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
+        expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
+        target_selector=driver._target_selector(deployment, regions),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: f"exec-{region}" for region in regions}}))
+    safety = {region: {"document_name": f"expiry-{region}", "document_version": "1"} for region in regions}
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
+        "executions": {region: f"exec-{region}" for region in regions}, "safety": safety,
+        "regional_parameters": parameters, "expiry_evidence": expiry.model_dump(mode="json")})
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    driver._verify_safety_absent = lambda *_args: True
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.expiry.value.state == "failed"
+    assert result.expiry.value.failure is not None
+    observed = result.expiry.value.provider_metadata.value["regional_outcomes"]
+    assert observed["eu-central-1"]["state"] == "Success"
+    assert observed["eu-west-2"]["state"] == "Failed"
+
+
 @pytest.mark.parametrize("tamper", [False, True])
 def test_provision_revalidates_registered_evidence_and_time_after_readback(tmp_path, tamper):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
