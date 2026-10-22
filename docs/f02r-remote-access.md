@@ -18,9 +18,9 @@ The implementation is limited to the four existing remote modules, their narrow 
 F02R-owned synthetic fixtures/tests, and this record. Shared F01R contract/schema files and
 historical specs 001/002 have no diff from the merged F01R base.
 
-- Tested implementation SHA: `a434ab9c1c76a64d9129a7ff4b21ad70addbec87`.
-- Focused command from `quickstart.md`: exit 0, **40 passed**.
-- Full regression command from `quickstart.md`: exit 0, **451 passed** (422 at baseline).
+- Tested implementation SHA: `d1372332f0b73c31d8fe12f35b82707374563a0d`.
+- Focused command from `quickstart.md`: exit 0, **53 passed**.
+- Full regression command from `quickstart.md`: exit 0, **464 passed** (422 at baseline).
 - `git diff --check`: exit 0.
 - Ownership/frozen-contract/historical-spec diff inspection against `cef838e42fc620f90b5943f5a8d1528ddc0b0724`: no changes found in shared contracts, schemas, or specs 001/002.
 - No CLI/schema command is specified by the feature quickstart, and F02R changes no Terraform files.
@@ -39,7 +39,7 @@ credential-free and local.
 
 - Focused quickstart command: exit 0, **53 passed**.
 - Full regression command: exit 0, **464 passed**.
-- `git diff --check`: run after the final implementation and documentation commits below.
+- `git diff --check`: exit 0 on the tested implementation and after the final documentation edits.
 - Shared F01R contracts/schemas and historical specs 001/002 remain unchanged against the F01R base.
 - No real SSH/SCP, upstream download/build, cloud call, benchmark, or guest/provider enforcement was run.
 
