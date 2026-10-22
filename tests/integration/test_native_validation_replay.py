@@ -73,7 +73,7 @@ def test_materialized_jsonl_records_are_consumed_incrementally(tmp_path):
 
 def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, deterministic_token,
                                 fake_git_commits, request, *, config_name="exp-001-multi-provider.yaml",
-                                mode_override=None, provider="aws"):
+                                mode_override=None, provider="aws", frozen_n=False, shared_slot=False):
     from tests.unit.test_validation import NOW, make_input
 
     config_path=repository_root/"configs/experiments"/config_name
@@ -83,11 +83,14 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         config_data["benchmark"]["measured_seconds"]=10
         config_data["admission"]["requires_common_n"]=False
         config_data["admission"]["requires_schedule"]=False
+    if frozen_n:
+        config_data["benchmark"]["common_n"]={"state":"frozen","common_n":4,
+            "source_campaign_id":"prior-calibration-campaign","source_sha256":"d"*64,"plateau_found":True}
     config_data["scheduled_start"]="2026-10-21T00:00:00Z"
     config_path=repository_root/"configs/tests"/f"f08-{tmp_path.name}-{provider}.yaml"
     request.addfinalizer(lambda: config_path.unlink(missing_ok=True))
     config_path.write_text(yaml.safe_dump(config_data,sort_keys=False))
-    entry_id=f"f08-{tmp_path.name}-{provider}"
+    entry_id="f08-shared-short-study" if shared_slot else f"f08-{tmp_path.name}-{provider}"
     row=f"{entry_id},{config_data['experiment_id']},{config_data['config_id']}"
     schedule=ScheduleEntry(schema_version=2,entry_id=entry_id,config_id=config_data["config_id"],
         experiment_id=config_data["experiment_id"],scheduled_start=datetime(2026,10,21,tzinfo=NOW.tzinfo),
@@ -149,28 +152,42 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     schedule_bytes=(schedule.original_header+"\n"+schedule.original_row+"\n").encode()
     materialize("schedule_snapshot",None,schedule_bytes)
     metadata = []
+    diagnostics = []
     for role in ("vm_a", "vm_b"):
         item = VmMetadata(schema_version=2, deployment_id=deployment_id, vm_role=role, provider=provider,
             cpu_model={"value":"synthetic CPU"}, nic_driver={"value":"synthetic NIC"},
             acceleration={"value":"synthetic"}, image={"value":"ubuntu"}, kernel={"value":"6.8"},
             congestion_control={"value":"cubic"}, tool_versions={"value":{"sockperf":"3.10","iperf3":"3.17.1"}},
-            source_builds={"value":{"sockperf":"synthetic-build","iperf3":"synthetic-build"}},
+            source_builds={"value":{"sockperf":"synthetic fixture build","iperf3":"synthetic fixture build"}},
             documented_network_limit={"unavailable_reason":"not specified in synthetic fixture"}, mtu={"value":1500},
             observed_region={"value":"us-east-1"}, observed_zone={"value":"us-east-1a"},
             physical_zone_id={"unavailable_reason":"not observed"}, actual_shape={"value":"synthetic"})
         metadata.append(item)
         materialize(f"{role}_metadata", None, item.model_dump_json().encode())
-        materialize(f"{role}_diagnostics", None, b"")
+        diagnostic = DiagnosticSample(schema_version=2, deployment_id=deployment_id, vm_role=role,
+            sampled_at=NOW, monotonic_seconds=0, interval_seconds=1,
+            cpu_total_percent={"value":5}, cpu_max_core_percent={"value":10}, cpu_steal_percent={"value":0},
+            tcp_retransmissions={"value":0}, interface_rx_drops={"value":0}, interface_tx_drops={"value":0},
+            interface_rx_errors={"value":0}, interface_tx_errors={"value":0}, rx_bytes={"value":1000}, tx_bytes={"value":1000})
+        diagnostics.append(diagnostic)
+        materialize(f"{role}_diagnostics", None, (diagnostic.model_dump_json()+"\n").encode())
     for artifact_id, content in (("sockperf_server_log", ""), ("iperf3_server_error", "")):
         materialize(artifact_id, None, content)
 
     def command(unit_id, producer, argv, stamp):
+        runtime=1
+        if "-t" in argv:
+            runtime=int(argv[argv.index("-t")+1])
+            if argv and "iperf3" in argv[0] and "-c" in argv and "-O" in argv:
+                runtime+=int(argv[argv.index("-O")+1])
+        elif "-s" in argv or "server" in argv:
+            runtime=86400
         return CommandEvidence(schema_version=2, request={"argv":argv}, result={"outcome":"succeeded"},
             producer=producer, deployment_id=deployment_id, unit_id=unit_id,
             binary_version={"value":"3.10" if "sockperf" in argv[0] else "3.17.1"},
             source_identity={"value":"synthetic fixture build"}, monotonic_started={"value":stamp},
-            monotonic_finished={"value":stamp+1}, started_at={"value":NOW+timedelta(seconds=stamp)},
-            finished_at={"value":NOW+timedelta(seconds=stamp+1)})
+            monotonic_finished={"value":stamp+runtime}, started_at={"value":NOW+timedelta(seconds=stamp)},
+            finished_at={"value":NOW+timedelta(seconds=stamp+runtime)})
 
     for index, unit in enumerate(units):
         if value.mode=="calibration":
@@ -276,13 +293,19 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         else (100 if unit.phase=="single_flow" else 500)) for unit in loaded_units}
     for unit in loaded_units:
         offset=offset_by_unit[unit.unit_id]
-        stamp=(NOW+timedelta(seconds=offset+7)).timestamp()
+        stamp=(NOW+timedelta(seconds=offset+(2 if value.mode=="diagnostic_day" else 7))).timestamp()
         received_bytes=86400000000 if value.mode=="diagnostic_day" else 125000000
         receiver_seconds=86400 if value.mode=="diagnostic_day" else unit.measured_seconds
-        receiver_events.extend([
-            {"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":unit.streams or 1},"timestamp":{"timesecs":stamp}}},
-            {"event":"interval","data":{"sum":{"start":offset+10,"end":offset+10+receiver_seconds,"seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}},
-            {"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}}])
+        interval_start=0 if value.mode=="diagnostic_day" else 3
+        receiver_events.append({"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":unit.streams or 1},"timestamp":{"timesecs":stamp}}})
+        if value.mode == "diagnostic_day":
+            receiver_events.extend({"event":"interval","data":{"sum":{"start":second,"end":second+1,
+                "seconds":1,"bytes":1_000_000,"sender":False,"omitted":False}}}
+                for second in range(86_400))
+        else:
+            receiver_events.append({"event":"interval","data":{"sum":{"start":interval_start,"end":interval_start+receiver_seconds,
+                "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
+        receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
     materialize("iperf3_server_log",None,"\n".join(json.dumps(event) for event in receiver_events)+"\n")
     for offset, state in enumerate(("provision_ready","running","collecting","validating","succeeded")):
         update_child_execution(child_path,state,NOW+timedelta(seconds=offset+1))
@@ -320,10 +343,10 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "design_git":GitSnapshot.model_validate(git["design_git"]),
         "schedule_entry":Evidence[object](value=schedule),
         "schedule_sha256":Evidence[str](value=hashlib.sha256(schedule_bytes).hexdigest()),
-        "schedule_snapshot_path":Evidence[str](value="schedule.csv")})
+        "schedule_snapshot_path":Evidence[str](value="schedule.csv"),"diagnostics":diagnostics})
     before={record.path:hashlib.sha256((child_root/record.path).read_bytes()).hexdigest() for record in records}
     result=validate_bundle(complete,evaluated_at=NOW)
-    expected_validity="partial" if value.mode=="short_study" else "valid"
+    expected_validity="partial" if value.mode=="short_study" and not frozen_n else "valid"
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.message) for item in result.findings[:35]]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     assert "EXP-001" in summarize_validation(result)
@@ -377,6 +400,20 @@ def test_three_provider_short_study_replay_keeps_pending_common_n_ineligible(rep
     reasons=[item.validation_status.comparison_reasons for item in paired.values()]
     assert all("all compared data must be valid" in item and "execution or cleanup is incomplete" in item for item in reasons)
     assert all(item.metrics.value["common_n"]["state"]=="pending" for item in results)
+
+
+def test_three_provider_short_study_with_prior_calibration_is_eligible(repository_root,
+        tmp_path,frozen_clock,deterministic_token,fake_git_commits,request):
+    bundles,results=[],[]
+    for provider in ("aws","azure","gcp"):
+        bundle,result=_materialize_complete_bundle(repository_root,tmp_path/provider,frozen_clock,
+            deterministic_token,fake_git_commits,request,provider=provider,frozen_n=True,shared_slot=True)
+        bundles.append(bundle)
+        results.append(result)
+    assert all(result.validation_status.data_validity=="valid" for result in results)
+    assert all(result.metrics.value["common_n"]["source_campaign_id"]=="prior-calibration-campaign" for result in results)
+    paired=evaluate_comparison(bundles,results)
+    assert all(item.validation_status.comparison_eligibility=="eligible" for item in paired.values())
 
 
 def test_diagnostic_day_materialized_bundle_replays_all_native_chunks(repository_root, tmp_path,

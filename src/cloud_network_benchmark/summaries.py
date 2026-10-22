@@ -8,8 +8,15 @@ from .contracts.validation import ValidationResult
 
 def _value(value: Any) -> str:
     if isinstance(value, dict):
+        if "commit" in value and "dirty" in value and "diff_sha256" in value:
+            commit = value.get("commit", {})
+            dirty = value.get("dirty", {})
+            diff = value.get("diff_sha256", {})
+            return (f"commit={_value(commit)}, dirty={_value(dirty)}, "
+                    f"diff_sha256={_value(diff)}")
         if value.get("value") is not None:
-            return str(value["value"])
+            nested = value["value"]
+            return _value(nested) if isinstance(nested, dict) else str(nested)
         return "unavailable: " + str(value.get("unavailable_reason") or "not supplied")
     return "unavailable" if value is None else str(value)
 
@@ -43,9 +50,19 @@ def summarize_validation(value: ValidationResult) -> str:
     for unit in metrics.get("units", []):
         lines.append(f"Unit {unit.get('unit_id')} [{unit.get('phase')}; {unit.get('data_validity', 'unavailable')}]: RTT median {_value(unit.get('rtt', {}).get('median_us'))} us; P95 {_value(unit.get('rtt', {}).get('p95_us'))} us; receiver TCP {_value(unit.get('tcp', {}).get('throughput_gbps'))} Gbit/s")
         for count in unit.get("probe_counts", []):
-            lines.append("  Sockperf counts: " + ", ".join(f"{name}={_value(count.get(name))}" for name in ("sent", "received", "dropped", "duplicated", "out_of_order", "skipped")))
+            lines.append("  Sockperf counts (" + str(count.get("reporting_scope", "scope unavailable")) + "): " + ", ".join(f"{name}={_value(count.get(name))}" for name in ("sent", "received", "dropped", "duplicated", "out_of_order", "skipped")))
         coverage = unit.get("coverage", {})
         lines.append(f"  Coverage: {_value(coverage.get('active_probe_ratio'))}; active={_value(coverage.get('active_probe_seconds'))} s; native sample support={_value(coverage.get('native_sample_support_seconds'))} s; gaps={len(coverage.get('gaps', []))}; receiver intervals={unit.get('receiver_interval_count', 0)}; RTT samples={unit.get('sample_count', 0)}")
+        if unit.get("command_invocation_count") is not None:
+            lines.append(f"  Command invocations: {unit['command_invocation_count']}")
+        bounds = coverage.get("valid_bounds")
+        if bounds:
+            lines.append(f"  Valid interval bounds ({bounds.get('source_artifact_id', 'source unavailable')}): {bounds.get('start_seconds')}–{bounds.get('end_seconds')} s")
+        gap_rows = coverage.get("gaps", [])
+        for gap in gap_rows[:10]:
+            lines.append(f"  Gap: {gap.get('started_at', 'start unavailable')}–{gap.get('finished_at', 'end unavailable')} ({gap.get('reason', 'reason unavailable')})")
+        if len(gap_rows) > 10:
+            lines.append(f"  Additional gaps omitted from summary: {len(gap_rows) - 10}")
         for source in unit.get("sources", []):
             lines.append(f"  Source {source.get('artifact_id')} ({source.get('path')}; {source.get('producer', 'producer unavailable')}): SHA-256 {source.get('sha256', 'unavailable')}")
         for source in (unit.get("native_sample_source"),):
@@ -62,6 +79,13 @@ def summarize_validation(value: ValidationResult) -> str:
         lines.append("Diagnostics:")
         for role in sorted(by_role):
             samples = by_role[role]
+            if len(samples) == 1 and "sample_count" in samples[0]:
+                item = samples[0]
+                cpu_range = (f"; CPU total range {item['cpu_min_percent']:g}–{item['cpu_max_percent']:g}%"
+                             if item.get("cpu_min_percent") is not None else "")
+                source = item.get("source", {})
+                lines.append(f"  {role}: {item['sample_count']} samples; counter resets={item['reset_count']}; gaps={item['gap_count']}{cpu_range}; source={source.get('artifact_id')} SHA-256={source.get('sha256')}")
+                continue
             resets = sum(len(item.get("reset_fields", [])) for item in samples)
             gaps = sum(item.get("gap_reason") is not None for item in samples)
             cpu = [item.get("cpu_total_percent", {}).get("value") for item in samples

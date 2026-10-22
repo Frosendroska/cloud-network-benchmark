@@ -8,13 +8,13 @@ import pytest
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts import IdentityContext, ValidatorInput, artifact_inputs
 from cloud_network_benchmark.contracts.campaign import PhaseConfiguration, derive_measurement_units
-from cloud_network_benchmark.contracts.common import ComparisonEligibility, DataValidity, Evidence, ExperimentMode, FailureEvidence, ValidationStatus
-from cloud_network_benchmark.contracts.measurements import ClockMapping, CommandEvidence, MeasurementTiming, TimingGap
+from cloud_network_benchmark.contracts.common import ComparisonEligibility, DataValidity, Evidence, ExperimentMode, FailureEvidence, StringEvidence, ValidationStatus
+from cloud_network_benchmark.contracts.measurements import ClockMapping, CommandEvidence, DiagnosticSample, MeasurementTiming, TimingGap
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _measured_samples, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _command_findings, _coverage, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
@@ -69,7 +69,7 @@ def make_input(repository_root, provider="aws", campaign="camp", *, config_name=
         design_git_commit={"value":"b"*40})
 
 
-def good_result(value):
+def good_result(value, source_campaign=None):
     identity = value.identity.model_dump(mode="json") | {"provider":str(value.provider), "scenario":str(value.scenario),
         "mode":str(value.mode), "context":value.context}
     provenance = {"config_sha256":value.config_sha256, "source_refs":[]}
@@ -80,8 +80,10 @@ def good_result(value):
         validation_status=ValidationStatus(data_validity=DataValidity.VALID, data_reasons=[],
             comparison_eligibility=ComparisonEligibility.UNAVAILABLE, comparison_reasons=["not matched yet"]),
         metrics={"value":{"identity":identity, "provenance":provenance, "units":units,
-                          "common_n":{"state":"frozen","common_n":4,"source_campaign_id":value.identity.campaign_id,
+                          "common_n":{"state":"frozen","common_n":4,"source_campaign_id":source_campaign or value.identity.campaign_id,
                                       "source_sha256":"f"*64,"plateau_found":True},
+                          "commands":[item.model_dump(mode="json") for item in value.commands],
+                          "timings":[item.model_dump(mode="json") for item in value.timings],
                           "execution":{"execution_state":"succeeded","bundle_complete":True}}}, evaluated_at=NOW)
 
 
@@ -136,6 +138,17 @@ def test_comparison_uses_actual_start_skew_and_returns_copied_results(repository
     assert all(item.validation_status.comparison_eligibility == "unavailable" for item in originals)
 
 
+def test_comparison_accepts_prior_calibration_campaign_and_binds_timing(repository_root):
+    values = [make_input(repository_root, provider) for provider in ("aws", "azure", "gcp")]
+    results = [good_result(value, "prior-calibration-campaign") for value in values]
+    output = evaluate_comparison(values, results)
+    assert all(item.validation_status.comparison_eligibility == "eligible" for item in output.values())
+    changed = values[0].model_copy(update={"timings":[values[0].timings[0].model_copy(update={
+        "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=1))}), *values[0].timings[1:]]})
+    with pytest.raises(ValueError, match="timing evidence"):
+        evaluate_comparison([changed, *values[1:]], results)
+
+
 def test_comparison_rejects_over_300_second_skew(repository_root):
     values = [make_input(repository_root, p) for p in ("aws", "azure", "gcp")]
     adjusted = [value.model_copy(update={"timings":[*value.timings[:1], value.timings[1].model_copy(update={
@@ -188,7 +201,13 @@ def _coverage_inputs(repository_root, *, duration=60.0, gap_seconds=0.0):
         measured_finished_at={"value": start + timedelta(seconds=5 + duration)},
         monotonic_started={"value": 100}, monotonic_finished={"value": 100 + duration},
         omitted_seconds=5, overlap_seconds={"value": min(60, duration)}, gaps=gaps, clock_mappings=mappings)
-    value = value.model_copy(update={"timings": [timing]})
+    probe_command = CommandEvidence(schema_version=2,
+        request={"argv":["sockperf","under-load","-i","10.0.0.2","-t","65"]},
+        result={"outcome":"succeeded"},producer="vm_a",deployment_id=value.identity.deployment_id,
+        unit_id=unit.unit_id,binary_version={"value":"3.10"},source_identity={"value":"fixture"},
+        started_at={"value":start},finished_at={"value":start+timedelta(seconds=65)},
+        monotonic_started={"value":100},monotonic_finished={"value":165})
+    value = value.model_copy(update={"timings": [timing], "commands":[probe_command]})
     count = ProbeCounts(sent=Evidence[int](value=65000), received=Evidence[int](value=60000),
         dropped=Evidence[int](value=0), duplicated=Evidence[int](value=0), out_of_order=Evidence[int](value=0),
         skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=65),
@@ -315,7 +334,13 @@ def test_conservative_command_native_bracket_uses_worst_case_overlap(repository_
         producer="vm_a", deployment_id=value.identity.deployment_id, unit_id=unit.unit_id,
         binary_version={"value":"3.17.1"}, source_identity={"value":"fixture build"},
         monotonic_started={"value":100}, monotonic_finished={"value":command_finish})
-    value = value.model_copy(update={"timings":[timing], "commands":[command]})
+    probe_command = CommandEvidence(schema_version=2,
+        request={"argv":["sockperf","under-load","-i","10.0.0.2","-t","65"]},
+        result={"outcome":"succeeded"},producer="vm_a",deployment_id=value.identity.deployment_id,
+        unit_id=unit.unit_id,binary_version={"value":"3.10"},source_identity={"value":"fixture"},
+        started_at={"value":NOW},finished_at={"value":NOW+timedelta(seconds=65)},
+        monotonic_started={"value":100},monotonic_finished={"value":165})
+    value = value.model_copy(update={"timings":[timing], "commands":[probe_command,command]})
     result = _coverage(value, unit, sock, tcp)
     assert result["active_probe_seconds"]["value"] == expected
     assert (result["tcp_start_bracket"].get("exact_utc_start_available") is False) if available else \
@@ -474,6 +499,93 @@ def test_materialized_artifact_integrity_and_symlink_escape_are_reported(reposit
     assert any(item.code == "artifact.path_or_read" for item in findings)
 
 
+def test_undeclared_consumed_native_log_integrity_is_verified(repository_root, tmp_path):
+    value = make_input(repository_root)
+    data = b"[Valid Duration] RunTime=60 sec; SentMessages=60000; ReceivedMessages=60000\n"
+    path = tmp_path / "sockperf.log"
+    path.write_bytes(data)
+    extra = ArtifactRecord(artifact_id="sockperf-log", path="sockperf.log", kind="sockperf-log",
+        producer="vm_a", unit_id=value.measurement_units[1].unit_id,
+        deployment_id=value.identity.deployment_id, closed=True, size_bytes={"value":len(data)},
+        sha256={"value":hashlib.sha256(data).hexdigest()}, retrieval_state="verified")
+    materialized = value.model_copy(update={"child_result_root":str(tmp_path), "artifact_records":[extra]})
+    assert not any(item.code == "artifact.path_or_read" for item in _validate_artifacts(materialized)[0])
+    path.unlink()
+    findings = _validate_artifacts(materialized)[0]
+    assert any(item.code == "artifact.path_or_read" for item in findings)
+
+
+def test_diagnostic_sources_must_be_nonempty_and_role_bound(repository_root, tmp_path):
+    from cloud_network_benchmark.validation import _validate_materialized_records
+    value = make_input(repository_root)
+    record = ArtifactRecord(artifact_id="vm_a_diagnostics", path="vm-a.jsonl", kind="diagnostic_samples",
+        producer="vm_a", unit_id=None, deployment_id=value.identity.deployment_id, closed=True,
+        size_bytes={"value":0}, sha256={"value":hashlib.sha256(b"").hexdigest()}, retrieval_state="verified")
+    path = tmp_path / record.path
+    path.write_bytes(b"")
+    materialized = value.model_copy(update={"child_result_root":str(tmp_path),"artifact_records":[record]})
+    findings = _validate_materialized_records(materialized,{})
+    assert any(item.code == "provenance.diagnostics_empty" for item in findings)
+    wrong = DiagnosticSample(schema_version=2,deployment_id=value.identity.deployment_id,vm_role="vm_b",
+        sampled_at=NOW,monotonic_seconds=0,interval_seconds=1,cpu_total_percent={"value":1},
+        cpu_max_core_percent={"value":1},cpu_steal_percent={"value":0},tcp_retransmissions={"value":0},
+        interface_rx_drops={"value":0},interface_tx_drops={"value":0},interface_rx_errors={"value":0},
+        interface_tx_errors={"value":0},rx_bytes={"value":0},tx_bytes={"value":0})
+    payload=(wrong.model_dump_json()+"\n").encode()
+    path.write_bytes(payload)
+    updated=record.model_copy(update={"size_bytes":Evidence[int](value=len(payload)),
+        "sha256":StringEvidence(value=hashlib.sha256(payload).hexdigest())})
+    findings=_validate_materialized_records(materialized.model_copy(update={"artifact_records":[updated]}),{})
+    assert any(item.code == "provenance.diagnostics_identity" for item in findings)
+
+
+def test_tcp_window_must_intersect_native_sample_support(repository_root):
+    value, unit, sock, tcp = _coverage_inputs(repository_root)
+    timing = value.timings[0].model_copy(update={
+        "unit_id":unit.unit_id,
+        "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=200)),
+        "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=260)),
+        "tcp_started_at":Evidence[datetime](value=NOW+timedelta(seconds=200)),
+    })
+    result = _coverage(value.model_copy(update={"timings":[timing]}), unit, sock, tcp)
+    assert result["complete"] is False
+    assert result["active_probe_seconds"]["value"] == 0
+
+
+def test_receiver_session_settings_endpoint_and_window_are_corroborated(repository_root):
+    value = make_input(repository_root)
+    unit = value.measurement_units[1]
+    command = CommandEvidence(schema_version=2,
+        request={"argv":["iperf3","-c","10.0.0.2","-P","1","-t","60","-O","5","-l","131072"]},
+        result={"outcome":"succeeded"}, producer="vm_a", deployment_id=value.identity.deployment_id,
+        unit_id=unit.unit_id, binary_version={"value":"3.17.1"}, source_identity={"value":"fixture"},
+        started_at={"value":NOW+timedelta(seconds=7)}, finished_at={"value":NOW+timedelta(seconds=70)},
+        monotonic_started={"value":7}, monotonic_finished={"value":70})
+    timing = value.timings[1].model_copy(update={
+        "tcp_started_at":Evidence[datetime](value=NOW+timedelta(seconds=7)),
+        "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=10)),
+        "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=70))})
+    value = value.model_copy(update={"commands":[command],"timings":[value.timings[0],timing,*value.timings[2:]]})
+    source = SourceRef("iperf3_server_log","receiver.jsonl","a"*64)
+    details = ({"session_id":"1","start":{"test_start":{"protocol":"TCP","num_streams":1,
+        "omit":5,"duration":60,"blksize":131072},"timestamp":{"timesecs":(NOW+timedelta(seconds=7)).timestamp()},
+        "connected":{"host":"10.0.0.2","port":5201}}},)
+    good = ReceiverInterval("1",3,63,60,1000,False,False,source,1)
+    straddling = ReceiverInterval("1",1,4,3,100,False,False,source,2)
+    parsed = NativeParse(source=source,sessions=("1",),session_details=details,
+        receiver_intervals=(good,straddling))
+    selected = _receiver_session_for_unit(value,unit,parsed)
+    assert selected.receiver_intervals == (good,)
+    assert any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
+    wrong_start = {**details[0]["start"],"connected":{"host":"10.0.0.3","port":5201}}
+    mismatch = _receiver_session_for_unit(value,unit,NativeParse(**{**parsed.__dict__,
+        "session_details":({**details[0],"start":wrong_start},)}))
+    assert any(item.code == "native.iperf3.endpoint_mismatch" for item in mismatch.findings)
+    shifted = {**details[0],"start":{**details[0]["start"],"timestamp":{"timesecs":(NOW+timedelta(seconds=299)).timestamp()}}}
+    ambiguous = _receiver_session_for_unit(value,unit,NativeParse(**{**parsed.__dict__,"session_details":(shifted,)}))
+    assert any(item.code == "native.iperf3.session_ambiguous" for item in ambiguous.findings)
+
+
 def test_schedule_snapshot_content_is_checked_after_self_consistent_hash_update(repository_root, tmp_path):
     from cloud_network_benchmark.validation import _validate_materialized_records
 
@@ -570,6 +682,26 @@ def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_e
     duplicate = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], "--time=60"]}})
     assert any(item.code == "command.duplicate_option" for item in
                _command_findings(value.model_copy(update={"commands":[duplicate]})))
+    for extra in ("--fq-rate=100M",):
+        altered = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], extra]}})
+        assert any(item.code == "command.protocol_extra" for item in
+                   _command_findings(value.model_copy(update={"commands":[altered]})))
+    wrong_argv = list(valid.request["argv"])
+    wrong_argv[wrong_argv.index("-C") + 1] = "reno"
+    wrong_congestion = valid.model_copy(update={"request":{"argv":wrong_argv}})
+    assert any(item.code == "command.congestion" and item.severity == "error" for item in
+               _command_findings(value.model_copy(update={"commands":[wrong_congestion]})))
+    day_value = make_input(repository_root, config_name="exp-001-diagnostic-day.yaml")
+    day = day_value.measurement_units[0]
+    chunk = PhaseConfiguration(unit_id="probe-chunk-001", kind="probe_chunk", phase="multi_flow",
+        measured_seconds=300, streams=4, parent_unit_id=day.unit_id)
+    probe = CommandEvidence(schema_version=2,
+        request={"argv":["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t","900","--full-log"]},
+        result={"outcome":"succeeded"}, producer="vm_a", deployment_id=day_value.identity.deployment_id,
+        unit_id=chunk.unit_id, binary_version={"value":"3.10"}, source_identity={"value":"fixture"},
+        monotonic_started={"value":1}, monotonic_finished={"value":901})
+    chunk_findings = _command_findings(day_value.model_copy(update={"measurement_units":[day,chunk], "commands":[probe]}))
+    assert any(item.code == "command.duration" and item.unit_id == chunk.unit_id for item in chunk_findings)
 
 
 def test_commands_require_private_targets_and_persistent_private_bound_listeners(repository_root):
@@ -580,9 +712,11 @@ def test_commands_require_private_targets_and_persistent_private_bound_listeners
         monotonic_started={"value":1}, monotonic_finished={"value":61})
     commands = [
         CommandEvidence(request={"argv":["sockperf", "server", "-i", "10.0.0.2", "-p", "11111"]},
-            producer="vm_b", **base),
+            producer="vm_b", **{**base,"unit_id":value.measurement_units[0].unit_id}),
         CommandEvidence(request={"argv":["iperf3", "-s", "-B", "10.0.0.2", "-p", "5201", "--json-stream", "--forceflush"]},
-            producer="vm_b", **base),
+            producer="vm_b", **{**base,"unit_id":value.measurement_units[0].unit_id}),
+        CommandEvidence(request={"argv":["iperf3", "-c", "10.0.0.2", "-p", "5201", "-Z", "-C", "cubic", "-P", "1", "-t", "60", "-O", "5", "-l", "131072", "-i", "1", "--json", "--get-server-output"]},
+            producer="vm_a", **base),
     ]
     findings = _command_findings(value.model_copy(update={"commands":commands}))
     assert not any(item.severity == "error" for item in findings)

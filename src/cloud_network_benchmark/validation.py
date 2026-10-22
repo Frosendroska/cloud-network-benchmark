@@ -20,7 +20,7 @@ from .contracts.common import (
     CleanupState, ComparisonEligibility, DataValidity, Evidence, ExecutionState,
     ExperimentMode, StructuredEvidence, ValidationStatus,
 )
-from .contracts.campaign import ResolvedCampaign, ResolvedObservation
+from .contracts.campaign import BenchmarkPlan, ResolvedCampaign, ResolvedObservation
 from .contracts.validation import ValidationFinding, ValidationResult, ValidatorInput
 from .contracts.measurements import DiagnosticSample, VmMetadata, CommandEvidence, MeasurementTiming
 from .manifests import CampaignManifest, ChildRunManifest
@@ -67,8 +67,41 @@ def _validate_artifacts(value: ValidatorInput) -> tuple[list[ValidationFinding],
     findings: list[ValidationFinding] = []
     records: dict[tuple[str, str | None], Any] = {}
     declarations = value.artifacts
+    seen_paths: dict[tuple[str, str | None, str], Any] = {}
     for record in value.artifact_records:
-        records[(record.artifact_id, record.unit_id)] = record
+        key = (record.artifact_id, record.unit_id)
+        path_key = (*key, record.path)
+        if path_key in seen_paths and seen_paths[path_key] != record:
+            findings.append(_finding("artifact.duplicate_contradiction", "error",
+                "artifact has contradictory duplicate declarations", unit=record.unit_id, artifact=record.artifact_id))
+        else:
+            seen_paths[path_key] = record
+        if key not in records:
+            records[key] = record
+        declaration = declarations.get(record.artifact_id)
+        dynamic_day_record = record.artifact_id in {"day-probe-csv", "day-probe-log"}
+        if declaration is not None and ((not dynamic_day_record and declaration.unit_id != record.unit_id)
+                or declaration.producer != record.producer or declaration.kind != record.kind):
+            findings.append(_finding("artifact.identity", "error",
+                "artifact record unit or producer contradicts its declaration", unit=record.unit_id, artifact=record.artifact_id))
+        if record.deployment_id != value.identity.deployment_id or (record.unit_id is not None and
+                record.unit_id not in {unit.unit_id for unit in value.measurement_units}):
+            findings.append(_finding("artifact.identity", "error",
+                "artifact record deployment or measurement unit contradicts the bundle", unit=record.unit_id, artifact=record.artifact_id))
+        # Every recorded source may be read below, including native count and day
+        # logs which do not have a separate ArtifactExpectation entry.
+        if record.retrieval_state != "verified" or not record.closed:
+            findings.append(_finding("artifact.unverified", "error", "artifact is not closed and verified", unit=record.unit_id, artifact=record.artifact_id))
+            continue
+        try:
+            path = _artifact_path(value, record)
+            payload_hash = _sha(path)
+            size = path.stat().st_size
+        except (OSError, ValueError) as exc:
+            findings.append(_finding("artifact.path_or_read", "error", f"artifact cannot be safely read: {exc}", unit=record.unit_id, artifact=record.artifact_id))
+            continue
+        if record.size_bytes.value != size or record.sha256.value != payload_hash:
+            findings.append(_finding("artifact.integrity", "error", "materialized artifact size or SHA-256 differs from its record", unit=record.unit_id, artifact=record.artifact_id))
     for artifact_id, declaration in declarations.items():
         relevant = [r for r in value.artifact_records if r.artifact_id == artifact_id]
         if declaration.expectation == "not_expected":
@@ -79,19 +112,6 @@ def _validate_artifacts(value: ValidatorInput) -> tuple[list[ValidationFinding],
             if declaration.expectation == "required":
                 findings.append(_finding("artifact.missing", "warning", "required artifact record is missing", unit=declaration.unit_id, artifact=artifact_id))
             continue
-        for record in relevant:
-            if record.retrieval_state != "verified" or not record.closed:
-                findings.append(_finding("artifact.unverified", "error", "artifact is not closed and verified", unit=record.unit_id, artifact=artifact_id))
-                continue
-            try:
-                path = _artifact_path(value, record)
-                payload_hash = _sha(path)
-                size = path.stat().st_size
-            except (OSError, ValueError) as exc:
-                findings.append(_finding("artifact.path_or_read", "error", f"artifact cannot be safely read: {exc}", unit=record.unit_id, artifact=artifact_id))
-                continue
-            if record.size_bytes.value != size or record.sha256.value != payload_hash:
-                findings.append(_finding("artifact.integrity", "error", "materialized artifact size or SHA-256 differs from its record", unit=record.unit_id, artifact=artifact_id))
     snapshot_checks = (("config_snapshot", value.config_snapshot_path, value.config_sha256),
                        ("resolved_snapshot", value.resolved_snapshot_path, value.resolved_sha256.value),
                        ("schedule_snapshot", value.schedule_snapshot_path.value, value.schedule_sha256.value))
@@ -222,10 +242,17 @@ def _validate_materialized_records(value: ValidatorInput, records: dict[tuple[st
                 matched = True
                 count = 0
                 for _, raw in _iter_jsonl(path):
-                    saved = DiagnosticSample.model_validate(raw).model_dump(mode="json")
+                    parsed_sample = DiagnosticSample.model_validate(raw)
+                    saved = parsed_sample.model_dump(mode="json")
+                    if str(parsed_sample.vm_role) != role or parsed_sample.deployment_id != value.identity.deployment_id:
+                        findings.append(_finding("provenance.diagnostics_identity", "error",
+                            "saved diagnostic sample has the wrong role or deployment", artifact=record.artifact_id))
                     if actual and (count >= len(actual) or saved != actual[count]):
                         matched = False
                     count += 1
+                if count == 0:
+                    findings.append(_finding("provenance.diagnostics_empty", "warning",
+                        "required VM diagnostic artifact contains no samples", artifact=record.artifact_id))
                 if actual and (not matched or count != len(actual)):
                     findings.append(_finding("provenance.diagnostics_content", "error", "saved diagnostic samples contradict supplied diagnostic records", artifact=record.artifact_id))
             elif record.artifact_id == "resolved_snapshot":
@@ -233,7 +260,54 @@ def _validate_materialized_records(value: ValidatorInput, records: dict[tuple[st
                     findings.append(_finding("provenance.resolved_content", "error", "saved resolved configuration bytes contradict resolved_sha256", artifact=record.artifact_id))
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             findings.append(_finding("provenance.materialized_invalid", "error", f"saved evidence cannot be parsed or checked: {exc}", unit=record.unit_id, artifact=record.artifact_id))
+    config_record = records.get(("config_snapshot", None))
+    resolved_record = records.get(("resolved_snapshot", None))
+    if config_record is not None and resolved_record is not None:
+        try:
+            source_config = yaml.safe_load(_artifact_path(value, config_record).read_bytes())
+            resolved_payload = json.loads(_artifact_path(value, resolved_record).read_text(encoding="utf-8"))
+            resolved = (ResolvedCampaign.model_validate(resolved_payload) if "selected_providers" in resolved_payload
+                        else ResolvedObservation.model_validate(resolved_payload))
+            source_benchmark = BenchmarkPlan.model_validate(source_config.get("benchmark", {}))
+            if (source_config.get("config_id") != resolved.config_id
+                    or source_config.get("experiment_id") != resolved.experiment_id
+                    or source_config.get("mode") != str(resolved.mode)
+                    or source_config.get("scenario") != str(resolved.scenario)
+                    or source_benchmark != resolved.benchmark):
+                findings.append(_finding("provenance.config_resolved_semantics", "error",
+                    "saved configuration protocol or identity contradicts its resolved snapshot", artifact="config_snapshot"))
+        except (OSError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
+            findings.append(_finding("provenance.config_resolved_semantics", "error",
+                f"saved configuration/resolved protocol equivalence cannot be established: {exc}", artifact="config_snapshot"))
     return findings
+
+
+def _diagnostic_summary(value: ValidatorInput) -> list[dict[str, Any]]:
+    """Stream saved diagnostics into bounded per-role evidence for summaries."""
+    output = []
+    for record in sorted((item for item in value.artifact_records
+                          if item.artifact_id in {"vm_a_diagnostics", "vm_b_diagnostics"}),
+                         key=lambda item: item.artifact_id):
+        role = "vm_a" if record.artifact_id == "vm_a_diagnostics" else "vm_b"
+        count = resets = gaps = 0
+        cpu_min = cpu_max = None
+        try:
+            for _, raw in _iter_jsonl(_artifact_path(value, record)):
+                item = DiagnosticSample.model_validate(raw)
+                count += 1
+                resets += len(item.reset_fields)
+                gaps += item.gap_reason is not None
+                if item.cpu_total_percent.value is not None:
+                    cpu_min = item.cpu_total_percent.value if cpu_min is None else min(cpu_min, item.cpu_total_percent.value)
+                    cpu_max = item.cpu_total_percent.value if cpu_max is None else max(cpu_max, item.cpu_total_percent.value)
+        except (OSError, ValueError, TypeError):
+            continue
+        output.append({"vm_role": role, "sample_count": count, "reset_count": resets,
+                       "gap_count": gaps, "cpu_min_percent": cpu_min,
+                       "cpu_max_percent": cpu_max,
+                       "source": {"artifact_id": record.artifact_id, "path": record.path,
+                                  "sha256": record.sha256.value}})
+    return output
 
 
 def _validate_manifests(value: ValidatorInput) -> list[ValidationFinding]:
@@ -267,6 +341,8 @@ def _validate_manifests(value: ValidatorInput) -> list[ValidationFinding]:
                           and manifest.config_provenance.schedule_sha256.value == value.schedule_sha256.value
                           and manifest.config_provenance.implementation_git_commit.value == value.implementation_git_commit.value
                           and manifest.config_provenance.design_git_commit.value == value.design_git_commit.value
+                          and manifest.config_provenance.implementation_git == value.implementation_git
+                          and manifest.config_provenance.design_git == value.design_git
                           and manifest.tool_versions == value.tool_versions)
         else:
             manifest_units = ([unit for unit in value.measurement_units if unit.kind != "probe_chunk"]
@@ -294,6 +370,8 @@ def _validate_manifests(value: ValidatorInput) -> list[ValidationFinding]:
                           and manifest.config_provenance.schedule_sha256.value == value.schedule_sha256.value
                           and manifest.config_provenance.implementation_git_commit.value == value.implementation_git_commit.value
                           and manifest.config_provenance.design_git_commit.value == value.design_git_commit.value
+                          and manifest.config_provenance.implementation_git == value.implementation_git
+                          and manifest.config_provenance.design_git == value.design_git
                           and manifest.execution_state == value.execution_state
                           and manifest.cleanup_state == value.cleanup_state
                           and manifest.failure == value.failure
@@ -363,7 +441,8 @@ def _option(argv: list[str], name: str) -> str | None:
 def _option_values(argv: list[str], name: str) -> list[str]:
     aliases = {"-c": ("--client",), "-p": ("--port",), "-P": ("--parallel",),
                "-t": ("--time",), "-O": ("--omit",), "-l": ("--length",),
-               "-i": ("--interval",), "-m": ("--message-size",), "--mps": ("--mps",)}
+               "-i": ("--interval",), "-m": ("--message-size",), "--mps": ("--mps",),
+               "-C": ("--congestion",)}
     values: list[str] = []
     for index, token in enumerate(argv):
         for candidate in dict.fromkeys((name, *aliases.get(name, ()))):
@@ -481,7 +560,10 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
             continue
         if protocol is not None and str(protocol).upper() != "TCP":
             continue
-        if command_start is not None and stamp is not None and abs(stamp - command_start.timestamp()) > 300:
+        if command_start is not None and stamp is not None:
+            if stamp > command_start.timestamp() + 2 or stamp < command_start.timestamp() - 2:
+                continue
+        elif command_start is None or stamp is None:
             continue
         candidates.append(session)
     if len(candidates) != 1:
@@ -492,14 +574,63 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
             sessions=parsed.sessions, session_details=parsed.session_details)
     selected = candidates[0]
     detail = details.get(selected, {})
-    streams, _, protocol = test_config(detail)
+    streams, session_stamp, protocol = test_config(detail)
     additions = []
     if streams is None or protocol is None:
         additions.append(_finding("native.iperf3.session_settings_unavailable", "warning",
             "VM B receiver start does not report protocol and num_streams for the associated session", unit=unit.unit_id,
             artifact=parsed.source.artifact_id if parsed.source else None))
+    start = detail.get("start") or {}
+    test = start.get("test_start", start) if isinstance(start, dict) else {}
+    command = next((item for item in value.commands if item.unit_id == unit.unit_id
+                    and item.producer == "vm_a" and item.request.get("argv")
+                    and "iperf3" in str(item.request["argv"][0]).lower()
+                    and _option(item.request["argv"], "-c") is not None), None)
+    if command is not None and isinstance(test, dict):
+        argv = command.request["argv"]
+        expected = {"omit": _option(argv, "-O"), "duration": _option(argv, "-t"),
+                    "blksize": _option(argv, "-l"), "num_streams": _option(argv, "-P"),
+                    "protocol": "TCP"}
+        for field, raw in expected.items():
+            if field not in test or raw is None:
+                continue
+            observed = test[field]
+            try:
+                agrees = (str(observed).upper() == raw.upper() if field == "protocol"
+                          else int(observed) == int(raw))
+            except (TypeError, ValueError):
+                agrees = False
+            if not agrees:
+                additions.append(_finding("native.iperf3.settings_mismatch", "error",
+                    f"receiver native {field} contradicts resolved client command", unit=unit.unit_id,
+                    artifact=parsed.source.artifact_id if parsed.source else None))
+        connected = start.get("connected") if isinstance(start, dict) else None
+        if isinstance(connected, dict):
+            expected_host, expected_port = _option(argv, "-c"), _option(argv, "-p")
+            observed_host, observed_port = connected.get("host"), connected.get("port")
+            if ((observed_host is not None and expected_host is not None and str(observed_host) != expected_host)
+                    or (observed_port is not None and expected_port is not None and str(observed_port) != expected_port)):
+                additions.append(_finding("native.iperf3.endpoint_mismatch", "error",
+                    "receiver session endpoint contradicts the resolved client target", unit=unit.unit_id,
+                    artifact=parsed.source.artifact_id if parsed.source else None))
+    timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
+    measured_start = timing.measured_started_at.value if timing else None
+    measured_finish = timing.measured_finished_at.value if timing else None
+    intervals = tuple(item for item in parsed.receiver_intervals if item.session_id == selected)
+    if measured_start is not None and measured_finish is not None and session_stamp is not None:
+        kept = []
+        for interval in intervals:
+            absolute_start = session_stamp + interval.start_seconds
+            absolute_end = session_stamp + interval.end_seconds
+            if absolute_start < measured_start.timestamp() - .002 or absolute_end > measured_finish.timestamp() + .002:
+                additions.append(_finding("native.iperf3.interval_outside_window", "error",
+                    "receiver interval lies outside or straddles the measured window; its bytes are excluded",
+                    unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+            else:
+                kept.append(interval)
+        intervals = tuple(kept)
     return replace(parsed,
-        receiver_intervals=tuple(item for item in parsed.receiver_intervals if item.session_id == selected),
+        receiver_intervals=intervals,
         receiver_totals=tuple(item for item in parsed.receiver_totals if item["session_id"] == selected),
         findings=(*(item for item in parsed.findings if item.code != "native.iperf3.multiple_sessions"), *additions), sessions=(selected,),
         session_details=tuple(item for item in parsed.session_details if item.get("session_id") == selected))
@@ -552,7 +683,9 @@ def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse) -> tu
     for sample in sock.samples:
         tx = mapping.utc_timestamp.timestamp() + sample.tx_seconds - mapping.monotonic_seconds
         rx = mapping.utc_timestamp.timestamp() + sample.rx_seconds - mapping.monotonic_seconds
-        if tx - error >= start and rx + error < end:
+        if (tx - error >= start and rx + error < end
+                and not any(gap.started_at.timestamp() < rx + error
+                            and gap.finished_at.timestamp() > tx - error for gap in timing.gaps)):
             result.append(sample)
     return tuple(result)
 
@@ -566,7 +699,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             continue
         lower = [token.lower() for token in argv]
         joined = " ".join(lower)
-        forbidden = {"--reverse", "-r", "--bidir", "--bidirectional", "--rate", "--bitrate", "-b", "--udp", "-u", "--window", "-w"}
+        forbidden = {"--reverse", "-r", "--bidir", "--bidirectional", "--rate", "--bitrate", "--fq-rate", "--fqrate", "--pacing-timer", "--burst", "--affinity", "-a", "-b", "--udp", "-u", "--window", "-w"}
         for token in argv:
             normalized = token.lower().split("=", 1)[0] if token.startswith("--") else token
             attached_short = any(token.startswith(flag) and token != flag for flag in ("-b", "-w", "-r", "-u"))
@@ -585,13 +718,13 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                 findings.append(_finding("command.target", "error", "iperf3 must target VM B's private IPv4 address", unit=command.unit_id))
             if "-z" not in lower and "--zerocopy" not in lower:
                 findings.append(_finding("command.zerocopy", "error", "iperf3 sender zerocopy flag is missing", unit=command.unit_id))
-            if "-cubic" not in joined and not ("-c" in lower and "cubic" in lower):
+            if _option_values(argv, "-C") != ["cubic"]:
                 findings.append(_finding("command.congestion", "warning", "CUBIC command setting is not explicit", unit=command.unit_id))
             if _option(argv, "-p") != "5201":
                 findings.append(_finding("command.port", "error", "iperf3 receiver port 5201 is missing", unit=command.unit_id))
             if len(_option_values(argv, "-c")) != 1 or len(_option_values(argv, "-p")) != 1:
                 findings.append(_finding("command.duplicate_option", "error", "iperf3 client and port options must each occur once", unit=command.unit_id))
-            if any(len(_option_values(argv, flag)) > 1 for flag in ("-c", "-p", "-P", "-t", "-O", "-l", "-i")):
+            if any(len(_option_values(argv, flag)) > 1 for flag in ("-c", "-p", "-P", "-t", "-O", "-l", "-i", "-C")):
                 findings.append(_finding("command.duplicate_option", "error", "iperf3 resolved options must not be repeated", unit=command.unit_id))
             if "-r" in lower or "-R".lower() in lower or "-d" in lower or "--bidir" in lower:
                 findings.append(_finding("command.direction", "error", "bidirectional/reverse iperf3 is unsupported", unit=command.unit_id))
@@ -603,7 +736,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                     if observed_values != [expected]:
                         observed = observed_values[0] if observed_values else None
                         findings.append(_finding("command.setting", "error", f"iperf3 {flag} must be {expected}, observed {observed!r}", unit=unit.unit_id))
-            if not ("-cubic" in joined or ("-c" in lower and "cubic" in lower)):
+            if _option_values(argv, "-C") != ["cubic"]:
                 findings.append(_finding("command.congestion", "error", "iperf3 CUBIC setting is missing", unit=command.unit_id))
             if unit and unit.kind == "continuous_day":
                 if "--json-stream" not in lower or "--forceflush" not in lower:
@@ -631,6 +764,10 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             expected_duration = unit.measured_seconds + (5 if unit and unit.phase == "idle_latency" else 10) if unit else None
             if expected_duration is not None and _option(argv, "-t") != str(expected_duration) and unit.kind not in {"probe_chunk", "continuous_day"}:
                 findings.append(_finding("command.duration", "error", f"Sockperf duration must be {expected_duration} seconds including warm-up/coordination", unit=unit.unit_id))
+            if unit and unit.kind == "probe_chunk":
+                duration = _option(argv, "-t")
+                if duration is None or not duration.isdigit() or int(duration) > 300:
+                    findings.append(_finding("command.duration", "error", "each diagnostic probe invocation must run for at most 300 seconds", unit=unit.unit_id))
             if "--full-log" not in lower:
                 findings.append(_finding("command.output", "error", "Sockperf native full-log output is required", unit=command.unit_id))
             target = _option(argv, "-i")
@@ -672,13 +809,29 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             findings.append(_finding("command.evidence_missing", "warning", "actual command evidence is unavailable", unit=unit.unit_id))
         for command in relevant:
             outcome = command.result.get("outcome")
-            if outcome not in {None, "succeeded"}:
+            if outcome != "succeeded":
                 findings.append(_finding("command.failed", "warning", f"command outcome is {outcome}", unit=unit.unit_id))
+            if command.started_at.value is None or command.finished_at.value is None:
+                findings.append(_finding("command.timing_unavailable", "warning",
+                    "actual command start or completion timestamp is unavailable", unit=unit.unit_id))
             argv = command.request.get("argv", [])
             if isinstance(argv, list) and argv and any(program in str(argv[0]).lower() for program in ("sockperf", "iperf3")):
                 if command.binary_version.value is None or command.source_identity.value is None:
                     findings.append(_finding("provenance.command_build_unavailable", "warning",
                         "actual benchmark command lacks binary version or source/build identity", unit=unit.unit_id))
+                program = "iperf3" if "iperf3" in str(argv[0]).lower() else "sockperf"
+                role = str(getattr(command.producer, "value", command.producer))
+                metadata = next((item for item in value.vm_metadata_records
+                                 if str(getattr(item.vm_role, "value", item.vm_role)) == role), None)
+                if metadata is not None:
+                    expected_version = (metadata.tool_versions.value or {}).get(program) if metadata.tool_versions.value else None
+                    expected_build = (metadata.source_builds.value or {}).get(program) if metadata.source_builds.value else None
+                    if expected_version is not None and command.binary_version.value is not None and str(expected_version) != command.binary_version.value:
+                        findings.append(_finding("provenance.command_version_mismatch", "error",
+                            f"{program} command version contradicts producer metadata", unit=unit.unit_id))
+                    if expected_build is not None and command.source_identity.value is not None and str(expected_build) != command.source_identity.value:
+                        findings.append(_finding("provenance.command_build_mismatch", "error",
+                            f"{program} command build contradicts producer metadata", unit=unit.unit_id))
     for role, program in (("vm_b", "sockperf"), ("vm_b", "iperf3")):
         present = any(command.producer == role and isinstance(command.request.get("argv"), list)
                       and command.request["argv"] and program in str(command.request["argv"][0]).lower()
@@ -719,7 +872,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                        and command.producer == "vm_a" and command.request.get("argv")
                        and "iperf3" in str(command.request["argv"][0]).lower()
                        and (_option(command.request["argv"], "-c") is not None)]
-            listeners = [command for command in value.commands if command.unit_id == unit.unit_id
+            listeners = [command for command in value.commands if command.producer == "vm_b"
                          and command.producer == "vm_b" and command.request.get("argv")
                          and "iperf3" in str(command.request["argv"][0]).lower()
                          and "-s" in command.request["argv"]]
@@ -732,7 +885,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             sock_clients = [command for command in value.commands if command.unit_id == unit.unit_id
                             and command.producer == "vm_a" and command.request.get("argv")
                             and "sockperf" in str(command.request["argv"][0]).lower()]
-            sock_listeners = [command for command in value.commands if command.unit_id == unit.unit_id
+            sock_listeners = [command for command in value.commands if command.producer == "vm_b"
                               and command.producer == "vm_b" and command.request.get("argv")
                               and "sockperf" in str(command.request["argv"][0]).lower()
                               and "server" in command.request["argv"]]
@@ -797,6 +950,20 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
                     if gap_end < end:
                         split.append((gap_end, end))
             probe_windows = split
+    if unit.kind != "continuous_day":
+        probe_command = next((command for command in value.commands
+            if command.unit_id == unit.unit_id and command.producer == "vm_a"
+            and isinstance(command.request.get("argv"), list) and command.request["argv"]
+            and "sockperf" in str(command.request["argv"][0]).lower()
+            and "under-load" in command.request["argv"]), None)
+        if (probe_command is None or probe_command.result.get("outcome") != "succeeded"
+                or probe_command.started_at.value is None or probe_command.finished_at.value is None):
+            probe_windows = []
+        else:
+            command_start = probe_command.started_at.value.timestamp()
+            command_end = probe_command.finished_at.value.timestamp()
+            probe_windows = [(max(start, command_start), min(end, command_end))
+                             for start, end in probe_windows if min(end, command_end) > max(start, command_start)]
     sample_support = None
     sample_bounds_utc = None
     if unit.kind not in {"continuous_day"} and sock.samples and timing:
@@ -859,6 +1026,13 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
                         candidates.extend((p_start - duration, p_end - duration, p_start, p_end))
                     starts = [candidate for candidate in candidates if utc0 <= candidate <= utc1]
                     minimum = min((overlap(candidate, duration) for candidate in starts), default=0.0)
+                    if sample_bounds_utc is not None:
+                        sample_supported = []
+                        for candidate in starts:
+                            left, right = max(candidate, sample_bounds_utc[0]), min(candidate + duration, sample_bounds_utc[1])
+                            sample_supported.append(sum(max(0.0, min(right, p_end) - max(left, p_start))
+                                for p_start, p_end in probe_windows) if right > left else 0.0)
+                        minimum = min(minimum, min(sample_supported, default=0.0))
                     active = minimum
                     bracket = {"start_utc_lower": utc0, "start_utc_upper": utc1,
                                "coverage_lower_bound_seconds": minimum,
@@ -872,7 +1046,15 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
             if sample_support < requested * .99:
                 active = None
         elif active is not None:
-            active = min(active, sample_support)
+            # Sample support elsewhere in the run cannot corroborate a disjoint
+            # TCP measured window.
+            if tcp_start is not None and tcp_finish is not None and sample_bounds_utc is not None:
+                left, right = max(tcp_start, sample_bounds_utc[0]), min(tcp_finish, sample_bounds_utc[1])
+                corroborated = sum(max(0.0, min(right, p_end) - max(left, p_start))
+                                   for p_start, p_end in probe_windows) if right > left else 0.0
+                active = min(active, corroborated)
+            elif tcp_start is not None and tcp_finish is not None:
+                active = None
     if unit.kind == "probe_chunk":
         if probe_windows and sock.samples and timing:
             mapping = next((m for m in timing.clock_mappings if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
@@ -1077,6 +1259,11 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
                 or (unit.kind == "probe_chunk" and record.artifact_id in {"day-probe-csv", "day-probe-log"})
             ],
             "receiver_interval_count": len(tcp.receiver_intervals) if tcp else 0,
+            "command_invocation_count": sum(command.unit_id == unit.unit_id for command in value.commands),
+            "valid_bounds": ({"start_seconds": min(i.start_seconds for i in tcp.receiver_intervals if not i.omitted),
+                              "end_seconds": max(i.end_seconds for i in tcp.receiver_intervals if not i.omitted),
+                              "source_artifact_id": tcp.source.artifact_id if tcp and tcp.source else "unavailable"}
+                             if tcp and any(not i.omitted for i in tcp.receiver_intervals) else None),
             "sample_count": len(measured_samples),
             "native_sample_source": sock.source.__dict__ if sock.source else None,
             "coverage": coverage,
@@ -1152,6 +1339,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
         "identity": value.identity.model_dump(mode="json") | {"provider": str(value.provider), "scenario": str(value.scenario), "mode": str(value.mode), "context": value.context},
         "common_n": common_n if common_n else {"state": "pending", "common_n": None},
         "commands": [command.model_dump(mode="json") for command in value.commands],
+        "timings": [timing.model_dump(mode="json") for timing in value.timings],
         "execution": {"execution_state": str(value.execution_state), "primary_failure": value.failure.model_dump(mode="json") if value.failure else None,
                       "retrieval_failure": value.retrieval_failure.model_dump(mode="json") if value.retrieval_failure else None,
                       "cleanup_state": str(value.cleanup_state), "cleanup_failure": value.cleanup_failure.model_dump(mode="json") if value.cleanup_failure else None,
@@ -1159,7 +1347,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
                       and value.execution_state == ExecutionState.SUCCEEDED
                       and value.retrieval_failure is None and data_validity == DataValidity.VALID},
         "provenance": provenance, "units": units_payload,
-        "diagnostics": [item.model_dump(mode="json") for item in value.diagnostics],
+        "diagnostics": _diagnostic_summary(value),
         "research_eligible_mode": value.mode == ExperimentMode.SHORT_STUDY,
     }
     return ValidationResult(schema_version=2, run_id=value.identity.run_id, mode=value.mode,
@@ -1198,6 +1386,9 @@ def evaluate_comparison(inputs: Sequence[ValidatorInput], results: Sequence[Vali
         expected_commands = [command.model_dump(mode="json") for command in item.commands]
         if metrics.get("commands", []) != expected_commands:
             raise ValueError("comparison result command/build evidence contradicts its ValidatorInput")
+        expected_timings = [timing.model_dump(mode="json") for timing in item.timings]
+        if metrics.get("timings", []) != expected_timings:
+            raise ValueError("comparison result timing evidence contradicts its ValidatorInput")
         result_units = metrics.get("units", [])
         input_units = [(unit.unit_id, str(getattr(unit.phase, "value", unit.phase)), unit.kind, unit.streams, unit.measured_seconds)
                        for unit in item.measurement_units]
@@ -1248,11 +1439,29 @@ def evaluate_comparison(inputs: Sequence[ValidatorInput], results: Sequence[Vali
         else:
             n_values.append(common_n["common_n"])
             required = (common_n.get("source_campaign_id"), common_n.get("source_sha256"), common_n.get("plateau_found"))
-            if (required[0] != (result.metrics.value.get("identity", {}) or {}).get("campaign_id")
+            # Common N is frozen by an earlier calibration campaign. Its source
+            # identity is intentionally independent of this study campaign.
+            if (not isinstance(required[0], str) or not required[0]
                     or not isinstance(required[1], str) or len(required[1]) != 64
                     or any(char not in "0123456789abcdef" for char in required[1])
                     or required[2] not in {True, False}):
                 unavailable.append(f"{result.run_id} CommonNState lacks source campaign/hash/plateau evidence")
+            if item.resolved_snapshot_path:
+                resolved_path = _artifact_path(item, next((record for record in item.artifact_records
+                    if record.artifact_id == "resolved_snapshot"), None)) if any(
+                    record.artifact_id == "resolved_snapshot" for record in item.artifact_records) else None
+                if resolved_path is not None:
+                    try:
+                        saved = json.loads(resolved_path.read_text(encoding="utf-8"))
+                        saved_n = saved.get("common_n") if isinstance(saved, dict) else None
+                        if isinstance(saved_n, dict) and (saved_n.get("state") != "frozen"
+                                or saved_n.get("source_campaign_id") != required[0]
+                                or saved_n.get("source_sha256") != required[1]
+                                or saved_n.get("common_n") != common_n.get("common_n")
+                                or saved_n.get("plateau_found") != required[2]):
+                            unavailable.append(f"{result.run_id} CommonNState contradicts its saved resolved configuration")
+                    except (OSError, ValueError):
+                        unavailable.append(f"{result.run_id} saved resolved configuration is unavailable")
             n_evidence.append(required)
     if len(n_values) == len(results) and (len(set(n_values)) != 1 or any(
         next((unit.streams for unit in item.measurement_units if unit.phase == "multi_flow"), None) != n_values[index]
