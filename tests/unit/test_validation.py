@@ -474,6 +474,33 @@ def test_materialized_artifact_integrity_and_symlink_escape_are_reported(reposit
     assert any(item.code == "artifact.path_or_read" for item in findings)
 
 
+def test_schedule_snapshot_content_is_checked_after_self_consistent_hash_update(repository_root, tmp_path):
+    from cloud_network_benchmark.validation import _validate_materialized_records
+
+    value = make_input(repository_root)
+    expected = value.schedule_entry.value
+    path = tmp_path / "schedule.csv"
+    valid = (expected.original_header + "\n" + expected.original_row + "\n").encode()
+    path.write_bytes(valid)
+    digest = hashlib.sha256(valid).hexdigest()
+    record = ArtifactRecord(artifact_id="schedule_snapshot", path="schedule.csv", kind="schedule_row",
+        producer="controller", unit_id=None, deployment_id=value.identity.deployment_id, closed=True,
+        size_bytes={"value":len(valid)}, sha256={"value":digest}, retrieval_state="verified")
+    materialized = value.model_copy(update={"child_result_root":str(tmp_path),
+        "schedule_snapshot_path":Evidence[str](value="schedule.csv"),
+        "schedule_sha256":Evidence[str](value=digest), "artifact_records":[record]})
+    assert not _validate_materialized_records(materialized, {})
+
+    contradictory = b"entry_id,experiment_id,priority\nother,EXP-001,P0\n"
+    path.write_bytes(contradictory)
+    changed_record = record.model_copy(update={"size_bytes":Evidence[int](value=len(contradictory)),
+        "sha256":Evidence[str](value=hashlib.sha256(contradictory).hexdigest())})
+    changed = materialized.model_copy(update={"schedule_sha256":Evidence[str](value=changed_record.sha256.value),
+        "artifact_records":[changed_record]})
+    findings = _validate_materialized_records(changed, {})
+    assert any(item.code == "provenance.schedule_content" for item in findings)
+
+
 def test_not_expected_artifact_and_execution_cleanup_failures_remain_distinct(repository_root):
     value = make_input(repository_root)
     declaration = value.artifacts["schedule_snapshot"]

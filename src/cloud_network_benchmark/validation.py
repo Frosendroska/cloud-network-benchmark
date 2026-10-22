@@ -189,11 +189,14 @@ def _validate_materialized_records(value: ValidatorInput, records: dict[tuple[st
                         or parsed.get("experiment_id") not in {None, value.identity.experiment_id}):
                     findings.append(_finding("provenance.config_identity", "error", "saved configuration identity contradicts ValidatorInput", artifact=record.artifact_id))
             elif record.artifact_id == "schedule_snapshot" and value.schedule_entry.value is not None:
-                schedule_text = path.read_text(encoding="utf-8")
+                schedule_bytes = path.read_bytes()
+                schedule_text = schedule_bytes.decode("utf-8")
                 rows = list(csv.DictReader(io.StringIO(schedule_text)))
                 expected = value.schedule_entry.value
                 if not rows or expected.original_row not in schedule_text.splitlines():
                     findings.append(_finding("provenance.schedule_content", "error", "saved schedule does not contain the supplied original row", artifact=record.artifact_id))
+                if value.schedule_sha256.value and hashlib.sha256(schedule_bytes).hexdigest() != value.schedule_sha256.value:
+                    findings.append(_finding("provenance.schedule_hash", "error", "saved schedule bytes contradict schedule_sha256", artifact=record.artifact_id))
             elif record.kind == "command_evidence":
                 saved = _json_records(path)
                 actual = [item.model_dump(mode="json") for item in value.commands if item.unit_id == record.unit_id]
@@ -228,9 +231,6 @@ def _validate_materialized_records(value: ValidatorInput, records: dict[tuple[st
             elif record.artifact_id == "resolved_snapshot":
                 if hashlib.sha256(path.read_bytes()).hexdigest() != value.resolved_sha256.value:
                     findings.append(_finding("provenance.resolved_content", "error", "saved resolved configuration bytes contradict resolved_sha256", artifact=record.artifact_id))
-            elif record.artifact_id == "schedule_snapshot" and value.schedule_sha256.value:
-                if hashlib.sha256(path.read_bytes()).hexdigest() != value.schedule_sha256.value:
-                    findings.append(_finding("provenance.schedule_hash", "error", "saved schedule bytes contradict schedule_sha256", artifact=record.artifact_id))
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             findings.append(_finding("provenance.materialized_invalid", "error", f"saved evidence cannot be parsed or checked: {exc}", unit=record.unit_id, artifact=record.artifact_id))
     return findings
