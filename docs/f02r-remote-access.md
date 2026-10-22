@@ -43,6 +43,28 @@ credential-free and local.
 - Shared F01R contracts/schemas and historical specs 001/002 remain unchanged against the F01R base.
 - No real SSH/SCP, upstream download/build, cloud call, benchmark, or guest/provider enforcement was run.
 
+### Phase 8 convergence repairs
+
+T037–T043 preserve interruption and transport-preflight failures as typed results with accumulated
+actions; failed partial transfers retain observed byte size/hash. Systemd observers now request
+`MainPID`, accept a successful start command without fabricated stdout, then verify the live `/proc`
+executable path/hash and bind its PID to the socket observation. ACL checks share one exact ordered
+owned-chain predicate and reject additional accept/jump rules. Build observations redact supplied
+credential references and secret text, while capability checks use separate Sockperf server and
+under-load help responses and iperf3-specific options. Retrieval checks the original cleanup budget
+after local hashing and final materialized verification, preserving failed integrity evidence. The
+integration suite composes F01R layouts with typed caller reservation/expiry evidence across all
+four modes, including missing B metadata and a failed later probe chunk.
+
+- Tested implementation SHA: `cef4b0abc87522c9354505ccf7944552e8d3676c`.
+- Focused quickstart suite: exit 0, **60 passed**.
+- Full regression suite: exit 0, **471 passed**.
+- Schema checks are included in the full suite (`tests/contract/test_v2_schema_export.py` and
+  `tests/contract/test_schema_integrity.py`); no shared schema files changed.
+- `git diff --check`: exit 0; historical specs and F01R/Frozen contracts remain unchanged.
+- Real SSH/SCP, downloads/builds, cloud calls, benchmark traffic, and provider enforcement remain
+  unrun.
+
 Focused command:
 
 ```sh
