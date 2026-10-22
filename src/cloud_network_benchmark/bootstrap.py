@@ -70,18 +70,26 @@ class SourceBuild(StrictModel):
         pinned = {
             "5ebd327da983225321818c0355db922515e026bd": (
                 "tool_patches/sockperf-3.10-acquisition.patch",
-                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285"),
+                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
             "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
                 "tool_patches/iperf-3.17.1-acquisition.patch",
-                "2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df"),
+                "2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df",
+                "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe", "iperf-"),
         }
+        expected_prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
+        pinned_reference = next((commit for commit, values in pinned.items()
+                                 if values[3] == expected_prefix and self.source_reference == values[3] + commit), None)
+        if pinned_reference is not None and self.upstream_commit != pinned_reference:
+            raise ValueError("pinned source reference requires its exact observation source identity")
         if self.upstream_commit in pinned:
-            expected_path, expected_digest = pinned[self.upstream_commit]
+            expected_path, expected_digest, expected_source_digest, prefix = pinned[self.upstream_commit]
             if self.observation_patch_path != expected_path or self.observation_patch_sha256 != expected_digest:
                 raise ValueError("pinned upstream source requires its exact packaged observation patch identity")
-            prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
             if self.source_reference != prefix + self.upstream_commit:
                 raise ValueError("pinned source archive extraction directory does not match its upstream commit")
+            if self.source_sha256 != expected_source_digest:
+                raise ValueError("pinned upstream source requires the official archive digest")
         elif self.observation_patch_path is not None:
             raise ValueError("observation patching is supported only for the pinned upstream commits")
         return self
@@ -542,7 +550,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                                            upstream_commit=source.upstream_commit,
                                            patch_path=source.observation_patch_path,
                                            patch_sha256=source.observation_patch_sha256,
-                                           build_configuration=(f"CC={evidence['compiler_version'].splitlines()[0]}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
+                                           build_configuration=(f"CC=${{CC:-cc}}; compiler={evidence['compiler_version'].splitlines()[0]}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
                                            observation_capability=evidence.get("observation_capability"),
                                            observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None))
         if role == "vm_b":

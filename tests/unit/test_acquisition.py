@@ -8,7 +8,7 @@ from cloud_network_benchmark.contracts import AcquisitionSource, VmRole
 
 def source():
     return AcquisitionSource(tool="sockperf", semantics_id="sockperf-3.10-enabled-v1", producer=VmRole.VM_A,
-        command_action_id="short-multiflow-sockperf", invocation_id="short-multiflow-sockperf",
+        command_action_id="sockperf-short-multiflow", invocation_id="sockperf-short-multiflow",
         boot_id="12345678-1234-1234-1234-123456789abc", clock_domain="CLOCK_MONOTONIC",
         log_artifact_id="sockperf-log", log_path="measurements/sockperf.stderr",
         native_artifact_ids=["sockperf-csv"], build_artifact_id="build-sockperf")
@@ -56,13 +56,47 @@ def test_iperf_receiver_intervals_are_session_bound_microsecond_intervals_and_ze
         native_artifact_ids=["iperf-client"], build_artifact_id="iperf-build")
     with (root / "iperf-receiver.log").open("rb") as stream:
         rows = parse_observation_stream(stream)
-        receiver = list(_iperf_windows((r for r in rows if r.value["record_kind"] != "clock_anchor"), iperf))
+        receiver = list(_iperf_windows((r for r in rows if r.value.get("cookie") == iperf.session_id
+                                        and r.value["record_kind"] != "clock_anchor"), iperf))
     assert len(receiver) == 1
     window = receiver[0]
     assert (window.start_earliest_ns, window.start_latest_ns) == (5_000_000_000, 5_000_001_000)
     assert (window.end_earliest_ns, window.end_latest_ns) == (6_000_000_000, 6_000_001_000)
     assert window.omitted is False and window.has_positive_inner_support
     assert window.stream_id == "stream-1"
+
+
+def test_receiver_stream_replay_keeps_memory_bounded_for_large_interval_logs():
+    import io, json, tracemalloc
+    from cloud_network_benchmark.acquisition import _iperf_windows
+    source_ref = AcquisitionSource(tool="iperf3", semantics_id="iperf-3.17.1-stats-v1", producer=VmRole.VM_B,
+        command_action_id="f02r-vm_b-listener-iperf3", invocation_id="f02r-vm_b-listener-iperf3",
+        session_id="native-cookie-1", boot_id="12345678-1234-1234-1234-123456789def",
+        clock_domain="CLOCK_MONOTONIC", log_artifact_id="iperf-observation", log_path="server-logs/iperf.stderr",
+        native_artifact_ids=["iperf-client"], build_artifact_id="iperf-build")
+    common = {"format": 1, "tool": "iperf3", "semantics_id": source_ref.semantics_id,
+        "invocation_id": source_ref.invocation_id, "pid": 51, "boot_id": source_ref.boot_id,
+        "clock": source_ref.clock_domain, "cookie": source_ref.session_id}
+    payload = [b"ordinary server notice\n", (b"CNB_ACQ_V1 " + json.dumps({**common,
+        "record_kind": "stats_origin", "stream_id": "stream-1", "phase": "post_omit",
+        "origin_us": 0}).encode() + b"\n")]
+    count = 50_000
+    for index in range(count):
+        value = {**common, "record_kind": "receiver_interval", "stream_id": "stream-1",
+            "role": "receiver", "protocol": "tcp", "local_host": "10.0.0.2", "local_port": "5201",
+            "remote_host": "10.0.0.1", "remote_port": "50100", "interval_start_us": index,
+            "interval_end_us": index + 1, "bytes": 0, "omitted": False}
+        payload.append(b"CNB_ACQ_V1 " + json.dumps(value, separators=(",", ":")).encode() + b"\n")
+    data = b"".join(payload)
+    del payload
+    tracemalloc.start()
+    parsed = parse_observation_stream(io.BytesIO(data))
+    windows = _iperf_windows((item for item in parsed if item.value.get("record_kind") != "clock_anchor"), source_ref)
+    observed = sum(1 for _ in windows)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert observed == count
+    assert peak < 1_000_000
 
 
 @pytest.mark.parametrize("patch,reason", [
@@ -81,7 +115,7 @@ def test_iperf_receiver_record_mutations_are_rejected(patch, reason):
         native_artifact_ids=["iperf-client"], build_artifact_id="iperf-build")
     root = Path(__file__).parents[1] / "fixtures" / "acquisition"
     with (root / "iperf-receiver.log").open("rb") as stream:
-        parsed = list(parse_observation_stream(stream))
+        parsed = [row for row in parse_observation_stream(stream) if row.value.get("cookie") == source_ref.session_id]
     origins = [r for r in parsed if r.value["record_kind"] == "stats_origin"]
     interval = next(r for r in parsed if r.value["record_kind"] == "receiver_interval")
     changed = ParsedRecord(patch(dict(interval.value)), interval.byte_offset, interval.byte_length)

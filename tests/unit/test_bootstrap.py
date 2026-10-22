@@ -128,13 +128,58 @@ def test_pinned_acquisition_patch_identity_is_mandatory_and_part_of_cache_key(tm
     script = _recipe(pinned, config)[4][-1]
     assert "patch --batch --fuzz=0 -p1" in script
     assert digest in script and "old_patch" in script
+    assert subprocess.run(["sh", "-n", "-c", script], capture_output=True).returncode == 0
+    assert "config_sha" in script and "CNB_ACQ_V1" in " ".join(" ".join(row) for row in _recipe(pinned, config))
     iperf_patch = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch"
     iperf_digest = hashlib.sha256(iperf_patch.read_bytes()).hexdigest()
     iperf = SourceBuild(tool="iperf3", source_url="https://github.com/esnet/iperf/archive/2acfcfe94e928e74542c9f107e02aa6dd4748a79.tar.gz",
         source_reference="iperf-2acfcfe94e928e74542c9f107e02aa6dd4748a79", upstream_commit="2acfcfe94e928e74542c9f107e02aa6dd4748a79", archive_name="iperf.tar.gz",
         source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
         observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch", observation_patch_sha256=iperf_digest)
-    assert "patch --batch --fuzz=0 -p1" in _recipe(iperf, config)[4][-1]
+    iperf_script = _recipe(iperf, config)[4][-1]
+    assert "patch --batch --fuzz=0 -p1" in iperf_script
+    assert subprocess.run(["sh", "-n", "-c", iperf_script], capture_output=True).returncode == 0
+
+
+def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_path):
+    sock_patch = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch"
+    iperf_patch = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch"
+    sock_sha, iperf_sha = hashlib.sha256(sock_patch.read_bytes()).hexdigest(), hashlib.sha256(iperf_patch.read_bytes()).hexdigest()
+    sock_commit, iperf_commit = "5ebd327da983225321818c0355db922515e026bd", "2acfcfe94e928e74542c9f107e02aa6dd4748a79"
+    config = bootstrap_config().model_copy(update={"sources": [
+        SourceBuild(tool="sockperf", source_url=f"https://github.com/Mellanox/sockperf/archive/{sock_commit}.tar.gz",
+            source_reference=f"sockperf-{sock_commit}", archive_name="sockperf.tar.gz",
+            source_sha256="a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e",
+            upstream_commit=sock_commit, observation_patch_path="tool_patches/sockperf-3.10-acquisition.patch",
+            observation_patch_sha256=sock_sha),
+        SourceBuild(tool="iperf3", source_url=f"https://github.com/esnet/iperf/archive/{iperf_commit}.tar.gz",
+            source_reference=f"iperf-{iperf_commit}", archive_name="iperf3.tar.gz",
+            source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
+            upstream_commit=iperf_commit, observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch",
+            observation_patch_sha256=iperf_sha)]})
+    class PatchedRunner(BootstrapRunner):
+        def run(self, request):
+            aid = request.action_id
+            tool = "sockperf" if "sockperf" in aid else "iperf3"
+            if aid.endswith(f"{tool}-2"):
+                digest = config.sources[0 if tool == "sockperf" else 1].source_sha256
+                archive = "sockperf.tar.gz" if tool == "sockperf" else "iperf3.tar.gz"
+                return result(aid, f"{digest} /var/lib/cnb/work/{archive}")
+            if aid.endswith(("sockperf-11", "iperf3-9")):
+                return result(aid, "CNB_ACQ_V1")
+            response = super().run(request)
+            if aid.endswith("listener-verify-iperf3"):
+                return result(aid, response.stdout + "\nEnvironment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n")
+            if aid.endswith("listener-config-iperf3"):
+                return result(aid, response.stdout + "\nEnvironment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n")
+            return response
+    outcome = run_bootstrap(connection(tmp_path), config, PatchedRunner(), deadline=deadline(), clock=lambda: 100)
+    assert outcome.succeeded
+    for build in outcome.builds:
+        assert build.observation_capability == "CNB_ACQ_V1"
+        assert build.patch_sha256 == (sock_sha if build.tool == "sockperf" else iperf_sha)
+        assert build.observation_semantics == ("sockperf-3.10-enabled-v1" if build.tool == "sockperf" else "iperf-3.17.1-stats-v1")
+        assert build.build_configuration and build.artifact_id
 
 
 def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):

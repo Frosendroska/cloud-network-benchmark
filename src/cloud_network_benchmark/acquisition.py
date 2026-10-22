@@ -209,6 +209,18 @@ def _validate_anchor(record: ParsedRecord, source: AcquisitionSource) -> None:
         raise ValueError("clock anchor bounds are invalid")
 
 
+def _expected_build_identity(tool: str) -> tuple[str, str, str, str]:
+    if tool == "sockperf":
+        return ("5ebd327da983225321818c0355db922515e026bd",
+                "tool_patches/sockperf-3.10-acquisition.patch",
+                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e")
+    return ("2acfcfe94e928e74542c9f107e02aa6dd4748a79",
+            "tool_patches/iperf-3.17.1-acquisition.patch",
+            "2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df",
+            "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe")
+
+
 def iter_source_windows(child_root: Path, source: AcquisitionSource,
                         artifact_records: Sequence[ArtifactRecord], commands: Sequence[CommandEvidence],
                         build_evidence: Sequence[object], clock_mappings: Sequence[ClockMapping] = ()) -> Iterator[SourceWindow]:
@@ -239,12 +251,20 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
     if log.unit_id not in {None, command[0].unit_id}:
         raise ValueError("acquisition log unit does not match its producing command")
     for item in native:
-        if item.deployment_id != log.deployment_id or item.unit_id not in {None, command[0].unit_id}:
-            raise ValueError("native acquisition artifacts must share deployment and measurement unit")
+        if item.deployment_id != log.deployment_id:
+            raise ValueError("native acquisition artifacts must share the source deployment")
         if source.tool == "sockperf" and (item.producer != source.producer or item.kind != "sockperf-csv"):
             raise ValueError("Sockperf source must reference its native client CSV")
         if source.tool == "iperf3" and (item.producer != VmRole.VM_A or item.kind not in {"iperf3-json", "iperf3-client-jsonl"}):
             raise ValueError("iperf3 receiver source must reference a native client artifact")
+        if source.tool == "sockperf" and item.unit_id not in {None, command[0].unit_id}:
+            raise ValueError("Sockperf native artifact must match its producing measurement unit")
+        if source.tool == "iperf3":
+            client_command = [row for row in commands if row.deployment_id == log.deployment_id
+                and row.producer == VmRole.VM_A and row.unit_id == item.unit_id
+                and (row.result.get("action_id") or row.request.get("action_id") or "").startswith("iperf3-")]
+            if len(client_command) != 1:
+                raise ValueError("iperf3 native artifact must match one client command in its unit")
         item.verify_materialized_file(child_root)
         if source.tool == "iperf3" and not _file_contains(
             resolve_artifact_path(child_root, item.path), source.session_id.encode("ascii")
@@ -256,17 +276,19 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
         raise ValueError("acquisition source must match one observed build artifact")
     observed = builds[0]
     expected_semantics = "sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1"
+    expected_commit, expected_patch_path, expected_patch_sha, expected_source_sha = _expected_build_identity(source.tool)
     if (getattr(observed, "tool", None) != source.tool
             or getattr(observed, "observation_capability", None) != "CNB_ACQ_V1"
-            or getattr(observed, "patch_sha256", None) is None
+            or getattr(observed, "patch_path", None) != expected_patch_path
+            or getattr(observed, "patch_sha256", None) != expected_patch_sha
+            or getattr(observed, "source_sha256", None) != expected_source_sha
+            or getattr(observed, "source_reference", None) != f"{('sockperf-' if source.tool == 'sockperf' else 'iperf-')}{expected_commit}"
+            or getattr(observed, "build_configuration", None) is None
+            or not getattr(observed, "compiler_version", "").strip()
             or getattr(observed, "binary_sha256", None) is None
-            or getattr(observed, "upstream_commit", None) is None
+            or getattr(observed, "upstream_commit", None) != expected_commit
             or getattr(observed, "observation_semantics", None) != expected_semantics):
         raise ValueError("installed build does not prove the requested observation capability")
-    expected_commit = ("5ebd327da983225321818c0355db922515e026bd" if source.tool == "sockperf"
-                       else "2acfcfe94e928e74542c9f107e02aa6dd4748a79")
-    if getattr(observed, "upstream_commit", None) != expected_commit:
-        raise ValueError("installed observation build does not match the pinned upstream commit")
     for index in source.mapping_indexes:
         if index >= len(clock_mappings) or clock_mappings[index].vm_role != source.producer:
             raise ValueError("acquisition clock mapping does not match producer domain")
@@ -277,31 +299,50 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
 
     if source.tool == "sockperf":
         found = 0
+        anchor_pid: int | None = None
         for record in records():
             if record.value.get("record_kind") == "clock_anchor":
                 _validate_anchor(record, source)
+                pid = _native_int(record.value.get("pid"), "pid")
+                if anchor_pid is not None and anchor_pid != pid:
+                    raise ValueError("conflicting Sockperf source process identity")
+                anchor_pid = pid
                 continue
             if record.value.get("record_kind") != "probe_window":
                 continue
             found += 1
             if found > 1:
                 raise ValueError("conflicting duplicate Sockperf probe window records")
+            if anchor_pid is None or _native_int(record.value.get("pid"), "pid") != anchor_pid:
+                raise ValueError("Sockperf window is not linked to its clock-anchor process")
             yield _sockperf_window(record, source)
         if not found:
             raise ValueError("Sockperf probe window observation is missing")
         return
     def iperf_records():
         anchors: dict[str | None, Mapping[str, object]] = {}
+        anchor_pids: dict[str | None, int] = {}
+        found_session_anchor = False
         for record in records():
             if record.value.get("record_kind") == "clock_anchor":
-                _validate_anchor(record, source)
                 cookie = record.value.get("cookie")
+                if cookie != source.session_id:
+                    continue
+                _validate_anchor(record, source)
                 previous = anchors.get(cookie)
                 if previous is not None and previous != record.value:
                     raise ValueError("conflicting duplicate iperf clock anchor")
                 anchors[cookie] = record.value
+                anchor_pids[cookie] = _native_int(record.value.get("pid"), "pid")
+                found_session_anchor = True
                 continue
+            if record.value.get("cookie") != source.session_id:
+                continue
+            if source.session_id not in anchor_pids or _native_int(record.value.get("pid"), "pid") != anchor_pids[source.session_id]:
+                raise ValueError("iperf session record is not linked to its clock-anchor process")
             yield record
+        if not found_session_anchor:
+            raise ValueError("iperf session clock anchor is missing")
     yield from _iperf_windows(iperf_records(), source)
 
 
@@ -326,37 +367,36 @@ def bind_acquisition_sources(*, child_root: Path, run_identity: object, commands
         if not build or not getattr(build, "observation_capability", None):
             continue
         record.verify_materialized_file(child_root)
-        with resolve_artifact_path(child_root, record.path).open("rb") as stream:
-            raw_records = parse_observation_stream(stream)
         anchors: dict[str | None, ParsedRecord] = {}
         observed_sessions: set[str] = set()
-        for raw in raw_records:
-            kind = raw.value.get("record_kind")
-            if kind == "clock_anchor":
-                try:
+        with resolve_artifact_path(child_root, record.path).open("rb") as stream:
+            for raw in parse_observation_stream(stream):
+                kind = raw.value.get("record_kind")
+                if kind == "clock_anchor":
+                    try:
+                        value = raw.value
+                        expected_semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
+                        if value.get("tool") != tool or value.get("semantics_id") != expected_semantics:
+                            continue
+                        if value.get("clock") != "CLOCK_MONOTONIC" or not isinstance(value.get("invocation_id"), str):
+                            continue
+                        boot_id = value.get("boot_id")
+                        if not isinstance(boot_id, str) or len(boot_id) != 36 or not isinstance(value.get("pid"), int):
+                            continue
+                        _native_int(value.get("pid"), "pid")
+                        _native_int(value.get("mono_before_ns"), "mono_before_ns")
+                        _native_int(value.get("realtime_ns"), "realtime_ns")
+                        _native_int(value.get("mono_after_ns"), "mono_after_ns")
+                        cookie = value.get("cookie") if tool == "iperf3" else None
+                        if tool == "iperf3" and (not isinstance(cookie, str) or not cookie):
+                            continue
+                        anchors[cookie] = raw
+                    except (KeyError, ValueError):
+                        continue
+                elif kind in {"receiver_interval", "probe_window"}:
                     value = raw.value
-                    expected_semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
-                    if value.get("tool") != tool or value.get("semantics_id") != expected_semantics:
-                        continue
-                    if value.get("clock") != "CLOCK_MONOTONIC" or not isinstance(value.get("invocation_id"), str):
-                        continue
-                    boot_id = value.get("boot_id")
-                    if not isinstance(boot_id, str) or len(boot_id) != 36 or not isinstance(value.get("pid"), int):
-                        continue
-                    _native_int(value.get("pid"), "pid")
-                    _native_int(value.get("mono_before_ns"), "mono_before_ns")
-                    _native_int(value.get("realtime_ns"), "realtime_ns")
-                    _native_int(value.get("mono_after_ns"), "mono_after_ns")
-                    cookie = value.get("cookie") if tool == "iperf3" else None
-                    if tool == "iperf3" and (not isinstance(cookie, str) or not cookie):
-                        continue
-                    anchors[cookie] = raw
-                except (KeyError, ValueError):
-                    continue
-            elif kind in {"receiver_interval", "probe_window"}:
-                value = raw.value
-                if isinstance(value.get("cookie"), str) and value.get("cookie"):
-                    observed_sessions.add(str(value["cookie"]))
+                    if isinstance(value.get("cookie"), str) and value.get("cookie"):
+                        observed_sessions.add(str(value["cookie"]))
         if tool == "sockperf":
             if None not in anchors:
                 continue
