@@ -1,6 +1,6 @@
 # F04 local diagnostics validation
 
-Implementation source and tests were validated at commit `6be1935` (`6be1935ab26377ea4bff9eaea6cb3b8619787fc7`) on `codex/f04-v2-diagnostics`, based on merged F03 head `7a70a3139c5ee9efa1f8ea13c3f6de40e9048121`. The later task-marker/documentation commit changes no executable files.
+Implementation source and tests were validated at code commit `423f4bc` (`423f4bce90b3a40e3141f304e79217e54e6920b2`) on `codex/f04-v2-diagnostics`, based on the F04 repair head `a8c9444ec0c1a07a8ea4bed65366b48a7e70f16c`. The following task-marker/documentation commit changes no executable files.
 
 ## What is implemented
 
@@ -10,15 +10,17 @@ Implementation source and tests were validated at commit `6be1935` (`6be1935ab26
 
 Counter decreases remain unavailable without wrap/clamp assumptions. Failed reads invalidate only affected evidence and recovery requires valid consecutive observations. Missed ticks retain actual elapsed time and are not backfilled. Missing chrony, image/build, driver, acceleration, or provider-limit evidence remains explicit. High host metrics do not trigger performance labels or exclusions.
 
+Convergence repairs keep malformed CPU cores from hiding aggregate values or fabricating maximum-core utilization; timestamp CPU and UTC around snapshot reads and preserve a partial sample when a read crosses the deadline; hash tool binaries in bounded chunks; resolve rooted sysfs links component by component; convert invalid MTU and empty guest strings to unavailable evidence; reject provider, declaration, closure, count, and clock-order contradictions in materialized outcomes; and strictly parse complete chrony numeric fields and units. Regression fixtures cover aggregate-only/malformed/recovered cores, delayed and deadline-crossing snapshots, deadline-exhausted binary identity with observed/supplied mismatch, relative lower-interface and absolute VF links, invalid metadata, outcome contradictions, malformed chrony fields, and UTC reversal.
+
 ## Checks
 
 | Command | Exit and result |
 | --- | --- |
-| `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_diagnostics.py tests/unit/test_diagnostics_clock.py tests/contract/test_diagnostics_contract.py tests/integration/test_diagnostics_collection.py` | 0; 26 passed, no skips (9.08 s) |
-| `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | 0; 653 passed, no skips (34.35 s) |
+| `test "$PWD" = /private/tmp/cnb-f04 && PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_diagnostics.py tests/unit/test_diagnostics_clock.py tests/contract/test_diagnostics_contract.py tests/integration/test_diagnostics_collection.py` | 0; 37 passed, no skips (9.80 s) |
+| `test "$PWD" = /private/tmp/cnb-f04 && THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | 0; 664 passed, no skips (36.15 s) |
 | `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | 0; shared schemas unchanged |
 | `/private/tmp/cnb-offline-venv/bin/python -m py_compile src/cloud_network_benchmark/diagnostics.py src/cloud_network_benchmark/diagnostics_guest.py` | 0 |
-| `git diff --cached --check` | 0; no whitespace errors in the source/test commit |
+| `git diff --check` | 0; no whitespace errors |
 
 The focused integration suite includes an uninterrupted fake 86,400-second stream, deadline exhaustion, early stop, delayed ticks, missing/reset/recovery cases, write/flush/close failures, output collisions and symlink rejection, clock query bounds, both-role artifact identity, and an isolated copy of the guest script run with `--help` and no project `PYTHONPATH`. These are offline fixture/fake results, not evidence about actual guest packages, clock accuracy, cloud permissions, NIC driver semantics, or measurement overhead.
 
