@@ -84,18 +84,19 @@ service observations, valid nft command/output handling, and authentic `cc --ver
 Retrieval hashes local files in bounded chunks and rechecks the original deadline after local
 filesystem work and before publication. The composed offline integration fixture verifies the
 service log directory and file mode setup permits same-user retrieval of root-created service logs.
+T048 updates the shared artifact verifier to stream in 1 MiB chunks and accepts an optional
+backward-compatible `budget_check(size, sha256_prefix)` callback. F02R uses the original cleanup
+deadline through that callback, stops verification at the cap, and records prefix integrity when
+verification stops mid-file. The coordinator authorized this narrow implementation ownership
+extension after F01R clock PR #9 merged; serialized fields and schemas are unchanged.
 
-- Tested implementation SHA: `938bc14fd6bb8f37531e8f19a609d6195b054f3c` on
+- Tested implementation SHA: `e2e7247e3d4e22abbb877b02b65b7b761f81dc1f` on
   `codex/f02r-v2-remote-access`.
-- Focused quickstart suite: exit 0, **66 passed**.
-- Full regression suite: exit 0, **477 passed**.
-- Frozen schema checks: exit 0, **6 passed**.
-- `git diff --check`: exit 0; no changes from F01R base in shared contracts, published schemas,
-  or historical specs 001/002.
-- T044–T047 are checked in `tasks.md`. T048 remains open pending coordinator authorization for
-  the narrowly scoped streaming update to frozen F01R `ArtifactRecord.verify_materialized_file`;
-  F02R's own hash pass is chunked and deadline-aware, but the current shared verifier still uses
-  `read_bytes()` and can allocate a complete large native file during materialized-file checking.
+- Focused quickstart and materialized-verifier checks: exit 0, **108 passed**.
+- Full regression suite: exit 0, **547 passed**.
+- Frozen schema checks: exit 0, **7 passed**; no schema files changed.
+- `git diff --check`: exit 0. Compared with merged F01R clock base `a468bb0219ff1f61bae6cbb3577ab797bdb9763b`, the only shared-contract source change is `contracts/artifacts.py`; published schemas and historical specs 001/002 are unchanged.
+- T044–T048 are checked in `tasks.md`.
 
 Primary format references used for the implementation check: systemd v255
 [`dbus-execute.c`](https://raw.githubusercontent.com/systemd/systemd/v255/src/core/dbus-execute.c)
@@ -108,12 +109,12 @@ nft enforcement, SSH/SCP, download/build, cloud call, benchmark, or provider beh
 **Validation commands** (all run with the worktree as the current directory):
 
 ```sh
-PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py tests/integration/test_v2_remote_access.py
-# exit 0: 66 passed
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py tests/integration/test_v2_remote_access.py tests/contract/test_v2_handoffs.py
+# exit 0: 108 passed (includes F02R contract, integration and materialized-verifier tests)
 PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
-# exit 0: 477 passed
+# exit 0: 547 passed
 PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_v2_schema_export.py tests/contract/test_schema_integrity.py
-# exit 0: 6 passed
+# exit 0: 7 passed
 git diff --check
 # exit 0
 ```
