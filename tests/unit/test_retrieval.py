@@ -191,12 +191,38 @@ def test_cap_consumed_during_final_materialized_verification_is_failure(tmp_path
             if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
             Path(request.argv[-1]).write_bytes(payload); return result(request.action_id)
     original=ArtifactRecord.verify_materialized_file
-    def slow_verify(record,root):
-        original(record,root); now[0]=291.0
+    def slow_verify(record,root,**kwargs):
+        original(record,root,**kwargs); now[0]=291.0
     monkeypatch.setattr(ArtifactRecord,"verify_materialized_file",slow_verify)
     outcome=run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=lambda:now[0])
     assert not outcome.complete and outcome.failure.category=="cleanup_allowance_reached_during_publication_verification"
     assert outcome.records[0].retrieval_state=="failed" and outcome.records[0].size_bytes.value==len(payload)
+
+
+def test_materialized_verification_stops_between_chunks_at_original_cap(tmp_path,monkeypatch):
+    from cloud_network_benchmark.contracts.artifacts import ArtifactRecord
+    import cloud_network_benchmark.retrieval as retrieval
+    c=connection(tmp_path); payload=b"z"*(3*1024*1024); now=[100.0]
+    class Runner:
+        def run(self,request):
+            if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(payload); return result(request.action_id)
+    original=ArtifactRecord.verify_materialized_file
+    def cap_during_stream(record,root,*,budget_check=None):
+        def check(size,digest):
+            if size>=1024*1024:
+                now[0]=291.0
+            if budget_check is not None:
+                budget_check(size,digest)
+        return original(record,root,budget_check=check)
+    monkeypatch.setattr(ArtifactRecord,"verify_materialized_file",cap_during_stream)
+    outcome=retrieval.run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=lambda:now[0])
+    assert not outcome.complete and outcome.failure.category=="cleanup_allowance_reached_during_publication_verification"
+    assert outcome.records[0].retrieval_state=="failed"
+    assert outcome.records[0].size_bytes.value==len(payload)
+    assert outcome.records[0].sha256.value==hashlib.sha256(payload).hexdigest()
+    assert outcome.records[0].failure.details["verified_prefix_bytes"]==1024*1024
+    assert outcome.records[0].failure.details["verified_prefix_sha256"]==hashlib.sha256(payload[:1024*1024]).hexdigest()
 
 
 def test_one_vm_loss_keeps_previously_verified_native_artifacts(tmp_path):

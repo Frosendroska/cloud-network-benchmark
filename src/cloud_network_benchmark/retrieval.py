@@ -178,6 +178,13 @@ def _hash_file(path: Path, *, deadline: RemoteDeadline | None = None, clock: Cal
     return size, digest.hexdigest()
 
 
+def _verification_budget_check(deadline: RemoteDeadline, clock: Callable[[], float]):
+    def check(size: int, sha256: str) -> None:
+        if deadline.remaining(clock, cleanup=True) <= 0:
+            raise _VerificationStopped(size, sha256)
+    return check
+
+
 def _evidence_failure(item: RetrievalItem, category: str, message: str, action_id: str | None = None) -> FailureEvidence:
     return FailureEvidence(category=category, message=message, action_id=action_id, occurred_at=datetime.now(timezone.utc), details={"artifact_id": item.artifact_id})
 
@@ -363,18 +370,43 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                     else:
                         os.link(staging, final_path)
                         staging.unlink()
+                        if deadline.remaining(clock, cleanup=True) <= 0:
+                            reason = "cleanup_allowance_reached_after_publication"
+                            stop = True
                 except OSError:
                     reason = "publication_failed"
                 if reason is None:
                     rec = ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](value=size), sha256=StringEvidence(value=digest), retrieval_state="verified")
+                    if deadline.remaining(clock, cleanup=True) <= 0:
+                        reason = "cleanup_allowance_reached_before_publication_verification"
+                        failure = _evidence_failure(item, reason, "materialized verification skipped after the caller cleanup allowance")
+                        records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
+                            size_bytes=Evidence[int](value=size), sha256=StringEvidence(value=digest), retrieval_state="failed", failure=failure))
+                        primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message="materialized verification skipped after cleanup allowance exhaustion", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                        item_verified = True
+                        stop = True
+                        break
                     try:
-                        rec.verify_materialized_file(child_root)
+                        rec.verify_materialized_file(
+                            child_root,
+                            budget_check=_verification_budget_check(deadline, clock),
+                        )
+                    except _VerificationStopped as exc:
+                        reason = "cleanup_allowance_reached_during_publication_verification"
+                        failure = _evidence_failure(item, reason, "streaming materialized verification stopped at the caller cleanup allowance")
+                        failure.details.update({"verified_prefix_bytes": exc.size, "verified_prefix_sha256": exc.sha256})
+                        records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
+                            size_bytes=Evidence[int](value=size), sha256=StringEvidence(value=digest), retrieval_state="failed", failure=failure))
+                        primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message="streaming materialized verification reached cleanup allowance", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                        item_verified = True
+                        stop = True
+                        break
                     except (OSError, ValueError):
                         records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="materialized verification failed"), sha256=StringEvidence(unavailable_reason="materialized verification failed"), retrieval_state="failed", failure=_evidence_failure(item, "publication_verification_failed", "published file failed materialized verification")))
                         primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="publication_verification_failed", message="published file failed materialized verification", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
                         item_verified = True
                         break
-                    if deadline.remaining(clock, cleanup=True) <= 0:
+                    if reason is None and deadline.remaining(clock, cleanup=True) <= 0:
                         reason = "cleanup_allowance_reached_during_publication_verification"
                         failure = _evidence_failure(item, reason, "materialized verification completed after the caller cleanup allowance")
                         records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
@@ -397,7 +429,7 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 break
         if not item_verified:
             last_attempt = next((attempt for attempt in reversed(attempts) if attempt.artifact_id == item.artifact_id), None)
-            reason = (last_attempt.reason if last_attempt and last_attempt.reason else "transfer_incomplete")
+            reason = (last_attempt.reason if last_attempt and last_attempt.reason else reason or "transfer_incomplete")
             failure = _evidence_failure(item, reason, "artifact was not verified and published within the available cleanup allowance")
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
                 size_bytes=Evidence[int](value=last_attempt.size_bytes) if last_attempt and last_attempt.size_bytes is not None else Evidence[int](unavailable_reason="no observed local size"),
