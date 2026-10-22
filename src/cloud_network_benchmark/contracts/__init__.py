@@ -66,6 +66,7 @@ from .execution import (
     SubprocessCommandRunner,
 )
 from .measurements import (
+    AcquisitionSource,
     ClockMapping,
     CommandEvidence,
     DiagnosticSample,

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import base64
 import math
 import re
 import shlex
 import time
 from typing import Callable, Dict, List, Literal, Optional
 from urllib.parse import urlparse
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from pydantic import Field, field_validator, model_validator
 
@@ -47,6 +48,9 @@ class SourceBuild(StrictModel):
     source_reference: str = Field(min_length=1)
     archive_name: str = Field(min_length=1)
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_patch_path: str | None = None
+    observation_patch_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    upstream_commit: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
 
     @model_validator(mode="after")
     def safe_source(self):
@@ -56,6 +60,30 @@ class SourceBuild(StrictModel):
         for name, value in (("source_reference", self.source_reference), ("archive_name", self.archive_name)):
             if value.startswith("-") or "/" in value or "\\" in value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", value):
                 raise ValueError(f"{name} must be a safe identifier or basename")
+        if (self.observation_patch_path is None) != (self.observation_patch_sha256 is None):
+            raise ValueError("observation patch path and digest must be supplied together")
+        if self.observation_patch_path is not None and (
+            self.observation_patch_path.startswith("/") or ".." in PurePosixPath(self.observation_patch_path).parts
+            or "\\" in self.observation_patch_path
+        ):
+            raise ValueError("observation patch path must be a safe package-relative path")
+        pinned = {
+            "5ebd327da983225321818c0355db922515e026bd": (
+                "tool_patches/sockperf-3.10-acquisition.patch",
+                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285"),
+            "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
+                "tool_patches/iperf-3.17.1-acquisition.patch",
+                "2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df"),
+        }
+        if self.upstream_commit in pinned:
+            expected_path, expected_digest = pinned[self.upstream_commit]
+            if self.observation_patch_path != expected_path or self.observation_patch_sha256 != expected_digest:
+                raise ValueError("pinned upstream source requires its exact packaged observation patch identity")
+            prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
+            if self.source_reference != prefix + self.upstream_commit:
+                raise ValueError("pinned source archive extraction directory does not match its upstream commit")
+        elif self.observation_patch_path is not None:
+            raise ValueError("observation patching is supported only for the pinned upstream commits")
         return self
 
 
@@ -93,6 +121,13 @@ class BuildObservation(StrictModel):
     binary_version: str
     binary_sha256: str
     capabilities: List[str]
+    artifact_id: str | None = None
+    upstream_commit: str | None = None
+    patch_path: str | None = None
+    patch_sha256: str | None = None
+    build_configuration: str | None = None
+    observation_capability: str | None = None
+    observation_semantics: str | None = None
 
     @model_validator(mode="after")
     def complete_observation(self):
@@ -102,6 +137,16 @@ class BuildObservation(StrictModel):
             raise ValueError("source and binary observations require lowercase SHA-256")
         if not set(_required_capabilities(self.tool)) <= set(self.capabilities):
             raise ValueError("build observation is missing required capability evidence")
+        observed_fields = (self.upstream_commit, self.patch_path, self.patch_sha256,
+                           self.build_configuration, self.observation_capability, self.observation_semantics)
+        if any(value is not None for value in observed_fields) and not all(value is not None for value in observed_fields):
+            raise ValueError("observation build identity must be complete or unavailable")
+        if self.observation_capability is not None:
+            expected = "sockperf-3.10-enabled-v1" if self.tool == "sockperf" else "iperf-3.17.1-stats-v1"
+            if self.observation_capability != "CNB_ACQ_V1" or self.observation_semantics != expected:
+                raise ValueError("observation build capability does not match tool semantics")
+            if not re.fullmatch(r"[a-f0-9]{40}", self.upstream_commit or "") or not re.fullmatch(r"[a-f0-9]{64}", self.patch_sha256 or ""):
+                raise ValueError("observation build requires pinned upstream commit and patch digest")
         return self
 
 
@@ -148,6 +193,13 @@ def _required_capabilities(tool: str) -> List[str]:
     return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "cubic", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
 
 
+def _build_config_prelude(config: BootstrapConfig) -> str:
+    spec = shlex.quote(f"./configure --prefix={config.install_prefix}; make -j2")
+    return ("compiler=$(cc --version | head -n 1) || exit 42; "
+            f"cfg=$(printf '%s\\n' \"${{CC:-cc}}\" \"$compiler\" {spec} | sha256sum) || exit 42; "
+            "set -- $cfg; config_sha=$1; ")
+
+
 def _capabilities_observed(text: str, tool: str, *, required: List[str] | None = None) -> bool:
     if not text.strip() or "usage" not in text.lower() or "error" in text.lower() or "unknown option" in text.lower():
         return False
@@ -155,7 +207,8 @@ def _capabilities_observed(text: str, tool: str, *, required: List[str] | None =
     return set(required if required is not None else _required_capabilities(tool)) <= tokens
 
 
-def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str) -> bool:
+def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str,
+                  observation_id: str | None = None) -> bool:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     match = re.search(r"argv\[\]=(.*?);", fields.get("ExecStart", ""))
     if not match:
@@ -171,7 +224,8 @@ def _unit_matches(text: str, config_text: str, tool: str, address: str, port: in
             and argv == expected and fields.get("Restart") == "no"
             and fields.get("StandardOutput") == "append"
             and fields.get("StandardError") == "append"
-            and _unit_log_destinations_match(config_text, stdout_path, stderr_path))
+            and _unit_log_destinations_match(config_text, stdout_path, stderr_path)
+            and (observation_id is None or _unit_environment_matches(text, config_text, observation_id)))
 
 
 def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
@@ -192,6 +246,20 @@ def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) 
             # subsequent effective value must still be explicit and exact.
             effective[key] = value or None
     return effective == {"StandardOutput": f"append:{stdout_path}", "StandardError": f"append:{stderr_path}"}
+
+
+def _unit_environment_matches(show_text: str, config_text: str, observation_id: str) -> bool:
+    expected = f"CNB_ACQUISITION_ID={observation_id}"
+    fields = dict(line.split("=", 1) for line in show_text.splitlines() if "=" in line)
+    effective = None
+    section = None
+    for raw in config_text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Service" and line.startswith("Environment="):
+            effective = line.split("=", 1)[1]
+    return expected in fields.get("Environment", "") and effective == expected
 
 
 def _process_identity_command(unit: str, binary: str) -> list[str]:
@@ -247,11 +315,28 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
     marker_q, binary_q = shlex.quote(marker), shlex.quote(binary)
     ref_q, digest_q = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
     build = "./autogen.sh && " if source.tool == "sockperf" else ""
-    build_script = (f"if [ -f {marker_q} ]; then IFS=' ' read -r old_ref old_sha old_bin < {marker_q}; "
+    patch_clause = ""
+    cache_patch = "legacy"
+    if source.observation_patch_path is not None:
+        patch_path = Path(__file__).parent / source.observation_patch_path
+        patch_bytes = patch_path.read_bytes()
+        patch_digest = hashlib.sha256(patch_bytes).hexdigest()
+        if patch_digest != source.observation_patch_sha256:
+            raise ValueError("packaged observation patch digest does not match requested identity")
+        patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+        encoded = base64.b64encode(patch_bytes).decode("ascii")
+        patch_clause = (f"printf '%s' {shlex.quote(encoded)} | base64 -d > {patch_q} && "
+                        f"printf '%s  %s\\n' {shlex.quote(patch_digest)} {patch_q} | sha256sum -c - && "
+                        f"cd {source_dir_q} && patch --batch --fuzz=0 -p1 < {patch_q} && ")
+        cache_patch = patch_digest
+    patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+    cache_q = shlex.quote(cache_patch)
+    build_script = (_build_config_prelude(config) +
+                    f"if [ -f {marker_q} ]; then IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker_q}; "
                     f"current=$(sha256sum {binary_q}) || exit 42; set -- $current; "
-                    f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
-                    f"[ ! -e {binary_q} ] || exit 43; cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
-                    f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s\\n' {ref_q} {digest_q} \"$1\" > {marker_q}")
+                    f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_patch\" = {cache_q} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
+                    f"[ ! -e {binary_q} ] || exit 43; {patch_clause}cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
+                    f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s %s %s\\n' {ref_q} {digest_q} {cache_q} \"$config_sha\" \"$1\" > {marker_q}")
     commands = [
         ["sudo", "apt-get", "install", "-y", *config.bootstrap_packages],
         ["curl", "--fail", "--location", "--silent", "--show-error", "--output", archive, source.source_url],
@@ -266,6 +351,8 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
     if source.tool == "sockperf":
         commands.extend([[f"{prefix}/bin/sockperf", "server", "--help"],
                          [f"{prefix}/bin/sockperf", "under-load", "--help"]])
+    if source.observation_patch_path is not None:
+        commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {binary_q} >/dev/null && printf CNB_ACQ_V1"])
     return commands
 
 
@@ -273,9 +360,11 @@ def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> 
     binary = shlex.quote(f"{config.install_prefix}/bin/{source.tool}")
     marker = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.identity")
     reference, digest = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
-    return (f"if [ ! -e {marker} ]; then [ ! -e {binary} ] || exit 43; printf 'missing\\n'; exit 0; fi; "
-            f"IFS=' ' read -r old_ref old_sha old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
-            f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
+    patch_digest = shlex.quote(source.observation_patch_sha256 or "legacy")
+    return (_build_config_prelude(config) +
+            f"if [ ! -e {marker} ]; then [ ! -e {binary} ] || exit 43; printf 'missing\\n'; exit 0; fi; "
+            f"IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
+            f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_patch\" = {patch_digest} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
 
 
 def _sha256sum_output(text: str, expected_path: str) -> str | None:
@@ -350,7 +439,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
                 observed = _execute(runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
                 if observed.outcome == CommandOutcome.SUCCEEDED:
@@ -362,7 +451,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
                         cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if (cat_result.outcome != CommandOutcome.SUCCEEDED or
-                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}")):
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
@@ -429,6 +519,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if not observed_hash:
                         return _failure_result(connection, actions, vm, req, result, "binary_hash_missing", f"{source.tool} binary hash was not observed", builds, listeners)
                     evidence["binary_sha256"] = observed_hash
+                elif source.observation_patch_path is not None and index == len(recipe) - 1:
+                    if text != "CNB_ACQ_V1":
+                        return _failure_result(connection, actions, vm, req, result, "observation_capability_missing", f"{source.tool} installed binary lacks CNB_ACQ_V1 capability", builds, listeners)
+                    evidence["observation_capability"] = text
                 elif index >= 8:
                     if source.tool == "sockperf":
                         required = (["server", "-i", "-p"] if index == 9 else
@@ -443,7 +537,14 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             builds.append(BuildObservation(role=role, tool=source.tool, source_reference=source.source_reference,
                                            source_sha256=evidence["source_sha256"], compiler_version=evidence["compiler_version"],
                                            binary_path=binary_path, binary_version=evidence["binary_version"], binary_sha256=evidence["binary_sha256"],
-                                           capabilities=_required_capabilities(source.tool)))
+                                           capabilities=_required_capabilities(source.tool),
+                                           artifact_id=f"f02r-{role}-{source.tool}-build",
+                                           upstream_commit=source.upstream_commit,
+                                           patch_path=source.observation_patch_path,
+                                           patch_sha256=source.observation_patch_sha256,
+                                           build_configuration=(f"CC={evidence['compiler_version'].splitlines()[0]}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
+                                           observation_capability=evidence.get("observation_capability"),
+                                           observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None))
         if role == "vm_b":
             # Establish the private-only ingress chain before starting either listener.
             chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
@@ -486,7 +587,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
                 inspect_result = _execute(runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
                 if inspect_result.outcome == CommandOutcome.SUCCEEDED:
@@ -500,7 +601,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                         cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
+                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
                         proc_id = f"f02r-vm_b-listener-process-{tool}"
                         proc_remaining = deadline.remaining(clock, readiness=True)
@@ -529,7 +631,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
                 if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
-                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs, *server_argv]
+                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs]
+                if tool == "iperf3" and sources[tool].observation_patch_path:
+                    command.append("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
+                command.extend(server_argv)
                 aid = f"f02r-vm_b-listener-{tool}"
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
@@ -543,7 +648,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 verify_remaining = deadline.remaining(clock, readiness=True)
                 if verify_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener identity verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, verify_remaining))
+                verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, verify_remaining))
                 verify_result = _execute(runner, verify_request)
                 actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
                 cat_remaining = deadline.remaining(clock, readiness=True)
@@ -552,7 +657,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                 cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                 if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
-                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs)):
+                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
+                            "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                     return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
                 proc_id = f"f02r-vm_b-listener-process-{tool}"
                 proc_remaining = deadline.remaining(clock, readiness=True)

@@ -5,20 +5,22 @@ import csv
 import ipaddress
 import json
 import math
+import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
 from .contracts import (
-    BenchmarkPhase, ClockMapping, CommandEvidence, CommandOutcome, CommandRequest,
+    AcquisitionSource, ArtifactRecord, BenchmarkPhase, ClockMapping, CommandEvidence, CommandOutcome, CommandRequest,
     CommandResult, Evidence, ExperimentMode, FailureEvidence, IdentityContext,
     MeasurementTiming, PhaseConfiguration, ResolvedObservation, StringEvidence,
     TimingGap, VmRole,
 )
 from .contracts.artifacts import resolve_artifact_path
+from .bootstrap import BuildObservation
 from .measurement_process import MeasurementClock, MeasurementProcesses, ProcessEvent, SystemMeasurementClock
 
 NOTIFICATION = "Starting test..."
@@ -35,6 +37,9 @@ class MeasurementContext:
     shutdown_grace_seconds: float
     clock_mappings: tuple[ClockMapping, ...] = ()
     tool_identity: Mapping[str, StringEvidence] = field(default_factory=dict)
+    build_observations: tuple[BuildObservation, ...] = ()
+    receiver_command_evidence: tuple[CommandEvidence, ...] = ()
+    source_artifact_records: tuple[ArtifactRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,11 +315,17 @@ def _evidence(value: object, reason: str) -> Evidence:
     return Evidence(value=value) if value is not None else Evidence(unavailable_reason=reason)
 
 
-def _request(action: str, argv: list[str], root: Path, deadline: float, clock: MeasurementClock) -> CommandRequest:
+def _request(action: str, argv: list[str], root: Path, deadline: float, clock: MeasurementClock,
+             *, acquisition_id: str | None = None) -> CommandRequest:
     remaining = deadline - clock.monotonic()
     if remaining <= 0:
         raise MeasurementError("measurement deadline exhausted", "deadline")
-    return CommandRequest(action_id=action, action_type="measurement", argv=argv, cwd=str(root), timeout_seconds=remaining)
+    environment = ({"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CNB_ACQUISITION_ID": acquisition_id}
+                   if acquisition_id is not None else {})
+    return CommandRequest(action_id=action, action_type="measurement", argv=argv, cwd=str(root),
+                          environment=environment,
+                          environment_classification="non_secret" if environment else "none",
+                          timeout_seconds=remaining)
 
 
 def _paths(observation: ResolvedObservation, root: Path, unit: PhaseConfiguration) -> dict[str, Path]:
@@ -471,13 +482,14 @@ class _Runner:
         # F09 owns the canonical aggregate stdout/stderr projection. These VM-local logs
         # preserve tool attribution until that caller materializes the controller files.
         probe_stdout = p["sockperf"].with_suffix(".stdout.log")
-        p_err = p["sockperf"].with_suffix(".sockperf.stderr.log")
-        tcp_err = p["iperf3"].with_suffix(".iperf3.stderr.log")
+        p_err = p["sockperf-observation"]
+        tcp_err = p["iperf3-observation"]
         for path in (p["sockperf"], probe_stdout, p_err, tcp_err, *( [p["iperf3"]] if tcp and not day else [])):
             if path.exists():
                 raise ValueError(f"measurement artifact already exists: {path.relative_to(self.root)}")
         self.artifacts.extend(path.relative_to(self.root).as_posix() for path in (p["sockperf"], probe_stdout, p_err))
-        probe_req = _request(f"sockperf-{unit.unit_id}", sockperf_argv(self.context.b_private_ipv4, p["sockperf"], probe_seconds), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock)
+        probe_action = f"sockperf-{unit.unit_id}"
+        probe_req = _request(probe_action, sockperf_argv(self.context.b_private_ipv4, p["sockperf"], probe_seconds), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=probe_action)
         probe = self._start(probe_req, probe_stdout, p_err)
         pmono, putc = self._start_times(probe)
         handles = [probe]
@@ -498,9 +510,10 @@ class _Runner:
                 if self.clock.monotonic() + seconds + 5 > self.context.deadline_monotonic - self.context.shutdown_grace_seconds:
                     raise MeasurementError("TCP measured duration and reserved shutdown grace no longer fit the deadline", "deadline")
                 tcp_dest = self.root / self.observation.artifact_layout.day_iperf3_client if day else p["iperf3"]
-                tcp_err_dest = tcp_dest.with_suffix(".stderr.log") if day else tcp_err
+                tcp_err_dest = self.root / self.observation.artifact_layout.day_iperf3_observation if day else tcp_err
                 self.artifacts.extend((tcp_dest.relative_to(self.root).as_posix(), tcp_err_dest.relative_to(self.root).as_posix()))
-                tcp_req = _request(f"iperf3-{unit.unit_id}", iperf3_argv(self.context.b_private_ipv4, streams or unit.streams or 1, seconds, day=day), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock)
+                tcp_action = f"iperf3-{unit.unit_id}"
+                tcp_req = _request(tcp_action, iperf3_argv(self.context.b_private_ipv4, streams or unit.streams or 1, seconds, day=day), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=tcp_action)
                 tcp_handle = self._start(tcp_req, tcp_dest, tcp_err_dest)
                 tcp_mono, tcp_utc = self._start_times(tcp_handle)
                 handles.append(tcp_handle)
@@ -662,7 +675,7 @@ class _Runner:
         tcp_path = resolve_artifact_path(self.root, self.observation.artifact_layout.day_iperf3_client)
         if tcp_path.exists():
             raise ValueError("diagnostic-day client output already exists")
-        tcp_err = tcp_path.with_suffix(".stderr.log")
+        tcp_err = resolve_artifact_path(self.root, self.observation.artifact_layout.day_iperf3_observation)
         if tcp_err.exists():
             raise ValueError("diagnostic-day client stderr already exists")
         self.artifacts.extend((tcp_path.relative_to(self.root).as_posix(), tcp_err.relative_to(self.root).as_posix()))
@@ -673,9 +686,10 @@ class _Runner:
 
     def _day_continuous(self, parent: PhaseConfiguration, tcp_path: Path, tcp_err: Path, deadline: float) -> None:
         layout = self.observation.artifact_layout
-        tcp_req = _request(f"iperf3-{parent.unit_id}", iperf3_argv(
+        tcp_action = f"iperf3-{parent.unit_id}"
+        tcp_req = _request(tcp_action, iperf3_argv(
             self.context.b_private_ipv4, self._streams(parent) or 1,
-            86400, day=True), self.root, deadline, self.clock)
+            86400, day=True), self.root, deadline, self.clock, acquisition_id=tcp_action)
         tcp_handle: Optional[object] = None
         tcp_result: Optional[CommandResult] = None
         tcp_mono: Optional[float] = None
@@ -707,14 +721,15 @@ class _Runner:
                     paths = layout.unit_paths(probe_id)
                     csv_path = resolve_artifact_path(self.root, layout.day_probe_csv_template.format(chunk_id=probe_id))
                     log_path = resolve_artifact_path(self.root, layout.day_probe_log_template.format(chunk_id=probe_id))
-                    stderr_path = log_path.with_suffix(".stderr.log")
+                    stderr_path = resolve_artifact_path(self.root, layout.day_probe_observation_template.format(chunk_id=probe_id))
                     if any(path.exists() for path in (csv_path, log_path, stderr_path)):
                         raise ValueError(f"diagnostic chunk artifact already exists: {probe_id}")
                     intended_artifacts = tuple(path.relative_to(self.root).as_posix()
                                                for path in (csv_path, log_path, stderr_path))
                     self.artifacts.extend(intended_artifacts)
-                    probe_req = _request(f"sockperf-{probe_id}", sockperf_argv(self.context.b_private_ipv4, csv_path, chunk_seconds),
-                                         self.root, deadline, self.clock)
+                    probe_action = f"sockperf-{probe_id}"
+                    probe_req = _request(probe_action, sockperf_argv(self.context.b_private_ipv4, csv_path, chunk_seconds),
+                                         self.root, deadline, self.clock, acquisition_id=probe_action)
                     try:
                         probe_handle = self._start(probe_req, log_path, stderr_path)
                     except BaseException:
@@ -875,4 +890,43 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
                     processes: MeasurementProcesses, clock: MeasurementClock) -> MeasurementResult:
     """Execute the supplied resolved units on A, returning unvalidated source evidence."""
     validated = ResolvedObservation.model_validate(observation.model_dump(mode="python"))
-    return _Runner(validated, context, processes, clock).run()
+    result = _Runner(validated, context, processes, clock).run()
+    if not context.source_artifact_records or not context.build_observations:
+        return result
+    from .acquisition import bind_acquisition_sources, iter_source_windows
+    try:
+        sources = bind_acquisition_sources(child_root=Path(context.root), run_identity=context.identity,
+            commands=result.command_evidence, receiver_command_evidence=context.receiver_command_evidence,
+            build_evidence=context.build_observations, source_artifact_records=context.source_artifact_records,
+            clock_mappings=context.clock_mappings)
+        verified: list[tuple[AcquisitionSource, str | None]] = []
+        all_commands = (*result.command_evidence, *context.receiver_command_evidence)
+        for source in sources:
+            has_window = False
+            for _window in iter_source_windows(Path(context.root), source, context.source_artifact_records,
+                    all_commands, context.build_observations, context.clock_mappings):
+                has_window = True
+            if not has_window:
+                continue
+            refs = {item.artifact_id: item for item in context.source_artifact_records}
+            unit_id = next((refs[item].unit_id for item in source.native_artifact_ids if item in refs and refs[item].unit_id), None)
+            if unit_id is None:
+                unit_id = refs[source.log_artifact_id].unit_id
+            verified.append((source, unit_id))
+        timings = []
+        for timing in result.timings:
+            rows = [source for source, unit_id in verified if unit_id == timing.unit_id]
+            if rows:
+                timings.append(timing.model_copy(update={
+                    "acquisition_sources": Evidence[list[AcquisitionSource]](value=rows)}))
+            else:
+                timings.append(timing)
+        return replace(result, timings=tuple(timings))
+    except (OSError, ValueError) as exc:
+        # A failed source replay keeps timing/overlap unknown and reports the exact
+        # prerequisite failure through the existing evidence reason field.
+        reason = f"acquisition source replay unavailable: {type(exc).__name__}: {exc}"
+        timings = tuple(timing.model_copy(update={
+            "acquisition_sources": Evidence[list[AcquisitionSource]](unavailable_reason=reason)})
+            for timing in result.timings)
+        return replace(result, timings=timings)

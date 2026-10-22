@@ -24,6 +24,9 @@ cloud-network-benchmark = "cloud_network_benchmark.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+cloud_network_benchmark = ["tool_patches/*.patch"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/contract", "tests/integration"]
 addopts = "-ra"

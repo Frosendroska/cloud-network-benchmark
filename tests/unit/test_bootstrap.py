@@ -7,7 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
 from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap
-from cloud_network_benchmark.bootstrap import _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
+from cloud_network_benchmark.bootstrap import _build_config_prelude, _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
 
 
 def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_path):
@@ -90,7 +90,8 @@ def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_p
     source=next(item for item in c.sources if item.tool=="iperf3")
     binary=Path(c.install_prefix)/"bin/iperf3"; binary.parent.mkdir(parents=True); binary.write_bytes(b"compiled binary")
     digest=hashlib.sha256(binary.read_bytes()).hexdigest(); marker=Path(c.install_prefix)/".f02r-iperf3.identity"
-    marker.write_text(f"{source.source_reference} {source.source_sha256} {digest}\n")
+    config_hash=subprocess.run(["sh", "-c", _build_config_prelude(c) + "printf '%s' \"$config_sha\""],text=True,capture_output=True,check=True).stdout
+    marker.write_text(f"{source.source_reference} {source.source_sha256} legacy {config_hash} {digest}\n")
     probe=subprocess.run(["sh","-c",_identity_preflight_script(source,c)],text=True,capture_output=True)
     assert probe.returncode==0 and probe.stdout.strip()=="matching"
     recipe=_recipe(source,c)
@@ -98,7 +99,7 @@ def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_p
     assert checked.returncode==0
     before=binary.read_bytes(); reused=subprocess.run(["sh","-c",recipe[4][-1]],text=True,capture_output=True)
     assert reused.returncode==0 and binary.read_bytes()==before
-    marker.write_text(f"other-source {source.source_sha256} {digest}\n")
+    marker.write_text(f"other-source {source.source_sha256} legacy {config_hash} {digest}\n")
     conflict=subprocess.run(["sh","-c",_identity_preflight_script(source,c)],text=True,capture_output=True)
     assert conflict.returncode != 0
 
@@ -108,6 +109,32 @@ def test_shell_unsafe_build_values_are_rejected_and_help_is_token_based():
     with pytest.raises(Exception): type(c).model_validate({**c.model_dump(),"workspace":"/var/lib/cnb/work;touch"})
     with pytest.raises(Exception): SourceBuild(tool="sockperf",source_url="https://example.invalid/x",source_reference="src;touch",archive_name="x.tar.gz",source_sha256="a"*64)
     assert not _capabilities_observed("Usage: tool [options]\nunder-loadish -iSomething --full-rtt-extra", "sockperf")
+
+
+def test_pinned_acquisition_patch_identity_is_mandatory_and_part_of_cache_key(tmp_path):
+    from pathlib import Path
+    from cloud_network_benchmark.bootstrap import SourceBuild
+    sockperf = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch"
+    import hashlib
+    digest = hashlib.sha256(sockperf.read_bytes()).hexdigest()
+    pinned = SourceBuild(tool="sockperf", source_url="https://github.com/Mellanox/sockperf/archive/5ebd327da983225321818c0355db922515e026bd.tar.gz",
+        source_reference="sockperf-5ebd327da983225321818c0355db922515e026bd", upstream_commit="5ebd327da983225321818c0355db922515e026bd", archive_name="sockperf.tar.gz",
+        source_sha256="a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e",
+        observation_patch_path="tool_patches/sockperf-3.10-acquisition.patch", observation_patch_sha256=digest)
+    with pytest.raises(Exception, match="exact packaged observation patch"):
+        SourceBuild(**{**pinned.model_dump(), "observation_patch_sha256": "f" * 64})
+    config = bootstrap_config().model_copy(update={"remote_root": str(tmp_path), "workspace": str(tmp_path / "work"),
+                                                    "install_prefix": str(tmp_path / "install")})
+    script = _recipe(pinned, config)[4][-1]
+    assert "patch --batch --fuzz=0 -p1" in script
+    assert digest in script and "old_patch" in script
+    iperf_patch = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch"
+    iperf_digest = hashlib.sha256(iperf_patch.read_bytes()).hexdigest()
+    iperf = SourceBuild(tool="iperf3", source_url="https://github.com/esnet/iperf/archive/2acfcfe94e928e74542c9f107e02aa6dd4748a79.tar.gz",
+        source_reference="iperf-2acfcfe94e928e74542c9f107e02aa6dd4748a79", upstream_commit="2acfcfe94e928e74542c9f107e02aa6dd4748a79", archive_name="iperf.tar.gz",
+        source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
+        observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch", observation_patch_sha256=iperf_digest)
+    assert "patch --batch --fuzz=0 -p1" in _recipe(iperf, config)[4][-1]
 
 
 def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):

@@ -1,0 +1,131 @@
+--- a/src/iperf_api.c
++++ b/src/iperf_api.c
+@@ -78,6 +78,7 @@
+ #include "iperf_sctp.h"
+ #endif /* HAVE_SCTP_H */
+ #include "timer.h"
++#include "cnb_acquisition.h"
+ 
+ #include "cjson.h"
+ #include "units.h"
+@@ -2021,6 +2022,11 @@
+     SLIST_FOREACH(sp, &test->streams, streams) {
+ 	sp->result->start_time = sp->result->start_time_fixed = now;
+     }
++	if (test->role == 's') {
++	    cnb_acq_anchor(test->cookie);
++	    SLIST_FOREACH(sp, &test->streams, streams)
++	        cnb_acq_origin(test, sp, "initial");
++	}
+ 
+     if (test->on_test_start)
+         test->on_test_start(test);
+@@ -3340,6 +3346,7 @@
+ 	}
+ 	rp->stream_retrans = 0;
+ 	rp->start_time = now;
++	if (test->role == 's') cnb_acq_origin(test, sp, "post_omit");
+     }
+ }
+ 
+@@ -3378,6 +3385,8 @@
+         memcpy(&temp.interval_end_time, &rp->end_time, sizeof(struct iperf_time));
+         iperf_time_diff(&temp.interval_start_time, &temp.interval_end_time, &temp_time);
+         temp.interval_duration = iperf_time_in_secs(&temp_time);
++	if (test->role == 's' && !sp->sender && test->protocol->id == Ptcp)
++	    cnb_acq_receiver_interval(test, sp, &temp);
+ 	if (test->protocol->id == Ptcp) {
+ 	    if ( has_tcpinfo()) {
+ 		save_tcpinfo(sp, &temp);
+--- a/src/cnb_acquisition.h
++++ b/src/cnb_acquisition.h
+@@ -0,0 +1,89 @@
++/* Additive source observations for the CNB_ACQ_V1 evidence stream. */
++#ifndef CNB_ACQUISITION_H
++#define CNB_ACQUISITION_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <netdb.h>
++#include <sys/socket.h>
++#include "iperf.h"
++#include "iperf_time.h"
++
++static int cnb_acq_context(char id[193], char boot[64])
++{
++    const char *env = getenv("CNB_ACQUISITION_ID");
++    FILE *fp;
++    if (!env || !*env || strlen(env) > 192 || strspn(env, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != strlen(env))
++        return 0;
++    memcpy(id, env, strlen(env) + 1);
++    fp = fopen("/proc/sys/kernel/random/boot_id", "r");
++    if (fp == NULL || fgets(boot, 64, fp) == NULL) {
++        if (fp != NULL) fclose(fp);
++        return 0;
++    }
++    fclose(fp);
++    boot[strcspn(boot, "\r\n")] = '\0';
++    return 1;
++}
++
++static void cnb_acq_anchor(const char *cookie)
++{
++#if defined(HAVE_CLOCK_GETTIME)
++    char id[193] = {0}, boot[64] = {0};
++    struct timespec before, realtime, after;
++    if (!cnb_acq_context(id, boot) || clock_gettime(CLOCK_MONOTONIC, &before) != 0 ||
++        clock_gettime(CLOCK_REALTIME, &realtime) != 0 || clock_gettime(CLOCK_MONOTONIC, &after) != 0)
++        return;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"clock_anchor\",\"cookie\":\"%s\",\"mono_before_ns\":%lld,\"realtime_ns\":%lld,\"mono_after_ns\":%lld}\n",
++        id, (long)getpid(), boot, cookie ? cookie : "", (long long)before.tv_sec * 1000000000LL + before.tv_nsec,
++        (long long)realtime.tv_sec * 1000000000LL + realtime.tv_nsec,
++        (long long)after.tv_sec * 1000000000LL + after.tv_nsec);
++    fflush(stderr);
++#else
++    (void)cookie;
++#endif
++}
++
++static void cnb_acq_origin(struct iperf_test *test, struct iperf_stream *sp, const char *phase)
++{
++#if defined(HAVE_CLOCK_GETTIME)
++    char id[193] = {0}, boot[64] = {0};
++    if (test->role != 's' || !cnb_acq_context(id, boot)) return;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"stats_origin\",\"cookie\":\"%s\",\"stream_id\":\"%d\",\"phase\":\"%s\",\"origin_us\":%llu,\"start_time_fixed_us\":%llu}\n",
++        id, (long)getpid(), boot, test->cookie, sp->socket, phase,
++        (unsigned long long)iperf_time_in_usecs(&sp->result->start_time),
++        (unsigned long long)iperf_time_in_usecs(&sp->result->start_time_fixed));
++    fflush(stderr);
++#else
++    (void)test; (void)sp; (void)phase;
++#endif
++}
++
++static void cnb_acq_receiver_interval(struct iperf_test *test, struct iperf_stream *sp,
++                                      struct iperf_interval_results *ir)
++{
++#if defined(HAVE_CLOCK_GETTIME)
++    char id[193] = {0}, boot[64] = {0}, local_host[NI_MAXHOST] = {0}, remote_host[NI_MAXHOST] = {0};
++    char local_port[NI_MAXSERV] = {0}, remote_port[NI_MAXSERV] = {0};
++    struct sockaddr_storage local, remote;
++    socklen_t llen = sizeof(local), rlen = sizeof(remote);
++    if (test->role != 's' || sp->sender || test->protocol->id != Ptcp || !cnb_acq_context(id, boot)) return;
++    if (getsockname(sp->socket, (struct sockaddr *)&local, &llen) != 0 ||
++        getpeername(sp->socket, (struct sockaddr *)&remote, &rlen) != 0 ||
++        getnameinfo((struct sockaddr *)&local, llen, local_host, sizeof(local_host), local_port, sizeof(local_port), NI_NUMERICHOST | NI_NUMERICSERV) != 0 ||
++        getnameinfo((struct sockaddr *)&remote, rlen, remote_host, sizeof(remote_host), remote_port, sizeof(remote_port), NI_NUMERICHOST | NI_NUMERICSERV) != 0) return;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"receiver_interval\",\"cookie\":\"%s\",\"stream_id\":\"%d\",\"role\":\"receiver\",\"local_host\":\"%s\",\"local_port\":\"%s\",\"remote_host\":\"%s\",\"remote_port\":\"%s\",\"interval_start_us\":%llu,\"interval_end_us\":%llu,\"bytes\":%llu,\"omitted\":%s}\n",
++        id, (long)getpid(), boot, test->cookie, sp->socket, local_host, local_port, remote_host, remote_port,
++        (unsigned long long)iperf_time_in_usecs(&ir->interval_start_time),
++        (unsigned long long)iperf_time_in_usecs(&ir->interval_end_time),
++        (unsigned long long)ir->bytes_transferred, ir->omitted ? "true" : "false");
++    fflush(stderr);
++#else
++    (void)test; (void)sp; (void)ir;
++#endif
++}
++
++#endif

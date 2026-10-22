@@ -9,6 +9,34 @@ from cloud_network_benchmark.measurement import (
 )
 
 
+def test_acquisition_coverage_uses_inner_probe_support_and_outer_receiver_bounds():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    receiver = SourceWindow("receiver_measured", "iperf3", "vm_a", "12345678-1234-1234-1234-123456789abc",
+        "CLOCK_MONOTONIC", "cookie", "stream", 0, 0, 1000, 1000, False, 0, 1)
+    exact = SourceWindow("probe_enabled", "sockperf", "vm_a", receiver.boot_id,
+        "CLOCK_MONOTONIC", None, None, 0, 0, 990, 990, None, 0, 1)
+    straddling = SourceWindow("probe_enabled", "sockperf", "vm_a", receiver.boot_id,
+        "CLOCK_MONOTONIC", None, None, 0, 0, 989, 989, None, 0, 1)
+    assert overlap_coverage_lower_bound([exact], [receiver]) == 0.99
+    assert overlap_coverage_lower_bound([straddling], [receiver]) < 0.99
+    different = SourceWindow("receiver_measured", "iperf3", "vm_a", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "CLOCK_MONOTONIC", "cookie", "stream", 0, 0, 1000, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([exact], [different]) is None
+
+
+def test_source_window_rejects_boolean_or_reversed_bounds_and_omitted_is_not_coverage():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    values = dict(kind="probe_enabled", tool="sockperf", producer="vm_a", boot_id="12345678-1234-1234-1234-123456789abc",
+        clock_domain="CLOCK_MONOTONIC", session_id=None, stream_id=None, start_earliest_ns=1,
+        start_latest_ns=1, end_earliest_ns=2, end_latest_ns=2, omitted=None, source_byte_offset=0, source_byte_length=1)
+    with pytest.raises(ValueError, match="integer"):
+        SourceWindow(**{**values, "start_earliest_ns": True})
+    with pytest.raises(ValueError, match="ordered"):
+        SourceWindow(**{**values, "start_earliest_ns": 3})
+    omitted = SourceWindow(**{**values, "kind": "receiver_measured", "tool": "iperf3", "session_id": "cookie", "stream_id": "s", "omitted": True})
+    assert not omitted.has_positive_inner_support
+
+
 def test_receiver_duration_uses_only_receiver_side_sum_received():
     assert receiver_duration(json.dumps({"end": {"sum_sent": {"seconds": 60}}})) is None
     assert receiver_duration(json.dumps({"server_output": {"end": {"sum_received": {"seconds": 60.0}}}})) == 60.0
