@@ -77,6 +77,47 @@ Full regression command:
 PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
 ```
 
+### Phase 9 convergence repairs
+
+T044–T047 repair request-boundary identity loss and zero-budget construction, native systemd
+service observations, valid nft command/output handling, and authentic `cc --version` identity.
+Retrieval hashes local files in bounded chunks and rechecks the original deadline after local
+filesystem work and before publication. The composed offline integration fixture verifies the
+service log directory and file mode setup permits same-user retrieval of root-created service logs.
+
+- Tested implementation SHA: `938bc14fd6bb8f37531e8f19a609d6195b054f3c` on
+  `codex/f02r-v2-remote-access`.
+- Focused quickstart suite: exit 0, **66 passed**.
+- Full regression suite: exit 0, **477 passed**.
+- Frozen schema checks: exit 0, **6 passed**.
+- `git diff --check`: exit 0; no changes from F01R base in shared contracts, published schemas,
+  or historical specs 001/002.
+- T044–T047 are checked in `tasks.md`. T048 remains open pending coordinator authorization for
+  the narrowly scoped streaming update to frozen F01R `ArtifactRecord.verify_materialized_file`;
+  F02R's own hash pass is chunked and deadline-aware, but the current shared verifier still uses
+  `read_bytes()` and can allocate a complete large native file during materialized-file checking.
+
+Primary format references used for the implementation check: systemd v255
+[`dbus-execute.c`](https://raw.githubusercontent.com/systemd/systemd/v255/src/core/dbus-execute.c)
+and [`execute.c`](https://raw.githubusercontent.com/systemd/systemd/v255/src/core/execute.c)
+show the D-Bus output mode separately from the configured `append:<path>` unit setting; the
+[nftables manual](https://www.netfilter.org/projects/nftables/manpage.html) documents supported
+`add` and `list` syntax. These references establish command formats only. No real systemd guest,
+nft enforcement, SSH/SCP, download/build, cloud call, benchmark, or provider behavior was tested.
+
+**Validation commands** (all run with the worktree as the current directory):
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py tests/integration/test_v2_remote_access.py
+# exit 0: 66 passed
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+# exit 0: 477 passed
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_v2_schema_export.py tests/contract/test_schema_integrity.py
+# exit 0: 6 passed
+git diff --check
+# exit 0
+```
+
 ## Assumptions and limits
 
 - The caller supplies the original `RemoteDeadline`, matching deployment identity, closed producer
