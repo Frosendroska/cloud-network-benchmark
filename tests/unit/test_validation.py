@@ -19,8 +19,8 @@ from cloud_network_benchmark.validation import _command_findings, _coverage, _me
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
 
-def make_input(repository_root, provider="aws", campaign="camp", *, config_name="exp-001-multi-provider.yaml", mode_override=None):
-    resolved, _ = resolve_campaign(repository_root / "configs/experiments" / config_name, repository_root)
+def make_input(repository_root, provider="aws", campaign="camp", *, config_name="exp-001-multi-provider.yaml", mode_override=None, config_path=None):
+    resolved, _ = resolve_campaign(config_path or repository_root / "configs/experiments" / config_name, repository_root)
     obs = next(item for item in resolved.observations if item.provider == provider)
     mode = ExperimentMode(mode_override) if mode_override else resolved.mode
     units = derive_measurement_units(mode, resolved.benchmark) if mode_override else obs.measurement_units

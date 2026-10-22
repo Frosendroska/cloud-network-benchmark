@@ -263,12 +263,19 @@ def _validate_manifests(value: ValidatorInput) -> list[ValidationFinding]:
                           and manifest.context == value.context
                           and manifest.schedule_entry.value == value.schedule_entry.value
                           and manifest.config_provenance.sha256 == value.config_sha256
-                          and manifest.config_provenance.resolved_sha256 == value.resolved_sha256.value
+                          and manifest.config_provenance.resolved_snapshot_sha256.value == value.resolved_sha256.value
                           and manifest.config_provenance.schedule_sha256.value == value.schedule_sha256.value
                           and manifest.config_provenance.implementation_git_commit.value == value.implementation_git_commit.value
                           and manifest.config_provenance.design_git_commit.value == value.design_git_commit.value
                           and manifest.tool_versions == value.tool_versions)
         else:
+            manifest_units = ([unit for unit in value.measurement_units if unit.kind != "probe_chunk"]
+                              if value.mode == ExperimentMode.DIAGNOSTIC_DAY else value.measurement_units)
+            manifest_unit_ids = {unit.unit_id for unit in manifest_units}
+            manifest_artifacts = [record for record in value.artifact_records
+                                  if record.unit_id is None or record.unit_id in manifest_unit_ids]
+            manifest_commands = [command for command in value.commands if command.unit_id in manifest_unit_ids]
+            manifest_timings = [timing for timing in value.timings if timing.unit_id in manifest_unit_ids]
             consistent = (manifest.run_id == value.identity.run_id
                           and manifest.campaign_id == value.identity.campaign_id
                           and manifest.deployment_id == value.identity.deployment_id
@@ -279,11 +286,11 @@ def _validate_manifests(value: ValidatorInput) -> list[ValidationFinding]:
                           and manifest.observation_id == value.identity.observation_id
                           and manifest.replaces_run_id == value.identity.replaces_run_id
                           and manifest.schedule_entry.value == value.schedule_entry.value
-                          and manifest.measurement_units == value.measurement_units
-                          and manifest.artifact_records == value.artifact_records
-                          and manifest.commands == value.commands and manifest.timings == value.timings
+                          and manifest.measurement_units == manifest_units
+                          and manifest.artifact_records == manifest_artifacts
+                          and manifest.commands == manifest_commands and manifest.timings == manifest_timings
                           and manifest.config_provenance.sha256 == value.config_sha256
-                          and manifest.config_provenance.resolved_sha256 == value.resolved_sha256.value
+                          and manifest.config_provenance.resolved_snapshot_sha256.value == value.resolved_sha256.value
                           and manifest.config_provenance.schedule_sha256.value == value.schedule_sha256.value
                           and manifest.config_provenance.implementation_git_commit.value == value.implementation_git_commit.value
                           and manifest.config_provenance.design_git_commit.value == value.design_git_commit.value
@@ -399,7 +406,8 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
     if unit.kind == "continuous_day":
         csv_record = log_record = None
         tcp_record = next((r for r in value.artifact_records if r.artifact_id == "day-iperf3-client"), None)
-    server_record = next((r for r in value.artifact_records if r.artifact_id == "iperf3_server_log"), None)
+    server_record = (next((r for r in value.artifact_records if r.artifact_id == "iperf3_server_log"), None)
+                     if unit.phase != "idle_latency" and unit.kind != "probe_chunk" else None)
     tcp = None
     if tcp_record:
         try:
@@ -443,7 +451,10 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
     command_start = next((command.started_at.value for command in value.commands
                           if command.unit_id == unit.unit_id and command.producer == "vm_a"
-                          and command.started_at.value is not None), None)
+                          and command.started_at.value is not None
+                          and isinstance(command.request.get("argv"), list)
+                          and command.request["argv"] and "iperf3" in str(command.request["argv"][0]).lower()
+                          and _option(command.request["argv"], "-c") is not None), None)
     command_start = command_start or (timing.tcp_started_at.value if timing else None)
 
     def test_config(detail: dict[str, Any]) -> tuple[Any, Any, Any]:
@@ -490,7 +501,7 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     return replace(parsed,
         receiver_intervals=tuple(item for item in parsed.receiver_intervals if item.session_id == selected),
         receiver_totals=tuple(item for item in parsed.receiver_totals if item["session_id"] == selected),
-        findings=(*parsed.findings, *additions), sessions=(selected,),
+        findings=(*(item for item in parsed.findings if item.code != "native.iperf3.multiple_sessions"), *additions), sessions=(selected,),
         session_details=tuple(item for item in parsed.session_details if item.get("session_id") == selected))
 
 
@@ -693,7 +704,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             continue
     for unit in value.measurement_units:
         needed = set() if unit.kind == "continuous_day" else {"sockperf"}
-        if unit.phase != "idle_latency":
+        if unit.phase != "idle_latency" and unit.kind != "probe_chunk":
             needed.add("iperf3")
         for program in needed:
             present = any(command.unit_id == unit.unit_id and command.producer == "vm_a"
