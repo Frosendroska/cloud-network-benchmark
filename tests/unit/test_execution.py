@@ -97,10 +97,13 @@ def test_monotonic_result_preserves_actual_utc_and_signed_discrepancy(utc_delta:
 
 def test_command_result_normalizes_aware_offsets_and_accepts_consistency_tolerance() -> None:
     offset_start = datetime(2026, 9, 27, 2, tzinfo=timezone(timedelta(hours=2)))
-    observed = monotonic_result(utc_delta=2.0, elapsed=2.0009, start=offset_start,
-                                utc_elapsed_discrepancy_seconds=-0.0009)
+    observed = monotonic_result(utc_delta=2.0, elapsed=2.001, start=offset_start,
+                                monotonic_finished=102.0, utc_elapsed_discrepancy_seconds=0.0)
+    discrepancy_boundary = monotonic_result(utc_delta=2.0, start=offset_start,
+                                            utc_elapsed_discrepancy_seconds=0.001)
     assert observed.started_at == NOW
     assert observed.started_at.tzinfo == timezone.utc
+    assert discrepancy_boundary.utc_elapsed_discrepancy_seconds == 0.001
 
 
 @pytest.mark.parametrize("updates", [
@@ -133,6 +136,14 @@ def test_utc_result_remains_strict_and_normalizes_aware_offsets() -> None:
     with pytest.raises(ValueError):
         CommandResult(action_id="clock-test", outcome="succeeded", started_at=NOW,
                       finished_at=NOW - timedelta(seconds=1), duration_seconds=0, exit_code=0, stdout="", stderr="")
+
+
+def test_monotonic_result_cannot_omit_its_explicit_basis() -> None:
+    with pytest.raises(ValueError, match="UTC duration basis"):
+        CommandResult(action_id="clock-test", outcome="succeeded", started_at=NOW,
+                      finished_at=NOW - timedelta(seconds=5), duration_seconds=2, exit_code=0,
+                      stdout="", stderr="", monotonic_started=100, monotonic_finished=102,
+                      utc_elapsed_discrepancy_seconds=-7)
 
 
 @pytest.mark.parametrize("outcome, exit_code, utc_delta", [

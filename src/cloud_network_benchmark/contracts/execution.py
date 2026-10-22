@@ -36,7 +36,7 @@ class CommandRequest(StrictModel):
 class CommandResult(StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True, json_schema_extra={
         "allOf": [
-            {"if": {"properties": {"duration_basis": {"const": "utc"}}, "required": ["duration_basis"]},
+            {"if": {"not": {"properties": {"duration_basis": {"const": "monotonic"}}, "required": ["duration_basis"]}},
              "then": {"properties": {"monotonic_started": {"type": "null"},
                                       "monotonic_finished": {"type": "null"},
                                       "utc_elapsed_discrepancy_seconds": {"type": "null"}}}},

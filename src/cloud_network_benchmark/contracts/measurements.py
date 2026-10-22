@@ -4,12 +4,39 @@ from datetime import datetime
 from math import isfinite
 from typing import Annotated, Literal, Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from .common import Evidence, IDENTIFIER_PATTERN, Provider, StrictModel, StringEvidence, StructuredEvidence, VmRole, utc_datetime
+from .execution import CommandResult
 
 
 class CommandEvidence(StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True, json_schema_extra={
+        "allOf": [
+            {"if": {"not": {"properties": {"duration_basis": {"const": "monotonic"}}, "required": ["duration_basis"]}},
+             "then": {"properties": {
+                 "utc_elapsed_discrepancy_seconds": {"type": "null"},
+                 "result": {"not": {"properties": {"duration_basis": {"const": "monotonic"}},
+                                     "required": ["duration_basis"]}},
+             }}},
+            {"if": {"properties": {"duration_basis": {"const": "monotonic"}}, "required": ["duration_basis"]},
+             "then": {
+                 "required": ["utc_elapsed_discrepancy_seconds"],
+                 "properties": {
+                     "monotonic_started": {"required": ["value"], "properties": {"value": {"type": "number", "minimum": 0}}},
+                     "monotonic_finished": {"required": ["value"], "properties": {"value": {"type": "number", "minimum": 0}}},
+                     "started_at": {"required": ["value"], "properties": {"value": {"type": "string", "format": "date-time"}}},
+                     "finished_at": {"required": ["value"], "properties": {"value": {"type": "string", "format": "date-time"}}},
+                     "utc_elapsed_discrepancy_seconds": {"type": "number"},
+                     "result": {"required": ["duration_basis", "monotonic_started", "monotonic_finished", "utc_elapsed_discrepancy_seconds"],
+                                "properties": {"duration_basis": {"const": "monotonic"},
+                                               "monotonic_started": {"type": "number", "minimum": 0},
+                                               "monotonic_finished": {"type": "number", "minimum": 0},
+                                               "utc_elapsed_discrepancy_seconds": {"type": "number"}}},
+                 },
+             }},
+        ]
+    })
     schema_version: Literal[2]
     request: dict[str, object]
     result: dict[str, object]
@@ -22,6 +49,15 @@ class CommandEvidence(StrictModel):
     monotonic_finished: Evidence[float]
     started_at: Evidence[datetime] = Field(default_factory=lambda: Evidence[datetime](unavailable_reason="not captured"))
     finished_at: Evidence[datetime] = Field(default_factory=lambda: Evidence[datetime](unavailable_reason="not captured"))
+    duration_basis: Literal["utc", "monotonic"] = "utc"
+    utc_elapsed_discrepancy_seconds: Optional[float] = Field(default=None, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_boolean_discrepancy(cls, value: object) -> object:
+        if isinstance(value, dict) and isinstance(value.get("utc_elapsed_discrepancy_seconds"), bool):
+            raise ValueError("utc_elapsed_discrepancy_seconds must be numeric, not boolean")
+        return value
 
     @model_validator(mode="after")
     def durable_only_views(self) -> "CommandEvidence":
@@ -45,8 +81,47 @@ class CommandEvidence(StrictModel):
             raise ValueError("command UTC start must be timezone-aware")
         if utc_finish is not None and (utc_finish.tzinfo is None or utc_finish.utcoffset() is None):
             raise ValueError("command UTC finish must be timezone-aware")
-        if utc_start is not None and utc_finish is not None and utc_finish < utc_start:
-            raise ValueError("command UTC finish must not precede start")
+        if utc_start is not None:
+            object.__setattr__(self, "started_at", Evidence[datetime](value=utc_datetime(utc_start)))
+            utc_start = self.started_at.value
+        if utc_finish is not None:
+            object.__setattr__(self, "finished_at", Evidence[datetime](value=utc_datetime(utc_finish)))
+            utc_finish = self.finished_at.value
+        if self.duration_basis == "utc":
+            if self.utc_elapsed_discrepancy_seconds is not None:
+                raise ValueError("UTC duration basis cannot include clock discrepancy")
+            if self.result.get("duration_basis") == "monotonic":
+                raise ValueError("monotonic command result cannot be wrapped as UTC evidence")
+            if utc_start is not None and utc_finish is not None and utc_finish < utc_start:
+                raise ValueError("command UTC finish must not precede start")
+            return self
+
+        if self.utc_elapsed_discrepancy_seconds is None or not isfinite(self.utc_elapsed_discrepancy_seconds):
+            raise ValueError("monotonic duration basis requires a finite clock discrepancy")
+        if start is None or finish is None or utc_start is None or utc_finish is None:
+            raise ValueError("monotonic duration basis requires complete observed clock bounds")
+        result_basis = self.result.get("duration_basis", "utc")
+        if result_basis != "monotonic":
+            raise ValueError("monotonic evidence must match a monotonic command result")
+        try:
+            projected_values = {
+                name: self.result[name]
+                for name in CommandResult.model_fields
+                if name in self.result
+            }
+            projected = CommandResult.model_validate(projected_values)
+        except Exception as exc:
+            raise ValueError("monotonic command result must be a complete valid durable projection") from exc
+        if projected.duration_basis != self.duration_basis:
+            raise ValueError("command result timing basis must match native evidence")
+        if projected.started_at != utc_datetime(utc_start) or projected.finished_at != utc_datetime(utc_finish):
+            raise ValueError("command result UTC bounds must match native evidence")
+        if abs(projected.monotonic_started - start) > 0.001 or abs(projected.monotonic_finished - finish) > 0.001:
+            raise ValueError("command result monotonic bounds must match native evidence")
+        if abs(projected.utc_elapsed_discrepancy_seconds - self.utc_elapsed_discrepancy_seconds) > 0.001:
+            raise ValueError("command result discrepancy must match native evidence")
+        object.__setattr__(self, "started_at", Evidence[datetime](value=utc_datetime(utc_start)))
+        object.__setattr__(self, "finished_at", Evidence[datetime](value=utc_datetime(utc_finish)))
         return self
 
 

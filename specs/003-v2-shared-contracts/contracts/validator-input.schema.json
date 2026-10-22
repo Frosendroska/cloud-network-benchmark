@@ -232,6 +232,131 @@
     },
     "CommandEvidence": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "duration_basis": {
+                  "const": "monotonic"
+                }
+              },
+              "required": [
+                "duration_basis"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "not": {
+                  "properties": {
+                    "duration_basis": {
+                      "const": "monotonic"
+                    }
+                  },
+                  "required": [
+                    "duration_basis"
+                  ]
+                }
+              },
+              "utc_elapsed_discrepancy_seconds": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "duration_basis": {
+                "const": "monotonic"
+              }
+            },
+            "required": [
+              "duration_basis"
+            ]
+          },
+          "then": {
+            "properties": {
+              "finished_at": {
+                "properties": {
+                  "value": {
+                    "format": "date-time",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "value"
+                ]
+              },
+              "monotonic_finished": {
+                "properties": {
+                  "value": {
+                    "minimum": 0,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "value"
+                ]
+              },
+              "monotonic_started": {
+                "properties": {
+                  "value": {
+                    "minimum": 0,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "value"
+                ]
+              },
+              "result": {
+                "properties": {
+                  "duration_basis": {
+                    "const": "monotonic"
+                  },
+                  "monotonic_finished": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "monotonic_started": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "utc_elapsed_discrepancy_seconds": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "duration_basis",
+                  "monotonic_started",
+                  "monotonic_finished",
+                  "utc_elapsed_discrepancy_seconds"
+                ]
+              },
+              "started_at": {
+                "properties": {
+                  "value": {
+                    "format": "date-time",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "value"
+                ]
+              },
+              "utc_elapsed_discrepancy_seconds": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "utc_elapsed_discrepancy_seconds"
+            ]
+          }
+        }
+      ],
       "properties": {
         "binary_version": {
           "$ref": "#/$defs/Evidence_str_"
@@ -239,6 +364,15 @@
         "deployment_id": {
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
           "title": "Deployment Id",
+          "type": "string"
+        },
+        "duration_basis": {
+          "default": "utc",
+          "enum": [
+            "utc",
+            "monotonic"
+          ],
+          "title": "Duration Basis",
           "type": "string"
         },
         "finished_at": {
@@ -295,6 +429,18 @@
           ],
           "default": null,
           "title": "Unit Id"
+        },
+        "utc_elapsed_discrepancy_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Utc Elapsed Discrepancy Seconds"
         }
       },
       "required": [
