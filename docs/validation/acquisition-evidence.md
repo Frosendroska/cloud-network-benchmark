@@ -122,7 +122,9 @@ as separate gates. Do not use this change to consume or edit an unmerged F08 run
 
 ## Recorded checks and task coverage
 
-At the completed source tree based on verified main `e03a07e`, the focused command
+The completed and tested source tree is committed as
+`c2acff441a763db96218a34c010a737b858a7152`, based on verified main
+`e03a07eaa5ed9ea372c695db19fd6fbcffdad024`. The focused command
 `env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/integration/test_acquisition_producer.py tests/unit/test_measurement_timing.py tests/unit/test_acquisition.py tests/contract/test_acquisition_contract.py`
 exited 0 with **53 passed in 23.68s** after all-mode replay, streaming lower-bound assembly,
 and gap-boundary tests were added. The full offline command
