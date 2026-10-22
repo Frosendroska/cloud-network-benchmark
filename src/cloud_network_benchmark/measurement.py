@@ -914,14 +914,37 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
                 unit_id = refs[source.log_artifact_id].unit_id
             verified.append((source, unit_id))
         timings = []
+        replay_notes = []
+        child_parent = {str(note.get("unit_id")): str(note.get("parent_unit_id"))
+            for note in result.timing_notes if note.get("parent_unit_id") and note.get("unit_id")}
         for timing in result.timings:
-            rows = [source for source, unit_id in verified if unit_id == timing.unit_id]
+            related_units = {timing.unit_id}
+            related_units.update(unit_id for unit_id, parent_id in child_parent.items() if parent_id == timing.unit_id)
+            rows = [source for source, unit_id in verified if unit_id in related_units]
             if rows:
                 timings.append(timing.model_copy(update={
                     "acquisition_sources": Evidence[list[AcquisitionSource]](value=rows)}))
             else:
                 timings.append(timing)
-        return replace(result, timings=tuple(timings))
+            probes = sorted((source for source, unit_id in verified
+                if unit_id in related_units and source.tool == "sockperf"), key=lambda source: source.command_action_id)
+            receivers = sorted((source for source, unit_id in verified
+                if unit_id in related_units and source.tool == "iperf3"), key=lambda source: source.command_action_id)
+            if probes and receivers:
+                from .acquisition import overlap_coverage_lower_bound
+
+                def replay(group):
+                    for source in group:
+                        yield from iter_source_windows(Path(context.root), source,
+                            context.source_artifact_records, all_commands, context.build_observations,
+                            context.clock_mappings)
+
+                coverage = overlap_coverage_lower_bound(replay(probes), replay(receivers))
+                replay_notes.append({"unit_id": timing.unit_id,
+                    "acquisition_coverage_lower_bound": coverage,
+                    "acquisition_coverage_reason": (None if coverage is not None else
+                        "source clock domains lack a bounded common transform or ordered support")})
+        return replace(result, timings=tuple(timings), timing_notes=(*result.timing_notes, *replay_notes))
     except (OSError, ValueError) as exc:
         # A failed source replay keeps timing/overlap unknown and reports the exact
         # prerequisite failure through the existing evidence reason field.

@@ -95,9 +95,9 @@ therefore remains unproved pending the approved Linux build check.
 Patch-application command, run from the feature worktree against clean extracted snapshots:
 
 ```text
-patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acq-apply-check/sockperf < src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acq-final-source-check/sockperf < src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch
 exit 0
-patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acq-apply-check/iperf < src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acq-final-source-check/iperf < src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch
 exit 0
 ```
 
@@ -119,3 +119,22 @@ existing 99% diagnostic-day rule, and keep generation checks independent. It mus
 four-mode and eligible prior-calibration peer replay, preserve old bundles as unknown, and leave
 paid acceptance, actual tool output, guest clock mapping, disk overhead, and exported bundle checks
 as separate gates. Do not use this change to consume or edit an unmerged F08 runtime.
+
+## Recorded checks and task coverage
+
+At the completed source tree based on verified main `e03a07e`, the focused command
+`env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/integration/test_acquisition_producer.py tests/unit/test_measurement_timing.py tests/unit/test_acquisition.py tests/contract/test_acquisition_contract.py`
+exited 0 with **53 passed in 23.68s** after all-mode replay, streaming lower-bound assembly,
+and gap-boundary tests were added. The full offline command
+`env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q`
+exited 0 with **816 passed in 76.83s**. The canonical schema check
+`env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check`
+and `git diff --check` both exited 0. The pinned source patch application was separately rerun
+against fresh exact extracts; both commands exited 0. No supported Linux compilation was
+available, so compile remains **not run**.
+
+All 20 tasks are checked. The four-mode fake process exercise traverses F03 commands through the
+F01R binder and replay helper, keeps the 100 ms diagnostics alignment test separate, rejects
+cross-host windows without a bounded common transform, preserves gap duration in the receiver
+denominator, and checks repeated replay hashes plus a generated 50,000-interval stream. The final
+day chunk without positive post-warm-up support remains unknown. Compilation is still not run.

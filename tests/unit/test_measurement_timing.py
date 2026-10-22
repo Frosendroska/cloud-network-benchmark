@@ -24,6 +24,60 @@ def test_acquisition_coverage_uses_inner_probe_support_and_outer_receiver_bounds
     assert overlap_coverage_lower_bound([exact], [different]) is None
 
 
+def test_acquisition_coverage_keeps_missing_receiver_intervals_in_denominator():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    boot = "12345678-1234-1234-1234-123456789abc"
+    receiver = [
+        SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+            "cookie", "stream", 0, 0, 40, 40, False, 0, 1),
+        SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+            "cookie", "stream", 60, 60, 100, 100, False, 0, 1),
+    ]
+    probes = [
+        SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+            None, None, 0, 0, 40, 40, None, 0, 1),
+        SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+            None, None, 60, 60, 100, 100, None, 0, 1),
+    ]
+    # 80ns of observed receiver support over the continuous 100ns outer envelope.
+    assert overlap_coverage_lower_bound(probes, receiver) == pytest.approx(0.8)
+
+
+def test_cross_vm_and_utc_step_source_windows_stay_unknown_without_transform():
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    from cloud_network_benchmark.contracts import ClockMapping, Evidence, StringEvidence
+    from cloud_network_benchmark.diagnostics import alignment_eligibility
+
+    boot_a = "12345678-1234-1234-1234-123456789abc"
+    boot_b = "12345678-1234-1234-1234-123456789def"
+    probe = SourceWindow("probe_enabled", "sockperf", "vm_a", boot_a, "CLOCK_MONOTONIC",
+        None, None, 1_000_000_000, 1_000_000_000, 2_000_000_000, 2_000_000_000, None, 0, 1)
+    receiver = SourceWindow("receiver_measured", "iperf3", "vm_b", boot_b, "CLOCK_MONOTONIC",
+        "cookie", "stream", 3_601_000_000_000, 3_601_000_000_000,
+        3_602_000_000_000, 3_602_000_000_000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [receiver]) is None
+
+    # An hour step in wall-clock mapping is not converted into monotonic source
+    # support by an error estimate. Keep the source comparison unknown.
+    now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+    mapping_a = ClockMapping(vm_role="vm_a", monotonic_seconds=1,
+        utc_timestamp=now, estimated_error_ms=Evidence[float](value=1),
+        synchronization_source=StringEvidence(value="chrony synchronized"))
+    mapping_b = ClockMapping(vm_role="vm_b", monotonic_seconds=1,
+        utc_timestamp=now + timedelta(hours=1), estimated_error_ms=Evidence[float](value=1),
+        synchronization_source=StringEvidence(value="chrony synchronized"))
+    assert overlap_coverage_lower_bound([probe], [receiver]) is None
+    missing = ClockMapping(vm_role="vm_b", monotonic_seconds=1, utc_timestamp=now,
+        estimated_error_ms=Evidence[float](unavailable_reason="clock error unavailable"),
+        synchronization_source=StringEvidence(unavailable_reason="synchronization source unavailable"))
+    eligible, reasons = alignment_eligibility(mapping_a, missing)
+    assert not eligible and reasons
+    over_limit = mapping_b.model_copy(update={"estimated_error_ms": Evidence[float](value=100.001)})
+    eligible, reasons = alignment_eligibility(mapping_a, over_limit)
+    assert not eligible and any("100 ms" in reason for reason in reasons)
+
+
 def test_source_window_rejects_boolean_or_reversed_bounds_and_omitted_is_not_coverage():
     from cloud_network_benchmark.acquisition import SourceWindow
     values = dict(kind="probe_enabled", tool="sockperf", producer="vm_a", boot_id="12345678-1234-1234-1234-123456789abc",

@@ -1,10 +1,10 @@
 # Validation and handoff
 
-Use `/private/tmp/cnb-acquisition-evidence`, branch `codex/f01r-acquisition-evidence`, base `7a70a3139c5ee9efa1f8ea13c3f6de40e9048121`. Only planning artifacts exist at this stage. Commands for new tests below are **planned; not yet run**. Existing scripts/CLI routes were inspected before listing them.
+Use `/private/tmp/cnb-acquisition-evidence`, branch `codex/f01r-acquisition-evidence`, based on verified main `e03a07eaa5ed9ea372c695db19fd6fbcffdad024`. This section records implementation and planning checks separately.
 
 ## Planning checks
 
-Observed unchanged-runtime baseline during planning: `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` exited **0**, **627 passed in 26.59s**, at the base runtime above with only these planning files added. Canonical schema `--check` exited **0**. Artifact structure/link/task coverage check exited **0**: 13 requirements/outcomes mapped, 20 sequential unchecked tasks. These results do not test the unimplemented observation hooks.
+Observed unchanged-runtime baseline during planning: `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` exited **0**, **627 passed in 26.59s** at the original base. That baseline predates implementation and does not test observation hooks.
 
 With explicit `GIT_BRANCH_NAME=codex/f01r-acquisition-evidence` and `SPECIFY_FEATURE_DIRECTORY=specs/016-acquisition-evidence`:
 
@@ -21,15 +21,15 @@ Spec Kit's scripts report the directory-derived feature label `016-acquisition-e
 ## Implementer checks
 
 ```sh
-PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_acquisition_contract.py tests/unit/test_acquisition.py tests/unit/test_bootstrap.py tests/unit/test_measurement_timing.py tests/integration/test_acquisition_producer.py
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_acquisition_contract.py tests/unit/test_acquisition.py tests/unit/test_bootstrap.py tests/unit/test_measurement_timing.py tests/integration/test_acquisition_producer.py
 PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check
 PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
 git diff --check
 ```
 
-Required outcome after implementation: exits 0, no skipped/unexplained failures; existing command/sequence/bootstrap/native retrieval checks remain intact. Export canonical schemas before --check if models change. Record actual checked head, environment, exact commands and results in docs/validation/acquisition-evidence.md. Terraform is unchanged; Terraform checks are not applicable here.
+Latest implementation runs: the focused acquisition/contract/timing/producer tests exited **0**, **53 passed in 23.68s**. The full offline suite based on verified main exited **0**, **816 passed in 76.83s**. Canonical schema `--check` and `git diff --check` exited **0**. Exact environment, source hashes and limits are recorded in docs/validation/acquisition-evidence.md. Terraform is unchanged by this feature; Terraform checks are not applicable here.
 
-Apply/compile checks must use the pinned upstream sources and packaged patches without network traffic or benchmark execution. Exact commands depend on the implementation's verified archive names and build packaging; record the real commands/exit results rather than inventing them now. Check zero-fuzz patch application, upstream diff limited to observations, compiler/config flags and HAVE_CLOCK_GETTIME. A local offline Linux toolchain is preferred. If unavailable, say **compile not run**, preserve source/static evidence and leave actual build proof open for the coordinator; never substitute fake logs for a compile result. Do not start containers/VMs/clouds or send loopback traffic to remedy this.
+The packaged patches were applied to fresh extracts from the pinned commits with `patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acq-final-source-check/sockperf < src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch` and the equivalent iperf command; both exited **0**. See docs/validation/acquisition-evidence.md for source and patch hashes and reviewed diff scope. **Compile not run**: this macOS arm64 environment is not the supported Linux guest toolchain. Preserve this as an open source-built behavior proof; never substitute fake logs for a compile result. No containers/VMs/clouds or loopback benchmark traffic were started.
 
 ## Requirement-discriminating acceptance matrix
 

@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 from .contracts.artifacts import ArtifactRecord, resolve_artifact_path
 from .contracts.measurements import AcquisitionSource, ClockMapping, CommandEvidence
@@ -246,6 +246,11 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
                or item.request.get("action_id") == source.command_action_id]
     if len(command) != 1 or command[0].deployment_id != log.deployment_id:
         raise ValueError("acquisition source must match one command in its deployment")
+    outcome = (command[0].result.get("outcome") if isinstance(command[0].result, Mapping)
+               else getattr(command[0].result, "outcome", None))
+    outcome = getattr(outcome, "value", outcome)
+    if outcome is not None and outcome != "succeeded":
+        raise ValueError("acquisition source command did not complete successfully")
     if command[0].producer != source.producer:
         raise ValueError("acquisition command producer does not match source")
     if log.unit_id not in {None, command[0].unit_id}:
@@ -467,31 +472,62 @@ def _union(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def overlap_coverage_lower_bound(probes: Sequence[SourceWindow], receivers: Sequence[SourceWindow]) -> float | None:
+def overlap_coverage_lower_bound(probes: Iterable[SourceWindow], receivers: Iterable[SourceWindow]) -> float | None:
     """Return conservative inner acquisition/outer receiver coverage in one proven domain.
 
     None means identities or boundaries do not support a finite ratio. Gaps stay
     absent from both unions, and omitted receiver intervals never enter the denominator.
     """
-    if not probes or not receivers:
+    domain: tuple[str, str, str] | None = None
+    receiver_start: int | None = None
+    receiver_end: int | None = None
+    included = False
+    for item in receivers:
+        item_domain = (item.producer, item.boot_id, item.clock_domain)
+        if domain is None:
+            domain = item_domain
+        elif domain != item_domain:
+            return None
+        if item.omitted is None:
+            return None
+        if item.omitted:
+            continue
+        included = True
+        receiver_start = item.start_earliest_ns if receiver_start is None else min(receiver_start, item.start_earliest_ns)
+        receiver_end = item.end_latest_ns if receiver_end is None else max(receiver_end, item.end_latest_ns)
+    if not included or domain is None or receiver_start is None or receiver_end is None:
         return None
-    domains = {(item.producer, item.boot_id, item.clock_domain) for item in [*probes, *receivers]}
-    if len(domains) != 1 or any(item.omitted is None for item in receivers):
+    # Keep the continuous receiver-session envelope in the denominator. Using
+    # the union here would silently forgive missing intervals and inflate coverage.
+    receiver_duration = receiver_end - receiver_start
+    if receiver_duration <= 0:
         return None
-    receiver_bounds = _union([(item.start_earliest_ns, item.end_latest_ns)
-                              for item in receivers if item.omitted is not True])
-    if not receiver_bounds:
+    numerator = 0
+    pending: tuple[int, int] | None = None
+    previous_start: int | None = None
+    has_probe_evidence = False
+    for item in probes:
+        if (item.producer, item.boot_id, item.clock_domain) != domain:
+            return None
+        if not item.has_positive_inner_support:
+            continue
+        has_probe_evidence = True
+        start = max(receiver_start, item.start_latest_ns)
+        end = min(receiver_end, item.end_earliest_ns)
+        if end <= start:
+            continue
+        if previous_start is not None and start < previous_start:
+            return None
+        previous_start = start
+        if pending is not None and start <= pending[1]:
+            pending = (pending[0], max(pending[1], end))
+        else:
+            if pending is not None:
+                numerator += pending[1] - pending[0]
+            pending = (start, end)
+    if pending is not None:
+        numerator += pending[1] - pending[0]
+    if not has_probe_evidence:
         return None
-    probe_inner = [(item.start_latest_ns, item.end_earliest_ns)
-                   for item in probes if item.has_positive_inner_support]
-    overlaps = []
-    for r_start, r_end in receiver_bounds:
-        for p_start, p_end in probe_inner:
-            start, end = max(r_start, p_start), min(r_end, p_end)
-            if end > start:
-                overlaps.append((start, end))
-    denominator = sum(end - start for start, end in receiver_bounds)
-    numerator = sum(end - start for start, end in _union(overlaps))
-    if denominator <= 0:
-        return None
+    denominator = receiver_duration
     return min(1.0, numerator / denominator)
