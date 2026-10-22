@@ -86,7 +86,7 @@ resource "aws_ssm_document" "expiry" {
             region        = "{{ Region }}"
           }
         }
-        # Discovery runs for 300 seconds; 30 seconds remain for API response handling.
+        # Discovery horizon is 300 seconds; the remaining 30 seconds bound action return handling.
         timeoutSeconds = 330
       }
     ]

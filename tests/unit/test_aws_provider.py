@@ -20,6 +20,7 @@ from cloud_network_benchmark.providers.aws import (
     EXPIRY_INPUT_ID,
     EXPIRY_INPUT_PATH,
     EXPIRY_INPUT_SHA256,
+    _ssm_scalar,
     SAFETY_LEAD_SECONDS,
     AwsProviderDriver,
     AwsProviderError,
@@ -28,6 +29,7 @@ from cloud_network_benchmark.providers.aws import (
     _has_exact_ownership_tags,
     _known_resource_ids,
     _remaining_inventory,
+    _validate_terminal_execution,
     _validate_deployment,
 )
 
@@ -504,15 +506,63 @@ def test_cleanup_inventory_blocks_on_denied_or_truncated_aws_cli_results(tmp_pat
         assert failures[0].category == "inventory_truncated"
 
 
+def test_known_volume_not_found_is_absence_only_in_authenticated_recorded_region(tmp_path):
+    class Runner:
+        def __init__(self, account="123456789012"):
+            self.account = account
+
+        def run(self, request):
+            if "describe-volumes" in request.argv:
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=255, stdout="",
+                    stderr="An error occurred (InvalidVolume.NotFound) when calling the DescribeVolumes operation")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0,
+                stdout=json.dumps({"Account": self.account}), stderr="")
+
+    deployment = make_deployment()
+    known = {"volume": {"eu-central-1": ["vol-recorded"]}}
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    failures = []
+    assert driver._verify_known_resource_ids(known, "eu-central-1", failures) == {}
+    assert not failures
+    mismatched = AwsProviderDriver(Runner("999999999999"), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    failures = []
+    assert mismatched._verify_known_resource_ids(known, "eu-central-1", failures) == {"volume": ["inventory_unknown"]}
+    assert failures[0].category == "inventory_account_mismatch"
+
+
+def test_expired_registration_deadline_does_not_block_bounded_terminal_cleanup(tmp_path):
+    class Runner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, request):
+            self.actions.append(request.action_id)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path), clock=lambda: NOW)
+    import time
+    driver._registration_deadline = time.monotonic() - 1
+    driver._run("aws-expiry-read-terminal-eu-central-1", ["aws", "ssm", "get-automation-execution"], 30)
+    assert runner.actions == ["aws-expiry-read-terminal-eu-central-1"]
+    with pytest.raises(AwsProviderError, match="registration exceeded"):
+        driver._run("aws-expiry-confirm-eu-central-1", ["aws", "ssm", "get-automation-execution"], 30)
+
+
 def test_expiry_price_source_is_dated_and_hash_verified():
     source = ROOT / EXPIRY_INPUT_PATH
     raw = source.read_bytes()
     fixture = json.loads(raw)
     assert fixture["id"] == EXPIRY_INPUT_ID
     assert fixture["free_tier_assumed"] is False
-    assert fixture["worst_planned_cost_per_region"] == 0.013
+    assert fixture["discovery_horizon_seconds_per_region"] == 300
+    assert fixture["planned_action_seconds_per_region"] == 330
+    assert fixture["worst_planned_cost_per_region"] == 0.0139
     assert hashlib.sha256(raw).hexdigest() == EXPIRY_INPUT_SHA256
-    assert fixture["worst_planned_cost_for_two_regions"] == 0.026
+    assert fixture["worst_planned_cost_for_two_regions"] == 0.0278
 
 
 def test_attempt_state_is_private_atomic_and_separate_by_deployment(tmp_path):
@@ -559,7 +609,8 @@ def test_ambiguous_automation_readback_never_authorizes_creation():
     response = {
         "DocumentName": "expiry", "DocumentVersion": "1", "AutomationExecutionStatus": "InProgress",
         "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry", "Parameters": params,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}],
+        "StepExecutionsTruncated": False,
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])}}],
     }
     assert _automation_matches(response, safety, params)
     response["AutomationExecutionStatus"] = "Pending"
@@ -581,12 +632,44 @@ def test_automation_readback_rejects_truncated_or_mismatched_execution(change):
     execution = {
         "DocumentName": "expiry", "DocumentVersion": "1", "AutomationExecutionStatus": "InProgress",
         "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry", "Parameters": params,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}],
+        "StepExecutionsTruncated": False,
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])}}],
     }
     safety = {"document_name": "expiry", "document_version": "1"}
     assert _automation_matches(execution, safety, params)
     execution.update(change)
     assert not _automation_matches(execution, safety, params)
+
+
+def test_ssm_inputs_parse_literal_scalars_and_fail_closed_on_truncation():
+    assert _ssm_scalar('\"2026-10-22T12:14:00Z\"') == "2026-10-22T12:14:00Z"
+    assert _ssm_scalar("2026-10-22T12:14:00Z") == "2026-10-22T12:14:00Z"
+    assert _ssm_scalar("[]") is None
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    execution = {"DocumentName": "expiry", "DocumentVersion": "1", "AutomationExecutionStatus": "InProgress",
+        "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry", "Parameters": params,
+        "StepExecutionsTruncated": True, "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
+        "StepStatus": "InProgress", "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])}}]}
+    assert not _automation_matches(execution, {"document_name": "expiry", "document_version": "1"}, params)
+
+
+def test_terminal_expiry_evidence_rejects_foreign_execution_and_wrong_region():
+    params = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"],
+        "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": ["r"], "DeploymentId": ["d"],
+        "Region": ["eu-central-1"]}
+    execution = {"AutomationExecutionId": "foreign-exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False,
+        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "Failed",
+            "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])}}],
+        "AutomationExecutionStatus": "Failed"}
+    with pytest.raises(AwsProviderError, match="identity differs"):
+        _validate_terminal_execution(execution, "expected-exec", "eu-central-1",
+            {"document_name": "expiry", "document_version": "1"}, params)
+    execution["AutomationExecutionId"] = "expected-exec"
+    with pytest.raises(AwsProviderError, match="incomplete"):
+        _validate_terminal_execution(execution, "expected-exec", "eu-west-2",
+            {"document_name": "expiry", "document_version": "1"}, params)
 
 
 def test_automation_confirmation_retries_pending_with_one_execution_id_and_scalar_inputs(tmp_path):
@@ -597,7 +680,7 @@ def test_automation_confirmation_retries_pending_with_one_execution_id_and_scala
         "AutomationExecutionStatus": "Pending", "Parameters": params, "StepExecutions": []}
     active = {"AutomationExecutionId": "exec-bound", "DocumentName": "expiry", "DocumentVersion": "1",
         "AutomationExecutionStatus": "InProgress", "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry",
-        "Parameters": params, "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
+        "Parameters": params, "StepExecutionsTruncated": False, "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
             "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}]}
 
     class Runner:

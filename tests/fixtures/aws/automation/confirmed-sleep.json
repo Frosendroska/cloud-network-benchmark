@@ -4,6 +4,7 @@
     "DocumentName": "cnb-expiry-campaign-aws-deployment",
     "DocumentVersion": "1",
     "AutomationExecutionStatus": "InProgress",
+    "StepExecutionsTruncated": false,
     "CurrentAction": "aws:sleep",
     "CurrentStepName": "waitUntilExpiry",
     "Parameters": {

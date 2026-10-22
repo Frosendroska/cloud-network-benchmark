@@ -39,10 +39,12 @@ from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
 
 SAFETY_LEAD_SECONDS = 360
 EXPIRY_SCRIPT_SECONDS = 300
+EXPIRY_ACTION_TIMEOUT_SECONDS = 330
 PLANNED_STOP_MARGIN_SECONDS = 60
 EXPIRY_INPUT_ID = "aws-ssm-automation-public-2026-10-22"
 EXPIRY_INPUT_PATH = "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
-EXPIRY_INPUT_SHA256 = "bccb6e3018b6985058331ef98dc343df27647a8a563df7cc7c54df601f27694f"
+EXPIRY_INPUT_SHA256 = "315d3e49755396597f97cac3512b9843fcf1c95083fadc11fae667c770215a61"
+EXPIRY_COST_PER_REGION = 0.0139
 NETWORK_LIMIT = {
     "baseline_gbit_per_second": 1.562,
     "burst_gbit_per_second": 12.5,
@@ -136,6 +138,14 @@ class AwsProviderError(RuntimeError):
         self.action_id = action_id
 
 
+class AwsCliServiceError(AwsProviderError):
+    def __init__(self, code: str, region: str, resource_id: str, action_id: str):
+        super().__init__(f"AWS API returned {code} for recorded resource {resource_id} in {region}", category="aws_api", action_id=action_id)
+        self.code = code
+        self.region = region
+        self.resource_id = resource_id
+
+
 class AwsProviderDriver:
     def __init__(
         self,
@@ -149,6 +159,7 @@ class AwsProviderDriver:
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
+        self._cleanup_deadline: float | None = None
         self._precreate_deadline: float | None = None
         self._active_primary_failure: FailureEvidence | None = None
 
@@ -209,6 +220,7 @@ class AwsProviderDriver:
                     journal["executions"][region] = execution_id
                     self._save_journal(attempt, journal)
                 execution = self._confirm_automation(region, execution_id, outputs[region], expected)
+                journal.setdefault("regional_parameters", {})[region] = expected
                 journal.setdefault("regional_expiry_outcomes", {})[region] = {
                     "execution_id": execution_id,
                     "state": execution.get("AutomationExecutionStatus"),
@@ -239,11 +251,15 @@ class AwsProviderDriver:
                     "regional_document_versions": {region: outputs[region]["document_version"] for region in regions},
                     "trigger_utc": trigger.isoformat(),
                     "script_deadline_seconds": EXPIRY_SCRIPT_SECONDS,
+                    "discovery_horizon_seconds": EXPIRY_SCRIPT_SECONDS,
+                    "planned_action_seconds": EXPIRY_ACTION_TIMEOUT_SECONDS,
                     "planned_stop_margin_seconds": PLANNED_STOP_MARGIN_SECONDS,
                     "reserved_cap_end_utc": reservation.expires_at.value.isoformat(),
                     "cost_input_id": EXPIRY_INPUT_ID,
                     "cost_input_sha256": EXPIRY_INPUT_SHA256,
-                    "planned_expiry_cost_usd": 0.013 * len(regions),
+                    "action_timeout_seconds": EXPIRY_ACTION_TIMEOUT_SECONDS,
+                    "planned_expiry_cost_per_region_usd": EXPIRY_COST_PER_REGION,
+                    "planned_expiry_cost_usd": EXPIRY_COST_PER_REGION * len(regions),
                     "stop_is_not_deletion": True,
                 }),
             )
@@ -280,7 +296,7 @@ class AwsProviderDriver:
                 continue
             try:
                 if execution_id:
-                    self._cancel_or_confirm_terminal(region, execution_id)
+                    self._cancel_or_confirm_terminal(region, execution_id, journal.get("safety", {}).get(region), journal.get("regional_parameters", {}).get(region))
                 result = self._run(
                     f"aws-safety-rollback-{region}",
                     [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "destroy", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
@@ -410,6 +426,8 @@ class AwsProviderDriver:
         primary = FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else self._active_primary_failure
         inventory_by_region: dict[str, Any] = {}
         regions = journal.get("regions") or self._regions(deployment)
+        self._registration_deadline = None
+        self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
 
         if journal.get("creation_may_have_started"):
             state_path = Path(journal.get("pair_state_path", attempt / "pair.tfstate"))
@@ -441,7 +459,7 @@ class AwsProviderDriver:
             execution_id = journal.get("executions", {}).get(region)
             if execution_id:
                 try:
-                    outcome = self._cancel_or_confirm_terminal(region, execution_id)
+                    outcome = self._cancel_or_confirm_terminal(region, execution_id, journal.get("safety", {}).get(region), journal.get("regional_parameters", {}).get(region))
                     state = outcome["state"]
                     journal.setdefault("regional_expiry_outcomes", {})[region] = {"execution_id": execution_id, **outcome}
                     if state == "Cancelled":
@@ -494,8 +512,10 @@ class AwsProviderDriver:
         expiry = self._expiry_from_journal(deployment, journal)
         if expiry and journal.get("regional_expiry_outcomes"):
             outcomes = journal["regional_expiry_outcomes"]
-            state = "cancelled" if all(item.get("state") == "Cancelled" for item in outcomes.values()) else "triggered"
-            expiry = expiry.model_copy(update={"state": state, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
+            states = {item.get("state") for item in outcomes.values()}
+            state = "cancelled" if states == {"Cancelled"} else "triggered" if states == {"Success"} else "failed"
+            failure = _failure(AwsProviderError("one or more regional expiry executions failed or timed out", category="expiry_execution_failed"), self.clock()) if state == "failed" else None
+            expiry = expiry.model_copy(update={"state": state, "failure": failure, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
         result = AwsCleanupResult(
             cleanup_state=CleanupState.SUCCEEDED if journal.get("creation_may_have_started") else CleanupState.NOT_REQUIRED,
@@ -1061,12 +1081,27 @@ class AwsProviderDriver:
                         found = [inst for res in found for inst in res["Instances"] if inst.get("State", {}).get("Name") != "terminated"]
                     if found:
                         remaining.setdefault(resource_type, []).extend(found)
+                except AwsCliServiceError as exc:
+                    expected_codes = {
+                        "instance": {"InvalidInstanceID.NotFound"},
+                        "volume": {"InvalidVolume.NotFound"},
+                        "network_interface": {"InvalidNetworkInterfaceID.NotFound"},
+                    }.get(resource_type, set())
+                    if exc.code in expected_codes and exc.region == region and exc.resource_id == str(resource_id):
+                        identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
+                        if isinstance(identity, dict) and identity.get("Account") == self.settings.account_id:
+                            continue
+                        failures.append(_failure(AwsProviderError("authenticated AWS account does not match recorded resource scope", category="inventory_account_mismatch"), self.clock()))
+                        remaining.setdefault(resource_type, []).append("inventory_unknown")
+                        continue
+                    failures.append(_failure(exc, self.clock()))
+                    remaining.setdefault(resource_type, []).append("inventory_unknown")
                 except Exception as exc:
                     failures.append(_failure(exc, self.clock()))
                     remaining.setdefault(resource_type, []).append("inventory_unknown")
         return remaining
 
-    def _cancel_or_confirm_terminal(self, region: str, execution_id: str) -> dict[str, Any]:
+    def _cancel_or_confirm_terminal(self, region: str, execution_id: str, safety: dict[str, str] | None = None, parameters: dict[str, list[str]] | None = None) -> dict[str, Any]:
         current = self._run(
             f"aws-expiry-read-terminal-{region}",
             [self.settings.aws_cli, "ssm", "get-automation-execution", "--automation-execution-id", execution_id, "--region", region, "--output", "json"],
@@ -1075,6 +1110,7 @@ class AwsProviderDriver:
         if not _succeeded(current):
             raise AwsProviderError(f"cannot read expiry state in {region}", category="expiry_cancel_unverified", action_id=current.action_id)
         execution = _json_execution(current.stdout)
+        _validate_terminal_execution(execution, execution_id, region, safety, parameters)
         state = execution.get("AutomationExecutionStatus")
         if state not in TERMINAL_AUTOMATION_STATES:
             stop = self._run(
@@ -1092,10 +1128,11 @@ class AwsProviderDriver:
             if not _succeeded(current):
                 raise AwsProviderError(f"expiry cancellation readback failed in {region}", category="expiry_cancel_unverified", action_id=current.action_id)
             execution = _json_execution(current.stdout)
+            _validate_terminal_execution(execution, execution_id, region, safety, parameters)
             state = execution.get("AutomationExecutionStatus")
         if state not in TERMINAL_AUTOMATION_STATES:
             raise AwsProviderError(f"expiry execution remains nonterminal in {region}: {state}", category="expiry_cancel_unverified")
-        return {"state": str(state), "action_outputs": execution.get("Outputs"), "failure_message": execution.get("FailureMessage")}
+        return {"state": str(state), "steps": execution.get("StepExecutions"), "step_executions_truncated": execution.get("StepExecutionsTruncated"), "outputs": execution.get("Outputs"), "failure_message": execution.get("FailureMessage")}
 
     def _expiry_from_journal(self, deployment: ProviderDeploymentInput, journal: dict[str, Any]) -> ExpiryEvidence | None:
         value = journal.get("expiry_evidence")
@@ -1200,10 +1237,16 @@ class AwsProviderDriver:
                 temp.unlink()
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
-        if self._registration_deadline is not None and action_id.startswith("aws-expiry-"):
+        registration_action = action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")) and "-cancel-" not in action_id
+        if self._registration_deadline is not None and registration_action:
             remaining = int(self._registration_deadline - time.monotonic())
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
+            timeout = min(timeout, remaining)
+        if self._cleanup_deadline is not None and action_id.startswith("aws-expiry-"):
+            remaining = int(self._cleanup_deadline - time.monotonic())
+            if remaining <= 0:
+                raise AwsProviderError("AWS expiry cleanup exceeded its bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
         if self._precreate_deadline is not None and action_id == "aws-pair-apply":
             remaining = int(self._precreate_deadline - time.monotonic())
@@ -1246,6 +1289,11 @@ class AwsProviderDriver:
         action_id = "aws-" + "-".join(argv[1:3]).replace("_", "-")
         result = self._run(action_id, [self.settings.aws_cli, *argv], self.settings.command_timeout_seconds)
         if not _succeeded(result):
+            error_match = re.search(r"\(?(Invalid(?:InstanceID|Volume|NetworkInterfaceID)\.NotFound)\)?", result.stderr)
+            region_match = re.search(r"--region\s+([a-z0-9-]+)", " ".join(argv))
+            resource_id = argv[argv.index("--instance-ids") + 1] if "--instance-ids" in argv and argv.index("--instance-ids") + 1 < len(argv) else argv[argv.index("--volume-ids") + 1] if "--volume-ids" in argv and argv.index("--volume-ids") + 1 < len(argv) else argv[argv.index("--network-interface-ids") + 1] if "--network-interface-ids" in argv and argv.index("--network-interface-ids") + 1 < len(argv) else ""
+            if error_match and region_match and resource_id:
+                raise AwsCliServiceError(error_match.group(1), region_match.group(1), resource_id, action_id)
             raise AwsProviderError(f"AWS read-only API command failed: {action_id}", category="aws_api", action_id=action_id)
         try:
             value = json.loads(result.stdout)
@@ -1279,8 +1327,13 @@ def _validate_expiry_price_fixture(root: Path, settings: AwsRuntimeSettings) -> 
         # The reservation's complete-workflow source is independently validated against its admission hash.
         raise AwsProviderError("dated AWS expiry price fixture ID/hash differs", category="cost_fixture_mismatch")
     payload = json.loads(raw)
-    if payload.get("free_tier_assumed") is not False or payload.get("worst_planned_cost_per_region") != 0.013:
-        raise AwsProviderError("expiry price fixture omits the documented two-step/300-second allowance", category="cost_fixture_invalid")
+    steps = payload.get("planned_steps_per_region")
+    action_seconds = payload.get("planned_action_seconds_per_region")
+    per_region = steps * payload.get("automation_step_price", 0) + action_seconds * payload.get("script_second_price", 0) if isinstance(steps, int) and isinstance(action_seconds, int) else None
+    if (payload.get("free_tier_assumed") is not False or payload.get("discovery_horizon_seconds_per_region") != EXPIRY_SCRIPT_SECONDS
+        or action_seconds != EXPIRY_ACTION_TIMEOUT_SECONDS or round(per_region, 4) != EXPIRY_COST_PER_REGION
+        or payload.get("worst_planned_cost_for_two_regions") != round(EXPIRY_COST_PER_REGION * 2, 4)):
+        raise AwsProviderError("expiry price fixture omits the documented two-step/330-second action allowance", category="cost_fixture_invalid")
 
 
 def _namespace(deployment: ProviderDeploymentInput) -> str:
@@ -1316,8 +1369,13 @@ def _json_execution(stdout: str) -> dict[str, Any]:
 
 
 def _automation_matches(execution: dict[str, Any], safety: dict[str, str], parameters: dict[str, list[str]], execution_id: str | None = None) -> bool:
-    steps = execution.get("StepExecutions") or []
-    sleep_step = next((step for step in steps if step.get("StepName") == "waitUntilExpiry"), None)
+    steps = execution.get("StepExecutions")
+    if execution.get("StepExecutionsTruncated") is not False or not isinstance(steps, list):
+        return False
+    matching = [step for step in steps if isinstance(step, dict) and step.get("StepName") == "waitUntilExpiry"]
+    if len(matching) != 1:
+        return False
+    sleep_step = matching[0]
     inputs = (sleep_step or {}).get("Inputs") or {}
     return (
         execution.get("DocumentName") == safety["document_name"]
@@ -1333,8 +1391,33 @@ def _automation_matches(execution: dict[str, Any], safety: dict[str, str], param
     )
 
 
+def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, region: str, safety: dict[str, str] | None, parameters: dict[str, list[str]] | None) -> None:
+    if not isinstance(safety, dict) or not isinstance(parameters, dict):
+        raise AwsProviderError(f"recorded expiry identity is incomplete in {region}", category="expiry_terminal_identity")
+    steps = execution.get("StepExecutions")
+    if execution.get("AutomationExecutionId") != execution_id or execution.get("DocumentName") != safety.get("document_name") or execution.get("DocumentVersion") != safety.get("document_version") or execution.get("Parameters") != parameters:
+        raise AwsProviderError(f"terminal expiry readback identity differs in {region}", category="expiry_terminal_identity")
+    if parameters.get("Region") != [region] or execution.get("StepExecutionsTruncated") is not False or not isinstance(steps, list):
+        raise AwsProviderError(f"terminal expiry readback is incomplete in {region}", category="expiry_terminal_incomplete")
+    sleep = [step for step in steps if isinstance(step, dict) and step.get("StepName") == "waitUntilExpiry"]
+    if len(sleep) != 1 or sleep[0].get("Action") != "aws:sleep" or _ssm_scalar((sleep[0].get("Inputs") or {}).get("Timestamp")) != parameters.get("ExpiryTriggerUtc", [None])[0]:
+        raise AwsProviderError(f"terminal expiry sleep evidence differs in {region}", category="expiry_terminal_step")
+    status = execution.get("AutomationExecutionStatus")
+    step_status = sleep[0].get("StepStatus")
+    if status not in TERMINAL_AUTOMATION_STATES | {"Pending", "InProgress"} or step_status not in {"Pending", "InProgress", "Success", "Cancelled", "TimedOut", "Failed"}:
+        raise AwsProviderError(f"terminal expiry status evidence is malformed in {region}", category="expiry_terminal_step")
+    if status == "Success" and step_status != "Success" or status == "InProgress" and step_status != "InProgress":
+        raise AwsProviderError(f"terminal expiry top-level and sleep-step statuses conflict in {region}", category="expiry_terminal_step")
+
+
 def _ssm_scalar(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    return decoded if isinstance(decoded, str) else None
 
 
 def _known_resource_ids(output: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
