@@ -346,7 +346,10 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "schedule_snapshot_path":Evidence[str](value="schedule.csv"),"diagnostics":diagnostics})
     before={record.path:hashlib.sha256((child_root/record.path).read_bytes()).hexdigest() for record in records}
     result=validate_bundle(complete,evaluated_at=NOW)
-    expected_validity="partial" if value.mode=="short_study" and not frozen_n else "valid"
+    # Current F01R materialized evidence has no source-bound active-probe
+    # acquisition intervals, so native invocation/runtime and RTT point spans
+    # cannot yield a complete validity claim.
+    expected_validity="partial"
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.message) for item in result.findings[:35]]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     assert "EXP-001" in summarize_validation(result)
@@ -380,8 +383,8 @@ def test_three_provider_materialized_calibrations_recommend_from_saved_bundles(r
             for record in bundle.artifact_records)
         results.append(result)
     recommendation=select_common_n(results)
-    assert recommendation.source_campaign_id.value==results[0].metrics.value["identity"]["campaign_id"]
-    assert recommendation.common_n.value in {1,2,4,8}
+    assert recommendation.common_n.value is None
+    assert recommendation.unavailable_reason
 
 
 def test_three_provider_short_study_replay_keeps_pending_common_n_ineligible(repository_root,
@@ -402,7 +405,7 @@ def test_three_provider_short_study_replay_keeps_pending_common_n_ineligible(rep
     assert all(item.metrics.value["common_n"]["state"]=="pending" for item in results)
 
 
-def test_three_provider_short_study_with_prior_calibration_is_eligible(repository_root,
+def test_three_provider_short_study_with_prior_calibration_remains_ineligible_without_acquisition_windows(repository_root,
         tmp_path,frozen_clock,deterministic_token,fake_git_commits,request):
     bundles,results=[],[]
     for provider in ("aws","azure","gcp"):
@@ -410,10 +413,12 @@ def test_three_provider_short_study_with_prior_calibration_is_eligible(repositor
             deterministic_token,fake_git_commits,request,provider=provider,frozen_n=True,shared_slot=True)
         bundles.append(bundle)
         results.append(result)
-    assert all(result.validation_status.data_validity=="valid" for result in results)
+    assert all(result.validation_status.data_validity=="partial" for result in results)
     assert all(result.metrics.value["common_n"]["source_campaign_id"]=="prior-calibration-campaign" for result in results)
     paired=evaluate_comparison(bundles,results)
-    assert all(item.validation_status.comparison_eligibility=="eligible" for item in paired.values())
+    assert all(item.validation_status.comparison_eligibility=="ineligible" for item in paired.values())
+    assert all(any("all compared data must be valid" in reason for reason in item.validation_status.comparison_reasons)
+        for item in paired.values())
 
 
 def test_diagnostic_day_materialized_bundle_replays_all_native_chunks(repository_root, tmp_path,

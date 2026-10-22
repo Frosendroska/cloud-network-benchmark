@@ -221,15 +221,13 @@ def _coverage_inputs(repository_root, *, duration=60.0, gap_seconds=0.0):
     return value, unit, sock, tcp
 
 
-@pytest.mark.parametrize(("duration", "gap", "complete", "ratio"), [
-    (59.999, 0, False, 1.0), (60.0, 0, True, 1.0), (60.001, 0, True, 60 / 60.001),
-    (60.0, .6, True, .99), (60.0, .6001, False, 59.3999 / 60),
-])
-def test_coverage_requires_full_receiver_duration_and_exact_99_percent(repository_root, duration, gap, complete, ratio):
-    value, unit, sock, tcp = _coverage_inputs(repository_root, duration=duration, gap_seconds=gap)
+@pytest.mark.parametrize("duration", [59.999, 60.0, 60.001])
+def test_runtime_and_point_samples_cannot_prove_continuous_probe_coverage(repository_root, duration):
+    value, unit, sock, tcp = _coverage_inputs(repository_root, duration=duration)
     result = _coverage(value, unit, sock, tcp)
-    assert result["complete"] is complete
-    assert result["active_probe_ratio"]["value"] == pytest.approx(ratio, abs=1e-9)
+    assert result["complete"] is False
+    assert result["active_probe_ratio"]["value"] is None
+    assert "source-bound active-probe acquisition intervals" in result["tcp_start_bracket"]["unavailable_reason"]
 
 
 def test_rtt_selection_excludes_warmup_and_samples_outside_half_open_measured_window(repository_root):
@@ -297,10 +295,10 @@ def test_day_requires_one_continuous_receiver_span_and_unions_chunk_tails(reposi
                               SourceRef("iperf3_server_log", "server.jsonl", "a"*64), 1)
     sock, tcp=NativeParse(), NativeParse(receiver_intervals=(receiver,), sessions=("1",))
     day_coverage=module._coverage(full, day, sock, tcp)
-    assert day_coverage["complete"] is True
-    assert day_coverage["active_probe_ratio"]["value"] >= .99
-    # One first-chunk warm-up plus the in-chunk gap are removed; the valid tail remains.
-    assert day_coverage["active_probe_seconds"]["value"] == 86394
+    assert day_coverage["complete"] is False
+    assert day_coverage["active_probe_ratio"]["value"] is None
+    assert day_coverage["active_probe_seconds"]["value"] is None
+    assert "source-bound active-probe acquisition intervals" in day_coverage["tcp_start_bracket"]["unavailable_reason"]
     gapped_tcp=NativeParse(receiver_intervals=(
         ReceiverInterval("1", 0, 85400, 85400, 900_000, False, False, tcp.receiver_intervals[0].source, 1),
         ReceiverInterval("1", 86400, 87400, 1000, 100_000, False, False, tcp.receiver_intervals[0].source, 2)),
@@ -342,9 +340,9 @@ def test_conservative_command_native_bracket_uses_worst_case_overlap(repository_
         monotonic_started={"value":100},monotonic_finished={"value":165})
     value = value.model_copy(update={"timings":[timing], "commands":[probe_command,command]})
     result = _coverage(value, unit, sock, tcp)
-    assert result["active_probe_seconds"]["value"] == expected
-    assert (result["tcp_start_bracket"].get("exact_utc_start_available") is False) if available else \
-        result["tcp_start_bracket"]["unavailable_reason"]
+    assert result["active_probe_seconds"]["value"] is None
+    assert result["active_probe_ratio"]["value"] is None
+    assert "source-bound active-probe acquisition intervals" in result["tcp_start_bracket"]["unavailable_reason"]
 
 
 def test_frozen_common_n_consistency_and_inflation_rejects_incomplete_idle_baseline(repository_root, monkeypatch):
@@ -549,7 +547,8 @@ def test_tcp_window_must_intersect_native_sample_support(repository_root):
     })
     result = _coverage(value.model_copy(update={"timings":[timing]}), unit, sock, tcp)
     assert result["complete"] is False
-    assert result["active_probe_seconds"]["value"] == 0
+    assert result["active_probe_seconds"]["value"] is None
+    assert "source-bound active-probe acquisition intervals" in result["tcp_start_bracket"]["unavailable_reason"]
 
 
 def test_receiver_session_settings_endpoint_and_window_are_corroborated(repository_root):

@@ -1122,7 +1122,16 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
             else:
                 merged.append([start, end])
         active = sum(end - start for start, end in merged) if merged else None
-    elif unit.kind == "probe_chunk":
+    # F01R carries probe notification/runtime and measured sample timestamps,
+    # but no source-bound acquisition-window intervals. Those establish
+    # invocation and point observations; they do not prove continuous active-
+    # probe coverage between observations. Keep the derived candidates above
+    # as diagnostics only until such evidence exists in an owned materialized
+    # source.
+    active = None
+    ratio = None
+    bracket = {"unavailable_reason": "source-bound active-probe acquisition intervals are not recorded"}
+    if unit.kind == "probe_chunk":
         ratio = active / requested if active is not None and requested else None
     elif phase == "idle_latency":
         ratio = active / requested if active is not None and requested else None
