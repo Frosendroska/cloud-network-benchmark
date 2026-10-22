@@ -436,6 +436,10 @@ class _Runner:
             self._event_until([probe], min(until, deadline))
         if self.clock.monotonic() < until:
             raise MeasurementError("measurement clock did not reach probe lead deadline", "deadline")
+        # The exit can land exactly on the lead boundary, after the loop's last
+        # liveness check. The TCP gate is valid only while this probe is live.
+        if self.processes.poll(probe) is not None:
+            raise MeasurementError("Sockperf exited at the two-second probe lead boundary", "probe_exit")
         usable = self.context.deadline_monotonic - self.context.shutdown_grace_seconds
         if self.clock.monotonic() >= usable:
             raise MeasurementError("usable measurement deadline expired during the probe lead", "deadline")
@@ -681,6 +685,8 @@ class _Runner:
         notification: Optional[ProcessEvent] = None
         initial_notification_monotonic: Optional[float] = None
         first = True
+        day_failure: Optional[BaseException] = None
+        unresolved_probe: Optional[BaseException] = None
         try:
             while True:
                 if probe_handle is None:
@@ -700,11 +706,20 @@ class _Runner:
                     stderr_path = log_path.with_suffix(".stderr.log")
                     if any(path.exists() for path in (csv_path, log_path, stderr_path)):
                         raise ValueError(f"diagnostic chunk artifact already exists: {probe_id}")
+                    intended_artifacts = tuple(path.relative_to(self.root).as_posix()
+                                               for path in (csv_path, log_path, stderr_path))
+                    self.artifacts.extend(intended_artifacts)
                     probe_req = _request(f"sockperf-{probe_id}", sockperf_argv(self.context.b_private_ipv4, csv_path, chunk_seconds),
                                          self.root, deadline, self.clock)
-                    probe_handle = self._start(probe_req, log_path, stderr_path)
+                    try:
+                        probe_handle = self._start(probe_req, log_path, stderr_path)
+                    except BaseException:
+                        # Keep references to partial files, not destinations that
+                        # the failed start never created.
+                        self.artifacts[:] = [path for path in self.artifacts
+                            if path not in intended_artifacts or (self.root / path).exists()]
+                        raise
                     probe_start, _ = self._start_times(probe_handle)
-                    self.artifacts.extend((csv_path.relative_to(self.root).as_posix(), log_path.relative_to(self.root).as_posix(), stderr_path.relative_to(self.root).as_posix()))
                     if first:
                         notification = self._wait_notification(probe_handle, deadline)
                         self._lead(probe_handle, notification)
@@ -790,6 +805,7 @@ class _Runner:
                 "probe_active_coverage": "unavailable",
                 "reason": "Sockperf full-log rows are filtered valid samples rather than continuous acquisition intervals; exact day probe coverage remains unavailable"})
         except BaseException as exc:
+            day_failure = exc
             self._failure(exc, category=getattr(exc, "category", "measurement"))
             raise
         finally:
@@ -833,10 +849,22 @@ class _Runner:
                             "reason": "probe finalized with TCP; exact acquisition endpoints remain unavailable"})
                 except BaseException as shutdown_exc:
                     self._failure(shutdown_exc, category="shutdown")
+                    if handle is probe_handle:
+                        try:
+                            if self.processes.poll(handle) is None:
+                                unresolved_probe = shutdown_exc
+                        except BaseException:
+                            unresolved_probe = shutdown_exc
                     continue
             if not any(t.unit_id == parent.unit_id for t in self.timings):
                 self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,
                     omitted=5, clocks=self.context.clock_mappings))
+            if unresolved_probe is not None and day_failure is None:
+                unresolved = MeasurementError(
+                    "diagnostic probe shutdown failed and the owned client remains unresolved: "
+                    f"{type(unresolved_probe).__name__}: {unresolved_probe}", "shutdown")
+                self._failure(unresolved, category="shutdown")
+                raise unresolved
 
 
 def run_measurement(observation: ResolvedObservation, context: MeasurementContext, *,

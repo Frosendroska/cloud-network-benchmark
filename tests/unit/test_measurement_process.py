@@ -229,6 +229,113 @@ def test_stop_reports_termination_or_reap_failure(tmp_path, monkeypatch, failure
     assert (tmp_path / "err").read_bytes() == b"partial stderr"
 
 
+def test_stop_falls_back_to_kill_after_unexpected_wait_error(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout, self.stderr, self.stdin = BytesIO(b"partial stdout"), BytesIO(b"partial stderr"), None
+            self.returncode = None
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                return self.returncode
+            if not self.killed:
+                raise OSError("unexpected wait failure")
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
+    runner = LocalMeasurementProcesses(SystemMeasurementClock())
+    req = CommandRequest(action_id="wait-error", action_type="measurement", argv=["fake-tool"],
+                         cwd=str(tmp_path), timeout_seconds=1)
+    handle = runner.start(req, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    result = runner.stop(handle, time.monotonic() + 1)
+    assert handle.process.killed and handle.process.poll() == -9
+    assert result.outcome == "failed"
+    assert "wait failed: OSError: unexpected wait failure" in result.stderr
+    assert handle.stdout_file.closed and handle.stderr_file.closed
+    assert (tmp_path / "out").read_bytes() == b"partial stdout"
+    assert (tmp_path / "err").read_bytes() == b"partial stderr"
+
+
+@pytest.mark.parametrize("first_error", ["flush", "close"])
+def test_stop_attempts_to_close_second_stream_after_first_stream_error(tmp_path, monkeypatch, first_error):
+    original_open = Path.open
+    wrappers = {}
+
+    class FaultyStream:
+        def __init__(self, wrapped, fail):
+            self.wrapped, self.fail = wrapped, fail
+
+        @property
+        def closed(self):
+            return self.wrapped.closed
+
+        def flush(self):
+            if self.fail == "flush":
+                raise OSError("first flush failed")
+            self.wrapped.flush()
+
+        def write(self, data):
+            return self.wrapped.write(data)
+
+        def close(self):
+            if self.fail == "close":
+                self.fail = None
+                raise OSError("first close failed")
+            self.wrapped.close()
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    def wrapped_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.name == "out":
+            stream = FaultyStream(stream, None)
+        wrappers[path.name] = stream
+        return stream
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout, self.stderr, self.stdin = BytesIO(b"partial stdout"), BytesIO(b"partial stderr"), None
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(Path, "open", wrapped_open)
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
+    runner = LocalMeasurementProcesses(SystemMeasurementClock())
+    req = CommandRequest(action_id="close-error", action_type="measurement", argv=["fake-tool"],
+                         cwd=str(tmp_path), timeout_seconds=1)
+    handle = runner.start(req, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    wrappers["out"].fail = first_error
+    result = runner.stop(handle, time.monotonic() + 1)
+    assert wrappers["err"].closed
+    assert "stdout stream " + first_error + " failed" in result.stderr
+    assert original_open(tmp_path / "out", "rb").read() == b"partial stdout"
+    assert original_open(tmp_path / "err", "rb").read() == b"partial stderr"
+
+
 def test_fake_clock_utc_adjustment_does_not_change_monotonic_wait():
     from f03_support import FakeClock
 

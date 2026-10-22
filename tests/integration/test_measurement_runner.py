@@ -175,6 +175,59 @@ def test_failed_day_probe_rotates_without_restarting_tcp(repository_root, tmp_pa
     assert len([handle for handle in processes.handles if handle.request.argv[0] == "sockperf"]) >= 288
 
 
+def test_day_tcp_success_with_unresolved_final_probe_stop_fails_run(repository_root, tmp_path):
+    item = observation(repository_root, "diagnostic_day")
+    clock = FakeClock()
+
+    class UnresolvedFinalProbe(FakeProcesses):
+        def start(self, request, **kwargs):
+            handle = super().start(request, **kwargs)
+            if request.action_id == "sockperf-probe-chunk-000002":
+                handle.finishes = float("inf")
+            return handle
+
+    processes = UnresolvedFinalProbe(clock, stop_failure_action="sockperf-probe-chunk-000002")
+    result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
+    assert result.outcome == "failed"
+    assert any(f.category == "shutdown" and "owned client remains unresolved" in f.message
+               for f in result.failures)
+    assert any(row.request.get("action_id") == f"iperf3-{item.measurement_units[0].unit_id}"
+               for row in result.command_evidence)
+    assert not any(row.request.get("action_id") == "sockperf-probe-chunk-000002"
+                   for row in result.command_evidence)
+    assert any("probe-chunk-000002" in path for path in result.artifact_paths)
+
+
+@pytest.mark.parametrize("chunk_number", [1, 2])
+def test_day_start_failure_retains_only_partially_created_probe_artifacts(repository_root, tmp_path, chunk_number):
+    item = observation(repository_root, "diagnostic_day")
+    clock = FakeClock()
+    action = f"sockperf-probe-chunk-{chunk_number:06d}"
+
+    class PartialStartFailure(FakeProcesses):
+        def start(self, request, *, stdout_path, stderr_path):
+            if request.action_id == action:
+                csv_path = Path(request.argv[request.argv.index("--full-log") + 1])
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                csv_path.write_bytes(b"partial native csv")
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_bytes(b"partial probe log")
+                raise OSError("scripted partial probe start failure")
+            return super().start(request, stdout_path=stdout_path, stderr_path=stderr_path)
+
+    result = run_measurement(item, context(item, tmp_path), processes=PartialStartFailure(clock), clock=clock)
+    csv_path = item.artifact_layout.day_probe_csv_template.format(chunk_id=f"probe-chunk-{chunk_number:06d}")
+    log_path = item.artifact_layout.day_probe_log_template.format(chunk_id=f"probe-chunk-{chunk_number:06d}")
+    stderr_path = str(Path(log_path).with_suffix(".stderr.log"))
+    assert result.outcome == "failed"
+    assert result.failures[0].message.startswith("OSError: scripted partial probe start failure")
+    assert csv_path in result.artifact_paths and log_path in result.artifact_paths
+    assert stderr_path not in result.artifact_paths
+    assert (tmp_path / csv_path).read_bytes() == b"partial native csv"
+    assert (tmp_path / log_path).read_bytes() == b"partial probe log"
+    assert not any(row.request.get("action_id") == action for row in result.command_evidence)
+
+
 def test_failed_day_tcp_preserves_partial_day_and_does_not_restart(repository_root, tmp_path):
     item = observation(repository_root, "diagnostic_day")
     clock = FakeClock()

@@ -69,6 +69,29 @@ def test_current_probe_early_exit_during_notification_lead_fails_unit(repository
     assert any(f.category == "probe_exit" for f in result.failures)
 
 
+@pytest.mark.parametrize("mode", ["short_study", "acceptance", "calibration"])
+def test_probe_exit_exactly_at_notification_lead_boundary_blocks_tcp(repository_root, tmp_path, mode):
+    item = observation(repository_root, mode)
+    target = item.measurement_units[0] if mode == "calibration" else item.measurement_units[1]
+    action = f"sockperf-{target.unit_id}"
+    clock = FakeClock()
+
+    class BoundaryExitProcesses(FakeProcesses):
+        def start(self, request, **kwargs):
+            handle = super().start(request, **kwargs)
+            if request.action_id == action:
+                handle.finishes = handle.started_monotonic + self.notification_delay + 2
+            return handle
+
+    processes = BoundaryExitProcesses(clock)
+    result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
+    tcp_actions = [h.request.action_id for h in processes.handles if h.request.argv[0] == "iperf3"]
+    assert result.outcome == "failed"
+    assert not any(action.replace("sockperf-", "iperf3-") == started for started in tcp_actions)
+    assert any(f.category == "probe_exit" for f in result.failures)
+    assert any(row.request.get("action_id") == action for row in result.command_evidence)
+
+
 def test_failed_calibration_trial_preserves_evidence_and_stops_later_units(repository_root, tmp_path):
     item = observation(repository_root, "calibration")
     clock = FakeClock()
