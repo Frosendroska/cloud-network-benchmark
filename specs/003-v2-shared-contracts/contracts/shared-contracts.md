@@ -29,6 +29,24 @@ CommandRunner.run(CommandRequest) -> CommandResult
 ScriptedCommandRunner.assert_exhausted() -> None
 ```
 
+### Command timing amendment (F01R_CLOCK)
+
+The additive [honest command clock evidence contract](../../015-command-clock-evidence/contracts/command-timing.md)
+extends `CommandResult` and `CommandEvidence` within schema version 2. Existing payloads default to
+`duration_basis="utc"`, retaining ordered UTC bounds and duration-equals-UTC validation; legacy
+partial/unavailable native timing remains representable. Opting into `monotonic` requires complete
+finite local monotonic bounds, actual aware UTC endpoints, elapsed/discrepancy consistency, and an
+identical validated result projection. The runner retains actual UTC observations even when they
+move backward and derives elapsed duration from monotonic time.
+
+`utc_elapsed_discrepancy_seconds` is the observed UTC interval minus monotonic elapsed interval. It
+does not estimate absolute UTC error, establish synchronization or clock-step cause, detect every
+possible step, or change data/comparison eligibility. Existing clock mappings remain authoritative
+for synchronization estimates. Only the active child-run-manifest and validator-input exports
+change; V2 remains version 2 and historical V1 remains rejected. Strict pre-amendment readers must
+be upgraded before reading newly emitted monotonic fields. JSON Schema covers representable field
+presence/types/bounds; runtime validation checks cross-field arithmetic.
+
 `replacement_context` is optional IdentityContext-compatible observation/replaces-run metadata,
 validated against short_study/context=replacement and selected provider. First attempts need none.
 No F01R retry launcher. Preserve `initialize_campaign` result identity/path fields, adding new
