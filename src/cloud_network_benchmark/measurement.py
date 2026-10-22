@@ -385,8 +385,17 @@ class _Runner:
         return {handle: self.processes.poll(handle) for handle in handles}
 
     def _event_until(self, handles: Sequence[object], until: float) -> Optional[ProcessEvent]:
-        event = self.processes.next_event(handles, min(until, self.context.deadline_monotonic - self.context.shutdown_grace_seconds))
-        return event if isinstance(event, ProcessEvent) else event
+        allowed = tuple(handles)
+        event_deadline = min(until, self.context.deadline_monotonic - self.context.shutdown_grace_seconds)
+        while self.clock.monotonic() < event_deadline:
+            event = self.processes.next_event(handles, event_deadline)
+            if event is None or not isinstance(event, ProcessEvent):
+                return event
+            if any(event.handle is handle for handle in allowed):
+                return event
+            # Production queues are shared by concurrent clients. A queued event
+            # from a process completed by the previous unit is only a wake-up.
+        return None
 
     def _wait_notification(self, probe: object, until: float) -> Optional[ProcessEvent]:
         tail = ""
@@ -782,25 +791,43 @@ class _Runner:
                 (probe_handle, probe_req, probe_id, probe_start),
                 (tcp_handle, tcp_req, parent.unit_id, tcp_mono),
             ):
-                if handle is None or self.processes.poll(handle) is not None:
+                if handle is None:
                     continue
                 try:
-                    result = self.processes.stop(handle, self.context.deadline_monotonic)
+                    result = self.processes.poll(handle)
+                    if result is None:
+                        result = self.processes.stop(handle, self.context.deadline_monotonic)
                     if req is not None and unit_id is not None:
                         fm, _ = self._finish_times(handle, result)
-                        self.commands.append(_record(req, result, self.context, unit_id,
-                            started_monotonic=start_mono, finished_monotonic=fm))
+                        if not any(row.request.get("action_id") == req.action_id for row in self.commands):
+                            self.commands.append(_record(req, result, self.context, unit_id,
+                                started_monotonic=start_mono, finished_monotonic=fm))
+                    if handle is probe_handle and unit_id is not None and not any(t.unit_id == unit_id for t in self.timings):
+                        self.timings.append(_timing(unit_id, self.context, notification=notification.utc if notification else None,
+                            tcp_started=None, omitted=0, clocks=self.context.clock_mappings))
+                        self.artifacts.append(f"{layout.unit_paths(unit_id)['timing']}")
+                        if result.outcome == CommandOutcome.SUCCEEDED:
+                            self.executed.append(unit_id)
+                        elif result.outcome != CommandOutcome.INTERRUPTED:
+                            self._failure(MeasurementError(f"Sockperf chunk exited {result.exit_code}", "probe_chunk_failure"),
+                                          req.action_id if req else None)
+                        csv_path = resolve_artifact_path(self.root, layout.day_probe_csv_template.format(chunk_id=unit_id))
+                        native_runtime, native_valid = _sockperf_full_log_timing(csv_path)
+                        bounds = (conservative_sockperf_run_start_bounds(
+                            start_mono, fm, native_runtime,
+                            semantics_verified=_sockperf_310_semantics(self.context))
+                            if start_mono is not None and fm is not None else None)
+                        self.notes.append({"unit_id": unit_id, "parent_unit_id": parent.unit_id,
+                            "probe_process_monotonic": [start_mono, fm],
+                            "sockperf_source_semantics_verified": _sockperf_310_semantics(self.context),
+                            "sockperf_native_total_run_seconds": native_runtime,
+                            "sockperf_native_valid_duration_seconds": native_valid,
+                            "sockperf_test_start_bounds_monotonic": list(bounds) if bounds else None,
+                            "process_rotation_gap_seconds": None, "probe_gap_endpoints": "unavailable",
+                            "reason": "probe finalized with TCP; exact acquisition endpoints remain unavailable"})
                 except BaseException as shutdown_exc:
                     self._failure(shutdown_exc, category="shutdown")
                     continue
-                if handle is probe_handle and unit_id is not None and not any(t.unit_id == unit_id for t in self.timings):
-                    self.timings.append(_timing(unit_id, self.context, notification=None, tcp_started=None,
-                        omitted=0, clocks=self.context.clock_mappings))
-                    self.notes.append({"unit_id": unit_id, "parent_unit_id": parent.unit_id,
-                                       "probe_process_monotonic": [probe_start, getattr(handle, "finished_monotonic", None)],
-                                       "process_rotation_gap_seconds": None,
-                                       "probe_gap_endpoints": "unavailable",
-                                       "reason": "probe chunk was interrupted before native timing could bound its acquisition"})
             if not any(t.unit_id == parent.unit_id for t in self.timings):
                 self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,
                     omitted=5, clocks=self.context.clock_mappings))

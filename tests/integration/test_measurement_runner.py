@@ -189,6 +189,50 @@ def test_failed_day_tcp_preserves_partial_day_and_does_not_restart(repository_ro
     assert parent.unit_id in result.unexecuted_unit_ids
 
 
+def test_day_finalizes_probe_that_exits_with_tcp(repository_root, tmp_path):
+    item = observation(repository_root, "diagnostic_day")
+    clock = FakeClock()
+
+    class SimultaneousExitProcesses(FakeProcesses):
+        def poll(self, handle):
+            if handle.request.argv[0] == "iperf3" and clock.monotonic() >= handle.finishes:
+                for other in self.handles:
+                    if other.request.argv[0] == "sockperf" and other.result is None:
+                        other.finishes = clock.monotonic()
+            return super().poll(handle)
+
+    processes = SimultaneousExitProcesses(clock)
+    result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
+    probes = [handle for handle in processes.handles if handle.request.argv[0] == "sockperf"]
+    probe_rows = [row for row in result.command_evidence if row.request["argv"][0] == "sockperf"]
+    probe_ids = [row.unit_id for row in probe_rows]
+    assert result.outcome == "succeeded"
+    assert len([handle for handle in processes.handles if handle.request.argv[0] == "iperf3"]) == 1
+    assert len(probe_rows) == len(probes)
+    assert len(probe_ids) == len(set(probe_ids))
+    assert all(unit_id in result.executed_unit_ids for unit_id in probe_ids)
+    assert all(f"{unit_id}" in " ".join(result.artifact_paths) for unit_id in probe_ids)
+
+
+def test_day_finalization_error_is_secondary_to_interruption(repository_root, tmp_path):
+    item = observation(repository_root, "diagnostic_day")
+    clock = FakeClock()
+
+    class InterruptedDayProcesses(FakeProcesses):
+        def next_event(self, handles, deadline_monotonic):
+            if any(handle.request.argv[0] == "iperf3" for handle in handles):
+                raise KeyboardInterrupt("scripted diagnostic-day interruption")
+            return super().next_event(handles, deadline_monotonic)
+
+    processes = InterruptedDayProcesses(clock, stop_failure_action="sockperf-probe-chunk-000001")
+    result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
+    assert result.outcome == "failed"
+    assert result.failures[0].message.startswith("KeyboardInterrupt:")
+    assert any(f.category == "shutdown" and "termination failure" in f.message for f in result.failures[1:])
+    assert len([handle for handle in processes.handles if handle.request.argv[0] == "iperf3"]) == 1
+    assert len(processes.stop_calls) == 2
+
+
 def test_split_delayed_notification_gates_tcp_on_notification_plus_monotonic_lead(repository_root, tmp_path):
     item = observation(repository_root, "acceptance")
     clock = FakeClock()

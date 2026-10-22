@@ -194,7 +194,7 @@ def test_stream_write_failure_is_reported_as_failed_command(tmp_path, monkeypatc
 def test_stop_reports_termination_or_reap_failure(tmp_path, monkeypatch, failure):
     class FakePopen:
         def __init__(self, argv, **kwargs):
-            self.stdout, self.stderr, self.stdin = BytesIO(b""), BytesIO(b""), None
+            self.stdout, self.stderr, self.stdin = BytesIO(b"partial stdout"), BytesIO(b"partial stderr"), None
             self.returncode = None
 
         def poll(self):
@@ -221,6 +221,9 @@ def test_stop_reports_termination_or_reap_failure(tmp_path, monkeypatch, failure
     handle = runner.start(req, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     with pytest.raises((OSError, TimeoutError)):
         runner.stop(handle, time.monotonic() + 0.05)
+    assert handle.stdout_file.closed and handle.stderr_file.closed
+    assert (tmp_path / "out").read_bytes() == b"partial stdout"
+    assert (tmp_path / "err").read_bytes() == b"partial stderr"
 
 
 def test_fake_clock_utc_adjustment_does_not_change_monotonic_wait():

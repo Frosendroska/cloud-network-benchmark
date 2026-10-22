@@ -175,31 +175,55 @@ class LocalMeasurementProcesses:
         if item.result is not None:
             return item.result
         proc = item.process
+        shutdown_errors: list[str] = []
         try:
             if proc.poll() is None:
-                proc.terminate()
+                try:
+                    proc.terminate()
+                except BaseException as exc:
+                    shutdown_errors.append(f"terminate failed: {type(exc).__name__}: {exc}")
             remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
             try:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    proc.kill()
+                except BaseException as exc:
+                    shutdown_errors.append(f"kill failed: {type(exc).__name__}: {exc}")
                 remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
                 try:
                     proc.wait(timeout=remaining)
                 except subprocess.TimeoutExpired as exc:
-                    raise TimeoutError("measurement process could not be reaped before deadline") from exc
+                    shutdown_errors.append(f"reap failed: {type(exc).__name__}: {exc}")
         finally:
             for thread in item.threads:
-                thread.join(timeout=max(0.0, deadline_monotonic - self.clock.monotonic()))
+                try:
+                    thread.join(timeout=max(0.0, deadline_monotonic - self.clock.monotonic()))
+                except BaseException as exc:
+                    shutdown_errors.append(f"drain join failed: {type(exc).__name__}: {exc}")
+            item.stream_errors.extend(shutdown_errors)
+            # Every bounded shutdown path owns these streams. Drain workers have
+            # already had their remaining deadline to flush and close their pipes.
+            for stream in (item.stdout_file, item.stderr_file):
+                if not getattr(stream, "closed", False):
+                    try:
+                        stream.flush()
+                    except BaseException as exc:
+                        item.stream_errors.append(f"stream flush failed: {type(exc).__name__}: {exc}")
+                    finally:
+                        stream.close()
         if proc.poll() is None or any(thread.is_alive() for thread in item.threads):
-            raise TimeoutError("measurement process could not be reaped before deadline")
+            details = "; ".join(dict.fromkeys(item.stream_errors))
+            error = "measurement process could not be reaped before deadline"
+            raise TimeoutError(f"{error}: {details}" if details else error)
         return self._finish(item, CommandOutcome.INTERRUPTED, None)
 
     def _finish(self, item: LocalProcess, outcome: CommandOutcome, code: Optional[int]) -> CommandResult:
         if item.result is not None:
             return item.result
-        item.stdout_file.close()
-        item.stderr_file.close()
+        for stream in (item.stdout_file, item.stderr_file):
+            if not getattr(stream, "closed", False):
+                stream.close()
         finished_at = self.clock.utc_now()
         duration = max(0.0, (finished_at - item.started_at).total_seconds())
         stdout = bytes(item.preview["stdout"]).decode("utf-8", errors="replace")
