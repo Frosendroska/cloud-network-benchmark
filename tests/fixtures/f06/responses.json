@@ -1,0 +1,7 @@
+{
+  "runbook_published": {"properties": {"state": "Published"}},
+  "schedule_enabled": {"properties": {"frequency": "OneTime", "isEnabled": true}},
+  "job_binding": {"properties": {"parameters": {"vmaresourceid": "vm-a", "vmbresourceid": "vm-b"}}},
+  "late_targets": {"a": "absent", "b": "creating"},
+  "cleanup_inventory": {"complete": false, "resources": ["unknown"]}
+}
