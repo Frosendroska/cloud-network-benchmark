@@ -9,7 +9,7 @@ from typing import Callable, List
 from pydantic import Field, model_validator
 
 from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _identity_references_available, _request, _request_failure, _scrub
-from .bootstrap import BootstrapResult, _acl_matches, _process_identity_command, _process_identity_matches
+from .bootstrap import BootstrapResult, _acl_matches, _process_identity_command, _process_identity_matches, _unit_log_destinations_match
 from .contracts.common import CommandOutcome, StrictModel
 from .contracts.execution import CommandRunner
 
@@ -65,8 +65,8 @@ def _systemd_healthy(stdout: str, connection: ConnectionOutput, prepared: Bootst
     return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
             and fields.get("Restart") == "no" and observed == expected
             and fields.get("MainPID", "0").isdigit() and int(fields.get("MainPID", "0")) > 0
-            and fields.get("StandardOutput") == "append:" + listener.stdout_path
-            and fields.get("StandardError") == "append:" + listener.stderr_path)
+            and fields.get("StandardOutput") == "append"
+            and fields.get("StandardError") == "append")
 
 
 def _listener_pid(stdout: str, tool: str, address: str, port: int) -> int | None:
@@ -78,7 +78,8 @@ def _listener_pid(stdout: str, tool: str, address: str, port: int) -> int | None
 
 
 def _acl_healthy(stdout: str, connection: ConnectionOutput) -> bool:
-    return _acl_matches(stdout, connection.private_ipv4_a, connection.private_ipv4_b)
+    chain = "cnb_" + re.sub(r"[^A-Za-z0-9_]", "_", connection.deployment_id)[:32]
+    return _acl_matches(stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain)
 
 
 def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
@@ -96,6 +97,9 @@ def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: B
         tool = name.removeprefix("process-")
         build = next((item for item in prepared.builds if item.role == "vm_b" and item.tool == tool), None)
         return bool(build and _process_identity_matches(stdout, build.binary_path, build.binary_sha256))
+    if name.startswith("unit-config-"):
+        listener = next((item for item in prepared.listeners if item.tool == name.removeprefix("unit-config-")), None)
+        return bool(listener and _unit_log_destinations_match(stdout, listener.stdout_path, listener.stderr_path))
     if name == "socket-sockperf":
         return _listener_pid(stdout, "sockperf", connection.private_ipv4_b, 11111) is not None
     if name == "socket-iperf3":
@@ -124,11 +128,13 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
         ("private-tcp", connection.vm_a, ["nc", "-z", "-w", "1", connection.private_ipv4_b, "5201"], connection.timeouts.private_path_seconds),
         ("service-sockperf", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-sockperf", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
         ("service-iperf3", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-iperf3", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
-        ("socket-sockperf", connection.vm_b, ["ss", "-H", "-lunp"], connection.timeouts.server_seconds),
-        ("socket-iperf3", connection.vm_b, ["ss", "-H", "-ltnp"], connection.timeouts.server_seconds),
-        ("guest-acl", connection.vm_b, ["sudo", "nft", "list", "chain", "inet", "cnb_f02r", chain], connection.timeouts.server_seconds),
+        ("socket-sockperf", connection.vm_b, ["sudo", "ss", "-H", "-lunp"], connection.timeouts.server_seconds),
+        ("socket-iperf3", connection.vm_b, ["sudo", "ss", "-H", "-ltnp"], connection.timeouts.server_seconds),
+        ("guest-acl", connection.vm_b, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], connection.timeouts.server_seconds),
     ]
-    checks[8:8] = [(f"process-{tool}", connection.vm_b,
+    checks[8:8] = [(f"unit-config-{tool}", connection.vm_b, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], connection.timeouts.server_seconds)
+        for tool in ("sockperf", "iperf3")]
+    checks[10:10] = [(f"process-{tool}", connection.vm_b,
         _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", next(item.binary_path for item in prepared.listeners if item.tool == tool)), connection.timeouts.server_seconds)
         for tool in ("sockperf", "iperf3")]
     for name, vm, argv, ceiling in checks:

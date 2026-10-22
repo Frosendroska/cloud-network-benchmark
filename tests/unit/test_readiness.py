@@ -15,7 +15,7 @@ def test_readiness_uses_matching_preparation_and_observes_all_fixed_predicates(t
             self.requests.append(request); aid=request.action_id
             return result(aid,readiness_output(request,prep))
     runner=Runner(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=2),runner,prepared=prep,deadline=deadline(),clock=lambda:100)
-    assert outcome.ready and len(outcome.observations)==13
+    assert outcome.ready and len(outcome.observations)==15
     assert all(not ("systemctl" in req.argv and any(req.argv[index] in {"start", "restart"} for index in range(len(req.argv)))) for req in runner.requests)
 
 
@@ -47,7 +47,7 @@ def test_wrong_private_target_service_binary_and_acl_are_unhealthy(tmp_path):
     from cloud_network_benchmark.readiness import _predicate
     c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
     assert not _predicate("private-icmp","64 bytes from 203.0.113.4",c,prep)
-    wrong_service="LoadState=loaded\nActiveState=active\nExecStart={ path=/tmp/iperf3; argv[]=/tmp/iperf3 -s -B 10.0.0.2 -p 5201 --json-stream --forceflush; }\nStandardOutput=append:/var/lib/cnb/work/server-logs/iperf3-server.jsonl\nStandardError=append:/var/lib/cnb/work/server-logs/iperf3-server.err\nRestart=no\n"
+    wrong_service="LoadState=loaded\nActiveState=active\nExecStart={ path=/tmp/iperf3; argv[]=/tmp/iperf3 -s -B 10.0.0.2 -p 5201 --json-stream --forceflush; }\nStandardOutput=append\nStandardError=append\nRestart=no\n"
     assert not _predicate("service-iperf3",wrong_service,c,prep)
     assert not _predicate("guest-acl","hook input policy accept 0.0.0.0/0 10.0.0.2 11111 5201 drop",c,prep)
 

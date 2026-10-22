@@ -173,8 +173,8 @@ def test_cap_consumed_during_local_hash_preserves_partial_integrity_without_publ
             if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
             Path(request.argv[-1]).write_bytes(payload); return result(request.action_id)
     original=retrieval._hash_file
-    def slow_hash(path):
-        value=original(path); now[0]=291.0; return value
+    def slow_hash(path,**kwargs):
+        value=original(path,**kwargs); now[0]=291.0; return value
     monkeypatch.setattr(retrieval,"_hash_file",slow_hash)
     outcome=retrieval.run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=lambda:now[0])
     assert not outcome.complete and outcome.failure.category=="cleanup_allowance_reached_during_local_verification"
@@ -261,6 +261,58 @@ def test_interrupted_inventory_stops_remote_commands_and_accounts_for_later_item
     runner=Interrupted(); outcome=run_retrieval(c,m,runner,tmp_path,deadline=deadline(),clock=lambda:100)
     assert not outcome.complete and len(runner.calls)==1 and runner.calls[0].action_type=="ssh"
     assert [record.retrieval_state for record in outcome.records]==["failed","failed"]
+
+
+def test_identity_file_loss_between_artifacts_preserves_first_verified_export(tmp_path):
+    c=connection(tmp_path); base=manifest(c,b"first"); first=base.items[0]; second_payload=b"second"
+    second=RetrievalItem(artifact_id="iperf3-b",deployment_id=c.deployment_id,source_vm=c.vm_b.host,source_role="vm_b",source_path="/var/lib/cnb/work/b.json",destination_path="measurements/b.json",kind="iperf3-json",unit_id="unit-2",expected_size_bytes=len(second_payload),expected_sha256=hashlib.sha256(second_payload).hexdigest(),timeout_seconds=5)
+    declarations=[base.declarations[0],ArtifactInput(artifact_id="iperf3-b",path="measurements/b.json",kind="iperf3-json",producer="vm_b",unit_id="unit-2",expectation="required")]
+    m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace=base.remote_workspace,declarations=declarations,items=[first,second],measurement_ended_at=base.measurement_ended_at,producers_closed_at=base.producers_closed_at,closure_evidence="both closed")
+    class LostKey:
+        def run(self,request):
+            payload=b"first" if "sockperf-a" in request.action_id else second_payload
+            if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(payload)
+            Path(c.vm_a.host_key_reference).unlink(missing_ok=True)
+            return result(request.action_id)
+    outcome=run_retrieval(c,m,LostKey(),tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and outcome.failure.category=="transport_preflight_failed"
+    assert outcome.retrieved==["sockperf-a"] and (tmp_path/"measurements/a.csv").read_bytes()==b"first"
+    assert [record.retrieval_state for record in outcome.records]==["verified","failed"]
+
+
+def test_large_native_file_hash_stops_between_stream_chunks_at_cleanup_cap(tmp_path):
+    c=connection(tmp_path); payload=b"x"*(3*1024*1024)
+    class Clock:
+        value=100.0
+        def __call__(self): return self.value
+    clock=Clock()
+    class Runner:
+        def run(self,request):
+            if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(payload); clock.value=291.0; return result(request.action_id)
+    outcome=run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=clock)
+    assert not outcome.complete and outcome.failure.category=="cleanup_allowance_reached_during_local_verification"
+    assert outcome.attempts[0].size_bytes==1024*1024
+    assert outcome.attempts[0].sha256==hashlib.sha256(payload[:1024*1024]).hexdigest()
+    assert not (tmp_path/"measurements/a.csv").exists()
+
+
+def test_delayed_destination_directory_setup_prevents_publication(tmp_path,monkeypatch):
+    c=connection(tmp_path); payload=b"native"; now=[100.0]
+    class Runner:
+        def run(self,request):
+            if request.action_type=="ssh": return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(payload); return result(request.action_id)
+    original=Path.mkdir
+    def slow_mkdir(path,*args,**kwargs):
+        output=original(path,*args,**kwargs)
+        if path.name=="measurements": now[0]=291.0
+        return output
+    monkeypatch.setattr(Path,"mkdir",slow_mkdir)
+    outcome=run_retrieval(c,manifest(c,payload),Runner(),tmp_path,deadline=deadline(),clock=lambda:now[0])
+    assert not outcome.complete and outcome.failure.category=="cleanup_allowance_reached_before_publication"
+    assert not (tmp_path/"measurements/a.csv").exists()
 
 
 def test_full_identity_and_late_destination_collisions_preflight_before_copy(tmp_path):

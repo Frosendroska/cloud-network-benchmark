@@ -139,6 +139,11 @@ def test_frozen_layouts_compose_through_prepare_readiness_and_retrieval(tmp_path
             def wait(self,seconds): self.value+=seconds
         clock=Clock()
         prepared=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=bound,clock=clock)
+        log_directory=next(action for action in prepared.actions if "listener-log-directory-sockperf" in action.action_id)
+        log_service=next(action for action in prepared.actions if action.action_id.endswith("listener-sockperf"))
+        log_accessible=("-m 0755" in log_directory.request.get("argv",[])[-1]
+                        and "--property=UMask=0022" in log_service.request.get("argv",[])[-1])
+        assert log_accessible, "same SSH user must traverse log directory and read root-created append logs"
         class Ready:
             def run(self,request): return result(request.action_id,readiness_output(request,prepared))
         ready=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Ready(),prepared=prepared,deadline=bound,clock=clock)
@@ -148,6 +153,8 @@ def test_frozen_layouts_compose_through_prepare_readiness_and_retrieval(tmp_path
                 artifact=next(key for key in payloads if key in request.action_id)
                 payload=payloads[artifact]
                 if request.action_type=="ssh": out=f"{len(payload)} {hashlib.sha256(payload).hexdigest()}"
+                elif artifact in {"sockperf_server_log","iperf3_server_log","iperf3_server_error"} and not log_accessible:
+                    return result(request.action_id,success=False,stderr="permission denied reading service log")
                 elif mode=="diagnostic_day" and "day-probe-csv-diagnostic_day-chunk-2" in artifact:
                     return result(request.action_id,success=False,stderr="later probe chunk unavailable")
                 else: Path(request.argv[-1]).write_bytes(payload); out=""

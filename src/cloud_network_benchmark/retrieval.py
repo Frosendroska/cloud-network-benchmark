@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _request
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _identity_references_available, _request, _request_failure
 from .contracts.artifacts import ArtifactInput, ArtifactRecord, resolve_artifact_path
 from .contracts.common import ArtifactExpectation, CommandOutcome, Evidence, FailureEvidence, StrictModel, StringEvidence, VmRole
 from .contracts.execution import CommandRequest, CommandRunner
@@ -159,13 +159,22 @@ def _failure_record(item: RetrievalItem, category: str, message: str, action_id:
     return _evidence_failure(item, category, message, action_id)
 
 
-def _hash_file(path: Path) -> tuple[int, str]:
+class _VerificationStopped(Exception):
+    def __init__(self, size: int, sha256: str):
+        super().__init__("cleanup allowance reached during streaming local verification")
+        self.size = size
+        self.sha256 = sha256
+
+
+def _hash_file(path: Path, *, deadline: RemoteDeadline | None = None, clock: Callable[[], float] | None = None) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
             size += len(chunk)
             digest.update(chunk)
+            if deadline is not None and clock is not None and deadline.remaining(clock, cleanup=True) <= 0:
+                raise _VerificationStopped(size, digest.hexdigest())
     return size, digest.hexdigest()
 
 
@@ -255,6 +264,15 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             failures.append(failure.model_dump(mode="json"))
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason=reason), sha256=StringEvidence(unavailable_reason=reason), retrieval_state="failed", failure=failure))
             continue
+        if not _identity_references_available(vm):
+            request, result = _request_failure(f"f02r-retrieve-{item.artifact_id}-transport-preflight", vm, item.timeout_seconds, ValueError("credential reference unavailable between artifacts"))
+            actions.append(_action(request.action_id, "ssh", vm, request, result))
+            failure = _evidence_failure(item, "transport_preflight_failed", "SSH identity reference became unavailable before inventory", request.action_id)
+            failures.append(failure.model_dump(mode="json"))
+            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="transport_preflight_failed", message="SSH identity reference became unavailable between artifact transfers", action_id=request.action_id, source_path=item.source_path, occurred_at=result.finished_at)
+            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="inventory not attempted"), sha256=StringEvidence(unavailable_reason="inventory not attempted"), retrieval_state="failed", failure=failure))
+            stop = True
+            continue
         remaining = deadline.remaining(clock, cleanup=True)
         if remaining <= 0:
             failure = _evidence_failure(item, "cleanup_allowance_reached", "copy stopped to preserve cleanup allowance")
@@ -317,7 +335,7 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 reason = f"copy_{result.outcome}" if result.outcome != CommandOutcome.SUCCEEDED else "copy_not_materialized"
             else:
                 try:
-                    size, digest = _hash_file(staging)
+                    size, digest = _hash_file(staging, deadline=deadline, clock=clock)
                     if result.outcome != CommandOutcome.SUCCEEDED:
                         reason = f"copy_{result.outcome}"
                     elif size != item.expected_size_bytes:
@@ -327,13 +345,20 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                     if deadline.remaining(clock, cleanup=True) <= 0:
                         reason = "cleanup_allowance_reached_during_local_verification"
                         stop = True
+                except _VerificationStopped as exc:
+                    size, digest = exc.size, exc.sha256
+                    reason = "cleanup_allowance_reached_during_local_verification"
+                    stop = True
                 except OSError:
                     reason = "staging_read_failed"
             attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed", size_bytes=size, sha256=digest, reason=reason))
             if reason is None:
                 try:
                     final_path.parent.mkdir(parents=True, exist_ok=True)
-                    if final_path.exists() or final_path.is_symlink() or any(p.is_symlink() for p in final_path.parents if p != child_root.parent):
+                    if deadline.remaining(clock, cleanup=True) <= 0:
+                        reason = "cleanup_allowance_reached_before_publication"
+                        stop = True
+                    elif final_path.exists() or final_path.is_symlink() or any(p.is_symlink() for p in final_path.parents if p != child_root.parent):
                         reason = "destination_collision"
                     else:
                         os.link(staging, final_path)

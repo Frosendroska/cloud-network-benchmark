@@ -7,7 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
 from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap
-from cloud_network_benchmark.bootstrap import _capabilities_observed, _identity_preflight_script, _recipe
+from cloud_network_benchmark.bootstrap import _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
 
 
 def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_path):
@@ -146,6 +146,34 @@ def test_interrupted_runner_and_lost_identity_file_preserve_failure_evidence(tmp
     assert all("preflight-failed" not in request.argv for request in runner.requests)
 
 
+def test_known_hosts_loss_between_vm_a_and_vm_b_returns_accumulated_result(tmp_path):
+    c=connection(tmp_path)
+    class LostAtBoundary(BootstrapRunner):
+        def run(self,request):
+            response=super().run(request)
+            if request.action_id=="f02r-vm_a-iperf3-8":
+                Path(c.vm_a.host_key_reference).unlink(missing_ok=True)
+            return response
+    runner=LostAtBoundary(); outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="transport_preflight_failed"
+    assert len(outcome.actions)>10 and not any("vm_b-cloud-init" in request.action_id for request in runner.requests)
+
+
+def test_listener_observation_exhausting_deadline_returns_evidence(tmp_path):
+    c=connection(tmp_path); clock_value=[100.0]
+    class Clock:
+        def __call__(self): return clock_value[0]
+    class SlowFinalObservation(BootstrapRunner):
+        def run(self,request):
+            response=super().run(request)
+            if "listener-config-sockperf" in request.action_id:
+                clock_value[0]=200.0
+            return response
+    outcome=run_bootstrap(c,bootstrap_config(),SlowFinalObservation(),deadline=deadline(),clock=Clock())
+    assert not outcome.succeeded and outcome.failure.category=="readiness_deadline_exhausted"
+    assert outcome.actions and not any("listener-process-sockperf" in action.action_id for action in outcome.actions)
+
+
 def test_successful_build_observations_redact_credentials_and_secret_text(tmp_path):
     c=connection(tmp_path); key=c.vm_a.authentication_reference
     class LeakyCompiler(BootstrapRunner):
@@ -171,9 +199,20 @@ def test_sockperf_subcommand_capabilities_are_observed_independently(tmp_path):
     assert not any("listener-" in action.action_id for action in outcome.actions)
 
 
+def test_cc_version_accepts_authentic_driver_banner_and_rejects_malformed_text():
+    assert _compiler_identity_observed("cc (Ubuntu 13.3.0-6ubuntu2) 13.3.0")
+    assert _compiler_identity_observed("Apple clang version 16.0.0")
+    assert _compiler_identity_observed("gcc (GCC) 14.2.1")
+    assert not _compiler_identity_observed("")
+    assert not _compiler_identity_observed("cc version not found")
+
+
 def test_acl_rejects_accept_or_jump_bypass_before_expected_rules():
     from cloud_network_benchmark.bootstrap import _acl_matches
-    valid="type filter hook input priority -10; policy accept;\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept\nip daddr 10.0.0.2 udp dport 11111 drop\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 tcp dport 5201 accept\nip daddr 10.0.0.2 tcp dport 5201 drop"
-    assert _acl_matches(valid,"10.0.0.1","10.0.0.2")
-    assert not _acl_matches(valid.replace("priority -10; policy accept;", "priority -10; policy accept;\nip daddr 10.0.0.2 accept"),"10.0.0.1","10.0.0.2")
-    assert not _acl_matches(valid.replace("priority -10; policy accept;", "priority -10; policy accept;\njump unrestricted"),"10.0.0.1","10.0.0.2")
+    from fixtures.f02r.support import nft_listing
+    valid=nft_listing("campaign-aws-deployment"); chain="cnb_campaign_aws_deployment"
+    assert _acl_matches(valid,"10.0.0.1","10.0.0.2",chain)
+    assert not _acl_matches(valid.replace("priority -10; policy accept;", "priority -10; policy accept;\n  ip daddr 10.0.0.2 accept"),"10.0.0.1","10.0.0.2",chain)
+    assert not _acl_matches(valid.replace("priority -10; policy accept;", "type filter hook output priority -10; policy accept;"),"10.0.0.1","10.0.0.2",chain)
+    assert not _acl_matches(valid.replace("chain cnb_campaign_aws_deployment {", "chain cnb_campaign_aws_deployment {\n  jump unrestricted"),"10.0.0.1","10.0.0.2",chain)
+    assert not _acl_matches(valid,"10.0.0.1","10.0.0.2","wrong_chain")

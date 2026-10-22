@@ -131,7 +131,7 @@ def _capabilities_observed(text: str, tool: str, *, required: List[str] | None =
     return set(required if required is not None else _required_capabilities(tool)) <= tokens
 
 
-def _unit_matches(text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str) -> bool:
+def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str) -> bool:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     match = re.search(r"argv\[\]=(.*?);", fields.get("ExecStart", ""))
     if not match:
@@ -145,8 +145,14 @@ def _unit_matches(text: str, tool: str, address: str, port: int, prefix: str, st
     return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
             and fields.get("MainPID", "0").isdigit() and int(fields.get("MainPID", "0")) > 0
             and argv == expected and fields.get("Restart") == "no"
-            and fields.get("StandardOutput") == "append:" + stdout_path
-            and fields.get("StandardError") == "append:" + stderr_path)
+            and fields.get("StandardOutput") == "append"
+            and fields.get("StandardError") == "append"
+            and _unit_log_destinations_match(config_text, stdout_path, stderr_path))
+
+
+def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
+    return (f"StandardOutput=append:{stdout_path}" in text.splitlines()
+            and f"StandardError=append:{stderr_path}" in text.splitlines())
 
 
 def _process_identity_command(unit: str, binary: str) -> list[str]:
@@ -165,17 +171,31 @@ def _process_identity_matches(text: str, binary: str, expected_sha256: str) -> b
             and lines[1].split()[0] == expected_sha256)
 
 
-def _acl_matches(text: str, source: str, address: str) -> bool:
-    rules = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", " ".join(line.strip().split())).strip() for line in text.splitlines() if line.strip()]
-    expected = [f"ip saddr {source}/32 ip daddr {address} udp dport 11111 accept",
-                f"ip daddr {address} udp dport 11111 drop",
-                f"ip saddr {source}/32 ip daddr {address} tcp dport 5201 accept",
-                f"ip daddr {address} tcp dport 5201 drop"]
-    headers = [line for line in rules if "hook input" in line and "policy accept" in line]
-    effective = [line for line in rules if line not in headers]
-    # The owned chain may contain exactly the four ordered benchmark rules. Any
-    # additional accept/jump/goto could bypass source restriction.
-    return len(headers) == 1 and effective == expected
+def _acl_matches(text: str, source: str, address: str, chain: str | None = None) -> bool:
+    lines = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", line.strip()).strip() for line in text.splitlines() if line.strip()]
+    table_lines = [line for line in lines if re.fullmatch(r"table inet cnb_f02r \{", line)]
+    chain_lines = [line for line in lines if re.fullmatch(r"chain [A-Za-z0-9_]+ \{", line)]
+    if len(table_lines) != 1 or len(chain_lines) != 1:
+        return False
+    actual_chain = chain_lines[0].split()[1]
+    if chain is not None and actual_chain != chain:
+        return False
+    start = lines.index(chain_lines[0]) + 1
+    try:
+        end = lines.index("}", start)
+    except ValueError:
+        return False
+    body = [" ".join(line.split()) for line in lines[start:end]]
+    headers = [line for line in body if re.fullmatch(r"type filter hook input priority -?\d+; policy accept;", line)]
+    rules = [line for line in body if line not in headers]
+    source_forms = {source, f"{source}/32"}
+    expected_rules = [
+        next((f"ip saddr {host} ip daddr {address} udp dport 11111 accept" for host in source_forms if f"ip saddr {host} ip daddr {address} udp dport 11111 accept" in rules), ""),
+        f"ip daddr {address} udp dport 11111 drop",
+        next((f"ip saddr {host} ip daddr {address} tcp dport 5201 accept" for host in source_forms if f"ip saddr {host} ip daddr {address} tcp dport 5201 accept" in rules), ""),
+        f"ip daddr {address} tcp dport 5201 drop",
+    ]
+    return len(headers) == 1 and all(expected_rules) and rules == expected_rules and lines[end + 1:] == ["}"]
 
 
 def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
@@ -227,6 +247,15 @@ def _sha256sum_output(text: str, expected_path: str) -> str | None:
     return match.group(1) if match and match.group(2) == expected_path else None
 
 
+def _compiler_identity_observed(text: str) -> bool:
+    value = text.strip()
+    if not value or re.search(r"(?i)\b(error|not found|unknown option)\b", value):
+        return False
+    identified = re.search(r"(?im)^(?:gcc|g\+\+|clang|Apple clang|cc\s*\()", value) is not None
+    versioned = re.search(r"\b\d+(?:\.\d+){1,3}\b", value) is not None
+    return identified and versioned
+
+
 def _sha256sum_output(text: str, expected_path: str) -> str | None:
     lines = text.strip().splitlines()
     if len(lines) != 1:
@@ -257,6 +286,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
     tool_index = 0
     for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
         init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable between VM preparations", builds, listeners)
         if deadline.remaining(clock, readiness=True) <= 0:
             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="no time remains before remote preparation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
         for argv, timeout_name, kind in init:
@@ -281,8 +314,15 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
                 if observed.outcome == CommandOutcome.SUCCEEDED:
                     load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
-                    if load_state != "not-found" and not _unit_matches(observed.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
-                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
+                    if load_state != "not-found":
+                        cat_remaining = deadline.remaining(clock, readiness=True)
+                        if cat_remaining <= 0:
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                        cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
+                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        if (cat_result.outcome != CommandOutcome.SUCCEEDED or
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}")):
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
         for source in config.sources:
@@ -336,7 +376,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         return _failure_result(connection, actions, vm, req, result, "source_digest_mismatch", f"{source.tool} source archive digest did not match", builds, listeners)
                     evidence["source_sha256"] = observed_hash
                 elif index == 5:
-                    if not text or not re.search(r"(?i)\b(gcc|clang|gnu compiler)\b", text):
+                    if not _compiler_identity_observed(text):
                         return _failure_result(connection, actions, vm, req, result, "compiler_identity_missing", "compiler version was not observed", builds, listeners)
                     evidence["compiler_version"] = text
                 elif index == 6:
@@ -374,16 +414,16 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             pre_result = _execute(runner, pre_request)
             actions.append(_action(pre_id, "ssh", vm, pre_request, pre_result))
             if pre_result.outcome == CommandOutcome.SUCCEEDED:
-                if not _acl_matches(pre_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b):
+                if not _acl_matches(pre_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
                     return _failure_result(connection, actions, vm, pre_request, pre_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
             elif pre_result.outcome == CommandOutcome.FAILED and any(text in (pre_result.stdout + pre_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
                 rules = [
-                    ["sudo", "nft", "-exist", "add", "table", "inet", "cnb_f02r"],
-                    ["sudo", "nft", "-exist", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
+                    ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
+                    ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
                 ]
                 for index, argv in enumerate(rules):
                     remaining = deadline.remaining(clock, readiness=True)
@@ -413,9 +453,19 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
                     if fields.get("LoadState") == "not-found":
                         pass
-                    elif _unit_matches(output, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
+                    else:
+                        cat_remaining = deadline.remaining(clock, readiness=True)
+                        if cat_remaining <= 0:
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                        cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
+                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
                         proc_id = f"f02r-vm_b-listener-process-{tool}"
-                        proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, deadline.remaining(clock, readiness=True)))
+                        proc_remaining = deadline.remaining(clock, readiness=True)
+                        if proc_remaining <= 0:
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                        proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
                         proc_result = _execute(runner, proc_request)
                         actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
                         build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
@@ -425,9 +475,6 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                             unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
                             stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
                         continue
-                    elif fields.get("LoadState") != "not-found":
-                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions,
-                            failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match the requested listener", occurred_at=inspect_result.finished_at), builds=builds, listeners=listeners)
                 elif inspect_result.outcome != CommandOutcome.FAILED or not any(text in (inspect_result.stdout + inspect_result.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, inspect_result, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
                 stdout_abs = f"{config.workspace}/{stdout_path}"
@@ -436,12 +483,12 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 mkdir_remaining = deadline.remaining(clock, readiness=True)
                 if mkdir_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before log setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                mkdir_request = _request(mkdir_id, vm, ["sudo", "install", "-d", "-m", "0750", str(PurePosixPath(stdout_abs).parent)], min(connection.timeouts.command_seconds, mkdir_remaining))
+                mkdir_request = _request(mkdir_id, vm, ["sudo", "install", "-d", "-m", "0755", str(PurePosixPath(stdout_abs).parent)], min(connection.timeouts.command_seconds, mkdir_remaining))
                 mkdir_result = _execute(runner, mkdir_request)
                 actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
                 if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
-                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs, *server_argv]
+                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs, *server_argv]
                 aid = f"f02r-vm_b-listener-{tool}"
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
@@ -458,10 +505,19 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, verify_remaining))
                 verify_result = _execute(runner, verify_request)
                 actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
-                if verify_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(verify_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs):
+                cat_remaining = deadline.remaining(clock, readiness=True)
+                if cat_remaining <= 0:
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service output path verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
+                cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
+                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs)):
                     return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
                 proc_id = f"f02r-vm_b-listener-process-{tool}"
-                proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, deadline.remaining(clock, readiness=True)))
+                proc_remaining = deadline.remaining(clock, readiness=True)
+                if proc_remaining <= 0:
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
                 proc_result = _execute(runner, proc_request)
                 actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
                 build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
@@ -475,21 +531,21 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             remaining = deadline.remaining(clock, readiness=True)
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before ACL inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            inspect = _request(inspect_id, vm, ["sudo", "nft", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, remaining))
+            inspect = _request(inspect_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, remaining))
             acl_result = _execute(runner, inspect)
             actions.append(_action(inspect_id, "ssh", vm, inspect, acl_result))
             expected_acl = [f"{connection.private_ipv4_a}/32", connection.private_ipv4_b, "11111", "5201", "drop", "hook input"]
             if acl_result.outcome == CommandOutcome.SUCCEEDED:
-                if not _acl_matches(acl_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b):
+                if not _acl_matches(acl_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
                     return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
             elif acl_result.outcome == CommandOutcome.FAILED and any(text in (acl_result.stdout + acl_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
                 rules = [
-                    ["sudo", "nft", "-exist", "add", "table", "inet", "cnb_f02r"],
-                    ["sudo", "nft", "-exist", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
-                    ["sudo", "nft", "-exist", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
+                    ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
+                    ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
+                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
                 ]
                 for index, argv in enumerate(rules):
                     aid = f"f02r-vm_b-acl-create-{index}"
