@@ -1,0 +1,86 @@
+# Tasks: F05 V2 AWS provider
+
+**Input**: `specs/007-v2-aws-provider/` spec, plan, research, data model, contracts and quickstart.
+**Tests**: Required by F05. Use precise fake commands/clients/clocks and real static Terraform schema checks; no credentials, cloud calls or real plan/apply/destroy.
+**Ownership**: Assigned AWS files only (plan.md tree). One writer in `/private/tmp/cnb-f05`; preserve others' work. Shared F01R contracts/configs and Thesis are read-only. Merge latest coordinator-approved main before implementation; no unfinished sibling import.
+
+## Phase 1: Setup
+
+- [ ] T001 Reconcile assigned branch/base and frozen F01R imports, then record actual base/source identities, tools and owned paths in `docs/f05-aws-provider.md`; verify current supported AWS provider schema before selecting the normal root-local lock versions. (FR-001, FR-012)
+- [ ] T002 Create exact AWS response/scenario/console/failure fixtures and dated, hashed `aws-ssm-automation-public-2026-10-22` cost input under `tests/fixtures/aws/`; record primary source URLs, response field meanings, $0.013/region worst planned two-step/300-second cost with no free-tier assumption. (FR-002–007, FR-010, FR-012)
+
+## Phase 2: Foundational prerequisites
+
+**Goal**: Provider-local settings, state and frozen-model boundaries; blocks story implementations.
+
+- [ ] T003 Add input/private-state/secret-export tests in `tests/unit/test_aws_provider.py`: require provider=aws, exactly vm_a/vm_b, run_id=campaign_id+"-aws", deployment_id=run_id+"-deployment", reserved state with observed ID/cost/cap timestamps/policy, matching dated cost source/hash, scenario review evidence, controller IPv4 /32 and complete remaining time; reject missing/invalid/expired evidence and residual cleanup before side effects. (FR-001, FR-008–009)
+- [ ] T004 Implement provider-local AwsRuntimeSettings, AwsCleanupResult, atomic private attempt journal and shell-free CommandRunner calls in `src/cloud_network_benchmark/providers/aws.py`; reuse CleanupState not_started/not_required/attempted/succeeded/failed and FailureEvidence/StructuredEvidence, keep failure iff failed, isolate keys/two-root states/namespaces and cap clock without shared schema edits. Add only package marker if necessary. (FR-001, FR-006, FR-008–011)
+
+## Phase 3: US1 Protect the pair before creation (P1, MVP)
+
+**Independent test**: Confirmed regional registration follows reservation activation and precedes pair commands; failed/uncertain registration creates zero VMs. Fake script proves scoped discovery after controller loss.
+
+- [ ] T005 [US1] Add source-backed Automation start/get/stop response and ordering tests in `tests/integration/test_aws_provider_sequences.py`, covering pending/failed/truncated/mismatched readback, lost start response, duplicate recovery, partial S4 registration, expired cap and zero pair calls unless every region is confirmed. (FR-009–010, SC-002)
+- [ ] T006 [P] [US1] Add focused tests for the actual inline script source in `tests/unit/test_aws_expiry.py` with paginated fake EC2 clients/time: exact AND run/deployment tags, foreign attempt, initially empty/delayed tags, pending -> running, IncorrectInstanceState, throttling/transient API errors, extra owned IDs, stopped/terminated, long stopping, denied API and 300-second bounded horizon; no real wait. (FR-010, FR-012, SC-003)
+- [ ] T007 [US1] Implement safety-only IAM/document resources in `terraform/aws/safety/{versions,main,variables,outputs}.tf` and root `.terraform.lock.hcl`: schemaVersion 0.3 Automation, explicit SSM role trust/account scope, tag-scoped StopInstances writes plus required read-only DescribeInstances, no instances/provisioners/agent/logs/attachments. Output document/version/hash and role per region. (FR-009–010)
+- [ ] T008 [US1] Implement inline Python3.11 discovery/stop in `terraform/aws/safety/expiry.py`: full 300-second paginated requery, 5-second polling, bounded retries/API deadlines, pending handling, exact ownership, stop all owned matches with anomaly evidence, no forced stop/deletion; record stop requests separately from observed states. Inject source into two-step sleep/executeScript document in safety `main.tf`. (FR-010, SC-003)
+- [ ] T009 [US1] Implement register_expiry and journal/recovery in `src/cloud_network_benchmark/providers/aws.py`: supplied cap starts before safety side effects, trigger=reserved cap end minus 360 seconds, script max300 plus planned60 margin; confirm GetAutomationExecution identity/parameters/current aws:sleep/step inputs and InProgress before aggregate registered, all regions before pair. Fail uncertain starts safely with deterministic UUID client tokens/readback and clean unused protection when known safe. (FR-001, FR-009–010, SC-002)
+
+**Checkpoint**: US1 can be validated with fake pair calls; no real VM launch is an MVP action.
+
+## Phase 4: US2 Selected private AWS topology (P2)
+
+**Independent test**: Scenario/static/fake outputs prove exact shape, zones, placement, routes, security and authenticated host identity; tests can supply valid US1 evidence fixtures.
+
+- [ ] T010 [US2] Add contract tests in `tests/contract/test_aws_provider_contract.py` for frozen ProviderDeploymentOutput/ProviderVmOutput/RemoteConnectionData/Evidence round trips, public/private addresses, source/date network limits, physical zone IDs and explained missing/extra/malformed roles. No schema changes. (FR-007, SC-001, SC-004)
+- [ ] T011 [P] [US2] Add topology/HCL assertions in `tests/unit/test_aws_provider.py`: exactly two On-Demand Ubuntu24.04 amd64 m7i.xlarge, one NIC, 32GiB gp3/delete-on-termination, ENA without Express/EFA; S1 eu-central-1a, S2 1a/1b, S3 same-zone cluster PG, gated S4 London eu-west-2a; fixed CIDRs/routes, controller /32 and B listeners accepting only A private /32. Assert no Spot/NAT/bastion/platform resources. (FR-002–005, SC-001)
+- [ ] T012 [US2] Implement explicit pair resources in `terraform/aws/pair/{versions,main,variables,outputs}.tf` and root `.terraform.lock.hcl`: Frankfurt 10.60.0.0/16 selected /24s, London10.61.0.0/16 +10.61.1.0/24, fixed role IPs, one auto public IPv4/VM, public management IGW/routes, scoped SSH/ICMP/private listeners, S3 cluster PG only, S4 requester+London accepter+reciprocal private routes. Tag instances/volumes and all resources with ownership; no silent substitutions. (FR-002–005, FR-008)
+- [ ] T013 [US2] Add authenticated console/keyscan fingerprint tests to `tests/unit/test_aws_provider.py` with `tests/fixtures/aws/console/`: success, absent/stale/conflicting host fingerprints, wrong account/region/instance/boot, keypair-versus-host confusion and mismatch; exported secrets absent. (FR-006, SC-004)
+- [ ] T014 [US2] Implement provision, provider-authenticated image/type/zone/console parsing and strict known_hosts materialization in `src/cloud_network_benchmark/providers/aws.py`, including explicit Canonical owner099720109477/noble24.04/x86_64/HVM AMI validation, actual physical zone IDs/shape/addresses/placement, baseline1.562/burst-up-to12.5 source-labeled metadata, incomplete-output evidence and attempt-local authentication references. Hand off MTU1460/CUBIC/DSCP0/ECNoff/default-offloads intent without importing guest preparation. (FR-002–008, SC-001, SC-004)
+- [ ] T015 [US2] Add complete fake S1–S4 apply/output/identity traces in `tests/integration/test_aws_provider_sequences.py`; assert both regional protection IDs precede S4 apply, role-scoped private benchmark paths, concurrent P0/P1 state/key/tag independence and refusal before create on wrong gate/time/identity. (FR-001–010, SC-001–004)
+
+## Phase 5: US3 Explain and finish attempts (P3)
+
+**Independent test**: Seed partial state/inventory fixtures without executing US2; cleanup must preserve errors, protection and launch blockers until complete absence is verified.
+
+- [ ] T016 [US3] Add failure-injection traces to `tests/integration/test_aws_provider_sequences.py`: apply/output timeout/nonzero/interruption, partial resources, destroy-zero-with-leftover, denied/truncated/paginated inventory, both regions, cancellation race/denial, repeated cleanup and primary failure preservation. (FR-008, FR-011–012, SC-005)
+- [ ] T017 [US3] Implement cleanup in `src/cloud_network_benchmark/providers/aws.py`: mark possible creation before pair apply, attempt destroy on every terminal path afterward, discover owned IDs+tags across all pages/regions, verify absent instances/disks/addresses/ENIs/placement/peering/keypairs/network resources, retain protection until compute absence, then cancel/readback terminal execution and remove/verify safety resources. Return AwsCleanupResult.failed with FailureEvidence on leftovers/unknowns/cancellation/support cleanup errors; never overwrite primary failure or delete foreign resources. (FR-011, SC-005)
+- [ ] T018 [US3] Complete controller-loss/recovery fixtures in `tests/fixtures/aws/failures/` and integration assertions: no controller cleanup command after crash, independent script sees partial/late creation and requests stop, stopped compute retains charged disk leftovers, state survives locally, later recovery inventory/cancellation is required, over-cap/unknown stop evidence blocks launches. No fake result is labeled real AWS proof. (FR-008–012, SC-003, SC-005)
+
+## Phase 6: Polish and acceptance evidence
+
+- [ ] T019 Run focused AWS and affected F01R tests plus exact two-root Terraform fmt/init-backend-false/validate from `specs/007-v2-aws-provider/quickstart.md`; repair owned files only, record actual executable `/private/tmp/cnb-tools/terraform` v1.16.6, provider lock versions and command/exit results in `docs/f05-aws-provider.md`. Cloud credentials/live calls/real plans/applies are forbidden. (FR-012, SC-006)
+- [ ] T020 Document runtime interface, upfront IAM/role propagation, charged dated expiry cost allowance, cap-start/360-second lead and asynchronous-stop/late-creation limits, authenticated host-key evidence, private state recovery and all-region cleanup in `docs/f05-aws-provider.md`; distinguish passed, failed, not run and later paid acceptance. Update this feature's tasks/evidence and request authorized convergence, without editing Thesis/shared runtime state or merging. (FR-001–012, SC-001–006)
+
+## Dependencies and execution order
+
+T001 -> T002 -> T003/T004 foundation. US1 T005/T006 tests precede T007/T008/T009. US2 T010/T011/T013 tests precede T012/T014/T015 after US1 checkpoint; valid registration fixtures permit isolated US2 tests. US3 T016 precedes T017/T018 and can be tested with seeded partial state; integration requires completed US1/US2. T019/T020 follow all stories. T004 defines journal/model shape, not full story logic. Same-file changes are serial.
+
+Parallel examples (logical opportunities only; one assigned writer): US1 T005 integration cases and T006 separate expiry tests have no mutual dependency; US2 T010 contract tests and T011 topology assertions are independent files; US3 T016 sequence tests and a read-only review of failure fixtures can be prepared independently, but T018 is not marked parallel because it updates integration assertions. Do not spawn extra writers for this feature.
+
+## Requirement coverage
+
+| Requirement | Tasks |
+| --- | --- |
+| FR-001 | T001,T003,T004,T009,T015,T020 |
+| FR-002 | T002,T010,T011,T012,T014,T020 |
+| FR-003 | T002,T010,T011,T012,T015,T020 |
+| FR-004 | T002,T011,T012,T015,T020 |
+| FR-005 | T002,T011,T012,T015,T020 |
+| FR-006 | T003,T004,T013,T014,T020 |
+| FR-007 | T002,T010,T014,T020 |
+| FR-008 | T003,T004,T012,T014,T015,T016,T018,T020 |
+| FR-009 | T003,T005,T007,T009,T015,T020 |
+| FR-010 | T002,T005,T006,T007,T008,T009,T018,T020 |
+| FR-011 | T004,T016,T017,T018,T020 |
+| FR-012 | T001,T002,T006,T016,T018,T019,T020 |
+| SC-001 | T010,T011,T012,T014,T015,T019 |
+| SC-002 | T005,T009,T015,T019 |
+| SC-003 | T006,T008,T018,T019 |
+| SC-004 | T010,T013,T014,T019 |
+| SC-005 | T016,T017,T018,T019 |
+| SC-006 | T019,T020 |
+
+## Implementation strategy
+
+Build the safety boundary first, validate it with fakes, then the exact pair and finally cleanup/recovery. No deployment/demo is authorized. Story task counts: US1=5, US2=6, US3=3; setup/foundation=4, final=2, total20. Mark tasks complete only with actual evidence. Convergence may append remaining work; no independent extra review stage.

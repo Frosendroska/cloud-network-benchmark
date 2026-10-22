@@ -1,0 +1,19 @@
+# F05 data model
+
+Reuse F01R at base `cef838e`; no shared schemas are changed.
+
+| Entity/type | Constraints and relationships |
+| --- | --- |
+| ProviderDeploymentInput | provider=aws; schema_version=2; run_id=campaign_id+"-aws"; deployment_id=run_id+"-deployment"; exactly vm_a client and vm_b receiver; existing scenario/mode/admission invariants apply |
+| ReservationEvidence | state=reserved; observed reservation_id, reserved_cost_usd, cap_started_at, expires_at, cap_start_policy_id; source_path/hash identify dated complete-workflow estimate including expiry allowance |
+| ExpiryRequest | action=stop; exact run/deployment/provider; resource_namespace matches isolated attempt; target_selector identifies BOTH exact run/deployment tags, account and all involved regions; expires_at is earlier safety trigger |
+| ExpiryEvidence | existing states not_registered/registered/failed/cancelled/triggered; registered requires observed ID, registration UTC and expiry UTC; provider_metadata carries regional execution IDs/document identity/parameters/status/trigger/script deadline/cap endpoint/cost source |
+| ProviderVmOutput | one each vm_a/vm_b; observed resource_id/private_ipv4/image_identity/actual_shape/region/zone; public_ipv4 and physical_zone_id evidence; connection requires authenticated trust or is null with explained unavailable evidence |
+| ProviderDeploymentOutput | exactly two roles; identity matches run/deployment/provider; apply started after registration; output_artifact_path=terraform-outputs.redacted.json; explicit documented_network_limit/provider_metadata |
+| AwsCleanupResult (F05-owned) | cleanup_state uses existing CleanupState enum: not_started/not_required/attempted/succeeded/failed; cleanup_failure is optional existing FailureEvidence; inventory is StructuredEvidence; expiry is existing Evidence[ExpiryEvidence]; no shared CleanupEvidence exists; failed/unknown/residual inventory requires failed state plus failure; succeeded requires complete all-region absence and terminal expiry/support cleanup |
+| AwsRuntimeSettings (private F05) | controller IPv4 /32; account identity reference; region->AMI ID; authentication/public-key/known-hosts references; private state root; cost-input identity/hash; primary_review_decision as StructuredEvidence containing decision=approved, scenario, source_path/source_sha256 and reviewed_at UTC when required for P2/P3; complete_workflow_remaining_seconds supplied by caller must be positive and fit before trigger; injected clock and bounded command timeouts; no secret values in durable exports |
+| Attempt journal (private F05) | ownership IDs, two root paths, registration tokens/IDs per region, redacted command identity, cap/trigger, creation-may-have-started flag, failures and last verified inventory; atomic local writes, private directory permissions |
+
+Regional registrations aggregate under one local registration ID linked to separate execution IDs; no synthetic single AWS execution is claimed. Zero observed VM IDs at registration is valid because discovery occurs later. A registration timeout after a start is uncertain, not absent; journal supports subsequent authenticated lookup. A region registration failure prevents both VM creations and safely cleans unused safety resources where cancellation is known.
+
+Transitions: admitted reservation -> safety setup -> per-region start/readback -> aggregate registered -> pair creation-may-have-started -> output/partial failure -> pair cleanup -> all-region compute absence -> expiry terminal/cancelled -> safety cleanup -> verified absent. Failure can branch at every arrow. Compute-stop trigger leaves cleanup incomplete. Unknown verification preserves an open recovery state. A repeated attempt cannot reuse state or reset the reservation cap; repeated cleanup is idempotent.
