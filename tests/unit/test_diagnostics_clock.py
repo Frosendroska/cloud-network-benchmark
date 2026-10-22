@@ -44,3 +44,37 @@ def test_clock_query_uses_bounded_local_read_only_command_and_skips_deadline():
     calls.clear()
     guest._mapping("vm_a",Clock(),lambda argv,timeout:(calls.append((argv,timeout)) or {}),deadline=1.0)
     assert calls == []
+
+
+def test_chrony_numeric_fields_require_complete_finite_values_and_units():
+    base="""Reference ID : C0000201 (192.0.2.1)
+Stratum : 2
+Ref time (UTC) : Wed Oct 22 12:00:00 2026
+System time : 0.010 seconds fast of NTP time
+Root delay : 0.020000 seconds
+Root dispersion : 0.030000 seconds
+Leap status : Normal
+"""
+    for bad in ("NaN 0.0 seconds", "0.03 seconds trailing", "Infinity seconds", "0.03 milliseconds"):
+        text=base.replace("0.030000 seconds",bad)
+        record=guest._clock_record("vm_a",5,datetime.now(timezone.utc),{"returncode":0,"stdout":text},0.01,0.02)
+        assert record["estimated_error_ms"]["value"] is None, bad
+        assert "unsynchronized" in record["synchronization_source"]["value"]
+    for bad in ("2x", "0"):
+        text=base.replace("Stratum : 2",f"Stratum : {bad}")
+        record=guest._clock_record("vm_a",5,datetime.now(timezone.utc),{"returncode":0,"stdout":text},0.01,0.02)
+        assert record["estimated_error_ms"]["value"] is None
+
+
+def test_clock_invalid_reference_and_nonfinite_bracket_are_unavailable():
+    text="""Reference ID : 00000000
+Stratum : 2
+Ref time (UTC) : Wed Oct 22 12:00:00 2026
+System time : 0 seconds fast of NTP time
+Root delay : 0 seconds
+Root dispersion : 0 seconds
+Leap status : Normal
+"""
+    for result, elapsed in (({"returncode":0,"stdout":text},0.0),(None,float("inf"))):
+        record=guest._clock_record("vm_a",5,datetime.now(timezone.utc),result or {"returncode":0,"stdout":text},elapsed,0)
+        assert record["estimated_error_ms"]["value"] is None

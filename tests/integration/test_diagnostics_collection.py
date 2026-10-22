@@ -171,3 +171,79 @@ def test_copied_guest_help_needs_no_project_path(tmp_path):
     source=Path(__file__).parents[2]/"src/cloud_network_benchmark/diagnostics_guest.py"
     copied=tmp_path/"diagnostics_guest.py"; shutil.copy(source,copied)
     subprocess.run([sys.executable,str(copied),"--help"],cwd=tmp_path,env={"PATH":__import__("os").environ["PATH"]},check=True,timeout=3,capture_output=True)
+
+
+def test_snapshot_timestamps_bracket_actual_reads_and_deadline_read_is_partial(tmp_path):
+    from datetime import datetime
+    out=tmp_path/"crossing"; out.mkdir(); clock=FakeClock(); reads=[0]
+    def read(_):
+        reads[0]+=1
+        if reads[0] == 2: clock.now += 1.5
+        return snapshot(reads[0])
+    context={"deployment_id":"RUN-deployment","vm_role":"vm_a","provider":"aws","interface":"eth0","output_root":str(out),"duration_seconds":2,"metadata_seed":seed()}
+    outcome=collect_local(context,root=Path(__file__).parents[1]/"fixtures/f04",clock=clock,run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"},snapshot_reader=read)
+    rows=[json.loads(line) for line in (out/"diagnostics/vm_a.jsonl").read_text().splitlines()]
+    assert outcome["state"] == "interrupted" and len(rows) == 1
+    row=rows[0]
+    utc=datetime.fromisoformat(row["sampled_at"].replace("Z","+00:00"))
+    assert abs(utc.timestamp()-datetime(2026,10,22,tzinfo=timezone.utc).timestamp()-row["monotonic_seconds"]) < 1e-9
+    assert row["monotonic_seconds"] > 1 and row["interval_seconds"] == row["monotonic_seconds"]
+    assert "after collection deadline" in row["gap_reason"]
+    assert outcome["mapping_count"] == 1
+
+
+def test_loader_rejects_provider_foreign_closure_and_empty_completed_clock_stream(tmp_path):
+    from cloud_network_benchmark.diagnostics import load_collection_result
+    from cloud_network_benchmark.contracts.measurements import VmMetadata
+    from cloud_network_benchmark.contracts.common import StringEvidence
+
+    def collect(case):
+        out=tmp_path/case; out.mkdir()
+        context={"deployment_id":"RUN-deployment","vm_role":"vm_a","provider":"aws","interface":"eth0","output_root":str(out),"duration_seconds":1,"metadata_seed":seed()}
+        outcome=collect_local(context,root=Path(__file__).parents[1]/"fixtures/f04",clock=FakeClock(),run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"},snapshot_reader=lambda _:snapshot(0))
+        return context,outcome,out
+
+    context,outcome,out=collect("provider")
+    payload=json.loads((out/"metadata/vm_a.json").read_text()); payload["provider"]="gcp"
+    (out/"metadata/vm_a.json").write_text(json.dumps(payload)+"\n")
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "failed" and any("provider" in f["message"] for f in loaded.failures)
+
+    context,outcome,out=collect("foreign-close")
+    outcome["closed_paths"].append(str(out/"foreign.json"))
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "failed" and any("foreign" in f["message"] for f in loaded.failures)
+
+    context,outcome,out=collect("empty-clock")
+    (out/"diagnostics/vm_a-clock.jsonl").write_text("")
+    outcome["mapping_count"]=0
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "failed" and any(f["category"] == "clock_mapping_missing" for f in loaded.failures)
+
+
+def test_loader_rejects_duplicate_closure_and_preserves_partial_records(tmp_path):
+    from cloud_network_benchmark.diagnostics import load_collection_result
+    out=tmp_path/"duplicate"; out.mkdir()
+    context={"deployment_id":"RUN-deployment","vm_role":"vm_b","provider":"gcp","interface":"eth0","output_root":str(out),"duration_seconds":2,"metadata_seed":seed("vm_b","gcp")}
+    outcome=collect_local(context,root=Path(__file__).parents[1]/"fixtures/f04",clock=FakeClock(),run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"},snapshot_reader=lambda _:snapshot(0),stop_requested=lambda:True)
+    outcome["closed_paths"].append(outcome["closed_paths"][0])
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "interrupted"
+    assert any("duplicate" in f["message"] for f in loaded.failures)
+    assert loaded.metadata is not None
+
+
+def test_loader_rejects_foreign_artifact_declaration_and_reversed_clock_time(tmp_path):
+    from cloud_network_benchmark.diagnostics import load_collection_result
+    out=tmp_path/"clock-reversal"; out.mkdir()
+    context={"deployment_id":"RUN-deployment","vm_role":"vm_a","provider":"aws","interface":"eth0","output_root":str(out),"duration_seconds":2,"metadata_seed":seed()}
+    outcome=collect_local(context,root=Path(__file__).parents[1]/"fixtures/f04",clock=FakeClock(),run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"},snapshot_reader=lambda _:snapshot(0))
+    outcome["artifacts"]["foreign"]=str(out/"foreign.json")
+    (out/"diagnostics/vm_a-clock.jsonl").write_text(
+        json.dumps({"vm_role":"vm_a","monotonic_seconds":2,"utc_timestamp":"2026-10-22T00:00:02Z","estimated_error_ms":{"value":None,"unavailable_reason":"unknown"},"synchronization_source":{"value":"chronyc tracking unavailable; missing","unavailable_reason":None}})+"\n"
+        +json.dumps({"vm_role":"vm_a","monotonic_seconds":3,"utc_timestamp":"2026-10-21T00:00:03Z","estimated_error_ms":{"value":None,"unavailable_reason":"unknown"},"synchronization_source":{"value":"chronyc tracking unavailable; missing","unavailable_reason":None}})+"\n")
+    outcome["mapping_count"]=2
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "failed"
+    assert any("exactly metadata" in f["message"] for f in loaded.failures)
+    assert any("time reversed" in f["message"] for f in loaded.failures)

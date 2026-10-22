@@ -147,6 +147,9 @@ def load_collection_result(context: dict, outcome: dict) -> DiagnosticCollection
     metadata = None
     expected = {"metadata":root/f"metadata/{role}.json", "diagnostics":root/f"diagnostics/{role}.jsonl", "clock":root/f"diagnostics/{role}-clock.jsonl"}
     declared_paths = outcome.get("artifacts") or {}
+    if not isinstance(declared_paths, dict) or set(declared_paths) != set(expected):
+        failures.append({"category":"artifact_declaration_mismatch", "message":"outcome must declare exactly metadata, diagnostics, and clock artifacts"})
+        declared_paths = declared_paths if isinstance(declared_paths, dict) else {}
     for key, path in expected.items():
         if declared_paths.get(key) != str(path):
             failures.append({"category":"artifact_declaration_mismatch", "message":f"outcome path differs for {key}"})
@@ -160,16 +163,23 @@ def load_collection_result(context: dict, outcome: dict) -> DiagnosticCollection
         try:
             if key == "metadata":
                 metadata = VmMetadata.model_validate_json(path.read_text(encoding="utf-8"))
-                if metadata.deployment_id != deployment or metadata.vm_role != role:
-                    raise ValueError("metadata identity differs from context")
+                if (metadata.deployment_id != deployment or metadata.vm_role != role
+                        or metadata.provider != context.get("provider")):
+                    raise ValueError("metadata identity or provider differs from context")
             elif key == "diagnostics":
                 for item in iter_samples(path):
                     samples += 1
                     if item.deployment_id != deployment or item.vm_role != role: raise ValueError(f"{path}: sample identity mismatch")
             else:
+                previous_mapping = None
                 for item in iter_clock_mappings(path):
                     mappings += 1
                     if item.vm_role != role: raise ValueError(f"{path}: clock role mismatch")
+                    if previous_mapping is not None and (
+                            item.monotonic_seconds < previous_mapping.monotonic_seconds
+                            or item.utc_timestamp < previous_mapping.utc_timestamp):
+                        raise ValueError(f"{path}: clock mapping time reversed")
+                    previous_mapping = item
         except Exception as exc:
             failures.append({"category":"artifact_validation", "message":str(exc)[:500]})
     declared_samples, declared_mappings = outcome.get("sample_count"), outcome.get("mapping_count")
@@ -177,9 +187,22 @@ def load_collection_result(context: dict, outcome: dict) -> DiagnosticCollection
         failures.append({"category":"count_mismatch", "message":"diagnostic sample count differs from outcome"})
     if isinstance(declared_mappings, bool) or not isinstance(declared_mappings, int) or mappings != declared_mappings:
         failures.append({"category":"count_mismatch", "message":"clock mapping count differs from outcome"})
-    closed = set(outcome.get("closed_paths") or [])
+    raw_closed = outcome.get("closed_paths")
+    if not isinstance(raw_closed, list) or any(not isinstance(item, str) for item in raw_closed):
+        failures.append({"category":"closure_mismatch", "message":"closed_paths must be a list of declared artifact paths"})
+        raw_closed = []
+    closed = set(raw_closed)
+    expected_closed = {str(path) for path in expected.values()}
+    if len(raw_closed) != len(closed):
+        failures.append({"category":"closure_mismatch", "message":"closed_paths contains duplicate declarations"})
+    if closed - expected_closed:
+        failures.append({"category":"closure_mismatch", "message":"closed_paths contains foreign artifact paths"})
     for path in expected.values():
         if str(path) not in closed:
             failures.append({"category":"closure_mismatch", "message":f"artifact not reported closed: {path.name}"})
+    if state == "completed" and mappings == 0:
+        failures.append({"category":"clock_mapping_missing", "message":"completed collection requires a baseline clock mapping"})
+    if state == "completed" and closed != expected_closed:
+        failures.append({"category":"closure_mismatch", "message":"completed collection must close exactly its three declared artifacts"})
     if state == "completed" and failures: state = "failed"
     return DiagnosticCollectionResult(deployment, role, state, samples, mappings, _declarations(role), sorted(closed), failures, metadata)

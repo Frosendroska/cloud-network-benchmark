@@ -126,7 +126,13 @@ def parse_proc_stat(text):
     for line in text.splitlines():
         match = re.fullmatch(r"(cpu(?:[0-9]+)?)\s+(.+)", line)
         if match:
-            result[match.group(1)] = _ints(match.group(2), 8)[:8]
+            name = match.group(1)
+            try:
+                result[name] = _ints(match.group(2), 8)[:8]
+            except ValueError as exc:
+                if name == "cpu":
+                    raise
+                result[name] = {"error": str(exc)}
     if "cpu" not in result:
         raise ValueError("aggregate CPU row missing")
     return result
@@ -210,9 +216,12 @@ def _cpu_values(previous, current, reset_fields):
     old_cpu, new_cpu = previous.get("cpu", {}), current.get("cpu", {})
     old_cpu = old_cpu if isinstance(old_cpu, dict) else {}
     new_cpu = new_cpu if isinstance(new_cpu, dict) else {}
-    old_cores = {k:v for k,v in old_cpu.items() if k.startswith("cpu")}
-    new_cores = {k:v for k,v in new_cpu.items() if k.startswith("cpu")}
-    if not old_cores or old_cores.keys() != new_cores.keys():
+    core_name = re.compile(r"cpu[0-9]+\Z")
+    old_cores = {k:v for k,v in old_cpu.items() if core_name.fullmatch(k)}
+    new_cores = {k:v for k,v in new_cpu.items() if core_name.fullmatch(k)}
+    if (not old_cores or old_cores.keys() != new_cores.keys()
+            or any(not isinstance(v, (list, tuple)) or len(v) < 8 for v in old_cores.values())
+            or any(not isinstance(v, (list, tuple)) or len(v) < 8 for v in new_cores.values())):
         max_e = _e(None, "CPU core membership changed or unavailable")
     else:
         values = [calc(old_cores[k], new_cores[k], "cpu_max_core_percent") for k in sorted(old_cores)]
@@ -277,22 +286,24 @@ def _clock_record(role, monotonic_seconds, utc_time, result, query_elapsed, utc_
             key, value = line.split(":", 1)
             fields[key.strip()] = value.strip()
     try:
-        def seconds(name):
-            match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", fields[name])
+        def seconds(name, pattern):
+            match = re.fullmatch(pattern, fields[name])
             if not match: raise ValueError(name)
-            v = float(match.group())
+            v = float(match.group(1))
             if not math.isfinite(v): raise ValueError(name)
             return v
-        offset = seconds("System time")
-        delay = seconds("Root delay")
-        dispersion = seconds("Root dispersion")
+        number = r"([-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))"
+        offset = seconds("System time", number + r" seconds (?:fast|slow) of NTP time")
+        delay = seconds("Root delay", number + r" seconds")
+        dispersion = seconds("Root dispersion", number + r" seconds")
+        if not re.fullmatch(r"[0-9]+", fields["Stratum"]): raise ValueError("Stratum")
         stratum = int(fields["Stratum"])
         reference = fields["Reference ID"]
         leap = fields["Leap status"]
         ref_time = fields.get("Ref time (UTC)", "")
         datetime.strptime(ref_time, "%a %b %d %H:%M:%S %Y")
         if not re.fullmatch(r"[0-9A-Fa-f]{8}(?:\s+\([^)]{1,64}\))?", reference): raise ValueError("Reference ID")
-        synchronized = result.get("returncode") == 0 and leap.lower() == "normal" and 1 <= stratum <= 15 and reference.split()[0].lower() not in ("7f7f0101", "00000000") and delay >= 0 and dispersion >= 0
+        synchronized = result.get("returncode") == 0 and leap.lower() == "normal" and 1 <= stratum <= 15 and reference.split()[0].lower() not in ("7f7f0101", "00000000") and delay >= 0 and dispersion >= 0 and math.isfinite(query_elapsed) and query_elapsed >= 0 and math.isfinite(utc_bracket) and utc_bracket >= 0
         details = f"reference={reference}; ref_time={ref_time}; stratum={stratum}; leap={leap}; offset={fields.get('System time')}; root_delay={fields.get('Root delay')}; root_dispersion={fields.get('Root dispersion')}"
         source = f"chronyc tracking {'synchronized' if synchronized else 'unsynchronized'}; {details}"
         if synchronized:
@@ -323,32 +334,41 @@ def read_static_metadata(context, *, root=Path("/"), run_command=_command, remai
     def unavailable(reason): return _e(None, reason)
     try:
         cpu = _read("/proc/cpuinfo", root)
-        models = sorted(set(re.findall(r"^model name\s*:\s*(.+)$", cpu, re.M)))
+        models = sorted({model.strip() for model in re.findall(r"^model name\s*:\s*(.+)$", cpu, re.M) if model.strip()})
         seed["cpu_model"] = _e("; ".join(models)) if models else unavailable("CPU model not observed")
     except ValueError as exc: seed["cpu_model"] = unavailable(str(exc))
-    try: seed["kernel"] = _e(_read("/proc/sys/kernel/osrelease", root).strip())
+    try:
+        kernel = _read("/proc/sys/kernel/osrelease", root).strip()
+        seed["kernel"] = _e(kernel) if kernel else unavailable("kernel release is empty")
     except ValueError as exc: seed["kernel"] = unavailable(str(exc))
     base = root / "sys/class/net" / context["interface"]
-    try: seed["mtu"] = _e(int((base/"mtu").read_text().strip()))
+    try:
+        mtu = int((base/"mtu").read_text().strip())
+        seed["mtu"] = _e(mtu) if mtu > 0 else unavailable("MTU must be positive")
     except (OSError, ValueError): seed["mtu"] = unavailable("MTU unavailable or malformed")
     try:
         driver_link = base / "device/driver"
         seed["nic_driver"] = _e(_rooted_link_name(driver_link, root))
     except OSError: seed["nic_driver"] = unavailable("selected NIC driver unavailable")
     seed["acceleration"] = _acceleration(root, context["interface"], seed.get("provider"), seed.get("nic_driver"))
-    try: seed["congestion_control"] = _e(_read("/proc/sys/net/ipv4/tcp_congestion_control", root).strip())
+    try:
+        congestion = _read("/proc/sys/net/ipv4/tcp_congestion_control", root).strip()
+        seed["congestion_control"] = _e(congestion) if congestion else unavailable("congestion control is empty")
     except ValueError as exc: seed["congestion_control"] = unavailable(str(exc))
     versions, builds = {}, {}
     for tool in ("sockperf", "iperf3"):
         argv = [tool, "--version"] if tool == "sockperf" else [tool, "--version"]
         timeout = min(0.2, remaining())
         result = run_command(argv, timeout) if remaining() > 0 else {"returncode": None, "stdout": "", "stderr": "deadline reached"}
-        binary = Path(shutil_which(tool) or "")
+        binary_name = shutil_which(tool)
         version = (result.get("stdout") or result.get("stderr", "")).strip().splitlines()
         data = {"version": _e(version[0][:240]) if result.get("returncode") == 0 and version else unavailable("version unavailable"),
                 "binary_sha256": unavailable("binary unavailable")}
-        try: data["binary_sha256"] = _e(hashlib.sha256(binary.read_bytes()).hexdigest())
-        except OSError: pass
+        if binary_name:
+            try:
+                digest = _hash_binary(Path(binary_name), remaining)
+                data["binary_sha256"] = _e(digest) if digest else unavailable("binary identity deadline reached or binary unavailable")
+            except OSError: pass
         versions[tool] = data
         source_value = (seed.get("source_builds") or {}).get("value") or {}
         supplied = source_value.get(tool) if isinstance(source_value, dict) else None
@@ -373,6 +393,20 @@ def shutil_which(name):
     return shutil.which(name)
 
 
+def _hash_binary(path, remaining, *, chunk_size=65536):
+    """Hash incrementally and discard identity when the collection budget expires."""
+    digest = hashlib.sha256()
+    if remaining() <= 0:
+        return None
+    with Path(path).open("rb") as stream:
+        while remaining() > 0:
+            block = stream.read(min(chunk_size, 65536))
+            if not block:
+                return digest.hexdigest() if remaining() > 0 else None
+            digest.update(block)
+    return None
+
+
 def _acceleration(root, interface, provider, driver):
     if not driver or driver.get("value") is None:
         return _e(None, "acceleration mechanism unavailable without observed driver")
@@ -383,7 +417,8 @@ def _acceleration(root, interface, provider, driver):
         net = root/"sys/class/net"/interface
         for lower in net.glob("lower_*"):
             try:
-                vf_driver = _rooted_link_name(lower/"device/driver", root)
+                rooted_lower = _resolve_rooted(lower, root)
+                vf_driver = _rooted_link_name(rooted_lower/"device/driver", root)
                 if vf_driver and vf_driver != "hv_netvsc":
                     return _e(f"observed linked VF driver: {vf_driver}")
             except OSError:
@@ -392,16 +427,43 @@ def _acceleration(root, interface, provider, driver):
     return _e(f"observed driver {value}; acceleration semantics not verified")
 
 
-def _rooted_link_name(link, root):
-    """Read a sysfs link name while keeping absolute fixture links inside root."""
-    link, root = Path(link), Path(root)
-    raw = os.readlink(link)
-    target = (root/raw.lstrip("/") if raw.startswith("/") else link.parent/raw)
-    normalized = Path(os.path.normpath(str(target)))
-    try: normalized.relative_to(root)
+def _resolve_rooted(path, root):
+    """Resolve symlink components without following absolute fixture links on host."""
+    root = Path(root).absolute()
+    path = Path(path)
+    try:
+        relative = path.relative_to(root) if path.is_absolute() else path
+    except ValueError as exc:
+        raise OSError("sysfs path escapes fixture root") from exc
+    pending, resolved, links = list(relative.parts), root, 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if resolved == root: raise OSError("sysfs link escapes fixture root")
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        if candidate.is_symlink():
+            links += 1
+            if links > 40: raise OSError("sysfs symlink loop")
+            target = os.readlink(candidate)
+            if target.startswith("/"):
+                resolved = root
+                pending = list(Path(target.lstrip("/")).parts) + pending
+            else:
+                pending = list(Path(target).parts) + pending
+        else:
+            resolved = candidate
+    try: resolved.relative_to(root)
     except ValueError as exc: raise OSError("sysfs link escapes fixture root") from exc
-    if not normalized.exists(): raise OSError("sysfs link target is unavailable")
-    return normalized.name
+    if not resolved.exists(): raise OSError("sysfs link target is unavailable")
+    return resolved
+
+
+def _rooted_link_name(link, root):
+    return _resolve_rooted(link, root).name
 
 
 def collect_local(context, *, root=Path("/"), clock=None, run_command=None, stop_requested=None, snapshot_reader=None):
@@ -424,6 +486,11 @@ def collect_local(context, *, root=Path("/"), clock=None, run_command=None, stop
         except Exception as exc:
             empty = {"error": f"snapshot read failed: {type(exc).__name__}: {exc}"}
             return {"cpu":None,"tcp":None,"nic":{key:empty for _,key in COUNTERS.values() if key != "RetransSegs"}}, empty["error"]
+    def timed_snapshot():
+        before_mono, before_utc = clock.monotonic(), clock.utc_now()
+        snapshot, error = take_snapshot()
+        after_utc, after_mono = clock.utc_now(), clock.monotonic()
+        return snapshot, error, (before_mono + after_mono) / 2, before_utc + (after_utc-before_utc)/2, after_mono
     try:
         for path in paths.values():
             inside_root = False
@@ -450,9 +517,10 @@ def collect_local(context, *, root=Path("/"), clock=None, run_command=None, stop
             opened["clock"].write(json.dumps(mapping, separators=(",",":"), allow_nan=False)+"\n")
             opened["clock"].flush(); mappings += 1
         if clock.monotonic() < deadline:
-            previous, baseline_error = take_snapshot()
-            baseline = clock.monotonic()
+            previous, baseline_error, baseline, _, baseline_finished = timed_snapshot()
             write_mapping()
+            if baseline_finished > deadline:
+                state = "interrupted"
         else:
             # Startup consumed the supplied duration; preserve a UTC/monotonic
             # mapping with unavailable accuracy without starting another command.
@@ -463,16 +531,22 @@ def collect_local(context, *, root=Path("/"), clock=None, run_command=None, stop
             clock.wait_until(target)
             now = clock.monotonic()
             if now > deadline: break
-            current, current_error = take_snapshot()
+            current, current_error, observed_at, observed_utc, read_finished = timed_snapshot()
             gap_parts = [item for item in (baseline_error, current_error) if item]
-            if now-target >= 1.0: gap_parts.append(f"scheduled tick delayed; {math.floor(now-target)} tick opportunities omitted")
+            if observed_at-target >= 1.0: gap_parts.append(f"scheduled tick delayed; {math.floor(observed_at-target)} tick opportunities omitted")
+            crossed_deadline = read_finished > deadline
+            if crossed_deadline:
+                gap_parts.append("snapshot completed after collection deadline; partial observation")
             gap = "; ".join(gap_parts) or None
             sample = derive_sample(previous, current, deployment_id=deployment, vm_role=role,
-                sampled_at=clock.utc_now(), monotonic_seconds=now, interval_seconds=now-baseline, gap_reason=gap)
+                sampled_at=observed_utc, monotonic_seconds=observed_at, interval_seconds=observed_at-baseline, gap_reason=gap)
             opened["diagnostics"].write(json.dumps(sample, separators=(",",":"), allow_nan=False)+"\n"); opened["diagnostics"].flush(); samples += 1
+            if crossed_deadline:
+                state = "interrupted"
+                break
             write_mapping()
-            previous, baseline, baseline_error = current, now, current_error
-            target += max(1, math.floor((now-target)/1.0)+1)
+            previous, baseline, baseline_error = current, observed_at, current_error
+            target += max(1, math.floor((read_finished-target)/1.0)+1)
         if stop_requested(): state = "interrupted"
     except BaseException as exc:
         state = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"

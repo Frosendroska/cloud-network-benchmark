@@ -97,11 +97,65 @@ def test_azure_netvsc_requires_and_reports_linked_vf_driver(tmp_path):
     net=temp/"sys/class/net/eth0"; (net/"device").mkdir(parents=True,exist_ok=True)
     (net/"device/driver").symlink_to("/sys/bus/pci/drivers/hv_netvsc")
     (temp/"sys/bus/pci/drivers/hv_netvsc").mkdir(parents=True)
-    lower=net/"lower_vf0"; (lower/"device").mkdir(parents=True)
-    (lower/"device/driver").symlink_to("/sys/bus/pci/drivers/ena")
+    vf=net/"vf0"; (vf/"device").mkdir(parents=True)
+    (vf/"device/driver").symlink_to("/sys/bus/pci/drivers/ena")
+    (net/"lower_vf0").symlink_to("vf0")
     (temp/"sys/bus/pci/drivers/ena").mkdir(parents=True)
     assert guest._rooted_link_name(net/"device/driver",temp) == "hv_netvsc"
     assert guest._acceleration(temp,"eth0","azure",{"value":"hv_netvsc"})["value"] == "observed linked VF driver: ena"
+    (temp/"sys/bus/pci/drivers/escape").symlink_to("/etc")
+    try: guest._rooted_link_name(temp/"sys/bus/pci/drivers/escape",temp)
+    except OSError: pass
+    else: raise AssertionError("escaping absolute sysfs symlink was followed")
+    (net/"lower_missing").symlink_to("does-not-exist")
+    (net/"lower_vf0").unlink()
+    assert guest._acceleration(temp,"eth0","azure",{"value":"hv_netvsc"})["value"] is None
+
+
+def test_static_metadata_marks_bad_mtu_and_empty_required_strings_unavailable(tmp_path):
+    import shutil
+    from pathlib import Path
+    from cloud_network_benchmark.contracts.measurements import VmMetadata
+    for value in ("0", "-1", "not-an-integer"):
+        root=tmp_path/("root-"+value.replace("/", "_")); shutil.copytree(Path(__file__).parents[1]/"fixtures/f04",root)
+        (root/"sys/class/net/eth0/mtu").write_text(value)
+        (root/"proc/sys/kernel/osrelease").write_text("  \n")
+        (root/"proc/sys/net/ipv4/tcp_congestion_control").write_text(" \n")
+        (root/"proc/cpuinfo").write_text("processor : 0\nmodel name :   \n")
+        vm=SimpleNamespace(image_identity="image",region="region",zone="zone",physical_zone_id={"value":None,"unavailable_reason":"not exposed"},actual_shape="shape")
+        context=build_collection_context(SimpleNamespace(schema_version=2,deployment_id="RUN-deployment",identity=SimpleNamespace(deployment_id="RUN-deployment"),provider="aws",vm_a=vm,vm_b=vm,documented_network_limit=StructuredEvidence(value={"source":"docs"})),role="vm_a",interface="eth0",output_root=root,duration_seconds=60)
+        metadata=guest.read_static_metadata(context,root=root,run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"})
+        metadata.update(schema_version=2,deployment_id="RUN-deployment",vm_role="vm_a",provider="aws")
+        parsed=VmMetadata.model_validate(metadata)
+        assert parsed.mtu.value is None and parsed.mtu.unavailable_reason
+        assert parsed.cpu_model.value is None and parsed.kernel.value is None and parsed.congestion_control.value is None
+    valid=Path(__file__).parents[1]/"fixtures/f04"
+    assert (valid/"sys/class/net/eth0/mtu").read_text().strip() == "9000"
+
+
+def test_binary_hash_is_incremental_and_budget_exhaustion_is_unknown(tmp_path):
+    import hashlib
+    binary=tmp_path/"tool"; binary.write_bytes(b"x"*150000)
+    assert guest._hash_binary(binary,lambda:10,chunk_size=1024) == hashlib.sha256(binary.read_bytes()).hexdigest()
+    remaining=iter((10,10,0))
+    assert guest._hash_binary(binary,lambda:next(remaining),chunk_size=1024) is None
+
+
+def test_static_binary_identity_materializes_supplied_comparison_and_deadline_unknown(tmp_path, monkeypatch):
+    import hashlib
+    from pathlib import Path
+    binary=tmp_path/"synthetic-tool"; binary.write_bytes(b"synthetic executable bytes")
+    context={"interface":"eth0","metadata_seed":{"source_builds":{"value":{
+        "sockperf":{"binary_sha256":{"value":"incorrect","unavailable_reason":None},"binary_version":"v1"},
+        "iperf3":{"binary_sha256":{"value":hashlib.sha256(binary.read_bytes()).hexdigest(),"unavailable_reason":None},"binary_version":"v1"}},"unavailable_reason":None}}}
+    monkeypatch.setattr(guest,"shutil_which",lambda _tool:str(binary))
+    metadata=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":0,"stdout":"v1\n","stderr":""},remaining=lambda:5)
+    assert metadata["tool_versions"]["value"]["sockperf"]["binary_sha256"]["value"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert metadata["source_builds"]["value"]["sockperf"]["matches_bootstrap_binary"]["value"] is False
+    assert metadata["source_builds"]["value"]["iperf3"]["matches_bootstrap_binary"]["value"] is True
+    exhausted=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":0,"stdout":"v1\n","stderr":""},remaining=lambda:0)
+    for tool in ("sockperf","iperf3"):
+        assert exhausted["tool_versions"]["value"][tool]["binary_sha256"]["value"] is None
 
 
 def test_cpu_model_mixture_and_interface_traversal_are_preserved(tmp_path):
@@ -127,3 +181,26 @@ def test_malformed_tcp_header_does_not_hide_nic_values():
         assert "RetransSegs" in str(exc)
     else:
         raise AssertionError("missing named TCP counter accepted")
+
+
+def test_aggregate_cpu_survives_malformed_core_but_maximum_is_unavailable_and_recovers():
+    old = snap(cores={"cpu0":[100,20,40,800,5,10,5,2], "cpu1":[100,20,40,800,5,10,5,2]})
+    malformed = {"cpu":{"cpu":[110,22,44,820,5,12,7,3], "cpu0":[110,22,44,820,5,12,7,3], "cpu1":{"error":"bad core row"}},"tcp":5,"nic":old["nic"]}
+    row=guest.derive_sample(old,malformed,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=2,interval_seconds=1)
+    assert row["cpu_total_percent"]["value"] is not None
+    assert row["cpu_steal_percent"]["value"] is not None
+    assert row["cpu_max_core_percent"]["value"] is None
+    assert guest.parse_proc_stat("cpu 1 2 3 4 5 6 7 8\ncpu0 1 2 3 4 5 6 7 8\ncpu1 nope\n")["cpu1"]["error"]
+    recovered=snap(cpu=(120,24,48,840,5,14,9,4))
+    recovered_row=guest.derive_sample(malformed,recovered,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=3,interval_seconds=1)
+    assert recovered_row["cpu_max_core_percent"]["value"] is None
+    recovered_row=guest.derive_sample(snap(),recovered,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=4,interval_seconds=1)
+    assert recovered_row["cpu_max_core_percent"]["value"] is not None
+
+
+def test_aggregate_only_snapshot_never_substitutes_aggregate_for_max_core():
+    old={"cpu":{"cpu":[100,20,40,800,5,10,5,2]},"tcp":1,"nic":{}}
+    new={"cpu":{"cpu":[110,22,44,820,5,12,7,3]},"tcp":2,"nic":{}}
+    row=guest.derive_sample(old,new,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1,interval_seconds=1)
+    assert row["cpu_total_percent"]["value"] is not None
+    assert row["cpu_max_core_percent"]["value"] is None
