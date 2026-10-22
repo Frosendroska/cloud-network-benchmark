@@ -2,7 +2,7 @@
 
 ## Scope and environment
 
-Validation ran in `/private/tmp/cnb-f06` on `codex/f06-v2-azure`, based on merged F05/AWS `e03a07eaa5ed9ea372c695db19fd6fbcffdad024`. The feature commit before final evidence is `be65da8940180c16b47393e84c97315f4334c9da`; final code-and-evidence head is recorded in the commit history. Python was 3.11.13, Terraform 1.16.6 and the locked AzureRM provider 4.81.0. The AzureRM plugin was installed locally for backend-disabled validation. No Azure credentials, API requests, real plan/apply/destroy, SSH connection or benchmark traffic were used.
+Validation ran in `/private/tmp/cnb-f06` on `codex/f06-v2-azure`, based on merged F05/AWS `e03a07eaa5ed9ea372c695db19fd6fbcffdad024`. The final validated implementation commit is `deb848f71c73bf707fee6075b3e55f9c066c4a23` (parent checkpoint `be65da8940180c16b47393e84c97315f4334c9da`). Python was 3.11.13, Terraform 1.16.6 and the locked AzureRM provider 4.81.0. The AzureRM plugin was installed locally for backend-disabled validation. No Azure credentials, API requests, real plan/apply/destroy, SSH connection or benchmark traffic were used.
 
 For required offline runbook parsing and fake-cmdlet execution, the temporary runtime was the official PowerShell 7.5.11 macOS ARM64 release from [PowerShell/PowerShell v7.5.11](https://github.com/PowerShell/PowerShell/releases/tag/v7.5.11). Its archive SHA-256 was `93c5d5b71a3937e3dbb68934886d318689f57ecda466443764a9d7101f196e6f`; it was extracted under `/private/tmp/cnb-tools` and is not part of the repository. This does not establish compatibility with the specified hosted PowerShell 5.1 Automation runtime or Az.Accounts module.
 
