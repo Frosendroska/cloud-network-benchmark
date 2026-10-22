@@ -5,7 +5,7 @@ from pydantic import ValidationError
 from jsonschema import Draft202012Validator
 import yaml
 
-from cloud_network_benchmark.contracts import CommonNState, DiagnosticSample, Evidence, ValidationResult
+from cloud_network_benchmark.contracts import CommandEvidence, CommandResult, CommonNState, DiagnosticSample, Evidence, ValidationResult
 from cloud_network_benchmark.contracts.common import ValidationStatus
 from cloud_network_benchmark.contracts.measurements import TimingGap
 from cloud_network_benchmark.contracts.validation import ValidationFinding
@@ -118,3 +118,70 @@ def test_timing_gap_and_validation_finding_reasons_are_nonblank_in_runtime_and_s
         assert not finding_schema.is_valid(invalid_finding)
         with pytest.raises(ValidationError):
             ValidationFinding.model_validate(invalid_finding)
+
+
+def test_command_timing_schema_accepts_legacy_and_monotonic_v2_but_rejects_incomplete_modes() -> None:
+    legacy = CommandResult(action_id="schema-test", outcome="succeeded", started_at="2026-10-22T12:00:00Z",
+                           finished_at="2026-10-22T12:00:02Z", duration_seconds=2, exit_code=0,
+                           stdout="", stderr="").model_dump(mode="json")
+    result_schema = Draft202012Validator(CommandResult.model_json_schema(mode="validation"))
+    assert result_schema.is_valid(legacy)
+    assert result_schema.is_valid({key: value for key, value in legacy.items() if key != "duration_basis"})
+    monotonic = CommandResult(action_id="schema-test", outcome="succeeded", started_at="2026-10-22T12:00:00Z",
+                              finished_at="2026-10-22T11:59:55Z", duration_seconds=2, exit_code=0,
+                              stdout="", stderr="", duration_basis="monotonic", monotonic_started=100,
+                              monotonic_finished=102, utc_elapsed_discrepancy_seconds=-7).model_dump(mode="json")
+    assert result_schema.is_valid(monotonic)
+    assert not result_schema.is_valid({**monotonic, "monotonic_finished": None})
+    assert not result_schema.is_valid({**monotonic, "duration_basis": "utc"})
+    assert not result_schema.is_valid({key: value for key, value in monotonic.items() if key != "duration_basis"})
+
+    evidence_schema = Draft202012Validator(CommandEvidence.model_json_schema(mode="validation"))
+    base_evidence = {
+        "schema_version": 2, "request": {"argv": ["tool"]}, "result": monotonic,
+        "producer": "controller", "deployment_id": "campaign-aws-deployment",
+        "binary_version": {"value": "tool-1"}, "source_identity": {"value": "a" * 40},
+        "monotonic_started": {"value": 100}, "monotonic_finished": {"value": 102},
+        "started_at": {"value": "2026-10-22T12:00:00Z"}, "finished_at": {"value": "2026-10-22T11:59:55Z"},
+        "duration_basis": "monotonic", "utc_elapsed_discrepancy_seconds": -7,
+    }
+    assert evidence_schema.is_valid(base_evidence)
+    for field in ("started_at", "finished_at"):
+        incomplete = dict(base_evidence)
+        del incomplete[field]
+        assert not evidence_schema.is_valid(incomplete)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(incomplete)
+    for field in ("started_at", "finished_at", "duration_seconds", "outcome", "stdout", "exit_code"):
+        incomplete_result = dict(base_evidence)
+        incomplete_result["result"] = dict(base_evidence["result"])
+        del incomplete_result["result"][field]
+        assert not evidence_schema.is_valid(incomplete_result)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(incomplete_result)
+
+    malformed_values = (
+        ("duration_seconds", -1), ("outcome", "unknown"), ("stdout", 1),
+        ("exit_code", []), ("started_at", 123), ("monotonic_started", True),
+    )
+    for field, malformed in malformed_values:
+        candidate = dict(base_evidence)
+        candidate["result"] = dict(base_evidence["result"])
+        candidate["result"][field] = malformed
+        assert not evidence_schema.is_valid(candidate)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(candidate)
+
+    assert not evidence_schema.is_valid({**base_evidence, "monotonic_started": {"unavailable_reason": "missing"}})
+    assert not evidence_schema.is_valid({**base_evidence, "utc_elapsed_discrepancy_seconds": None})
+    assert not evidence_schema.is_valid({**base_evidence, "duration_basis": "utc"})
+    assert not evidence_schema.is_valid({**base_evidence, "duration_basis": "utc",
+                                         "utc_elapsed_discrepancy_seconds": None})
+    assert not evidence_schema.is_valid({key: value for key, value in base_evidence.items() if key != "duration_basis"})
+
+    legacy_evidence = {**base_evidence, "duration_basis": "utc", "utc_elapsed_discrepancy_seconds": None,
+                       "result": {"stdout": "", "stderr": ""},
+                       "monotonic_started": {"value": 100}, "monotonic_finished": {"unavailable_reason": "not captured"},
+                       "started_at": {"value": "2026-10-22T12:00:00Z"}, "finished_at": {"unavailable_reason": "not captured"}}
+    assert evidence_schema.is_valid(legacy_evidence)
+    CommandEvidence.model_validate(legacy_evidence)
