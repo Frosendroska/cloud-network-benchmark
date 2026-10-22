@@ -1,0 +1,24 @@
+{
+  "AutomationExecution": {
+    "AutomationExecutionId": "exec-0123456789abcdef0",
+    "DocumentName": "cnb-expiry-campaign-aws-deployment",
+    "DocumentVersion": "1",
+    "AutomationExecutionStatus": "InProgress",
+    "StepExecutionsTruncated": false,
+    "CurrentAction": "aws:sleep",
+    "CurrentStepName": "waitUntilExpiry",
+    "Parameters": {
+      "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/cnb-expiry-campaign-aws-deployment"],
+      "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+      "RunId": ["campaign-aws"],
+      "DeploymentId": ["campaign-aws-deployment"],
+      "Region": ["eu-central-1"]
+    },
+    "StepExecutions": [{
+      "StepName": "waitUntilExpiry",
+      "Action": "aws:sleep",
+      "StepStatus": "InProgress",
+      "Inputs": {"Timestamp": "2026-10-22T12:14:00Z"}
+    }]
+  }
+}
