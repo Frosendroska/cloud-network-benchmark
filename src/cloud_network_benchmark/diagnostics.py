@@ -175,10 +175,8 @@ def load_collection_result(context: dict, outcome: dict) -> DiagnosticCollection
                 for item in iter_clock_mappings(path):
                     mappings += 1
                     if item.vm_role != role: raise ValueError(f"{path}: clock role mismatch")
-                    if previous_mapping is not None and (
-                            item.monotonic_seconds < previous_mapping.monotonic_seconds
-                            or item.utc_timestamp < previous_mapping.utc_timestamp):
-                        raise ValueError(f"{path}: clock mapping time reversed")
+                    if previous_mapping is not None and item.monotonic_seconds < previous_mapping.monotonic_seconds:
+                        raise ValueError(f"{path}: monotonic clock mapping time reversed")
                     previous_mapping = item
         except Exception as exc:
             failures.append({"category":"artifact_validation", "message":str(exc)[:500]})

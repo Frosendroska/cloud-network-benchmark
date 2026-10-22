@@ -44,6 +44,49 @@ def test_rooted_linux_fixture_and_named_tcp_counter(tmp_path):
     assert result["nic"]["rx_bytes"] == 100
 
 
+def test_rooted_interface_symlink_reads_mtu_statistics_and_lower_vf_links(tmp_path):
+    import shutil
+    from pathlib import Path
+    root=tmp_path/"fixture"; shutil.copytree(Path(__file__).parents[1]/"fixtures/f04",root)
+    class_net=root/"sys/class/net"; nic=root/"sys/devices/net/eth0"
+    nic.parent.mkdir(parents=True)
+    shutil.move(str(class_net/"eth0"),str(nic))
+    (class_net/"eth0").symlink_to("/sys/devices/net/eth0")
+    (nic/"device").mkdir(parents=True,exist_ok=True)
+    (nic/"device/driver").symlink_to("/sys/bus/pci/drivers/hv_netvsc")
+    (root/"sys/bus/pci/drivers/hv_netvsc").mkdir(parents=True)
+    vf=root/"sys/devices/pci/vf0"; (vf/"device").mkdir(parents=True)
+    (vf/"device/driver").symlink_to("/sys/bus/pci/drivers/ena")
+    (root/"sys/bus/pci/drivers/ena").mkdir(parents=True)
+    (nic/"lower_vf0").symlink_to("/sys/devices/pci/vf0")
+    observed=guest.read_linux_snapshot("eth0",root=root)
+    assert observed["nic"]["rx_bytes"] == 100
+    (nic/"lower_vf_relative").symlink_to("../../pci/vf0")
+    vm=SimpleNamespace(image_identity="image",region="region",zone="zone",physical_zone_id={"value":None,"unavailable_reason":"not exposed"},actual_shape="shape")
+    context=build_collection_context(SimpleNamespace(schema_version=2,deployment_id="RUN-deployment",identity=SimpleNamespace(deployment_id="RUN-deployment"),provider="azure",vm_a=vm,vm_b=vm,documented_network_limit=StructuredEvidence(value={"source":"docs"})),role="vm_a",interface="eth0",output_root=root,duration_seconds=60)
+    metadata=guest.read_static_metadata(context,root=root,run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"})
+    assert metadata["mtu"]["value"] == 9000
+    assert metadata["acceleration"]["value"] == "observed linked VF driver: ena"
+    nic_relative=root/"sys/devices/net/eth1"; (nic_relative/"statistics").mkdir(parents=True)
+    (nic_relative/"mtu").write_text("9000")
+    for counter in ("rx_dropped","tx_dropped","rx_errors","tx_errors","rx_bytes","tx_bytes"):
+        shutil.copyfile(nic/"statistics"/counter,nic_relative/"statistics"/counter)
+    (class_net/"eth1").symlink_to("../../devices/net/eth1")
+    assert guest.read_linux_snapshot("eth1",root=root)["nic"]["rx_bytes"] == 100
+
+
+def test_rooted_interface_symlink_missing_and_escape_targets_are_unavailable(tmp_path):
+    import shutil
+    from pathlib import Path
+    root=tmp_path/"fixture"; shutil.copytree(Path(__file__).parents[1]/"fixtures/f04",root)
+    net=root/"sys/class/net"; shutil.rmtree(net/"eth0")
+    (net/"eth0").symlink_to("/sys/devices/net/missing")
+    assert guest.read_linux_snapshot("eth0",root=root)["nic"]["rx_bytes"]["error"]
+    (net/"eth0").unlink(); (net/"eth0").symlink_to("/etc")
+    observed=guest.read_linux_snapshot("eth0",root=root)
+    assert observed["nic"]["rx_bytes"]["error"]
+
+
 def test_counter_recovers_from_reset_using_current_value_as_new_baseline():
     old=snap(tcp=90); reset=snap(tcp=4); recovered=snap(tcp=8)
     first=guest.derive_sample(old,reset,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1,interval_seconds=1)
@@ -204,3 +247,31 @@ def test_aggregate_only_snapshot_never_substitutes_aggregate_for_max_core():
     row=guest.derive_sample(old,new,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1,interval_seconds=1)
     assert row["cpu_total_percent"]["value"] is not None
     assert row["cpu_max_core_percent"]["value"] is None
+
+
+def test_rooted_bad_aggregate_keeps_valid_core_maximum_and_recovers(tmp_path):
+    import shutil
+    from pathlib import Path
+    root=tmp_path/"fixture"; shutil.copytree(Path(__file__).parents[1]/"fixtures/f04",root)
+    stat=root/"proc/stat"
+    stat.write_text("cpu broken\ncpu0 100 20 40 800 5 10 5 2\ncpu1 200 20 40 800 5 10 5 2\n")
+    current=guest.read_linux_snapshot("eth0",root=root)
+    assert current["cpu"]["cpu"]["error"]
+    previous={"cpu":{"cpu":[90,20,40,790,5,9,4,1],"cpu0":[90,20,40,790,5,9,4,1],"cpu1":[190,20,40,790,5,9,4,1]},"tcp":3,"nic":current["nic"]}
+    row=guest.derive_sample(previous,current,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1,interval_seconds=1)
+    assert row["cpu_total_percent"]["value"] is None and row["cpu_steal_percent"]["value"] is None
+    assert row["cpu_max_core_percent"]["value"] is not None
+    stat.write_text("cpu0 110 22 44 810 5 12 7 3\ncpu1 210 22 44 810 5 12 7 3\n")
+    missing=guest.read_linux_snapshot("eth0",root=root)
+    row=guest.derive_sample(current,missing,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1.5,interval_seconds=.5)
+    assert row["cpu_total_percent"]["value"] is None and row["cpu_steal_percent"]["value"] is None
+    assert row["cpu_max_core_percent"]["value"] is not None
+    stat.write_text("cpu 110 22 44 810 5 12 7 3\ncpu0 110 22 44 810 5 12 7 3\ncpu1 210 22 44 810 5 12 7 3\n")
+    recovered=guest.read_linux_snapshot("eth0",root=root)
+    row=guest.derive_sample(current,recovered,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=2,interval_seconds=1)
+    assert row["cpu_total_percent"]["value"] is None
+    assert row["cpu_max_core_percent"]["value"] is not None
+    valid_next={"cpu":{"cpu":[120,24,48,820,5,14,9,4],"cpu0":[120,24,48,820,5,14,9,4],"cpu1":[220,24,48,820,5,14,9,4]},"tcp":6,"nic":recovered["nic"]}
+    assert guest.derive_sample(recovered,valid_next,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=3,interval_seconds=1)["cpu_total_percent"]["value"] is not None
+    missing=guest.parse_proc_stat("cpu0 1 2 3 4 5 6 7 8\ncpu1 2 3 4 5 6 7 8 9\n")
+    assert "cpu" not in missing and len([key for key in missing if key.startswith("cpu")]) == 2

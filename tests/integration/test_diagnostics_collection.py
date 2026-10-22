@@ -233,7 +233,7 @@ def test_loader_rejects_duplicate_closure_and_preserves_partial_records(tmp_path
     assert loaded.metadata is not None
 
 
-def test_loader_rejects_foreign_artifact_declaration_and_reversed_clock_time(tmp_path):
+def test_loader_accepts_structural_clock_stream_with_utc_reversal_and_rejects_foreign_declaration(tmp_path):
     from cloud_network_benchmark.diagnostics import load_collection_result
     out=tmp_path/"clock-reversal"; out.mkdir()
     context={"deployment_id":"RUN-deployment","vm_role":"vm_a","provider":"aws","interface":"eth0","output_root":str(out),"duration_seconds":2,"metadata_seed":seed()}
@@ -246,4 +246,33 @@ def test_loader_rejects_foreign_artifact_declaration_and_reversed_clock_time(tmp
     loaded=load_collection_result(context,outcome)
     assert loaded.state == "failed"
     assert any("exactly metadata" in f["message"] for f in loaded.failures)
-    assert any("time reversed" in f["message"] for f in loaded.failures)
+    assert not any("time reversed" in f["message"] for f in loaded.failures)
+    outcome["artifacts"].pop("foreign")
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "completed" and not loaded.failures and loaded.mapping_count == 2
+
+
+def test_snapshot_utc_step_records_observed_endpoint_and_typed_loading_keeps_collection_complete(tmp_path):
+    from cloud_network_benchmark.diagnostics import load_collection_result
+    class SteppedClock(FakeClock):
+        def __init__(self):
+            super().__init__(); self.offset=0
+        def utc_now(self):
+            return datetime(2026,10,22,tzinfo=timezone.utc)+timedelta(seconds=self.now+self.offset)
+    out=tmp_path/"utc-step"; out.mkdir(); clock=SteppedClock(); reads=[0]
+    def read(_):
+        reads[0]+=1
+        if reads[0] == 2: clock.offset=-3600
+        return snapshot(reads[0])
+    context={"deployment_id":"RUN-deployment","vm_role":"vm_a","provider":"aws","interface":"eth0","output_root":str(out),"duration_seconds":2,"metadata_seed":seed()}
+    outcome=collect_local(context,root=Path(__file__).parents[1]/"fixtures/f04",clock=clock,run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"},snapshot_reader=read)
+    rows=[json.loads(line) for line in (out/"diagnostics/vm_a.jsonl").read_text().splitlines()]
+    mappings=[json.loads(line) for line in (out/"diagnostics/vm_a-clock.jsonl").read_text().splitlines()]
+    assert outcome["state"] == "completed" and len(rows) == 2 and len(mappings) == 3
+    assert rows[0]["sampled_at"] == "2026-10-21T23:00:01Z"
+    assert rows[1]["sampled_at"] == "2026-10-21T23:00:02Z"
+    assert [row["monotonic_seconds"] for row in rows] == [1,2]
+    assert rows[1]["interval_seconds"] == 1
+    assert mappings[1]["utc_timestamp"] < mappings[0]["utc_timestamp"]
+    loaded=load_collection_result(context,outcome)
+    assert loaded.state == "completed" and not loaded.failures and loaded.mapping_count == 3

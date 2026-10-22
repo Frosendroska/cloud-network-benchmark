@@ -107,7 +107,7 @@ def _read(path, root=Path("/")):
     if path.is_absolute():
         path = Path(root) / str(path).lstrip("/")
     try:
-        return path.read_text(encoding="utf-8")
+        return _resolve_rooted(path, root).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"unavailable read {path}: {exc.__class__.__name__}: {exc}") from exc
 
@@ -130,11 +130,7 @@ def parse_proc_stat(text):
             try:
                 result[name] = _ints(match.group(2), 8)[:8]
             except ValueError as exc:
-                if name == "cpu":
-                    raise
                 result[name] = {"error": str(exc)}
-    if "cpu" not in result:
-        raise ValueError("aggregate CPU row missing")
     return result
 
 
@@ -343,7 +339,7 @@ def read_static_metadata(context, *, root=Path("/"), run_command=_command, remai
     except ValueError as exc: seed["kernel"] = unavailable(str(exc))
     base = root / "sys/class/net" / context["interface"]
     try:
-        mtu = int((base/"mtu").read_text().strip())
+        mtu = int(_read(f"/sys/class/net/{context['interface']}/mtu", root).strip())
         seed["mtu"] = _e(mtu) if mtu > 0 else unavailable("MTU must be positive")
     except (OSError, ValueError): seed["mtu"] = unavailable("MTU unavailable or malformed")
     try:
@@ -414,7 +410,8 @@ def _acceleration(root, interface, provider, driver):
     if value in ("ena", "gve"):
         return _e(f"observed driver mechanism: {value}; optional entitlement exclusions not verified")
     if value == "hv_netvsc":
-        net = root/"sys/class/net"/interface
+        try: net = _resolve_rooted(root/"sys/class/net"/interface, root)
+        except OSError: return _e(None, "Azure SR-IOV VF evidence unavailable")
         for lower in net.glob("lower_*"):
             try:
                 rooted_lower = _resolve_rooted(lower, root)
@@ -489,8 +486,10 @@ def collect_local(context, *, root=Path("/"), clock=None, run_command=None, stop
     def timed_snapshot():
         before_mono, before_utc = clock.monotonic(), clock.utc_now()
         snapshot, error = take_snapshot()
-        after_utc, after_mono = clock.utc_now(), clock.monotonic()
-        return snapshot, error, (before_mono + after_mono) / 2, before_utc + (after_utc-before_utc)/2, after_mono
+        after_mono, after_utc = clock.monotonic(), clock.utc_now()
+        # The end of acquisition is a paired, actually observed UTC/monotonic
+        # instant. Averaging wall time across a clock step would invent a time.
+        return snapshot, error, after_mono, after_utc, after_mono
     try:
         for path in paths.values():
             inside_root = False
