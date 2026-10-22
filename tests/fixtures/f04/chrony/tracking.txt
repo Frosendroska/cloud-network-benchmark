@@ -1,0 +1,7 @@
+Reference ID    : C0000201 (192.0.2.1)
+Stratum         : 2
+Ref time (UTC)  : Wed Oct 22 12:00:00 2026
+System time     : 0.010 seconds fast of NTP time
+Root delay      : 0.020000 seconds
+Root dispersion : 0.030000 seconds
+Leap status     : Normal

@@ -1,0 +1,129 @@
+from datetime import datetime, timezone
+
+from cloud_network_benchmark import diagnostics_guest as guest
+from cloud_network_benchmark.diagnostics import build_collection_context
+from cloud_network_benchmark.contracts.common import StructuredEvidence
+from types import SimpleNamespace
+
+
+def snap(cpu=(100,20,40,800,5,10,5,2), cores=None, tcp=4, nic=None):
+    nic = nic or dict(rx_dropped=0,tx_dropped=0,rx_errors=0,tx_errors=0,rx_bytes=0,tx_bytes=0)
+    return {"cpu":{"cpu":list(cpu), **(cores or {"cpu0":list(cpu), "cpu1":list(cpu)})}, "tcp":tcp,"nic":nic}
+
+
+def test_cpu_and_counter_deltas_keep_zero_and_large_integers():
+    old=snap()
+    new=snap(cpu=(110,22,44,820,5,12,7,3),tcp=11,nic=dict(rx_dropped=0,tx_dropped=2,rx_errors=0,tx_errors=1,rx_bytes=10**19,tx_bytes=20))
+    row=guest.derive_sample(old,new,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=2,interval_seconds=1)
+    assert abs(row["cpu_total_percent"]["value"] - 100*20/41) < 1e-9
+    assert abs(row["cpu_steal_percent"]["value"] - 100/41) < 1e-9
+    assert abs(row["cpu_max_core_percent"]["value"] - 100*20/41) < 1e-9
+    assert row["tcp_retransmissions"]["value"] == 7
+    assert row["interface_rx_drops"]["value"] == 0
+    assert row["rx_bytes"]["value"] == 10**19
+
+
+def test_resets_and_core_change_are_unavailable_without_wrapping():
+    old=snap(cpu=(100,20,40,800,5,10,5,2), tcp=99)
+    new=snap(cpu=(90,20,40,800,5,10,5,2), tcp=1, cores={"cpu0":[51,10,20,400,2,5,3,1]})
+    row=guest.derive_sample(old,new,deployment_id="RUN-deployment",vm_role="vm_b",sampled_at=datetime.now(timezone.utc),monotonic_seconds=3,interval_seconds=2)
+    assert row["cpu_total_percent"]["value"] is None
+    assert row["cpu_max_core_percent"]["value"] is None
+    assert row["tcp_retransmissions"]["value"] is None
+    assert {"cpu_total_percent","tcp_retransmissions"} <= set(row["reset_fields"])
+    assert row["cpu_max_core_percent"]["unavailable_reason"]
+
+
+def test_rooted_linux_fixture_and_named_tcp_counter(tmp_path):
+    import shutil
+    from pathlib import Path
+    shutil.copytree(Path(__file__).parents[1]/"fixtures/f04", tmp_path, dirs_exist_ok=True)
+    result=guest.read_linux_snapshot("eth0",root=tmp_path)
+    assert result["tcp"] == 4
+    assert result["cpu"]["cpu0"][0] == 50
+    assert result["nic"]["rx_bytes"] == 100
+
+
+def test_counter_recovers_from_reset_using_current_value_as_new_baseline():
+    old=snap(tcp=90); reset=snap(tcp=4); recovered=snap(tcp=8)
+    first=guest.derive_sample(old,reset,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=1,interval_seconds=1)
+    second=guest.derive_sample(reset,recovered,deployment_id="RUN-deployment",vm_role="vm_a",sampled_at=datetime.now(timezone.utc),monotonic_seconds=2,interval_seconds=1)
+    assert first["tcp_retransmissions"]["value"] is None
+    assert second["tcp_retransmissions"]["value"] == 4
+
+
+def test_context_uses_provider_observations_and_rejects_build_identity_mismatch(tmp_path):
+    for provider in ("aws","azure","gcp"):
+        vm=SimpleNamespace(image_identity="observed-image",region="observed-region",zone="observed-zone",
+            physical_zone_id={"value":"physical-zone","unavailable_reason":None},actual_shape="observed-shape")
+        identity=SimpleNamespace(deployment_id="RUN-deployment")
+        deployment=SimpleNamespace(schema_version=2,deployment_id="RUN-deployment",identity=identity,provider=provider,
+            vm_a=vm,vm_b=vm,documented_network_limit=StructuredEvidence(value={"source":"dated docs","limit":"provider-specific"}))
+        context=build_collection_context(deployment,role="vm_a",interface="eth0",output_root=tmp_path,duration_seconds=60)
+        assert context["metadata_seed"]["image"]["value"] == "observed-image"
+        assert context["metadata_seed"]["documented_network_limit"]["value"]["source"] == "dated docs"
+        bad=SimpleNamespace(deployment_id="OTHER",identity=identity,builds=[])
+        try: build_collection_context(deployment,role="vm_a",interface="eth0",output_root=tmp_path,duration_seconds=60,prepared=bad)
+        except ValueError as exc: assert "identity" in str(exc)
+        else: raise AssertionError("mismatched bootstrap identity accepted")
+
+
+def test_metadata_reads_actual_fixture_values_and_preserves_unknown_driver():
+    from pathlib import Path
+    from cloud_network_benchmark.contracts.measurements import VmMetadata
+    for provider in ("aws","azure","gcp"):
+        context=build_collection_context(
+            SimpleNamespace(schema_version=2,deployment_id="RUN-deployment",identity=SimpleNamespace(deployment_id="RUN-deployment"),
+                provider=provider,vm_a=SimpleNamespace(image_identity=f"{provider}-image",region="region",zone="zone",physical_zone_id={"value":None,"unavailable_reason":"not exposed"},actual_shape="shape"),
+                vm_b=None,documented_network_limit=StructuredEvidence(value={"source":"dated source","semantics":provider})),
+            role="vm_a",interface="eth0",output_root=Path(__file__).parents[1],duration_seconds=60)
+        metadata=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"tool unavailable"})
+        metadata.update(schema_version=2,provider=provider,deployment_id="RUN-deployment",vm_role="vm_a")
+        parsed=VmMetadata.model_validate(metadata)
+        assert parsed.cpu_model.value == "Synthetic Cloud CPU"
+        assert parsed.kernel.value == "6.8.0-f04-fixture"
+        assert parsed.mtu.value == 9000
+        assert parsed.congestion_control.value == "cubic"
+        assert parsed.nic_driver.value is None
+        assert parsed.acceleration.value is None
+        assert parsed.image.value == f"{provider}-image"
+        assert parsed.documented_network_limit.value["semantics"] == provider
+
+
+def test_azure_netvsc_requires_and_reports_linked_vf_driver(tmp_path):
+    from pathlib import Path
+    root=Path(__file__).parents[1]/"fixtures/f04"
+    temp=tmp_path/"root"; __import__("shutil").copytree(root,temp)
+    net=temp/"sys/class/net/eth0"; (net/"device").mkdir(parents=True,exist_ok=True)
+    (net/"device/driver").symlink_to("/sys/bus/pci/drivers/hv_netvsc")
+    (temp/"sys/bus/pci/drivers/hv_netvsc").mkdir(parents=True)
+    lower=net/"lower_vf0"; (lower/"device").mkdir(parents=True)
+    (lower/"device/driver").symlink_to("/sys/bus/pci/drivers/ena")
+    (temp/"sys/bus/pci/drivers/ena").mkdir(parents=True)
+    assert guest._rooted_link_name(net/"device/driver",temp) == "hv_netvsc"
+    assert guest._acceleration(temp,"eth0","azure",{"value":"hv_netvsc"})["value"] == "observed linked VF driver: ena"
+
+
+def test_cpu_model_mixture_and_interface_traversal_are_preserved(tmp_path):
+    from pathlib import Path
+    import shutil
+    root=Path(__file__).parents[1]/"fixtures/f04"
+    temp=tmp_path/"fixture"
+    shutil.copytree(root,temp,dirs_exist_ok=True)
+    (temp/"proc/cpuinfo").write_text("processor : 0\nmodel name : CPU-A\n\nprocessor : 1\nmodel name : CPU-B\n")
+    vm=SimpleNamespace(image_identity="image",region="region",zone="zone",physical_zone_id={"value":None,"unavailable_reason":"not exposed"},actual_shape="shape")
+    context=build_collection_context(SimpleNamespace(schema_version=2,deployment_id="RUN-deployment",identity=SimpleNamespace(deployment_id="RUN-deployment"),provider="aws",vm_a=vm,vm_b=vm,documented_network_limit=StructuredEvidence(value={"source":"docs"})),role="vm_a",interface="eth0",output_root=temp,duration_seconds=60)
+    metadata=guest.read_static_metadata(context,root=temp,run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"missing"})
+    assert metadata["cpu_model"]["value"] == "CPU-A; CPU-B"
+    try: guest.read_linux_snapshot("../eth0",root="/tmp")
+    except ValueError as exc: assert "interface" in str(exc)
+    else: raise AssertionError("interface traversal accepted")
+
+
+def test_malformed_tcp_header_does_not_hide_nic_values():
+    try:
+        guest.parse_tcp_retrans("Tcp: A B\nTcp: 1 2\n")
+    except ValueError as exc:
+        assert "RetransSegs" in str(exc)
+    else:
+        raise AssertionError("missing named TCP counter accepted")
