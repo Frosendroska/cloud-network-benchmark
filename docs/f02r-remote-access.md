@@ -119,6 +119,43 @@ git diff --check
 # exit 0
 ```
 
+### Phase 10 convergence repairs
+
+T049–T052 are implemented in code commit `1b04bec880f86bacdb3e9b92da778eadafd9309c`.
+Bootstrap and retrieval convert local request-construction failures into redacted failed action
+evidence without invoking the command runner, preserving earlier actions. Retrieval now returns
+per-item cleanup failures when inventory consumes the remaining allowance before the first SCP.
+The ACL preflight uses the same `nft -n -y list chain` output format as readiness. Listener log
+validation resolves the last effective `StandardOutput` and `StandardError` assignments across
+ordered unit/drop-in sections, including empty resets. Retrieval recomputes its original remaining
+copy budget immediately after staging setup and before constructing SCP; adverse-clock tests prove
+a positive first timeout and no second transfer invocation after staging consumes the cap.
+
+- Tested implementation SHA: `1b04bec880f86bacdb3e9b92da778eadafd9309c`.
+- Focused quickstart suite: exit 0, **79 passed**.
+- Full regression suite: exit 0, **559 passed**.
+- Focused bootstrap/readiness/retrieval unit suite: exit 0, **64 passed**.
+- Schema export drift check: exit 0; frozen schema tests: exit 0, **7 passed**.
+- Four offline CLI checks exited 0: acceptance validation; short-study, calibration and diagnostic-day dry-runs.
+- `git diff --check`: exit 0. Ownership diff inspection found no changes to contracts, schemas, configs or historical specs 001/002; the historical-spec diff against merged F01R clock base `a468bb0219ff1f61bae6cbb3577ab797bdb9763b` is empty.
+- Real SSH/SCP, compiler/source builds, nft/systemd guest enforcement, cloud calls, benchmark traffic and provider cleanup remain unrun.
+
+The focused command was:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_remote_access_contract.py tests/unit/test_bootstrap.py tests/unit/test_readiness.py tests/unit/test_retrieval.py tests/integration/test_remote_sequences.py tests/integration/test_v2_remote_access.py
+```
+
+The full regression command was:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+```
+
+Schema drift, schema tests and CLI checks used the commands recorded in
+`docs/f01r-offline-validation.md`; all ran offline and did not reserve IDs or paths or execute
+external actions.
+
 ## Assumptions and limits
 
 - The caller supplies the original `RemoteDeadline`, matching deployment identity, closed producer
