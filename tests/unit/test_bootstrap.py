@@ -1,9 +1,13 @@
 from pathlib import Path
+import hashlib
+import shlex
+import subprocess
 import sys
 import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline
+from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
 from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap
+from cloud_network_benchmark.bootstrap import _capabilities_observed, _identity_preflight_script, _recipe
 
 
 def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_path):
@@ -19,7 +23,7 @@ def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_pat
     iperf3=next(request for request in runner.requests if request.action_id=="f02r-vm_b-listener-iperf3")
     assert "/var/lib/cnb/install/bin/sockperf" in sockperf.argv[-1] and "-i 10.0.0.2 -p 11111" in sockperf.argv[-1]
     assert "/var/lib/cnb/install/bin/iperf3" in iperf3.argv[-1] and "-B 10.0.0.2 -p 5201 --json-stream --forceflush" in iperf3.argv[-1]
-    acl_rules=[request.argv[-1] for request in runner.requests if "acl-create" in request.action_id]
+    acl_rules=[request.argv[-1] for request in runner.requests if "acl" in request.action_id and "create" in request.action_id]
     assert any("10.0.0.1/32" in rule and "10.0.0.2" in rule and "11111" in rule and "accept" in rule for rule in acl_rules)
     assert any("10.0.0.2" in rule and "11111" in rule and "drop" in rule for rule in acl_rules)
     assert any("10.0.0.1/32" in rule and "10.0.0.2" in rule and "5201" in rule and "accept" in rule for rule in acl_rules)
@@ -79,3 +83,44 @@ def test_missing_tool_capability_stops_before_listener_preparation(tmp_path):
     runner=MissingHelp(); outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
     assert not outcome.succeeded and outcome.failure.category=="capability_missing"
     assert not any("listener" in request.action_id for request in runner.requests)
+
+
+def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_path):
+    c=bootstrap_config().model_copy(update={"remote_root":str(tmp_path),"workspace":str(tmp_path/"work"),"install_prefix":str(tmp_path/"install")})
+    source=next(item for item in c.sources if item.tool=="iperf3")
+    binary=Path(c.install_prefix)/"bin/iperf3"; binary.parent.mkdir(parents=True); binary.write_bytes(b"compiled binary")
+    digest=hashlib.sha256(binary.read_bytes()).hexdigest(); marker=Path(c.install_prefix)/".f02r-iperf3.identity"
+    marker.write_text(f"{source.source_reference} {source.source_sha256} {digest}\n")
+    probe=subprocess.run(["sh","-c",_identity_preflight_script(source,c)],text=True,capture_output=True)
+    assert probe.returncode==0 and probe.stdout.strip()=="matching"
+    recipe=_recipe(source,c)
+    checked=subprocess.run(["sh","-n","-c",recipe[4][-1]],text=True,capture_output=True)
+    assert checked.returncode==0
+    before=binary.read_bytes(); reused=subprocess.run(["sh","-c",recipe[4][-1]],text=True,capture_output=True)
+    assert reused.returncode==0 and binary.read_bytes()==before
+    marker.write_text(f"other-source {source.source_sha256} {digest}\n")
+    conflict=subprocess.run(["sh","-c",_identity_preflight_script(source,c)],text=True,capture_output=True)
+    assert conflict.returncode != 0
+
+
+def test_shell_unsafe_build_values_are_rejected_and_help_is_token_based():
+    c=bootstrap_config()
+    with pytest.raises(Exception): type(c).model_validate({**c.model_dump(),"workspace":"/var/lib/cnb/work;touch"})
+    with pytest.raises(Exception): SourceBuild(tool="sockperf",source_url="https://example.invalid/x",source_reference="src;touch",archive_name="x.tar.gz",source_sha256="a"*64)
+    assert not _capabilities_observed("Usage: tool [options]\nunder-loadish -iSomething --full-rtt-extra", "sockperf")
+
+
+def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):
+    c=connection(tmp_path)
+    class EmptyCompiler(BootstrapRunner):
+        def run(self,request):
+            if request.action_id.endswith("sockperf-5"): return result(request.action_id,"")
+            return super().run(request)
+    failed=run_bootstrap(c,bootstrap_config(),EmptyCompiler(),deadline=deadline(),clock=lambda:100)
+    assert not failed.succeeded and failed.failure.category=="compiler_identity_missing", (failed.failure.category, [a.action_id for a in failed.actions[-5:]])
+    class Raising(BootstrapRunner):
+        def run(self,request):
+            if request.action_id.endswith("sockperf-1"): raise OSError("synthetic")
+            return super().run(request)
+    failed=run_bootstrap(c,bootstrap_config(),Raising(),deadline=deadline(),clock=lambda:100)
+    assert not failed.succeeded and len(failed.actions)>=3 and failed.failure.category=="source_build_failed"

@@ -28,25 +28,31 @@ def result(action_id: str, stdout: str="", success: bool=True, stderr: str="") -
 
 class BootstrapRunner:
     def __init__(self, fail_action: str|None=None, *, existing_listeners: bool=False, existing_acl: bool=False, mismatched_listener: bool=False):
-        self.requests=[]; self.fail_action=fail_action; self.existing_listeners=existing_listeners; self.existing_acl=existing_acl; self.mismatched_listener=mismatched_listener
+        self.requests=[]; self.fail_action=fail_action; self.existing_listeners=existing_listeners; self.existing_acl=existing_acl; self.created_acl=False; self.mismatched_listener=mismatched_listener
     def run(self, request):
         self.requests.append(request); aid=request.action_id
         if aid==self.fail_action: return result(aid, success=False, stderr="failed")
         if aid.endswith("cloud-init"): out="status: done"
+        elif "listener-verify-" in aid:
+            tool=aid.rsplit("-",1)[-1]
+            port=11111 if tool=="sockperf" else 5201
+            args=f"server -i 10.0.0.2 -p {port}" if tool=="sockperf" else f"-s -B 10.0.0.2 -p {port} --json-stream --forceflush"
+            out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
         elif "listener-inspect-" in aid:
             tool=aid.rsplit("-",1)[-1]
             if not self.existing_listeners: out="LoadState=not-found\n"
             else:
                 port=11111 if tool=="sockperf" else (5202 if self.mismatched_listener else 5201)
-                out=f"LoadState=loaded\nActiveState=active\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {'server -i 10.0.0.2 -p '+str(port) if tool=='sockperf' else '-s -B 10.0.0.2 -p '+str(port)+' --json-stream --forceflush'}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
-        elif aid.endswith("acl-inspect"):
-            if self.existing_acl: out="hook input priority -10 policy accept 10.0.0.1/32 10.0.0.2 11111 5201 drop"
+                out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {'server -i 10.0.0.2 -p '+str(port) if tool=='sockperf' else '-s -B 10.0.0.2 -p '+str(port)+' --json-stream --forceflush'}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
+        elif "acl" in aid and "inspect" in aid:
+            if self.existing_acl or self.created_acl: out="type filter hook input priority -10; policy accept;\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept\nip daddr 10.0.0.2 udp dport 11111 drop\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 tcp dport 5201 accept\nip daddr 10.0.0.2 tcp dport 5201 drop"
             else: return result(aid,success=False,stderr="No such file or directory")
-        elif aid.endswith("-2") and any(f"-{tool}-2" in aid for tool in ("sockperf","iperf3")): out=("a"*64 if "sockperf" in aid else "b"*64)+" archive"
+        elif "acl-pre-create" in aid: self.created_acl=True; out=""
+        elif aid.endswith("-2") and any(f"-{tool}-2" in aid for tool in ("sockperf","iperf3")): out=("a"*64 if "sockperf" in aid else "b"*64)+f" /var/lib/cnb/work/{'sockperf.tar.gz' if 'sockperf' in aid else 'iperf3.tar.gz'}"
         elif aid.endswith("-5") and any(f"-{tool}-5" in aid for tool in ("sockperf","iperf3")): out="gcc version synthetic 1.0"
         elif aid.endswith("-6") and any(f"-{tool}-6" in aid for tool in ("sockperf","iperf3")): out="sockperf version 3.10" if "sockperf" in aid else "iperf3 version 3.17"
-        elif aid.endswith("-7") and any(f"-{tool}-7" in aid for tool in ("sockperf","iperf3")): out="c"*64+" binary"
-        elif aid.endswith("-8") and any(f"-{tool}-8" in aid for tool in ("sockperf","iperf3")): out="server under-load -i -p -m --mps --reply-every --full-rtt --no-rdtsc --full-log -t -s -c -B -P -O -l -C cubic -Z -J --get-server-output --json-stream --forceflush"
+        elif aid.endswith("-7") and any(f"-{tool}-7" in aid for tool in ("sockperf","iperf3")): out="c"*64+f" /var/lib/cnb/install/bin/{'sockperf' if 'sockperf' in aid else 'iperf3'}"
+        elif aid.endswith("-8") and any(f"-{tool}-8" in aid for tool in ("sockperf","iperf3")): out="Usage: tool [options]\nserver under-load -i -p -m --mps --reply-every --full-rtt --no-rdtsc --full-log -t -s -c -B -P -O -l -C cubic -Z -J --get-server-output --json-stream --forceflush"
         elif "listener-" in aid: out="Active: active (running)"
         else: out="ok"
         return result(aid,out)
@@ -61,8 +67,8 @@ def readiness_output(request, prepared):
         tool="sockperf" if "sockperf" in aid else "iperf3"
         port=11111 if tool=="sockperf" else 5201
         args=f"server -i 10.0.0.2 -p {port}" if tool=="sockperf" else f"-s -B 10.0.0.2 -p {port} --json-stream --forceflush"
-        return f"LoadState=loaded\nActiveState=active\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
+        return f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
     if "socket-sockperf" in aid: return 'UNCONN 0 0 10.0.0.2:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))'
     if "socket-iperf3" in aid: return 'LISTEN 0 4096 10.0.0.2:5201 0.0.0.0:* users:(("iperf3",pid=21,fd=3))'
-    if "guest-acl" in aid: return "hook input priority -10 policy accept 10.0.0.1/32 10.0.0.2 11111 5201 drop"
+    if "guest-acl" in aid: return "type filter hook input priority -10; policy accept;\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept\nip daddr 10.0.0.2 udp dport 11111 drop\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 tcp dport 5201 accept\nip daddr 10.0.0.2 tcp dport 5201 drop"
     return "authenticated"

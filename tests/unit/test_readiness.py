@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime,timezone
 import json,sys
 sys.path.insert(0,str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner,bootstrap_config,connection,deadline,result,readiness_output
@@ -84,3 +85,31 @@ def test_interrupted_readiness_check_is_reported_without_retry(tmp_path):
     runner=Interrupted(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=4),runner,prepared=prep,deadline=deadline(),clock=lambda:100)
     assert not outcome.ready and outcome.failure.category=="readiness_interrupted"
     assert len(runner.requests)==1
+
+
+def test_exact_listener_pid_acl_semantics_and_redacted_observation(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    assert not _predicate("socket-iperf3",'LISTEN 0 4096 10.0.0.2:52010 0.0.0.0:* users:("iperf3",pid=21,fd=3)',c,prep)
+    assert not _predicate("socket-sockperf",'UNCONN 0 0 10.0.0.2:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))\nUNCONN 0 0 10.0.0.2:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=4))',c,prep)
+    assert not _predicate("guest-acl","type filter hook input priority -10; policy accept;\ncomment expected ip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept",c,prep)
+    secret=c.vm_a.authentication_reference
+    class Secret:
+        def run(self,request): return result(request.action_id,f"observed {secret}; token=synthetic-secret",success=False)
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Secret(),prepared=prep,deadline=deadline(),clock=lambda:100)
+    encoded=str(outcome.model_dump(mode="json"))
+    assert secret not in encoded and "synthetic-secret" not in encoded and "[REDACTED]" in encoded
+
+
+def test_late_success_at_original_deadline_is_not_ready(tmp_path):
+    from fixtures.f02r.helpers import FakeClock
+    from datetime import timedelta
+    from cloud_network_benchmark.access import RemoteDeadline
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    clock=FakeClock(100); now=datetime.now(timezone.utc)
+    limit=RemoteDeadline(readiness_deadline_monotonic=105,overall_deadline_monotonic=110,cleanup_reserve_seconds=1,cap_started_at=now,cap_expires_at=now+timedelta(seconds=20))
+    class LateHealthy:
+        def run(self,request): clock.advance(5); return result(request.action_id,"authenticated")
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=1),LateHealthy(),prepared=prep,deadline=limit,clock=clock)
+    assert not outcome.ready and outcome.failure.category=="readiness_deadline_exhausted"
+    assert outcome.remaining_seconds==0 and outcome.elapsed_seconds==5

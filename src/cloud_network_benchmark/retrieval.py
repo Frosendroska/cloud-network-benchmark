@@ -7,13 +7,14 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import os
+import subprocess
 import time
 from typing import Callable, Dict, List, Optional
 from uuid import uuid4
 
 from pydantic import Field, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _failure, _request
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _request
 from .contracts.artifacts import ArtifactInput, ArtifactRecord, resolve_artifact_path
 from .contracts.common import ArtifactExpectation, CommandOutcome, Evidence, FailureEvidence, StrictModel, StringEvidence, VmRole
 from .contracts.execution import CommandRequest, CommandRunner
@@ -145,6 +146,19 @@ class RetrievalResult(StrictModel):
     failure: AccessFailureEvidence | None = None
 
 
+def _inventory_script(source_path: str) -> str:
+    """Return a POSIX-shell observation for a closed regular file."""
+    path = shlex.quote(source_path)
+    ancestors = " && ".join(f"[ ! -L {shlex.quote(str(parent))} ]" for parent in reversed(PurePosixPath(source_path).parents) if str(parent) != "/")
+    return (f"if {ancestors} && [ -f {path} ] && [ ! -L {path} ]; then "
+            f"size=$(wc -c < {path}) && hash=$(sha256sum {path}) && "
+            "set -- $hash && printf '%s %s\\n' \"$size\" \"$1\"; else exit 1; fi")
+
+
+def _failure_record(item: RetrievalItem, category: str, message: str, action_id: str | None = None) -> FailureEvidence:
+    return _evidence_failure(item, category, message, action_id)
+
+
 def _hash_file(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
@@ -160,7 +174,7 @@ def _evidence_failure(item: RetrievalItem, category: str, message: str, action_i
 
 
 def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> RetrievalResult:
-    if manifest.deployment_id != connection.deployment_id or manifest.identity.get("run_id") != connection.run_id:
+    if manifest.deployment_id != connection.deployment_id or manifest.identity != connection.identity.model_dump():
         raise ValueError("retrieval manifest identity does not match connection")
     child_root = filesystem.resolve()
     actions: List[RemoteActionEvidence] = []
@@ -170,9 +184,36 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
     failures: List[dict] = []
     attempts: List[TransferAttempt] = []
     primary_failure: AccessFailureEvidence | None = None
-    interrupted = False
+    stop = False
     required_remote = {d.artifact_id for d in manifest.declarations if d.producer != "controller" and d.expectation == ArtifactExpectation.REQUIRED}
-    item_ids = {item.artifact_id for item in manifest.items}
+    declarations = {d.artifact_id: d for d in manifest.declarations}
+    # Validate every source identity and every destination before the first command/copy.
+    preflight_errors: dict[str, str] = {}
+    destination_paths: dict[str, Path] = {}
+    for item in manifest.items:
+        vm = connection.vm_a if item.source_role == "vm_a" else connection.vm_b
+        try:
+            if vm.host != item.source_vm or item.deployment_id != connection.deployment_id:
+                raise ValueError("retrieval source identity does not match VM role/deployment")
+            resolved = resolve_artifact_path(child_root, item.destination_path)
+            target = child_root / item.destination_path
+            if any(part.is_symlink() for part in [target, *target.parents] if part != child_root.parent):
+                raise ValueError("destination path contains a symlink")
+            if resolved.exists() or resolved.is_symlink():
+                raise ValueError("destination collision")
+            destination_paths[item.artifact_id] = resolved
+        except (ValueError, OSError) as exc:
+            preflight_errors[item.artifact_id] = str(exc)
+    entries = list(destination_paths.items())
+    for index, (artifact_id, path) in enumerate(entries):
+        for other_id, other in entries[index + 1:]:
+            if path in other.parents or other in path.parents:
+                preflight_errors.setdefault(artifact_id, "conflicting ancestor destination")
+                preflight_errors.setdefault(other_id, "conflicting ancestor destination")
+    staging_root = child_root / ".f02r-attempts"
+    if staging_root.is_symlink():
+        for item in manifest.items:
+            preflight_errors.setdefault(item.artifact_id, "attempt staging root must not be a symlink")
     for artifact_id, missing in manifest.unavailable_items.items():
         failures.append({"artifact_id": artifact_id, "reason": missing.get("reason", "unavailable")})
         if artifact_id in required_remote:
@@ -188,20 +229,31 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             size_bytes=Evidence[int](unavailable_reason="artifact unavailable"),
             sha256=StringEvidence(unavailable_reason="artifact unavailable"), retrieval_state=state,
             failure=failure_record))
+    if preflight_errors:
+        for item in manifest.items:
+            vm = connection.vm_a if item.source_role == "vm_a" else connection.vm_b
+            message = preflight_errors.get(item.artifact_id, "another inventory item failed whole-inventory preflight")
+            category = "destination_invalid" if item.artifact_id in preflight_errors else "inventory_preflight_failed"
+            failure = _evidence_failure(item, category, message)
+            failures.append(failure.model_dump(mode="json"))
+            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=category, message=message, source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="whole inventory preflight failed"), sha256=StringEvidence(unavailable_reason="whole inventory preflight failed"), retrieval_state="failed", failure=failure))
+        return RetrievalResult(complete=False, cleanup_required=True, actions=actions, retrieved=retrieved, integrity=integrity, records=records, failures=failures, attempts=attempts, failure=primary_failure)
     for item in manifest.items:
         vm = connection.vm_a if item.source_role == "vm_a" else connection.vm_b
-        if vm.host != item.source_vm or item.deployment_id != connection.deployment_id:
-            raise ValueError("retrieval source identity does not match VM role/deployment")
-        try:
-            final_path = resolve_artifact_path(child_root, item.destination_path)
-            original = child_root / item.destination_path
-            if any(part.is_symlink() for part in [original, *original.parents] if part != child_root.parent) or final_path.exists() or final_path.is_symlink():
-                raise ValueError("destination collision")
-        except (ValueError, OSError) as exc:
-            failure = _evidence_failure(item, "destination_invalid", str(exc))
+        if item.artifact_id in preflight_errors:
+            message = preflight_errors[item.artifact_id]
+            failure = _evidence_failure(item, "destination_invalid", message)
             failures.append(failure.model_dump(mode="json"))
-            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="destination_invalid", message=str(exc), source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="destination_invalid", message=message, source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=item.closed, size_bytes=Evidence[int](unavailable_reason="transfer not verified"), sha256=StringEvidence(unavailable_reason="transfer not verified"), retrieval_state="failed", failure=failure))
+            continue
+        final_path = child_root / item.destination_path
+        if stop:
+            reason = "not_attempted_after_stop"
+            failure = _evidence_failure(item, reason, "item was not attempted after interruption or budget exhaustion")
+            failures.append(failure.model_dump(mode="json"))
+            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason=reason), sha256=StringEvidence(unavailable_reason=reason), retrieval_state="failed", failure=failure))
             continue
         remaining = deadline.remaining(clock, cleanup=True)
         if remaining <= 0:
@@ -210,23 +262,34 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="cleanup_allowance_reached", message="copy stopped to preserve cleanup allowance", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
             failure_record = _evidence_failure(item, "cleanup_allowance_reached", "copy stopped to preserve cleanup allowance")
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="not copied"), sha256=StringEvidence(unavailable_reason="not copied"), retrieval_state="failed", failure=failure_record))
-            break
+            stop = True
+            continue
         # Verify remote closed-file observations at the source before SCP.
-        remote_path = shlex.quote(item.source_path)
-        observe_script = f"test -f -- {remote_path} && test ! -L -- {remote_path} && size=$(stat -c %s -- {remote_path}) && hash=$(sha256sum -- {remote_path}) && printf '%s %s\\n' \\\"$size\\\" \\\"${{hash%% *}}\\\""
+        observe_script = _inventory_script(item.source_path)
         obs_request = _request(f"f02r-retrieve-observe-{item.artifact_id}", vm, ["sh", "-c", observe_script], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "ssh")
-        obs_result = runner.run(obs_request)
+        try:
+            obs_result = _execute(runner, obs_request)
+        except Exception as exc:
+            failure = _evidence_failure(item, "inventory_command_error", "remote inventory command failed at the runner boundary", obs_request.action_id)
+            failures.append(failure.model_dump(mode="json")); primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="inventory_command_error", message=type(exc).__name__, action_id=obs_request.action_id, source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="inventory command failed"), sha256=StringEvidence(unavailable_reason="inventory command failed"), retrieval_state="failed", failure=failure))
+            continue
         actions.append(_action(obs_request.action_id, "ssh", vm, obs_request, obs_result))
         observation = obs_result.stdout.split() if obs_result.outcome == CommandOutcome.SUCCEEDED else []
         try:
+            if len(observation) != 2 or not re.fullmatch(r"[a-f0-9]{64}", observation[1]):
+                raise ValueError("malformed inventory output")
             observed_size, observed_hash = int(observation[0]), observation[1]
         except (ValueError, IndexError):
             observed_size, observed_hash = None, None
         if observed_size != item.expected_size_bytes or observed_hash != item.expected_sha256:
-            failure = _evidence_failure(item, "remote_inventory_mismatch", "remote closed-file observation did not match supplied inventory", obs_request.action_id)
+            inventory_error = "command runner raised " in obs_result.stderr
+            failure = _evidence_failure(item, "inventory_command_error" if inventory_error else "remote_inventory_mismatch", "remote closed-file observation did not match supplied inventory", obs_request.action_id)
             failures.append(failure.model_dump(mode="json"))
-            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="remote_inventory_mismatch", message="remote closed-file observation did not match inventory", source_path=item.source_path, occurred_at=obs_result.finished_at)
+            primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="inventory_command_error" if inventory_error else "remote_inventory_mismatch", message="remote closed-file observation did not match inventory", source_path=item.source_path, occurred_at=obs_result.finished_at)
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="remote observation mismatch"), sha256=StringEvidence(unavailable_reason="remote observation mismatch"), retrieval_state="failed", failure=failure))
+            if obs_result.outcome == CommandOutcome.INTERRUPTED:
+                stop = True
             continue
         item_verified = False
         for attempt in (1, 2):
@@ -234,14 +297,19 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             if remaining <= 0:
                 break
             staging = child_root / ".f02r-attempts" / f"{item.artifact_id}-{attempt}-{uuid4().hex}.part"
-            if staging.parent.is_symlink():
-                raise ValueError("attempt staging root must not be a symlink")
-            staging.parent.mkdir(parents=True, exist_ok=True)
-            if staging.exists() or staging.is_symlink():
-                raise RuntimeError("unique staging path collision")
-            remote = f"{vm.user}@{vm.host}:{item.source_path}"
-            req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm, [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
-            result = runner.run(req)
+            try:
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                if staging.parent.is_symlink() or staging.exists() or staging.is_symlink():
+                    raise OSError("unsafe or colliding staging path")
+                remote = f"{vm.user}@{vm.host}:{item.source_path}"
+                req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm, [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
+                result = _execute(runner, req)
+            except Exception as exc:
+                reason = "staging_or_runner_error"
+                attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="failed", reason=reason))
+                failure = _evidence_failure(item, reason, "transfer could not be staged or invoked", None)
+                failures.append(failure.model_dump(mode="json")); primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message=type(exc).__name__, source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                continue
             actions.append(_action(req.action_id, "scp", vm, req, result))
             size = digest = None
             reason = None
@@ -250,26 +318,34 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             elif not staging.is_file() or staging.is_symlink():
                 reason = "copy_not_materialized"
             else:
-                size, digest = _hash_file(staging)
-                if size != item.expected_size_bytes:
-                    reason = "size_mismatch"
-                elif digest != item.expected_sha256:
-                    reason = "sha256_mismatch"
+                try:
+                    size, digest = _hash_file(staging)
+                    if size != item.expected_size_bytes:
+                        reason = "size_mismatch"
+                    elif digest != item.expected_sha256:
+                        reason = "sha256_mismatch"
+                except OSError:
+                    reason = "staging_read_failed"
             attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed", size_bytes=size, sha256=digest, reason=reason))
             if reason is None:
-                final_path.parent.mkdir(parents=True, exist_ok=True)
-                if final_path.exists() or final_path.is_symlink():
-                    reason = "destination_collision"
-                else:
-                    try:
-                        os.link(staging, final_path)
-                    except FileExistsError:
+                try:
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                    if final_path.exists() or final_path.is_symlink() or any(p.is_symlink() for p in final_path.parents if p != child_root.parent):
                         reason = "destination_collision"
                     else:
+                        os.link(staging, final_path)
                         staging.unlink()
+                except OSError:
+                    reason = "publication_failed"
                 if reason is None:
                     rec = ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](value=size), sha256=StringEvidence(value=digest), retrieval_state="verified")
-                    rec.verify_materialized_file(child_root)
+                    try:
+                        rec.verify_materialized_file(child_root)
+                    except (OSError, ValueError):
+                        records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="materialized verification failed"), sha256=StringEvidence(unavailable_reason="materialized verification failed"), retrieval_state="failed", failure=_evidence_failure(item, "publication_verification_failed", "published file failed materialized verification")))
+                        primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="publication_verification_failed", message="published file failed materialized verification", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                        item_verified = True
+                        break
                     records.append(rec)
                     retrieved.append(item.artifact_id)
                     integrity[item.artifact_id] = {"bytes": size, "sha256": digest}
@@ -280,19 +356,23 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 failures.append(failure.model_dump(mode="json"))
                 primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message=f"artifact {item.artifact_id} failed transfer verification", source_path=item.source_path, occurred_at=result.finished_at)
             if result.outcome == CommandOutcome.INTERRUPTED:
-                interrupted = True
+                stop = True
                 break
         if not item_verified:
             failure = _evidence_failure(item, "transfer_incomplete", "artifact was not verified after available attempts")
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="no verified transfer"), sha256=StringEvidence(unavailable_reason="no verified transfer"), retrieval_state="failed", failure=failure))
-        if interrupted:
-            break
+        if not item_verified and deadline.remaining(clock, cleanup=True) <= 0:
+            stop = True
     verified_ids = set(retrieved)
     complete = True
     for declaration in manifest.declarations:
         if declaration.artifact_id not in required_remote:
             continue
-        matches = ({declaration.artifact_id} & verified_ids) if declaration.path_template is None else {value for value in verified_ids if value.startswith(declaration.artifact_id + "-")}
-        if not matches or declaration.artifact_id in manifest.unavailable_items:
+        concrete = [item.artifact_id for item in manifest.items if item.artifact_id == declaration.artifact_id or (declaration.path_template is not None and item.artifact_id.startswith(declaration.artifact_id + "-"))]
+        if declaration.artifact_id in manifest.unavailable_items or not concrete or any(artifact_id not in verified_ids for artifact_id in concrete):
             complete = False
+    if any(item.artifact_id in required_remote and item.artifact_id not in verified_ids for item in manifest.items):
+        complete = False
+    if deadline.remaining(clock, cleanup=True) <= 0:
+        complete = False
     return RetrievalResult(complete=complete, cleanup_required=True, actions=actions, retrieved=retrieved, integrity=integrity, records=records, failures=failures, attempts=attempts, failure=primary_failure)

@@ -184,6 +184,20 @@ def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], 
                           redactions=[connection.authentication_reference, connection.host_key_reference])
 
 
+def _execute(runner: CommandRunner, request: CommandRequest) -> CommandResult:
+    """Turn a runner-boundary exception into durable failed command evidence."""
+    started = datetime.now(timezone.utc)
+    try:
+        return runner.run(request)
+    except Exception as exc:
+        finished = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                             started_at=started, finished_at=finished,
+                             duration_seconds=max(0.0, (finished - started).total_seconds()),
+                             exit_code=1, stdout="", stderr=f"command runner raised {type(exc).__name__}",
+                             redactions=request.redactions)
+
+
 def _action(action_id: str, action_type: str, vm: RemoteConnectionData, request: CommandRequest, result: CommandResult) -> RemoteActionEvidence:
     req = request.durable_view()
     res = result.durable_view()

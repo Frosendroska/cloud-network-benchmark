@@ -7,7 +7,8 @@ from fixtures.f02r.support import BootstrapRunner,bootstrap_config,connection,de
 from cloud_network_benchmark.bootstrap import run_bootstrap
 from cloud_network_benchmark.readiness import ReadinessConfig,run_readiness
 from cloud_network_benchmark.retrieval import RetrievalItem,RetrievalManifest,run_retrieval
-from cloud_network_benchmark.contracts.artifacts import ArtifactInput
+from cloud_network_benchmark.contracts.artifacts import ArtifactInput, ArtifactLayout
+from cloud_network_benchmark.contracts.common import BenchmarkPhase, Evidence, StringEvidence
 
 
 def _prepared(c):
@@ -66,9 +67,31 @@ def test_retained_pair_final_export_resolves_closed_probe_chunks(tmp_path):
 
 def test_caller_cap_order_is_evidence_and_f02r_only_consumes_deadlines(tmp_path):
     from datetime import timedelta
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence, ExpiryEvidence
+    from cloud_network_benchmark.contracts.common import StructuredEvidence
     cap=datetime.now(timezone.utc); registered=cap+timedelta(seconds=1); created=registered+timedelta(seconds=1)
-    assert cap<=registered<=created
+    reservation=ReservationEvidence(schema_version=2,campaign_id="campaign",reservation_id=Evidence(value="reservation"),state="reserved",reserved_cost_usd=Evidence(value=0.1),cap_started_at=Evidence(value=cap),expires_at=Evidence(value=created+timedelta(seconds=60)),cap_start_policy_id=StringEvidence(value="policy"),source_path="local-register.json",source_sha256="a"*64)
+    expiry=ExpiryEvidence(schema_version=2,run_id="run-aws",deployment_id="run-aws-deployment",provider="aws",action="stop",state="registered",registration_id=Evidence(value="expiry"),registered_at=Evidence(value=registered),expires_at=Evidence(value=created+timedelta(seconds=60)),target_selector="deployment-tag",provider_metadata=StructuredEvidence(value={"observed":True}))
+    assert reservation.cap_started_at.value<=expiry.registered_at.value<=created<expiry.expires_at.value
     assert "expiry" not in run_bootstrap.__code__.co_names
+
+
+def test_frozen_f01r_layouts_cover_both_roles_and_retained_pair_chunks():
+    from types import SimpleNamespace
+    phases=[BenchmarkPhase.IDLE_LATENCY,BenchmarkPhase.SINGLE_FLOW,BenchmarkPhase.MULTI_FLOW]
+    cases=(("acceptance",phases),("calibration",phases),("short_study",phases),("diagnostic_day",[BenchmarkPhase.MULTI_FLOW]))
+    for mode, selected in cases:
+        units=[SimpleNamespace(unit_id=f"{mode}-{index}",phase=phase,kind="phase",parent_unit_id=None) for index,phase in enumerate(selected)]
+        layout=ArtifactLayout.for_mode(mode,units)
+        declarations=layout.declarations_for_mode(mode,units)
+        producers={item.producer.value if hasattr(item.producer,"value") else item.producer for item in declarations}
+        assert {"vm_a","vm_b"}<=producers
+        if mode=="diagnostic_day":
+            chunks=[SimpleNamespace(unit_id=f"chunk-{index}",phase=BenchmarkPhase.MULTI_FLOW,kind="probe_chunk",parent_unit_id=units[0].unit_id) for index in (1,2)]
+            extended=layout.declarations_for_mode(mode,units+chunks)
+            assert sum(item.artifact_id=="day-probe-csv" for item in extended)==1
+            assert layout.day_probe_csv_template.count("{chunk_id}")==1
+            assert all(chunk.parent_unit_id==units[0].unit_id for chunk in chunks)
 
 
 def test_retrieval_failure_stays_secondary_to_caller_owned_measurement_failure(tmp_path):

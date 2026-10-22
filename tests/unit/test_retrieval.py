@@ -1,11 +1,13 @@
 from datetime import datetime,timezone
 import hashlib
 from pathlib import Path
+import subprocess
 import sys
 import pytest
 sys.path.insert(0,str(Path(__file__).parents[1]))
 from fixtures.f02r.support import connection,deadline,result
 from cloud_network_benchmark.retrieval import RetrievalItem,RetrievalManifest,run_retrieval
+from cloud_network_benchmark.retrieval import _inventory_script
 from cloud_network_benchmark.contracts.artifacts import ArtifactInput
 
 
@@ -181,3 +183,76 @@ def test_one_vm_loss_keeps_previously_verified_native_artifacts(tmp_path):
     assert (tmp_path/"measurements/a.csv").read_bytes()==a
     assert [record.retrieval_state for record in outcome.records]==["verified","failed"]
     assert len(outcome.attempts)==3
+
+
+def test_generated_inventory_shell_observes_real_closed_file_bytes(tmp_path):
+    source=tmp_path/"native.csv"; payload=b"timestamp,value\n1,2\n"; source.write_bytes(payload)
+    command=subprocess.run(["sh","-c",_inventory_script(str(source))],text=True,capture_output=True,check=True)
+    assert command.stdout.split()==[str(len(payload)),hashlib.sha256(payload).hexdigest()]
+    missing=subprocess.run(["sh","-c",_inventory_script(str(tmp_path/"missing.csv"))],text=True,capture_output=True)
+    assert missing.returncode != 0 and not missing.stdout
+
+
+def test_required_dynamic_declaration_needs_every_resolved_chunk(tmp_path):
+    c=connection(tmp_path); now=datetime.now(timezone.utc); first=b"chunk-one"; second=b"chunk-two"
+    declaration=ArtifactInput(artifact_id="day-probe-csv",path_template="measurements/day/{chunk_id}.csv",kind="sockperf-csv",producer="vm_a",unit_id=None,expectation="required")
+    items=[RetrievalItem(artifact_id=f"day-probe-csv-unit-{index}",deployment_id=c.deployment_id,source_vm=c.vm_a.host,source_role="vm_a",source_path=f"/var/lib/cnb/work/chunk-{index}.csv",destination_path=f"measurements/day/unit-{index}.csv",kind="sockperf-csv",unit_id=f"unit-{index}",expected_size_bytes=len(payload),expected_sha256=hashlib.sha256(payload).hexdigest(),timeout_seconds=5) for index,payload in ((1,first),(2,second))]
+    m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace="/var/lib/cnb/work",declarations=[declaration],items=items,measurement_ended_at=now,producers_closed_at=now,closure_evidence="both probe chunks closed")
+    class Mixed:
+        def run(self,request):
+            if request.action_type=="ssh":
+                payload=first if "unit-1" in request.action_id else second
+                return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            if "unit-2" in request.action_id: return result(request.action_id,success=False,stderr="source unavailable")
+            Path(request.argv[-1]).write_bytes(first); return result(request.action_id)
+    outcome=run_retrieval(c,m,Mixed(),tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and outcome.retrieved==["day-probe-csv-unit-1"]
+    assert [record.retrieval_state for record in outcome.records]==["verified","failed"]
+
+
+def test_interrupted_inventory_stops_remote_commands_and_accounts_for_later_item(tmp_path):
+    c=connection(tmp_path); base=manifest(c); first=base.items[0]; now=base.measurement_ended_at
+    second=first.model_copy(update={"artifact_id":"sockperf-b","source_role":"vm_b","source_vm":c.vm_b.host,"source_path":"/var/lib/cnb/work/b.csv","destination_path":"measurements/b.csv"})
+    declarations=[base.declarations[0],base.declarations[0].model_copy(update={"artifact_id":"sockperf-b","path":"measurements/b.csv","producer":"vm_b"})]
+    m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace=base.remote_workspace,declarations=declarations,items=[first,second],measurement_ended_at=now,producers_closed_at=now,closure_evidence="closed")
+    from cloud_network_benchmark.contracts.common import CommandOutcome
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    class Interrupted:
+        def __init__(self): self.calls=[]
+        def run(self,request):
+            self.calls.append(request); stamp=datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.INTERRUPTED,started_at=stamp,finished_at=stamp,duration_seconds=0,exit_code=None,stdout="partial",stderr="")
+    runner=Interrupted(); outcome=run_retrieval(c,m,runner,tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and len(runner.calls)==1 and runner.calls[0].action_type=="ssh"
+    assert [record.retrieval_state for record in outcome.records]==["failed","failed"]
+
+
+def test_full_identity_and_late_destination_collisions_preflight_before_copy(tmp_path):
+    c=connection(tmp_path); m=manifest(c)
+    with pytest.raises(ValueError,match="identity"):
+        run_retrieval(c,m.model_copy(update={"identity":{**m.identity,"provider":"azure"}}),lambda req: (_ for _ in ()).throw(AssertionError("copy started")),tmp_path,deadline=deadline(),clock=lambda:100)
+
+
+def test_later_destination_collision_prevents_every_copy(tmp_path):
+    c=connection(tmp_path); base=manifest(c); first=base.items[0]
+    second=first.model_copy(update={"artifact_id":"sockperf-b","source_role":"vm_b","source_vm":c.vm_b.host,"source_path":"/var/lib/cnb/work/b.csv","destination_path":"measurements/b.csv"})
+    declarations=[base.declarations[0],base.declarations[0].model_copy(update={"artifact_id":"sockperf-b","path":"measurements/b.csv","producer":"vm_b"})]
+    m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace=base.remote_workspace,declarations=declarations,items=[first,second],measurement_ended_at=base.measurement_ended_at,producers_closed_at=base.producers_closed_at,closure_evidence="closed")
+    (tmp_path/"measurements").mkdir(); (tmp_path/"measurements/b.csv").write_bytes(b"preexisting")
+    outcome=run_retrieval(c,m,lambda req: (_ for _ in ()).throw(AssertionError("whole inventory must preflight before copy")),tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and not outcome.actions and [r.retrieval_state for r in outcome.records]==["failed","failed"]
+
+
+def test_inventory_runner_exception_returns_failure_evidence(tmp_path):
+    c=connection(tmp_path); outcome=run_retrieval(c,manifest(c),lambda req: (_ for _ in ()).throw(OSError("synthetic")),tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and outcome.failure.category=="inventory_command_error"
+    assert outcome.actions and outcome.records[0].retrieval_state=="failed"
+
+
+def test_budget_exhaustion_accounts_for_all_remaining_items(tmp_path):
+    c=connection(tmp_path); base=manifest(c); first=base.items[0]
+    second=first.model_copy(update={"artifact_id":"sockperf-b","source_role":"vm_b","source_vm":c.vm_b.host,"source_path":"/var/lib/cnb/work/b.csv","destination_path":"measurements/b.csv"})
+    declarations=[base.declarations[0],base.declarations[0].model_copy(update={"artifact_id":"sockperf-b","path":"measurements/b.csv","producer":"vm_b"})]
+    m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace=base.remote_workspace,declarations=declarations,items=[first,second],measurement_ended_at=base.measurement_ended_at,producers_closed_at=base.producers_closed_at,closure_evidence="closed")
+    outcome=run_retrieval(c,m,lambda req: (_ for _ in ()).throw(AssertionError("zero budget must prevent command")),tmp_path,deadline=deadline(),clock=lambda:291)
+    assert not outcome.complete and len(outcome.records)==2 and all(r.retrieval_state=="failed" for r in outcome.records)

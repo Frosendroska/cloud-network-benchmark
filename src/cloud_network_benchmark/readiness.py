@@ -8,7 +8,7 @@ from typing import Callable, List
 
 from pydantic import Field, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _request
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _request, _scrub
 from .bootstrap import BootstrapResult
 from .contracts.common import CommandOutcome, StrictModel
 from .contracts.execution import CommandRunner
@@ -38,7 +38,7 @@ class ReadinessResult(StrictModel):
 
 def _bootstrap_matches(connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
     return bool(prepared.succeeded and prepared.deployment_id == connection.deployment_id
-                and prepared.identity.run_id == connection.run_id
+                and prepared.identity == connection.identity
                 and len(prepared.builds) == 4
                 and {(x.role, x.tool) for x in prepared.builds} == {(r, t) for r in ("vm_a", "vm_b") for t in ("sockperf", "iperf3")}
                 and {(x.tool, x.protocol, x.port, x.address, x.allowed_source) for x in prepared.listeners}
@@ -53,16 +53,49 @@ def _systemd_healthy(stdout: str, connection: ConnectionOutput, prepared: Bootst
     if listener is None:
         return False
     exec_start = fields.get("ExecStart", "")
-    expected = [listener.binary_path, connection.private_ipv4_b,
-                "11111" if tool == "sockperf" else "5201"]
-    if tool == "iperf3":
-        expected.extend(("--json-stream", "--forceflush"))
-    else:
-        expected.append("server")
+    match = re.search(r"argv\[\]=(.*?);", exec_start)
+    if not match:
+        return False
+    try:
+        observed = __import__("shlex").split(match.group(1))
+    except ValueError:
+        return False
+    expected = [listener.binary_path]
+    expected += ["server", "-i", connection.private_ipv4_b, "-p", "11111"] if tool == "sockperf" else ["-s", "-B", connection.private_ipv4_b, "-p", "5201", "--json-stream", "--forceflush"]
     return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
-            and fields.get("Restart") == "no" and all(token in exec_start for token in expected)
-            and listener.stdout_path in fields.get("StandardOutput", "")
-            and listener.stderr_path in fields.get("StandardError", ""))
+            and fields.get("Restart") == "no" and observed == expected
+            and fields.get("MainPID", "0").isdigit() and int(fields.get("MainPID", "0")) > 0
+            and fields.get("StandardOutput") == "append:" + listener.stdout_path
+            and fields.get("StandardError") == "append:" + listener.stderr_path)
+
+
+def _listener_pid(stdout: str, tool: str, address: str, port: int) -> int | None:
+    rows = [line for line in stdout.splitlines() if re.search(rf"(?:^|\s){re.escape(address)}:{port}(?:\s|$)", line)]
+    if len(rows) != 1 or re.search(rf"(?:0\.0\.0\.0|\*):{port}(?:\s|$)", rows[0]):
+        return None
+    match = re.search(rf'users:\(\("{re.escape(tool)}",pid=(\d+),', rows[0])
+    return int(match.group(1)) if match else None
+
+
+def _acl_healthy(stdout: str, connection: ConnectionOutput) -> bool:
+    rules = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", " ".join(line.strip().split())).strip() for line in stdout.splitlines() if line.strip()]
+    wanted = [
+        f"ip saddr {connection.private_ipv4_a}/32 ip daddr {connection.private_ipv4_b} udp dport 11111 accept",
+        f"ip daddr {connection.private_ipv4_b} udp dport 11111 drop",
+        f"ip saddr {connection.private_ipv4_a}/32 ip daddr {connection.private_ipv4_b} tcp dport 5201 accept",
+        f"ip daddr {connection.private_ipv4_b} tcp dport 5201 drop",
+    ]
+    positions = []
+    for expected in wanted:
+        hits = [i for i, line in enumerate(rules) if line == expected]
+        if len(hits) != 1:
+            return False
+        positions.append(hits[0])
+    if positions != sorted(positions):
+        return False
+    if not any("hook input" in line and "policy accept" in line for line in rules):
+        return False
+    return True
 
 
 def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
@@ -77,13 +110,11 @@ def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: B
     if name.startswith("service-"):
         return _systemd_healthy(stdout, connection, prepared, name.removeprefix("service-"))
     if name == "socket-sockperf":
-        return f"{connection.private_ipv4_b}:11111" in stdout and "sockperf" in stdout.lower() and "0.0.0.0:11111" not in stdout and "*:11111" not in stdout
+        return _listener_pid(stdout, "sockperf", connection.private_ipv4_b, 11111) is not None
     if name == "socket-iperf3":
-        return f"{connection.private_ipv4_b}:5201" in stdout and "iperf3" in stdout.lower() and "0.0.0.0:5201" not in stdout and "*:5201" not in stdout
+        return _listener_pid(stdout, "iperf3", connection.private_ipv4_b, 5201) is not None
     if name == "guest-acl":
-        return (f"{connection.private_ipv4_a}/32" in stdout and connection.private_ipv4_b in stdout
-                and "11111" in stdout and "5201" in stdout and "drop" in stdout.lower()
-                and "hook input" in stdout.lower())
+        return _acl_healthy(stdout, connection)
     return False
 
 
@@ -118,11 +149,23 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
                 break
             attempts += 1
             request = _request(f"f02r-ready-{name}-{attempt}", vm, argv, min(ceiling, remaining))
-            result = runner.run(request)
+            result = _execute(runner, request)
             actions.append(_action(request.action_id, "ssh", vm, request, result))
             healthy = result.outcome == CommandOutcome.SUCCEEDED and _predicate(name, result.stdout, connection, prepared)
+            remaining_after = deadline.remaining(clock, readiness=True)
+            if name.startswith("socket-") and healthy:
+                tool = name.removeprefix("socket-")
+                service = next((o.get("observation", "") for o in reversed(observations) if o.get("predicate") == f"service-{tool}"), "")
+                fields = dict(line.split("=", 1) for line in service.splitlines() if "=" in line)
+                pid = _listener_pid(result.stdout, tool, connection.private_ipv4_b, 11111 if tool == "sockperf" else 5201)
+                healthy = pid is not None and str(pid) == fields.get("MainPID")
+            if healthy and remaining_after <= 0:
+                healthy = False
+            safe_stdout = result.stdout
+            for secret in (vm.authentication_reference, vm.host_key_reference):
+                safe_stdout = _scrub(safe_stdout, secret)
             last = {"predicate": name, "outcome": str(result.outcome), "healthy": healthy,
-                    "observation": result.stdout, "remaining_seconds": deadline.remaining(clock, readiness=True)}
+                    "observation": safe_stdout, "remaining_seconds": remaining_after}
             observations.append(last)
             if healthy:
                 break
@@ -150,5 +193,9 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
                 occurred_at=datetime.now(timezone.utc), details={"last_observation": last or {}, "elapsed_seconds": max(0, clock()-start), "remaining_seconds": now_remaining})
             return ReadinessResult(ready=False, attempts=attempts, actions=actions, observations=observations,
                 deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=now_remaining, failure=failure)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        failure = AccessFailureEvidence(stage="readiness", category="readiness_deadline_exhausted", message="readiness observations completed after the original deadline", occurred_at=datetime.now(timezone.utc), details={"last_observation": observations[-1] if observations else {}, "elapsed_seconds": max(0, clock()-start), "remaining_seconds": remaining})
+        return ReadinessResult(ready=False, attempts=attempts, actions=actions, observations=observations, deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=remaining, failure=failure)
     return ReadinessResult(ready=True, attempts=attempts, actions=actions, observations=observations,
-        deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=deadline.remaining(clock, readiness=True))
+        deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=remaining)

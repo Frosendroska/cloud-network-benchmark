@@ -25,6 +25,24 @@ historical specs 001/002 have no diff from the merged F01R base.
 - Ownership/frozen-contract/historical-spec diff inspection against `cef838e42fc620f90b5943f5a8d1528ddc0b0724`: no changes found in shared contracts, schemas, or specs 001/002.
 - No CLI/schema command is specified by the feature quickstart, and F02R changes no Terraform files.
 
+### Phase 7 convergence repairs
+
+The appended T025–T036 defects were repaired in the remote modules and F02R tests. Retrieval now
+uses an executable POSIX inventory script, checks every concrete required declaration, preserves
+typed failure/partial-copy evidence, stops after interrupted inventory, and preflights all item
+identities and destinations. Bootstrap safely quotes/rejects nested shell values, checks install
+identity before rebuild, validates observed compiler/tool capabilities, verifies exact listener
+and ordered ACL/process state, and preserves accumulated evidence at command boundaries. Readiness
+checks full prepared identity, exact listener predicates, redaction, and the original deadline.
+Integration tests use frozen F01R layouts and typed reservation/expiry evidence; they remain
+credential-free and local.
+
+- Focused quickstart command: exit 0, **53 passed**.
+- Full regression command: exit 0, **464 passed**.
+- `git diff --check`: run after the final implementation and documentation commits below.
+- Shared F01R contracts/schemas and historical specs 001/002 remain unchanged against the F01R base.
+- No real SSH/SCP, upstream download/build, cloud call, benchmark, or guest/provider enforcement was run.
+
 Focused command:
 
 ```sh
