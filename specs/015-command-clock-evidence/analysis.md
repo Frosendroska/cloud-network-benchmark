@@ -20,17 +20,17 @@ Final actionable findings: **0**. No constitution alignment issue, unresolved so
 | FR-004 synchronous monotonic capture/outcomes | Yes | T005, T006 |
 | FR-005 native durable projection consistency | Yes | T008, T009, T010 |
 | FR-006 discrepancy/uncertainty semantics | Yes | T006, T008, T009, T012 |
-| FR-007 additive V2/active exports | Yes | T002, T010, T011, T012, T014 |
-| FR-008 offline checks | Yes | T001, T005, T007, T008, T010, T013, T014 |
+| FR-007 additive V2/active exports | Yes | T002, T010, T011, T012, T014, T015 |
+| FR-008 offline checks | Yes | T001, T005, T007, T008, T010, T013, T014, T015 |
 | SC-001 four outcomes/steps | Yes | T003, T005, T007 |
 | SC-002 malformed/legacy cases | Yes | T003, T007, T008 |
 | SC-003 durable provenance/redaction | Yes | T008, T010 |
-| SC-004 regression/schema/ownership | Yes | T001, T011, T013, T014 |
+| SC-004 regression/schema/ownership | Yes | T001, T011, T013, T014, T015 |
 
 ## Metrics
 
 - Requirements: 8 functional + 4 measurable outcomes = 12.
-- Tasks: 14; setup/foundational 2, US1 5, US2 5, final validation/handoff 2.
+- Tasks: 15; setup/foundational 2, US1 5, US2 5, final validation/handoff 2, convergence 1.
 - Requirement coverage: 100%; unmapped tasks 0.
 - Final ambiguity, duplication and critical issue counts: 0.
 - Built-in spec quality: 16/16; custom clock-contract quality: 12/12, separately reviewed after unchecked generation under coordinator authorization.
@@ -82,16 +82,16 @@ The read-only lint covered required artifacts and quality/coverage syntax; seman
 
 ## Implementation completion and validation
 
-All 14 tasks are complete and marked `[X]`. Final tested implementation head: `2b67b8876a3488807e8c5e6e8ade972b4b521ae6`.
+The original 14 implementation tasks and convergence task T015 are complete and marked `[X]`. T015 aligned the exported monotonic `CommandEvidence` schema with runtime-required UTC wrappers and projected `CommandResult` field presence/types/numeric constraints. Cross-field arithmetic remains runtime-only, the legacy UTC form is accepted by both schema and runtime, and only the two active schema snapshots were regenerated. Tested implementation head for T015: `4b8f983fc00128de164a45f6c5845297eeae36fe`.
 
 | Command/action | Exit/result | Tested revision |
 | --- | --- | --- |
-| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py tests/contract/test_v2_handoffs.py tests/contract/test_v2_schema_export.py` | 0; 94 passed | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
-| `env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | 0; 490 passed, no skips | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_execution.py tests/contract/test_v2_handoffs.py tests/contract/test_v2_schema_export.py` | 0; 94 passed | `4b8f983fc00128de164a45f6c5845297eeae36fe` |
+| `env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | 0; 490 passed, no skips | `4b8f983fc00128de164a45f6c5845297eeae36fe` |
 | `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts` | 0; generated only the two affected nested exports at the unchanged model content in commit `cd4e64d4ae66167135fb552d9ad932931c8b04b0` | `cd4e64d4ae66167135fb552d9ad932931c8b04b0` |
-| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | 0; deterministic exports current | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| `env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | 0; deterministic exports current | `4b8f983fc00128de164a45f6c5845297eeae36fe` |
 | `git diff --check` | 0 | Final evidence update; source/tests already committed at the tested revision |
-| Ownership/history audit | The implementation range from planning head `0bcd1bb06f584acb8a41fea361dcdc5e8b0943ea` changes only the two contract modules, three assigned test modules, two active schemas and existing shared-contract reference. No historical `specs/001-*` or `specs/002-*` path changed. Schema registry and V2 version are unchanged. `git diff --check` exited 0. | `2b67b8876a3488807e8c5e6e8ade972b4b521ae6` |
+| Ownership/history audit | The original implementation range from planning head `0bcd1bb06f584acb8a41fea361dcdc5e8b0943ea` changes only assigned runtime/test/export/reference files. The T015 amendment at `4b8f983fc00128de164a45f6c5845297eeae36fe` adds `measurements.py`, `test_v2_schema_export.py` and the two active schema snapshots; no historical `specs/001-*` or `specs/002-*` path changed. Schema registry and V2 version are unchanged. `git diff --check` exited 0. | `4b8f983fc00128de164a45f6c5845297eeae36fe` |
 
 The active requirements checklist remains 16/16 checked and the custom clock-contract checklist remains 12/12 checked; no checklist markers were edited. No check remains unrun within this feature's offline acceptance set. Cloud, SSH, benchmark traffic, paid acceptance and cross-repository writes remain intentionally unrun and are not established by this stage.
 

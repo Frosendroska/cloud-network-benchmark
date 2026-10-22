@@ -50,3 +50,7 @@ US1: none scheduled; result and runner share execution.py/test_execution.py. US2
 ## Implementation strategy
 
 Complete result/runner US1 first and validate its narrow behavior. Then add durable native US2 and active exports. Full acceptance requires both stories, focused/full checks and later clean Spec Kit convergence; a planning analysis or fake test alone is not cloud evidence.
+
+## Phase 6: Convergence
+
+- [X] T015 [US2] Close the MEDIUM schema/runtime parity gap in src/cloud_network_benchmark/contracts/measurements.py for monotonic CommandEvidence: require both outer started_at/finished_at observed UTC wrappers and encode the representable required fields, types and numeric constraints of the complete projected CommandResult in result, while preserving legacy UTC dictionaries and documented durable metadata. Add omission/malformed projection regressions in tests/contract/test_v2_schema_export.py (including absent outer UTC wrappers and absent projected UTC bounds, duration_seconds, outcome, stdout and exit_code), regenerate only the two active child-run-manifest/validator-input schema snapshots, and rerun focused/schema checks. Current schemas accept those omissions while runtime rejects them; cross-field arithmetic remains runtime-only. Required by FR-007, plan: active deterministic schema presence/type/numeric constraints, contracts/command-timing.md: Evidence limits and schema exports, and T011/T012 (partial).
