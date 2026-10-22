@@ -1,31 +1,139 @@
-from cloud_network_benchmark import ConnectionOutput, ReadinessConfig, TimeoutPolicy, check_readiness
-from cloud_network_benchmark.contracts.deployment import RemoteConnectionData
-from cloud_network_benchmark.contracts.execution import CommandResult
-from datetime import datetime, timezone
+from pathlib import Path
+from datetime import datetime,timezone
+import json,sys
+sys.path.insert(0,str(Path(__file__).parents[1]))
+from fixtures.f02r.support import BootstrapRunner,bootstrap_config,connection,deadline,result,readiness_output
+from cloud_network_benchmark.bootstrap import run_bootstrap
+from cloud_network_benchmark.readiness import ReadinessConfig,run_readiness
 
 
-def test_ssh_alone_does_not_grant_readiness():
-    t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
+def test_readiness_uses_matching_preparation_and_observes_all_fixed_predicates(tmp_path):
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
     class Runner:
-        def run(self, request):
-            now = datetime.now(timezone.utc)
-            stdout = "" if request.action_id.startswith("ssh-") else "not ready"
-            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now, finished_at=now, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
-    result = check_readiness(c, ReadinessConfig(success_output="ready"), Runner())
-    assert result.ready is False
-    assert result.failure.category == "private_path_failed"
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request); aid=request.action_id
+            return result(aid,readiness_output(request,prep))
+    runner=Runner(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=2),runner,prepared=prep,deadline=deadline(),clock=lambda:100)
+    assert outcome.ready and len(outcome.observations)==15
+    assert all(not ("systemctl" in req.argv and any(req.argv[index] in {"start", "restart"} for index in range(len(req.argv)))) for req in runner.requests)
 
 
-def test_default_readiness_accepts_successful_private_path_and_active_server():
-    t = TimeoutPolicy(ssh_seconds=1, command_seconds=1, cloud_init_seconds=1, private_path_seconds=1, server_seconds=1, transfer_seconds=1)
-    c = ConnectionOutput(run_id="r", provider="aws", scenario="same_zone", vm_a=RemoteConnectionData(role="vm_a", host="10.0.0.1", user="u", authentication_reference="ref", host_key_reference="known-hosts"), vm_b=RemoteConnectionData(role="vm_b", host="10.0.0.2", user="u", authentication_reference="ref", host_key_reference="known-hosts"), private_ipv4_a="10.0.0.1", private_ipv4_b="10.0.0.2", timeouts=t)
+def test_deadline_exhaustion_starts_no_remote_command(tmp_path):
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    class Never:
+        requests=[]
+        def run(self,request): self.requests.append(request); raise AssertionError("no command after deadline")
+    runner=Never(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=1,attempt_ceiling=3),runner,prepared=prep,deadline=deadline(),clock=lambda:200)
+    assert not outcome.ready and outcome.failure.category=="readiness_deadline_exhausted" and not runner.requests
 
-    class Runner:
-        def run(self, request):
-            now = datetime.now(timezone.utc)
-            stdout = "" if request.action_id.startswith("ssh-") else "active" if request.action_id == "server-health" else "PING 10.0.0.2"
-            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now, finished_at=now, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
 
-    result = check_readiness(c, ReadinessConfig(), Runner())
-    assert result.ready is True
+def test_stale_bootstrap_evidence_fails_closed(tmp_path):
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    from cloud_network_benchmark.bootstrap import BootstrapResult
+    stale=prep.model_copy(update={"deployment_id":"other"})
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=1,attempt_ceiling=1),BootstrapRunner(),prepared=stale,deadline=deadline(),clock=lambda:100)
+    assert not outcome.ready and outcome.failure.category=="bootstrap_evidence_mismatch"
+
+
+def test_wildcard_listener_never_satisfies_private_bind_predicate(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    assert not _predicate("socket-sockperf",'UNCONN 0 0 0.0.0.0:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))',c,prep)
+    assert not _predicate("socket-iperf3",'LISTEN 0 4096 *:5201 *:* users:(("iperf3",pid=21,fd=3))',c,prep)
+
+
+def test_wrong_private_target_service_binary_and_acl_are_unhealthy(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    assert not _predicate("private-icmp","64 bytes from 203.0.113.4",c,prep)
+    wrong_service="LoadState=loaded\nActiveState=active\nExecStart={ path=/tmp/iperf3; argv[]=/tmp/iperf3 -s -B 10.0.0.2 -p 5201 --json-stream --forceflush; }\nStandardOutput=append\nStandardError=append\nRestart=no\n"
+    assert not _predicate("service-iperf3",wrong_service,c,prep)
+    assert not _predicate("guest-acl","hook input policy accept 0.0.0.0/0 10.0.0.2 11111 5201 drop",c,prep)
+
+
+def test_slow_checks_shrink_budgets_and_stop_at_deadline(tmp_path):
+    from datetime import datetime,timedelta,timezone
+    from fixtures.f02r.helpers import FakeClock
+    from cloud_network_benchmark.access import RemoteDeadline
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    clock=FakeClock(100)
+    class Slow:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request); clock.advance(4)
+            from fixtures.f02r.support import result
+            return result(request.action_id,"unhealthy",success=False)
+    runner=Slow(); now=datetime.now(timezone.utc)
+    limit=RemoteDeadline(readiness_deadline_monotonic=108,overall_deadline_monotonic=108,cleanup_reserve_seconds=1,cap_started_at=now,cap_expires_at=now+timedelta(seconds=20))
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=1,attempt_ceiling=3),runner,prepared=prep,deadline=limit,clock=clock)
+    assert not outcome.ready and outcome.failure.category=="readiness_deadline_exhausted"
+    assert [request.timeout_seconds for request in runner.requests]==[5,4]
+    assert clock.now==108
+
+
+def test_interrupted_readiness_check_is_reported_without_retry(tmp_path):
+    from datetime import datetime,timezone
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.contracts.common import CommandOutcome
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    class Interrupted:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request); now=datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.INTERRUPTED,started_at=now,finished_at=now,duration_seconds=0,exit_code=None,stdout="",stderr="")
+    runner=Interrupted(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=4),runner,prepared=prep,deadline=deadline(),clock=lambda:100)
+    assert not outcome.ready and outcome.failure.category=="readiness_interrupted"
+    assert len(runner.requests)==1
+
+
+def test_exact_listener_pid_acl_semantics_and_redacted_observation(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    assert not _predicate("socket-iperf3",'LISTEN 0 4096 10.0.0.2:52010 0.0.0.0:* users:("iperf3",pid=21,fd=3)',c,prep)
+    assert not _predicate("socket-sockperf",'UNCONN 0 0 10.0.0.2:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))\nUNCONN 0 0 10.0.0.2:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=4))',c,prep)
+    assert not _predicate("guest-acl","type filter hook input priority -10; policy accept;\ncomment expected ip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept",c,prep)
+    secret=c.vm_a.authentication_reference
+    class Secret:
+        def run(self,request): return result(request.action_id,f"observed {secret}; token=synthetic-secret",success=False)
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Secret(),prepared=prep,deadline=deadline(),clock=lambda:100)
+    encoded=str(outcome.model_dump(mode="json"))
+    assert secret not in encoded and "synthetic-secret" not in encoded and "[REDACTED]" in encoded
+
+
+def test_readiness_rejects_effective_service_log_overrides_and_accepts_matching_dropins(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prepared=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    listener=next(item for item in prepared.listeners if item.tool=="sockperf")
+    matching=("# /run/systemd/transient/unit.service\n[Service]\n"
+        f"StandardOutput=append:{listener.stdout_path}\nStandardError=append:{listener.stderr_path}\n"
+        "# /etc/systemd/system/unit.service.d/override.conf\n[Service]\n"
+        f"StandardOutput=append:{listener.stdout_path}\nStandardError=append:{listener.stderr_path}\n")
+    assert _predicate("unit-config-sockperf",matching,c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardOutput=append:/var/lib/cnb/wrong.log\n",c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardError=\n",c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardError=append:/var/lib/cnb/conflict.err\n",c,prepared)
+
+    class Override:
+        def run(self,request):
+            output=readiness_output(request,prepared)
+            if request.action_id=="f02r-ready-unit-config-sockperf-1":
+                output += "# /etc/systemd/system/override.conf\n[Service]\nStandardOutput=append:/var/lib/cnb/wrong.log\n"
+            return result(request.action_id,output)
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Override(),prepared=prepared,deadline=deadline(),clock=lambda:100)
+    assert not outcome.ready and outcome.failure.category=="readiness_predicate_failed"
+    assert outcome.failure.action_id=="f02r-ready-unit-config-sockperf-1"
+
+
+def test_late_success_at_original_deadline_is_not_ready(tmp_path):
+    from fixtures.f02r.helpers import FakeClock
+    from datetime import timedelta
+    from cloud_network_benchmark.access import RemoteDeadline
+    c=connection(tmp_path); prep=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    clock=FakeClock(100); now=datetime.now(timezone.utc)
+    limit=RemoteDeadline(readiness_deadline_monotonic=105,overall_deadline_monotonic=110,cleanup_reserve_seconds=1,cap_started_at=now,cap_expires_at=now+timedelta(seconds=20))
+    class LateHealthy:
+        def run(self,request): clock.advance(5); return result(request.action_id,"authenticated")
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=1),LateHealthy(),prepared=prep,deadline=limit,clock=clock)
+    assert not outcome.ready and outcome.failure.category=="readiness_deadline_exhausted"
+    assert outcome.remaining_seconds==0 and outcome.elapsed_seconds==5
