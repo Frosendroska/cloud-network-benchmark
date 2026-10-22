@@ -107,3 +107,72 @@ def test_expiry_records_denied_discovery_for_full_horizon():
     result = execute(FakeEc2(denied=True))
     assert len(result["errors"]) == 60
     assert result["unresolved_instance_ids"] == []
+
+
+def test_expiry_finds_late_instance_and_observes_stopped_after_request():
+    class DelayedEc2(FakeEc2):
+        def pages_for_call(self):
+            if self.calls < 4:
+                return []
+            if self.calls < 6:
+                return [instance("i-late", "running")]
+            if self.calls < 10:
+                return [instance("i-late", "stopping")]
+            return [instance("i-late", "stopped")]
+
+    client = DelayedEc2()
+    result = execute(client)
+    assert client.stop_calls == ["i-late"]
+    assert result["instances_seen"] == {"i-late": "stopped"}
+    assert result["unresolved_instance_ids"] == []
+
+
+def test_expiry_retries_throttled_discovery_and_incorrect_state_stop():
+    class TransientError(RuntimeError):
+        response = {"Error": {"Code": "ThrottlingException"}}
+
+    class IncorrectState(RuntimeError):
+        response = {"Error": {"Code": "IncorrectInstanceState"}}
+
+    class RetryingEc2(FakeEc2):
+        def pages_for_call(self):
+            if self.calls == 1:
+                raise TransientError("throttled")
+            state = "stopped" if self.calls >= 4 else "running"
+            return [instance("i-race", state)]
+
+        def stop_instances(self, *, InstanceIds):
+            self.stop_calls.extend(InstanceIds)
+            if len(self.stop_calls) == 1:
+                raise IncorrectState("state changed during stop")
+
+    client = RetryingEc2()
+    result = execute(client)
+    assert client.calls == 60
+    assert any(error["code"] == "ThrottlingException" for error in result["errors"])
+    assert any(error["code"] == "IncorrectInstanceState" for error in result["errors"])
+    assert result["instances_seen"]["i-race"] == "stopped"
+    assert result["unresolved_instance_ids"] == []
+
+
+def test_expiry_observes_pending_to_running_to_stopped_and_ignores_terminated():
+    class TransitionEc2(FakeEc2):
+        def pages_for_call(self):
+            if self.calls == 4:
+                return [instance("i-transition", "pending")]
+            if self.calls == 5:
+                return [instance("i-transition", "running")]
+            if self.calls >= 6:
+                return [instance("i-transition", "stopped")]
+            return []
+
+    client = TransitionEc2()
+    result = execute(client)
+    assert client.stop_calls == ["i-transition"]
+    assert result["instances_seen"]["i-transition"] == "stopped"
+    assert result["unresolved_instance_ids"] == []
+
+    terminated = FakeEc2([instance("i-terminated", "terminated")])
+    result = execute(terminated)
+    assert terminated.stop_calls == []
+    assert result["unresolved_instance_ids"] == []

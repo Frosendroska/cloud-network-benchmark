@@ -189,8 +189,13 @@ class AwsProviderDriver:
                 expected = self._automation_parameters(deployment, region, trigger, outputs[region]["role_arn"])
                 execution_id = journal["executions"].get(region)
                 if execution_id is None:
+                    if region not in journal.setdefault("registration_attempted_regions", []):
+                        journal["registration_attempted_regions"].append(region)
+                        self._save_journal(attempt, journal)
                     execution_id = self._start_or_recover_automation(region, outputs[region], expected, token)
                     if not execution_id:
+                        journal.setdefault("registration_uncertain_regions", []).append(region)
+                        self._save_journal(attempt, journal)
                         raise AwsProviderError(
                             f"regional expiry start is uncertain in {region}; pair creation is blocked",
                             category="expiry_uncertain",
@@ -239,11 +244,44 @@ class AwsProviderDriver:
             try:
                 attempt = self._attempt_dir(deployment)
                 journal = self._load_journal(attempt, deployment)
+                journal["registration_failure"] = _failure(exc, self.clock()).model_dump(mode="json")
                 journal["commands"] = list(self._active_commands)
                 self._save_journal(attempt, journal)
+                self._cleanup_unused_protection(deployment, attempt, journal)
             except Exception:
                 pass
             return self._failed_expiry(deployment, request, exc)
+
+    def _cleanup_unused_protection(self, deployment: ProviderDeploymentInput, attempt: Path, journal: dict[str, Any]) -> None:
+        """Remove regional protection only after known executions are terminal.
+
+        A lost or malformed start/readback is ambiguous. Preserve that region's
+        support resources, while cleaning independently safe regions.
+        """
+        uncertain = set(journal.get("registration_uncertain_regions", []))
+        for region in journal.get("regions", []):
+            if region in uncertain:
+                continue
+            execution_id = journal.get("executions", {}).get(region)
+            state_path = attempt / f"safety-{region}.tfstate"
+            vars_path = attempt / f"safety-{region}.tfvars.json"
+            if not vars_path.exists():
+                continue
+            try:
+                if execution_id:
+                    self._cancel_or_confirm_terminal(region, execution_id)
+                result = self._run(
+                    f"aws-safety-rollback-{region}",
+                    [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "destroy", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
+                    self.settings.command_timeout_seconds,
+                    cwd=attempt,
+                )
+                if not _succeeded(result):
+                    journal.setdefault("unused_protection_cleanup_errors", []).append({"region": region, "action_id": result.action_id})
+            except Exception as cleanup_exc:
+                journal.setdefault("unused_protection_cleanup_errors", []).append({"region": region, "message": str(cleanup_exc)})
+        journal["commands"] = list(self._active_commands)
+        self._save_journal(attempt, journal)
 
     def provision(self, deployment: ProviderDeploymentInput) -> ProviderDeploymentOutput:
         _validate_deployment(deployment)
@@ -253,6 +291,7 @@ class AwsProviderDriver:
         self._active_attempt = attempt
         self._active_commands = []
         journal = self._load_journal(attempt, deployment)
+        self._block_on_residual_cleanup(deployment)
         if not journal.get("registered") or set(journal.get("registered_regions", [])) != set(self._regions(deployment)):
             raise AwsProviderError("private expiry journal does not confirm every involved region", category="expiry_required")
         now = self.clock().astimezone(timezone.utc)
@@ -280,6 +319,7 @@ class AwsProviderDriver:
                 self.settings.command_timeout_seconds,
                 cwd=attempt,
             )
+            _restrict_private_file(Path(state_path))
             if not _succeeded(apply_result):
                 raise AwsProviderError("AWS pair Terraform apply failed", category="terraform_apply", action_id="aws-pair-apply")
             output_result = self._run(
@@ -302,6 +342,10 @@ class AwsProviderDriver:
             self._save_journal(attempt, journal)
             return normalized
         except Exception as exc:
+            try:
+                _restrict_private_file(Path(state_path))
+            except (OSError, AwsProviderError):
+                pass
             journal["primary_failure"] = _failure(exc, self.clock()).model_dump(mode="json")
             self._save_journal(attempt, journal)
             # Once an apply could have started, every failure path invokes normal cleanup.
@@ -321,7 +365,7 @@ class AwsProviderDriver:
         if journal.get("creation_may_have_started"):
             state_path = Path(journal.get("pair_state_path", attempt / "pair.tfstate"))
             vars_path = attempt / "pair.tfvars.json"
-            if state_path.exists():
+            if vars_path.exists():
                 result = self._run(
                     "aws-pair-destroy",
                     [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "destroy", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
@@ -358,7 +402,10 @@ class AwsProviderDriver:
                 self.settings.command_timeout_seconds,
                 cwd=attempt,
             )
-            safety_absent[region] = _succeeded(result)
+            terraform_destroyed = _succeeded(result)
+            safety_absent[region] = self._verify_safety_absent(region, journal["safety"][region])
+            if not terraform_destroyed:
+                failures.append(_failure(AwsProviderError(f"AWS safety Terraform cleanup failed in {region}", category="safety_destroy", action_id=f"aws-safety-destroy-{region}"), self.clock()))
             if not safety_absent[region]:
                 failures.append(_failure(AwsProviderError(f"AWS safety support cleanup failed in {region}", category="safety_destroy", action_id=f"aws-safety-destroy-{region}"), self.clock()))
         journal["last_cleanup_inventory"] = inventory_by_region
@@ -379,6 +426,22 @@ class AwsProviderDriver:
         self._save_journal(attempt, journal)
         return result
 
+    def _verify_safety_absent(self, region: str, safety: dict[str, str]) -> bool:
+        role_name = safety["role_arn"].rsplit("/", 1)[-1]
+        document = self._run(
+            f"aws-expiry-document-absence-{region}",
+            [self.settings.aws_cli, "ssm", "describe-document", "--name", safety["document_name"], "--region", region, "--output", "json"],
+            self.settings.registration_timeout_seconds,
+        )
+        role = self._run(
+            f"aws-expiry-role-absence-{region}",
+            [self.settings.aws_cli, "iam", "get-role", "--role-name", role_name, "--output", "json"],
+            self.settings.registration_timeout_seconds,
+        )
+        document_absent = not _succeeded(document) and _aws_cli_error_code(document.stderr) == "InvalidDocument"
+        role_absent = not _succeeded(role) and _aws_cli_error_code(role.stderr) == "NoSuchEntity"
+        return document_absent and role_absent
+
     def _validate_registration(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> tuple[list[str], ReservationEvidence, datetime]:
         _validate_deployment(deployment)
         if request.provider != Provider.AWS or request.action != "stop":
@@ -390,6 +453,8 @@ class AwsProviderDriver:
             raise AwsProviderError("active complete reservation evidence is required", category="reservation_required")
         if reservation.campaign_id != deployment.campaign_id or reservation.expires_at.value is None or reservation.cap_started_at.value is None:
             raise AwsProviderError("reservation evidence is incomplete or mismatched", category="reservation_invalid")
+        if reservation.cap_start_policy_id.value != "reservation-activation-before-provider-expiry":
+            raise AwsProviderError("reservation cap-start policy must confirm activation before provider expiry registration", category="reservation_policy_mismatch")
         admission_hash = deployment.admission.cost_input_sha256.value
         if (
             deployment.admission.cost_input_id != self.settings.cost_input_id
@@ -418,7 +483,46 @@ class AwsProviderDriver:
         if deployment.admission.requires_primary_review:
             if not _primary_review_valid(self.settings.primary_review_decision, str(deployment.scenario), now):
                 raise AwsProviderError("scenario requires sourced primary-review admission evidence", category="review_required")
+        self._block_on_residual_cleanup(deployment)
         return regions, reservation, trigger
+
+    def _block_on_residual_cleanup(self, deployment: ProviderDeploymentInput) -> None:
+        root = self.settings.private_state_root.expanduser().absolute()
+        if root.is_symlink():
+            raise AwsProviderError("private state root is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
+        if not root.exists():
+            return
+        prefix = f"cnb-{deployment.run_id}-"
+        for namespace in root.iterdir():
+            if not namespace.name.startswith(prefix):
+                continue
+            if namespace.is_symlink():
+                raise AwsProviderError("an earlier attempt namespace is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
+            if not namespace.is_dir():
+                continue
+            run_dir = namespace / deployment.run_id
+            if run_dir.is_symlink():
+                raise AwsProviderError("an earlier attempt run directory is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
+            if not run_dir.exists():
+                continue
+            for attempt_dir in run_dir.iterdir():
+                if attempt_dir.is_symlink():
+                    raise AwsProviderError("an earlier attempt directory is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
+                if not attempt_dir.is_dir():
+                    continue
+                journal_path = attempt_dir / "attempt.json"
+                if not journal_path.exists():
+                    continue
+                if journal_path.is_symlink():
+                    raise AwsProviderError("an attempt journal is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
+                try:
+                    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise AwsProviderError("an earlier AWS attempt journal is unreadable; launches remain blocked", category="residual_cleanup_unknown") from exc
+                if journal.get("run_id") != deployment.run_id:
+                    continue
+                if journal.get("creation_may_have_started") and journal.get("cleanup_state") != CleanupState.SUCCEEDED.value:
+                    raise AwsProviderError("an earlier AWS attempt has unresolved cleanup; new launches are blocked", category="residual_cleanup_required")
 
     def _apply_safety_root(self, deployment: ProviderDeploymentInput, region: str, attempt: Path) -> dict[str, str]:
         vars_path = attempt / f"safety-{region}.tfvars.json"
@@ -437,6 +541,7 @@ class AwsProviderDriver:
             self.settings.command_timeout_seconds,
             cwd=attempt,
         )
+        _restrict_private_file(state_path)
         if not _succeeded(result):
             raise AwsProviderError(f"AWS safety Terraform failed in {region}", category="safety_apply", action_id=result.action_id)
         outputs = self._run(
@@ -563,7 +668,7 @@ class AwsProviderDriver:
         outputs: dict[str, ProviderVmOutput] = {}
         for role in ("vm_a", "vm_b"):
             details = vm_values[role]
-            required = ("instance_id", "private_ipv4", "public_ipv4", "region", "zone", "zone_id", "image_id", "image_owner_id", "architecture", "shape")
+            required = ("instance_id", "private_ipv4", "public_ipv4", "region", "zone", "zone_id", "image_id", "image_owner_id", "architecture", "shape", "boot_volume_id")
             missing = [name for name in required if not details.get(name)]
             if missing:
                 raise AwsProviderError(f"Terraform output {role} missing {', '.join(missing)}", category="output_incomplete")
@@ -593,7 +698,7 @@ class AwsProviderDriver:
         updated: dict[str, ProviderVmOutput] = {}
         for role, item in outputs.items():
             detail = vm_values[role]
-            detail.update(self._verify_observed_instance(detail, deployment.scenario))
+            detail.update(self._verify_observed_instance(detail, deployment.scenario, role, deployment.run_id, deployment.deployment_id))
             evidence = self._verify_host_key(detail)
             host_key_path = evidence["known_hosts_path"]
             connection = RemoteConnectionData(
@@ -679,7 +784,7 @@ class AwsProviderDriver:
         self._write_private(known_hosts, ("\n".join(host_lines) + "\n").encode())
         return {"known_hosts_path": str(known_hosts), "boot_id": expected_boot.group(1), "fingerprint": fingerprints[0]}
 
-    def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any) -> dict[str, Any]:
+    def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str) -> dict[str, Any]:
         region = expected["region"]
         caller = self._aws_json("sts", "get-caller-identity", "--region", region, "--output", "json")
         if caller.get("Account") != self.settings.account_id:
@@ -692,14 +797,20 @@ class AwsProviderDriver:
         placement = instance.get("Placement") or {}
         networks = instance.get("NetworkInterfaces") or []
         mappings = instance.get("BlockDeviceMappings") or []
+        tags = {item.get("Key"): item.get("Value") for item in instance.get("Tags", []) if isinstance(item, dict)}
         if instance.get("InstanceId") != expected["instance_id"] or instance.get("State", {}).get("Name") != "running":
             raise AwsProviderError("observed AWS instance identity or running state differs", category="instance_identity_mismatch")
+        if tags.get("cnb_run_id") != run_id or tags.get("cnb_deployment_id") != deployment_id or tags.get("cnb_role") != role:
+            raise AwsProviderError("observed AWS instance ownership tags differ from the active attempt", category="instance_identity_mismatch")
         if instance.get("InstanceType") != "m7i.xlarge" or instance.get("ImageId") != expected["image_id"]:
             raise AwsProviderError("observed AWS image or shape differs from the selected pair", category="image_shape_mismatch")
         if instance.get("PrivateIpAddress") != expected["private_ipv4"] or instance.get("PublicIpAddress") != expected["public_ipv4"]:
             raise AwsProviderError("observed AWS address differs from Terraform output", category="address_mismatch")
         if placement.get("AvailabilityZone") != expected["zone"] or len(networks) != 1:
             raise AwsProviderError("observed AWS zone or one-NIC shape differs", category="topology_mismatch")
+        expected_group = expected.get("placement_group")
+        if placement.get("GroupName") != expected_group:
+            raise AwsProviderError("observed placement group differs from the selected scenario", category="placement_mismatch")
         if any(network.get("InterfaceType") == "efa" for network in networks):
             raise AwsProviderError("EFA network interfaces are not part of the selected protocol", category="acceleration_mismatch")
         zone = self._aws_json("ec2", "describe-instance-topology", "--instance-ids", expected["instance_id"], "--region", region, "--output", "json")
@@ -718,7 +829,7 @@ class AwsProviderDriver:
             or image.get("VirtualizationType") != "hvm"
             or image.get("RootDeviceType") != "ebs"
             or image.get("State") != "available"
-            or not re.search(r"ubuntu-noble-24\\.04-amd64-server-", str(image.get("Name", "")))
+            or not re.search(r"ubuntu-noble-24\.04-amd64-server-", str(image.get("Name", "")))
         ):
             raise AwsProviderError("AMI is not an available Canonical Ubuntu 24.04 amd64 HVM image", category="image_identity_mismatch")
         if image.get("EnaSupport") is not True:
@@ -729,6 +840,8 @@ class AwsProviderDriver:
         if len(mappings) != 1 or not mappings[0].get("Ebs", {}).get("VolumeId") or mappings[0].get("Ebs", {}).get("DeleteOnTermination") is not True:
             raise AwsProviderError("instance must have one EBS root volume with delete-on-termination", category="disk_mismatch")
         volume_id = mappings[0]["Ebs"]["VolumeId"]
+        if volume_id != expected["boot_volume_id"]:
+            raise AwsProviderError("observed root volume differs from Terraform output", category="disk_mismatch")
         volumes = self._aws_json("ec2", "describe-volumes", "--volume-ids", volume_id, "--region", region, "--output", "json").get("Volumes", [])
         if len(volumes) != 1 or volumes[0].get("Size") != 32 or volumes[0].get("VolumeType") != "gp3":
             raise AwsProviderError("root disk must be one 32 GiB gp3 volume", category="disk_mismatch")
@@ -759,6 +872,10 @@ class AwsProviderDriver:
             "ena_support": image.get("EnaSupport"),
             "efa_attached": any(network.get("InterfaceType") == "efa" for network in networks),
             "ena_express_enabled": any((network.get("EnaSrdSpecification") or {}).get("EnaSrdEnabled") is True for network in networks),
+            "boot_volume_size_gib": volumes[0]["Size"],
+            "boot_volume_type": volumes[0]["VolumeType"],
+            "instance_tags": tags,
+            "placement_group": placement.get("GroupName"),
             "scenario": str(scenario),
         }
 
@@ -799,6 +916,9 @@ class AwsProviderDriver:
             try:
                 data = self._aws_json(*argv)
                 values = data.get(response_fields[name], [])
+                if data.get("NextToken") or data.get("nextToken"):
+                    complete = False
+                    failures.append(_failure(AwsProviderError(f"{name} inventory response is truncated", category="inventory_truncated"), self.clock()))
                 # EC2 instance response is one extra nesting level.
                 if name == "instances":
                     values = [instance for reservation in values for instance in reservation.get("Instances", [])]
@@ -888,13 +1008,17 @@ class AwsProviderDriver:
 
     def _attempt_dir(self, deployment: ProviderDeploymentInput) -> Path:
         root = self.settings.private_state_root.expanduser().absolute()
+        if root.is_symlink():
+            raise AwsProviderError("private state root must not be a symlink", category="state_path_unsafe")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(root, 0o700)
-        path = root / _namespace(deployment) / deployment.run_id / deployment.deployment_id
-        if path.exists() and path.is_symlink():
-            raise AwsProviderError("attempt state path must not be a symlink", category="state_path_unsafe")
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(path, 0o700)
+        path = root
+        for component in (_namespace(deployment), deployment.run_id, deployment.deployment_id):
+            path = path / component
+            if path.is_symlink():
+                raise AwsProviderError("attempt state path must not contain symlink components", category="state_path_unsafe")
+            path.mkdir(exist_ok=True, mode=0o700)
+            os.chmod(path, 0o700)
         if root.resolve() not in path.resolve().parents:
             raise AwsProviderError("attempt state path escapes private state root", category="state_path_unsafe")
         return path
@@ -1015,6 +1139,18 @@ def _timestamp(value: datetime) -> str:
 
 def _succeeded(result: CommandResult) -> bool:
     return result.outcome == CommandOutcome.SUCCEEDED and result.exit_code == 0
+
+
+def _aws_cli_error_code(stderr: str) -> str | None:
+    match = re.search(r"\bAn error occurred \(([A-Za-z0-9]+)\)", stderr)
+    return match.group(1) if match else None
+
+
+def _restrict_private_file(path: Path) -> None:
+    if path.is_symlink():
+        raise AwsProviderError("refusing to trust symlinked Terraform state", category="state_path_unsafe")
+    if path.is_file():
+        os.chmod(path, 0o600)
 
 
 def _json_execution(stdout: str) -> dict[str, Any]:
