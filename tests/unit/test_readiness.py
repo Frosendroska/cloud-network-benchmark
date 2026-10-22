@@ -15,7 +15,7 @@ def test_readiness_uses_matching_preparation_and_observes_all_fixed_predicates(t
             self.requests.append(request); aid=request.action_id
             return result(aid,readiness_output(request,prep))
     runner=Runner(); outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.1,attempt_ceiling=2),runner,prepared=prep,deadline=deadline(),clock=lambda:100)
-    assert outcome.ready and len(outcome.observations)==11
+    assert outcome.ready and len(outcome.observations)==13
     assert all(not ("systemctl" in req.argv and any(req.argv[index] in {"start", "restart"} for index in range(len(req.argv)))) for req in runner.requests)
 
 

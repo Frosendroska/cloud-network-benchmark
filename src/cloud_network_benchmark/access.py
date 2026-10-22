@@ -173,7 +173,7 @@ def _transport_options(connection: RemoteConnectionData, *, scp: bool = False) -
 def _request(action_id: str, connection: RemoteConnectionData, argv: List[str], timeout: float, action_type: str = "ssh") -> CommandRequest:
     if timeout <= 0 or not math.isfinite(timeout):
         raise ValueError("command timeout must be positive and finite")
-    command = ["scp", *_transport_options(connection, scp=True)] if action_type == "scp" else ["ssh", *_transport_options(connection)]
+    command = ["scp", *_transport_options(connection, scp=action_type == "scp")] if action_type == "scp" else ["ssh", *_transport_options(connection)]
     target = f"{connection.user}@{connection.host}"
     if action_type == "scp":
         command.extend(argv)
@@ -189,6 +189,13 @@ def _execute(runner: CommandRunner, request: CommandRequest) -> CommandResult:
     started = datetime.now(timezone.utc)
     try:
         return runner.run(request)
+    except KeyboardInterrupt:
+        finished = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.INTERRUPTED,
+                             started_at=started, finished_at=finished,
+                             duration_seconds=max(0.0, (finished - started).total_seconds()),
+                             exit_code=None, stdout="", stderr="command interrupted",
+                             redactions=request.redactions)
     except Exception as exc:
         finished = datetime.now(timezone.utc)
         return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
@@ -196,6 +203,27 @@ def _execute(runner: CommandRunner, request: CommandRequest) -> CommandResult:
                              duration_seconds=max(0.0, (finished - started).total_seconds()),
                              exit_code=1, stdout="", stderr=f"command runner raised {type(exc).__name__}",
                              redactions=request.redactions)
+
+
+def _request_failure(action_id: str, connection: RemoteConnectionData, timeout: float, error: BaseException) -> tuple[CommandRequest, CommandResult]:
+    """Represent a failed local transport preflight without attempting a remote command."""
+    now = datetime.now(timezone.utc)
+    request = CommandRequest(action_id=action_id, action_type="ssh", argv=["ssh", "[preflight-failed]"],
+        cwd=".", environment_classification="contains_secret_references", timeout_seconds=max(timeout, 0.001),
+        redactions=[connection.authentication_reference, connection.host_key_reference])
+    result = CommandResult(action_id=action_id, outcome=CommandOutcome.FAILED, started_at=now,
+        finished_at=now, duration_seconds=0, exit_code=1, stdout="",
+        stderr=f"transport preflight failed: {type(error).__name__}", redactions=request.redactions)
+    return request, result
+
+
+def _identity_references_available(connection: RemoteConnectionData) -> bool:
+    try:
+        for path in (connection.authentication_reference, connection.host_key_reference):
+            _readable_reference(path, "identity")
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _action(action_id: str, action_type: str, vm: RemoteConnectionData, request: CommandRequest, result: CommandResult) -> RemoteActionEvidence:

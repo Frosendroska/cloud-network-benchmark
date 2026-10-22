@@ -94,6 +94,76 @@ def test_frozen_f01r_layouts_cover_both_roles_and_retained_pair_chunks():
             assert all(chunk.parent_unit_id==units[0].unit_id for chunk in chunks)
 
 
+def test_frozen_layouts_compose_through_prepare_readiness_and_retrieval(tmp_path):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from cloud_network_benchmark.access import RemoteDeadline
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence, ExpiryEvidence
+    from cloud_network_benchmark.contracts.common import BenchmarkPhase, Evidence, StringEvidence, StructuredEvidence
+    phases=[BenchmarkPhase.IDLE_LATENCY,BenchmarkPhase.SINGLE_FLOW,BenchmarkPhase.MULTI_FLOW]
+    cases=(("acceptance",phases),("calibration",phases),("short_study",phases),("diagnostic_day",[BenchmarkPhase.MULTI_FLOW]))
+    for mode, selected in cases:
+        root=tmp_path/mode; root.mkdir(); c=connection(root)
+        units=[SimpleNamespace(unit_id=f"{mode}-{index}",phase=phase,kind="phase",parent_unit_id=None) for index,phase in enumerate(selected)]
+        layout=ArtifactLayout.for_mode(mode,units)
+        declarations=layout.declarations_for_mode(mode,units)
+        if mode=="diagnostic_day":
+            chunks=[SimpleNamespace(unit_id=f"{mode}-chunk-{index}",phase=BenchmarkPhase.MULTI_FLOW,kind="probe_chunk",parent_unit_id=units[0].unit_id) for index in (1,2)]
+            declarations=layout.declarations_for_mode(mode,units+chunks)
+        items=[]; payloads={}; unavailable={}
+        for declaration in declarations:
+            if declaration.producer=="controller" or declaration.expectation!="required": continue
+            role=declaration.producer.value if hasattr(declaration.producer,"value") else declaration.producer
+            if mode=="acceptance" and role=="vm_b" and declaration.artifact_id=="vm_b_metadata":
+                unavailable[declaration.artifact_id]={"role":"vm_b","path":"/var/lib/cnb/acceptance/metadata/vm_b.json","reason":"VM B metadata was not produced"}
+                continue
+            paths=([declaration.path] if declaration.path else [declaration.path_template.replace("{chunk_id}",f"{mode}-chunk-{index}") for index in (1,2)])
+            for index,path in enumerate(paths):
+                chunk_id=f"{mode}-chunk-{index+1}"
+                artifact_id=declaration.artifact_id if declaration.path else f"{declaration.artifact_id}-{chunk_id}"
+                payload=f"{mode}:{artifact_id}".encode(); payloads[artifact_id]=payload
+                items.append(RetrievalItem(artifact_id=artifact_id,deployment_id=c.deployment_id,
+                    source_vm=c.vm_a.host if role=="vm_a" else c.vm_b.host,source_role=role,
+                    source_path=f"/var/lib/cnb/{mode}/{artifact_id}.native",destination_path=path,
+                    kind=declaration.kind,unit_id=declaration.unit_id if declaration.path else chunk_id,expected_size_bytes=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),timeout_seconds=5))
+        now=datetime.now(timezone.utc); registered=now+timedelta(seconds=1); expires=registered+timedelta(seconds=600)
+        reservation=ReservationEvidence(schema_version=2,campaign_id="campaign",reservation_id=Evidence(value=f"res-{mode}"),state="reserved",reserved_cost_usd=Evidence(value=1.0),cap_started_at=Evidence(value=now),expires_at=Evidence(value=expires),cap_start_policy_id=StringEvidence(value="caller-policy"),source_path="caller-register.json",source_sha256="a"*64)
+        expiry=ExpiryEvidence(schema_version=2,run_id=c.run_id,deployment_id=c.deployment_id,provider=c.provider,action="stop",state="registered",registration_id=Evidence(value=f"exp-{mode}"),registered_at=Evidence(value=registered),expires_at=Evidence(value=expires),target_selector="deployment",provider_metadata=StructuredEvidence(value={"caller":"fixture"}))
+        bound=RemoteDeadline(readiness_deadline_monotonic=180,overall_deadline_monotonic=300,cleanup_reserve_seconds=10,cap_started_at=reservation.cap_started_at.value,cap_expires_at=expiry.expires_at.value)
+        manifest=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace="/var/lib/cnb",declarations=declarations,items=items,unavailable_items=unavailable,measurement_ended_at=now,producers_closed_at=now,closure_evidence=f"{mode} producers flushed")
+        class Clock:
+            value=100.0
+            def __call__(self):
+                current=self.value; self.value+=.001; return current
+            def wait(self,seconds): self.value+=seconds
+        clock=Clock()
+        prepared=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=bound,clock=clock)
+        class Ready:
+            def run(self,request): return result(request.action_id,readiness_output(request,prepared))
+        ready=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Ready(),prepared=prepared,deadline=bound,clock=clock)
+        assert ready.ready, mode
+        class Transfer:
+            def run(self,request):
+                artifact=next(key for key in payloads if key in request.action_id)
+                payload=payloads[artifact]
+                if request.action_type=="ssh": out=f"{len(payload)} {hashlib.sha256(payload).hexdigest()}"
+                elif mode=="diagnostic_day" and "day-probe-csv-diagnostic_day-chunk-2" in artifact:
+                    return result(request.action_id,success=False,stderr="later probe chunk unavailable")
+                else: Path(request.argv[-1]).write_bytes(payload); out=""
+                return result(request.action_id,out)
+        retrieved=run_retrieval(c,manifest,Transfer(),root,deadline=bound,clock=clock)
+        assert clock.value>100.0, "preparation/readiness/retrieval must consume the caller's shared monotonic budget"
+        if mode=="acceptance":
+            assert not retrieved.complete and retrieved.failure.category=="required_artifact_unavailable"
+        elif mode=="diagnostic_day":
+            assert not retrieved.complete and any("day-probe-csv-diagnostic_day-chunk-1" in item for item in retrieved.retrieved)
+        else:
+            assert retrieved.complete and len(retrieved.retrieved)==len(items), mode
+        assert {item.source_role for item in items}=={"vm_a","vm_b"}
+        if mode=="diagnostic_day": assert len([item for item in items if item.artifact_id.startswith("day-probe-csv-")])==2
+
+
 def test_retrieval_failure_stays_secondary_to_caller_owned_measurement_failure(tmp_path):
     from cloud_network_benchmark.contracts.common import FailureEvidence
     root=tmp_path/"partial"; root.mkdir(); c=connection(root); payload=b"native"

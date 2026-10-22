@@ -12,7 +12,7 @@ from pathlib import PurePosixPath
 
 from pydantic import Field, field_validator, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _request
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _identity_references_available, _request, _request_failure
 from .contracts.common import CommandOutcome, IdentityContext, StrictModel
 from .contracts.execution import CommandRequest, CommandRunner
 
@@ -124,11 +124,11 @@ def _required_capabilities(tool: str) -> List[str]:
     return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "cubic", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
 
 
-def _capabilities_observed(text: str, tool: str) -> bool:
+def _capabilities_observed(text: str, tool: str, *, required: List[str] | None = None) -> bool:
     if not text.strip() or "usage" not in text.lower() or "error" in text.lower() or "unknown option" in text.lower():
         return False
     tokens = set(re.findall(r"--[A-Za-z0-9-]+|-[A-Za-z0-9]|[A-Za-z][A-Za-z0-9-]*", text))
-    return set(_required_capabilities(tool)) <= tokens
+    return set(required if required is not None else _required_capabilities(tool)) <= tokens
 
 
 def _unit_matches(text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str) -> bool:
@@ -149,19 +149,33 @@ def _unit_matches(text: str, tool: str, address: str, port: int, prefix: str, st
             and fields.get("StandardError") == "append:" + stderr_path)
 
 
+def _process_identity_command(unit: str, binary: str) -> list[str]:
+    unit_q, binary_q = shlex.quote(unit), shlex.quote(binary)
+    script = (f"pid=$(systemctl show --property=MainPID --value {unit_q}) || exit 1; "
+              f"case $pid in ''|*[!0-9]*) exit 1;; esac; [ \"$pid\" -gt 0 ] || exit 1; "
+              f"actual=$(readlink -f /proc/$pid/exe) || exit 1; [ \"$actual\" = {binary_q} ] || exit 1; "
+              "printf '%s\\n' \"$actual\"; sha256sum /proc/$pid/exe")
+    return ["sudo", "sh", "-c", script]
+
+
+def _process_identity_matches(text: str, binary: str, expected_sha256: str) -> bool:
+    lines = text.strip().splitlines()
+    return (len(lines) == 2 and lines[0] == binary
+            and re.fullmatch(r"[a-f0-9]{64}\s+/proc/[1-9][0-9]*/exe", lines[1]) is not None
+            and lines[1].split()[0] == expected_sha256)
+
+
 def _acl_matches(text: str, source: str, address: str) -> bool:
     rules = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", " ".join(line.strip().split())).strip() for line in text.splitlines() if line.strip()]
     expected = [f"ip saddr {source}/32 ip daddr {address} udp dport 11111 accept",
                 f"ip daddr {address} udp dport 11111 drop",
                 f"ip saddr {source}/32 ip daddr {address} tcp dport 5201 accept",
                 f"ip daddr {address} tcp dport 5201 drop"]
-    positions = []
-    for rule in expected:
-        found = [index for index, line in enumerate(rules) if line == rule]
-        if len(found) != 1:
-            return False
-        positions.append(found[0])
-    return positions == sorted(positions) and any("hook input" in line and "policy accept" in line for line in rules)
+    headers = [line for line in rules if "hook input" in line and "policy accept" in line]
+    effective = [line for line in rules if line not in headers]
+    # The owned chain may contain exactly the four ordered benchmark rules. Any
+    # additional accept/jump/goto could bypass source restriction.
+    return len(headers) == 1 and effective == expected
 
 
 def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
@@ -179,7 +193,7 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
                     f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
                     f"[ ! -e {binary_q} ] || exit 43; cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
                     f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s\\n' {ref_q} {digest_q} \"$1\" > {marker_q}")
-    return [
+    commands = [
         ["sudo", "apt-get", "install", "-y", *config.bootstrap_packages],
         ["curl", "--fail", "--location", "--silent", "--show-error", "--output", archive, source.source_url],
         ["sha256sum", archive],
@@ -188,8 +202,12 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
         ["cc", "--version"],
         [f"{prefix}/bin/{source.tool}", "--version"],
         ["sha256sum", f"{prefix}/bin/{source.tool}"],
-        [f"{prefix}/bin/{source.tool}", "--help"],
     ]
+    commands.append([f"{prefix}/bin/{source.tool}", "--help"])
+    if source.tool == "sockperf":
+        commands.extend([[f"{prefix}/bin/sockperf", "server", "--help"],
+                         [f"{prefix}/bin/sockperf", "under-load", "--help"]])
+    return commands
 
 
 def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> str:
@@ -225,6 +243,8 @@ def render_commands(config: BootstrapConfig, role: str) -> List[List[str]]:
 
 
 def _failure_result(connection, actions, vm, request, result, category, message, builds, listeners):
+    if result.outcome == CommandOutcome.INTERRUPTED:
+        category, message = "command_interrupted", "remote preparation command was interrupted"
     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
                            actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
 
@@ -246,6 +266,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             actions.append(_action(req.action_id, "ssh", vm, req, result))
             if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
                 return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable", builds, listeners)
         if role == "vm_b":
             for tool, port, stdout_path, stderr_path in (("sockperf", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
                 remaining = deadline.remaining(clock, readiness=True)
@@ -285,7 +309,12 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 return _failure_result(connection, actions, vm, workspace_request, workspace_result, "workspace_setup_failed", "could not prepare writable deployment paths", builds, listeners)
             recipe = _recipe(source, config)
             evidence: Dict[str, str] = {}
+            capability_outputs: list[str] = []
             for index, argv in enumerate(recipe):
+                if not _identity_references_available(vm):
+                    failed_request, failed_result = _request_failure(f"f02r-{role}-{source.tool}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
+                    actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+                    return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable during build", builds, listeners)
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
@@ -297,6 +326,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, req, result, "source_build_failed", f"{source.tool} build action failed", builds, listeners)
                 text = result.stdout.strip()
+                for secret in (vm.authentication_reference, vm.host_key_reference):
+                    text = re.sub(r"(?i)(password|token|secret|private[_ -]?key)\s*[=:]\s*\S+", r"\1=[REDACTED]", text)
+                    text = text.replace(secret, "[REDACTED]")
+                text = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[REDACTED_KEY]", text, flags=re.DOTALL)
                 if index == 2:
                     observed_hash = _sha256sum_output(text, f"{config.workspace}/{source.archive_name}")
                     if observed_hash != source.source_sha256:
@@ -315,10 +348,16 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if not observed_hash:
                         return _failure_result(connection, actions, vm, req, result, "binary_hash_missing", f"{source.tool} binary hash was not observed", builds, listeners)
                     evidence["binary_sha256"] = observed_hash
-                elif index == 8:
-                    if not _capabilities_observed(text, source.tool):
+                elif index >= 8:
+                    if source.tool == "sockperf":
+                        required = (["server", "-i", "-p"] if index == 9 else
+                                    ["under-load", "-i", "-p", "-m", "--mps", "--reply-every", "--full-rtt", "--no-rdtsc", "--full-log", "-t"] if index == 10 else [])
+                    else:
+                        required = _required_capabilities(source.tool)
+                    if not _capabilities_observed(text, source.tool, required=required):
                         return _failure_result(connection, actions, vm, req, result, "capability_missing", f"{source.tool} required capability help was incomplete", builds, listeners)
-                    evidence["capabilities"] = text
+                    capability_outputs.append(text)
+            evidence["capabilities"] = "\n".join(capability_outputs)
             binary_path = f"{config.install_prefix}/bin/{source.tool}"
             builds.append(BuildObservation(role=role, tool=source.tool, source_reference=source.source_reference,
                                            source_sha256=evidence["source_sha256"], compiler_version=evidence["compiler_version"],
@@ -366,7 +405,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
                 inspect_result = _execute(runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
                 if inspect_result.outcome == CommandOutcome.SUCCEEDED:
@@ -375,6 +414,13 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if fields.get("LoadState") == "not-found":
                         pass
                     elif _unit_matches(output, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
+                        proc_id = f"f02r-vm_b-listener-process-{tool}"
+                        proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, deadline.remaining(clock, readiness=True)))
+                        proc_result = _execute(runner, proc_request)
+                        actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
+                        build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
+                        if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
+                            return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
                         listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
                             unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
                             stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
@@ -403,7 +449,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 req = _request(aid, vm, command, min(connection.timeouts.server_seconds, remaining))
                 result = _execute(runner, req)
                 actions.append(_action(aid, "ssh", vm, req, result))
-                if result.outcome != CommandOutcome.SUCCEEDED or not re.search(r"(?im)^active:\s+active\s+\(running\)\s*$", result.stdout):
+                if result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, req, result, "listener_setup_failed", f"{tool} listener was not observed", builds, listeners)
                 verify_id = f"f02r-vm_b-listener-verify-{tool}"
                 verify_remaining = deadline.remaining(clock, readiness=True)
@@ -414,6 +460,13 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
                 if verify_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(verify_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs):
                     return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
+                proc_id = f"f02r-vm_b-listener-process-{tool}"
+                proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, deadline.remaining(clock, readiness=True)))
+                proc_result = _execute(runner, proc_request)
+                actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
+                build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
+                if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
+                    return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
                 listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
                     unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=stdout_abs,
                     stderr_path=stderr_abs, allowed_source=f"{connection.private_ipv4_a}/32", state="active"))

@@ -124,3 +124,56 @@ def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence
             return super().run(request)
     failed=run_bootstrap(c,bootstrap_config(),Raising(),deadline=deadline(),clock=lambda:100)
     assert not failed.succeeded and len(failed.actions)>=3 and failed.failure.category=="source_build_failed"
+
+
+def test_interrupted_runner_and_lost_identity_file_preserve_failure_evidence(tmp_path):
+    c=connection(tmp_path)
+    class Interrupted(BootstrapRunner):
+        def run(self,request):
+            if request.action_id.endswith("cloud-init"):
+                raise KeyboardInterrupt()
+            return super().run(request)
+    outcome=run_bootstrap(c,bootstrap_config(),Interrupted(),deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.actions and outcome.failure.category=="command_interrupted"
+    class LostKey(BootstrapRunner):
+        def run(self,request):
+            response=super().run(request)
+            if request.action_id.endswith("cloud-init"):
+                Path(c.vm_a.authentication_reference).unlink(missing_ok=True)
+            return response
+    runner=LostKey(); outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.actions and outcome.failure.category=="transport_preflight_failed"
+    assert all("preflight-failed" not in request.argv for request in runner.requests)
+
+
+def test_successful_build_observations_redact_credentials_and_secret_text(tmp_path):
+    c=connection(tmp_path); key=c.vm_a.authentication_reference
+    class LeakyCompiler(BootstrapRunner):
+        def run(self,request):
+            if request.action_id.endswith("-5"):
+                return result(request.action_id,f"gcc version 13.2 key={key} token=synthetic-secret")
+            return super().run(request)
+    outcome=run_bootstrap(c,bootstrap_config(),LeakyCompiler(),deadline=deadline(),clock=lambda:100)
+    assert outcome.succeeded
+    serialized=outcome.model_dump_json()
+    assert key not in serialized and "synthetic-secret" not in serialized
+
+
+def test_sockperf_subcommand_capabilities_are_observed_independently(tmp_path):
+    c=connection(tmp_path)
+    class MissingUnderLoad(BootstrapRunner):
+        def run(self,request):
+            if request.action_id.endswith("-10") and "sockperf" in request.action_id:
+                return result(request.action_id,"Usage: sockperf under-load -i -p -m --mps --reply-every --full-log -t")
+            return super().run(request)
+    outcome=run_bootstrap(c,bootstrap_config(),MissingUnderLoad(),deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="capability_missing"
+    assert not any("listener-" in action.action_id for action in outcome.actions)
+
+
+def test_acl_rejects_accept_or_jump_bypass_before_expected_rules():
+    from cloud_network_benchmark.bootstrap import _acl_matches
+    valid="type filter hook input priority -10; policy accept;\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 udp dport 11111 accept\nip daddr 10.0.0.2 udp dport 11111 drop\nip saddr 10.0.0.1/32 ip daddr 10.0.0.2 tcp dport 5201 accept\nip daddr 10.0.0.2 tcp dport 5201 drop"
+    assert _acl_matches(valid,"10.0.0.1","10.0.0.2")
+    assert not _acl_matches(valid.replace("priority -10; policy accept;", "priority -10; policy accept;\nip daddr 10.0.0.2 accept"),"10.0.0.1","10.0.0.2")
+    assert not _acl_matches(valid.replace("priority -10; policy accept;", "priority -10; policy accept;\njump unrestricted"),"10.0.0.1","10.0.0.2")

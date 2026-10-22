@@ -8,8 +8,8 @@ from typing import Callable, List
 
 from pydantic import Field, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _request, _scrub
-from .bootstrap import BootstrapResult
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _identity_references_available, _request, _request_failure, _scrub
+from .bootstrap import BootstrapResult, _acl_matches, _process_identity_command, _process_identity_matches
 from .contracts.common import CommandOutcome, StrictModel
 from .contracts.execution import CommandRunner
 
@@ -78,24 +78,7 @@ def _listener_pid(stdout: str, tool: str, address: str, port: int) -> int | None
 
 
 def _acl_healthy(stdout: str, connection: ConnectionOutput) -> bool:
-    rules = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", " ".join(line.strip().split())).strip() for line in stdout.splitlines() if line.strip()]
-    wanted = [
-        f"ip saddr {connection.private_ipv4_a}/32 ip daddr {connection.private_ipv4_b} udp dport 11111 accept",
-        f"ip daddr {connection.private_ipv4_b} udp dport 11111 drop",
-        f"ip saddr {connection.private_ipv4_a}/32 ip daddr {connection.private_ipv4_b} tcp dport 5201 accept",
-        f"ip daddr {connection.private_ipv4_b} tcp dport 5201 drop",
-    ]
-    positions = []
-    for expected in wanted:
-        hits = [i for i, line in enumerate(rules) if line == expected]
-        if len(hits) != 1:
-            return False
-        positions.append(hits[0])
-    if positions != sorted(positions):
-        return False
-    if not any("hook input" in line and "policy accept" in line for line in rules):
-        return False
-    return True
+    return _acl_matches(stdout, connection.private_ipv4_a, connection.private_ipv4_b)
 
 
 def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: BootstrapResult) -> bool:
@@ -109,6 +92,10 @@ def _predicate(name: str, stdout: str, connection: ConnectionOutput, prepared: B
         return True
     if name.startswith("service-"):
         return _systemd_healthy(stdout, connection, prepared, name.removeprefix("service-"))
+    if name.startswith("process-"):
+        tool = name.removeprefix("process-")
+        build = next((item for item in prepared.builds if item.role == "vm_b" and item.tool == tool), None)
+        return bool(build and _process_identity_matches(stdout, build.binary_path, build.binary_sha256))
     if name == "socket-sockperf":
         return _listener_pid(stdout, "sockperf", connection.private_ipv4_b, 11111) is not None
     if name == "socket-iperf3":
@@ -135,12 +122,15 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
         ("cloud-init-vm-b", connection.vm_b, ["cloud-init", "status", "--wait"], connection.timeouts.cloud_init_seconds),
         ("private-icmp", connection.vm_a, ["ping", "-c", "1", "-W", "1", connection.private_ipv4_b], connection.timeouts.private_path_seconds),
         ("private-tcp", connection.vm_a, ["nc", "-z", "-w", "1", connection.private_ipv4_b, "5201"], connection.timeouts.private_path_seconds),
-        ("service-sockperf", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-sockperf", "--property=LoadState,ActiveState,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
-        ("service-iperf3", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-iperf3", "--property=LoadState,ActiveState,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
+        ("service-sockperf", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-sockperf", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
+        ("service-iperf3", connection.vm_b, ["systemctl", "show", f"cnb-{connection.deployment_id}-iperf3", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], connection.timeouts.server_seconds),
         ("socket-sockperf", connection.vm_b, ["ss", "-H", "-lunp"], connection.timeouts.server_seconds),
         ("socket-iperf3", connection.vm_b, ["ss", "-H", "-ltnp"], connection.timeouts.server_seconds),
         ("guest-acl", connection.vm_b, ["sudo", "nft", "list", "chain", "inet", "cnb_f02r", chain], connection.timeouts.server_seconds),
     ]
+    checks[8:8] = [(f"process-{tool}", connection.vm_b,
+        _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", next(item.binary_path for item in prepared.listeners if item.tool == tool)), connection.timeouts.server_seconds)
+        for tool in ("sockperf", "iperf3")]
     for name, vm, argv, ceiling in checks:
         last = None
         for attempt in range(1, config.attempt_ceiling + 1):
@@ -148,6 +138,11 @@ def run_readiness(connection: ConnectionOutput, config: ReadinessConfig, runner:
             if remaining <= 0:
                 break
             attempts += 1
+            if not _identity_references_available(vm):
+                request, result = _request_failure(f"f02r-ready-{name}-{attempt}", vm, min(ceiling, remaining), ValueError("credential reference unavailable"))
+                actions.append(_action(request.action_id, "ssh", vm, request, result))
+                failure = AccessFailureEvidence(stage="readiness", vm_id=vm.host, role=str(vm.role), category="transport_preflight_failed", message="SSH identity reference became unavailable during readiness", action_id=request.action_id, occurred_at=result.finished_at)
+                return ReadinessResult(ready=False, attempts=attempts, actions=actions, observations=observations, deadline=deadline, elapsed_seconds=max(0, clock()-start), remaining_seconds=deadline.remaining(clock, readiness=True), failure=failure)
             request = _request(f"f02r-ready-{name}-{attempt}", vm, argv, min(ceiling, remaining))
             result = _execute(runner, request)
             actions.append(_action(request.action_id, "ssh", vm, request, result))

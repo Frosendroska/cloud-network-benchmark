@@ -313,17 +313,20 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             actions.append(_action(req.action_id, "scp", vm, req, result))
             size = digest = None
             reason = None
-            if result.outcome != CommandOutcome.SUCCEEDED:
-                reason = f"copy_{result.outcome}"
-            elif not staging.is_file() or staging.is_symlink():
-                reason = "copy_not_materialized"
+            if not staging.is_file() or staging.is_symlink():
+                reason = f"copy_{result.outcome}" if result.outcome != CommandOutcome.SUCCEEDED else "copy_not_materialized"
             else:
                 try:
                     size, digest = _hash_file(staging)
-                    if size != item.expected_size_bytes:
+                    if result.outcome != CommandOutcome.SUCCEEDED:
+                        reason = f"copy_{result.outcome}"
+                    elif size != item.expected_size_bytes:
                         reason = "size_mismatch"
                     elif digest != item.expected_sha256:
                         reason = "sha256_mismatch"
+                    if deadline.remaining(clock, cleanup=True) <= 0:
+                        reason = "cleanup_allowance_reached_during_local_verification"
+                        stop = True
                 except OSError:
                     reason = "staging_read_failed"
             attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed", size_bytes=size, sha256=digest, reason=reason))
@@ -346,6 +349,15 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                         primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="publication_verification_failed", message="published file failed materialized verification", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
                         item_verified = True
                         break
+                    if deadline.remaining(clock, cleanup=True) <= 0:
+                        reason = "cleanup_allowance_reached_during_publication_verification"
+                        failure = _evidence_failure(item, reason, "materialized verification completed after the caller cleanup allowance")
+                        records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
+                            size_bytes=Evidence[int](value=size), sha256=StringEvidence(value=digest), retrieval_state="failed", failure=failure))
+                        primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message="retrieval verification exceeded the caller cleanup allowance", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                        item_verified = True
+                        stop = True
+                        break
                     records.append(rec)
                     retrieved.append(item.artifact_id)
                     integrity[item.artifact_id] = {"bytes": size, "sha256": digest}
@@ -359,8 +371,13 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 stop = True
                 break
         if not item_verified:
-            failure = _evidence_failure(item, "transfer_incomplete", "artifact was not verified after available attempts")
-            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="no verified transfer"), sha256=StringEvidence(unavailable_reason="no verified transfer"), retrieval_state="failed", failure=failure))
+            last_attempt = next((attempt for attempt in reversed(attempts) if attempt.artifact_id == item.artifact_id), None)
+            reason = (last_attempt.reason if last_attempt and last_attempt.reason else "transfer_incomplete")
+            failure = _evidence_failure(item, reason, "artifact was not verified and published within the available cleanup allowance")
+            records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
+                size_bytes=Evidence[int](value=last_attempt.size_bytes) if last_attempt and last_attempt.size_bytes is not None else Evidence[int](unavailable_reason="no observed local size"),
+                sha256=StringEvidence(value=last_attempt.sha256) if last_attempt and last_attempt.sha256 is not None else StringEvidence(unavailable_reason="no observed local hash"),
+                retrieval_state="failed", failure=failure))
         if not item_verified and deadline.remaining(clock, cleanup=True) <= 0:
             stop = True
     verified_ids = set(retrieved)
