@@ -537,13 +537,14 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
     assert runner.destroy_attempts == 2
 
 
-def test_cleanup_records_cancelled_terminal_state_and_action_outputs(tmp_path):
+@pytest.mark.parametrize("terminal,expiry_state", [("Cancelled", "cancelled"), ("Success", "triggered"), ("Failed", "triggered"), ("TimedOut", "triggered")])
+def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, expiry_state):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
 
     class TerminalRunner:
         def run(self, request):
             if request.action_id.startswith("aws-expiry-read-terminal-"):
-                output = {"AutomationExecution": {"AutomationExecutionStatus": "Cancelled", "Outputs": {"stop_requests": ["i-one"]}}}
+                output = {"AutomationExecution": {"AutomationExecutionStatus": terminal, "Outputs": {"stop_requests": ["i-one"]}}}
             else:
                 output = {}
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
@@ -568,7 +569,8 @@ def test_cleanup_records_cancelled_terminal_state_and_action_outputs(tmp_path):
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     result = driver.cleanup(deployment)
     assert result.cleanup_state == "succeeded"
-    assert result.expiry.value.state == "cancelled"
+    assert result.expiry.value.state == expiry_state
+    assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["state"] == terminal
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["action_outputs"] == {"stop_requests": ["i-one"]}
 
 

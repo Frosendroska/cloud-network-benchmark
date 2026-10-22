@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 
@@ -588,6 +589,36 @@ def test_automation_readback_rejects_truncated_or_mismatched_execution(change):
     assert not _automation_matches(execution, safety, params)
 
 
+def test_automation_confirmation_retries_pending_with_one_execution_id_and_scalar_inputs(tmp_path):
+    params = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"],
+        "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": ["campaign-aws"],
+        "DeploymentId": ["campaign-aws-deployment"], "Region": ["eu-central-1"]}
+    pending = {"AutomationExecutionId": "exec-bound", "DocumentName": "expiry", "DocumentVersion": "1",
+        "AutomationExecutionStatus": "Pending", "Parameters": params, "StepExecutions": []}
+    active = {"AutomationExecutionId": "exec-bound", "DocumentName": "expiry", "DocumentVersion": "1",
+        "AutomationExecutionStatus": "InProgress", "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry",
+        "Parameters": params, "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
+            "StepStatus": "InProgress", "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}]}
+
+    class Runner:
+        def __init__(self):
+            self.responses = [pending, active]
+            self.calls = 0
+
+        def run(self, request):
+            self.calls += 1
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0,
+                stdout=json.dumps({"AutomationExecution": self.responses.pop(0)}), stderr="")
+
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path), clock=lambda: NOW)
+    driver._registration_deadline = 9_999_999_999
+    result = driver._confirm_automation("eu-central-1", "exec-bound", {"document_name": "expiry", "document_version": "1"}, params)
+    assert result["AutomationExecutionId"] == "exec-bound"
+    assert runner.calls == 2
+
+
 @pytest.mark.parametrize("scenario,file", [
     ("same_zone", "configs/experiments/exp-001-multi-provider.yaml"),
     ("cross_zone", "configs/experiments/exp-002-cross-zone.yaml"),
@@ -640,6 +671,16 @@ def test_aws_safety_role_trust_scope_and_regional_names_are_execution_safe():
     assert 'substr(sha256("${var.run_id}:${var.deployment_id}:${var.region}"), 0, 24)' in main
     assert 'document_name  = "cnb-expiry-${local.safe_namespace}-${local.attempt_digest}"' in main
     assert 'ec2:StopInstances' in main and 'ec2:ResourceTag/cnb_run_id' in main and 'ec2:ResourceTag/cnb_deployment_id' in main
+    def role_name(run_id, deployment_id, region):
+        prefix = "cnb-expiry-" + f"cnb-{run_id}-{deployment_id}"[:24]
+        digest = hashlib.sha256(f"{run_id}:{deployment_id}:{region}".encode()).hexdigest()[:24]
+        return f"{prefix}-{digest}"
+    long_prefix = "campaign-with-a-long-concurrent-attempt-prefix"
+    frankfurt = role_name(long_prefix, "deployment-a", "eu-central-1")
+    london = role_name(long_prefix, "deployment-a", "eu-west-2")
+    concurrent = role_name(long_prefix, "deployment-b", "eu-central-1")
+    assert len(frankfurt) <= 64 and len(london) <= 64 and len(concurrent) <= 64
+    assert len({frankfurt, london, concurrent}) == 3
 
 
 def test_aws_scenario_subnets_do_not_create_duplicate_same_zone_cidrs():
@@ -649,6 +690,13 @@ def test_aws_scenario_subnets_do_not_create_duplicate_same_zone_cidrs():
     assert 'subnet_id                   = local.cross_zone ? aws_subnet.b_frankfurt[0].id : aws_subnet.a.id' in main
     assert 'cidr_block              = local.subnet_b_frankfurt_cidr' in main
     assert 'subnet_b_frankfurt_cidr = "10.60.2.0/24"' in main
+    selected = {
+        "same_zone": [ipaddress.ip_network("10.60.1.0/24")],
+        "placement_optimization": [ipaddress.ip_network("10.60.1.0/24")],
+        "cross_zone": [ipaddress.ip_network("10.60.1.0/24"), ipaddress.ip_network("10.60.2.0/24")],
+    }
+    for cidrs in selected.values():
+        assert all(not left.overlaps(right) for index, left in enumerate(cidrs) for right in cidrs[index + 1:])
 
 
 def test_known_resource_inventory_finds_an_untagged_detached_boot_disk(tmp_path):
