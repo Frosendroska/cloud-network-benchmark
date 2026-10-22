@@ -1,6 +1,6 @@
 # F03 offline validation
 
-Implementation commit tested: `d30d4c3e31792c8a295ec5fe0501125b00556085` on
+Implementation commit tested: `70eb201` on
 `codex/f03-v2-measurement`, based on merged F01R
 `a468bb0219ff1f61bae6cbb3577ab797bdb9763b`. Environment: Python 3.11.13 at
 `/private/tmp/cnb-offline-venv/bin/python`, repository root `/private/tmp/cnb-f03`,
@@ -12,8 +12,8 @@ Implementation commit tested: `d30d4c3e31792c8a295ec5fe0501125b00556085` on
 | Command | Result |
 | --- | --- |
 | `GIT_BRANCH_NAME=codex/f03-v2-measurement SPECIFY_FEATURE_DIRECTORY=specs/005-v2-measurement-runner bash .specify/scripts/bash/check-prerequisites.sh --json --require-spec --require-tasks --include-tasks` | Exit 0; feature directory and required specification/task artifacts found. |
-| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py` | Exit 0; 57 passed, including stale prior-process exit, simultaneous day-process completion, failed shutdown stream closure and UTC-jump cases. |
-| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 547 passed. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py` | Exit 0; 67 passed, including all four convergence repairs. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 557 passed. |
 | `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_schema_integrity.py tests/contract/test_v2_schema_export.py` | Exit 0; 7 passed. |
 | `git diff --check` | Exit 0; no whitespace errors. |
 | `git diff a468bb0219ff1f61bae6cbb3577ab797bdb9763b -- specs/001-core-offline-contracts specs/002-vm-access-bootstrap` | Exit 0; no changes to historical F01/F02 specifications. |
@@ -36,6 +36,17 @@ UTC elapsed minus monotonic elapsed discrepancy. F03 projects those same values 
 for successful and failed exits, plus backward-step cancellation that escalates to kill;
 each result round-trips through `CommandEvidence` with matching timing fields. These checks
 make no claim about clock synchronization accuracy and do not clamp or synthesize UTC values.
+
+T026–T029 are implemented and tested at `70eb201`. Production shutdown now attempts kill and
+reap after an unexpected timed-wait error, closes each owned output stream independently even
+when an earlier flush/close fails, and retains shutdown errors in command evidence. Boundary
+checks after the two-second lead reject a current probe exit exactly at notification plus two
+seconds for short, acceptance and calibration modes. Diagnostic-day completion now fails the
+overall result when a final owned probe remains unresolved after stop fails, while retaining
+the completed TCP evidence and identifying unresolved shutdown. Day chunk paths are registered
+before process start, then absent paths are removed if startup fails; partially created native
+CSV/log files remain referenced. Fake Popen/stream and materialized-file tests cover these cases.
+Terminal exit and cancellation events during the lead are both fail-stop conditions.
 
 ## Interface and evidence boundary
 
