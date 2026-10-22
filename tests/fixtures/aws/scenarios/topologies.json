@@ -1,0 +1,30 @@
+{
+  "same_zone": {
+    "regions": ["eu-central-1"],
+    "zones": ["eu-central-1a", "eu-central-1a"],
+    "subnets": ["10.60.1.0/24"],
+    "private_ipv4": ["10.60.1.10", "10.60.1.11"],
+    "placement": "none"
+  },
+  "cross_zone": {
+    "regions": ["eu-central-1"],
+    "zones": ["eu-central-1a", "eu-central-1b"],
+    "subnets": ["10.60.1.0/24", "10.60.2.0/24"],
+    "private_ipv4": ["10.60.1.10", "10.60.2.10"],
+    "placement": "none"
+  },
+  "placement_optimization": {
+    "regions": ["eu-central-1"],
+    "zones": ["eu-central-1a", "eu-central-1a"],
+    "subnets": ["10.60.1.0/24"],
+    "private_ipv4": ["10.60.1.10", "10.60.1.11"],
+    "placement": "cluster"
+  },
+  "inter_region": {
+    "regions": ["eu-central-1", "eu-west-2"],
+    "zones": ["eu-central-1a", "eu-west-2a"],
+    "subnets": ["10.60.1.0/24", "10.61.1.0/24"],
+    "private_ipv4": ["10.60.1.10", "10.61.1.10"],
+    "placement": "none"
+  }
+}

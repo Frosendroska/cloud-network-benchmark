@@ -1,0 +1,14 @@
+{
+  "id": "aws-ssm-automation-public-2026-10-22",
+  "checked_on": "2026-10-22",
+  "source": "https://aws.amazon.com/systems-manager/pricing/",
+  "currency": "USD",
+  "automation_step_price": 0.002,
+  "script_second_price": 0.00003,
+  "planned_steps_per_region": 2,
+  "planned_script_seconds_per_region": 300,
+  "worst_planned_cost_per_region": 0.013,
+  "worst_planned_cost_for_two_regions": 0.026,
+  "free_tier_assumed": false,
+  "notes": "Published public prices checked on the date shown; not a live quote. Tax and price changes are not included."
+}

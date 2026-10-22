@@ -1,0 +1,9 @@
+{
+  "apply_timeout": {"action_id": "aws-pair-apply", "outcome": "timed_out", "exit_code": null},
+  "apply_nonzero": {"action_id": "aws-pair-apply", "outcome": "failed", "exit_code": 1},
+  "inventory_denied": {"api": "DescribeVolumes", "code": "UnauthorizedOperation", "terminal": false},
+  "inventory_truncated": {"api": "DescribeInstances", "next_token": "present", "terminal": false},
+  "cancellation_denied": {"api": "StopAutomationExecution", "code": "AccessDeniedException", "terminal": false},
+  "primary_failure": {"category": "terraform_apply", "message": "apply timed out"},
+  "secondary_failure": {"category": "inventory", "message": "inventory denied"}
+}
