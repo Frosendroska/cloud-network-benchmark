@@ -1,0 +1,28 @@
+{
+  "covered_envelope": {
+    "duration_seconds": 60,
+    "start_bounds": [10, 10],
+    "probe_windows": [[10, 70]],
+    "expected_minimum_coverage_seconds": 60
+  },
+  "boundary_99_percent": {
+    "duration_seconds": 60,
+    "start_bounds": [0, 0],
+    "probe_windows": [[0, 59.4]],
+    "expected_minimum_coverage_seconds": 59.4
+  },
+  "below_99_percent": {
+    "duration_seconds": 60,
+    "start_bounds": [0, 0],
+    "probe_windows": [[0, 59.39]],
+    "expected_minimum_coverage_seconds": 59.39
+  },
+  "overlap_and_gap": {
+    "duration_seconds": 10,
+    "start_bounds": [0, 0],
+    "probe_windows": [[0, 6], [4, 10]],
+    "gaps": [[4, 5]],
+    "expected_minimum_coverage_seconds": 9
+  },
+  "unbounded": {"duration_seconds": 60, "start_bounds": [0, null], "expected": null}
+}
