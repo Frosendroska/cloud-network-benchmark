@@ -82,3 +82,28 @@ No actual Sockperf/iperf3 executable, receiver, SSH, credentials, cloud API, net
 full-day wait or paid acceptance operation was used. Real native output flushing, exact
 filtered acquisition bounds, installed-build identity/semantics, receiver-side day streaming,
 and full-duration/99% coverage remain to be checked during separately authorized acceptance.
+
+## T030 normal-finalization repair
+
+The T030 implementation and focused/full checks were run in the worktree at base commit
+`ba5b499f86508f7458de9452f8f7ddb25ec181a7`, with the T030 source and regression-test changes
+present as working-tree edits. This records the exact source base plus tested edits; it is not a
+claim that those edits were committed at that SHA. Python 3.11.13 and the environment above were
+used.
+
+| Command | Result |
+| --- | --- |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_measurement_process.py -k 'normal_poll_closes_stderr_and_caches_failed_result_after_stdout_close_errors'` | Exit 0; 1 passed, 17 deselected. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_measurement_contract.py tests/unit/test_measurement_commands.py tests/unit/test_measurement_process.py tests/unit/test_measurement_timing.py tests/unit/test_measurement_modes.py tests/integration/test_measurement_runner.py` | Exit 0; 68 passed. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 627 passed. |
+| `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/contract/test_schema_integrity.py tests/contract/test_v2_schema_export.py` | Exit 0; 7 passed. |
+| `git diff --check` | Exit 0; no whitespace errors. |
+| `git diff HEAD -- specs/001-core-offline-contracts specs/002-vm-access-bootstrap` | Exit 0; no historical F01/F02 specification changes. |
+
+Normal `poll()` finalization now flushes and closes stdout and stderr independently, records each
+failure, and retries a still-open stream once. A stream that remains open is named explicitly in
+the failed command evidence; the result is cached so repeated polling cannot throw again or
+duplicate command/timing evidence. The production-adapter regression uses a normal-exit fake
+process whose stdout close persistently fails, and verifies stderr closure, bounded close attempts,
+both streams' partial native bytes, and the cached failed result. Real subprocess, OS-level file
+failure behavior, benchmark tools, receiver, cloud access and traffic remain unrun.

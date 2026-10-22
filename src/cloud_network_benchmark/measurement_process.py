@@ -231,9 +231,30 @@ class LocalMeasurementProcesses:
     def _finish(self, item: LocalProcess, outcome: CommandOutcome, code: Optional[int]) -> CommandResult:
         if item.result is not None:
             return item.result
-        for stream in (item.stdout_file, item.stderr_file):
+        # Normal completion owns the same files as stop(). A broken close on one
+        # stream must not skip the other stream or escape poll(), since callers
+        # use that result to enter their bounded cleanup/failure path.
+        for name, stream in (("stdout", item.stdout_file), ("stderr", item.stderr_file)):
+            if getattr(stream, "closed", False):
+                continue
+            try:
+                stream.flush()
+            except BaseException as exc:
+                item.stream_errors.append(f"{name} stream flush failed: {type(exc).__name__}: {exc}")
             if not getattr(stream, "closed", False):
-                stream.close()
+                try:
+                    stream.close()
+                except BaseException as exc:
+                    item.stream_errors.append(f"{name} stream close failed: {type(exc).__name__}: {exc}")
+            # A close implementation may fail transiently. Retry once, without
+            # looping, while preserving an explicit unresolved state if it fails.
+            if not getattr(stream, "closed", False):
+                try:
+                    stream.close()
+                except BaseException as exc:
+                    item.stream_errors.append(f"{name} stream close retry failed: {type(exc).__name__}: {exc}")
+                if not getattr(stream, "closed", False):
+                    item.stream_errors.append(f"{name} stream remains open after finalization")
         finished_at = self.clock.utc_now()
         finished_monotonic = self.clock.monotonic()
         duration = finished_monotonic - item.started_monotonic

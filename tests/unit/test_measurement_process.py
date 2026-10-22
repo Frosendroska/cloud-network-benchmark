@@ -336,6 +336,70 @@ def test_stop_attempts_to_close_second_stream_after_first_stream_error(tmp_path,
     assert original_open(tmp_path / "err", "rb").read() == b"partial stderr"
 
 
+def test_normal_poll_closes_stderr_and_caches_failed_result_after_stdout_close_errors(tmp_path, monkeypatch):
+    original_open = Path.open
+    streams = {}
+
+    class PersistentCloseFailure:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.close_attempts = 0
+
+        @property
+        def closed(self):
+            return self.wrapped.closed
+
+        def close(self):
+            self.close_attempts += 1
+            raise OSError("stdout close remains unavailable")
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    def wrapped_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.name == "out":
+            stream = PersistentCloseFailure(stream)
+        streams[path.name] = stream
+        return stream
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout, self.stderr, self.stdin = BytesIO(b"native stdout"), BytesIO(b"native stderr"), None
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(Path, "open", wrapped_open)
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
+    runner = LocalMeasurementProcesses(SystemMeasurementClock())
+    req = CommandRequest(action_id="normal-close-error", action_type="measurement", argv=["fake-tool"],
+                         cwd=str(tmp_path), timeout_seconds=1)
+    handle = runner.start(req, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    for thread in handle.threads:
+        thread.join(timeout=1)
+
+    result = runner.poll(handle)
+    assert result is not None and result.outcome == "failed" and result.exit_code == 125
+    assert runner.poll(handle) is result
+    assert streams["out"].close_attempts == 2
+    assert not streams["out"].closed
+    assert streams["err"].closed
+    assert "stdout stream remains open after finalization" in result.stderr
+    assert original_open(tmp_path / "out", "rb").read() == b"native stdout"
+    assert original_open(tmp_path / "err", "rb").read() == b"native stderr"
+
+
 def test_fake_clock_utc_adjustment_does_not_change_monotonic_wait():
     from f03_support import FakeClock
 
