@@ -159,6 +159,37 @@ def test_known_hosts_loss_between_vm_a_and_vm_b_returns_accumulated_result(tmp_p
     assert len(outcome.actions)>10 and not any("vm_b-cloud-init" in request.action_id for request in runner.requests)
 
 
+def test_request_construction_failure_after_identity_preflight_is_returned_as_evidence(tmp_path):
+    c=connection(tmp_path)
+    class LostDuringIdentityCheck(BootstrapRunner):
+        def run(self,request):
+            response=super().run(request)
+            if request.action_id=="f02r-vm_a-sockperf-identity-preflight":
+                Path(c.vm_a.host_key_reference).unlink(missing_ok=True)
+            return response
+    runner=LostDuringIdentityCheck()
+    outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="transport_preflight_failed"
+    assert len(outcome.actions)>2 and outcome.actions[-1].action_id=="f02r-vm_a-sockperf-workspace"
+    assert not any(request.action_id=="f02r-vm_a-sockperf-workspace" for request in runner.requests)
+    assert "request construction failed" in outcome.actions[-1].result["stderr"]
+
+
+def test_listener_request_construction_failure_preserves_setup_actions(tmp_path):
+    c=connection(tmp_path)
+    class LostBeforeListener(BootstrapRunner):
+        def run(self,request):
+            response=super().run(request)
+            if request.action_id=="f02r-vm_b-listener-log-directory-sockperf":
+                Path(c.vm_b.authentication_reference).unlink(missing_ok=True)
+            return response
+    runner=LostBeforeListener()
+    outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="transport_preflight_failed"
+    assert outcome.actions[-1].action_id=="f02r-vm_b-listener-sockperf"
+    assert not any(request.action_id=="f02r-vm_b-listener-sockperf" for request in runner.requests)
+
+
 def test_listener_observation_exhausting_deadline_returns_evidence(tmp_path):
     c=connection(tmp_path); clock_value=[100.0]
     class Clock:
@@ -216,3 +247,45 @@ def test_acl_rejects_accept_or_jump_bypass_before_expected_rules():
     assert not _acl_matches(valid.replace("priority -10; policy accept;", "type filter hook output priority -10; policy accept;"),"10.0.0.1","10.0.0.2",chain)
     assert not _acl_matches(valid.replace("chain cnb_campaign_aws_deployment {", "chain cnb_campaign_aws_deployment {\n  jump unrestricted"),"10.0.0.1","10.0.0.2",chain)
     assert not _acl_matches(valid,"10.0.0.1","10.0.0.2","wrong_chain")
+
+
+def test_acl_preflight_requests_numeric_priority_format_for_fresh_and_reused_chains(tmp_path):
+    for existing in (False, True):
+        case=tmp_path / str(existing); case.mkdir()
+        c=connection(case); runner=BootstrapRunner(existing_acl=existing)
+        outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
+        assert outcome.succeeded
+        request=next(request for request in runner.requests if request.action_id=="f02r-vm_b-acl-preflight-inspect")
+        assert "nft -n -y list chain" in request.argv[-1]
+
+
+def test_effective_systemd_log_destinations_honor_ordered_overrides_and_resets():
+    from cloud_network_benchmark.bootstrap import _unit_log_destinations_match
+    expected_out="/var/lib/cnb/work/server.log"; expected_err="/var/lib/cnb/work/server.err"
+    base=("# /run/systemd/transient/unit.service\n[Service]\n"
+          f"StandardOutput=append:{expected_out}\nStandardError=append:{expected_err}\n")
+    assert _unit_log_destinations_match(base,expected_out,expected_err)
+    assert not _unit_log_destinations_match(base+"# /etc/systemd/system/unit.service.d/override.conf\n[Service]\nStandardOutput=append:/var/lib/cnb/wrong.log\n",expected_out,expected_err)
+    assert not _unit_log_destinations_match(base+"# reset drop-in\n[Service]\nStandardError=\n",expected_out,expected_err)
+    assert not _unit_log_destinations_match(base+"# conflicting drop-in\n[Service]\nStandardError=append:/var/lib/cnb/other.err\n",expected_out,expected_err)
+    assert _unit_log_destinations_match(base+"[Unit]\nStandardOutput=append:/wrong/section\n",expected_out,expected_err)
+
+
+@pytest.mark.parametrize("override",[
+    "StandardOutput=append:/var/lib/cnb/wrong.log\n",
+    "StandardError=append:/var/lib/cnb/wrong.err\n",
+    "StandardOutput=\n",
+    "StandardError=\n",
+])
+def test_repeated_preparation_rejects_effective_log_override_or_reset(tmp_path,override):
+    c=connection(tmp_path)
+    class WrongDropin(BootstrapRunner):
+        def run(self,request):
+            if request.action_id=="f02r-vm_b-preflight-listener-config-sockperf":
+                return result(request.action_id,
+                    "[Service]\nStandardOutput=append:/var/lib/cnb/work/server-logs/sockperf.log\n"
+                    "StandardError=append:/var/lib/cnb/work/server-logs/sockperf.err\n"
+                    "# /etc/systemd/system/override.conf\n[Service]\n"+override)
+            return super().run(request)
+    outcome=run_bootstrap(c,bootstrap_config(),WrongDropin(existing_listeners=True,existing_acl=True),deadline=deadline(),clock=lambda:100)
+    assert not outcome.succeeded and outcome.failure.category=="listener_state_mismatch"

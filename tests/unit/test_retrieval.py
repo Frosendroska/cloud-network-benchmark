@@ -18,6 +18,13 @@ def manifest(c,payload=b"native"):
     return RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace="/var/lib/cnb/work",declarations=[declaration],items=[item],measurement_ended_at=now,producers_closed_at=now,closure_evidence="producer flush observed")
 
 
+def multi_manifest(c,payload=b"native"):
+    first=manifest(c,payload); now=first.measurement_ended_at
+    declaration=ArtifactInput(artifact_id="iperf3-b",path="measurements/b.jsonl",kind="iperf3-jsonl",producer="vm_b",expectation="required")
+    item=RetrievalItem(artifact_id="iperf3-b",deployment_id=c.deployment_id,source_vm=c.vm_b.host,source_role="vm_b",source_path="/var/lib/cnb/work/b.jsonl",destination_path="measurements/b.jsonl",kind="iperf3-jsonl",expected_size_bytes=len(payload),expected_sha256=hashlib.sha256(payload).hexdigest(),timeout_seconds=5)
+    return RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace="/var/lib/cnb/work",declarations=[*first.declarations,declaration],items=[*first.items,item],measurement_ended_at=now,producers_closed_at=now,closure_evidence="both producers flush observed")
+
+
 def test_retrieval_verifies_materialized_bytes_and_final_record(tmp_path):
     c=connection(tmp_path); payload=b"native"
     class Runner:
@@ -83,6 +90,72 @@ def test_cleanup_reserve_exhaustion_stops_before_remote_observation(tmp_path):
     outcome=run_retrieval(c,manifest(c),runner,tmp_path,deadline=deadline(),clock=lambda:291)
     assert not outcome.complete and outcome.cleanup_required
     assert outcome.failure.category=="cleanup_allowance_reached" and not outcome.actions
+
+
+def test_inventory_consuming_remaining_allowance_returns_pending_item_evidence(tmp_path):
+    c=connection(tmp_path); payload=b"native"; now=[100.0]
+    class SlowInventory:
+        def __init__(self): self.requests=[]
+        def __call__(self,request): return self.run(request)
+        def run(self,request):
+            self.requests.append(request)
+            now[0]=290.0
+            return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+    runner=SlowInventory()
+    outcome=run_retrieval(c,multi_manifest(c,payload),runner,tmp_path,deadline=deadline(),clock=lambda:now[0])
+    assert not outcome.complete and outcome.cleanup_required
+    assert len(outcome.actions)==1 and outcome.actions[0].action_type=="ssh"
+    assert not outcome.attempts and len(outcome.records)==2
+    assert outcome.records[0].failure.category=="cleanup_allowance_reached_before_transfer"
+    assert outcome.records[1].failure.category=="not_attempted_after_stop"
+    assert outcome.failure.category=="cleanup_allowance_reached_before_transfer"
+
+
+def test_staging_that_consumes_copy_allowance_prevents_scp_and_records_exhaustion(tmp_path,monkeypatch):
+    import cloud_network_benchmark.retrieval as retrieval
+    c=connection(tmp_path); payload=b"native"; now=[100.0]; requests=[]
+    class Clock:
+        def __call__(self): return now[0]
+    class Inventory:
+        def run(self,request):
+            requests.append(request)
+            if request.action_type=="ssh":
+                return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(b"partial")
+            return result(request.action_id)
+    real_mkdir=retrieval.Path.mkdir
+    staging_calls=[0]
+    def delayed_mkdir(path,*args,**kwargs):
+        value=real_mkdir(path,*args,**kwargs)
+        if path.name==".f02r-attempts":
+            staging_calls[0]+=1
+            now[0]=150.0 if staging_calls[0]==1 else 290.0
+        return value
+    monkeypatch.setattr(retrieval.Path,"mkdir",delayed_mkdir)
+    outcome=run_retrieval(c,multi_manifest(c,payload),Inventory(),tmp_path,deadline=deadline(),clock=Clock())
+    assert [request.action_type for request in requests]==["ssh","scp"]
+    assert requests[1].timeout_seconds>0 and requests[1].timeout_seconds<=5
+    assert len(outcome.attempts)==1 and outcome.attempts[0].size_bytes==len(b"partial") and not outcome.complete
+    assert outcome.records[0].failure.category=="cleanup_allowance_reached_before_transfer"
+    assert outcome.records[1].failure.category=="not_attempted_after_stop"
+    assert (tmp_path/".f02r-attempts").is_dir()
+
+
+def test_lost_known_hosts_during_inventory_keeps_request_failure_and_skips_scp(tmp_path):
+    c=connection(tmp_path); payload=b"native"
+    class LostIdentity:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            Path(c.vm_a.host_key_reference).unlink(missing_ok=True)
+            return result(request.action_id,f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+    runner=LostIdentity()
+    outcome=run_retrieval(c,manifest(c,payload),runner,tmp_path,deadline=deadline(),clock=lambda:100)
+    assert not outcome.complete and len(outcome.actions)==2
+    assert len(runner.requests)==1 and outcome.failure.category=="transport_preflight_failed"
+    assert outcome.actions[-1].action_type=="scp"
+    assert "request construction failed" in outcome.actions[-1].result["stderr"]
+    assert outcome.records[0].failure.category=="transport_preflight_failed"
 
 
 def test_remote_workspace_and_declaration_mismatches_are_rejected(tmp_path):

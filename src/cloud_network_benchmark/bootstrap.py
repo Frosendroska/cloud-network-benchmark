@@ -12,9 +12,33 @@ from pathlib import PurePosixPath
 
 from pydantic import Field, field_validator, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _identity_references_available, _request, _request_failure
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
 from .contracts.common import CommandOutcome, IdentityContext, StrictModel
 from .contracts.execution import CommandRequest, CommandRunner
+
+
+def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
+    """Keep local request-construction failures inside the action evidence stream."""
+    try:
+        return _build_request(action_id, connection, argv, timeout, action_type)
+    except Exception:
+        safe_timeout = timeout if math.isfinite(timeout) and timeout > 0 else 0.001
+        return CommandRequest(action_id=action_id, action_type=action_type,
+            argv=["scp" if action_type == "scp" else "ssh", "[request-construction-failed]"], cwd=".",
+            environment_classification="contains_secret_references", timeout_seconds=safe_timeout,
+            redactions=[connection.authentication_reference, connection.host_key_reference])
+
+
+def _execute(runner: CommandRunner, request: CommandRequest):
+    if request.argv and request.argv[-1] == "[request-construction-failed]":
+        from datetime import datetime, timezone
+        from .contracts.common import CommandOutcome
+        from .contracts.execution import CommandResult
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED, started_at=now,
+            finished_at=now, duration_seconds=0, exit_code=1, stdout="",
+            stderr="request construction failed: authenticated transport preflight", redactions=request.redactions)
+    return _run_command(runner, request)
 
 
 class SourceBuild(StrictModel):
@@ -151,8 +175,23 @@ def _unit_matches(text: str, config_text: str, tool: str, address: str, port: in
 
 
 def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
-    return (f"StandardOutput=append:{stdout_path}" in text.splitlines()
-            and f"StandardError=append:{stderr_path}" in text.splitlines())
+    effective = {"StandardOutput": None, "StandardError": None}
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section != "Service" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in effective:
+            # systemd's empty assignment resets an inherited setting; the
+            # subsequent effective value must still be explicit and exact.
+            effective[key] = value or None
+    return effective == {"StandardOutput": f"append:{stdout_path}", "StandardError": f"append:{stderr_path}"}
 
 
 def _process_identity_command(unit: str, binary: str) -> list[str]:
@@ -274,6 +313,8 @@ def render_commands(config: BootstrapConfig, role: str) -> List[List[str]]:
 def _failure_result(connection, actions, vm, request, result, category, message, builds, listeners):
     if result.outcome == CommandOutcome.INTERRUPTED:
         category, message = "command_interrupted", "remote preparation command was interrupted"
+    elif "request construction failed" in result.stderr:
+        category, message = "transport_preflight_failed", "authenticated remote request could not be constructed"
     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
                            actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
 
@@ -410,7 +451,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             pre_remaining = deadline.remaining(clock, readiness=True)
             if pre_remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before guest restriction", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            pre_request = _request(pre_id, vm, ["sudo", "nft", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, pre_remaining))
+            pre_request = _request(pre_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, pre_remaining))
             pre_result = _execute(runner, pre_request)
             actions.append(_action(pre_id, "ssh", vm, pre_request, pre_result))
             if pre_result.outcome == CommandOutcome.SUCCEEDED:

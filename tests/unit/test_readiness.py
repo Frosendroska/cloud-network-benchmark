@@ -101,6 +101,30 @@ def test_exact_listener_pid_acl_semantics_and_redacted_observation(tmp_path):
     assert secret not in encoded and "synthetic-secret" not in encoded and "[REDACTED]" in encoded
 
 
+def test_readiness_rejects_effective_service_log_overrides_and_accepts_matching_dropins(tmp_path):
+    from cloud_network_benchmark.readiness import _predicate
+    c=connection(tmp_path); prepared=run_bootstrap(c,bootstrap_config(),BootstrapRunner(),deadline=deadline(),clock=lambda:100)
+    listener=next(item for item in prepared.listeners if item.tool=="sockperf")
+    matching=("# /run/systemd/transient/unit.service\n[Service]\n"
+        f"StandardOutput=append:{listener.stdout_path}\nStandardError=append:{listener.stderr_path}\n"
+        "# /etc/systemd/system/unit.service.d/override.conf\n[Service]\n"
+        f"StandardOutput=append:{listener.stdout_path}\nStandardError=append:{listener.stderr_path}\n")
+    assert _predicate("unit-config-sockperf",matching,c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardOutput=append:/var/lib/cnb/wrong.log\n",c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardError=\n",c,prepared)
+    assert not _predicate("unit-config-sockperf",matching+"StandardError=append:/var/lib/cnb/conflict.err\n",c,prepared)
+
+    class Override:
+        def run(self,request):
+            output=readiness_output(request,prepared)
+            if request.action_id=="f02r-ready-unit-config-sockperf-1":
+                output += "# /etc/systemd/system/override.conf\n[Service]\nStandardOutput=append:/var/lib/cnb/wrong.log\n"
+            return result(request.action_id,output)
+    outcome=run_readiness(c,ReadinessConfig(poll_interval_seconds=.01,attempt_ceiling=1),Override(),prepared=prepared,deadline=deadline(),clock=lambda:100)
+    assert not outcome.ready and outcome.failure.category=="readiness_predicate_failed"
+    assert outcome.failure.action_id=="f02r-ready-unit-config-sockperf-1"
+
+
 def test_late_success_at_original_deadline_is_not_ready(tmp_path):
     from fixtures.f02r.helpers import FakeClock
     from datetime import timedelta

@@ -14,10 +14,31 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _failure, _identity_references_available, _request, _request_failure
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
 from .contracts.artifacts import ArtifactInput, ArtifactRecord, resolve_artifact_path
 from .contracts.common import ArtifactExpectation, CommandOutcome, Evidence, FailureEvidence, StrictModel, StringEvidence, VmRole
-from .contracts.execution import CommandRequest, CommandRunner
+from .contracts.execution import CommandRequest, CommandResult, CommandRunner
+
+
+def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
+    """Represent local authenticated-request failures without invoking a runner."""
+    try:
+        return _build_request(action_id, connection, argv, timeout, action_type)
+    except Exception:
+        safe_timeout = timeout if math.isfinite(timeout) and timeout > 0 else 0.001
+        return CommandRequest(action_id=action_id, action_type=action_type,
+            argv=["scp" if action_type == "scp" else "ssh", "[request-construction-failed]"], cwd=".",
+            environment_classification="contains_secret_references", timeout_seconds=safe_timeout,
+            redactions=[connection.authentication_reference, connection.host_key_reference])
+
+
+def _execute(runner: CommandRunner, request: CommandRequest):
+    if request.argv and request.argv[-1] == "[request-construction-failed]":
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+            started_at=now, finished_at=now, duration_seconds=0, exit_code=1, stdout="",
+            stderr="request construction failed: authenticated transport preflight", redactions=request.redactions)
+    return _run_command(runner, request)
 
 
 class RetrievalItem(StrictModel):
@@ -308,7 +329,8 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
         except (ValueError, IndexError):
             observed_size, observed_hash = None, None
         if observed_size != item.expected_size_bytes or observed_hash != item.expected_sha256:
-            inventory_error = "command runner raised " in obs_result.stderr
+            inventory_error = ("command runner raised " in obs_result.stderr
+                               or "request construction failed" in obs_result.stderr)
             failure = _evidence_failure(item, "inventory_command_error" if inventory_error else "remote_inventory_mismatch", "remote closed-file observation did not match supplied inventory", obs_request.action_id)
             failures.append(failure.model_dump(mode="json"))
             primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category="inventory_command_error" if inventory_error else "remote_inventory_mismatch", message="remote closed-file observation did not match inventory", source_path=item.source_path, occurred_at=obs_result.finished_at)
@@ -317,15 +339,26 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 stop = True
             continue
         item_verified = False
+        reason = "cleanup_allowance_reached_before_transfer"
+        last_attempt = None
         for attempt in (1, 2):
             remaining = deadline.remaining(clock, cleanup=True)
             if remaining <= 0:
+                reason = "cleanup_allowance_reached_before_transfer"
+                stop = True
                 break
             staging = child_root / ".f02r-attempts" / f"{item.artifact_id}-{attempt}-{uuid4().hex}.part"
             try:
                 staging.parent.mkdir(parents=True, exist_ok=True)
                 if staging.parent.is_symlink() or staging.exists() or staging.is_symlink():
                     raise OSError("unsafe or colliding staging path")
+                # Local staging can consume the original copy allowance. Re-read
+                # it immediately before constructing the SCP command.
+                remaining = deadline.remaining(clock, cleanup=True)
+                if remaining <= 0:
+                    reason = "cleanup_allowance_reached_before_transfer"
+                    stop = True
+                    break
                 remote = f"{vm.user}@{vm.host}:{item.source_path}"
                 req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm, [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
                 result = _execute(runner, req)
@@ -338,7 +371,9 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             actions.append(_action(req.action_id, "scp", vm, req, result))
             size = digest = None
             reason = None
-            if not staging.is_file() or staging.is_symlink():
+            if req.argv and req.argv[-1] == "[request-construction-failed]":
+                reason = "transport_preflight_failed"
+            elif not staging.is_file() or staging.is_symlink():
                 reason = f"copy_{result.outcome}" if result.outcome != CommandOutcome.SUCCEEDED else "copy_not_materialized"
             else:
                 try:
@@ -359,6 +394,8 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 except OSError:
                     reason = "staging_read_failed"
             attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed", size_bytes=size, sha256=digest, reason=reason))
+            if reason == "transport_preflight_failed":
+                stop = True
             if reason is None:
                 try:
                     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -427,10 +464,16 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             if result.outcome == CommandOutcome.INTERRUPTED:
                 stop = True
                 break
+            if reason == "transport_preflight_failed":
+                break
         if not item_verified:
             last_attempt = next((attempt for attempt in reversed(attempts) if attempt.artifact_id == item.artifact_id), None)
-            reason = (last_attempt.reason if last_attempt and last_attempt.reason else reason or "transfer_incomplete")
+            if reason != "cleanup_allowance_reached_before_transfer":
+                reason = last_attempt.reason if last_attempt and last_attempt.reason else reason or "transfer_incomplete"
             failure = _evidence_failure(item, reason, "artifact was not verified and published within the available cleanup allowance")
+            if reason == "cleanup_allowance_reached_before_transfer":
+                failures.append(failure.model_dump(mode="json"))
+                primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message="staging work exhausted the original copy allowance before SCP", source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True,
                 size_bytes=Evidence[int](value=last_attempt.size_bytes) if last_attempt and last_attempt.size_bytes is not None else Evidence[int](unavailable_reason="no observed local size"),
                 sha256=StringEvidence(value=last_attempt.sha256) if last_attempt and last_attempt.sha256 is not None else StringEvidence(unavailable_reason="no observed local hash"),
