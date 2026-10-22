@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+from math import isfinite
 import os
 import re
 import tempfile
@@ -81,6 +82,7 @@ class AwsRuntimeSettings(StrictModel):
     cost_input_id: str = Field(min_length=1)
     cost_input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     cost_source_path: str = Field(min_length=1)
+    complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
@@ -260,6 +262,9 @@ class AwsProviderDriver:
                     "action_timeout_seconds": EXPIRY_ACTION_TIMEOUT_SECONDS,
                     "planned_expiry_cost_per_region_usd": EXPIRY_COST_PER_REGION,
                     "planned_expiry_cost_usd": EXPIRY_COST_PER_REGION * len(regions),
+                    "expiry_cost_handoff_source_path": self.settings.complete_workflow_cost_handoff.value["source_path"],
+                    "expiry_cost_handoff_source_sha256": self.settings.complete_workflow_cost_handoff.value["source_sha256"],
+                    "expiry_cost_included_usd": self.settings.complete_workflow_cost_handoff.value["expiry_cost_included_usd"],
                     "stop_is_not_deletion": True,
                 }),
             )
@@ -513,7 +518,8 @@ class AwsProviderDriver:
         if expiry and journal.get("regional_expiry_outcomes"):
             outcomes = journal["regional_expiry_outcomes"]
             states = {item.get("state") for item in outcomes.values()}
-            state = "cancelled" if states == {"Cancelled"} else "triggered" if states == {"Success"} else "failed"
+            failed_states = states & {"Failed", "TimedOut"}
+            state = "failed" if failed_states else "triggered" if "Success" in states else "cancelled"
             failure = _failure(AwsProviderError("one or more regional expiry executions failed or timed out", category="expiry_execution_failed"), self.clock()) if state == "failed" else None
             expiry = expiry.model_copy(update={"state": state, "failure": failure, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
@@ -569,9 +575,10 @@ class AwsProviderDriver:
         ):
             raise AwsProviderError("dated complete-workflow cost source identity/hash does not match", category="cost_source_mismatch")
         _validate_expiry_price_fixture(self._root(), self.settings)
+        regions = self._regions(deployment)
+        self._validate_expiry_cost_coverage(reservation, regions)
         if request.reservation_id.value != reservation.reservation_id.value:
             raise AwsProviderError("expiry reservation identity does not match active reservation", category="reservation_mismatch")
-        regions = self._regions(deployment)
         trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
         selector = self._target_selector(deployment, regions)
         if request.target_selector != selector or request.resource_namespace != _namespace(deployment):
@@ -590,6 +597,31 @@ class AwsProviderDriver:
                 raise AwsProviderError("scenario requires sourced primary-review admission evidence", category="review_required")
         self._block_on_residual_cleanup(deployment)
         return regions, reservation, trigger
+
+    def _validate_expiry_cost_coverage(self, reservation: ReservationEvidence, regions: list[str]) -> None:
+        required = round(EXPIRY_COST_PER_REGION * len(regions), 4)
+        reserved = reservation.reserved_cost_usd.value
+        if reserved is None or reserved + 1e-9 < required:
+            raise AwsProviderError(f"reserved cost does not cover the AWS expiry allowance of {required:.4f} USD", category="expiry_cost_underreserved")
+        handoff = self.settings.complete_workflow_cost_handoff.value
+        if not isinstance(handoff, dict):
+            raise AwsProviderError("complete-workflow cost handoff is missing expiry coverage evidence", category="expiry_cost_handoff_missing")
+        included = handoff.get("expiry_cost_included_usd")
+        if (
+            handoff.get("source_path") != reservation.source_path
+            or handoff.get("source_sha256") != reservation.source_sha256
+            or handoff.get("expiry_input_id") != EXPIRY_INPUT_ID
+            or handoff.get("expiry_input_sha256") != EXPIRY_INPUT_SHA256
+            or handoff.get("expiry_cost_allowance_per_region_usd") != EXPIRY_COST_PER_REGION
+            or handoff.get("expiry_cost_regions") != regions
+            or isinstance(included, bool)
+            or not isinstance(included, (int, float))
+            or not isfinite(included)
+            or included + 1e-9 < required
+        ):
+            raise AwsProviderError("complete-workflow cost handoff does not identify the matching sourced AWS expiry allowance", category="expiry_cost_handoff_mismatch")
+        if reserved + 1e-9 < included:
+            raise AwsProviderError("reserved cost is below the expiry amount claimed by the complete-workflow cost handoff", category="expiry_cost_underreserved")
 
     def _block_on_residual_cleanup(self, deployment: ProviderDeploymentInput) -> None:
         root = self.settings.private_state_root.expanduser().absolute()
@@ -1132,7 +1164,9 @@ class AwsProviderDriver:
             state = execution.get("AutomationExecutionStatus")
         if state not in TERMINAL_AUTOMATION_STATES:
             raise AwsProviderError(f"expiry execution remains nonterminal in {region}: {state}", category="expiry_cancel_unverified")
-        return {"state": str(state), "steps": execution.get("StepExecutions"), "step_executions_truncated": execution.get("StepExecutionsTruncated"), "outputs": execution.get("Outputs"), "failure_message": execution.get("FailureMessage")}
+        stop_step = next((step for step in execution["StepExecutions"] if step.get("StepName") == "discoverAndStopOwnedInstances"), None)
+        stop_payload = _expiry_stop_payload(stop_step, parameters) if stop_step and stop_step.get("StepStatus") == "Success" else None
+        return {"state": str(state), "steps": execution.get("StepExecutions"), "step_executions_truncated": execution.get("StepExecutionsTruncated"), "outputs": execution.get("Outputs"), "stop_payload": stop_payload, "failure_message": execution.get("FailureMessage")}
 
     def _expiry_from_journal(self, deployment: ProviderDeploymentInput, journal: dict[str, Any]) -> ExpiryEvidence | None:
         value = journal.get("expiry_evidence")
@@ -1399,15 +1433,74 @@ def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, r
         raise AwsProviderError(f"terminal expiry readback identity differs in {region}", category="expiry_terminal_identity")
     if parameters.get("Region") != [region] or execution.get("StepExecutionsTruncated") is not False or not isinstance(steps, list):
         raise AwsProviderError(f"terminal expiry readback is incomplete in {region}", category="expiry_terminal_incomplete")
-    sleep = [step for step in steps if isinstance(step, dict) and step.get("StepName") == "waitUntilExpiry"]
-    if len(sleep) != 1 or sleep[0].get("Action") != "aws:sleep" or _ssm_scalar((sleep[0].get("Inputs") or {}).get("Timestamp")) != parameters.get("ExpiryTriggerUtc", [None])[0]:
-        raise AwsProviderError(f"terminal expiry sleep evidence differs in {region}", category="expiry_terminal_step")
     status = execution.get("AutomationExecutionStatus")
+    if not steps and status in {"Pending", "Cancelled"}:
+        return
+    if len(steps) not in {1, 2} or any(not isinstance(step, dict) for step in steps):
+        raise AwsProviderError(f"terminal expiry step evidence is ambiguous in {region}", category="expiry_terminal_step")
+    sleep = [step for step in steps if step.get("StepName") == "waitUntilExpiry"]
+    stop = [step for step in steps if step.get("StepName") == "discoverAndStopOwnedInstances"]
+    if len(sleep) != 1 or len(stop) > 1 or len(sleep) + len(stop) != len(steps) or steps[0] is not sleep[0] or (stop and steps[1] is not stop[0]) or sleep[0].get("Action") != "aws:sleep" or _ssm_scalar((sleep[0].get("Inputs") or {}).get("Timestamp")) != parameters.get("ExpiryTriggerUtc", [None])[0]:
+        raise AwsProviderError(f"terminal expiry sleep evidence differs in {region}", category="expiry_terminal_step")
     step_status = sleep[0].get("StepStatus")
     if status not in TERMINAL_AUTOMATION_STATES | {"Pending", "InProgress"} or step_status not in {"Pending", "InProgress", "Success", "Cancelled", "TimedOut", "Failed"}:
         raise AwsProviderError(f"terminal expiry status evidence is malformed in {region}", category="expiry_terminal_step")
-    if status == "Success" and step_status != "Success" or status == "InProgress" and step_status != "InProgress":
-        raise AwsProviderError(f"terminal expiry top-level and sleep-step statuses conflict in {region}", category="expiry_terminal_step")
+    stop_status = stop[0].get("StepStatus") if stop else None
+    if stop and (stop[0].get("Action") != "aws:executeScript" or not _expiry_stop_inputs_match(stop[0], parameters, region)):
+        raise AwsProviderError(f"terminal expiry stop step identity differs in {region}", category="expiry_terminal_step")
+    if stop and stop_status not in {"Pending", "InProgress", "Success", "Cancelled", "TimedOut", "Failed"}:
+        raise AwsProviderError(f"terminal expiry stop status is malformed in {region}", category="expiry_terminal_step")
+    if status == "Success":
+        if step_status != "Success" or not stop or stop_status != "Success":
+            raise AwsProviderError(f"successful expiry lacks completed stop-step evidence in {region}", category="expiry_terminal_step")
+        _expiry_stop_payload(stop[0], parameters)
+    elif status == "InProgress":
+        if step_status == "Success":
+            if not stop or stop_status not in {"Pending", "InProgress"} or execution.get("CurrentStepName") != "discoverAndStopOwnedInstances" or execution.get("CurrentAction") != "aws:executeScript":
+                raise AwsProviderError(f"active expiry stop-step evidence conflicts in {region}", category="expiry_terminal_step")
+        elif step_status != "InProgress" or stop or execution.get("CurrentStepName") != "waitUntilExpiry" or execution.get("CurrentAction") != "aws:sleep":
+            raise AwsProviderError(f"active expiry sleep-step evidence conflicts in {region}", category="expiry_terminal_step")
+    elif status in {"Failed", "TimedOut"}:
+        if not (step_status in {"Failed", "TimedOut"} or stop_status in {"Failed", "TimedOut"}):
+            raise AwsProviderError(f"failed expiry lacks a failed or timed-out step in {region}", category="expiry_terminal_step")
+    elif status == "Cancelled":
+        if step_status == "Success" and (not stop or stop_status not in {"Pending", "Cancelled"}):
+            raise AwsProviderError(f"cancelled expiry has conflicting stop-step evidence in {region}", category="expiry_terminal_step")
+        if step_status in {"Failed", "TimedOut"} or stop_status in {"Failed", "TimedOut", "Success", "InProgress"}:
+            raise AwsProviderError(f"cancelled expiry has conflicting terminal step evidence in {region}", category="expiry_terminal_step")
+
+
+def _expiry_stop_inputs_match(step: dict[str, Any], parameters: dict[str, list[str]], region: str) -> bool:
+    inputs = step.get("Inputs")
+    if not isinstance(inputs, dict):
+        return False
+    raw = inputs.get("InputPayload")
+    if not isinstance(raw, str):
+        return False
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+    except (TypeError, ValueError):
+        return False
+    return payload == {"run_id": parameters.get("RunId", [None])[0], "deployment_id": parameters.get("DeploymentId", [None])[0], "region": region}
+
+
+def _expiry_stop_payload(step: dict[str, Any], parameters: dict[str, list[str]]) -> dict[str, Any]:
+    outputs = step.get("Outputs")
+    values = outputs.get("OutputPayload") if isinstance(outputs, dict) else None
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], str):
+        raise AwsProviderError("successful expiry stop step has absent or ambiguous payload", category="expiry_terminal_payload")
+    try:
+        payload = json.loads(values[0])
+    except (TypeError, ValueError) as exc:
+        raise AwsProviderError("successful expiry stop payload is malformed", category="expiry_terminal_payload") from exc
+    required = {"run_id", "deployment_id", "discovery_seconds", "action_timeout_seconds", "instances_seen", "stop_requests", "errors", "owned_instance_count_anomaly", "unresolved_instance_ids", "complete_deletion"}
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    valid_errors = isinstance(errors, list) and all(isinstance(item, dict) and isinstance(item.get("instance_id"), str) and isinstance(item.get("code"), str) for item in errors)
+    if not isinstance(payload, dict) or not required <= payload.keys() or payload.get("run_id") != parameters.get("RunId", [None])[0] or payload.get("deployment_id") != parameters.get("DeploymentId", [None])[0] or payload.get("discovery_seconds") != EXPIRY_SCRIPT_SECONDS or payload.get("action_timeout_seconds") != EXPIRY_ACTION_TIMEOUT_SECONDS or not isinstance(payload.get("instances_seen"), dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in payload["instances_seen"].items()) or not isinstance(payload.get("stop_requests"), list) or not all(isinstance(item, str) for item in payload["stop_requests"]) or not valid_errors or not isinstance(payload.get("owned_instance_count_anomaly"), bool) or not isinstance(payload.get("unresolved_instance_ids"), list) or not all(isinstance(item, str) for item in payload["unresolved_instance_ids"]) or payload.get("complete_deletion") is not False:
+        raise AwsProviderError("successful expiry stop payload is incomplete or mismatched", category="expiry_terminal_payload")
+    return payload
 
 
 def _ssm_scalar(value: Any) -> str | None:

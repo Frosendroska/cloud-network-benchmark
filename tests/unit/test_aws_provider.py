@@ -20,6 +20,7 @@ from cloud_network_benchmark.providers.aws import (
     EXPIRY_INPUT_ID,
     EXPIRY_INPUT_PATH,
     EXPIRY_INPUT_SHA256,
+    EXPIRY_COST_PER_REGION,
     _ssm_scalar,
     SAFETY_LEAD_SECONDS,
     AwsProviderDriver,
@@ -90,6 +91,15 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
         "cost_input_id": deployment.admission.cost_input_id,
         "cost_input_sha256": deployment.admission.cost_input_sha256.value,
         "cost_source_path": deployment.reservation.value.source_path,
+        "complete_workflow_cost_handoff": StructuredEvidence(value={
+            "source_path": deployment.reservation.value.source_path,
+            "source_sha256": deployment.reservation.value.source_sha256,
+            "expiry_input_id": EXPIRY_INPUT_ID,
+            "expiry_input_sha256": EXPIRY_INPUT_SHA256,
+            "expiry_cost_allowance_per_region_usd": EXPIRY_COST_PER_REGION,
+            "expiry_cost_regions": list(dict.fromkeys((deployment.vm_a.region, deployment.vm_b.region))),
+            "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
+        }),
         "complete_workflow_remaining_seconds": 120,
     }
     values.update(overrides)
@@ -147,6 +157,37 @@ def test_active_reservation_source_and_trigger_are_bound_before_any_command(tmp_
     assert reservation.reservation_id.value == "reservation-1"
     assert trigger == NOW + timedelta(seconds=840)
     assert driver._pair_variables(deployment)["account_id"] == "123456789012"
+
+
+@pytest.mark.parametrize("scenario,reserved,included,category", [
+    ("same_zone", 0.0, 0.0139, "expiry_cost_underreserved"),
+    ("same_zone", 0.0138, 0.0139, "expiry_cost_underreserved"),
+    ("inter_region", 0.0277, 0.0278, "expiry_cost_underreserved"),
+    ("same_zone", 1.0, 0.0138, "expiry_cost_handoff_mismatch"),
+])
+def test_expiry_registration_requires_sufficient_sourced_cost_handoff(tmp_path, scenario, reserved, included, category):
+    config_path = "configs/experiments/exp-004-inter-region.yaml" if scenario == "inter_region" else "configs/tests/exp-900-single-provider.yaml"
+    deployment = make_deployment(config_path=config_path)
+    reservation = deployment.reservation.value.model_copy(update={"reserved_cost_usd": Evidence[float](value=reserved)})
+    deployment = deployment.model_copy(update={"reservation": Evidence[ReservationEvidence](value=reservation)})
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    handoff = dict(driver.settings.complete_workflow_cost_handoff.value)
+    handoff["expiry_cost_included_usd"] = included
+    driver.settings = driver.settings.model_copy(update={"complete_workflow_cost_handoff": StructuredEvidence(value=handoff)})
+    with pytest.raises(AwsProviderError) as error:
+        driver._validate_registration(deployment, make_request(driver, deployment))
+    assert error.value.category == category
+
+
+@pytest.mark.parametrize("scenario,required", [("same_zone", 0.0139), ("inter_region", 0.0278)])
+def test_expiry_registration_accepts_exact_sourced_allowance(tmp_path, scenario, required):
+    config_path = "configs/experiments/exp-004-inter-region.yaml" if scenario == "inter_region" else "configs/tests/exp-900-single-provider.yaml"
+    deployment = make_deployment(config_path=config_path)
+    reservation = deployment.reservation.value.model_copy(update={"reserved_cost_usd": Evidence[float](value=required)})
+    deployment = deployment.model_copy(update={"reservation": Evidence[ReservationEvidence](value=reservation)})
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    regions, _, _ = driver._validate_registration(deployment, make_request(driver, deployment))
+    assert len(regions) == (2 if scenario == "inter_region" else 1)
 
 
 @pytest.mark.parametrize("change,match", [
@@ -670,6 +711,47 @@ def test_terminal_expiry_evidence_rejects_foreign_execution_and_wrong_region():
     with pytest.raises(AwsProviderError, match="incomplete"):
         _validate_terminal_execution(execution, "expected-exec", "eu-west-2",
             {"document_name": "expiry", "document_version": "1"}, params)
+
+
+def _terminal_stop_step(params, status="Success", payload=None):
+    payload = payload or {"run_id": params["RunId"][0], "deployment_id": params["DeploymentId"][0],
+        "discovery_seconds": 300, "action_timeout_seconds": 330, "instances_seen": {"i-1": "stopping"},
+        "stop_requests": ["i-1"], "errors": [], "owned_instance_count_anomaly": False,
+        "unresolved_instance_ids": ["i-1"], "complete_deletion": False}
+    return {"StepName": "discoverAndStopOwnedInstances", "Action": "aws:executeScript", "StepStatus": status,
+        "Inputs": {"InputPayload": json.dumps({"run_id": params["RunId"][0], "deployment_id": params["DeploymentId"][0], "region": params["Region"][0]})},
+        "Outputs": {"OutputPayload": [json.dumps(payload)]} if status == "Success" else {}}
+
+
+def test_terminal_expiry_requires_successful_stop_step_and_bound_payload():
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    safety = {"document_name": "expiry", "document_version": "1"}
+    sleep = {"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "Success",
+        "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}}
+    base = {"AutomationExecutionId": "exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False, "AutomationExecutionStatus": "Success"}
+    with pytest.raises(AwsProviderError, match="completed stop-step"):
+        _validate_terminal_execution({**base, "StepExecutions": [sleep]}, "exec", "eu-central-1", safety, params)
+    stop = _terminal_stop_step(params)
+    _validate_terminal_execution({**base, "StepExecutions": [sleep, stop]}, "exec", "eu-central-1", safety, params)
+    malformed = _terminal_stop_step(params, payload={"run_id": "foreign"})
+    with pytest.raises(AwsProviderError, match="payload"):
+        _validate_terminal_execution({**base, "StepExecutions": [sleep, malformed]}, "exec", "eu-central-1", safety, params)
+
+
+def test_terminal_expiry_accepts_sleep_complete_while_stop_is_running():
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    execution = {"AutomationExecutionId": "exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False, "AutomationExecutionStatus": "InProgress",
+        "CurrentAction": "aws:executeScript", "CurrentStepName": "discoverAndStopOwnedInstances",
+        "StepExecutions": [
+            {"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "Success",
+                "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}},
+            _terminal_stop_step(params, status="InProgress"),
+        ]}
+    _validate_terminal_execution(execution, "exec", "eu-central-1", {"document_name": "expiry", "document_version": "1"}, params)
 
 
 def test_automation_confirmation_retries_pending_with_one_execution_id_and_scalar_inputs(tmp_path):

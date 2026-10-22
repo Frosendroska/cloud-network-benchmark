@@ -11,7 +11,7 @@ from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRe
 from cloud_network_benchmark.contracts.common import CommandOutcome, Evidence, StringEvidence, StructuredEvidence
 from cloud_network_benchmark.contracts.deployment import ProviderDeploymentInput
 from cloud_network_benchmark.contracts.execution import CommandResult
-from cloud_network_benchmark.providers.aws import AwsProviderDriver, AwsProviderError, AwsRuntimeSettings
+from cloud_network_benchmark.providers.aws import AwsProviderDriver, AwsProviderError, AwsRuntimeSettings, EXPIRY_COST_PER_REGION, EXPIRY_INPUT_ID, EXPIRY_INPUT_SHA256
 
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -133,6 +133,13 @@ def make_inter_region_attempt(tmp_path, scenario="inter_region"):
         authentication_reference="private-ssh-key:attempt-only", private_state_root=tmp_path / "state",
         aws_cli="aws", terraform="terraform", cost_input_id=observation.admission.cost_input_id,
         cost_input_sha256=source_hash, cost_source_path=reservation.source_path,
+        complete_workflow_cost_handoff=StructuredEvidence(value={
+            "source_path": reservation.source_path, "source_sha256": reservation.source_sha256,
+            "expiry_input_id": EXPIRY_INPUT_ID, "expiry_input_sha256": EXPIRY_INPUT_SHA256,
+            "expiry_cost_allowance_per_region_usd": EXPIRY_COST_PER_REGION,
+            "expiry_cost_regions": list(dict.fromkeys((deployment.vm_a.region, deployment.vm_b.region))),
+            "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
+        }),
         complete_workflow_remaining_seconds=120,
     )
     if observation.admission.requires_primary_review:
@@ -142,14 +149,29 @@ def make_inter_region_attempt(tmp_path, scenario="inter_region"):
     return deployment, settings
 
 
-def terminal_automation(execution_id, document_name, parameters, status="Cancelled", outputs=None):
-    return {"AutomationExecution": {
+def terminal_automation(execution_id, document_name, parameters, status="Cancelled", outputs=None, *, sleep_status=None, stop_status=None, stop_payload=None):
+    sleep_status = sleep_status or ("Success" if status == "Success" else status if status in {"Failed", "TimedOut"} else "Cancelled")
+    if stop_status is None:
+        stop_status = "Success" if status == "Success" else "Failed" if status in {"Failed", "TimedOut"} and sleep_status == "Success" else "Pending" if sleep_status == "Success" else None
+    steps = [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": sleep_status,
+        "Inputs": {"Timestamp": parameters["ExpiryTriggerUtc"][0]}}]
+    if stop_status is not None:
+        steps.append({"StepName": "discoverAndStopOwnedInstances", "Action": "aws:executeScript", "StepStatus": stop_status,
+            "Inputs": {"InputPayload": json.dumps({"run_id": parameters["RunId"][0], "deployment_id": parameters["DeploymentId"][0], "region": parameters["Region"][0]})},
+            "Outputs": {"OutputPayload": [json.dumps(stop_payload or {"run_id": parameters["RunId"][0], "deployment_id": parameters["DeploymentId"][0],
+                "discovery_seconds": 300, "action_timeout_seconds": 330, "instances_seen": {"i-one": "stopping"},
+                "stop_requests": ["i-one"], "errors": [], "owned_instance_count_anomaly": False,
+                "unresolved_instance_ids": ["i-one"], "complete_deletion": False})]}})
+    execution = {
         "AutomationExecutionId": execution_id, "DocumentName": document_name, "DocumentVersion": "1",
         "Parameters": parameters, "StepExecutionsTruncated": False,
-        "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": status,
-            "Inputs": {"Timestamp": parameters["ExpiryTriggerUtc"][0]}}],
+        "StepExecutions": steps,
         "AutomationExecutionStatus": status, "Outputs": outputs,
-    }}
+    }
+    if status == "InProgress":
+        execution["CurrentStepName"] = "discoverAndStopOwnedInstances" if sleep_status == "Success" else "waitUntilExpiry"
+        execution["CurrentAction"] = "aws:executeScript" if sleep_status == "Success" else "aws:sleep"
+    return {"AutomationExecution": execution}
 
 
 def test_expiry_start_uses_one_request_and_returns_execution_identity(tmp_path):
@@ -576,8 +598,12 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
     assert runner.destroy_attempts == 2
 
 
-@pytest.mark.parametrize("terminal,expiry_state", [("Cancelled", "cancelled"), ("Success", "triggered"), ("Failed", "failed"), ("TimedOut", "failed")])
-def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, expiry_state):
+@pytest.mark.parametrize("terminal,expiry_state,sleep_status,stop_status", [
+    ("Cancelled", "cancelled", None, None), ("Success", "triggered", None, None),
+    ("Failed", "failed", None, None), ("TimedOut", "failed", None, None),
+    ("Failed", "failed", "Success", "Failed"), ("TimedOut", "failed", "Success", "TimedOut"),
+])
+def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, expiry_state, sleep_status, stop_status):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
 
     regions = ["eu-central-1"]
@@ -586,11 +612,8 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
     class TerminalRunner:
         def run(self, request):
             if request.action_id.startswith("aws-expiry-read-terminal-"):
-                output = {"AutomationExecution": {"AutomationExecutionId": "exec-one", "DocumentName": "expiry",
-                    "DocumentVersion": "1", "Parameters": parameters, "StepExecutionsTruncated": False,
-                    "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep",
-                        "StepStatus": terminal, "Inputs": {"Timestamp": parameters["ExpiryTriggerUtc"][0]}}],
-                    "AutomationExecutionStatus": terminal, "Outputs": {"stop_requests": ["i-one"]}}}
+                output = terminal_automation("exec-one", "expiry", parameters, status=terminal,
+                    sleep_status=sleep_status, stop_status=stop_status)
             else:
                 output = {}
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
@@ -619,15 +642,77 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
     assert result.cleanup_state == "succeeded"
     assert result.expiry.value.state == expiry_state
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["state"] == terminal
-    assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["outputs"] == {"stop_requests": ["i-one"]}
+    outcome = result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]
+    if terminal == "Success":
+        assert outcome["stop_payload"]["stop_requests"] == ["i-one"]
+    else:
+        assert outcome["stop_payload"] is None
+    assert outcome["steps"][0]["StepName"] == "waitUntilExpiry"
+    if terminal == "Success":
+        assert outcome["steps"][1]["Action"] == "aws:executeScript"
 
 
-def test_cleanup_preserves_mixed_s4_expiry_outcomes_as_failed_evidence(tmp_path):
+def test_cleanup_cancels_active_stop_step_after_sleep_completed(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
+    region = "eu-central-1"
+    parameters = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"],
+        "ExpiryTriggerUtc": ["2026-10-22T12:10:00Z"], "RunId": [deployment.run_id],
+        "DeploymentId": [deployment.deployment_id], "Region": [region]}
+    active = terminal_automation("exec-one", "expiry", parameters, status="InProgress",
+        sleep_status="Success", stop_status="InProgress")
+
+    class ActiveStopRunner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, request):
+            self.actions.append(request.action_id)
+            if request.action_id == f"aws-expiry-read-terminal-{region}":
+                output = active
+            elif request.action_id == f"aws-expiry-confirm-cancel-{region}":
+                output = terminal_automation("exec-one", "expiry", parameters, status="Cancelled",
+                    sleep_status="Success", stop_status="Cancelled")
+            else:
+                output = {}
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=json.dumps(output), stderr="")
+
+    runner = ActiveStopRunner()
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
+    regions = [region]
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
+        provider="aws", action="stop", state="registered",
+        registration_id=Evidence[str](value=f"aws-ssm:{deployment.deployment_id}"),
+        registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
+        expires_at=Evidence[datetime](value=NOW + timedelta(seconds=600)),
+        target_selector=driver._target_selector(deployment, regions),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: "exec-one"}}))
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
+        "executions": {region: "exec-one"}, "safety": {region: {"document_name": "expiry", "document_version": "1"}},
+        "regional_parameters": {region: parameters}, "expiry_evidence": expiry.model_dump(mode="json")})
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    driver._verify_safety_absent = lambda *_args: True
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.expiry.value.state == "cancelled"
+    assert "aws-expiry-cancel-eu-central-1" in runner.actions
+    assert result.expiry.value.provider_metadata.value["regional_outcomes"][region]["steps"][1]["StepStatus"] == "Cancelled"
+
+
+@pytest.mark.parametrize("statuses,expected", [
+    ({"eu-central-1": "Success", "eu-west-2": "Cancelled"}, "triggered"),
+    ({"eu-central-1": "Success", "eu-west-2": "Failed"}, "failed"),
+    ({"eu-central-1": "Cancelled", "eu-west-2": "Failed"}, "failed"),
+])
+def test_cleanup_preserves_mixed_s4_expiry_outcomes_truthfully(tmp_path, statuses, expected):
     deployment, settings = make_inter_region_attempt(tmp_path)
     driver = AwsProviderDriver(object(), settings, clock=lambda: NOW)
     regions = driver._regions(deployment)
     trigger = "2026-10-22T12:14:00Z"
-    statuses = {"eu-central-1": "Success", "eu-west-2": "Failed"}
     parameters = {
         region: {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
             "ExpiryTriggerUtc": [trigger], "RunId": [deployment.run_id],
@@ -666,11 +751,11 @@ def test_cleanup_preserves_mixed_s4_expiry_outcomes_as_failed_evidence(tmp_path)
     driver._verify_safety_absent = lambda *_args: True
     result = driver.cleanup(deployment)
     assert result.cleanup_state == "succeeded"
-    assert result.expiry.value.state == "failed"
-    assert result.expiry.value.failure is not None
+    assert result.expiry.value.state == expected
+    assert (result.expiry.value.failure is not None) == (expected == "failed")
     observed = result.expiry.value.provider_metadata.value["regional_outcomes"]
-    assert observed["eu-central-1"]["state"] == "Success"
-    assert observed["eu-west-2"]["state"] == "Failed"
+    for region in regions:
+        assert observed[region]["state"] == statuses[region]
 
 
 @pytest.mark.parametrize("tamper", [False, True])
