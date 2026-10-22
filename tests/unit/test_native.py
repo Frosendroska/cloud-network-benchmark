@@ -24,12 +24,16 @@ def test_sockperf_native_preamble_rows_and_separate_counts_are_source_linked():
     before = hashlib.sha256(csv_path.read_bytes()).hexdigest()
     parsed = parse_sockperf(csv_path, log_path, source=source(csv_path, "sockperf"), log_source=source(log_path, "sockperf-log"))
     assert [sample.rtt_us for sample in parsed.samples] == [1.0, 2.0]
-    assert [sample.line for sample in parsed.samples] == [5, 6]
+    assert [sample.line for sample in parsed.samples] == [4, 5]
     assert parsed.probe_counts[0].sent.value == 2000
     assert parsed.probe_counts[0].dropped.value == 1
     assert parsed.probe_counts[0].duplicated.value == 2
     assert parsed.probe_counts[0].out_of_order.value == 3
     assert parsed.probe_counts[0].skipped.value == 0
+    by_scope = {item.reporting_scope: item for item in parsed.probe_counts}
+    assert set(by_scope) == {"[Total Run]", "[Valid Duration]"}
+    assert by_scope["[Total Run]"].runtime_seconds.value == 2.1
+    assert by_scope["[Valid Duration]"].runtime_seconds.value == 2.0
     assert hashlib.sha256(csv_path.read_bytes()).hexdigest() == before
     assert parsed.source.sha256 == before
 
@@ -112,6 +116,16 @@ def test_sockperf_truncated_row_keeps_valid_rows():
     parsed = parse_sockperf(path, None, source=source(path))
     assert [item.rtt_us for item in parsed.samples] == [1.0, 2.0]
     assert any(item.code == "native.sockperf.row" for item in parsed.findings)
+
+
+def test_sockperf_missing_file_and_invalid_encoding_have_explicit_findings(tmp_path):
+    missing = parse_sockperf(tmp_path / "missing.csv", None,
+                             source=SourceRef("sockperf", "missing.csv", "0" * 64))
+    assert any(item.code == "native.sockperf.read" for item in missing.findings)
+    invalid = tmp_path / "invalid.csv"
+    invalid.write_bytes(b"\xff\xfe")
+    parsed = parse_sockperf(invalid, None, source=SourceRef("sockperf", "invalid.csv", "0" * 64))
+    assert any(item.code == "native.sockperf.encoding" for item in parsed.findings)
 
 
 def test_iperf3_jsonl_parses_events_and_keeps_receiver_interval():

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import statistics
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -30,11 +31,7 @@ class CalibrationRecommendation:
                 "plateau_found": self.plateau_found.value if self.common_n.value is not None else None}
 
 
-_ORDERS = {
-    "aws": (1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4),
-    "azure": (8, 2, 4, 1, 1, 4, 2, 8, 4, 1, 8, 2),
-    "gcp": (2, 8, 1, 4, 4, 1, 8, 2, 1, 4, 2, 8),
-}
+_ORDER = (1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4)
 
 
 def _unavailable(results: Sequence[ValidationResult], reason: str) -> CalibrationRecommendation:
@@ -59,7 +56,7 @@ def select_common_n(results: Sequence[ValidationResult]) -> CalibrationRecommend
         provider = identity.get("provider")
         campaign = identity.get("campaign_id")
         deployment = identity.get("deployment_id")
-        if provider not in _ORDERS or provider in providers or not campaign or not deployment or deployment in deployments:
+        if provider not in {"aws", "azure", "gcp"} or provider in providers or not campaign or not deployment or deployment in deployments:
             return _unavailable(results, "provider, campaign or retained deployment identity is missing, duplicate or inconsistent")
         providers[provider] = result
         campaigns.add(campaign)
@@ -73,7 +70,7 @@ def select_common_n(results: Sequence[ValidationResult]) -> CalibrationRecommend
             if isinstance(index, bool) or not isinstance(index, int) or index in unit_by_index:
                 return _unavailable(results, f"{provider} has missing or duplicate trial indices")
             unit_by_index[index] = unit
-        if tuple(unit_by_index.get(i, {}).get("streams") for i in range(1, 13)) != _ORDERS[provider]:
+        if tuple(unit_by_index.get(i, {}).get("streams") for i in range(1, 13)) != _ORDER:
             return _unavailable(results, f"{provider} trial order does not match the retained calibration order")
         all_trials[provider] = [unit_by_index[i] for i in range(1, 13)]
     if len(campaigns) != 1:
@@ -85,8 +82,10 @@ def select_common_n(results: Sequence[ValidationResult]) -> CalibrationRecommend
         for unit in all_trials[provider]:
             ev = unit.get("tcp", {}).get("throughput_gbps", {})
             value = ev.get("value") if isinstance(ev, dict) else None
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                return _unavailable(results, f"{provider} has missing, invalid or all-zero receiver throughput evidence")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                return _unavailable(results, f"{provider} has missing, nonfinite or negative receiver throughput evidence")
+            if unit.get("deployment_id", providers[provider].metrics.value.get("identity", {}).get("deployment_id")) != providers[provider].metrics.value.get("identity", {}).get("deployment_id"):
+                return _unavailable(results, f"{provider} trial {unit.get('trial_index')} is outside the retained deployment")
             sources = unit.get("sources", [])
             source_rows = sorted(
                 ({"artifact_id": source.get("artifact_id"), "path": source.get("path"), "sha256": source.get("sha256")}
@@ -108,13 +107,17 @@ def select_common_n(results: Sequence[ValidationResult]) -> CalibrationRecommend
         if any(len(values[n]) != 3 for n in values):
             return _unavailable(results, f"{provider} must provide three valid trials per stream count")
         medians[provider] = {n: statistics.median(values[n]) for n in values}
+        if max(medians[provider].values()) <= 0:
+            return _unavailable(results, f"{provider} has no positive best tested median")
     best = {provider: max(counts.values()) for provider, counts in medians.items()}
     ratios = {n: {provider: medians[provider][n] / best[provider] for provider in sorted(medians)} for n in (2, 4, 8)}
     selected = next((n for n in (2, 4, 8) if all(ratios[n][provider] >= .95 for provider in medians)), None)
     plateau = selected is not None
     if selected is None:
         selected = 8
-    canonical = json.dumps({"campaign_id": next(iter(campaigns)), "evidence": evidence_rows}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    canonical = json.dumps({"campaign_id": next(iter(campaigns), None),
+                            "deployments": {provider: providers[provider].metrics.value["identity"]["deployment_id"] for provider in sorted(providers)},
+                            "evidence": evidence_rows}, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return CalibrationRecommendation(
         Evidence[int](value=selected), Evidence[bool](value=plateau), medians, ratios,
         Evidence[str](value=next(iter(campaigns))), tuple(sorted(result.run_id for result in results)),

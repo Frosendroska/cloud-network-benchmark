@@ -111,6 +111,7 @@ class NativeParse:
     source: Optional[SourceRef] = None
     sessions: tuple[str, ...] = ()
     receiver_totals: tuple[dict[str, Any], ...] = ()
+    session_details: tuple[dict[str, Any], ...] = ()
 
 
 def _finding(code: str, message: str, source: Optional[SourceRef] = None, severity: str = "error") -> ValidationFinding:
@@ -156,8 +157,8 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
     findings: list[ValidationFinding] = []
     samples: list[RttSample] = []
     counters: dict[str, Any] = {}
-    csv_source = SourceRef(**{**source.__dict__, "sha256": _sha(csv_path)})
     try:
+        csv_source = SourceRef(**{**source.__dict__, "sha256": _sha(csv_path)})
         lines = csv_path.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
         return NativeParse(findings=(_finding("native.sockperf.read", f"cannot read CSV: {exc}", source),), source=source)
@@ -178,9 +179,10 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
     if header_index is None:
         findings.append(_finding("native.sockperf.header", "full-RTT CSV header was not found", csv_source))
     else:
-        reader = csv.reader(lines[header_index:])
-        next(reader, None)
-        for offset, row in enumerate(reader, header_index + 2):
+        for offset, line in enumerate(lines[header_index + 1:], header_index + 2):
+            if line.strip().startswith("[") or line.strip().lower().startswith("sockperf:"):
+                break
+            row = next(csv.reader([line]), [])
             if not row or all(not cell.strip() for cell in row):
                 continue
             if len(row) == 1 and row[0].strip() and set(row[0].strip()) == {"-"}:
@@ -199,9 +201,9 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
             except (ValueError, OverflowError) as exc:
                 findings.append(_finding("native.sockperf.row", f"line {offset}: {exc}", csv_source, "warning"))
 
-    csv_counts, conflicts = _sockperf_counters(lines)
-    for key in conflicts:
-        findings.append(_finding("native.sockperf.counter_conflict", f"CSV preamble reports conflicting {key} values", csv_source))
+    scoped_counts, conflicts = _sockperf_counters(lines)
+    for scope, key in conflicts:
+        findings.append(_finding("native.sockperf.counter_conflict", f"CSV {scope} reports conflicting {key} values", csv_source))
     if log_path is not None:
         if log_source is None:
             findings.append(_finding("native.sockperf.log_source", "log counters unavailable because log_source provenance was not supplied", source))
@@ -210,13 +212,15 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
             try:
                 log_lines = log_path.read_text(encoding="utf-8-sig").splitlines()
                 log_counts, log_conflicts = _sockperf_counters(log_lines)
-                for key in log_conflicts:
-                    findings.append(_finding("native.sockperf.counter_conflict", f"log reports conflicting {key} values", log_source))
-                for key, val in log_counts.items():
-                    if key in csv_counts and csv_counts[key] != val:
-                        findings.append(_finding("native.sockperf.counter_conflict", f"CSV and log disagree for {key}", log_source))
-                    else:
-                        csv_counts[key] = val
+                for scope, key in log_conflicts:
+                    findings.append(_finding("native.sockperf.counter_conflict", f"log {scope} reports conflicting {key} values", log_source))
+                for scope, values in log_counts.items():
+                    target = scoped_counts.setdefault(scope, {})
+                    for key, val in values.items():
+                        if key in target and target[key] != val:
+                            findings.append(_finding("native.sockperf.counter_conflict", f"CSV and log {scope} disagree for {key}", log_source))
+                        else:
+                            target[key] = val
                 csv_source = SourceRef(**{**csv_source.__dict__, "sha256": csv_source.sha256})
                 counter_source = SourceRef(**{**log_source.__dict__, "sha256": _sha(log_path)})
             except (OSError, UnicodeError) as exc:
@@ -224,17 +228,17 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
                 counter_source = csv_source
     else:
         counter_source = csv_source
-    if csv_counts:
-        counts = ProbeCounts(
-            sent=_evidence(csv_counts.get("sent"), "native sent count was not reported"),
-            received=_evidence(csv_counts.get("received"), "native received count was not reported"),
-            dropped=_evidence(csv_counts.get("dropped"), "native dropped count was not reported"),
-            duplicated=_evidence(csv_counts.get("duplicated"), "native duplicate count was not reported"),
-            out_of_order=_evidence(csv_counts.get("out_of_order"), "native out-of-order count was not reported"),
-            skipped=_evidence(csv_counts.get("skipped"), "native skipped count was not reported"),
-            runtime_seconds=_evidence(csv_counts.get("runtime_seconds"), "native runtime was not reported"),
-            reporting_scope="one Sockperf invocation", source=counter_source)
-        count_tuple = (counts,)
+    if scoped_counts:
+        count_tuple = tuple(ProbeCounts(
+            sent=_evidence(values.get("sent"), f"native sent count was not reported for {scope}"),
+            received=_evidence(values.get("received"), f"native received count was not reported for {scope}"),
+            dropped=_evidence(values.get("dropped"), f"native dropped count was not reported for {scope}"),
+            duplicated=_evidence(values.get("duplicated"), f"native duplicate count was not reported for {scope}"),
+            out_of_order=_evidence(values.get("out_of_order"), f"native out-of-order count was not reported for {scope}"),
+            skipped=_evidence(values.get("skipped"), f"native skipped count was not reported for {scope}"),
+            runtime_seconds=_evidence(values.get("runtime_seconds"), f"native runtime was not reported for {scope}"),
+            reporting_scope=scope, source=counter_source)
+            for scope, values in sorted(scoped_counts.items(), key=lambda item: (item[0] != "[Valid Duration]", item[0])))
     else:
         count_tuple = ()
         findings.append(_finding("native.sockperf.counts_unavailable", "Sockperf invocation counters were not reported", source, "warning"))
@@ -244,10 +248,14 @@ def parse_sockperf(csv_path: Path, log_path: Optional[Path], *, source: SourceRe
                        findings=tuple(findings), source=csv_source, sessions=("1",))
 
 
-def _sockperf_counters(lines: Sequence[str]) -> tuple[dict[str, Any], set[str]]:
-    values: dict[str, list[Any]] = {}
+def _sockperf_counters(lines: Sequence[str]) -> tuple[dict[str, dict[str, Any]], set[tuple[str, str]]]:
+    values: dict[str, dict[str, list[Any]]] = {}
+    scope = "[Unscoped]"
     for line in lines:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        scope_match = re.search(r"\[(Total Run|Valid Duration)\]", clean, re.I)
+        if scope_match:
+            scope = "[" + scope_match.group(1).title() + "]"
         for key, pattern in _COUNTER_PATTERNS.items():
             match = pattern.search(clean)
             if match:
@@ -256,16 +264,17 @@ def _sockperf_counters(lines: Sequence[str]) -> tuple[dict[str, Any], set[str]]:
                     if math.isfinite(val) and val >= 0:
                         if key == "runtime_seconds" and val == 0:
                             continue
-                        values.setdefault(key, []).append(val)
+                        values.setdefault(scope, {}).setdefault(key, []).append(val)
                 except ValueError:
                     continue
         if ("RunTime=" in clean and "SentMessages=" in clean and "ReceivedMessages=" in clean
                 and "SkippedMessages=" not in clean):
             # Sockperf 3.10 emits SkippedMessages only on the branch where a skip occurred.
-            values.setdefault("skipped", []).append(0)
-    return {key: entries[0] for key, entries in values.items()}, {
-        key for key, entries in values.items() if len(set(entries)) > 1
-    }
+            values.setdefault(scope, {}).setdefault("skipped", []).append(0)
+    return ({scope: {key: entries[0] for key, entries in counters.items()}
+             for scope, counters in values.items()},
+            {(scope, key) for scope, counters in values.items() for key, entries in counters.items()
+             if len(set(entries)) > 1})
 
 
 def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -290,33 +299,38 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
     intervals: list[ReceiverInterval] = []
     totals: list[dict[str, Any]] = []
     sessions: list[str] = []
+    session_details: list[dict[str, Any]] = []
     actual_source = source
     try:
-        content = path.read_text(encoding="utf-8")
         actual_source = SourceRef(**{**source.__dict__, "sha256": _sha(path)})
-    except (OSError, UnicodeError) as exc:
+    except OSError as exc:
         return NativeParse(findings=(_finding("native.iperf3.read", f"cannot read input: {exc}", source),), source=source)
-    objects: list[tuple[int, dict[str, Any]]]
+    objects: Any
     if format == "json":
         try:
-            root = _json_load(content)
+            root = _json_load(path.read_text(encoding="utf-8"))
             if not isinstance(root, dict):
                 raise ValueError("top-level JSON must be an object")
             objects = [(1, root)]
-        except (ValueError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             return NativeParse(findings=(_finding("native.iperf3.json", str(exc), actual_source),), source=actual_source)
     else:
-        objects = []
-        for line_no, line in enumerate(content.splitlines(), 1):
-            if not line.strip():
-                continue
+        def jsonl_objects():
             try:
-                value = _json_load(line)
-                if not isinstance(value, dict):
-                    raise ValueError("event must be a JSON object")
-                objects.append((line_no, value))
-            except (ValueError, json.JSONDecodeError) as exc:
-                findings.append(_finding("native.iperf3.jsonl", f"line {line_no}: {exc}", actual_source, "warning"))
+                with path.open(encoding="utf-8") as handle:
+                    for line_no, line in enumerate(handle, 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            value = _json_load(line)
+                            if not isinstance(value, dict):
+                                raise ValueError("event must be a JSON object")
+                            yield line_no, value
+                        except (ValueError, json.JSONDecodeError) as exc:
+                            findings.append(_finding("native.iperf3.jsonl", f"line {line_no}: {exc}", actual_source, "warning"))
+            except (OSError, UnicodeError) as exc:
+                findings.append(_finding("native.iperf3.read", f"cannot read JSONL: {exc}", actual_source))
+        objects = jsonl_objects()
     current = 0
     for line_no, obj in objects:
         if format == "jsonl":
@@ -324,6 +338,8 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
             if event == "start":
                 current += 1
                 sessions.append(str(current))
+                data = obj.get("data", {})
+                session_details.append({"session_id": str(current), "start": data})
                 continue
             if event == "error":
                 findings.append(_finding("native.iperf3.error", f"line {line_no}: iperf3 error event", actual_source))
@@ -332,6 +348,8 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
                 payload = obj.get("data", obj)
                 if event == "end":
                     totals.extend(_extract_totals(payload, actual_source, line_no, str(max(1, current))))
+                    if session_details and session_details[-1]["session_id"] == str(max(1, current)):
+                        session_details[-1]["end"] = payload
                 elif event.startswith("server_output"):
                     embedded = payload
                     if isinstance(embedded, str):
@@ -352,6 +370,7 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
             intervals.extend(_extract_interval_data(data, actual_source, line_no, str(current), findings))
             continue
         sessions.append("1")
+        session_details.append({"session_id": "1", "start": obj.get("start", {}), "end": obj.get("end", {})})
         intervals.extend(_extract_intervals(obj, actual_source, line_no, "1", findings))
         server = obj.get("server_output_json")
         if isinstance(server, str):
@@ -376,7 +395,8 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
     if not intervals:
         findings.append(_finding("native.iperf3.receiver_unavailable", "no receiver-side measured intervals were found", actual_source, "warning"))
     return NativeParse(receiver_intervals=tuple(intervals), findings=tuple(findings), source=actual_source,
-                       sessions=tuple(dict.fromkeys(sessions)), receiver_totals=tuple(totals))
+                       sessions=tuple(dict.fromkeys(sessions)), receiver_totals=tuple(totals),
+                       session_details=tuple(session_details))
 
 
 def _extract_interval_data(data: Any, source: SourceRef, line: int, session: str,
@@ -406,7 +426,14 @@ def _interval_items(obj: dict[str, Any], source: SourceRef, line: int, session: 
     if isinstance(interval, dict) and interval.get("sender") is False:
         candidates = [interval]
     elif isinstance(streams, list):
-        recv = [s.get("receiver") for s in streams if isinstance(s, dict) and isinstance(s.get("receiver"), dict)]
+        recv = []
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            if isinstance(stream.get("receiver"), dict):
+                recv.append(stream["receiver"])
+            elif stream.get("sender") is False:
+                recv.append(stream)
         if recv and all(_bounds(s) == _bounds(recv[0]) for s in recv):
             candidates = recv
     if not candidates:
@@ -445,6 +472,16 @@ def _extract_totals(root: Any, source: SourceRef, line: int, session: str) -> li
             amount, seconds = _nonnegative_integer(item.get("bytes")), _number(item.get("seconds"))
             if amount is not None and seconds is not None and seconds > 0:
                 return [{"session_id": session, "bytes": amount, "seconds": seconds,
+                         "source": source, "line": line}]
+    streams = end.get("streams")
+    if isinstance(streams, list):
+        receivers = [item.get("receiver") for item in streams
+                     if isinstance(item, dict) and isinstance(item.get("receiver"), dict)]
+        if receivers and all(_number(item.get("seconds")) == _number(receivers[0].get("seconds")) for item in receivers):
+            amounts = [_nonnegative_integer(item.get("bytes")) for item in receivers]
+            seconds = _number(receivers[0].get("seconds"))
+            if seconds and all(value is not None for value in amounts):
+                return [{"session_id": session, "bytes": sum(amounts), "seconds": seconds,
                          "source": source, "line": line}]
     return []
 

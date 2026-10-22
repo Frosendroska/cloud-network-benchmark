@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import GeneratorType
 
 from cloud_network_benchmark.native import SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
+from cloud_network_benchmark.validation import _json_records
 
 
 def test_native_fixture_replay_is_source_linked_and_does_not_mutate_inputs():
@@ -40,6 +42,20 @@ def test_jsonl_malformed_tail_keeps_prior_receiver_intervals(tmp_path):
     assert len(parsed.receiver_intervals)==1
     assert parsed.receiver_intervals[0].bytes==125000000
     assert any(item.code=="native.iperf3.jsonl" for item in parsed.findings)
+
+
+def test_materialized_jsonl_records_are_consumed_incrementally(tmp_path):
+    path = tmp_path / "evidence.jsonl"
+    path.write_text('{"event":1}\nnot-json\n', encoding="utf-8")
+    records = _json_records(path)
+    assert isinstance(records, GeneratorType)
+    assert next(records) == {"event": 1}
+    try:
+        next(records)
+    except ValueError as exc:
+        assert "line 2" in str(exc)
+    else:
+        raise AssertionError("malformed second record must be reported when consumed")
 
 
 def test_materialized_native_replay_keeps_mode_unit_deployment_and_status_inputs_separate():

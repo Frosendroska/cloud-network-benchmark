@@ -13,8 +13,8 @@ from cloud_network_benchmark.contracts.measurements import ClockMapping, Command
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
-from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
+from cloud_network_benchmark.validation import _command_findings, _coverage, _measured_samples, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
@@ -70,11 +70,18 @@ def make_input(repository_root, provider="aws", campaign="camp", *, config_name=
 
 
 def good_result(value):
+    identity = value.identity.model_dump(mode="json") | {"provider":str(value.provider), "scenario":str(value.scenario),
+        "mode":str(value.mode), "context":value.context}
+    provenance = {"config_sha256":value.config_sha256, "source_refs":[]}
+    units = [{"unit_id":unit.unit_id, "kind":unit.kind, "phase":str(getattr(unit.phase,"value",unit.phase)),
+              "streams":unit.streams, "coverage":{"requested_seconds":unit.measured_seconds}}
+             for unit in value.measurement_units]
     return ValidationResult(schema_version=2, run_id=value.identity.run_id, mode=value.mode,
         validation_status=ValidationStatus(data_validity=DataValidity.VALID, data_reasons=[],
             comparison_eligibility=ComparisonEligibility.UNAVAILABLE, comparison_reasons=["not matched yet"]),
-        metrics={"value":{"identity":{"provider":value.provider},
-                          "common_n":{"state":"frozen","common_n":4},
+        metrics={"value":{"identity":identity, "provenance":provenance, "units":units,
+                          "common_n":{"state":"frozen","common_n":4,"source_campaign_id":value.identity.campaign_id,
+                                      "source_sha256":"f"*64,"plateau_found":True},
                           "execution":{"execution_state":"succeeded","bundle_complete":True}}}, evaluated_at=NOW)
 
 
@@ -86,7 +93,7 @@ def test_empty_materialized_bundle_is_unavailable_and_explains_missing_evidence(
     assert any(f.code == "artifact.missing" for f in result.findings)
     assert any(f.code == "identity.campaign_manifest_missing" for f in result.findings)
     assert any(f.code == "identity.child_manifest_missing" for f in result.findings)
-    assert result.metrics.value["execution"]["bundle_complete"] is True
+    assert result.metrics.value["execution"]["bundle_complete"] is False
     assert len(result.metrics.value["units"]) == 3
 
 
@@ -186,7 +193,10 @@ def _coverage_inputs(repository_root, *, duration=60.0, gap_seconds=0.0):
         dropped=Evidence[int](value=0), duplicated=Evidence[int](value=0), out_of_order=Evidence[int](value=0),
         skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=65),
         reporting_scope="one Sockperf invocation", source=SourceRef("sockperf-log", "sockperf.log", "d" * 64))
-    sock = NativeParse(probe_counts=(count,))
+    sample_source = SourceRef("sockperf-csv", "sockperf.csv", "f" * 64, unit.unit_id, value.identity.deployment_id, "vm_a", "3.10")
+    samples = (RttSample(0, 105, 105.000001, 1, sample_source, 1),
+               RttSample(1, 164.999999, 165.0, 1, sample_source, 2))
+    sock = NativeParse(samples=samples, probe_counts=(count,))
     tcp = NativeParse(receiver_intervals=(ReceiverInterval("1", 5, 5 + duration, duration, 1000,
         False, False, SourceRef("iperf3_receiver", "iperf3.json", "e" * 64), 1),))
     return value, unit, sock, tcp
@@ -201,6 +211,84 @@ def test_coverage_requires_full_receiver_duration_and_exact_99_percent(repositor
     result = _coverage(value, unit, sock, tcp)
     assert result["complete"] is complete
     assert result["active_probe_ratio"]["value"] == pytest.approx(ratio, abs=1e-9)
+
+
+def test_rtt_selection_excludes_warmup_and_samples_outside_half_open_measured_window(repository_root):
+    value, unit, sock, _ = _coverage_inputs(repository_root)
+    ref = SourceRef("sockperf-csv", "samples.csv", "f"*64, unit.unit_id, value.identity.deployment_id, "vm_a", "3.10")
+    rows = [RttSample(i, tx, rx, (rx-tx)*1_000_000, ref, i+1) for i, (tx, rx) in enumerate([
+        (104.999999, 105.0), (105.0, 105.000001), (164.999999, 164.999999), (165.0, 165.000001)])]
+    selected = _measured_samples(value, unit, NativeParse(samples=tuple(rows)))
+    assert [item.packet_index for item in selected] == [1, 2]
+
+
+def test_process_runtime_without_native_sample_bounds_cannot_prove_coverage(repository_root):
+    value, unit, sock, tcp = _coverage_inputs(repository_root)
+    uncorroborated = _coverage(value, unit, NativeParse(probe_counts=sock.probe_counts), tcp)
+    assert uncorroborated["complete"] is False
+    assert uncorroborated["active_probe_seconds"]["value"] is None
+
+
+def test_day_requires_one_continuous_receiver_span_and_unions_chunk_tails(repository_root, monkeypatch):
+    value = make_input(repository_root, config_name="exp-001-diagnostic-day.yaml")
+    day = value.measurement_units[0]
+    day_timing = value.timings[0].model_copy(update={
+        "probe_test_started_at":Evidence[datetime](value=NOW),
+        "tcp_started_at":Evidence[datetime](value=NOW),
+        "measured_started_at":Evidence[datetime](value=NOW),
+        "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=86400)),
+        "clock_mappings":[ClockMapping(vm_role="vm_b", monotonic_seconds=0, utc_timestamp=NOW,
+            estimated_error_ms={"value":0}, synchronization_source={"value":"fixture"})]})
+    chunks=[]
+    timings=[day_timing]
+    chunk_parses={}
+    source=SourceRef("day-probe-csv", "day.csv", "f"*64, None, value.identity.deployment_id, "vm_a", "3.10")
+    for index in range(288):
+        unit_id=f"chunk-{index+1:03d}"
+        chunks.append(day.model_copy(update={"unit_id":unit_id, "kind":"probe_chunk", "measured_seconds":300,
+            "parent_unit_id":day.unit_id, "trial_index":None, "streams":None}))
+        offset=index*300
+        gap=([TimingGap(started_at=NOW+timedelta(seconds=offset+100),
+                        finished_at=NOW+timedelta(seconds=offset+101), reason="one-second probe gap")]
+             if index==1 else [])
+        timings.append(day_timing.model_copy(update={"unit_id":unit_id,
+            "probe_test_started_at":Evidence[datetime](value=NOW+timedelta(seconds=offset)),
+            "tcp_started_at":Evidence[datetime](unavailable_reason="no new TCP start during probe rotation"),
+            "measured_started_at":Evidence[datetime](unavailable_reason="probe timing only"),
+            "measured_finished_at":Evidence[datetime](unavailable_reason="probe timing only"),
+            "monotonic_started":Evidence[float](value=offset),
+            "monotonic_finished":Evidence[float](value=offset+(305 if index==0 else 300)),
+            "omitted_seconds":5 if index==0 else 0, "gaps":gap,
+            "clock_mappings":[ClockMapping(vm_role="vm_a", monotonic_seconds=0, utc_timestamp=NOW,
+                estimated_error_ms={"value":0}, synchronization_source={"value":"fixture"})]}))
+        first=offset+(5 if index==0 else 0)
+        last=offset+(305 if index==0 else 300)
+        samples=(RttSample(0, first, first+.000001, 1, source, 1),
+                 RttSample(1, last-.000001, last, 1, source, 2))
+        count=ProbeCounts(sent=Evidence[int](value=300000), received=Evidence[int](value=300000),
+            dropped=Evidence[int](value=0), duplicated=Evidence[int](value=0), out_of_order=Evidence[int](value=0),
+            skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=300),
+            reporting_scope="[Valid Duration]", source=SourceRef("day-probe-log", "day.log", "e"*64))
+        chunk_parses[unit_id]=NativeParse(samples=samples, probe_counts=(count,))
+    full=value.model_copy(update={"measurement_units":[day,*chunks], "timings":timings})
+    import cloud_network_benchmark.validation as module
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+                        (chunk_parses.get(unit.unit_id, NativeParse()), None))
+    receiver=ReceiverInterval("1", 0, 86400, 86400, 1_000_000, False, False,
+                              SourceRef("iperf3_server_log", "server.jsonl", "a"*64), 1)
+    sock, tcp=NativeParse(), NativeParse(receiver_intervals=(receiver,), sessions=("1",))
+    day_coverage=module._coverage(full, day, sock, tcp)
+    assert day_coverage["complete"] is True
+    assert day_coverage["active_probe_ratio"]["value"] >= .99
+    # One first-chunk warm-up plus the in-chunk gap are removed; the valid tail remains.
+    assert day_coverage["active_probe_seconds"]["value"] == 86394
+    gapped_tcp=NativeParse(receiver_intervals=(
+        ReceiverInterval("1", 0, 85400, 85400, 900_000, False, False, tcp.receiver_intervals[0].source, 1),
+        ReceiverInterval("1", 86400, 87400, 1000, 100_000, False, False, tcp.receiver_intervals[0].source, 2)),
+        sessions=("1",))
+    rejected=module._coverage(full, day, sock, gapped_tcp)
+    assert rejected["observed_receiver_seconds"]["value"] == 86400
+    assert rejected["complete"] is False
 
 
 @pytest.mark.parametrize(("command_finish", "expected", "available"), [
@@ -234,7 +322,7 @@ def test_conservative_command_native_bracket_uses_worst_case_overlap(repository_
         result["tcp_start_bracket"]["unavailable_reason"]
 
 
-def test_frozen_common_n_consistency_and_inflation_are_bound_to_same_short_deployment(repository_root, monkeypatch):
+def test_frozen_common_n_consistency_and_inflation_rejects_incomplete_idle_baseline(repository_root, monkeypatch):
     value = make_input(repository_root)
     idle = value.measurement_units[0].unit_id
     loaded = value.measurement_units[1].unit_id
@@ -243,14 +331,35 @@ def test_frozen_common_n_consistency_and_inflation_are_bound_to_same_short_deplo
         ref = SourceRef("sockperf-csv", f"{unit_id}.csv", "f" * 64, unit_id,
                         value.identity.deployment_id, "vm_a", "3.10")
         from cloud_network_benchmark.native import RttSample
-        parses[unit_id] = NativeParse(samples=tuple(RttSample(i, i, i + sample / 1_000_000,
-            sample, ref, i + 1) for i, sample in enumerate(samples)))
+        sample_rows = tuple(RttSample(i, 0 if i == 0 else 60 - sample / 1_000_000 - .000001,
+            (0 if i == 0 else 60 - sample / 1_000_000 - .000001) + sample / 1_000_000,
+            sample, ref, i + 1) for i, sample in enumerate(samples))
+        counts = ProbeCounts(sent=Evidence[int](value=65000), received=Evidence[int](value=60000),
+            dropped=Evidence[int](value=0), duplicated=Evidence[int](value=0), out_of_order=Evidence[int](value=0),
+            skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=65),
+            reporting_scope="one Sockperf invocation", source=SourceRef("sockperf-log", "sockperf.log", "d"*64))
+        parses[unit_id] = NativeParse(samples=sample_rows, probe_counts=(counts,))
+    from cloud_network_benchmark.contracts.measurements import ClockMapping
+    timed = []
+    for timing, offset in zip(value.timings, (5, 10, 10)):
+        mappings = [ClockMapping(vm_role="vm_a", monotonic_seconds=0,
+            utc_timestamp=NOW + timedelta(seconds=offset), estimated_error_ms={"value":0},
+            synchronization_source={"value":"fixture"})]
+        if timing.unit_id == loaded:
+            mappings.append(ClockMapping(vm_role="vm_b", monotonic_seconds=0,
+                utc_timestamp=NOW + timedelta(seconds=offset), estimated_error_ms={"value":0},
+                synchronization_source={"value":"fixture"}))
+        timed.append(timing.model_copy(update={"clock_mappings": mappings}))
+    value = value.model_copy(update={"timings":timed})
     import cloud_network_benchmark.validation as module
     monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
-                        (parses.get(unit.unit_id, NativeParse()), None))
+                        (parses.get(unit.unit_id, NativeParse()),
+                         NativeParse(receiver_intervals=(ReceiverInterval("1", 10, 70, 60, 1000, False, False,
+                             SourceRef("iperf3", "receiver.json", "e"*64), 1),)) if unit.unit_id == loaded else None))
     result = module.validate_bundle(value, evaluated_at=NOW)
     inflation = result.metrics.value["units"][1]["rtt"]["latency_inflation_us"]["value"]
-    assert inflation == 4.0
+    assert inflation is None
+    assert result.metrics.value["units"][0]["data_validity"] != "valid"
     assert result.metrics.value["common_n"]["state"] == "pending"
 
 
@@ -384,6 +493,27 @@ def test_not_expected_artifact_and_execution_cleanup_failures_remain_distinct(re
     assert result.metrics.value["execution"]["bundle_complete"] is False
 
 
+def test_missing_generation_and_end_only_receiver_totals_remain_partial_not_unavailable(repository_root, monkeypatch):
+    value = make_input(repository_root)
+    missing = ProbeCounts(sent=Evidence[int](unavailable_reason="sent omitted"),
+        received=Evidence[int](unavailable_reason="not reported"), dropped=Evidence[int](unavailable_reason="not reported"),
+        duplicated=Evidence[int](unavailable_reason="not reported"), out_of_order=Evidence[int](unavailable_reason="not reported"),
+        skipped=Evidence[int](unavailable_reason="not reported"), runtime_seconds=Evidence[float](unavailable_reason="runtime omitted"),
+        reporting_scope="[Valid Duration]", source=SourceRef("sockperf-log", "sockperf.log", "d"*64))
+    total = {"session_id":"1", "bytes":1000, "seconds":60, "source":SourceRef("iperf3", "receiver.json", "e"*64), "line":1}
+    import cloud_network_benchmark.validation as module
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+                        (NativeParse(probe_counts=(missing,)) if unit.phase == "idle_latency" else NativeParse(),
+                         NativeParse(receiver_totals=(total,)) if unit.phase == "single_flow" else None))
+    failed = value.model_copy(update={"retrieval_failure":FailureEvidence(category="retrieval", message="copy failed", occurred_at=NOW)})
+    result = validate_bundle(failed, evaluated_at=NOW)
+    assert result.validation_status.data_validity == "partial"
+    assert any(item.code == "generation.unavailable" for item in result.findings)
+    assert any(item.code == "retrieval.failed" for item in result.findings)
+    assert result.metrics.value["units"][1]["tcp"]["throughput_gbps"]["value"] is not None
+    assert result.metrics.value["execution"]["bundle_complete"] is False
+
+
 def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_extras(repository_root):
     value = make_input(repository_root)
     unit = value.measurement_units[1]
@@ -400,6 +530,19 @@ def test_actual_command_options_accept_equivalent_spelling_and_reject_protocol_e
     udp = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], "-u"]}})
     assert any(item.code == "command.protocol_extra" for item in
                _command_findings(value.model_copy(update={"commands":[udp]})))
+    for override in ("--bitrate=100M", "--window=128K", "-b100M", "-w128K"):
+        altered = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], override]}})
+        assert any(item.code == "command.protocol_extra" for item in
+                   _command_findings(value.model_copy(update={"commands":[altered]})))
+    long_options = ["iperf3", "--client=10.0.0.2", "--port=5201", "-Z", "-C", "cubic",
+                    "--parallel=1", "--time=60", "--omit=5", "--length=131072", "--interval=1",
+                    "--json", "--get-server-output"]
+    equivalent = valid.model_copy(update={"request":{"argv":long_options}})
+    assert not any(item.severity == "error" for item in
+                   _command_findings(value.model_copy(update={"commands":[equivalent]})))
+    duplicate = valid.model_copy(update={"request":{"argv":[*valid.request["argv"], "--time=60"]}})
+    assert any(item.code == "command.duplicate_option" for item in
+               _command_findings(value.model_copy(update={"commands":[duplicate]})))
 
 
 def test_commands_require_private_targets_and_persistent_private_bound_listeners(repository_root):

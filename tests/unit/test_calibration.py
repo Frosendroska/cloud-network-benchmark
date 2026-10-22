@@ -7,7 +7,7 @@ from cloud_network_benchmark.contracts.common import ComparisonEligibility, Data
 from cloud_network_benchmark.contracts.validation import ValidationResult
 
 
-ORDERS = {"aws": [1,4,2,8,8,2,4,1,2,8,1,4], "azure": [8,2,4,1,1,4,2,8,4,1,8,2], "gcp": [2,8,1,4,4,1,8,2,1,4,2,8]}
+ORDERS = {provider: [1,4,2,8,8,2,4,1,2,8,1,4] for provider in ("aws", "azure", "gcp")}
 
 
 def result(provider, run, levels=None, *, valid=True, deployment=None, campaign="campaign"):
@@ -17,6 +17,7 @@ def result(provider, run, levels=None, *, valid=True, deployment=None, campaign=
         seen[streams]+=1
         value=(levels or {1:4,2:9,4:9.6,8:10})[streams]
         units.append({"unit_id":f"trial-{index}", "trial_index":index, "streams":streams,
+                      "deployment_id": deployment or f"deployment-{provider}",
                       "tcp":{"throughput_gbps":{"value":value}}, "receiver_intervals":[],
                       "sources":[{"artifact_id":"iperf3_receiver","path":f"{provider}/trial-{index}.json",
                                   "sha256":f"{index:064x}"}]})
@@ -67,3 +68,13 @@ def test_mixed_campaign_duplicate_deployment_and_duplicate_trial_stay_pending():
     duplicate = result("aws", "a2")
     duplicate.metrics.value["units"][11]["trial_index"] = 1
     assert select_common_n([duplicate, azure, gcp]).common_n.value is None
+
+
+def test_zero_trial_is_valid_when_best_median_is_positive_and_digest_binds_deployments():
+    levels = {1: 0, 2: 9, 4: 9.6, 8: 10}
+    values = [result(provider, provider, levels) for provider in ("aws", "azure", "gcp")]
+    recommendation = select_common_n(values)
+    assert recommendation.common_n.value == 4
+    assert recommendation.source_sha256.value
+    values[0].metrics.value["units"][0]["deployment_id"] = "another-deployment"
+    assert select_common_n(values).common_n.value is None

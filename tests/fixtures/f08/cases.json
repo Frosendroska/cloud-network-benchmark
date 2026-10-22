@@ -32,8 +32,8 @@
     "iperf3.json": "51498f4f8ce5fe37f366314e1d8090962d24dfc00a61ae0859cb9f6f39a83218",
     "iperf3.jsonl": "68d4736bf9499d51142dd666520c9762a681da222ca01af29576b420cda393e4",
     "sockperf-corrupt.csv": "2fa4cddb1a806619d0c36c6a4e9325483b1f620363ca3d335d75b0f0f9277f4a",
-    "sockperf.csv": "d479494710bfb464937ae3f94b617b01030b587b21c815e46558529fefd87291",
-    "sockperf.log": "0120b64f5455dfe0767687303c2f876ea75188f6ba4d66eda26987e5bcbeb14f"
+    "sockperf.csv": "45668448f2813825f3d13717dcdaae4286183d7fafeeda4b2c782a2642165914",
+    "sockperf.log": "19e5176c396406e49c1dd0f96e65d22ba1dbbd26da385a30d203c846bed4ba0a"
   },
   "sockperf_counter_labels": [
     "RunTime",

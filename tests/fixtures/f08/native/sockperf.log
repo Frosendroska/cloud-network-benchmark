@@ -1,3 +1,4 @@
 sockperf: Summary
-[Total Run] RunTime=2.000 sec; Warm up time=5000 msec; SentMessages=2000; ReceivedMessages=2
+[Total Run] RunTime=2.100 sec; Warm up time=5000 msec; SentMessages=2100; ReceivedMessages=2
+[Valid Duration] RunTime=2.000 sec; SentMessages=2000; ReceivedMessages=2
 # dropped messages = 1; # duplicated messages = 2; # out-of-order messages = 3
