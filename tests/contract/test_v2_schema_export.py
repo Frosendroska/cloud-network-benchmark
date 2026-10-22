@@ -146,6 +146,32 @@ def test_command_timing_schema_accepts_legacy_and_monotonic_v2_but_rejects_incom
         "duration_basis": "monotonic", "utc_elapsed_discrepancy_seconds": -7,
     }
     assert evidence_schema.is_valid(base_evidence)
+    for field in ("started_at", "finished_at"):
+        incomplete = dict(base_evidence)
+        del incomplete[field]
+        assert not evidence_schema.is_valid(incomplete)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(incomplete)
+    for field in ("started_at", "finished_at", "duration_seconds", "outcome", "stdout", "exit_code"):
+        incomplete_result = dict(base_evidence)
+        incomplete_result["result"] = dict(base_evidence["result"])
+        del incomplete_result["result"][field]
+        assert not evidence_schema.is_valid(incomplete_result)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(incomplete_result)
+
+    malformed_values = (
+        ("duration_seconds", -1), ("outcome", "unknown"), ("stdout", 1),
+        ("exit_code", []), ("started_at", 123), ("monotonic_started", True),
+    )
+    for field, malformed in malformed_values:
+        candidate = dict(base_evidence)
+        candidate["result"] = dict(base_evidence["result"])
+        candidate["result"][field] = malformed
+        assert not evidence_schema.is_valid(candidate)
+        with pytest.raises((ValidationError, ValueError)):
+            CommandEvidence.model_validate(candidate)
+
     assert not evidence_schema.is_valid({**base_evidence, "monotonic_started": {"unavailable_reason": "missing"}})
     assert not evidence_schema.is_valid({**base_evidence, "utc_elapsed_discrepancy_seconds": None})
     assert not evidence_schema.is_valid({**base_evidence, "duration_basis": "utc"})
@@ -158,3 +184,4 @@ def test_command_timing_schema_accepts_legacy_and_monotonic_v2_but_rejects_incom
                        "monotonic_started": {"value": 100}, "monotonic_finished": {"unavailable_reason": "not captured"},
                        "started_at": {"value": "2026-10-22T12:00:00Z"}, "finished_at": {"unavailable_reason": "not captured"}}
     assert evidence_schema.is_valid(legacy_evidence)
+    CommandEvidence.model_validate(legacy_evidence)

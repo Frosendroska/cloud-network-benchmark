@@ -314,8 +314,30 @@
               },
               "result": {
                 "properties": {
+                  "action_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "duration_basis": {
                     "const": "monotonic"
+                  },
+                  "duration_seconds": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "exit_code": {
+                    "anyOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "finished_at": {
+                    "format": "date-time",
+                    "type": "string"
                   },
                   "monotonic_finished": {
                     "minimum": 0,
@@ -325,11 +347,37 @@
                     "minimum": 0,
                     "type": "number"
                   },
+                  "outcome": {
+                    "enum": [
+                      "succeeded",
+                      "failed",
+                      "timed_out",
+                      "interrupted"
+                    ]
+                  },
+                  "started_at": {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "stderr": {
+                    "type": "string"
+                  },
+                  "stdout": {
+                    "type": "string"
+                  },
                   "utc_elapsed_discrepancy_seconds": {
                     "type": "number"
                   }
                 },
                 "required": [
+                  "action_id",
+                  "outcome",
+                  "started_at",
+                  "finished_at",
+                  "duration_seconds",
+                  "exit_code",
+                  "stdout",
+                  "stderr",
                   "duration_basis",
                   "monotonic_started",
                   "monotonic_finished",
@@ -352,6 +400,8 @@
               }
             },
             "required": [
+              "started_at",
+              "finished_at",
               "utc_elapsed_discrepancy_seconds"
             ]
           }
