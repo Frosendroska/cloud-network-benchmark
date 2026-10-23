@@ -96,8 +96,8 @@ fixture, affected generated 003 schemas only, and 018 feature documentation.
 | Specify/clarify/plan/tasks/analyze | Completed by artifact review; see stage results reported with planning commit |
 | 017 merge / writer release | Verified `2cd36e9ea7b12681545e8c6680ccda42388ffded`; implementation release received after planning gates |
 | Latest-main integration | Merged normally; main base `2cd36e9ea7b12681545e8c6680ccda42388ffded`, integrated head `79dc82d930d7c4aa23650aaa88612e6e55c78912` |
-| Application code/schema changes | Pending implementation |
-| New focused tests / regression suite / schema check | Not run during planning |
+| Application code/schema changes | Implemented in commits `11f7079` and `7782fd9`; no schema output changed |
+| Focused tests / regression suite / schema check | Completed; see final implementation gate below |
 | Real native-tool/cloud acceptance | Not run; outside this feature |
 
 ## Implementation checkpoint
@@ -121,9 +121,8 @@ git diff --check
 exit 0
 ```
 
-This is a focused contract checkpoint only. The canonical F03-to-retrieval-to-validator-to-helper
-integration proof, full regressions, schema check and complete offline suite are still pending;
-no real native-tool or cloud acceptance is claimed.
+At that point this was a focused contract checkpoint only. The integration proof and broader gates
+were subsequently completed as recorded below; no real native-tool or cloud acceptance is claimed.
 
 ## Integration and schema checkpoint
 
@@ -152,7 +151,31 @@ exit 0: 140 passed in 48.29s
 ```
 
 Schema exporter/checker completed with exit 0 and no schema diff. Schema integrity completed with
-exit 0: 2 passed in 1.50s. Full offline suite remains pending. All acquisition/build evidence in
-these fixtures is synthetic; cloud access, real native execution and traffic remain unrun.
+exit 0: 2 passed in 1.50s. The full offline suite was run after this checkpoint as recorded below.
+All acquisition/build evidence in these fixtures is synthetic; cloud access, real native execution
+and traffic remain unrun.
+
+The full credential-free suite then completed at code head `7782fd91aa628385bf7f72739417f24bf70a5bdf`:
+
+```text
+test "$PWD" = /private/tmp/cnb-day-identity || exit 97
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider
+exit 0: 1073 passed in 137.15s (0:02:17), no skips
+```
+
+At the same head, the schema checker command above exited 0 without a generated diff;
+`git diff --check` exited 0. The focused command above exited 0 with 140 tests. The feature base
+is the normal merge head `79dc82d930d7c4aa23650aaa88612e6e55c78912` integrating latest `origin/main`
+`2cd36e9ea7b12681545e8c6680ccda42388ffded`. The current `origin/main` still resolves to that SHA.
+No research choice, F08 consumer, helper, native artifact format or cross-record schema was changed.
+
+## Final evidence boundary
+
+The actual F03 state machine and its source-format fake fixtures are exercised locally. Native
+observations, artifact retrieval, build identity and raw-source replay in the new integration test
+are synthetic/credential-free test evidence; this is not execution of Sockperf/iperf3 binaries,
+cloud VMs, continuous 86,400-second traffic, or a data-validity/complete-day claim.
 
 Implementer records exact head/base, commands/exit results, focused test count, schema diff/no-diff and remaining limitations here when executing the tasks. Coordinator dispatches existing convergence after code/checks; a passing identity fixture is not F08 or F10 completion. No shared runtime state or PR is owned by this planner.
