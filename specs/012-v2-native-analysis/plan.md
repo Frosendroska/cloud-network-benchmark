@@ -66,6 +66,10 @@ tests/integration/test_analysis_replay.py
 
 **Structure Decision**: Three ordinary modules separate calculation from scientific rendering and file publication. Reuse existing evidence models and native/F08 functions. No registry, new package hierarchy or shared schema root. New tests may read/reuse F08's materialized bundle helper; do not edit F08 tests or duplicate its full fixture platform.
 
+## Implementation reconciliation
+
+Implementation stayed within the declared F12 modules, CLI, optional plotting extra, tests, and documentation. Provider matching delegates eligibility to F08; the S1/S3 descriptive view groups independent scenario distributions without inventing pairs. Fixture support extends the real materialized F08 evidence with exact supplemental declarations and matching child-manifest rows for its already-produced observation/build files. The S1/S3 integration test adapts only its disposable copy of the F08 synthetic schedule row and summary label. These are fixture compatibility details, not production validation relaxations. Receiver byte bins remain unavailable where F08 does not provide exact corroborated UTC attribution; aggregate receiver throughput continues to use the existing F08 validated result. See actual commands, evidence boundaries, and visual review in [quickstart.md](quickstart.md).
+
 ## Interfaces, ownership and dependencies
 
 `analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> AnalysisReport` is a read-only F12 entry. `AnalysisReport` is one local frozen record containing serializable payload and protected source paths; it is not a shared DTO. `write_analysis(report, output_root: Path) -> tuple[Path,...]` publishes derived files, calling plot rendering. CLI `analyze --selection PATH --output NEW_DIRECTORY` supplies observed RepositoryGitProvenance snapshot and reports publication outcome separately from dataset validity.

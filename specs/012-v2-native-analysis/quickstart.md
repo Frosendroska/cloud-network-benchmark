@@ -1,38 +1,16 @@
 # F12 validation and user handoff
 
-Implementation in progress. Assigned worktree `/private/tmp/cnb-f12`, branch `codex/f12-v2-analysis`, verified F08 merge base `4a80f4af86feddc86e4ab930d254a19e29b35591`. At setup, HEAD was `fea5e449b77ca0259e5e5211b74094bb8ee7044f`; `origin/main` was the same verified F08 base. The worktree was clean. Shared DTOs/F08/F07/Thesis/state are outside ownership. See [contract](contracts/native-analysis.md) and [data model](data-model.md).
+F12 implementation is complete on assigned branch `codex/f12-v2-analysis` in `/private/tmp/cnb-f12`. The implementation/source-test checkpoint is `5b3552d`; the assigned F08 base was `4a80f4af86feddc86e4ab930d254a19e29b35591`; approved main updates were integrated, including GCP PR20 `527451d8697917c795d8dc9224cf8a17947c4311`. The feature was implemented only in its declared modules, CLI, optional plotting dependency, tests, docs, and feature artifacts. Shared DTO/schema, F07/F08 production code, Thesis, and coordinator state were not changed. Convergence remains a separate coordinator stage.
 
-## Runtime and context
+## Runtime and boundaries
 
-Use every command from this assigned worktree with explicit context:
+Validation used Python 3.11.13 on macOS 15.2 x86_64, Matplotlib 3.11.2, NumPy 2.4.6, and Agg with `MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config`. PowerShell 7.5.11 ran from `/private/tmp/cnb-tools/powershell-7.5.11/pwsh` (arm64 binary under the available host runtime). No clouds, benchmark traffic, credentials, or paid acceptance were used. The full suite's temporary `configs/tests/f08-*-aws.yaml` fixtures were cleaned up; final search found none.
 
-```sh
-test "$PWD" = /private/tmp/cnb-f12 || exit 97
-export GIT_BRANCH_NAME=codex/f12-v2-analysis
-export SPECIFY_FEATURE_DIRECTORY=specs/012-v2-native-analysis
-export THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis
-export PYTHONPATH=src
-export PYTHONDONTWRITEBYTECODE=1
-export PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH
-export MPLBACKEND=Agg
-export MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config
-CNB_PYTHON=/private/tmp/cnb-offline-venv/bin/python
-test -x "$CNB_PYTHON"
-```
+Read-only schema validation and CLI checks pass. Existing native receiver interval attribution is retained: where it cannot establish exact UTC-to-bin support, per-bin throughput stays unavailable; validated aggregate receiver throughput remains available. DAY reports are descriptive and do not imply an idle baseline, causal burst effect, or continuous every-send proof. Cross-provider comparisons require the full expected peer set and reuse F08 policy. S1/S3 results compare independent compatible scenario distributions; they do not fabricate matched pairs. Receiver bytes are not prorated across bins.
 
-Optional dependency declaration is `analysis = ["matplotlib>=3.7,<4"]` (added during T002). Verified in the assigned runtime with `MPLBACKEND=Agg` and `MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config`: Python 3.11.13, x86_64 process on macOS 15.2 x86_64, Matplotlib 3.11.2, NumPy 2.4.6, Agg backend, bundled Matplotlib data directory `/private/tmp/cnb-offline-venv/lib/python3.11/site-packages/matplotlib/mpl-data`; the DejaVu Sans TTF path is verified below during renderer QA. Official PowerShell on the supplied PATH is 7.5.11. Do not confuse host/process architecture. Exact F12 renderer acceptance is not yet run. Use the supplied official PowerShell PATH for full-suite checks without changing provider tests.
+## User command and inputs
 
-Setup reconciliation: `.specify/extensions.yml` is absent (no implement hooks); both implementation checklists had 16/16 items checked. The existing `.gitignore` excludes Python caches/environments/build outputs and generated `results/processed/*`; `.terraformignore` excludes Terraform state/plan/secrets. The prerequisite script completed successfully with the assigned feature directory and task artifacts. Read-only F08 adapters confirmed available: `validate_bundle(value, evaluated_at=...)`, `evaluate_comparison(inputs, results)`, native parsers/statistics in `native.py`, plus `_acquisition_windows` and `_measured_samples` in `validation.py`; the existing integration fixture materializes real F08 lifecycle artifacts and is the planned F12 test wrapper. Baseline command:
-
-```sh
-PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider tests/integration/test_native_validation_replay.py
-```
-
-Result: exit 0, 10 passed in 52.41s. No F12 implementation/render/replay or full suite checks have been run yet. No cloud, benchmark traffic, or credentials used.
-
-## Planned user command and inputs
-
-After implementation, a selection file pairs saved existing DTO files:
+A selection pairs existing saved `ValidatorInput` and `ValidationResult` JSON files:
 
 ```json
 {
@@ -43,49 +21,42 @@ After implementation, a selection file pairs saved existing DTO files:
 }
 ```
 
-These are user-selected existing files, not a new YAML experiment plan. Paths resolve relative to the selector; optional UTC/cost selection fields are defined in the contract. No F09 dependency or actual paid bundle is required for fixture replay. The planned command is:
+Paths resolve relative to the selection. The CLI is:
 
 ```sh
-"$CNB_PYTHON" -m cloud_network_benchmark analyze --selection selection.json --output results/processed/report-new
+cloud-network-benchmark analyze --selection selection.json --output results/processed/report-001
 ```
 
-Use the existing ignored results/processed area or a source-disjoint directory outside the implementation checkout so generated outputs do not alter observed analysis Git dirty identity on the next replay. This uses existing ignore rules; no ignore or provenance implementation change is required. It writes the documented normalized tables, PNG/SVG figures and index.html in a fresh directory. Its exit0 means report generation succeeded, not that every dataset is valid/eligible. Existing or source-overlapping output is an error; current validation and unavailable reasons remain visible. README user guidance stays concise; detailed calculation/replay limits belong in docs/native-analysis.md.
+The output must be a new directory disjoint from the selected sources. Exit 0 means publication succeeded; validation and comparison eligibility remain explicit in the report and do not become an overall “all valid” claim. The command writes `report.json`, normalized CSV tables, PNG/SVG figures and offline `index.html`. Detailed calculations and limitations are in [native-analysis.md](../../docs/native-analysis.md).
 
-## Exact checks after implementation
+## Checks and exact results
 
-```sh
-"$CNB_PYTHON" -m pytest -q -p no:cacheprovider tests/unit/test_analysis.py tests/unit/test_analysis_plots.py tests/contract/test_analysis_interface.py tests/integration/test_analysis_replay.py
-"$CNB_PYTHON" -m pytest -q -p no:cacheprovider tests/unit/test_native.py tests/unit/test_validation.py tests/integration/test_native_validation_replay.py tests/integration/test_validate_resolve_cli.py tests/integration/test_dry_run_cli.py tests/integration/test_initialize_cli.py
-"$CNB_PYTHON" -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check
-"$CNB_PYTHON" -m pytest -q -p no:cacheprovider
-git diff --check
-```
+All commands ran from `/private/tmp/cnb-f12` with the assigned offline runtime and `PYTHONPATH=src` (plus `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis` where required). The full command included the official PowerShell directory on `PATH`, Agg, and the isolated Matplotlib configuration directory.
 
-The new tests are planned files, not runnable planning evidence. Record actual command/exit/count/head after implementation. No Terraform/provider changes require new paid checks; the full Python suite uses existing fakes/static fixtures. If a dependency or tool is unavailable, report it as not run rather than skip it into a passing claim.
-
-## Acceptance matrix and visual review
-
-| Case | Required proof |
+| Check | Result |
 | --- | --- |
-| Numeric oracle | Unequal interval rates use total receiver bytes/elapsed; parallel bytes have one elapsed denominator; exact raw-bin RTT quantiles, SD/count thresholds and zero baseline treatment match independent expected values. |
-| Mode/support | Actual F08 materialized four-mode inputs revalidate; omit/warm-up/gaps/straddling intervals and unknown clocks do not become fabricated bins; partial DAY has one-minute rows without idle/inflation or fake completeness. |
-| Cohorts | Correct deployment counts/median/IQR/points; duplicate/replacement/retained units stay separate; provider matching preserves full expected cohort, frozen N/skew gates; S1/S3 within provider/window records actual dates and same-week deviation. |
-| Context | Both-role reset/missing diagnostics survive; selected-attempt reliability denominator and sourced cost distinctions/dedup are explicit; missing charge/runtime/transfer is unavailable. |
-| Trust/output | Changed source or stale saved result cannot restore validity; unsafe paths/existing reports refused; raw hashes and record identities unchanged; failed rendering does not publish a complete report. |
-| Replay | Actual CLI generates all required formats twice in new directories, with reversed descriptor order/name, same source/revision/environment; every produced file byte and source hash matches. |
-| Visual | Open representative PNGs for each distinct plot class at full size; inspect matching SVG labels/dimensions and HTML in a local browser. Axes/units/counts, spikes/gaps, status/source captions and source/table/image links must be readable, unclipped and offline. |
+| Focused F12: `tests/unit/test_analysis.py tests/unit/test_analysis_plots.py tests/contract/test_analysis_interface.py tests/integration/test_analysis_replay.py` | Exit 0; 30 passed in 95.64s. |
+| Existing F08/native/CLI regressions: `tests/unit/test_native.py tests/unit/test_validation.py tests/integration/test_native_validation_replay.py tests/integration/test_validate_resolve_cli.py tests/integration/test_dry_run_cli.py tests/integration/test_initialize_cli.py` | Exit 0; 129 passed in 54.77s. |
+| Full credential-free suite: `python -m pytest -q -p no:cacheprovider` | Exit 0; 1284 passed, 0 skipped in 261.79s. Command used `PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH`. |
+| Canonical contracts: `python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | Exit 0; no schema drift. |
+| CLI: `python -m cloud_network_benchmark analyze --help` | Exit 0; exposes only `--selection` and `--output`. |
+| `git diff --check` | Exit 0. |
+| Renderer environment: `pwsh -v` with official path; Python version/import/backend probe | Exit 0; PowerShell 7.5.11, Python 3.11.13, Matplotlib 3.11.2, NumPy 2.4.6, Agg, x86_64. |
 
-Visual checks include nonempty short-study and partial DAY, deployment/provider/placement distributions and an empty/ineligible selection. Avoid golden-image-only tests: numerical plot data and eligibility need independent oracles. Use actual generated report paths printed by integration tests; record those paths and inspection findings. Native metadata/software warnings are not performance warnings and do not authorize clipping slow results.
+Focused and full integration replay exercise materialized F08 lifecycle evidence for short-study, acceptance, calibration, and diagnostic-day modes through the F12 CLI. Reversed descriptor order and different output names produce byte-identical report files; checks cover source hashes, status recomputation, independent expected arithmetic, missing/partial evidence, full provider cohort eligibility, S1/S3 distribution comparison, and failure cases. Integration support adds exact supplemental artifact declarations and matching child-manifest rows for observation/build files already produced by the F08 fixture; it does not synthesize success or relax production validation. The S1/S3 fixture uses a disposable real config copy and adapts only the synthetic schedule row/summary label.
 
-## Evidence at planning handoff
+## Visual and replay review
 
-| Item | Status |
-| --- | --- |
-| F08 dependency | Merged at the assigned base; branch verified locally |
-| Spec Kit planning/artifact review | Completed stages reported with planning commit |
-| Plot dependency tooling | Coordinator-reported installation/Agg smoke exit0; F12 application acceptance unrun |
-| Application code / shared schema edits | Not made by planner |
-| New/focused/full application tests and visual report review | Not run during planning |
-| Clouds / native benchmark execution | Not run; outside F12 |
+The generated PNGs for time-series, raw RTT distribution, deployment points, placement comparison, empty placement, and DAY views were opened at full size. Long category labels in deployment points were split across lines after visual inspection; the revised figure has readable, unclipped labels and a source caption. The nonempty S1/S3 placement plot has a readable zero-centered comparison and units. Corresponding SVGs parse and use consistent 576pt × 324pt dimensions; no date metadata is injected. The static HTML parser check found local navigation/source links and all table/image links with no external HTTP assets; hostile labels are escaped.
 
-Implementer fills exact tested head/base, versions, command results, figure paths and visual/deterministic evidence here; coordinator dispatches convergence. F12 completion does not establish F10 or paid acceptance.
+Representative generated artifacts from the final full-suite run are under `/private/var/folders/15/gp82yk6d61v0ldtfbgbcwlzw0000gp/T/pytest-of-katya/pytest-1107/`, including:
+
+- `test_materialized_four_mode_in0/{short_study,acceptance,calibration,diagnostic_day}/report/`
+- `test_s1_s3_scenario_distributi0/s1-s3-report/figures/placement-comparison.png`
+- `test_render_produces_determini0/{one,two}/deployment-points.png`
+
+Replay checks compare every report output byte and source hash across the paired output directories. Generated report artifacts remain in the temporary test directory and do not alter selected native input bytes.
+
+## Evidence status
+
+The full credential-free offline implementation gate passed. No native benchmark, provider operation, cloud acceptance, or thesis interpretation was attempted. F12 demonstrates deterministic local analysis of supplied evidence only; it does not establish F10 cloud readiness or approve paid execution. The coordinator should run convergence against the integrated branch before declaring the feature closed.
