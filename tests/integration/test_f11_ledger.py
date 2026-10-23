@@ -244,6 +244,14 @@ def test_stage_fit_preserves_original_monotonic_cap_and_effective_trigger(tmp_pa
     decision=book.reserve(request,plan=plan)
     assert decision.effective_deadline == utc[0] + timedelta(seconds=840)
     rid=decision.evidence.reservation_id.value
+    omitted_future = WorkflowAllowance(10,0,10,60,76,1,10,10,"time-policy",{"aws":360,"azure":60,"gcp":60})
+    assert not book.check_stage_fit(rid,stage="registration",remaining=omitted_future).eligible
+    assert book.check_stage_fit(rid,stage="registration",remaining=allowance).eligible
+    # Wall-clock steps are evidence only; fit uses the original monotonic cap mapping.
+    utc[0] += timedelta(days=2)
+    monotonic[0] += 1
+    assert book.check_stage_fit(rid,stage="registration",remaining=allowance).eligible
+    utc[0] -= timedelta(days=4)
     assert book.check_stage_fit(rid,stage="registration",remaining=allowance).eligible
     monotonic[0] += 150
     utc[0] += timedelta(seconds=150)
@@ -293,6 +301,8 @@ def test_final_billing_and_all_provider_absence_release_only_proved_unused_fundi
     assert reservation["evidence"]["reasons"]
     assert Decimal(state["funding_remaining"]["primary"]) == Decimal("100.3")
     assert not state["cleanup_blocked"]
+    terminal = book.claim_creation(rid, provider=Provider.AWS, expiry_requests=[], expiry_evidence=[])
+    assert not terminal.eligible and terminal.reason_codes == ("reservation_terminal",)
 
 
 def test_replacement_is_bound_to_one_failed_short_observation_and_original_provider(tmp_path):
@@ -604,8 +614,24 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
             target_selector=req.target_selector, provider_metadata=StructuredEvidence(value={"fixture":True})))
     decision = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert decision.eligible and decision.creation_granted
+    late = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
+        monotonic_now=lambda:1.0 + request.lifetime_cap_seconds + 1, controller_session_id="session-1")
+    expired = late.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+    assert not expired.eligible and "workflow_time_insufficient" in expired.reason_codes
     replay = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert replay.eligible and not replay.creation_granted and "creation_already_claimed" in replay.reason_codes
+    resumed = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
+        monotonic_now=lambda:2.0, controller_session_id="new-controller-session")
+    campaign2 = (resolve_campaign(config_path, ROOT)[0] if mode == "acceptance"
+        else scheduled_campaign(config_path, f"{mode}-after-registration", now + timedelta(seconds=60)))
+    if mode in {"short_study", "diagnostic_day"}:
+        campaign2 = campaign2.model_copy(update={"benchmark":campaign2.benchmark.model_copy(update={"common_n":frozen})})
+    request2, plan2 = scheduled_request_and_plan(campaign2, costs, campaign_id=f"create-{mode}-after-registration",
+        providers=providers, child_prefix=f"after-registration-{mode}", namespace_prefix=f"after-registration-{mode}-ns",
+        funding={"primary":"0.5"}, measurement_seconds=minimum)
+    request2 = request2.model_copy(update={"outstanding_cleanup":True,"active_reserved_usd":Evidence[float](value=0.5)})
+    blocked = resumed.reserve(request2, plan=plan2)
+    assert blocked.status == "rejected" and blocked.reasons == ("controller_session_changed",)
 
 
 @pytest.mark.parametrize("mutation", ["missing_component", "wrong_region", "underfunded_component"])
@@ -624,13 +650,34 @@ def test_cost_envelopes_reject_incomplete_or_mismatched_workflow_cost(mutation):
     elif mutation == "wrong_region":
         row["regions"] = ["invented-region"]
     else:
-        row["components"] = dict(row["components"])
-        component = dict(row["components"]["compute"])
-        component["amount_usd"] = str(Decimal(component["amount_usd"]) - Decimal("0.01"))
-        row["components"]["compute"] = component
+        underfunded = plan.__class__(**{**plan.__dict__, "funding":{"primary":Decimal("0.49")}})
+        with pytest.raises(ValueError, match="cost_envelope_invalid"):
+            admission_module._validate_cost_envelopes(underfunded, request)
+        return
     envelopes["aws"] = row
     with pytest.raises(ValueError, match="cost_envelope_invalid"):
         admission_module._validate_cost_envelopes(plan.__class__(**{**plan.__dict__, "cost_envelopes":envelopes}), request)
+
+
+def test_saved_provider_price_envelopes_validate_without_launching_paid_work(tmp_path):
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="priced-boundary",
+        providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix="priced-run",
+        namespace_prefix="priced-ns", funding={"primary":"0.5"})
+    rows = make_synthetic_envelopes(campaign, plan.child_identities, plan.funding)
+    public_rows = {name:{**{k:v for k,v in row.items() if k not in {"source_path","source_sha256"}},
+        "source_kind":"provider-price-input"} for name,row in rows.items()}
+    payload = dict(costs.payload)
+    payload["provider_run_envelopes"] = public_rows
+    priced_path = tmp_path / "dated-prices.json"
+    priced_path.write_text(json.dumps(payload,sort_keys=True),encoding="utf-8")
+    priced = load_cost_inputs(priced_path)
+    envelopes = {name:{**row,"source_kind":"provider-price-input", "source_path":priced.source_path,
+        "source_sha256":priced.payload_sha256} for name,row in rows.items()}
+    request = request.model_copy(update={"source_path":priced.source_path,"source_sha256":priced.payload_sha256})
+    paid_plan = plan.__class__(**{**plan.__dict__,"costs":priced,"execution_scope":"paid_request","cost_envelopes":envelopes})
+    assert admission_module._validate_cost_envelopes(paid_plan,request)[0] == Decimal("0.5")
 
 
 def test_saved_cost_bytes_must_match_at_initialize(tmp_path):
@@ -678,6 +725,11 @@ def test_cost_source_switch_requires_review_and_preserves_old_allocations(tmp_pa
     old = load_cost_inputs(source)
     book = ledger(tmp_path / "ledger.json")
     book.initialize(old)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    old_request, old_plan = scheduled_request_and_plan(campaign, old, campaign_id="old-cost-source",
+        providers=[Provider.AWS,Provider.AZURE,Provider.GCP], child_prefix="old-source-run", namespace_prefix="old-source-ns",
+        funding={"primary":"0.5"})
+    assert book.reserve(old_request, plan=old_plan).status == "reserved"
     payload = dict(old.payload)
     payload["cost_input_id"] = "reviewed-next-source"
     payload["funding"] = dict(payload["funding"])
@@ -685,14 +737,18 @@ def test_cost_source_switch_requires_review_and_preserves_old_allocations(tmp_pa
     next_path = tmp_path / "costs-v2.json"
     next_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     fresh = load_cost_inputs(next_path)
+    changed_request = old_request.model_copy(update={"campaign_id":"changed-source-attempt", "source_path":fresh.source_path,
+        "source_sha256":fresh.payload_sha256})
+    changed_plan = old_plan.__class__(**{**old_plan.__dict__,"costs":fresh})
+    assert book.reserve(changed_request, plan=changed_plan).reasons == ("source_mismatch",)
     evidence = {"evidence_id":"cost-source-review-2", "source_path":"review/source-change.json",
         "source_sha256":"f"*64, "reviewed_payload_sha256":fresh.payload_sha256,
         "scope_id":"offline-scope", "status":"reviewed"}
     with pytest.raises(ValueError, match="source_mismatch"):
         book.reconcile_cost_source(fresh, {**evidence, "reviewed_payload_sha256":"0"*64})
     updated = book.reconcile_cost_source(fresh, evidence)
-    assert Decimal(updated["funding_remaining"]["primary"]) == Decimal("200")
-    assert len(updated["source_history"]) == 2
+    assert Decimal(updated["funding_remaining"]["primary"]) == Decimal("199.5")
+    assert len(updated["source_history"]) == 3
 
 
 def test_optional_rows_remain_offline_and_paid_request_needs_current_review_and_support(tmp_path):

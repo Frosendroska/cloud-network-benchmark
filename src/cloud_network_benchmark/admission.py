@@ -204,6 +204,16 @@ def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest)
     return total, bucket_totals, support_totals
 
 
+def _validate_paid_acceptance_evidence(evidence: Mapping[str, Any], campaign: Any) -> None:
+    """Require a source-linked completed acceptance covering this campaign scope."""
+    BudgetLedger._validate_gate_evidence(evidence)
+    providers = {Provider(p).value for p in campaign.selected_providers}
+    if (evidence.get("status") != "completed" or evidence.get("config_id") != campaign.config_id
+        or evidence.get("mode") != ExperimentMode.ACCEPTANCE.value
+        or set(evidence.get("providers", ())) != providers):
+        raise ValueError("paid acceptance evidence does not match requested mode/config/providers")
+
+
 def load_cost_inputs(path: Path) -> CostInputs:
     raw = path.read_bytes()
     try:
@@ -211,7 +221,7 @@ def load_cost_inputs(path: Path) -> CostInputs:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid cost input JSON") from exc
     required = {"schema_version", "cost_input_id", "prices_checked_on", "source_scope", "source_sha256", "source_identity_kind", "currency", "funding"}
-    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support"}) or not required <= set(data):
+    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support", "provider_run_envelopes"}) or not required <= set(data):
         raise ValueError("invalid cost input fields")
     if data["schema_version"] != 1 or data["currency"] != "USD":
         raise ValueError("unsupported cost input scope")
@@ -689,11 +699,7 @@ class BudgetLedger:
                 try:
                     for key in required: self._validate_gate_evidence(plan.prerequisites[key])
                     if "paid_acceptance" in required:
-                        acceptance = plan.prerequisites["paid_acceptance"]
-                        if (acceptance.get("status") != "completed"
-                            or acceptance.get("config_id") != campaign.config_id
-                            or set(acceptance.get("providers", [])) != {Provider(p).value for p in campaign.selected_providers}):
-                            raise ValueError("paid acceptance scope does not match requested work")
+                        _validate_paid_acceptance_evidence(plan.prerequisites["paid_acceptance"], campaign)
                 except ValueError:
                     reasons.append("prerequisite_pending")
             if plan.optional_reviewed is False and request.priority in {"P2", "P3"}: reasons.append("optional_review_required")

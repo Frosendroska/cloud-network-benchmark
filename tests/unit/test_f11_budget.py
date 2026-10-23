@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from cloud_network_benchmark.admission import AdmissionPlan, BudgetLedger, WorkflowAllowance, load_cost_inputs, minimum_protocol_seconds, _decimal
+from cloud_network_benchmark.admission import AdmissionPlan, BudgetLedger, WorkflowAllowance, load_cost_inputs, minimum_protocol_seconds, _decimal, _validate_paid_acceptance_evidence
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.admission import ReservationRequest
 from cloud_network_benchmark.contracts.common import Evidence, Provider
@@ -40,6 +40,23 @@ def test_cost_input_dates_require_exact_calendar_date_format(tmp_path, field):
 def test_money_rejects_boolean_negative_and_nonfinite(value):
     with pytest.raises(ValueError):
         _decimal(value)
+
+
+@pytest.mark.parametrize("mutation", ["failed", "wrong_config", "wrong_mode", "wrong_providers"])
+def test_paid_acceptance_evidence_requires_completed_matching_scope(mutation):
+    campaign, _ = resolve_campaign(ROOT / "configs/experiments/exp-001-multi-provider.yaml", ROOT)
+    evidence = {"evidence_id":"acceptance-result", "source_path":"evidence/acceptance.json",
+        "source_sha256":"a"*64, "status":"completed", "config_id":campaign.config_id,
+        "mode":"acceptance", "providers":["aws", "azure", "gcp"]}
+    if mutation == "failed": evidence["status"] = "failed"
+    if mutation == "wrong_config": evidence["config_id"] = "other-config"
+    if mutation == "wrong_mode": evidence["mode"] = "calibration"
+    if mutation == "wrong_providers": evidence["providers"] = ["aws"]
+    with pytest.raises(ValueError, match="paid acceptance evidence"):
+        _validate_paid_acceptance_evidence(evidence, campaign)
+    good = {**evidence, "status":"completed", "config_id":campaign.config_id, "mode":"acceptance",
+        "providers":["aws", "azure", "gcp"]}
+    _validate_paid_acceptance_evidence(good, campaign)
 
 
 @pytest.mark.parametrize(("working", "accepted"), [("250", True), ("250.0001", False), ("300", False)])
