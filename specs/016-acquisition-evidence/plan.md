@@ -95,6 +95,15 @@ fixtures do not claim a real patched binary or cloud run. The approved workload,
 native files, coverage denominator, and separate generation and alignment thresholds remain
 unchanged. No F08 runtime consumer or other feature worktree is part of this amendment.
 
+The serialized T026–T029 convergence also owns the bounded retrieval test-fixture repair: new
+observation artifacts are matched by exact command artifact ID and path, avoiding prefix collisions
+without changing production matching rules. Native iperf support consumes either the existing
+pretty-printed client JSON artifact or the closed/retrieved B receiver JSONL artifact; it does not
+alter measurement flags. Session-wide proof is preflighted before publishing windows, while only a
+genuinely failed/truncated tail can preserve a correlated closed prefix. Day-scale replay and
+coverage require chronological source iterators and retain bounded state. Corrupt native candidates
+are isolated per unit so valid evidence from another unit remains available.
+
 ## Complexity Tracking
 
 No constitution violations. Two additive upstream observation patches are necessary because current native sources expose filtered samples and relative/statistical spans rather than source-bound enabled windows. A DTO alone cannot close the gap. No additional agent/platform abstraction is justified.

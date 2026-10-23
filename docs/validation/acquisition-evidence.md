@@ -224,5 +224,43 @@ Linux compile, installed tool help check, patched executable run, guest clock ve
 SSH, benchmark traffic, and credential use were not run. The retrieval integration fixture now
 matches exact unit command IDs and artifact paths so similarly prefixed actions cannot be mistaken
 for the producing client; this fixture repair stays inside the assigned feature test harness.
-Convergence task markers T021–T025 are checked, for 25 total feature tasks. The final code head
-before this documentation update was `a89442c49dfc56d241337261c54fb557fc10b534`.
+Convergence task markers T021–T025 were checked at the preceding checkpoint. The serialized
+T026–T029 convergence added actual pinned iperf grammar/origin handling, bounded session preflight
+and chronological coverage, strict global-proof gating before any window is published, and
+per-unit isolation for corrupt Sockperf candidates. The day-scale fixture now emits 100,000
+receiver intervals and matching native JSONL rows through public replay, rather than relying on a
+large unrelated log notice. The tests also mutate shared session settings/origins/stream count and
+verify failure before the first yield; command failure and genuinely truncated tails preserve only
+corroborated closed prefixes.
+
+The code checkpoint is `18aac5c` (`fix(acquisition): preflight native streams and bound replay`)
+on top of the normal merge of `origin/main` at `24a964505210b2e4e8593861bcabf8ce5ec2e9d6`.
+Validation after that code commit:
+
+```text
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+exit 0: 915 passed in 100.60s
+
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q \
+  tests/unit/test_measurement_timing.py tests/integration/test_acquisition_producer.py
+exit 0: 50 passed in 48.84s
+
+PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python \
+  -m cloud_network_benchmark.contracts.schema \
+  --output specs/003-v2-shared-contracts/contracts --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+The current packaged Sockperf and iperf patches were reverse-applied from the previously
+zero-fuzz-patched copies, restoring the exact pinned-source hashes listed above, then reapplied
+with `patch --batch --fuzz=0 -p1`; both reapplications exited 0. The packaged patch SHA-256 values
+remain unchanged. The tests cover raw source binding and replay for all four modes, including the
+diagnostic B receiver JSONL artifact; no protocol/CLI flags, warm-up, workload, or native output
+files changed. Linux compilation, patched native executable/help checks, cloud, SSH, credentials,
+and benchmark traffic were not run. All 29 tasks are now checked.
