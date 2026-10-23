@@ -10,6 +10,7 @@ from cloud_network_benchmark.contracts.common import Evidence, Provider, Structu
 from cloud_network_benchmark.admission import AdmissionPlan, WorkflowAllowance
 from decimal import Decimal
 import os
+import json
 import subprocess
 import sys
 import multiprocessing
@@ -18,6 +19,7 @@ import fcntl
 import hashlib
 from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.campaign import CommonNState, ReplacementContext
+from tests.fixtures.f11.envelope_factory import make_synthetic_envelopes
 
 
 ROOT = Path(__file__).parents[2]
@@ -41,9 +43,11 @@ def _reserve_same_claim_in_process(args):
         priority=campaign.admission.priority, lifetime_cap_seconds=1200,
         estimated_cost_usd=Evidence[float](value=.5), source_path=costs.source_path, source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](value=0), active_reserved_usd=Evidence[float](value=0), outstanding_cleanup=False)
-    plan = AdmissionPlan(campaign, {p: f"{campaign_id}-{p}" for p in ("aws", "azure", "gcp")},
+    children = {p: f"{campaign_id}-{p}" for p in ("aws", "azure", "gcp")}
+    funding = {"primary": Decimal("0.5")}
+    plan = AdmissionPlan(campaign, children,
         {p: f"{campaign_id}-{p}-ns" for p in ("aws", "azure", "gcp")}, costs, allowance,
-        funding={"primary": Decimal("0.5")})
+        funding=funding,cost_envelopes=make_synthetic_envelopes(campaign,children,funding))
     result = book.reserve(request, plan=plan)
     return result.status, result.newly_reserved, result.revision
 
@@ -64,16 +68,20 @@ def scheduled_request_and_plan(campaign, costs, *, campaign_id, providers, child
                                original_failure=None, observation_id=None, measurement_seconds=226, lead_seconds=60):
     names=[Provider(provider).value for provider in providers]
     allowance=WorkflowAllowance(10,20,10,60,measurement_seconds,1,10,10,"synthetic-sourced-policy",{name:lead_seconds for name in names})
+    schedule_evidence = (Evidence[str](value=campaign.schedule_entry.value.entry_id) if campaign.schedule_entry.value
+        else Evidence[str](unavailable_reason="acceptance has no scheduled row"))
     request=ReservationRequest(schema_version=2,campaign_id=campaign_id,config_id=campaign.config_id,
-        schedule_entry_id=Evidence[str](value=campaign.schedule_entry.value.entry_id),selected_providers=providers,
+        schedule_entry_id=schedule_evidence,selected_providers=providers,
         mode=campaign.mode,priority=campaign.admission.priority,lifetime_cap_seconds=campaign.admission.lifetime_cap_seconds,
         estimated_cost_usd=Evidence[float](value=float(sum((Decimal(value) for value in funding.values()),Decimal("0")))),source_path=costs.source_path,
         source_sha256=costs.payload_sha256,incurred_cost_usd=Evidence[float](value=0),
         active_reserved_usd=Evidence[float](value=0),outstanding_cleanup=False)
-    plan=AdmissionPlan(campaign,{name:f"{child_prefix}-{name}" for name in names},
+    children={name:f"{child_prefix}-{name}" for name in names}
+    funding_map={key:Decimal(value) for key,value in funding.items()}
+    plan=AdmissionPlan(campaign,children,
         {name:f"{namespace_prefix}-{name}" for name in names},costs,allowance,
-        funding={key:Decimal(value) for key,value in funding.items()},original_failure=original_failure,
-        observation_id=observation_id)
+        funding=funding_map,original_failure=original_failure,observation_id=observation_id,
+        cost_envelopes=make_synthetic_envelopes(campaign,children,funding_map))
     return request,plan
 
 
@@ -158,6 +166,23 @@ def test_preview_is_pending_read_only_and_invalid_input_exits_two(tmp_path):
     assert bad.returncode == 2
 
 
+def test_preview_reports_duplicate_retained_schedule_as_invalid(tmp_path):
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    duplicate = tmp_path / "duplicate-calibration.csv"
+    duplicate.write_text("entry_id,config_id,experiment_id,scheduled_start,window_label,priority\n"
+        "CAL-A,exp-001-calibration,EXP-001,,night,P0\n"
+        "CAL-B,exp-001-calibration,EXP-001,,night,P0\n", encoding="utf-8")
+    command = [sys.executable, "-m", "cloud_network_benchmark.admission", "preview", "--schedule", str(duplicate),
+        "--config-map", "tests/fixtures/f11/config-map.json", "--cost-inputs", "tests/fixtures/f11/cost-inputs.json",
+        "--now", "2026-10-22T00:00:00Z"]
+    result = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert report["status"] == "invalid"
+    assert any(code.startswith("schedule_error:identity_mismatch:CAL-A:retained_mode_requires_one_entry")
+        for code in report["reason_codes"])
+
+
 def test_concurrent_processes_commit_one_identical_claim(tmp_path):
     path = tmp_path / "ledger.json"
     book = ledger(path)
@@ -213,18 +238,22 @@ def test_stage_fit_preserves_original_monotonic_cap_and_effective_trigger(tmp_pa
         mode=campaign.mode,priority=campaign.admission.priority,lifetime_cap_seconds=1200,
         estimated_cost_usd=Evidence[float](value=.5),source_path=costs.source_path,source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](value=0),active_reserved_usd=Evidence[float](value=0),outstanding_cleanup=False)
-    plan=AdmissionPlan(campaign,{p.value:f"{p.value}-child" for p in providers},{p.value:f"{p.value}-namespace" for p in providers},
-        costs,allowance,funding={"primary":Decimal("0.5")})
+    children={p.value:f"{p.value}-child" for p in providers}; funding={"primary":Decimal("0.5")}
+    plan=AdmissionPlan(campaign,children,{p.value:f"{p.value}-namespace" for p in providers},
+        costs,allowance,funding=funding,cost_envelopes=make_synthetic_envelopes(campaign,children,funding))
     decision=book.reserve(request,plan=plan)
     assert decision.effective_deadline == utc[0] + timedelta(seconds=840)
     rid=decision.evidence.reservation_id.value
     assert book.check_stage_fit(rid,stage="registration",remaining=allowance).eligible
     monotonic[0] += 150
     utc[0] += timedelta(seconds=150)
-    measurement=WorkflowAllowance(0,0,0,0,76,1,10,10,"time-policy",{"aws":360,"azure":60,"gcp":60})
+    measurement=WorkflowAllowance(0,0,0,0,76,1,10,10,"time-policy",{"aws":360,"azure":60,"gcp":60},("registration","preparation"))
     blocked=book.check_stage_fit(rid,stage="measurement",remaining=measurement)
-    assert not blocked.eligible
-    assert "workflow_time_insufficient" in blocked.reason_codes
+    assert blocked.eligible
+    # The cap and provider trigger, rather than the initial fit estimate, bound work.
+    monotonic[0] = 940.0
+    expired = book.check_stage_fit(rid,stage="measurement",remaining=measurement)
+    assert not expired.eligible and "workflow_time_insufficient" in expired.reason_codes
     monotonic[0]=99.0
     regressed=book.check_stage_fit(rid,stage="registration",remaining=allowance)
     assert "controller_session_changed" in regressed.reason_codes
@@ -244,17 +273,24 @@ def test_final_billing_and_all_provider_absence_release_only_proved_unused_fundi
             occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc)))
     for provider in (Provider.AWS,Provider.AZURE):
         record_absence(book,f"absence-{provider.value}",rid,provider,datetime(2026,10,22,0,2,tzinfo=timezone.utc))
+    for provider, amount in ((Provider.AWS, Decimal("0.02")), (Provider.AZURE, Decimal("0.03"))):
+        book.reconcile(Reconciliation(f"final-billing-{provider.value}",rid,provider,
+            hashlib.sha256(f"billing-{provider.value}".encode()).hexdigest(), incurred_usd=amount, actual=True,
+            occurred_at=datetime(2026,10,22,0,2,30,tzinfo=timezone.utc),billing_final=True,
+            source_path=f"local/{provider.value}-billing.json"))
     billing_sha=hashlib.sha256(b"synthetic-final-billing-evidence").hexdigest()
     book.reconcile(Reconciliation("final-billing",rid,Provider.GCP,billing_sha,
-        incurred_usd=Decimal("0.1"),actual=True,cleanup_verified_absent=True,billable_resources_present=False,
+        incurred_usd=Decimal("0.05"),actual=True,cleanup_verified_absent=True,billable_resources_present=False,
         occurred_at=datetime(2026,10,22,0,3,tzinfo=timezone.utc),billing_final=True,
         released_funding_by_bucket={"primary":Decimal("0.4")},release_evidence_id="billing-final-v1",
         release_source_path="local/billing-final.json",source_path="local/billing-final.json",
         absence_evidence_id="absence-final-billing",absent_resource_ids=("gcp:vm-a","gcp:vm-b","gcp:expiry-support")))
     state=book.inspect()
     reservation=state["reservations"][rid]
-    assert reservation["incurred_usd"] == "0.1"
+    assert Decimal(reservation["incurred_usd"]) == Decimal("0.1")
     assert reservation["released_usd"] == "0.4"
+    assert reservation["evidence"]["state"] == "released"
+    assert reservation["evidence"]["reasons"]
     assert Decimal(state["funding_remaining"]["primary"]) == Decimal("100.3")
     assert not state["cleanup_blocked"]
 
@@ -482,6 +518,28 @@ def test_past_short_slot_is_missed_without_catchup_or_ledger_mutation(tmp_path):
     assert not book.inspect()["reservations"]
 
 
+def test_exact_claim_retry_after_target_returns_original_reservation(tmp_path):
+    now = [datetime(2026, 10, 22, tzinfo=timezone.utc)]
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book = BudgetLedger(tmp_path / "ledger.json", scope_id="retry-scope", utc_now=lambda:now[0],
+        monotonic_now=lambda:1.0, controller_session_id="retry-session")
+    book.initialize(costs)
+    campaign = scheduled_campaign(ROOT / "configs/experiments/exp-001-multi-provider.yaml", "RETRY-AFTER-TARGET", now[0]+timedelta(seconds=30))
+    frozen = CommonNState(state="frozen", common_n=4, source_campaign_id="CAL-OBS", source_sha256="c"*64, plateau_found=True)
+    campaign = campaign.model_copy(update={"benchmark":campaign.benchmark.model_copy(update={"common_n":frozen})})
+    request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="retry-target",
+        providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix="retry-run", namespace_prefix="retry-ns", funding={"primary":"0.5"})
+    first = book.reserve(request, plan=plan)
+    assert first.newly_reserved
+    now[0] += timedelta(seconds=60)
+    retry = book.reserve(request, plan=plan)
+    assert retry.status == "reserved" and not retry.newly_reserved
+    assert retry.evidence.reservation_id.value == first.evidence.reservation_id.value
+    changed = plan.__class__(**{**plan.__dict__, "observation_id":"changed-prerequisite-context"})
+    conflict = book.reserve(request, plan=changed)
+    assert conflict.status == "rejected" and conflict.reasons == ("duplicate_conflict",)
+
+
 def test_retained_calibration_admits_one_row_while_day_waits_for_common_n(tmp_path):
     now=datetime(2026,10,22,tzinfo=timezone.utc)
     costs=load_cost_inputs(ROOT/"tests/fixtures/f11/cost-inputs.json")
@@ -505,6 +563,138 @@ def test_retained_calibration_admits_one_row_while_day_waits_for_common_n(tmp_pa
     assert not day_book.inspect()["reservations"]
 
 
+@pytest.mark.parametrize("config_name,mode,minimum", [
+    ("tests/exp-903-three-provider-smoke.yaml", "acceptance", 76),
+    ("experiments/exp-001-multi-provider.yaml", "short_study", 226),
+    ("experiments/exp-001-calibration.yaml", "calibration", 951),
+    ("experiments/exp-001-diagnostic-day.yaml", "diagnostic_day", 86408),
+])
+def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode, minimum):
+    now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book = ledger(tmp_path / f"{mode}.json")
+    book.initialize(costs)
+    config_path = ROOT / ("configs/" + config_name if config_name.startswith("tests/") else "configs/" + config_name)
+    if mode == "acceptance":
+        campaign, _ = resolve_campaign(config_path, ROOT)
+    else:
+        campaign = scheduled_campaign(config_path, f"{mode}-row", now + timedelta(seconds=30))
+    if mode in {"short_study", "diagnostic_day"}:
+        frozen = CommonNState(state="frozen", common_n=4, source_campaign_id="CAL-OBS", source_sha256="c"*64, plateau_found=True)
+        campaign = campaign.model_copy(update={"benchmark": campaign.benchmark.model_copy(update={"common_n": frozen})})
+    providers = [Provider(p) for p in campaign.selected_providers]
+    request, plan = scheduled_request_and_plan(campaign, costs, campaign_id=f"create-{mode}", providers=providers,
+        child_prefix=f"create-{mode}-run", namespace_prefix=f"create-{mode}-ns", funding={"primary":"0.5"}, measurement_seconds=minimum)
+    reserved = book.reserve(request, plan=plan)
+    assert reserved.status == "reserved", reserved.reasons
+    rid = reserved.evidence.reservation_id.value
+    expiry_requests, expiry_evidence = [], []
+    for provider in providers:
+        name = provider.value
+        run_id = plan.child_identities[name]
+        trigger = reserved.evidence.expires_at.value - timedelta(seconds=plan.allowance.provider_leads_seconds[name])
+        action = "deallocate" if provider == Provider.AZURE else "stop"
+        req = ExpiryRequest(schema_version=2, run_id=run_id, deployment_id=f"{run_id}-deployment", provider=provider,
+            action=action, expires_at=Evidence[datetime](value=trigger), reservation_id=Evidence[str](value=rid),
+            resource_namespace=plan.namespaces[name], target_selector=f"target-{name}")
+        expiry_requests.append(req)
+        expiry_evidence.append(ExpiryEvidence(schema_version=2, run_id=run_id, deployment_id=req.deployment_id,
+            provider=provider, action=action, state="registered", registration_id=Evidence[str](value=f"registration-{name}"),
+            registered_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=trigger),
+            target_selector=req.target_selector, provider_metadata=StructuredEvidence(value={"fixture":True})))
+    decision = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+    assert decision.eligible and decision.creation_granted
+    replay = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+    assert replay.eligible and not replay.creation_granted and "creation_already_claimed" in replay.reason_codes
+
+
+@pytest.mark.parametrize("mutation", ["missing_component", "wrong_region", "underfunded_component"])
+def test_cost_envelopes_reject_incomplete_or_mismatched_workflow_cost(mutation):
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    request, plan = scheduled_request_and_plan(campaign, costs, campaign_id=f"cost-{mutation}",
+        providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix=f"cost-{mutation}-run",
+        namespace_prefix=f"cost-{mutation}-ns", funding={"primary":"0.5"})
+    assert sum(admission_module._validate_cost_envelopes(plan, request)[1].values()) == Decimal("0.5")
+    envelopes = {name: dict(row) for name, row in plan.cost_envelopes.items()}
+    row = dict(envelopes["aws"])
+    if mutation == "missing_component":
+        row["components"] = dict(row["components"])
+        del row["components"]["tax"]
+    elif mutation == "wrong_region":
+        row["regions"] = ["invented-region"]
+    else:
+        row["components"] = dict(row["components"])
+        component = dict(row["components"]["compute"])
+        component["amount_usd"] = str(Decimal(component["amount_usd"]) - Decimal("0.01"))
+        row["components"]["compute"] = component
+    envelopes["aws"] = row
+    with pytest.raises(ValueError, match="cost_envelope_invalid"):
+        admission_module._validate_cost_envelopes(plan.__class__(**{**plan.__dict__, "cost_envelopes":envelopes}), request)
+
+
+def test_saved_cost_bytes_must_match_at_initialize(tmp_path):
+    source = tmp_path / "costs.json"
+    source.write_bytes((ROOT / "tests/fixtures/f11/cost-inputs.json").read_bytes())
+    costs = load_cost_inputs(source)
+    source.write_text(source.read_text().replace('"primary_forecast": "147.82"', '"primary_forecast": "147.83"'))
+    book = ledger(tmp_path / "ledger.json")
+    with pytest.raises(ValueError, match="source_mismatch"):
+        book.initialize(costs)
+    source.unlink()
+    with pytest.raises((ValueError, OSError)):
+        book.initialize(costs)
+
+
+def test_earlier_controller_session_blocks_from_reservation_activation(tmp_path):
+    now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    original = ledger(tmp_path / "ledger.json")
+    original.initialize(costs)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="pre-registration",
+        providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix="pre-registration-run",
+        namespace_prefix="pre-registration-ns", funding={"primary":"0.5"})
+    assert original.reserve(request, plan=plan).status == "reserved"
+    resumed = BudgetLedger(tmp_path / "ledger.json", scope_id="offline-scope", utc_now=lambda:now,
+        monotonic_now=lambda:2.0, controller_session_id="session-after-restart")
+    campaign_b, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    request_b, plan_b = scheduled_request_and_plan(campaign_b, costs, campaign_id="after-restart",
+        providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix="after-restart-run",
+        namespace_prefix="after-restart-ns", funding={"primary":"0.5"})
+    request_b = request_b.model_copy(update={"outstanding_cleanup":True,
+        "active_reserved_usd":Evidence[float](value=0.5)})
+    blocked = resumed.reserve(request_b, plan=plan_b)
+    assert blocked.status == "rejected" and blocked.reasons == ("controller_session_changed",)
+    rid = next(iter(original.inspect()["reservations"]))
+    for index, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP)):
+        record_absence(original, f"restart-cleanup-{index}", rid, provider, now + timedelta(seconds=index))
+    assert not original.inspect()["cleanup_open"]
+
+
+def test_cost_source_switch_requires_review_and_preserves_old_allocations(tmp_path):
+    source = tmp_path / "costs-v1.json"
+    source.write_bytes((ROOT / "tests/fixtures/f11/cost-inputs.json").read_bytes())
+    old = load_cost_inputs(source)
+    book = ledger(tmp_path / "ledger.json")
+    book.initialize(old)
+    payload = dict(old.payload)
+    payload["cost_input_id"] = "reviewed-next-source"
+    payload["funding"] = dict(payload["funding"])
+    payload["funding"]["primary"] = "200"
+    next_path = tmp_path / "costs-v2.json"
+    next_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    fresh = load_cost_inputs(next_path)
+    evidence = {"evidence_id":"cost-source-review-2", "source_path":"review/source-change.json",
+        "source_sha256":"f"*64, "reviewed_payload_sha256":fresh.payload_sha256,
+        "scope_id":"offline-scope", "status":"reviewed"}
+    with pytest.raises(ValueError, match="source_mismatch"):
+        book.reconcile_cost_source(fresh, {**evidence, "reviewed_payload_sha256":"0"*64})
+    updated = book.reconcile_cost_source(fresh, evidence)
+    assert Decimal(updated["funding_remaining"]["primary"]) == Decimal("200")
+    assert len(updated["source_history"]) == 2
+
+
 def test_optional_rows_remain_offline_and_paid_request_needs_current_review_and_support(tmp_path):
     now=datetime(2026,10,22,tzinfo=timezone.utc)
     costs=load_cost_inputs(ROOT/"tests/fixtures/f11/cost-inputs.json")
@@ -526,8 +716,8 @@ def test_optional_rows_remain_offline_and_paid_request_needs_current_review_and_
     plan=plan.__class__(**{**plan.__dict__,"execution_scope":"paid_request","optional_reviewed":True,
         "optional_review_evidence":evidence})
     paid=book.reserve(request,plan=plan)
-    assert paid.status=="pending"
-    assert {"price_refresh_required","prerequisite_pending","support_cost_missing"} <= set(paid.reasons)
+    assert paid.status=="rejected"
+    assert paid.reasons == ("cost_envelope_invalid",)
     assert not book.inspect()["reservations"]
 
 
@@ -577,9 +767,10 @@ def test_same_session_can_hold_two_independent_primary_reservations(tmp_path):
             priority=campaign.admission.priority, lifetime_cap_seconds=1200,
             estimated_cost_usd=Evidence[float](value=.5), source_path=costs.source_path, source_sha256=costs.payload_sha256,
             incurred_cost_usd=Evidence[float](value=0), active_reserved_usd=Evidence[float](value=0), outstanding_cleanup=False)
-        plan = AdmissionPlan(campaign, {p: f"{campaign_id}-{p}" for p in ("aws", "azure", "gcp")},
+        children = {p: f"{campaign_id}-{p}" for p in ("aws", "azure", "gcp")}; funding={"primary": Decimal("0.5")}
+        plan = AdmissionPlan(campaign, children,
             {p: f"{campaign_id}-{p}-ns" for p in ("aws", "azure", "gcp")}, costs, allowance,
-            funding={"primary": Decimal("0.5")})
+            funding=funding,cost_envelopes=make_synthetic_envelopes(campaign,children,funding))
         return req, plan
     req_a, plan_a = reserve("F11-primary-s1")
     req_b, plan_b = reserve("F11-primary-s3")
@@ -637,6 +828,6 @@ def test_same_session_can_hold_two_independent_primary_reservations(tmp_path):
     assert book.reserve(req_c, plan=plan_c).reasons == ("cleanup_open",)
     for idx, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP), 2):
         record_absence(book,f"event-{idx}",rid,provider,datetime(2026,10,22,0,2+idx,tzinfo=timezone.utc))
-    req_c = req_c.model_copy(update={"incurred_cost_usd": Evidence[float](value=.1),
-        "active_reserved_usd": Evidence[float](value=.9)})
+    req_c = req_c.model_copy(update={"incurred_cost_usd": Evidence[float](value=0),
+        "active_reserved_usd": Evidence[float](value=1.0)})
     assert book.reserve(req_c, plan=plan_c).status == "reserved"

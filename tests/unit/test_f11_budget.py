@@ -10,6 +10,7 @@ from cloud_network_benchmark.admission import AdmissionPlan, BudgetLedger, Workf
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.admission import ReservationRequest
 from cloud_network_benchmark.contracts.common import Evidence, Provider
+from tests.fixtures.f11.envelope_factory import make_synthetic_envelopes
 
 
 ROOT = Path(__file__).parents[2]
@@ -59,8 +60,9 @@ def test_full_remaining_and_reserved_liabilities_obey_working_and_total_caps(tmp
         mode=campaign.mode,priority=campaign.admission.priority,lifetime_cap_seconds=1200,
         estimated_cost_usd=Evidence[float](value=.5),source_path=costs.source_path,source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](value=0),active_reserved_usd=Evidence[float](value=0),outstanding_cleanup=False)
-    plan = AdmissionPlan(campaign,{p.value:f"{p.value}-child" for p in providers},{p.value:f"{p.value}-namespace" for p in providers},
-        costs,allowance,funding={"primary":Decimal("0.5")})
+    children={p.value:f"{p.value}-child" for p in providers}; funding={"primary":Decimal("0.5")}
+    plan = AdmissionPlan(campaign,children,{p.value:f"{p.value}-namespace" for p in providers},
+        costs,allowance,funding=funding,cost_envelopes=make_synthetic_envelopes(campaign,children,funding))
     decision = book.reserve(request,plan=plan)
     assert (decision.status == "reserved") is accepted
     if accepted:
@@ -104,8 +106,9 @@ def test_complete_workflow_exact_earliest_trigger_boundary(tmp_path,workflow_sec
         mode=campaign.mode,priority=campaign.admission.priority,lifetime_cap_seconds=1200,
         estimated_cost_usd=Evidence[float](value=.5),source_path=costs.source_path,source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](value=0),active_reserved_usd=Evidence[float](value=0),outstanding_cleanup=False)
-    plan=AdmissionPlan(campaign,{p.value:f"{workflow_seconds}-{p.value}" for p in providers},
-        {p.value:f"trigger-{workflow_seconds}-{p.value}" for p in providers},costs,allowance,funding={"primary":Decimal("0.5")})
+    children={p.value:f"{workflow_seconds}-{p.value}" for p in providers}; funding={"primary":Decimal("0.5")}
+    plan=AdmissionPlan(campaign,children,{p.value:f"trigger-{workflow_seconds}-{p.value}" for p in providers},
+        costs,allowance,funding=funding,cost_envelopes=make_synthetic_envelopes(campaign,children,funding))
     result=book.reserve(request,plan=plan)
     assert (result.status=="reserved")==accepted
     if not accepted:

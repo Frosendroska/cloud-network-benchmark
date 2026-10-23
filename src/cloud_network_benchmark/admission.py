@@ -81,6 +81,129 @@ class CostInputs:
     refresh_required: bool
 
 
+COST_COMPONENTS = (
+    "compute", "disks", "addresses", "traffic_export", "tax", "uncertainty", "expiry_cleanup_support",
+)
+
+
+def _validated_cost_inputs(inputs: CostInputs) -> CostInputs:
+    """Re-read the declared source so a copied CostInputs object cannot forge saved bytes."""
+    loaded = load_cost_inputs(Path(inputs.source_path))
+    if (loaded.payload_sha256 != inputs.payload_sha256 or loaded.source_sha256 != inputs.source_sha256
+        or loaded.cost_input_id != inputs.cost_input_id or loaded.source_scope != inputs.source_scope
+        or loaded.payload != inputs.payload or loaded.refresh_required != inputs.refresh_required):
+        raise ValueError("source_mismatch: saved cost input changed or does not match its validated payload")
+    return loaded
+
+
+def _campaign_provider_regions(campaign: Any) -> dict[str, list[str]]:
+    observations = {Provider(item.provider).value: item for item in campaign.observations}
+    result: dict[str, list[str]] = {}
+    for provider in campaign.selected_providers:
+        name = Provider(provider).value
+        observation = observations.get(name)
+        if observation is None:
+            raise ValueError("identity_mismatch: resolved provider observation is missing")
+        vm_regions = (observation.provider_config.regions.vm_a, observation.provider_config.regions.vm_b)
+        if any(not isinstance(region, str) or not region.strip() for region in vm_regions):
+            raise ValueError("identity_mismatch: provider region set must identify both VM locations")
+        # Same-zone runs have two VMs in one region; inter-region runs have two.
+        regions = sorted(set(vm_regions))
+        result[name] = regions
+    return result
+
+
+def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest) -> tuple[Decimal, dict[str, Decimal], dict[str, Decimal]]:
+    """Validate source-backed per-provider run envelopes and derive funding totals."""
+    _validated_cost_inputs(plan.costs)
+    selected = {Provider(p).value for p in request.selected_providers}
+    if not isinstance(plan.cost_envelopes, Mapping) or set(plan.cost_envelopes) != selected:
+        raise ValueError("cost_envelope_missing: one per-provider run envelope is required")
+    expected_regions = _campaign_provider_regions(plan.resolved_campaign)
+    totals: dict[str, Decimal] = {}
+    bucket_totals: dict[str, Decimal] = {}
+    support_totals: dict[str, Decimal] = {}
+    common_sources: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for provider in sorted(selected):
+        envelope = plan.cost_envelopes[provider]
+        required = {"envelope_id", "provider", "run_id", "priced_on", "source_kind", "source_path",
+            "source_sha256", "regions", "unit_basis", "components"}
+        if not isinstance(envelope, Mapping) or set(envelope) != required:
+            raise ValueError("cost_envelope_invalid: missing or unknown envelope fields")
+        if (not all(isinstance(envelope.get(key), str) and envelope[key].strip() for key in
+            ("envelope_id", "provider", "run_id", "priced_on", "source_kind", "source_path", "unit_basis"))
+            or envelope["provider"] != provider or envelope["run_id"] != plan.child_identities.get(provider)
+            or envelope["unit_basis"] != "one-two-vm-provider-run"
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", envelope["priced_on"])):
+            raise ValueError("cost_envelope_invalid: envelope identity, date or unit basis mismatch")
+        date.fromisoformat(envelope["priced_on"])
+        _hash(envelope["source_sha256"], "cost envelope source hash")
+        if envelope["regions"] != expected_regions[provider]:
+            raise ValueError("cost_envelope_invalid: provider regions do not match resolved campaign")
+        source_path = Path(envelope["source_path"])
+        try:
+            raw = source_path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != envelope["source_sha256"]:
+                raise ValueError("cost_envelope_invalid: source bytes changed")
+            source = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("cost_envelope_invalid: envelope source is unavailable") from exc
+        if not isinstance(source, Mapping) or source.get("schema_version") != 1:
+            raise ValueError("cost_envelope_invalid: invalid envelope source")
+        if envelope["source_kind"] == "synthetic-test-only":
+            if plan.execution_scope != "offline_simulation" or source.get("fixture_scope") != "synthetic-test-only":
+                raise ValueError("cost_envelope_invalid: synthetic cost evidence cannot authorize paid requests")
+            source_row = source.get("provider_run_envelopes", {}).get(provider)
+        elif envelope["source_kind"] == "provider-price-input":
+            if plan.execution_scope != "paid_request" or envelope["source_path"] != plan.costs.source_path or envelope["source_sha256"] != plan.costs.payload_sha256:
+                raise ValueError("cost_envelope_invalid: paid envelope must bind the refreshed cost input")
+            source_row = plan.costs.payload.get("provider_run_envelopes", {}).get(provider)
+        else:
+            raise ValueError("cost_envelope_invalid: unknown source kind")
+        if not isinstance(source_row, Mapping):
+            raise ValueError("cost_envelope_invalid: source has no matching provider run row")
+        public_envelope = {key: value for key, value in envelope.items() if key not in {"source_path", "source_sha256"}}
+        if dict(source_row) != public_envelope:
+            raise ValueError("cost_envelope_invalid: envelope differs from saved source row")
+        if not isinstance(envelope["components"], Mapping) or set(envelope["components"]) != set(COST_COMPONENTS):
+            raise ValueError("cost_envelope_invalid: every cost component is required exactly once")
+        total = Decimal("0")
+        for component_name in COST_COMPONENTS:
+            component = envelope["components"][component_name]
+            if not isinstance(component, Mapping) or set(component) != {"amount_usd", "quantity", "unit", "inclusion_rule", "funding_bucket"}:
+                raise ValueError(f"cost_envelope_invalid: {component_name} requires amount, quantity, unit and inclusion rule")
+            amount = _decimal(component["amount_usd"], f"{component_name} amount")
+            quantity = _decimal(component["quantity"], f"{component_name} quantity")
+            if (quantity <= 0 or not isinstance(component["unit"], str) or not component["unit"].strip()
+                or not isinstance(component["inclusion_rule"], str) or not component["inclusion_rule"].strip()
+                or component["funding_bucket"] not in plan.funding):
+                raise ValueError(f"cost_envelope_invalid: {component_name} scope or funding bucket is missing")
+            total += amount
+            bucket_totals[component["funding_bucket"]] = bucket_totals.get(component["funding_bucket"], Decimal("0")) + amount
+            if component_name == "expiry_cleanup_support": support_totals[provider] = amount
+        totals[provider] = total.quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+        source_key = (envelope["source_path"], envelope["source_sha256"])
+        common_sources[source_key] = source
+        support = plan.provider_support.get(provider)
+        if support is not None:
+            support_regions = sorted(support.get("expiry_cost_regions", expected_regions[provider]))
+            if support_regions != expected_regions[provider]:
+                raise ValueError("cost_envelope_invalid: support region set does not match campaign")
+            inclusion_key = "expiry_cost_included_usd" if "expiry_cost_included_usd" in support else "included_usd"
+            if inclusion_key in support and _decimal(support[inclusion_key]) != support_totals[provider]:
+                raise ValueError("cost_envelope_invalid: support inclusion differs from envelope")
+    total = sum(totals.values(), Decimal("0")).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+    if set(bucket_totals) != set(plan.funding) or any(
+        bucket_totals.get(bucket, Decimal("0")).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+        != _decimal(amount).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+        for bucket, amount in plan.funding.items()
+    ):
+        raise ValueError("cost_envelope_invalid: funding moves do not equal sourced component totals")
+    if request.estimated_cost_usd.value is None or _decimal(request.estimated_cost_usd.value).quantize(Decimal("0.0001"), rounding=ROUND_CEILING) != total:
+        raise ValueError("cost_envelope_invalid: request estimate differs from complete provider envelopes")
+    return total, bucket_totals, support_totals
+
+
 def load_cost_inputs(path: Path) -> CostInputs:
     raw = path.read_bytes()
     try:
@@ -160,6 +283,7 @@ class WorkflowAllowance:
     cleanup_seconds: float
     source_id: str
     provider_leads_seconds: Mapping[str, float]
+    completed_stages: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
@@ -211,6 +335,7 @@ class AdmissionPlan:
     optional_reviewed: bool = False
     optional_review_evidence: Mapping[str, Any] = field(default_factory=dict)
     observation_id: str | None = None
+    cost_envelopes: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.execution_scope not in {"offline_simulation", "paid_request"}:
@@ -373,7 +498,7 @@ class BudgetLedger:
         except Exception as exc:
             raise ValueError("ledger_unavailable") from exc
         required = {"schema_version", "scope_id", "revision", "funding_remaining", "reservations", "claims", "events", "cleanup_open", "cleanup_blocked", "source_history"}
-        allowed = required | {"campaign_claims", "replacement_counts", "budget_blocked"}
+        allowed = required | {"campaign_claims", "replacement_counts", "budget_blocked", "active_cost_source"}
         if (not isinstance(state, dict) or not required <= set(state) or set(state) - allowed
             or state.get("schema_version") != 1 or state.get("scope_id") != self.scope_id
             or isinstance(state.get("revision"), bool) or not isinstance(state.get("revision"), int) or state["revision"] < 1
@@ -466,6 +591,7 @@ class BudgetLedger:
             if os.path.exists(name): os.unlink(name)
 
     def initialize(self, inputs: CostInputs) -> Mapping[str, Any]:
+        inputs = _validated_cost_inputs(inputs)
         fd = self._lock(initialize=True)
         try:
             os.write(fd, json.dumps({"schema_version": 1, "scope_id": self.scope_id}, sort_keys=True).encode())
@@ -473,6 +599,7 @@ class BudgetLedger:
             state = self._read(initializing=True)
             funding = inputs.payload.get("funding", {})
             state["funding_remaining"] = {k: str(_decimal(v, k)) for k, v in funding.items() if k in {"primary", "replacements", "tax", "uncertainty", "optional"}}
+            state["active_cost_source"] = {"path": inputs.source_path, "sha256": inputs.payload_sha256, "source_sha256": inputs.source_sha256}
             state["source_history"].append({"path": inputs.source_path, "sha256": inputs.payload_sha256, "source_sha256": inputs.source_sha256})
             self._write(state)
             return state
@@ -482,6 +609,41 @@ class BudgetLedger:
     def inspect(self) -> Mapping[str, Any]:
         fd = self._lock()
         try: return self._read()
+        finally: fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
+    def reconcile_cost_source(self, inputs: CostInputs, review_evidence: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Switch dated cost inputs only with a durable, source-linked human review record."""
+        inputs = _validated_cost_inputs(inputs)
+        self._validate_gate_evidence(review_evidence)
+        if (review_evidence.get("reviewed_payload_sha256") != inputs.payload_sha256
+            or review_evidence.get("scope_id") != self.scope_id
+            or review_evidence.get("status") != "reviewed"):
+            raise ValueError("source_mismatch: cost source review does not cover this payload and scope")
+        fd = self._lock()
+        try:
+            state = self._read()
+            current = state.get("active_cost_source")
+            if current and current.get("sha256") == inputs.payload_sha256:
+                return state
+            new_funding = inputs.payload.get("funding", {})
+            consumed: dict[str, Decimal] = {}
+            for rec in state["reservations"].values():
+                for bucket, amount in rec.get("funding_moves", {}).items():
+                    released = _decimal(rec.get("released_by_bucket", {}).get(bucket, "0"))
+                    consumed[bucket] = consumed.get(bucket, Decimal("0")) + max(_decimal(amount)-released, Decimal("0"))
+            updated = {}
+            for bucket in {"primary", "replacements", "tax", "uncertainty", "optional"}:
+                remaining = _decimal(new_funding.get(bucket, "0")) - consumed.get(bucket, Decimal("0"))
+                if remaining < 0:
+                    raise ValueError("budget_exhausted: revised source is below preserved commitments")
+                if remaining > 0 or bucket in new_funding:
+                    updated[bucket] = str(remaining)
+            state["funding_remaining"] = updated
+            state["active_cost_source"] = {"path": inputs.source_path, "sha256": inputs.payload_sha256, "source_sha256": inputs.source_sha256}
+            state["source_history"].append({"path": inputs.source_path, "sha256": inputs.payload_sha256,
+                "source_sha256": inputs.source_sha256, "review_evidence_id": review_evidence["evidence_id"]})
+            self._write(state)
+            return state
         finally: fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
     def reserve(self, request: ReservationRequest, *, plan: AdmissionPlan) -> AdmissionDecision:
@@ -506,6 +668,11 @@ class BudgetLedger:
             return AdmissionDecision("rejected", False, None, ("source_mismatch",), 0)
         if request.source_sha256 != plan.costs.payload_sha256 or request.source_path != plan.costs.source_path:
             return AdmissionDecision("rejected", False, None, ("source_mismatch",), 0)
+        try:
+            envelope_total, envelope_buckets, envelope_support = _validate_cost_envelopes(plan, request)
+        except ValueError as exc:
+            reason = "source_mismatch" if "source_mismatch" in str(exc) else "cost_envelope_invalid"
+            return AdmissionDecision("rejected", False, None, (reason,), 0)
         reasons = []
         support_components: list[Decimal] = []
         if plan.execution_scope == "paid_request":
@@ -514,11 +681,19 @@ class BudgetLedger:
                 ExperimentMode.SHORT_STUDY:{"f10_offline","paid_authorization","quota_review","common_n","study_window"},
                 ExperimentMode.CALIBRATION:{"f10_offline","paid_authorization","quota_review","calibration_authorized"},
                 ExperimentMode.DIAGNOSTIC_DAY:{"f10_offline","paid_authorization","quota_review","common_n","diagnostic_day_authorized","size_export_review"}}[ExperimentMode(campaign.mode)]
+            if ExperimentMode(campaign.mode) != ExperimentMode.ACCEPTANCE:
+                required.add("paid_acceptance")
             if not required <= set(plan.prerequisites) or any(not isinstance(plan.prerequisites.get(k), Mapping) for k in required):
                 reasons.append("prerequisite_pending")
             else:
                 try:
                     for key in required: self._validate_gate_evidence(plan.prerequisites[key])
+                    if "paid_acceptance" in required:
+                        acceptance = plan.prerequisites["paid_acceptance"]
+                        if (acceptance.get("status") != "completed"
+                            or acceptance.get("config_id") != campaign.config_id
+                            or set(acceptance.get("providers", [])) != {Provider(p).value for p in campaign.selected_providers}):
+                            raise ValueError("paid acceptance scope does not match requested work")
                 except ValueError:
                     reasons.append("prerequisite_pending")
             if plan.optional_reviewed is False and request.priority in {"P2", "P3"}: reasons.append("optional_review_required")
@@ -548,6 +723,8 @@ class BudgetLedger:
                             per_region = _decimal(support_scope.get("per_region_usd"), "AWS support rate")
                             if support_amount < (per_region * len(support["expiry_cost_regions"])):
                                 raise ValueError("AWS support inclusion undercounts selected regions")
+                        if support_amount != envelope_support.get(Provider(provider).value):
+                            raise ValueError("support inclusion differs from per-provider envelope")
                         support_components.append(support_amount)
                     except (KeyError, ValueError, AttributeError):
                         reasons.append("support_cost_missing")
@@ -577,8 +754,6 @@ class BudgetLedger:
             reasons.append("schedule_pending")
         if reasons:
             return AdmissionDecision("pending", False, None, tuple(sorted(set(reasons))), 0)
-        if campaign.admission.requires_schedule and _utc(self.utc_now()) >= _utc(campaign.scheduled_start):
-            return AdmissionDecision("missed", False, None, ("slot_missed",), 0)
         fd = self._lock()
         try:
             state = self._read()
@@ -597,6 +772,7 @@ class BudgetLedger:
                 "cleanup":plan.allowance.cleanup_seconds,"source_id":plan.allowance.source_id,
                 "provider_leads":dict(plan.allowance.provider_leads_seconds)},
                 "provider_support":dict(plan.provider_support), "original_failure":plan.original_failure,
+                "cost_envelopes":dict(plan.cost_envelopes),
                 "optional_reviewed":plan.optional_reviewed,"optional_review_evidence":dict(plan.optional_review_evidence),
                 "observation_id":plan.observation_id,"scheduled_start":campaign.scheduled_start.isoformat() if campaign.scheduled_start else None}
             fingerprint = hashlib.sha256(json.dumps({"request": request.model_dump(mode="json"), "source": plan.costs.payload_sha256, "plan":plan_payload}, sort_keys=True, default=str).encode()).hexdigest()
@@ -606,6 +782,11 @@ class BudgetLedger:
                     return AdmissionDecision("rejected", False, None, ("duplicate_conflict",), state["revision"])
                 ev = ReservationEvidence.model_validate(prior["evidence"])
                 return AdmissionDecision("reserved", False, ev, (), state["revision"])
+            active_source = state.get("active_cost_source")
+            if active_source and (active_source.get("path") != plan.costs.source_path or active_source.get("sha256") != plan.costs.payload_sha256):
+                return AdmissionDecision("rejected", False, None, ("source_mismatch",), state["revision"])
+            if campaign.admission.requires_schedule and _utc(self.utc_now()) >= _utc(campaign.scheduled_start):
+                return AdmissionDecision("missed", False, None, ("slot_missed",), state["revision"])
             if state.get("cleanup_blocked"):
                 return AdmissionDecision("rejected", False, None, ("cleanup_open",), state["revision"])
             current_spent = sum((_decimal(v.get("incurred_usd", "0")) for v in state["reservations"].values()), Decimal("0"))
@@ -654,13 +835,14 @@ class BudgetLedger:
                     return AdmissionDecision("rejected", False, None, ("identity_mismatch",), state["revision"])
                 if original.get("cleanup_open") or replacement_of in state.get("cleanup_blocked", []):
                     return AdmissionDecision("rejected", False, None, ("cleanup_open",), state["revision"])
-                if provider not in selected or original.get("replacement_claimed"):
+                if (selected != {provider} or not original or original.get("child_identities", {}).get(provider) != replaced_run
+                    or plan.child_identities.get(provider) == replaced_run or original.get("replacement_claimed")):
                     return AdmissionDecision("rejected", False, None, ("duplicate_conflict",), state["revision"])
                 if state.get("replacement_counts", {}).get(provider, 0) >= 3:
                     return AdmissionDecision("rejected", False, None, ("optional_review_required",), state["revision"])
             if any(v.get("cleanup_open") and v.get("session") != self.controller_session_id for v in state["reservations"].values()):
                 return AdmissionDecision("rejected", False, None, ("controller_session_changed",), state["revision"])
-            price = sum((_decimal(v) for v in plan.funding.values()), Decimal("0")).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+            price = envelope_total
             if sum(support_components, Decimal("0")) > price:
                 return AdmissionDecision("rejected", False, None, ("support_cost_missing",), state["revision"])
             if price <= 0 or not plan.funding:
@@ -685,18 +867,27 @@ class BudgetLedger:
                 cap_start_policy_id=StringEvidence(value="reservation-activation-before-provider-expiry"), source_path=request.source_path,
                 source_sha256=request.source_sha256, reasons=[])
             rec = {"reservation_id": rid, "evidence": evidence.model_dump(mode="json"), "reserved_cost_usd": str(price), "incurred_usd": "0", "session": self.controller_session_id,
-                   "cap_start_monotonic": _duration(self.monotonic_now(), "monotonic activation"), "allowance": workflow_seconds,
+                   "cap_start_monotonic": _duration(self.monotonic_now(), "monotonic activation"), "cap_seconds": request.lifetime_cap_seconds,
+                   "provider_trigger_monotonic": _duration(self.monotonic_now(), "monotonic activation") + min(request.lifetime_cap_seconds-float(v) for v in plan.allowance.provider_leads_seconds.values()),
+                   "scheduled_start_monotonic": _duration(self.monotonic_now(), "monotonic activation") + max(0.0, (_utc(campaign.scheduled_start)-now).total_seconds()) if campaign.scheduled_start else None,
+                   "allowance": workflow_seconds,
                    "funding_moves": {k: str(v) for k, v in plan.funding.items()},
                    "allowance_fields": {"registration_seconds":plan.allowance.registration_seconds,"provision_seconds":plan.allowance.provision_seconds,
                    "readiness_seconds":plan.allowance.readiness_seconds,"stabilization_seconds":plan.allowance.stabilization_seconds,
                    "measurement_seconds":plan.allowance.measurement_seconds,"measurement_shutdown_seconds":plan.allowance.measurement_shutdown_seconds,
                    "retrieval_seconds":plan.allowance.retrieval_seconds,"cleanup_seconds":plan.allowance.cleanup_seconds}, "cleanup_open": False,
             "request": request.model_dump(mode="json"), "provider_leads":dict(plan.allowance.provider_leads_seconds),
-                   "provider_cleanup":{},
+                   "provider_cleanup":{}, "provider_billing":{name:{"actual_usd":None,"estimate_usd":None,"final":False,"event_id":None} for name in selected},
                    "child_identities":dict(plan.child_identities), "plan": {"fingerprint": fingerprint,
                    "providers": [Provider(p).value for p in request.selected_providers], "support": plan.provider_support,
+                   "cost_envelopes":dict(plan.cost_envelopes),"component_buckets":{k:str(v) for k,v in envelope_buckets.items()},
                    "namespaces":dict(plan.namespaces), "scheduled_start": campaign.scheduled_start.isoformat() if campaign.scheduled_start else None,
                    "effective_deadline": deadline.isoformat()}}
+            # Activation precedes provider expiry registration; until sourced cleanup
+            # proves absence, a controller restart must conservatively block launches.
+            rec["cleanup_open"] = True
+            rec["provider_cleanup"] = {name: False for name in selected}
+            state["cleanup_open"].append(rid)
             rec["context"] = str(getattr(campaign.context,"value",campaign.context))
             rec["replacement_context"] = campaign.replacement_context.model_dump(mode="json") if campaign.replacement_context else None
             state["reservations"][rid] = rec
@@ -734,11 +925,29 @@ class BudgetLedger:
         reasons = []
         if any(name not in originals or value > originals[name] for name, value in remain_fields.items()):
             reasons.append("workflow_time_insufficient")
+        stage_prefixes = {"registration": (), "preparation": ("registration",),
+            "measurement": ("registration", "preparation"),
+            "retrieval": ("registration", "preparation", "measurement"),
+            "cleanup": ("registration", "preparation", "measurement", "retrieval")}
+        expected_completed = stage_prefixes[stage]
+        if tuple(remaining.completed_stages) != expected_completed:
+            reasons.append("workflow_time_insufficient")
         completed = {"preparation": ("registration_seconds",),
             "measurement": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds"),
             "retrieval": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds","measurement_seconds","measurement_shutdown_seconds"),
             "cleanup": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds","measurement_seconds","measurement_shutdown_seconds","retrieval_seconds")}.get(stage, ())
         if any(remain_fields[name] != 0 for name in completed): reasons.append("workflow_time_insufficient")
+        current = {"registration": {"registration_seconds"},
+            "preparation": {"provision_seconds", "readiness_seconds", "stabilization_seconds"},
+            "measurement": {"measurement_seconds", "measurement_shutdown_seconds"},
+            "retrieval": {"retrieval_seconds"}, "cleanup": {"cleanup_seconds"}}[stage]
+        future_by_stage = {"registration": {"provision_seconds", "readiness_seconds", "stabilization_seconds", "measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
+            "preparation": {"measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
+            "measurement": {"retrieval_seconds", "cleanup_seconds"}, "retrieval": {"cleanup_seconds"}, "cleanup": set()}[stage]
+        if any(remain_fields[name] != originals[name] for name in future_by_stage):
+            reasons.append("workflow_time_insufficient")
+        if any(remain_fields[name] <= 0 for name in current):
+            reasons.append("workflow_time_insufficient")
         if stage == "cleanup" and remaining.cleanup_seconds <= 0: reasons.append("workflow_time_insufficient")
         evidence = ReservationEvidence.model_validate(rec["evidence"])
         deadline = datetime.fromisoformat(rec["plan"].get("effective_deadline", evidence.expires_at.value.isoformat()))
@@ -748,25 +957,47 @@ class BudgetLedger:
         now = _utc(self.utc_now())
         monotonic_now = _duration(self.monotonic_now(), "monotonic time")
         elapsed = monotonic_now - rec["cap_start_monotonic"]
-        live = rec["allowance"] - elapsed
+        live = min(rec.get("cap_seconds", rec["allowance"]), rec.get("provider_trigger_monotonic", rec["cap_start_monotonic"]+rec["allowance"]) - rec["cap_start_monotonic"]) - elapsed
         if elapsed < 0:
             reasons.append("controller_session_changed")
         minimum_measurement = minimum_protocol_seconds(ExperimentMode(rec["request"]["mode"]))
         if stage in {"registration", "preparation", "measurement"} and remaining.measurement_seconds < minimum_measurement + remaining.measurement_shutdown_seconds:
             reasons.append("workflow_time_insufficient")
         schedule_start = datetime.fromisoformat(rec["plan"].get("scheduled_start")) if rec["plan"].get("scheduled_start") else None
-        remaining_total = remaining.fit_seconds(now=now, scheduled_start=schedule_start,
-            preparation_can_overlap=stage in {"registration", "preparation", "measurement"})
-        if live <= 0 or remaining_total > min(live, (deadline-now).total_seconds()): reasons.append("workflow_time_insufficient")
+        wait_remaining = max(0.0, rec["scheduled_start_monotonic"] - monotonic_now) if rec.get("scheduled_start_monotonic") is not None else 0.0
+        remaining_total = remaining.fit_seconds(now=now, preparation_can_overlap=stage in {"registration", "preparation", "measurement"})
+        if stage in {"registration", "preparation", "measurement"}:
+            remaining_total += max(0.0, wait_remaining - remaining.preparation_seconds)
+        if live <= 0 or remaining_total > live: reasons.append("workflow_time_insufficient")
         return StageDecision(not reasons, tuple(reasons), deadline)
 
     def claim_creation(self, reservation_id: str, *, provider: Provider, expiry_requests: Sequence[ExpiryRequest], expiry_evidence: Sequence[ExpiryEvidence]) -> StageDecision:
-        fit = self.check_stage_fit(reservation_id, stage="preparation", remaining=WorkflowAllowance(0,0,0,60,76,1,0,1,"f11-policy",{Provider(provider).value:0}))
-        if not fit.eligible: return fit
         fd = self._lock()
         try:
             state = self._read(); rec = state["reservations"].get(reservation_id)
             if not rec: return StageDecision(False,("ledger_unavailable",),None)
+            evidence_now = ReservationEvidence.model_validate(rec["evidence"])
+            if evidence_now.state != "reserved" or rec.get("terminal_released"):
+                return StageDecision(False,("reservation_terminal",),evidence_now.expires_at.value)
+            if Provider(provider).value not in rec["plan"]["providers"]:
+                return StageDecision(False,("identity_mismatch",),evidence_now.expires_at.value)
+            if rec["session"] != self.controller_session_id:
+                return StageDecision(False,("controller_session_changed",),evidence_now.expires_at.value)
+            fields = rec["allowance_fields"]
+            remaining = WorkflowAllowance(0, fields["provision_seconds"], fields["readiness_seconds"],
+                fields["stabilization_seconds"], fields["measurement_seconds"], fields["measurement_shutdown_seconds"],
+                fields["retrieval_seconds"], fields["cleanup_seconds"], "durable-reservation", rec["provider_leads"], ("registration",))
+            minimum = minimum_protocol_seconds(ExperimentMode(rec["request"]["mode"]))
+            if remaining.measurement_seconds < minimum + remaining.measurement_shutdown_seconds:
+                return StageDecision(False,("workflow_time_insufficient",),evidence_now.expires_at.value)
+            monotonic_now = _duration(self.monotonic_now(), "monotonic time")
+            elapsed = monotonic_now - rec["cap_start_monotonic"]
+            live = min(rec.get("cap_seconds",rec["allowance"]), rec.get("provider_trigger_monotonic",rec["cap_start_monotonic"]+rec["allowance"])-rec["cap_start_monotonic"]) - elapsed
+            wait = max(0.0, rec["scheduled_start_monotonic"]-monotonic_now) if rec.get("scheduled_start_monotonic") is not None else 0.0
+            required_fit = remaining.fit_seconds(now=_utc(self.utc_now()), preparation_can_overlap=True) + max(0.0, wait-remaining.preparation_seconds)
+            if live <= 0 or required_fit > live:
+                return StageDecision(False,("workflow_time_insufficient",),evidence_now.expires_at.value)
+            fit = StageDecision(True,(),evidence_now.expires_at.value)
             if state.get("cleanup_blocked"):
                 return StageDecision(False,("cleanup_open",),fit.effective_deadline)
             providers = set(rec["plan"]["providers"])
@@ -848,7 +1079,17 @@ class BudgetLedger:
             if rec is None: raise ValueError("identity_mismatch")
             provider = Provider(event.provider).value
             if provider not in rec["plan"]["providers"]: raise ValueError("identity_mismatch")
-            if event.incurred_usd is not None: rec["incurred_usd"]=str(_decimal(rec["incurred_usd"])+_decimal(event.incurred_usd))
+            bill = rec.setdefault("provider_billing", {name:{"actual_usd":None,"estimate_usd":None,"final":False,"event_id":None} for name in rec["plan"]["providers"]})[provider]
+            if event.billing_final and (not event.actual or event.incurred_usd is None):
+                raise ValueError("final provider billing requires an actual sourced charge")
+            if bill.get("final") and event.billing_final and (bill.get("actual_usd") != str(_decimal(event.incurred_usd)) or bill.get("event_id") != event.event_id):
+                raise ValueError("conflicting_final_billing")
+            if event.incurred_usd is not None:
+                bill["actual_usd" if event.actual else "estimate_usd"] = str(_decimal(event.incurred_usd))
+            if event.billing_final:
+                bill["final"] = True
+                bill["event_id"] = event.event_id
+            rec["incurred_usd"] = str(sum((_decimal(v["actual_usd"]) for v in rec["provider_billing"].values() if v.get("final") and v.get("actual_usd") is not None), Decimal("0")))
             if _decimal(rec["incurred_usd"]) > _decimal(rec["reserved_cost_usd"]):
                 blocked=state.setdefault("budget_blocked",[])
                 if event.reservation_id not in blocked: blocked.append(event.reservation_id)
@@ -867,6 +1108,8 @@ class BudgetLedger:
                 rec.setdefault("failures_by_provider", {})[provider] = dict(event.failure)
                 rec.setdefault("failure", dict(event.failure))
                 rec.setdefault("failure_provider", provider)
+                rec["cleanup_open"] = True
+                if event.reservation_id not in state["cleanup_blocked"]: state["cleanup_blocked"].append(event.reservation_id)
             if event.cleanup_verified_absent and event.billable_resources_present is False:
                 rec["provider_cleanup"][provider] = True
                 if all(rec["provider_cleanup"].get(name) is True for name in rec["plan"]["providers"]):
@@ -875,16 +1118,20 @@ class BudgetLedger:
                     if event.reservation_id in state["cleanup_blocked"]: state["cleanup_blocked"].remove(event.reservation_id)
                 elif event.reservation_id not in state["cleanup_blocked"]:
                     state["cleanup_blocked"].append(event.reservation_id)
-            else:
+            elif event.billable_resources_present is True:
                 rec["provider_cleanup"][provider] = False
                 rec["cleanup_open"] = True
-                if event.reservation_id not in state["cleanup_open"]:
-                    state["cleanup_open"].append(event.reservation_id)
+                if event.reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(event.reservation_id)
+                if event.reservation_id not in state["cleanup_blocked"]: state["cleanup_blocked"].append(event.reservation_id)
+            elif event.billable_resources_present is None:
+                rec["cleanup_open"] = True
+                if event.reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(event.reservation_id)
                 if event.reservation_id not in state["cleanup_blocked"]: state["cleanup_blocked"].append(event.reservation_id)
             if release_total:
                 if not (event.cleanup_verified_absent and event.billable_resources_present is False
-                    and all(rec["provider_cleanup"].get(name) is True for name in rec["plan"]["providers"])):
-                    raise ValueError("unused funding cannot be released before all-provider cleanup is verified")
+                    and all(rec["provider_cleanup"].get(name) is True for name in rec["plan"]["providers"])
+                    and all(rec["provider_billing"].get(name,{}).get("final") for name in rec["plan"]["providers"])):
+                    raise ValueError("unused funding requires final billing and all-provider cleanup")
                 available = max(_decimal(rec["reserved_cost_usd"]) - _decimal(rec.get("incurred_usd", "0")) - _decimal(rec.get("released_usd", "0")), Decimal("0"))
                 if release_total > available:
                     raise ValueError("released funding exceeds the proved unused reservation ceiling")
@@ -894,6 +1141,10 @@ class BudgetLedger:
                     state["funding_remaining"][bucket] = str(_decimal(state["funding_remaining"].get(bucket, "0")) + _decimal(amount))
                     rec["released_by_bucket"][bucket] = str(_decimal(rec["released_by_bucket"].get(bucket, "0")) + _decimal(amount))
                 rec["released_usd"] = str(_decimal(rec.get("released_usd", "0")) + release_total)
+                rec["terminal_released"] = True
+                ev = ReservationEvidence.model_validate(rec["evidence"])
+                ev = ev.model_copy(update={"state":"released", "reasons":["all_provider_final_billing_and_cleanup_verified"]})
+                rec["evidence"] = ev.model_dump(mode="json")
             state["events"][event.event_id]={"digest":digest,"payload":payload}
             self._write(state)
             return ReservationEvidence.model_validate(rec["evidence"])
@@ -929,7 +1180,9 @@ def preview(schedule: Path, config_map: Path, cost_inputs: Path, now: datetime, 
     reasons={reason for values in pending.values() for reason in values} | {"prerequisite_pending"}
     if costs.refresh_required:
         reasons.add("price_refresh_required")
-    return {"status":"inspectable","paid_eligible":False,"entries":[e.model_dump(mode="json") for e in entries],"pending":pending,
+    invalid_reasons = [*(f"schedule_error:{item}" for item in inspection.errors),
+        *(f"namespace_collision:{item}" for item in inspection.namespace_collisions)]
+    return {"status":"invalid" if invalid_reasons else "inspectable","paid_eligible":False,"entries":[e.model_dump(mode="json") for e in entries],"pending":pending,
             "cost_input":{"id":costs.cost_input_id,"sha256":costs.payload_sha256,"prices_checked_on":costs.prices_checked_on,"refresh_required":costs.refresh_required},
             "schedule":{"complete_primary_week":inspection.complete_primary_week,"errors":list(inspection.errors),"missed_entries":list(inspection.missed_entries),
                         "simultaneous_vm_demand":dict(inspection.simultaneous_vm_demand),
@@ -937,7 +1190,7 @@ def preview(schedule: Path, config_map: Path, cost_inputs: Path, now: datetime, 
                             "resources":dict(value.resource_namespaces),"state":dict(value.state_namespaces),"results":dict(value.result_namespaces)}
                             for key,value in inspection.identities_by_entry.items()},
                         "namespace_collisions":list(inspection.namespace_collisions)},
-            "reason_codes":sorted(reasons),"external_calls":0}
+            "reason_codes":sorted(reasons | set(invalid_reasons)),"external_calls":0}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -950,7 +1203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         now=datetime.fromisoformat(args.now.replace("Z","+00:00")); _utc(now)
         report=preview(args.schedule,args.config_map,args.cost_inputs,now,root=Path.cwd())
         print(json.dumps(report,sort_keys=True,separators=(",",":")))
-        return 0
+        return 2 if report["status"] == "invalid" else 0
     except Exception as exc:
         print(json.dumps({"status":"invalid","paid_eligible":False,"reason_codes":["invalid_schedule"],"error":str(exc)},sort_keys=True),file=sys.stderr)
         return 2
