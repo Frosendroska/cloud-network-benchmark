@@ -923,9 +923,9 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
     variables=build_pair_inputs(deployment,options)
     pair_vars=_persist_tfvars(root,journal,"pair",variables)
     try:
-        _verify_registered_expiry(deployment,options,root,runner,clock,now)
         _tf(root,options,runner,clock,"terraform/azure/pair","init","-input=false",action="pair_init")
         # Expiry readbacks and pair initialization may consume meaningful cap time.
+        _verify_registered_expiry(deployment,options,root,runner,clock,now)
         fresh_utc=utc_now().astimezone(UTC); fresh_mono=clock()
         _validate_request(deployment,options,fresh_utc,fresh_mono,require_registered=True)
         if deployment.expiry.value.expires_at.value - fresh_utc < timedelta(seconds=options.post_registration_workflow_seconds):

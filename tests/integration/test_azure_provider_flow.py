@@ -291,6 +291,7 @@ def test_registered_pair_provision_normalizes_both_vms_and_materializes_authenti
     assert result.deployment.vm_a.connection and result.deployment.vm_b.connection, result.failures
     assert result.deployment.vm_a.connection.host=="8.8.8.8"
     assert result.deployment.vm_b.connection.host=="1.1.1.1"
+    assert [r.action_type for r in runner.requests].index("pair_init") < [r.action_type for r in runner.requests].index("expiry_module_recheck")
     known_hosts=o.attempt_root/"known_hosts"
     assert known_hosts.read_text().splitlines()==[
         "8.8.8.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc",
