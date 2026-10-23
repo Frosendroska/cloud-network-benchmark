@@ -42,4 +42,4 @@ Tests use fake time and synthetic artifacts; they do not prove IAM permissions, 
 
 The full suite and Terraform validation are offline implementation evidence, not the complete F07 acceptance set. Several task rows remain unchecked where the requested failure corpus or per-scenario acceptance evidence is incomplete; no paid/cloud gate or F10 readiness is claimed.
 
-Final implementation source commit: `4336ce8c5fe3a7f5dbe542fec365f0310ea7eeb6`. The branch's evidence-only HEAD is `bdcd8f0f20f70a80a0130e9ae694b8e4d7fe51c5` on `codex/f07-v2-gcp` (ahead seven commits of `origin/main`, with clean worktree). `specs/009-v2-gcp-provider/tasks.md` has 13/26 tasks checked and 13 still open for convergence assessment.
+Final implementation source commit: `4336ce8c5fe3a7f5dbe542fec365f0310ea7eeb6`. Subsequent commits only record and clarify this evidence checkpoint. `specs/009-v2-gcp-provider/tasks.md` has 13/26 tasks checked and 13 still open for convergence assessment.
