@@ -1,6 +1,6 @@
 # Validation guide: DAY artifact identity
 
-These are implementation acceptance instructions, not passing test evidence. Planning writes only 018 artifacts. Baseline is `6971ba72cf5031ad50c4658606cc1d55c10242ac`; no cloud, credentials, traffic or instrumented-tool execution is authorized.
+These are implementation acceptance instructions, not passing test evidence. Planning base is `6971ba72cf5031ad50c4658606cc1d55c10242ac`; no cloud, credentials, traffic or instrumented-tool execution is authorized.
 
 ## Prerequisites and ownership gate
 
@@ -52,15 +52,77 @@ git diff --check
 
 If model metadata changes generated schemas, run the existing exporter once without `--check`, review and retain only affected canonical files, then repeat schema check and affected tests. Do not hand-edit generated schema or add a new schema root. A runtime-only change may correctly leave all schemas unchanged. New failing tests must demonstrate the actual identity mismatch before implementation rather than an import error.
 
+## Implementation reconciliation
+
+Coordinator confirmed the verified 017 merge `2cd36e9ea7b12681545e8c6680ccda42388ffded`,
+integrated latest `origin/main` and released the serialized shared-contract writer for this
+implementation stage. This feature branch merged that main commit normally: integrated main base
+`2cd36e9ea7b12681545e8c6680ccda42388ffded`, merge head `79dc82d930d7c4aa23650aaa88612e6e55c78912`.
+Branch/worktree: `codex/f01r-day-identity` at `/private/tmp/cnb-day-identity`. The checked-out
+constitution is `HEAD:.specify/memory/constitution.md` blob
+`ba72e63aa5b58260ee5fe57f1b02f8c6b1c0a07a`. Both feature checklists passed (requirements 16/16,
+contracts 12/12); there are no extension hooks. Existing `.gitignore` and `.terraformignore`
+cover Python/test outputs, Terraform state/vars/plans, and local secrets; no ignore edits were
+needed.
+
+T002 reconciliation confirmed the assigned production API mismatch: `ArtifactLayout` emits the
+fixed DAY client declarations with `unit_id=None` (`contracts/artifacts.py:226-232`), while
+`measurement.py` runs the client as `iperf3-{day_unit_id}` and acquisition binding requires that
+exact unit. `ValidatorInput` currently admits dynamic DAY template paths by pattern but requires
+the base family ID and day-parent unit (`contracts/validation.py:127-154`), while
+`RetrievalManifest` emits `<family-id>-<chunk-unit>` with the chunk unit (`retrieval.py:75-140`).
+The existing multi-mode producer fixture manually constructs records around that boundary
+(`tests/integration/test_acquisition_producer.py:874-956`), so it does not catch retrieval-to-DTO
+identity drift. Retrieval, acquisition and F03 remain read-only owners/boundaries in this change.
+
+Baseline command, before shared code/test/schema edits:
+
+```text
+test "$PWD" = /private/tmp/cnb-day-identity || exit 97
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/contract/test_v2_handoffs.py tests/integration/test_acquisition_producer.py
+exit 0: 86 passed in 47.79s
+```
+
+Writable implementation scope remains `contracts/artifacts.py`, `contracts/validation.py`,
+`tests/contract/test_day_artifact_identity.py`, the assigned acquisition producer integration
+fixture, affected generated 003 schemas only, and 018 feature documentation.
+
 ## Evidence and handoff
 
 | Stage | State at planning handoff |
 | --- | --- |
 | Specify/clarify/plan/tasks/analyze | Completed by artifact review; see stage results reported with planning commit |
-| 017 merge / writer release | Coordinator reported verified `2cd36e9ea7b12681545e8c6680ccda42388ffded`; release conditional on completed planning gates |
-| Latest-main integration | Not run by planner; required in this worktree before implementation |
-| Application code/schema changes | Not made |
+| 017 merge / writer release | Verified `2cd36e9ea7b12681545e8c6680ccda42388ffded`; implementation release received after planning gates |
+| Latest-main integration | Merged normally; main base `2cd36e9ea7b12681545e8c6680ccda42388ffded`, integrated head `79dc82d930d7c4aa23650aaa88612e6e55c78912` |
+| Application code/schema changes | Pending implementation |
 | New focused tests / regression suite / schema check | Not run during planning |
 | Real native-tool/cloud acceptance | Not run; outside this feature |
+
+## Implementation checkpoint
+
+The first focused contract checkpoint adds `tests/contract/test_day_artifact_identity.py` and
+changes only the assigned artifact declaration/validation models. Fixed DAY client records now
+associate with the single declared day unit; dynamic chunk IDs resolve to exactly one family and
+must match the concrete suffix, expanded path, declared chunk unit and day parent. The validator
+also admits only the two specified historical forms without rewriting their IDs, paths or units.
+
+Before the model changes, the new contract test command failed on the fixed DAY declaration being
+unassigned and on a correctly suffixed retrieval record being unrecognized. After the changes:
+
+```text
+test "$PWD" = /private/tmp/cnb-day-identity || exit 97
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/contract/test_day_artifact_identity.py
+exit 0: 13 passed in 0.24s
+git diff --check
+exit 0
+```
+
+This is a focused contract checkpoint only. The canonical F03-to-retrieval-to-validator-to-helper
+integration proof, full regressions, schema check and complete offline suite are still pending;
+no real native-tool or cloud acceptance is claimed.
 
 Implementer records exact head/base, commands/exit results, focused test count, schema diff/no-diff and remaining limitations here when executing the tasks. Coordinator dispatches existing convergence after code/checks; a passing identity fixture is not F08 or F10 completion. No shared runtime state or PR is owned by this planner.
