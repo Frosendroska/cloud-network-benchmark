@@ -427,6 +427,8 @@ class Reconciliation:
     source_path: str | None = None
     absence_evidence_id: str | None = None
     absent_resource_ids: tuple[str, ...] = ()
+    billing_amount_kind: str = "cumulative"
+    cleanup_status_reported: bool = False
 
 
 class BudgetLedger:
@@ -985,8 +987,10 @@ class BudgetLedger:
             state = self._read(); rec = state["reservations"].get(reservation_id)
             if not rec: return StageDecision(False,("ledger_unavailable",),None)
             evidence_now = ReservationEvidence.model_validate(rec["evidence"])
-            if evidence_now.state != "reserved" or rec.get("terminal_released"):
+            if evidence_now.state != "reserved" or rec.get("terminal_released") or rec.get("lifecycle_terminal"):
                 return StageDecision(False,("reservation_terminal",),evidence_now.expires_at.value)
+            effective_deadline = min(evidence_now.expires_at.value,
+                datetime.fromisoformat(rec["plan"].get("effective_deadline", evidence_now.expires_at.value.isoformat())))
             if Provider(provider).value not in rec["plan"]["providers"]:
                 return StageDecision(False,("identity_mismatch",),evidence_now.expires_at.value)
             if rec["session"] != self.controller_session_id:
@@ -1005,7 +1009,7 @@ class BudgetLedger:
             required_fit = remaining.fit_seconds(now=_utc(self.utc_now()), preparation_can_overlap=True) + max(0.0, wait-remaining.preparation_seconds)
             if live <= 0 or required_fit > live:
                 return StageDecision(False,("workflow_time_insufficient",),evidence_now.expires_at.value)
-            fit = StageDecision(True,(),evidence_now.expires_at.value)
+            fit = StageDecision(True,(),effective_deadline)
             if state.get("cleanup_blocked"):
                 return StageDecision(False,("cleanup_open",),fit.effective_deadline)
             providers = set(rec["plan"]["providers"])
@@ -1034,23 +1038,24 @@ class BudgetLedger:
             expiry_fingerprint = hashlib.sha256(json.dumps({"requests":[reqs[k].model_dump(mode="json") for k in sorted(reqs)],"evidence":[evs[k].model_dump(mode="json") for k in sorted(evs)]},sort_keys=True,default=str).encode()).hexdigest()
             if rec.get("expiry_fingerprint") and rec["expiry_fingerprint"] != expiry_fingerprint:
                 return StageDecision(False,("expiry_mismatch",),deadline)
-            required = rec["allowance"] - (self.monotonic_now() - rec["cap_start_monotonic"])
-            if required <= 0 or (deadline - _utc(self.utc_now())).total_seconds() < required:
-                return StageDecision(False,("workflow_time_insufficient",),deadline)
+            # The locked mode-specific remaining-work fit above is compared against the
+            # immutable monotonic cap/trigger; do not subtract elapsed time from the
+            # original workflow estimate or consult wall-clock UTC for eligibility.
             rec["provider_deadline"] = deadline.isoformat()
             rec["expiry_fingerprint"] = expiry_fingerprint
             claims = rec.setdefault("creation_claims", [])
-            if Provider(provider).value in claims: return StageDecision(True,("creation_already_claimed",),fit.effective_deadline,False)
+            if Provider(provider).value in claims: return StageDecision(True,("creation_already_claimed",),deadline,False)
             claims.append(Provider(provider).value)
             rec["cleanup_open"] = True
             if reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(reservation_id)
             self._write(state)
-            return StageDecision(True,(),fit.effective_deadline,True)
+            return StageDecision(True,(),deadline,True)
         finally: fcntl.flock(fd,fcntl.LOCK_UN);os.close(fd)
 
     def reconcile(self, event: Reconciliation) -> ReservationEvidence:
         if (not event.event_id.strip() or not event.reservation_id.strip() or not isinstance(event.actual, bool)
-            or not isinstance(event.billing_final, bool) or not isinstance(event.released_funding_by_bucket, Mapping)):
+            or not isinstance(event.billing_final, bool) or not isinstance(event.released_funding_by_bucket, Mapping)
+            or event.billing_amount_kind not in {"cumulative", "delta"}):
             raise ValueError("reconciliation identity/status is invalid")
         if event.occurred_at is None: raise ValueError("reconciliation timestamp is required")
         occurred_at = _utc(event.occurred_at)
@@ -1072,8 +1077,10 @@ class BudgetLedger:
         try:
             state=self._read(); payload={"reservation_id":event.reservation_id,"provider":Provider(event.provider).value,"source_sha256":event.source_sha256,
                 "incurred_usd":None if event.incurred_usd is None else str(event.incurred_usd),"actual":event.actual,
-                "cleanup_verified_absent":event.cleanup_verified_absent,"billable_resources_present":event.billable_resources_present,"failure":event.failure,
+                "cleanup_verified_absent":event.cleanup_verified_absent,"billable_resources_present":event.billable_resources_present,
+                "cleanup_status_reported":event.cleanup_status_reported,"failure":event.failure,
                 "occurred_at":occurred_at.isoformat(),"billing_final":event.billing_final,
+                "billing_amount_kind":event.billing_amount_kind,
                 "released_funding_by_bucket":{k:str(v) for k,v in sorted(event.released_funding_by_bucket.items())},
                 "release_evidence_id":event.release_evidence_id,"release_source_path":event.release_source_path,
                 "source_path":event.source_path,"absence_evidence_id":event.absence_evidence_id,
@@ -1087,17 +1094,34 @@ class BudgetLedger:
             if rec is None: raise ValueError("identity_mismatch")
             provider = Provider(event.provider).value
             if provider not in rec["plan"]["providers"]: raise ValueError("identity_mismatch")
-            bill = rec.setdefault("provider_billing", {name:{"actual_usd":None,"estimate_usd":None,"final":False,"event_id":None} for name in rec["plan"]["providers"]})[provider]
+            bill = rec.setdefault("provider_billing", {name:{"actual_usd":None,"estimate_usd":None,"final":False,"event_id":None,"history":[]} for name in rec["plan"]["providers"]})[provider]
             if event.billing_final and (not event.actual or event.incurred_usd is None):
                 raise ValueError("final provider billing requires an actual sourced charge")
             if bill.get("final") and event.billing_final and (bill.get("actual_usd") != str(_decimal(event.incurred_usd)) or bill.get("event_id") != event.event_id):
                 raise ValueError("conflicting_final_billing")
             if event.incurred_usd is not None:
-                bill["actual_usd" if event.actual else "estimate_usd"] = str(_decimal(event.incurred_usd))
-            if event.billing_final:
+                amount = _decimal(event.incurred_usd)
+                bill.setdefault("history", []).append({"event_id":event.event_id,"amount_usd":str(amount),
+                    "actual":event.actual,"billing_final":event.billing_final,"amount_kind":event.billing_amount_kind,
+                    "source_sha256":event.source_sha256,"occurred_at":occurred_at.isoformat()})
+                if not bill.get("final"):
+                    amount_key = "actual_usd" if event.actual else "estimate_usd"
+                    previous = _decimal(bill.get(amount_key) or "0")
+                    if event.billing_final:
+                        # A final cumulative bill supersedes provisional estimates/actuals;
+                        # a final delta adds only to known actual charges, never estimates.
+                        final_amount = amount if event.billing_amount_kind == "cumulative" else _decimal(bill.get("actual_usd") or "0") + amount
+                        bill["actual_usd"] = str(final_amount)
+                    else:
+                        next_amount = previous + amount if event.billing_amount_kind == "delta" else max(previous, amount)
+                        bill[amount_key] = str(next_amount)
+            if event.billing_final and not bill.get("final"):
                 bill["final"] = True
                 bill["event_id"] = event.event_id
-            rec["incurred_usd"] = str(sum((_decimal(v["actual_usd"]) for v in rec["provider_billing"].values() if v.get("final") and v.get("actual_usd") is not None), Decimal("0")))
+            rec["incurred_usd"] = str(sum((
+                _decimal(v.get("actual_usd") or "0") if v.get("final") else
+                max(_decimal(v.get("actual_usd") or "0"), _decimal(v.get("estimate_usd") or "0"))
+                for v in rec["provider_billing"].values()), Decimal("0")))
             if _decimal(rec["incurred_usd"]) > _decimal(rec["reserved_cost_usd"]):
                 blocked=state.setdefault("budget_blocked",[])
                 if event.reservation_id not in blocked: blocked.append(event.reservation_id)
@@ -1122,6 +1146,7 @@ class BudgetLedger:
                 rec["provider_cleanup"][provider] = True
                 if all(rec["provider_cleanup"].get(name) is True for name in rec["plan"]["providers"]):
                     rec["cleanup_open"]=False
+                    rec["lifecycle_terminal"] = True
                     if event.reservation_id in state["cleanup_open"]: state["cleanup_open"].remove(event.reservation_id)
                     if event.reservation_id in state["cleanup_blocked"]: state["cleanup_blocked"].remove(event.reservation_id)
                 elif event.reservation_id not in state["cleanup_blocked"]:
@@ -1131,7 +1156,8 @@ class BudgetLedger:
                 rec["cleanup_open"] = True
                 if event.reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(event.reservation_id)
                 if event.reservation_id not in state["cleanup_blocked"]: state["cleanup_blocked"].append(event.reservation_id)
-            elif event.billable_resources_present is None:
+            elif event.billable_resources_present is None and event.cleanup_status_reported:
+                rec["provider_cleanup"][provider] = False
                 rec["cleanup_open"] = True
                 if event.reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(event.reservation_id)
                 if event.reservation_id not in state["cleanup_blocked"]: state["cleanup_blocked"].append(event.reservation_id)

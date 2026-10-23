@@ -298,6 +298,8 @@ def test_final_billing_and_all_provider_absence_release_only_proved_unused_fundi
     assert Decimal(reservation["incurred_usd"]) == Decimal("0.1")
     assert reservation["released_usd"] == "0.4"
     assert reservation["evidence"]["state"] == "released"
+    released_claim = book.claim_creation(rid, provider=Provider.AWS, expiry_requests=[], expiry_evidence=[])
+    assert not released_claim.eligible and released_claim.reason_codes == ("reservation_terminal",)
     assert reservation["evidence"]["reasons"]
     assert Decimal(state["funding_remaining"]["primary"]) == Decimal("100.3")
     assert not state["cleanup_blocked"]
@@ -307,6 +309,54 @@ def test_final_billing_and_all_provider_absence_release_only_proved_unused_fundi
         book.reconcile(Reconciliation("conflicting-aws-final",rid,Provider.AWS,
             hashlib.sha256(b"conflicting-final").hexdigest(),incurred_usd=Decimal("0.09"),actual=True,
             billing_final=True,occurred_at=datetime(2026,10,22,0,4,tzinfo=timezone.utc),source_path="local/conflict.json"))
+
+
+@pytest.mark.parametrize("actual", [True, False])
+def test_nonfinal_provider_liability_counts_against_budget_and_is_retained(tmp_path, actual):
+    path = tmp_path / f"liability-{actual}.json"
+    book = ledger(path)
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book.initialize(costs)
+    _reserve_same_claim_in_process((str(path), f"F11-nonfinal-{actual}"))
+    rid = next(iter(book.inspect()["reservations"]))
+    event = Reconciliation(f"large-nonfinal-{actual}", rid, Provider.AWS,
+        hashlib.sha256(f"large-{actual}".encode()).hexdigest(), incurred_usd=Decimal("300"),
+        actual=actual, billing_final=False,
+        occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc), source_path="local/provisional-billing.json")
+    book.reconcile(event)
+    rec = book.inspect()["reservations"][rid]
+    assert Decimal(rec["incurred_usd"]) == Decimal("300")
+    assert rec["provider_billing"]["aws"]["final"] is False
+    assert Decimal(rec["provider_billing"]["aws"]["actual_usd" if actual else "estimate_usd"]) == Decimal("300")
+    assert rid in book.inspect()["budget_blocked"]
+    # Resolve the remaining resources, but retain the overrun and refuse another launch.
+    for index, provider in enumerate((Provider.AZURE, Provider.GCP), 1):
+        record_absence(book, f"liability-absence-{index}", rid, provider, datetime(2026,10,22,0,2+index,tzinfo=timezone.utc))
+    status, _, _ = _reserve_same_claim_in_process((str(path), f"F11-blocked-{actual}"))
+    assert status == "rejected"
+
+
+def test_provider_charge_deltas_finalize_without_double_count_or_late_overwrite(tmp_path):
+    path = tmp_path / "charge-history.json"
+    book = ledger(path)
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book.initialize(costs)
+    _reserve_same_claim_in_process((str(path), "F11-charge-history"))
+    rid = next(iter(book.inspect()["reservations"]))
+    def event(event_id, amount, *, final=False, kind="delta", actual=True):
+        return Reconciliation(event_id, rid, Provider.AWS, hashlib.sha256(event_id.encode()).hexdigest(),
+            incurred_usd=Decimal(amount), actual=actual, billing_final=final, billing_amount_kind=kind,
+            occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc), source_path=f"local/{event_id}.json")
+    book.reconcile(event("delta-1", "0.10"))
+    book.reconcile(event("delta-2", "0.20"))
+    assert Decimal(book.inspect()["reservations"][rid]["incurred_usd"]) == Decimal("0.30")
+    book.reconcile(event("final-total", "0.25", final=True, kind="cumulative"))
+    book.reconcile(event("late-provisional", "99.00", kind="cumulative"))
+    rec = book.inspect()["reservations"][rid]
+    assert Decimal(rec["incurred_usd"]) == Decimal("0.25")
+    assert len(rec["provider_billing"]["aws"]["history"]) == 4
+    with pytest.raises(ValueError, match="conflicting_final_billing"):
+        book.reconcile(event("conflicting-final", "0.26", final=True, kind="cumulative"))
 
 
 def test_replacement_is_bound_to_one_failed_short_observation_and_original_provider(tmp_path):
@@ -585,8 +635,11 @@ def test_retained_calibration_admits_one_row_while_day_waits_for_common_n(tmp_pa
 ])
 def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode, minimum):
     now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+    utc_clock = [now]
+    monotonic_clock = [1.0]
     costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
-    book = ledger(tmp_path / f"{mode}.json")
+    book = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:utc_clock[0],
+        monotonic_now=lambda:monotonic_clock[0], controller_session_id="session-1")
     book.initialize(costs)
     config_path = ROOT / ("configs/" + config_name if config_name.startswith("tests/") else "configs/" + config_name)
     if mode == "acceptance":
@@ -609,6 +662,12 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
     measurement_remainder = WorkflowAllowance(0,0,0,0,minimum,1,plan.allowance.retrieval_seconds,
         plan.allowance.cleanup_seconds,"mode-stage-test",plan.allowance.provider_leads_seconds,("registration","preparation"))
     assert book.check_stage_fit(rid, stage="measurement", remaining=measurement_remainder).eligible
+    utc_clock[0] = now + timedelta(days=2)
+    monotonic_clock[0] = 2.0
+    assert book.check_stage_fit(rid, stage="registration", remaining=plan.allowance).eligible
+    utc_clock[0] = now - timedelta(days=2)
+    monotonic_clock[0] = 3.0
+    assert book.check_stage_fit(rid, stage="registration", remaining=plan.allowance).eligible
     expiry_requests, expiry_evidence = [], []
     for provider in providers:
         name = provider.value
@@ -623,14 +682,23 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
             provider=provider, action=action, state="registered", registration_id=Evidence[str](value=f"registration-{name}"),
             registered_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=trigger),
             target_selector=req.target_selector, provider_metadata=StructuredEvidence(value={"fixture":True})))
+    utc_clock[0] = now
+    effective_seconds = request.lifetime_cap_seconds - max(plan.allowance.provider_leads_seconds.values())
+    claim_remainder = WorkflowAllowance(0,plan.allowance.provision_seconds,plan.allowance.readiness_seconds,
+        plan.allowance.stabilization_seconds,minimum,1,plan.allowance.retrieval_seconds,plan.allowance.cleanup_seconds,
+        "creation-fit-test",plan.allowance.provider_leads_seconds,("registration",))
+    remaining_fit = claim_remainder.fit_seconds(now=now)
+    monotonic_clock[0] = 1.0 + effective_seconds - remaining_fit
     decision = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert decision.eligible and decision.creation_granted
+    assert decision.effective_deadline == min(item.expires_at.value for item in expiry_requests)
     late = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
         monotonic_now=lambda:1.0 + request.lifetime_cap_seconds + 1, controller_session_id="session-1")
     expired = late.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert not expired.eligible and "workflow_time_insufficient" in expired.reason_codes
     replay = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert replay.eligible and not replay.creation_granted and "creation_already_claimed" in replay.reason_codes
+    assert replay.effective_deadline == decision.effective_deadline
     resumed = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
         monotonic_now=lambda:2.0, controller_session_id="new-controller-session")
     campaign2 = (resolve_campaign(config_path, ROOT)[0] if mode == "acceptance"
@@ -643,6 +711,44 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
     request2 = request2.model_copy(update={"outstanding_cleanup":True,"active_reserved_usd":Evidence[float](value=0.5)})
     blocked = resumed.reserve(request2, plan=plan2)
     assert blocked.status == "rejected" and blocked.reasons == ("controller_session_changed",)
+
+
+def test_creation_after_elapsed_registration_uses_remaining_fit_not_original_estimate(tmp_path):
+    now = datetime(2026,10,22,tzinfo=timezone.utc)
+    monotonic = [1.0]
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book = BudgetLedger(tmp_path / "elapsed-registration.json", scope_id="offline-scope",
+        utc_now=lambda:now, monotonic_now=lambda:monotonic[0], controller_session_id="elapsed-session")
+    book.initialize(costs)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    providers = [Provider.AWS,Provider.AZURE,Provider.GCP]
+    request, plan = scheduled_request_and_plan(campaign,costs,campaign_id="elapsed-registration",
+        providers=providers,child_prefix="elapsed-run",namespace_prefix="elapsed-ns",funding={"primary":"0.5"})
+    allowance = WorkflowAllowance(10,29,10,60,76,1,10,10,"elapsed-registration-policy",
+        {name:60 for name in ("aws","azure","gcp")})
+    plan = plan.__class__(**{**plan.__dict__,"allowance":allowance})
+    reserved = book.reserve(request,plan=plan)
+    assert reserved.status == "reserved"
+    rid = reserved.evidence.reservation_id.value
+    requests, evidence = [], []
+    for provider in providers:
+        name=provider.value
+        run_id=plan.child_identities[name]
+        trigger=reserved.evidence.expires_at.value-timedelta(seconds=allowance.provider_leads_seconds[name])
+        action="deallocate" if provider==Provider.AZURE else "stop"
+        req=ExpiryRequest(schema_version=2,run_id=run_id,deployment_id=f"{run_id}-deployment",provider=provider,
+            action=action,expires_at=Evidence[datetime](value=trigger),reservation_id=Evidence[str](value=rid),
+            resource_namespace=plan.namespaces[name],target_selector=f"target-{name}")
+        requests.append(req)
+        evidence.append(ExpiryEvidence(schema_version=2,run_id=run_id,deployment_id=req.deployment_id,provider=provider,
+            action=action,state="registered",registration_id=Evidence[str](value=f"registration-{name}"),
+            registered_at=Evidence[datetime](value=now),expires_at=Evidence[datetime](value=trigger),
+            target_selector=req.target_selector,provider_metadata=StructuredEvidence(value={"fixture":True})))
+    # Original complete estimate is 206 seconds; the current remainder after registration is 196.
+    monotonic[0] = 251.0
+    decision=book.claim_creation(rid,provider=Provider.AWS,expiry_requests=requests,expiry_evidence=evidence)
+    assert decision.eligible and decision.creation_granted
+    assert decision.effective_deadline == reserved.evidence.expires_at.value-timedelta(seconds=60)
 
 
 @pytest.mark.parametrize("mutation", ["missing_component", "wrong_region", "underfunded_component"])
@@ -728,6 +834,39 @@ def test_earlier_controller_session_blocks_from_reservation_activation(tmp_path)
     for index, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP)):
         record_absence(original, f"restart-cleanup-{index}", rid, provider, now + timedelta(seconds=index))
     assert not original.inspect()["cleanup_open"]
+    terminal_claim = original.claim_creation(next(iter(original.inspect()["reservations"])), provider=Provider.AWS,
+        expiry_requests=[], expiry_evidence=[])
+    assert not terminal_claim.eligible and terminal_claim.reason_codes == ("reservation_terminal",)
+
+
+def test_newer_unknown_cleanup_invalidates_only_that_providers_absence(tmp_path):
+    costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
+    book = ledger(tmp_path / "cleanup-generation.json")
+    book.initialize(costs)
+    _reserve_same_claim_in_process((str(book.path), "F11-cleanup-generation"))
+    rid = next(iter(book.inspect()["reservations"]))
+    now = datetime(2026,10,22,tzinfo=timezone.utc)
+    for index, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP)):
+        record_absence(book, f"initial-absence-{index}", rid, provider, now+timedelta(seconds=index))
+    unknown = Reconciliation("aws-cleanup-unknown", rid, Provider.AWS, hashlib.sha256(b"aws-unknown").hexdigest(),
+        billable_resources_present=None, cleanup_status_reported=True,
+        occurred_at=now+timedelta(seconds=5), source_path="local/aws-unknown.json")
+    book.reconcile(unknown)
+    assert book.inspect()["reservations"][rid]["provider_cleanup"]["aws"] is False
+    record_absence(book, "azure-new-absence", rid, Provider.AZURE, now+timedelta(seconds=6))
+    state = book.inspect()
+    assert rid in state["cleanup_blocked"] and state["reservations"][rid]["cleanup_open"]
+    assert state["reservations"][rid]["provider_cleanup"]["aws"] is False
+    book.reconcile(unknown)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    req, plan = scheduled_request_and_plan(campaign, costs, campaign_id="while-aws-cleanup-unknown",
+        providers=[Provider.AWS,Provider.AZURE,Provider.GCP], child_prefix="cleanup-blocked-run",
+        namespace_prefix="cleanup-blocked-ns", funding={"primary":"0.5"})
+    assert book.reserve(req, plan=plan).reasons == ("cleanup_open",)
+    record_absence(book, "aws-final-absence", rid, Provider.AWS, now+timedelta(seconds=7))
+    assert rid not in book.inspect()["cleanup_blocked"]
+    req = req.model_copy(update={"active_reserved_usd":Evidence[float](value=0.5)})
+    assert book.reserve(req, plan=plan).status == "reserved"
 
 
 def test_cost_source_switch_requires_review_and_preserves_old_allocations(tmp_path):
@@ -885,14 +1024,17 @@ def test_same_session_can_hold_two_independent_primary_reservations(tmp_path):
     assert state["funding_remaining"]["primary"] == "99.40"
     unknown = Reconciliation("event-1", rid, Provider.AWS, costs.payload_sha256,
         incurred_usd=Decimal("0.10"), actual=False, billable_resources_present=None,
+        cleanup_status_reported=True,
         occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc),source_path=costs.source_path)
     book.reconcile(unknown)
     with pytest.raises(ValueError, match="duplicate_conflict"):
         book.reconcile(Reconciliation("event-1", rid, Provider.AWS, costs.payload_sha256,
             incurred_usd=Decimal("0.11"), billable_resources_present=None,
+            cleanup_status_reported=True,
             occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc),source_path=costs.source_path))
     book.reconcile(Reconciliation("event-1-final", rid, Provider.AWS, costs.payload_sha256,
         incurred_usd=Decimal("0.10"), actual=True, billing_final=True, billable_resources_present=None,
+        cleanup_status_reported=True,
         occurred_at=datetime(2026,10,22,0,1,30,tzinfo=timezone.utc),source_path=costs.source_path))
     req_c, plan_c = reserve("F11-primary-third")
     assert book.reserve(req_c, plan=plan_c).reasons == ("cleanup_open",)
