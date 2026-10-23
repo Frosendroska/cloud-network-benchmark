@@ -263,4 +263,37 @@ with `patch --batch --fuzz=0 -p1`; both reapplications exited 0. The packaged pa
 remain unchanged. The tests cover raw source binding and replay for all four modes, including the
 diagnostic B receiver JSONL artifact; no protocol/CLI flags, warm-up, workload, or native output
 files changed. Linux compilation, patched native executable/help checks, cloud, SSH, credentials,
-and benchmark traffic were not run. All 29 tasks are now checked.
+and benchmark traffic were not run. The later Phase 8 convergence is recorded below.
+
+## Phase 8 convergence (T030–T032)
+
+Code checkpoint: `66ef7c8666436026a6337eb47de30e595f1882de`.
+
+The exact-code full offline suite, including the official PowerShell executable on `PATH`, passed:
+
+```text
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+exit 0: 923 passed in 119.32s
+```
+
+The focused bootstrap and source-producer tests were also run after the Phase 8 changes; the
+process output was truncated by the test-session tool before a reliable final count was captured,
+so no focused-test count is claimed. The full-suite result above includes those tests.
+
+Schema validation and `git diff --check` both exited 0. On the pinned source copies, both
+packaged native patches were reverse-applied and reapplied with `patch --batch --fuzz=0`; every
+reverse and forward application exited 0. The verified pre-patch source hashes are iperf3
+`src/iperf_api.c` `960341011c83b3990de0e431d082001d5126b05390cacdca23b23b6731e577fb`,
+`src/iperf_server_api.c` `12a19ecf2dc20d500dfb60af740d9c5a96b562c53552c5cc65af41f7a31646e5`,
+`src/iperf_client_api.c` `dfd7a23abc9be5d644bed38c756037024f31625da033a3e8cde35965a1b3a72b`,
+and `src/iperf_time.c` `f7d52905eb00bb196f0930f50709dd872d7521d089feb9a0e28bdbeacc717a54`; Sockperf
+`src/client.cpp` `a79a3b29dfad3f7c5adf8f93f770598d6cd6d380889c00d63a179f127534245f`.
+The packaged patch hashes remain iperf3 `11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661`
+and Sockperf `3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285`.
+
+No Linux native compilation, patched executable/help check, cloud or SSH access, credentials, or
+benchmark traffic was run. These checks establish patch applicability and offline framework
+behavior only; they do not establish a compiled native binary or cloud measurement capability.
+All 32 feature tasks are checked.

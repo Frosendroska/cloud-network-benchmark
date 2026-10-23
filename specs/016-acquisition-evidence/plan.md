@@ -104,6 +104,17 @@ genuinely failed/truncated tail can preserve a correlated closed prefix. Day-sca
 coverage require chronological source iterators and retain bounded state. Corrupt native candidates
 are isolated per unit so valid evidence from another unit remains available.
 
+The serialized T030–T032 convergence owns three source-grounded edge repairs. Version identity
+uses complete observed multiline output, with only outer output framing normalized for comparison;
+raw command and sidecar bytes remain evidence. The pinned iperf reporter's short, all-stream
+zero-byte final interval may be absent from native JSON, so only that verified case is reported as
+an explicit unsupported/filtered duration while earlier closed intervals remain available. An
+A-side JSONL file with a valid unique start/settings prefix and one truncated final event can
+corroborate the exact closed B-side prefix, with the remaining tail unknown; contradictory complete
+records remain invalid. These repairs add no benchmark flags, protocol or native-file changes, and
+make no research-policy decisions. The multiline banner capture and interrupted-A materialized
+fixture are feature-owned test/source plumbing.
+
 ## Complexity Tracking
 
 No constitution violations. Two additive upstream observation patches are necessary because current native sources expose filtered samples and relative/statistical spans rather than source-bound enabled windows. A DTO alone cannot close the gap. No additional agent/platform abstraction is justified.
