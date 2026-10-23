@@ -733,9 +733,33 @@ def _invocation_probe_counts(sock: NativeParse) -> tuple[Any, ...]:
     return total or _valid_probe_counts(sock)
 
 
+def _union_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted((left, right) for left, right in intervals if right > left):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _source_supported_windows(unit: Any,
+        acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]]) -> list[tuple[float, float]]:
+    sockperf = _union_intervals([(start, end) for tool, start, end in acquisition.get(unit.unit_id, ([], []))[0]
+                                if tool == "sockperf"])
+    phase = str(getattr(unit.phase, "value", unit.phase))
+    if phase == "idle_latency" or unit.kind == "probe_chunk":
+        return sockperf
+    receiver = _union_intervals([(start, end) for tool, start, end in acquisition.get(unit.unit_id, ([], []))[0]
+                                if tool == "iperf3"])
+    return _union_intervals([(max(probe_start, receiver_start), min(probe_end, receiver_end))
+        for probe_start, probe_end in sockperf for receiver_start, receiver_end in receiver
+        if min(probe_end, receiver_end) > max(probe_start, receiver_start)])
+
+
 def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse,
                       acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None) -> tuple[Any, ...]:
-    """Keep samples corroborated by native RTT, lifecycle, measured bounds, and gaps."""
+    """Keep samples corroborated by native RTT, both acquisition windows, measured bounds, and gaps."""
     timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
     if timing is None or timing.measured_started_at.value is None or timing.measured_finished_at.value is None:
         return ()
@@ -746,8 +770,7 @@ def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse,
         return ()
     start, end = timing.measured_started_at.value.timestamp(), timing.measured_finished_at.value.timestamp()
     error = mapping.estimated_error_ms.value / 1000
-    lifecycle = [(left, right) for tool, left, right in (acquisition or {}).get(unit.unit_id, ([], []))[0]
-                 if tool == "sockperf"]
+    lifecycle = _source_supported_windows(unit, acquisition or {})
     if not lifecycle:
         return ()
     result = []
@@ -996,15 +1019,19 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
         full_duration = full_duration and contiguous
     phase = str(getattr(unit.phase, "value", unit.phase))
     acquisition = acquisition or {}
-    source_windows = [(start, end) for tool, start, end in acquisition.get(unit.unit_id, ([], []))[0]
-                      if tool == "sockperf"]
+    source_windows = _source_supported_windows(unit, acquisition)
     source_errors = acquisition.get(unit.unit_id, ([], []))[1]
     if unit.kind == "continuous_day":
-        source_windows = [(start, end) for chunk in value.measurement_units if chunk.kind == "probe_chunk"
-                          for tool, start, end in acquisition.get(chunk.unit_id, ([], []))[0]
-                          if tool == "sockperf"]
-        source_errors = [error for chunk in value.measurement_units if chunk.kind == "probe_chunk"
-                         for error in acquisition.get(chunk.unit_id, ([], []))[1]]
+        probe_units = [chunk for chunk in value.measurement_units if chunk.kind == "probe_chunk"]
+        probe_windows = _union_intervals([(start, end) for chunk in probe_units
+            for start, end in _source_supported_windows(chunk, acquisition)])
+        receiver_windows = _union_intervals([(start, end) for tool, start, end
+            in acquisition.get(unit.unit_id, ([], []))[0] if tool == "iperf3"])
+        source_windows = _union_intervals([(max(probe_start, receiver_start), min(probe_end, receiver_end))
+            for probe_start, probe_end in probe_windows for receiver_start, receiver_end in receiver_windows
+            if min(probe_end, receiver_end) > max(probe_start, receiver_start)])
+        source_errors = [*source_errors, *(error for chunk in probe_units
+                         for error in acquisition.get(chunk.unit_id, ([], []))[1])]
     active = None
     ratio = None
     bracket: dict[str, Any] = {"unavailable_reason": source_errors[0] if source_errors else

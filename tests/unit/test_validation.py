@@ -99,6 +99,155 @@ def test_empty_materialized_bundle_is_unavailable_and_explains_missing_evidence(
     assert len(result.metrics.value["units"]) == 3
 
 
+def test_f08_intersects_materialized_loaded_sockperf_and_receiver_sources(repository_root, tmp_path):
+    from cloud_network_benchmark.acquisition import bind_acquisition_sources
+    from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
+    from cloud_network_benchmark.contracts import ArtifactInput, ArtifactExpectation, VmRole
+    from cloud_network_benchmark.validation import _acquisition_windows, _coverage, _measured_samples, _source_supported_windows
+    from cloud_network_benchmark.native import parse_iperf3, parse_sockperf
+    from tests.integration.test_acquisition_producer import _build, _native_iperf
+
+    value = make_input(repository_root)
+    unit = value.measurement_units[1]
+    root = tmp_path
+    build_sock = _build("sockperf", VmRole.VM_A, "f08-loaded-sockperf-build")
+    build_iperf = _build("iperf3", VmRole.VM_B, "f08-loaded-iperf-build")
+    builds = [build_sock, build_iperf]
+    build_records = materialize_build_identity_artifacts(root, value.identity.deployment_id, builds)
+    sock_id, sock_log_id = f"{unit.unit_id}-sockperf", f"{unit.unit_id}-sockperf-observation"
+    client_id, server_log_id = f"{unit.unit_id}-iperf3", "iperf3_server_error"
+    sock_path = f"measurements/{unit.unit_id}/sockperf.csv"
+    sock_log_path = f"measurements/{unit.unit_id}/sockperf-acquisition.stderr"
+    client_path = f"measurements/{unit.unit_id}/iperf3.json"
+    server_log_path = "server-logs/iperf3-server.err"
+    cookie = "materialized-loaded-session"
+    sock_action = f"sockperf-{unit.unit_id}"
+    receiver_action = "f02r-vm_b-listener-iperf3"
+    boot_a, boot_b = "12345678-1234-1234-1234-123456789abc", "12345678-1234-1234-1234-123456789def"
+
+    def write(relpath, payload):
+        path = root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return payload
+
+    def record(artifact_id, relpath, kind, producer, unit_id, payload):
+        return ArtifactRecord(artifact_id=artifact_id, path=relpath, kind=kind, producer=producer,
+            unit_id=unit_id, deployment_id=value.identity.deployment_id, closed=True,
+            size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()},
+            retrieval_state="verified")
+
+    sock_csv = write(sock_path, ("sockperf: test output\n------------------------------\n"
+        "packet, txTime(sec), rxTime(sec), rtt(usec)\n"
+        "0, 10.001000, 10.001001, 1.000\n1, 64.999000, 64.999001, 1.000\n").encode())
+    sock_rows = [
+        {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1",
+         "invocation_id":sock_action,"pid":42,"boot_id":boot_a,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"clock_anchor","mono_before_ns":0,"realtime_ns":int(NOW.timestamp()*1e9),"mono_after_ns":1000},
+        {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1",
+         "invocation_id":sock_action,"pid":42,"boot_id":boot_a,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"probe_window","sender_enabled_ns":1_000_000_000,"receiver_enabled_ns":1_000_000_000,
+         "termination_ns":70_000_000_000,"native_filter_start_ns":10_000_000_000,
+         "native_filter_end_ns":70_000_000_000,"termination_reason":"timer"},
+    ]
+    sock_log = write(sock_log_path, b"".join(b"CNB_ACQ_V1 " + json.dumps(row,separators=(",",":")).encode()+b"\n" for row in sock_rows))
+    native_client = json.loads(_native_iperf(cookie, duration=60, start=5, end=65,
+        byte_count=125_000_000, include_omitted=False))
+    native_client["intervals"] = native_client["server_output_json"]["intervals"]
+    native_client["end"] = {"sum_received":{"bytes":125_000_000,"seconds":60}}
+    client_json = write(client_path, (json.dumps(native_client)+"\n").encode())
+    receiver_rows = [
+        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1",
+         "invocation_id":receiver_action,"pid":51,"boot_id":boot_b,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"clock_anchor","cookie":cookie,"mono_before_ns":0,
+         "realtime_ns":int(NOW.timestamp()*1e9),"mono_after_ns":1000},
+        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1",
+         "invocation_id":receiver_action,"pid":51,"boot_id":boot_b,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"session_settings","cookie":cookie,"protocol":"TCP","num_streams":1,
+         "omit":5,"duration":60,"interval_us":1_000_000,"block_size":131072,"reverse":False},
+        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1",
+         "invocation_id":receiver_action,"pid":51,"boot_id":boot_b,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"initial",
+         "origin_us":0,"start_time_fixed_us":0},
+        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1",
+         "invocation_id":receiver_action,"pid":51,"boot_id":boot_b,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"post_omit",
+         "origin_us":5_000_000,"start_time_fixed_us":0},
+        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1",
+         "invocation_id":receiver_action,"pid":51,"boot_id":boot_b,"clock":"CLOCK_MONOTONIC",
+         "record_kind":"receiver_interval","cookie":cookie,"stream_id":"17","role":"receiver",
+         "protocol":"TCP","local_host":"10.0.0.2","local_port":"5201","remote_host":"10.0.0.1",
+         "remote_port":"50100","interval_start_us":10_000_000,"interval_end_us":70_000_000,
+         "bytes":125_000_000,"omitted":False},
+    ]
+    receiver_log = write(server_log_path, b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":")).encode()+b"\n" for row in receiver_rows))
+    sock_record = record(sock_id,sock_path,"sockperf-csv",VmRole.VM_A,unit.unit_id,sock_csv)
+    sock_log_record = record(sock_log_id,sock_log_path,"sockperf-observation-stderr",VmRole.VM_A,unit.unit_id,sock_log)
+    client_record = record(client_id,client_path,"iperf3-json",VmRole.VM_A,unit.unit_id,client_json)
+    receiver_log_record = record(server_log_id,server_log_path,"iperf3-observation-stderr",VmRole.VM_B,None,receiver_log)
+    clock_a = ClockMapping(vm_role=VmRole.VM_A,monotonic_seconds=0,utc_timestamp=NOW,
+        estimated_error_ms={"value":0},synchronization_source={"value":"materialized fixture"})
+    clock_b = ClockMapping(vm_role=VmRole.VM_B,monotonic_seconds=0,utc_timestamp=NOW,
+        estimated_error_ms={"value":0},synchronization_source={"value":"materialized fixture"})
+    sock_command = CommandEvidence(schema_version=2,request={"action_id":sock_action,
+        "acquisition_invocation_id":sock_action,"argv":[build_sock.binary_path,"under-load","-t","70"]},
+        result={"action_id":sock_action,"outcome":"succeeded"},producer=VmRole.VM_A,
+        deployment_id=value.identity.deployment_id,unit_id=unit.unit_id,
+        binary_version={"value":build_sock.binary_version},source_identity={"value":build_sock.source_reference},
+        started_at={"value":NOW},finished_at={"value":NOW+timedelta(seconds=70)},
+        monotonic_started={"value":0},monotonic_finished={"value":70})
+    client_command = CommandEvidence(schema_version=2,request={"action_id":f"iperf3-{unit.unit_id}",
+        "argv":[build_iperf.binary_path,"-c","10.0.0.2","-P","1","-t","60"]},
+        result={"action_id":f"iperf3-{unit.unit_id}","outcome":"succeeded"},producer=VmRole.VM_A,
+        deployment_id=value.identity.deployment_id,unit_id=unit.unit_id,
+        binary_version={"value":build_iperf.binary_version},source_identity={"value":build_iperf.source_reference},
+        monotonic_started={"value":5},monotonic_finished={"value":65})
+    receiver_command = CommandEvidence(schema_version=2,request={"action_id":receiver_action,
+        "argv":[build_iperf.binary_path,"-s","--json-stream","--forceflush",
+                f"--property=Environment=CNB_ACQUISITION_ID={receiver_action}"]},
+        result={"action_id":receiver_action,"outcome":"succeeded"},producer=VmRole.VM_B,
+        deployment_id=value.identity.deployment_id,unit_id=value.measurement_units[0].unit_id,
+        binary_version={"value":build_iperf.binary_version},source_identity={"value":build_iperf.source_reference},
+        monotonic_started={"value":0},monotonic_finished={"value":86400})
+    records = [sock_record,sock_log_record,client_record,receiver_log_record,*build_records]
+    sources = bind_acquisition_sources(child_root=root,run_identity=value.identity,
+        commands=[sock_command,client_command],receiver_command_evidence=[receiver_command],
+        build_evidence=builds,source_artifact_records=records,clock_mappings=[clock_a,clock_b])
+    assert {source.tool for source in sources} == {"sockperf","iperf3"}
+    declarations = dict(value.artifacts)
+    declarations[server_log_id] = ArtifactInput(artifact_id=server_log_id,path=server_log_path,
+        kind=receiver_log_record.kind,producer=VmRole.VM_B,unit_id=None,expectation=ArtifactExpectation.REQUIRED)
+    declarations.update({item.artifact_id:ArtifactInput(artifact_id=item.artifact_id,path=item.path,
+        kind=item.kind,producer=item.producer,unit_id=item.unit_id,expectation=ArtifactExpectation.REQUIRED)
+        for item in build_records})
+    old_timing = next(item for item in value.timings if item.unit_id == unit.unit_id)
+    timing = old_timing.model_copy(update={"probe_test_started_at":Evidence[datetime](value=NOW),
+        "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=10)),
+        "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=70)),
+        "clock_mappings":[clock_a,clock_b],"acquisition_sources":Evidence(value=list(sources))})
+    prepared = value.model_copy(update={"child_result_root":str(root),"artifacts":declarations,
+        "artifact_records":records,"commands":[sock_command,client_command,receiver_command],"timings":[timing]})
+    windows, errors = _acquisition_windows(prepared,timing)
+    assert not errors
+    assert {tool for tool,_,_ in windows} == {"sockperf","iperf3"}
+    by_tool = {tool:(start,end) for tool,start,end in windows}
+    assert by_tool["sockperf"] == (NOW.timestamp()+10,NOW.timestamp()+70)
+    assert by_tool["iperf3"] == pytest.approx((NOW.timestamp()+10,NOW.timestamp()+70),abs=1e-6)
+    supported = _source_supported_windows(unit,{unit.unit_id:(windows,errors)})
+    assert len(supported) == 1
+    assert supported[0][0] == pytest.approx(NOW.timestamp()+10,abs=1e-6)
+    assert supported[0][1] == pytest.approx(NOW.timestamp()+70,abs=1e-6)
+    sock_source = SourceRef(sock_id,sock_path,sock_record.sha256.value,unit.unit_id,
+        value.identity.deployment_id,"vm_a","3.10")
+    sock = parse_sockperf(root/sock_path,None,source=sock_source)
+    tcp = parse_iperf3(root/client_path,source=SourceRef(client_id,client_path,client_record.sha256.value,
+        unit.unit_id,value.identity.deployment_id,"vm_a","3.17.1"),format="json")
+    coverage = _coverage(prepared,unit,sock,tcp,{unit.unit_id:(windows,errors)})
+    assert coverage["active_probe_seconds"]["value"] == pytest.approx(60,abs=1e-6)
+    assert coverage["complete"] is True
+    assert [sample.packet_index for sample in _measured_samples(prepared,unit,sock,{unit.unit_id:(windows,errors)})] == [0,1]
+
+
 def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_source(repository_root, tmp_path):
     from cloud_network_benchmark.acquisition import bind_acquisition_sources
     from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
@@ -182,7 +331,7 @@ def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_sour
     sock = NativeParse(samples=(RttSample(0, 5.001, 5.001001, 1.0, source_ref, 1),
                                 RttSample(1, 64.999, 64.999001, 1.0, source_ref, 2)))
     coverage = _coverage(prepared, unit, sock, None, {unit.unit_id:(windows, errors)})
-    assert coverage["active_probe_seconds"]["value"] == 60
+    assert coverage["active_probe_seconds"]["value"] == pytest.approx(60,abs=1e-6)
     assert coverage["complete"] is True
     assert [sample.packet_index for sample in _measured_samples(prepared, unit, sock, {unit.unit_id:(windows, errors)})] == [0, 1]
 
@@ -318,6 +467,18 @@ def test_runtime_and_point_samples_cannot_prove_continuous_probe_coverage(reposi
     assert "source-bound active-probe acquisition intervals" in result["tcp_start_bracket"]["unavailable_reason"]
 
 
+def test_loaded_source_support_intersects_probe_and_receiver_and_unions_streams(repository_root):
+    from cloud_network_benchmark.validation import _source_supported_windows
+
+    value, unit, _, _ = _coverage_inputs(repository_root)
+    acquisition = {unit.unit_id: ([
+        ("sockperf", NOW.timestamp() + 5, NOW.timestamp() + 70),
+        ("iperf3", NOW.timestamp() + 10, NOW.timestamp() + 65),
+        ("iperf3", NOW.timestamp() + 10, NOW.timestamp() + 65),
+    ], [])}
+    assert _source_supported_windows(unit, acquisition) == [(NOW.timestamp() + 10, NOW.timestamp() + 65)]
+
+
 def test_rtt_selection_excludes_warmup_and_samples_outside_half_open_measured_window(repository_root):
     value, unit, sock, _ = _coverage_inputs(repository_root)
     ref = SourceRef("sockperf-csv", "samples.csv", "f"*64, unit.unit_id, value.identity.deployment_id, "vm_a", "3.10")
@@ -325,7 +486,8 @@ def test_rtt_selection_excludes_warmup_and_samples_outside_half_open_measured_wi
         (104.999999, 105.0), (105.0, 105.000001), (164.999999, 164.999999), (165.0, 165.000001)])]
     native = NativeParse(samples=tuple(rows))
     assert _measured_samples(value, unit, native) == ()
-    acquisition = {unit.unit_id: ([("sockperf", NOW.timestamp() + 5, NOW.timestamp() + 65)], [])}
+    acquisition = {unit.unit_id: ([("sockperf", NOW.timestamp() + 5, NOW.timestamp() + 65),
+                            ("iperf3", NOW.timestamp() + 5, NOW.timestamp() + 65)], [])}
     selected = _measured_samples(value, unit, native, acquisition)
     assert [item.packet_index for item in selected] == [1, 2]
 
