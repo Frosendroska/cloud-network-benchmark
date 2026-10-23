@@ -141,10 +141,13 @@ class ValidatorInput(StrictModel):
                 path_matches = re.fullmatch(pattern, record.path) is not None
             else:
                 path_matches = record.path == expected_path
-            dynamic_day_record = (record.artifact_id in {"day-probe-csv", "day-probe-log"}
+            dynamic_day_record = (record.artifact_id in {"day-probe-csv", "day-probe-log", "day-probe-observation"}
                                   and declaration.path_template is not None
                                   and record.unit_id == next((unit.unit_id for unit in self.measurement_units if unit.kind == "continuous_day"), None))
-            if not path_matches or record.kind != declaration.kind or record.producer != declaration.producer or (
+            compatible_legacy_kind = (record.artifact_id == "iperf3_server_error"
+                                       and record.kind == "iperf3-server-error"
+                                       and declaration.kind == "iperf3-observation-stderr")
+            if not path_matches or (record.kind != declaration.kind and not compatible_legacy_kind) or record.producer != declaration.producer or (
                 record.unit_id != declaration.unit_id and not dynamic_day_record
             ):
                 raise ValueError("artifact evidence must match its declared input")

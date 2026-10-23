@@ -18,6 +18,13 @@ def test_materialized_short_run_preserves_native_and_projects_shared_contract_sh
     result = run_measurement(item, context(item, tmp_path), processes=processes, clock=clock)
     assert result.outcome == "succeeded"
     assert len(result.command_evidence) == 5
+    assert all(handle.request.environment.get("CNB_ACQUISITION_ID") == handle.request.action_id
+               and handle.request.environment.get("PATH")
+               for handle in processes.handles)
+    assert all(handle.request.argv[0] == "sockperf" or handle.request.argv[0] == "iperf3"
+               for handle in processes.handles)
+    assert any(path.endswith("sockperf-acquisition.stderr") for path in result.artifact_paths)
+    assert any(path.endswith("iperf3-acquisition.stderr") for path in result.artifact_paths)
     assert all(isinstance(value, CommandEvidence) for value in result.command_evidence)
     assert all(isinstance(value, MeasurementTiming) for value in result.timings)
     sockperf = tmp_path / item.artifact_layout.unit_paths(item.measurement_units[0].unit_id)["sockperf"]

@@ -150,7 +150,7 @@ def test_frozen_layouts_compose_through_prepare_readiness_and_retrieval(tmp_path
         assert ready.ready, mode
         class Transfer:
             def run(self,request):
-                artifact=next(key for key in payloads if key in request.action_id)
+                artifact=max((key for key in payloads if key in request.action_id), key=len)
                 payload=payloads[artifact]
                 if request.action_type=="ssh": out=f"{len(payload)} {hashlib.sha256(payload).hexdigest()}"
                 elif artifact in {"sockperf_server_log","iperf3_server_log","iperf3_server_error"} and not log_accessible:

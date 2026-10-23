@@ -334,8 +334,9 @@ def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> No
         ("aws", {"instance_market_type": "spot"}, False),
         ("azure", {"priority": "Regular", "eviction_policy": "Delete", "max_price": -1.0}, True),
         ("azure", {"priority": "Spot", "eviction_policy": "Delete", "max_price": -1.0}, False),
-        ("gcp", {"provisioning_model": "STANDARD", "instance_termination_action": "DELETE"}, True),
-        ("gcp", {"provisioning_model": "SPOT", "instance_termination_action": "DELETE"}, False),
+        ("gcp", {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}, True),
+        ("gcp", {"provisioning_model": "STANDARD", "instance_termination_action": "DELETE"}, False),
+        ("gcp", {"provisioning_model": "SPOT", "instance_termination_action": "STOP"}, False),
     ],
 )
 def test_deployment_input_serializes_provider_native_purchase_options(
