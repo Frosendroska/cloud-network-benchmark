@@ -37,7 +37,7 @@ resource "google_compute_firewall" "listeners" {
   name          = "${var.namespace}-listeners"
   network       = google_compute_network.attempt.name
   direction     = "INGRESS"
-  source_ranges = [local.ips[0] == "10.80.1.10" ? "10.80.1.10/32" : "10.80.1.10/32"]
+  source_ranges = ["${local.ips[0]}/32"]
   target_tags   = ["${var.namespace}-vm-b"]
   allow {
     protocol = "tcp"
@@ -52,7 +52,7 @@ resource "google_compute_firewall" "pair_icmp" {
   name          = "${var.namespace}-icmp"
   network       = google_compute_network.attempt.name
   direction     = "INGRESS"
-  source_ranges = ["10.80.1.10/32", "10.80.2.10/32", "10.81.1.10/32"]
+  source_ranges = ["${local.ips[0]}/32", "${local.ips[1]}/32"]
   allow {
     protocol = "icmp"
   }

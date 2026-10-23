@@ -70,6 +70,8 @@ class GcpRuntimeSettings(StrictModel):
     def source_complete(self) -> "GcpRuntimeSettings":
         if set(self.images) != {"europe-west3", "europe-west2"}:
             raise ValueError("images must pin the selected Frankfurt and London image identities")
+        if any(not re.fullmatch(r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-[a-z0-9-]+", value) for value in self.images.values()):
+            raise ValueError("images must be immutable Ubuntu 24.04 amd64 image identities, not aliases or families")
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
             if field not in handoff:
@@ -123,6 +125,10 @@ class GcpProviderDriver:
             if set(templates) != {"vm_a", "vm_b"}:
                 raise GcpProviderError("both template identities were not observed", category="expiry_uncertain")
             journal["templates"] = templates
+            placement_policy_id = self._outputs(out).get("compact_policy_id")
+            journal["compact_policy_id"] = placement_policy_id
+            if deployment.scenario == "placement_optimization" and not placement_policy_id:
+                raise GcpProviderError("S3 compact placement policy was not observed", category="placement_missing")
             self._save(attempt, journal)
             observed = {}
             for role, template in templates.items():
@@ -182,6 +188,10 @@ class GcpProviderDriver:
                 if scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP" or scheduling.get("terminationTime") != trigger.isoformat().replace("+00:00", "Z"):
                     raise GcpProviderError("observed VM does not inherit absolute STOP scheduling", category="instance_policy_mismatch")
                 self._validate_instance(instance, deployment, role)
+                policies = instance.get("resourcePolicies", [])
+                expected_policy = journal.get("compact_policy_id")
+                if (deployment.scenario == "placement_optimization" and expected_policy not in policies) or (deployment.scenario != "placement_optimization" and policies):
+                    raise GcpProviderError("observed placement policy does not match selected scenario", category="placement_mismatch")
                 host_key = self._trusted_hostkey(resource["name"], resource["zone"], instance)
                 resource["_trusted_host_key"] = host_key
                 output[role] = instance
@@ -416,16 +426,19 @@ class GcpProviderDriver:
     def _inventory(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
         zones = sorted({deployment.vm_a.zone, deployment.vm_b.zone})
         pages, instances, disks, addresses, support = [], [], [], [], []
-        run_hash = hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20]
         dep_hash = hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]
         namespace = self._namespace(deployment)
+        journal = self._load(self._attempt_dir(deployment), deployment)
+        known_vms = {str(item.get("id")) for item in journal.get("observed_resources", {}).values() if item.get("id")}
+        known_disks = {str(source).rsplit("/", 1)[-1] for item in journal.get("observed_resources", {}).values() for source in item.get("disk_sources", []) if source}
+        known_templates = {str(item.get("id")) for item in journal.get("templates", {}).values() if item.get("id")}
         for zone in zones:
-            response = self._gcloud_json(["compute", "instances", "list", f"--zones={zone}", "--project", self.settings.project_id, "--filter", f"labels.cnb-run={run_hash}", "--format=json"], f"gcp-inventory-{zone}")
+            response = self._gcloud_json(["compute", "instances", "list", f"--zones={zone}", "--project", self.settings.project_id, "--format=json"], f"gcp-inventory-{zone}")
             if not isinstance(response, list): raise GcpProviderError("inventory pagination shape unknown", category="inventory_unknown")
-            pages.append(zone); instances.extend(item for item in response if item.get("labels", {}).get("cnb-deploy") == dep_hash)
-            disk_response = self._gcloud_json(["compute", "disks", "list", f"--zones={zone}", "--project", self.settings.project_id, "--filter", f"labels.cnb-run={run_hash}", "--format=json"], f"gcp-disk-inventory-{zone}")
+            pages.append(zone); instances.extend(item for item in response if str(item.get("id")) in known_vms or item.get("labels", {}).get("cnb-deploy") == dep_hash)
+            disk_response = self._gcloud_json(["compute", "disks", "list", f"--zones={zone}", "--project", self.settings.project_id, "--format=json"], f"gcp-disk-inventory-{zone}")
             if not isinstance(disk_response, list): raise GcpProviderError("disk inventory pagination shape unknown", category="inventory_unknown")
-            disks.extend(item for item in disk_response if item.get("labels", {}).get("cnb-deploy") == dep_hash)
+            disks.extend(item for item in disk_response if str(item.get("name")) in known_disks or item.get("labels", {}).get("cnb-deploy") == dep_hash)
         for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
             result = self._gcloud_json(["compute", "addresses", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-address-inventory-{region}")
             if not isinstance(result, list): raise GcpProviderError("regional address inventory pagination shape unknown", category="inventory_unknown")
@@ -436,7 +449,7 @@ class GcpProviderDriver:
         for collection, command in (("instance_templates", ["compute", "instance-templates", "list"]), ("networks", ["compute", "networks", "list"]), ("firewalls", ["compute", "firewall-rules", "list"])):
             result = self._gcloud_json([*command, "--project", self.settings.project_id, "--format=json"], f"gcp-{collection}-inventory")
             if not isinstance(result, list): raise GcpProviderError(f"{collection} inventory pagination shape unknown", category="inventory_unknown")
-            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace))
+            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace) or (collection == "instance_templates" and str(item.get("id")) in known_templates))
         for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
             result = self._gcloud_json(["compute", "resource-policies", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-policy-inventory-{region}")
             if not isinstance(result, list): raise GcpProviderError("resource policy inventory pagination shape unknown", category="inventory_unknown")
@@ -465,9 +478,21 @@ class GcpProviderDriver:
 
     def _validate_instance(self, instance: dict[str, Any], deployment: ProviderDeploymentInput, role: str) -> None:
         intent = deployment.vm_a if role == "vm_a" else deployment.vm_b
+        expected_ips = {
+            "same_zone": ("10.80.1.10", "10.80.1.11"),
+            "cross_zone": ("10.80.1.10", "10.80.2.10"),
+            "placement_optimization": ("10.80.1.10", "10.80.1.11"),
+            "inter_region": ("10.80.1.10", "10.81.1.11"),
+        }
+        expected_ip = expected_ips[deployment.scenario][0 if role == "vm_a" else 1]
+        actual_zone = instance.get("zone", "").rsplit("/", 1)[-1]
+        if actual_zone != intent.zone:
+            raise GcpProviderError("observed VM zone differs from selected zone", category="instance_shape_mismatch")
         interfaces = instance.get("networkInterfaces", [])
         if len(interfaces) != 1 or interfaces[0].get("nicType") != "GVNIC":
             raise GcpProviderError("observed VM must have exactly one gVNIC interface", category="instance_shape_mismatch")
+        if interfaces[0].get("networkIP") != expected_ip or not any(config.get("natIP") for config in interfaces[0].get("accessConfigs", [])):
+            raise GcpProviderError("observed VM private or public management address differs from selected topology", category="instance_shape_mismatch")
         if instance.get("machineType", "").rsplit("/", 1)[-1] != "n2-standard-4":
             raise GcpProviderError("observed VM machine type differs from selected shape", category="instance_shape_mismatch")
         boot = next((disk for disk in instance.get("disks", []) if disk.get("boot")), None)
@@ -476,6 +501,9 @@ class GcpProviderDriver:
         disk = self._gcloud_json(["compute", "disks", "describe", boot["source"].rsplit("/", 1)[-1], "--zone", intent.zone, "--project", self.settings.project_id, "--format=json"], f"gcp-boot-disk-{role}")
         if int(disk.get("sizeGb", 0)) != 32 or disk.get("type", "").rsplit("/", 1)[-1] != "pd-balanced":
             raise GcpProviderError("observed boot disk differs from selected 32-GiB pd-balanced disk", category="instance_shape_mismatch")
+        expected_image = self.settings.images[intent.region]
+        if disk.get("sourceImage", "").rsplit("/", 1)[-1] != expected_image.rsplit("/", 1)[-1]:
+            raise GcpProviderError("observed boot disk image differs from selected pinned image", category="image_mismatch")
         image = self._gcloud_json(["compute", "images", "describe", self.settings.images[intent.region].rsplit("/", 1)[-1], "--project", self.settings.images[intent.region].split("/")[1], "--format=json"], f"gcp-image-read-{role}")
         if image.get("architecture", "X86_64") != "X86_64":
             raise GcpProviderError("selected Ubuntu image is not amd64", category="image_mismatch")

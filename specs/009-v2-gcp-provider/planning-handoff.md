@@ -88,4 +88,10 @@ The initial optional extension-file cat returned 1 because no extension file exi
 
 ## Next stage
 
-Planning is complete. F01R_GCP_EXPIRY is integrated and verified; implementation and convergence evidence is in `docs/f07-gcp-provider.md`. Cloud acceptance and system readiness remain incomplete.
+Planning is complete. F01R_GCP_EXPIRY is integrated and verified. The initial prerequisite blocker above is resolved by PR #17 and the normal merge recorded above. Implementation evidence and remaining incomplete test cases are recorded in `docs/f07-gcp-provider.md`; this checkpoint is ready for Sol convergence review, not cloud acceptance or system readiness.
+
+## Implementation checkpoint (2026-10-23)
+
+Current implementation base: `d2bd3bc296c85fb95be7debdcdbd61cbc759369e`. The F07 changes are limited to the provider, its two Terraform roots, owned tests, fixture evidence, documentation, and task/handoff records. Latest focused GCP checks passed 19 tests; the full offline suite passed 1,078 tests with zero skips using the official PowerShell path. Both Terraform roots passed backend-disabled init and validate against locked Google provider 7.46.1; provider-schema assertions confirmed native absolute STOP fields, unique template references, and pair source-template binding. Terraform formatting and `git diff --check` passed.
+
+Not complete: T004, T006, T010–T012, T016–T022 and T026 remain unchecked where the full specified isolated-state, cap-edge, scenario matrix, controller-loss, exhaustive failure-injection, pagination/recovery and convergence handoff evidence is incomplete. The code's list commands rely on gcloud CLI pagination and fail closed on command/read shape errors, but do not expose page tokens for separate later-page injection. The task table records implementation status; no Terraform plan/apply/destroy, cloud API, credentials, SSH, benchmark traffic, paid admission, F10 readiness or research conclusions are claimed. The exact current implementation commit and complete command outcomes are in `docs/f07-gcp-provider.md`.
