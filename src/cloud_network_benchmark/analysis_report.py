@@ -17,11 +17,11 @@ from .analysis_plots import render_figures
 _TABLES = {
     "runs.csv": ("run_id", "deployment_id", "provider", "scenario", "mode", "context", "unit_id", "kind", "phase", "streams", "data_validity", "recorded_data_validity", "current_data_validity", "comparison_eligibility", "rtt", "receiver", "metadata", "source_refs"),
     "bins.csv": ("run_id", "deployment_id", "unit_id", "axis", "start_seconds", "end_seconds", "nominal_seconds", "rtt", "receiver_bytes", "source_refs"),
-    "deployments.csv": ("provider", "scenario", "phase", "metric", "n", "points", "median", "q1", "q3", "iqr"),
-    "comparisons.csv": ("comparison_id", "scenario", "slot_id", "window_label", "expected_providers", "present_providers", "missing_providers", "eligibility", "phase_ids", "run_ids", "reasons"),
+    "deployments.csv": ("provider", "scenario", "phase", "window_label", "metric", "n", "points", "deployment_ids", "run_ids", "source_refs", "study_dates", "median", "q1", "q3", "iqr"),
+    "comparisons.csv": ("comparison_type", "comparison_id", "provider", "scenario", "slot_id", "window_label", "phase", "metric", "direction", "expected_providers", "present_providers", "missing_providers", "eligibility", "phase_ids", "run_ids", "config_ids", "placement_settings", "baseline", "comparison", "rtt_difference_us", "throughput_change_percent", "n_s1", "n_s3", "study_dates", "same_utc_week", "reasons", "unavailable_reason"),
     "diagnostics.csv": ("run_id", "vm_role", "sampled_at", "monotonic_seconds", "interval_seconds", "metrics", "reset_fields", "gap_reason", "clock_mappings_within_100ms", "source"),
     "reliability.csv": ("run_id", "provider", "scenario", "mode", "attempts", "recorded_data_validity", "current_data_validity", "failure_reason"),
-    "costs.csv": ("run_id", "reservation", "actual", "estimated", "final", "runtime", "transfer"),
+    "costs.csv": ("run_id", "provider", "reservation_id", "reservation", "actual", "estimated", "final", "source_verified", "source_refs", "runtime", "transfer"),
 }
 
 
@@ -71,14 +71,15 @@ def _html(payload: dict[str, Any]) -> str:
     figures = payload.get("figures", [])
     images = "\n".join(f'<figure><a href="{html.escape(item["svg"], quote=True)}"><img src="{html.escape(item["png"], quote=True)}" alt="{html.escape(item["caption"], quote=True)}"></a><figcaption>{html.escape(item["caption"])}</figcaption></figure>' for item in figures)
     body_rows = "\n".join("<tr>" + "".join(f"<td>{html.escape(_stable(row.get(key)))}</td>" for key in ("run_id", "provider", "scenario", "mode", "unit_id", "phase", "data_validity", "comparison_eligibility")) + "</tr>" for row in rows)
-    source_rows = "\n".join(f'<tr><td>{html.escape(item.get("run_id", ""))}</td><td>{html.escape(item.get("artifact_id", item.get("kind", "")))}</td><td><code>{html.escape(item.get("path", ""))}</code></td><td>{html.escape(item.get("sha256", ""))}</td></tr>' for item in payload.get("sources", []))
+    source_rows = "\n".join(f'<tr><td>{html.escape(item.get("run_id", ""))}</td><td>{html.escape(item.get("artifact_id", item.get("kind", "")))}</td><td><a href="{html.escape(item.get("resolved_path", item.get("path", "")), quote=True)}"><code>{html.escape(item.get("path", ""))}</code></a></td><td>{html.escape(item.get("sha256", ""))}</td></tr>' for item in payload.get("sources", []))
     table_families = (("Bins", "bins", ("run_id", "unit_id", "start_seconds", "end_seconds", "nominal_seconds", "supported_seconds", "coverage", "rtt", "receiver_bytes")),
         ("Deployment distributions", "deployments", ("provider", "scenario", "phase", "window_label", "metric", "n", "points", "median", "q1", "q3", "iqr", "study_dates")),
         ("Matched provider comparisons", "comparisons", ("scenario", "slot_id", "window_label", "expected_providers", "present_providers", "missing_providers", "eligibility", "phase_ids", "run_ids", "reasons")),
-        ("S1/S3 placement comparisons", "placement_comparisons", ("provider", "phase", "window_label", "metric", "direction", "baseline", "comparison", "rtt_difference_us", "throughput_change_percent", "study_dates", "same_utc_week", "unavailable_reason")),
+        ("S1/S3 placement comparisons", "placement_comparisons", ("provider", "phase", "window_label", "metric", "direction", "config_ids", "placement_settings", "baseline", "comparison", "rtt_difference_us", "throughput_change_percent", "n_s1", "n_s3", "study_dates", "same_utc_week", "unavailable_reason")),
+        ("Diagnostic-day load context", "day_load_context", ("run_id", "scope", "initial_300_seconds", "subsequent_supported_bins", "idle_baseline", "causal_interpretation")),
         ("Diagnostics", "diagnostics", ("run_id", "vm_role", "sampled_at", "metrics", "reset_fields", "gap_reason", "clock_mappings_within_100ms", "source")),
         ("Reliability", "reliability", ("run_id", "provider", "scenario", "mode", "attempts", "attempt_status", "missing_phases", "replacement_of", "failure_reason")),
-        ("Recorded costs", "costs", ("run_id", "provider", "reservation", "actual", "estimated", "final", "runtime", "transfer")))
+        ("Recorded costs", "costs", ("run_id", "provider", "reservation_id", "reservation", "actual", "estimated", "final", "source_verified", "source_refs", "runtime", "transfer")))
     sections = []
     for label, key, columns in table_families:
         rows = payload.get(key, [])
@@ -112,6 +113,9 @@ def write_analysis(report: AnalysisReport, output_root: Path) -> tuple[Path, ...
         for filename, headers in _TABLES.items():
             key = filename.removesuffix(".csv")
             rows = payload.get(key, [])
+            if key == "comparisons":
+                rows = ([{"comparison_type": "provider", **row} for row in rows]
+                    + [{"comparison_type": "placement", **row} for row in payload.get("placement_comparisons", [])])
             if not isinstance(rows, list):
                 raise ValueError(f"report table {key} must be a row list")
             _write_csv(staging / filename, headers, rows)

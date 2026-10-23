@@ -97,22 +97,24 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
         else:
             labels, medians, lows, highs = [], [], [], []
             for row in points:
-                label = f"{row['provider']} / {row['scenario']} / {row['phase']}"
+                label = f"{row['provider']}\n{row['scenario']}\n{row['phase']}"
                 for value in row.get("points", []):
                     axis.scatter(label, value, marker="o", color="#4c78a8", alpha=.8)
                 labels.append(label); medians.append(row["median"])
                 lows.append(row["median"] - row["q1"]); highs.append(row["q3"] - row["median"])
             axis.errorbar(labels, medians, yerr=[lows, highs], fmt="_", capsize=5, color="#e45756", label="median and IQR")
-            axis.tick_params(axis="x", labelrotation=25)
+            axis.tick_params(axis="x", labelrotation=0, labelsize=8)
         metrics = sorted({row.get("metric", "") for row in points}) if points else []
         units = {"throughput_gbps": "Throughput (Gb/s)", "median_rtt_us": "Median RTT (µs)"}
         metric = metrics[0] if metrics else ""
         axis.set_ylabel(units.get(metric, metric or "Metric value (see report)"))
     save("deployment-points", "Independent deployment points", "Every deployment point is shown; bars span Q1 to Q3.",
-         deployment, [row.get("provider", "") for row in payload.get("deployments", [])], [])
+         deployment, sorted({run for row in payload.get("deployments", []) for run in row.get("run_ids", [])}),
+         [source for row in payload.get("deployments", []) for source in row.get("source_refs", [])])
 
+    placement_rows = [row for row in payload.get("placement_comparisons", []) if row.get("metric") == "median_rtt_us"]
     def placement(axis):
-        rows = [row for row in payload.get("placement_comparisons", []) if row.get("metric") == "median_rtt_us"]
+        rows = placement_rows
         values = [(row.get("provider", ""), row.get("rtt_difference_us", {}).get("value"))
                   for row in rows if row.get("rtt_difference_us", {}).get("value") is not None]
         if not values:
@@ -123,7 +125,8 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
         axis.set_ylabel("S3 − S1 median RTT (µs)")
         axis.set_xlabel("Provider")
     save("placement-comparison", "Within-provider placement effect", "S3 − S1 direction; only eligible, recorded groups are plotted.",
-         placement, [row.get("provider", "") for row in payload.get("comparisons", [])], [])
+         placement, sorted({run for row in placement_rows for run in (*row.get("s1_run_ids", []), *row.get("s3_run_ids", []))}),
+         [source for row in placement_rows for source in row.get("source_refs", [])])
     return specs
 
 

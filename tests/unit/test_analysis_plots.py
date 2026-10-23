@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 
 from cloud_network_benchmark.analysis_plots import _histogram_edges, render_figures
 
@@ -36,4 +37,7 @@ def test_render_produces_deterministic_offline_figures(tmp_path):
             svg = left.read_text()
             assert "Date:" not in svg
             assert not re.search(r"(?:href|src)=\"https?://|<script", svg)
+            root = ET.fromstring(svg)
+            assert root.attrib.get("width", "").endswith("pt")
+            assert root.attrib.get("height", "").endswith("pt")
     assert any("no eligible" in item["caption"].lower() or item["row_ids"] for item in specs_a)

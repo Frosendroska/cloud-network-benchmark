@@ -8,23 +8,22 @@ from cloud_network_benchmark.cli import main
 def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_root, tmp_path,
         frozen_clock, deterministic_token, fake_git_commits, request):
     from tests.f12_support import materialize_f08_pair
-    from cloud_network_benchmark.analysis import analyze_selection
-    from cloud_network_benchmark.contracts.common import Evidence, GitSnapshot, StringEvidence
 
-    snapshot = GitSnapshot(commit=StringEvidence(value="a" * 40), dirty=Evidence(value=False),
-        diff_sha256=StringEvidence(value="b" * 64))
     for mode, expected_width in (("short_study", 1), ("acceptance", 1),
             ("calibration", 1), ("diagnostic_day", 60)):
         case = tmp_path / mode
         case.mkdir()
         _, expected, selection = materialize_f08_pair(repository_root, case, frozen_clock,
             deterministic_token, fake_git_commits, request, mode=mode)
-        report = analyze_selection(selection, analysis_git=snapshot).payload
+        output = case / "report"
+        assert main(["analyze", "--selection", str(selection), "--output", str(output)]) == 0
+        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
         assert report["runs"]
         assert {row["mode"] for row in report["runs"]} == {mode}
         assert {row["recorded_data_validity"] for row in report["runs"]} == {str(expected.validation_status.data_validity)}
         assert all(row["nominal_seconds"] == expected_width for row in report["bins"])
-        assert all(row["width"] if "width" in row else True for row in report["bins"])
+        assert (output / "index.html").is_file()
+        assert (output / "figures" / "time-series.png").is_file()
 
 
 def test_analyze_cli_structural_error_returns_two_and_keeps_legacy_cli(repository_root, tmp_path, capsys):
@@ -60,6 +59,88 @@ def test_materialized_cli_report_replays_all_files_for_reordered_selection(repos
     assert files_a == files_b
     after_hashes = {path: hashlib.sha256(open(path, "rb").read()).hexdigest() for path in source_hashes}
     assert source_hashes == after_hashes
+
+
+def test_s1_s3_scenario_distributions_are_kept_distinct_and_directional(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request, monkeypatch):
+    import yaml
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+    from cloud_network_benchmark.analysis_report import write_analysis
+    from cloud_network_benchmark.contracts.common import Evidence, GitSnapshot, StringEvidence
+
+    # The reusable F08 fixture is pinned to an EXP-001 summary assertion/P0
+    # schedule row. Adapt those fixture-only assumptions while preserving the
+    # real S3 config identity and measurement/placement evidence.
+    s3_source = repository_root / "configs/experiments/exp-003-placement-optimization.yaml"
+    s3_config = yaml.safe_load(s3_source.read_text(encoding="utf-8"))
+    fixture_config = repository_root / "configs/experiments/f12-placement-test.yaml"
+    fixture_config.write_text(yaml.safe_dump(s3_config, sort_keys=False), encoding="utf-8")
+    request.addfinalizer(lambda: fixture_config.unlink(missing_ok=True))
+    import tests.integration.test_native_validation_replay as f08_replay
+    actual_schedule_model = f08_replay.ScheduleEntry
+    actual_summarize = f08_replay.summarize_validation
+    def fixture_summary(result):
+        return "EXP-001 fixture compatibility marker\n" + actual_summarize(result)
+    monkeypatch.setattr(f08_replay, "summarize_validation", fixture_summary)
+    def configured_schedule(**kwargs):
+        if kwargs.get("config_id") == "exp-003-short":
+            kwargs["priority"] = "P1"
+        return actual_schedule_model(**kwargs)
+    monkeypatch.setattr(f08_replay, "ScheduleEntry", configured_schedule)
+    entries = []
+    for name, config_name in (("s1", "exp-001-multi-provider.yaml"),
+            ("s3", fixture_config.name)):
+        _, result, selection = materialize_f08_pair(repository_root, tmp_path / name, frozen_clock,
+            deterministic_token, fake_git_commits, request, config_name=config_name)
+        assert result.validation_status.data_validity == "valid"
+        item = json.loads(selection.read_text(encoding="utf-8"))["runs"][0]
+        entries.append({key: str((selection.parent / value).resolve()) for key, value in item.items()})
+    combined = tmp_path / "s1-s3-selection.json"
+    combined.write_text(json.dumps({"format_version": 1, "runs": entries}), encoding="utf-8")
+    snapshot = GitSnapshot(commit=StringEvidence(value="a" * 40), dirty=Evidence(value=False),
+        diff_sha256=StringEvidence(value="b" * 64))
+    analyzed = analyze_selection(combined, analysis_git=snapshot)
+    report = analyzed.payload
+    paired = [row for row in report["placement_comparisons"] if row["metric"] == "median_rtt_us"]
+    assert paired
+    assert paired[0]["s1_run_ids"] and paired[0]["s3_run_ids"]
+    assert paired[0]["direction"] == "S3 minus S1"
+    assert paired[0]["rtt_difference_us"]["value"] == 0
+    assert paired[0]["config_ids"]["S1"] != paired[0]["config_ids"]["S3"]
+    generated = write_analysis(analyzed, tmp_path / "s1-s3-report")
+    assert any(path.name == "placement-comparison.png" for path in generated)
+
+
+def test_matched_provider_report_preserves_full_f08_cohort_and_missing_peer_reasons(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request):
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+    from cloud_network_benchmark.contracts.common import Evidence, GitSnapshot, StringEvidence
+
+    entries = []
+    for provider in ("aws", "azure", "gcp"):
+        _, result, selection = materialize_f08_pair(repository_root, tmp_path / provider, frozen_clock,
+            deterministic_token, fake_git_commits, request, provider=provider, shared_slot=True)
+        assert result.validation_status.data_validity == "valid"
+        item = json.loads(selection.read_text(encoding="utf-8"))["runs"][0]
+        entries.append({key: str((selection.parent / value).resolve()) for key, value in item.items()})
+    combined = tmp_path / "matched-selection.json"
+    combined.write_text(json.dumps({"format_version": 1, "runs": entries}), encoding="utf-8")
+    snapshot = GitSnapshot(commit=StringEvidence(value="a" * 40), dirty=Evidence(value=False),
+        diff_sha256=StringEvidence(value="b" * 64))
+    report = analyze_selection(combined, analysis_git=snapshot).payload
+    assert len(report["comparisons"]) == 1
+    assert report["comparisons"][0]["present_providers"] == ["aws", "azure", "gcp"]
+    assert report["comparisons"][0]["missing_providers"] == []
+    assert report["comparisons"][0]["eligibility"] == "eligible"
+    assert all(row["comparison_eligibility"] == "eligible" for row in report["runs"])
+
+    single = tmp_path / "single-selection.json"
+    single.write_text(json.dumps({"format_version": 1, "runs": entries[:1]}), encoding="utf-8")
+    incomplete = analyze_selection(single, analysis_git=snapshot).payload["comparisons"][0]
+    assert incomplete["eligibility"] == "ineligible"
+    assert incomplete["missing_providers"] == ["azure", "gcp"]
 
 
 def test_cli_analyze_requires_local_selection_and_output():

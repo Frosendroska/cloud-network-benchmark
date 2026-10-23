@@ -81,6 +81,7 @@ def _verified_provider_bill(ledger: dict[str, Any], ledger_path: Path,
     if not isinstance(bill, dict):
         return None
     verified_event_ids = set()
+    source_refs = []
     for history in bill.get("history", []):
         event_id = history.get("event_id") if isinstance(history, dict) else None
         event = ledger.get("events", {}).get(event_id)
@@ -97,6 +98,7 @@ def _verified_provider_bill(ledger: dict[str, Any], ledger_path: Path,
         if (payload.get("reservation_id") == reservation_id and payload.get("provider") == provider
                 and payload.get("source_sha256") == history.get("source_sha256") == source_hash):
             verified_event_ids.add(event_id)
+            source_refs.append({"event_id": event_id, "path": str(source.resolve()), "sha256": source_hash})
     verified = bool(bill.get("history")) and all(
         isinstance(item, dict) and item.get("event_id") in verified_event_ids for item in bill.get("history", []))
     return {"reserved": record.get("reserved_cost_usd"),
@@ -104,6 +106,7 @@ def _verified_provider_bill(ledger: dict[str, Any], ledger_path: Path,
             "actual": bill.get("actual_usd") if verified else None,
             "final": bool(bill.get("final")) and verified,
             "reservation_id": reservation_id, "source_verified": verified,
+            "source_refs": sorted(source_refs, key=lambda item: item["event_id"]),
             "unavailable_reason": None if verified else "billing event source bytes were unavailable or did not match recorded hashes"}
 
 
@@ -217,8 +220,13 @@ def _nonplacement_fingerprint(value: ValidatorInput) -> str | None:
             return None
         provider_config = dict(raw.get("provider_config", {}))
         provider_config.pop("placement", None)
-        selected = {key: raw.get(key) for key in ("config_id", "experiment_id", "mode", "context",
-            "provider", "measurement_units", "measurement_direction", "benchmark", "options")}
+        selected = {key: raw.get(key) for key in ("mode", "context", "provider",
+            "measurement_units", "measurement_direction", "benchmark", "options")}
+        options = dict(selected.get("options") or {})
+        labels = dict(options.get("labels") or {})
+        labels.pop("scenario_id", None)
+        options["labels"] = labels
+        selected["options"] = options
         selected["provider_config"] = provider_config
         return hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     except (OSError, ValueError, TypeError, StopIteration):
@@ -262,8 +270,22 @@ def _comparison_rows(inputs: list[ValidatorInput], results: list[ValidationResul
 
 def _placement_rows(inputs: list[ValidatorInput], run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_run = {item.identity.run_id: item for item in inputs}
+    def placement(value: ValidatorInput) -> Any:
+        record = next((item for item in value.artifact_records if item.artifact_id == "resolved_snapshot"), None)
+        if record is None:
+            return None
+        try:
+            raw = _json_file(_artifact_path(value, record))
+            if isinstance(raw, dict) and isinstance(raw.get("observations"), list):
+                provider = str(getattr(value.provider, "value", value.provider))
+                raw = next(item for item in raw["observations"] if item.get("provider") == provider)
+            return raw.get("provider_config", {}).get("placement") if isinstance(raw, dict) else None
+        except (OSError, ValueError, TypeError, StopIteration):
+            return None
     eligible = [row for row in run_rows if row["data_validity"] == "valid" and row["mode"] == "short_study"
-        and row["context"] == "standard" and row["original_unit"].get("coverage", {}).get("complete") is True]
+        and row["context"] == "standard" and row["execution_state"] == "succeeded"
+        and row["cleanup_state"] in {"succeeded", "not_required"}
+        and row["original_unit"].get("coverage", {}).get("complete") is True]
     groups: dict[tuple[str, str, str, str], dict[str, list[dict[str, Any]]]] = {}
     for row in eligible:
         if row["scenario"] not in {"same_zone", "placement_optimization"}:
@@ -297,13 +319,22 @@ def _placement_rows(inputs: list[ValidatorInput], run_rows: list[dict[str, Any]]
             unavailable = ("both independent scenario distributions are required" if not left or not right else
                 "S1 throughput baseline is zero" if metric == "throughput_gbps" and left_med == 0 else None)
             output.append({"provider": provider, "phase": phase, "window_label": label,
+                "comparison_id": hashlib.sha256(json.dumps([provider, phase, label, _fingerprint, metric],
+                    separators=(",", ":")).encode()).hexdigest(),
                 "metric": metric, "direction": "S3 minus S1" if metric == "median_rtt_us" else "100*(S3/S1-1)",
+                "config_ids": {"S1": sorted({by_run[run_id].identity.config_id for run_id in s1_runs}),
+                    "S3": sorted({by_run[run_id].identity.config_id for run_id in s3_runs})},
+                "placement_settings": {"S1": sorted({json.dumps(placement(by_run[run_id]), sort_keys=True) for run_id in s1_runs}),
+                    "S3": sorted({json.dumps(placement(by_run[run_id]), sort_keys=True) for run_id in s3_runs})},
                 "baseline": {"scenario": "same_zone", "value": left_med}, "comparison": {"scenario": "placement_optimization", "value": right_med},
                 "rtt_difference_us": {"value": difference} if difference is not None else {"unavailable_reason": unavailable or "not an RTT metric"},
                 "throughput_change_percent": {"value": relative} if relative is not None else {"unavailable_reason": unavailable or "not a throughput metric"},
+                "n_s1": len({row["deployment_id"] for row in s1}), "n_s3": len({row["deployment_id"] for row in s3}),
                 "s1_run_ids": s1_runs, "s3_run_ids": s3_runs, "study_dates": dates,
+                "source_refs": sorted({path for row in (*s1, *s3) for path in row["source_refs"]}),
                 "same_utc_week": same_week, "same_week_deviation": None if same_week else "selected scenario dates are not all in the same UTC week",
-                "eligible": bool(left and right), "unavailable_reason": unavailable})
+                "eligible": bool(left and right and not (metric == "throughput_gbps" and left_med == 0)),
+                "unavailable_reason": unavailable})
     return output
 
 
@@ -348,6 +379,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             "current_data_validity": str(result.validation_status.data_validity),
             "recorded_data_validity": str(recorded.validation_status.data_validity),
             "comparison_eligibility": str(result.validation_status.comparison_eligibility),
+            "execution_state": str(value.execution_state), "cleanup_state": str(value.cleanup_state),
             "rtt": rtt_statistics([sample.rtt_us for sample in selected_samples]),
             "rtt_histogram": _histogram_data([sample.rtt_us for sample in selected_samples]),
             "receiver": tcp_summary,
@@ -378,7 +410,8 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             supported_seconds = sum(right - left for left, right in overlaps)
             source_paths = {sample.source.path for _, sample in bucket_samples}
             bins.append({"run_id": value.identity.run_id, "deployment_id": value.identity.deployment_id,
-                "unit_id": unit_id, "axis": "utc-mapped elapsed seconds from measured start", "start_seconds": start,
+                "unit_id": unit_id, "mode": str(value.mode), "kind": str(unit.kind),
+                "axis": "utc-mapped elapsed seconds from measured start", "start_seconds": start,
                 "end_seconds": end, "nominal_seconds": width, "supported_seconds": supported_seconds,
                 "coverage": "supported" if supported_seconds >= width else "partial or acquisition gap",
                 "rtt": rtt, "receiver_bytes": {"unavailable_reason": "receiver intervals are not mapped to per-bin UTC bounds"},
@@ -389,7 +422,8 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                             *(interval.source for interval in parsed.receiver_intervals)):
                     if ref:
                         sources.append({"run_id": value.identity.run_id, "artifact_id": ref.artifact_id,
-                            "path": ref.path, "sha256": ref.sha256, "unit_id": ref.unit_id})
+                            "path": ref.path, "resolved_path": str((Path(value.child_result_root) / ref.path).resolve()),
+                            "sha256": ref.sha256, "unit_id": ref.unit_id})
     return run_rows, bins, sources
 
 
@@ -450,6 +484,8 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
     all_sources: list[dict[str, Any]] = []
     deployments: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     deployment_points_seen: set[tuple[str, str, str, str, str, str]] = set()
+    deployment_point_values: dict[tuple[str, str, str, str, str, str], float] = {}
+    deployment_conflicts: list[dict[str, str]] = []
     costs = []
     reliability = []
     diagnostics = []
@@ -490,9 +526,14 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
                 point_key = (*group, row["deployment_id"])
                 if point_key not in deployment_points_seen:
                     deployment_points_seen.add(point_key)
+                    deployment_point_values[point_key] = metric_value
                     deployments.setdefault(group, []).append({"run_id": row["run_id"],
                         "deployment_id": row["deployment_id"], "value": metric_value,
-                        "study_date": date_label, "window_label": window_label})
+                        "study_date": date_label, "window_label": window_label,
+                        "source_refs": row["source_refs"]})
+                elif deployment_point_values[point_key] != metric_value:
+                    deployment_conflicts.append({"deployment_id": row["deployment_id"], "metric": metric_name,
+                        "reason": "selected attempts for one deployment disagree; counted once as an independent deployment"})
         reliability.append({"run_id": value.identity.run_id, "provider": str(value.provider),
             "scenario": str(value.scenario), "mode": str(value.mode), "attempts": 1,
             "recorded_data_validity": str(recorded.validation_status.data_validity),
@@ -538,6 +579,7 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
                 "actual": {"value": bill["actual"], "unavailable_reason": bill["unavailable_reason"]} if bill["actual"] is not None else {"unavailable_reason": bill["unavailable_reason"]},
                 "estimated": {"value": bill["estimated"]} if bill["estimated"] is not None else {"unavailable_reason": bill["unavailable_reason"]},
                 "final": bill["final"], "source_verified": bill["source_verified"],
+                "source_refs": bill["source_refs"],
                 "runtime": {"unavailable_reason": "runtime not sourced"}, "transfer": {"unavailable_reason": "transfer not sourced"}})
         else:
             costs.append({"run_id": value.identity.run_id, "provider": provider_name,
@@ -545,7 +587,8 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
                 "actual": {"unavailable_reason": "no verified cost snapshot supplied"},
                 "estimated": {"unavailable_reason": "no verified cost snapshot supplied"},
                 "final": False, "runtime": {"unavailable_reason": "runtime not sourced"},
-                "transfer": {"unavailable_reason": "transfer not sourced"}})
+                "transfer": {"unavailable_reason": "transfer not sourced"},
+                "source_refs": []})
     comparison_rows, comparison_results = _comparison_rows(current_inputs, current_results) if current_inputs else ([], {})
     for row in all_runs:
         current = comparison_results.get(row["run_id"])
@@ -557,9 +600,24 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
         summary_rows.append({"provider": provider, "scenario": scenario, "phase": phase,
             "window_label": window_label, "metric": metric,
             "deployment_ids": sorted({item["deployment_id"] for item in values}),
+            "run_ids": sorted({item["run_id"] for item in values}),
+            "source_refs": sorted({path for item in values for path in item["source_refs"]}),
             "study_dates": sorted({item["study_date"] for item in values}),
             "points": points, **_deployment_summary(points)})
     placement_rows = _placement_rows(current_inputs, all_runs)
+    day_context = []
+    for run_id in sorted({row["run_id"] for row in all_runs if row["mode"] == "diagnostic_day"}):
+        run_bins = [row for row in all_bins if row["run_id"] == run_id and row.get("mode") == "diagnostic_day"
+            and row.get("kind") == "continuous_day"]
+        initial = [row["rtt"]["median_us"]["value"] for row in run_bins if row["start_seconds"] < 300
+            and row["rtt"].get("median_us", {}).get("value") is not None]
+        later = [row["rtt"]["median_us"]["value"] for row in run_bins if row["start_seconds"] >= 300
+            and row["rtt"].get("median_us", {}).get("value") is not None]
+        day_context.append({"run_id": run_id, "scope": "descriptive RTT medians during sustained TCP load",
+            "initial_300_seconds": _deployment_summary(initial) if initial else {"unavailable_reason": "no supported RTT bins in initial 300 seconds"},
+            "subsequent_supported_bins": _deployment_summary(later) if later else {"unavailable_reason": "no later supported RTT bins"},
+            "idle_baseline": {"unavailable_reason": "diagnostic-day mode has no idle baseline"},
+            "causal_interpretation": {"unavailable_reason": "descriptive association only"}})
     try:
         mpl_version = importlib.metadata.version("matplotlib")
     except importlib.metadata.PackageNotFoundError:
@@ -584,10 +642,17 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
         "deployments": summary_rows, "comparisons": sorted(comparison_rows, key=lambda row: row["comparison_id"]),
         "placement_comparisons": sorted(placement_rows, key=lambda row: (row["provider"], row["phase"], row["window_label"], row["metric"])),
         "diagnostics": sorted(diagnostics, key=lambda row: (row["run_id"], row["vm_role"], row["sampled_at"])),
+        "day_load_context": day_context,
+        "reliability_summary": {"selected_unique_attempts": len(reliability),
+            "successes": sum(row["attempt_status"] == "success" for row in reliability),
+            "partial": sum(row["attempt_status"] == "partial" for row in reliability),
+            "failed_or_unavailable": sum(row["attempt_status"] == "failed_or_unavailable" for row in reliability),
+            "replacement_links": sum(row.get("replacement_of") is not None for row in reliability)},
         "reliability": sorted(reliability, key=lambda row: row["run_id"]), "costs": sorted(costs, key=lambda row: row["run_id"]),
         "findings": sorted([{"run_id": result.run_id, "data_validity": str(result.validation_status.data_validity),
             "data_reasons": list(result.validation_status.data_reasons),
             "comparison_eligibility": str(result.validation_status.comparison_eligibility),
             "comparison_reasons": list(result.validation_status.comparison_reasons),
-            "finding_codes": sorted({finding.code for finding in result.findings})} for result in current_results], key=lambda row: row["run_id"])}
+            "finding_codes": sorted({finding.code for finding in result.findings})} for result in current_results], key=lambda row: row["run_id"]),
+        "cohort_findings": sorted(deployment_conflicts, key=lambda row: (row["deployment_id"], row["metric"]))}
     return AnalysisReport(payload=_jsonable(payload), protected_paths=tuple(dict.fromkeys(protected)))

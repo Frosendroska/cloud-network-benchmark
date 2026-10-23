@@ -125,6 +125,9 @@ def test_publish_writes_fixed_tables_escaped_offline_html_and_rejects_existing(t
     page = (output / "index.html").read_text()
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
     assert "<script>alert(1)</script>" not in page
+    assert 'href="runs.csv"' in page and 'href="report.json"' in page
+    assert "Matched provider comparisons" in page and "Recorded costs" in page
+    assert 'href="figures/time-series.svg"' in page
     assert "https://" not in page
     with pytest.raises(ValueError, match="already exists"):
         write_analysis(report, output)

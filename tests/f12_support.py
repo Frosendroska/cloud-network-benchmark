@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 def materialize_f08_pair(repository_root, tmp_path, frozen_clock, deterministic_token,
-                         fake_git_commits, request, *, mode="short_study", provider="aws"):
+                         fake_git_commits, request, *, mode="short_study", provider="aws",
+                         config_name=None, shared_slot=False):
     """Use F08's validated lifecycle fixture, then persist the exact existing DTOs."""
     from tests.integration.test_native_validation_replay import _materialize_complete_bundle
     from cloud_network_benchmark.contracts import ArtifactExpectation, ArtifactInput
@@ -13,12 +14,12 @@ def materialize_f08_pair(repository_root, tmp_path, frozen_clock, deterministic_
     from cloud_network_benchmark.validation import validate_bundle
     from tests.unit.test_validation import NOW
 
-    config_name = {"calibration": "exp-001-calibration.yaml",
+    config_name = config_name or {"calibration": "exp-001-calibration.yaml",
         "diagnostic_day": "exp-001-diagnostic-day.yaml"}.get(mode, "exp-001-multi-provider.yaml")
     complete, result = _materialize_complete_bundle(
         repository_root, tmp_path, frozen_clock, deterministic_token, fake_git_commits,
         request, mode_override="acceptance" if mode == "acceptance" else None,
-        config_name=config_name, provider=provider, frozen_n=(mode == "short_study"),
+        config_name=config_name, provider=provider, frozen_n=(mode == "short_study"), shared_slot=shared_slot,
     )
     # F08's replay helper adds observed producer sidecars with model_copy for
     # focused tests. F12 persists them as proper F01R supplemental declarations
