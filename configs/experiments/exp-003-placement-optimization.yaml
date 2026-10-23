@@ -142,7 +142,7 @@ provider_configs:
       only
     provider_options:
       provisioning_model: STANDARD
-      instance_termination_action: DELETE
+      instance_termination_action: STOP
     placement:
       kind: compact_placement_policy
       name: exp-003-gcp-compact
