@@ -106,11 +106,12 @@ class AutomationRunner:
 
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
-                 account_present=True, present_children=None, role_definition_inventory="[]", **kwargs):
+                 account_present=True, present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
         self.role_definition_inventory=role_definition_inventory
+        self.role_assignment_inventory=role_assignment_inventory
         self.present_children=set(present_children if present_children is not None else {"jobSchedules","schedules","runbooks"})
     def run(self, request):
         if request.action_type=="pair_destroy" and self.secret_output:
@@ -129,7 +130,7 @@ class CleanupRunner(AutomationRunner):
             resources=[{"id":self.account,"type":"Microsoft.Automation/automationAccounts"}] if self.account_present else []
             out="" if self.blank_inventory else json.dumps({"value":resources,"nextLink":url+"?api-version=2021-04-01&$skiptoken=two"})
         elif request.action_type=="expiry_inventory": self.requests.append(request); out="false"
-        elif request.action_type=="role_cleanup_inventory": self.requests.append(request); out="[]"
+        elif request.action_type=="role_cleanup_inventory": self.requests.append(request); out=self.role_assignment_inventory
         elif request.action_type=="role_definition_cleanup_inventory": self.requests.append(request); out=self.role_definition_inventory
         elif request.action_type=="automation_account_absence":
             self.requests.append(request)
@@ -543,6 +544,19 @@ def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_bloc
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
     assert "role definition inventory" in result.failures[0].message
+    assert (o.attempt_root/"recovery.json").exists()
+
+
+@pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]}"])
+def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root:Path,tmp_path:Path,inventory):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    runner=CleanupRunner(d,o,now,role_assignment_inventory=inventory)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.cleanup_state=="failed" and result.launch_blocked
+    assert "role assignment inventory" in result.failures[0].message
     assert (o.attempt_root/"recovery.json").exists()
 
 
