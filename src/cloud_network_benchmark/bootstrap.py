@@ -233,7 +233,9 @@ def _required_capabilities(tool: str) -> List[str]:
 
 def _build_config_prelude(config: BootstrapConfig) -> str:
     spec = shlex.quote(f"./configure --prefix={config.install_prefix}; make -j2")
-    return ("compiler=$(cc --version | head -n 1) || exit 42; "
+    # Command substitution removes the terminal newline but retains the complete
+    # multiline version banner used by BuildObservation and the sidecar.
+    return ("compiler=$(cc --version) || exit 42; "
             f"cfg=$(printf '%s\\n' \"${{CC:-cc}}\" \"$compiler\" {spec} | sha256sum) || exit 42; "
             "set -- $cfg; config_sha=$1; ")
 
@@ -400,7 +402,7 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
         build_config_suffix = f"; ./configure --prefix={prefix}; make -j2"
         config_prelude = _build_config_prelude(config)
         identity_script = (config_prelude +
-            f"binary_version=$(\"{binary}\" --version | head -n 1) || exit 42; "
+            f"binary_version=$(\"{binary}\" --version) || exit 42; "
             f"binary_hash=$(sha256sum {binary_q}) || exit 42; set -- $binary_hash; binary_sha=$1; "
             "compiler_b64=$(printf '%s' \"$compiler\" | base64 -w0) || exit 42; "
             "version_b64=$(printf '%s' \"$binary_version\" | base64 -w0) || exit 42; "
@@ -478,6 +480,11 @@ def _compiler_identity_observed(text: str) -> bool:
     identified = re.search(r"(?im)^(?:gcc|g\+\+|clang|Apple clang|cc\s*\()", value) is not None
     versioned = re.search(r"\b\d+(?:\.\d+){1,3}\b", value) is not None
     return identified and versioned
+
+
+def _canonical_version_text(text: str) -> str:
+    """Use the complete banner, removing only command-output framing whitespace."""
+    return text.strip()
 
 
 def _sha256sum_output(text: str, expected_path: str) -> str | None:
@@ -604,13 +611,16 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         return _failure_result(connection, actions, vm, req, result, "source_digest_mismatch", f"{source.tool} source archive digest did not match", builds, listeners)
                     evidence["source_sha256"] = observed_hash
                 elif index == 5:
-                    if not _compiler_identity_observed(text):
+                    version_text = _canonical_version_text(text)
+                    if not _compiler_identity_observed(version_text):
                         return _failure_result(connection, actions, vm, req, result, "compiler_identity_missing", "compiler version was not observed", builds, listeners)
-                    evidence["compiler_version"] = text
+                    evidence["compiler_version"] = version_text
                 elif index == 6:
-                    if source.tool not in text.lower():
+                    version_text = _canonical_version_text(text)
+                    displayed_tool = "iperf" if source.tool == "iperf3" else source.tool
+                    if re.search(rf"(?im)^\s*{re.escape(displayed_tool)}(?:\s|$)", version_text) is None:
                         return _failure_result(connection, actions, vm, req, result, "binary_version_missing", f"{source.tool} binary version was not observed", builds, listeners)
-                    evidence["binary_version"] = text
+                    evidence["binary_version"] = version_text
                 elif index == 7:
                     observed_hash = _sha256sum_output(text, f"{config.install_prefix}/bin/{source.tool}")
                     if not observed_hash:
@@ -626,8 +636,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     except ValueError as exc:
                         return _failure_result(connection, actions, vm, req, result, "build_identity_invalid", str(exc), builds, listeners)
                     if (identity["binary_sha256"] != evidence.get("binary_sha256")
-                            or identity["binary_version_b64_decoded"] != evidence.get("binary_version")
-                            or identity["compiler_version_b64_decoded"] != evidence.get("compiler_version")):
+                            or _canonical_version_text(identity["binary_version_b64_decoded"]) != evidence.get("binary_version")
+                            or _canonical_version_text(identity["compiler_version_b64_decoded"]) != evidence.get("compiler_version")):
                         return _failure_result(connection, actions, vm, req, result, "build_identity_mismatch", "build identity sidecar does not match the observed compiler or installed executable", builds, listeners)
                     identity_text = result.stdout
                 elif index >= 8:

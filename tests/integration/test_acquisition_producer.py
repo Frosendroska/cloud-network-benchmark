@@ -90,6 +90,62 @@ def _native_iperf_server_jsonl(cookie: str, *, duration: int = 60, stream: int =
     return ("\n".join(events) + "\n").encode()
 
 
+def _two_stream_iperf_tail_fixture(cookie: str, *, final_duration_us: int = 1_000,
+                                   final_bytes: tuple[int, int] = (0, 0),
+                                   include_final_native: bool = False) -> tuple[bytes, bytes]:
+    """Two source-observed streams with omitted, normal, and final intervals."""
+    raw = [json.loads(line[len(b"CNB_ACQ_V1 "):])
+           for line in (ROOT / "iperf-receiver.log").read_bytes().splitlines()]
+    for value in raw:
+        value["cookie"] = cookie
+    anchor, settings = raw[:2]
+    settings["num_streams"] = 2
+    initial = next(row for row in raw if row.get("record_kind") == "stats_origin" and row.get("phase") == "initial")
+    post = next(row for row in raw if row.get("record_kind") == "stats_origin" and row.get("phase") == "post_omit")
+    origins = []
+    for stream_id in ("17", "18"):
+        origins.append({**initial, "stream_id": stream_id})
+    omitted = next(row for row in raw if row.get("record_kind") == "receiver_interval" and row.get("omitted"))
+    normal = {**next(row for row in raw if row.get("record_kind") == "receiver_interval" and not row.get("omitted")),
+              "interval_start_us": 5_000_000, "interval_end_us": 6_000_000, "bytes": 0}
+    final_start = 6_000_000
+    def observation_for_stream(value, index):
+        return {**value, "stream_id": ("17", "18")[index],
+            "local_port": str(5201 + index), "remote_port": str(50100 + index)}
+    normal_rows = [observation_for_stream(omitted, index) for index in range(2)]
+    post_rows = [observation_for_stream(post, index) for index in range(2)]
+    measured_rows = [observation_for_stream(normal, index) for index in range(2)]
+    final_rows = [observation_for_stream({**normal, "interval_start_us": final_start,
+        "interval_end_us": final_start + final_duration_us, "bytes": final_bytes[index]}, index)
+        for index in range(2)]
+    observations = [anchor, settings, *origins, *normal_rows, *post_rows,
+        *measured_rows, *final_rows]
+    log = b"".join(b"CNB_ACQ_V1 " + json.dumps(row, separators=(",", ":")).encode() + b"\n"
+        for row in observations)
+
+    client_settings = {"protocol": "TCP", "num_streams": 2, "omit": 5, "duration": 60,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    connections = [{"socket": stream_id, "local_host": "10.0.0.2", "local_port": 5201 + index,
+        "remote_host": "10.0.0.1", "remote_port": 50100 + index}
+        for index, stream_id in enumerate((17, 18))]
+    native_rows = [
+        [{"socket": stream_id, "start": 0, "end": 4, "bytes": 250, "omitted": True, "sender": False}
+         for stream_id in (17, 18)],
+        [{"socket": stream_id, "start": 0, "end": 1, "bytes": 0, "omitted": False, "sender": False}
+         for stream_id in (17, 18)],
+    ]
+    if include_final_native:
+        native_rows.append([
+            {"socket": stream_id, "start": 1, "end": 1 + final_duration_us / 1_000_000,
+             "bytes": final_bytes[index], "omitted": False, "sender": False}
+            for index, stream_id in enumerate((17, 18))])
+    receiver = {"start": {"cookie": cookie, "test_start": client_settings, "connected": connections},
+        "intervals": [{"streams": rows} for rows in native_rows]}
+    client = {"start": {"cookie": cookie, "test_start": client_settings},
+        "server_output_json": receiver, "end": {}}
+    return log, (json.dumps(client, indent=2) + "\n").encode()
+
+
 def _command(action: str, producer: VmRole, unit_id: str | None, deployment_id: str = DEPLOYMENT):
     if producer == VmRole.VM_B and action == "f02r-vm_b-listener-iperf3":
         argv = ["systemd-run", "--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",
@@ -160,11 +216,13 @@ def _build(tool: str, producer: VmRole, artifact_id: str):
                   else "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe")
     commit_path = ("tool_patches/sockperf-3.10-acquisition.patch" if tool == "sockperf"
         else "tool_patches/iperf-3.17.1-acquisition.patch")
-    binary_version = f"{tool} 3.17.1"
-    build_configuration = "CC=${CC:-cc}; compiler=gcc 13.2; ./configure --prefix=/opt/cnb; make -j2"
+    compiler_version = "gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0\nCopyright (C) 2023 Free Software Foundation, Inc."
+    binary_version = f"{tool} 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.2.0"
+    build_configuration = f"CC=${{CC:-cc}}; compiler={compiler_version}; ./configure --prefix=/opt/cnb; make -j2"
     identity_bytes = ("CNB_BUILD_V1\n" + "\n".join((f"tool={tool}", f"source_reference={('sockperf-' if tool == 'sockperf' else 'iperf-')}{commit}",
         f"source_sha256={source_sha}", f"upstream_commit={commit}", f"patch_path={commit_path}", f"patch_sha256={patch}",
-        "compiler_version_b64=Z2NjIDEzLjI=", "build_configuration_b64=" + __import__("base64").b64encode(build_configuration.encode()).decode(),
+        "compiler_version_b64=" + __import__("base64").b64encode(compiler_version.encode()).decode(),
+        "build_configuration_b64=" + __import__("base64").b64encode(build_configuration.encode()).decode(),
         f"binary_path=/opt/cnb/bin/{tool}", "binary_version_b64=" + __import__("base64").b64encode(binary_version.encode()).decode(),
         f"binary_sha256={'b' * 64}", "observation_capability=CNB_ACQ_V1",
         f"observation_semantics={semantics}", f"capabilities={','.join(_required_capabilities(tool))}")) + "\n")
@@ -175,7 +233,7 @@ def _build(tool: str, producer: VmRole, artifact_id: str):
         upstream_commit=commit, patch_sha256=patch, binary_sha256="b" * 64,
         binary_path=f"/opt/cnb/bin/{tool}", binary_version=binary_version,
         capabilities=_required_capabilities(tool),
-        build_configuration=build_configuration, compiler_version="gcc 13.2", identity_bytes=identity_bytes)
+        build_configuration=build_configuration, compiler_version=compiler_version, identity_bytes=identity_bytes)
 
 
 def _build_records(root, deployment, builds):
@@ -325,6 +383,163 @@ def test_iperf_closed_prefix_survives_only_an_explicit_incomplete_tail(tail, tmp
         for window in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]):
             windows.append(window)
     assert len(windows) == 2
+
+
+def _bind_two_stream_iperf_fixture(tmp_path, *, final_duration_us=1_000,
+                                   final_bytes=(0, 0), include_final_native=False,
+                                   receiver_outcome="succeeded"):
+    cookie = "native-cookie-two-stream"
+    log_bytes, native_bytes = _two_stream_iperf_tail_fixture(cookie,
+        final_duration_us=final_duration_us, final_bytes=final_bytes,
+        include_final_native=include_final_native)
+    log = _record(tmp_path, "two-stream-log", "retrieval/two-stream-iperf.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
+    native = _record(tmp_path, "two-stream-client", "retrieval/two-stream-iperf.json",
+        "iperf3-json", VmRole.VM_A, native_bytes, "short-multiflow")
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    receiver.result["outcome"] = receiver_outcome
+    client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
+    build = _build("iperf3", VmRole.VM_B, "two-stream-build")
+    records = [log, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    return sources[0], records, [client, receiver], [build]
+
+
+def test_iperf_native_reporter_short_all_zero_tail_is_explicit_and_keeps_closed_prefix(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path)
+    windows = []
+    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval .*1000 us"):
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    # Both omitted rows and the normal one-second zero-byte reports remain
+    # independently correlated; only the final 1 ms interval is unsupported.
+    assert len(windows) == 4
+    assert sum(window.omitted is False for window in windows) == 2
+
+
+@pytest.mark.parametrize(("duration", "byte_counts"), [
+    (1_000, (0, 1)),  # a positive stream prevents all-stream suppression
+    (1_000_000, (0, 0)),  # normal one-second zero-byte intervals are reported
+])
+def test_iperf_zero_byte_reporting_is_not_overfiltered(duration, byte_counts, tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path,
+        final_duration_us=duration, final_bytes=byte_counts, include_final_native=True)
+    windows = list(iter_source_windows(tmp_path, source, records, commands, builds))
+    assert len(windows) == 6
+    assert sum(window.omitted is False for window in windows) == 4
+
+
+def test_iperf_short_zero_tail_with_failed_receiver_is_unknown_not_reporter_filtered(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path,
+        receiver_outcome="failed")
+    windows = []
+    with pytest.raises(ValueError, match="unknown unmatched interval tail") as error:
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    assert "filtered" not in str(error.value)
+    assert len(windows) == 4
+
+
+def _truncated_diagnostic_client(cookie: str, duration: int) -> bytes:
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": 5, "duration": duration,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    start = json.dumps({"event": "start", "data": {"cookie": cookie, "test_start": settings}})
+    return (start + "\n" + '{"event":"end","data":').encode()
+
+
+def test_truncated_diagnostic_client_retains_only_correlated_closed_receiver_prefix(
+        repository_root, tmp_path):
+    cookie = "diagnostic-client-truncated"
+    log_bytes = ((ROOT / "iperf-receiver.log").read_bytes()
+        .replace(b'"duration":60', b'"duration":86400')
+        .replace(b'"cookie":"native-cookie-1"', f'"cookie":"{cookie}"'.encode()))
+    log = _record(tmp_path, "truncated-client-log", "retrieval/diagnostic-iperf.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
+    client_native = _record(tmp_path, "truncated-client-native", "retrieval/diagnostic-client.jsonl",
+        "iperf3-client-jsonl", VmRole.VM_A, _truncated_diagnostic_client(cookie, 86400), "diagnostic-day")
+    server_native = _record(tmp_path, "truncated-client-server", "retrieval/diagnostic-server.jsonl",
+        "iperf3-server-jsonl", VmRole.VM_B,
+        _native_iperf_server_jsonl(cookie, duration=86400))
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-diagnostic-day", VmRole.VM_A, "diagnostic-day")
+    build = _build("iperf3", VmRole.VM_B, "diagnostic-iperf-build")
+    build_records = _build_records(tmp_path, DEPLOYMENT, [build])
+    records = [log, client_native, server_native, *build_records]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    raw_hashes_before = {item.artifact_id: hashlib.sha256((tmp_path / item.path).read_bytes()).hexdigest()
+        for item in records}
+    windows = []
+    with pytest.raises(ValueError, match="A-side diagnostic iperf client JSONL has an unknown truncated final event"):
+        for window in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]):
+            windows.append(window)
+    assert len(windows) == 2 and windows[0].omitted is True and windows[1].omitted is False
+    assert raw_hashes_before == {item.artifact_id: hashlib.sha256((tmp_path / item.path).read_bytes()).hexdigest()
+        for item in records}
+
+    resolved = observation(repository_root, "diagnostic_day")
+    runtime_context = context(resolved, tmp_path)
+    deployment_id = runtime_context.identity.deployment_id
+    # F03 uses its own deployment identity; rematerialize the same immutable
+    # bytes with that identity so the binder exercises the actual runtime scope.
+    f03_records = [
+        _record(tmp_path, "truncated-client-log", "retrieval/diagnostic-iperf.stderr",
+            "iperf3-observation-stderr", VmRole.VM_B, log_bytes, None, deployment_id),
+        _record(tmp_path, "truncated-client-native", "retrieval/diagnostic-client.jsonl",
+            "iperf3-client-jsonl", VmRole.VM_A, _truncated_diagnostic_client(cookie, 86400), "diagnostic-day", deployment_id),
+        _record(tmp_path, "truncated-client-server", "retrieval/diagnostic-server.jsonl",
+            "iperf3-server-jsonl", VmRole.VM_B, _native_iperf_server_jsonl(cookie, duration=86400), None, deployment_id),
+    ]
+    f03_receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None, deployment_id)
+    f03_receiver.result["outcome"] = "succeeded"
+    runtime = dataclass_replace(runtime_context, source_artifact_records=tuple(f03_records),
+        build_observations=(build,), receiver_command_evidence=(f03_receiver,))
+    clock = FakeClock()
+    result = run_measurement(resolved, runtime, processes=_fixture_processes(clock), clock=clock)
+    timing = next(row for row in result.timings if row.unit_id == "diagnostic-day")
+    assert timing.acquisition_sources.value is not None
+    assert any(source.tool == "iperf3" for source in timing.acquisition_sources.value)
+    note = next(row for row in result.timing_notes
+        if row.get("unit_id") == "diagnostic-day" and "acquisition_coverage_reason" in row)
+    assert "unknown tail" in note["acquisition_coverage_reason"]
+    assert "truncated final event" in note["acquisition_coverage_reason"]
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_start", "contradictory_cookie", "invalid_complete_record"])
+def test_client_jsonl_rejects_ambiguous_or_contradictory_complete_prefix(mutation, tmp_path):
+    cookie = "diagnostic-client-contradiction"
+    log_bytes = ((ROOT / "iperf-receiver.log").read_bytes()
+        .replace(b'"cookie":"native-cookie-1"', f'"cookie":"{cookie}"'.encode()))
+    log = _record(tmp_path, "contradictory-client-log", "retrieval/contradictory-client.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": 5, "duration": 86400,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    start = json.dumps({"event": "start", "data": {"cookie": cookie, "test_start": settings}})
+    if mutation == "duplicate_start":
+        client_bytes = (start + "\n" + start + "\n" + '{"event":"end","data":').encode()
+    elif mutation == "contradictory_cookie":
+        wrong = json.dumps({"event": "start", "data": {"cookie": "other-cookie", "test_start": settings}})
+        client_bytes = (start + "\n" + wrong + "\n").encode()
+    else:
+        client_bytes = (start + '\n{"event":"interval","data":}\n').encode()
+    client_native = _record(tmp_path, "contradictory-client-native", "retrieval/contradictory-client.jsonl",
+        "iperf3-client-jsonl", VmRole.VM_A, client_bytes, "diagnostic-day")
+    server_native = _record(tmp_path, "contradictory-client-server", "retrieval/contradictory-server.jsonl",
+        "iperf3-server-jsonl", VmRole.VM_B,
+        _native_iperf_server_jsonl(cookie, duration=86400))
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-diagnostic-day", VmRole.VM_A, "diagnostic-day")
+    build = _build("iperf3", VmRole.VM_B, "contradictory-client-build")
+    records = [log, client_native, server_native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert sources == ()
 
 
 @pytest.mark.parametrize("corrupt_position", ["first", "second"])

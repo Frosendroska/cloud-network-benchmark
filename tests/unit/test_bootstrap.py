@@ -164,8 +164,10 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
             if "CNB_BUILD_V1" in request.argv[-1]:
                 import base64
                 source = next(item for item in config.sources if item.tool == tool)
-                version = "sockperf version 3.10" if tool == "sockperf" else "iperf3 version 3.17"
-                compiler = "gcc version synthetic 1.0"
+                version = ("sockperf 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
+                           if tool == "sockperf" else
+                           "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0")
+                compiler = "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc."
                 build_configuration = f"CC=${{CC:-cc}}; compiler={compiler}; ./configure --prefix=/var/lib/cnb/install; make -j2"
                 semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
                 fields = ["CNB_BUILD_V1", f"tool={tool}", f"source_reference={source.source_reference}",
@@ -178,6 +180,13 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
                     f"binary_sha256={'c' * 64}", "observation_capability=CNB_ACQ_V1",
                     f"observation_semantics={semantics}", "capabilities=" + ",".join(_required_capabilities(tool))]
                 return result(aid, "\n".join(fields))
+            if aid.endswith(f"{tool}-5"):
+                return result(aid, "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc.\n")
+            if aid.endswith(f"{tool}-6"):
+                version = ("sockperf 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition\n"
+                           if tool == "sockperf" else
+                           "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0\n")
+                return result(aid, version)
             if aid.endswith(f"{tool}-2"):
                 digest = config.sources[0 if tool == "sockperf" else 1].source_sha256
                 archive = "sockperf.tar.gz" if tool == "sockperf" else "iperf3.tar.gz"
@@ -193,10 +202,14 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
     outcome = run_bootstrap(connection(tmp_path), config, PatchedRunner(), deadline=deadline(), clock=lambda: 100)
     assert outcome.succeeded
     for build in outcome.builds:
+        assert "\nCopyright" in build.compiler_version
+        assert "\n" in build.binary_version
         assert build.observation_capability == "CNB_ACQ_V1"
         assert build.patch_sha256 == (sock_sha if build.tool == "sockperf" else iperf_sha)
         assert build.observation_semantics == ("sockperf-3.10-enabled-v1" if build.tool == "sockperf" else "iperf-3.17.1-stats-v1")
         assert build.build_configuration and build.artifact_id
+    assert "compiler=$(cc --version)" in _recipe(config.sources[0], config)[-1][-1]
+    assert "--version | head -n 1" not in _recipe(config.sources[0], config)[-1][-1]
 
 
 def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):

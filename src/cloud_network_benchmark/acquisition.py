@@ -22,6 +22,11 @@ MAX_RECORD_BYTES = 4096
 PREFIX = b"CNB_ACQ_V1 "
 
 
+def _canonical_version_text(value: str) -> str:
+    """Match bootstrap's full-banner representation; remove only framing whitespace."""
+    return value.strip()
+
+
 @dataclass(frozen=True)
 class ParsedRecord:
     value: Mapping[str, object]
@@ -224,6 +229,11 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
             origin_us = post_omit_origin
         if (native is not None and native.get("_preflight_complete")
                 and interval_count >= int(native.get("validated_interval_count", 0))):
+            filtered = native.get("filtered_tail")
+            if (isinstance(filtered, Mapping) and omitted is False
+                    and start_us == filtered.get("start_us") and end_us == filtered.get("end_us")
+                    and value.get("bytes") == 0):
+                continue
             raise ValueError("native iperf receiver output has an unknown unmatched interval tail")
         if native_streams is not None:
             native_row = next(native_streams, None)
@@ -252,6 +262,15 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         raise ValueError("native iperf receiver JSONL has an unknown session tail")
     if native is not None and native.get("native_tail"):
         raise ValueError("native iperf receiver JSONL has an unknown truncated tail")
+    if native is not None and native.get("filtered_tail"):
+        filtered = native["filtered_tail"]
+        raise ValueError("native iperf reporter filtered the final all-stream zero-byte interval "
+            f"[{filtered['start_us']}, {filtered['end_us']}) us ({filtered['duration_us']} us); "
+            "duration remains unsupported")
+    if native is not None and native.get("client_tail"):
+        raise ValueError("A-side diagnostic iperf client JSONL has an unknown truncated final event")
+    if native is not None and native.get("client_complete") is not True:
+        raise ValueError("A-side iperf client JSONL ended without a complete end event")
 
 
 def _validate_anchor(record: ParsedRecord, source: AcquisitionSource) -> None:
@@ -334,6 +353,10 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     stream_rows = native["stream_factory"]()
     settings_checked = False
     missing_native_row = False
+    filtered_group: tuple[int, int] | None = None
+    filtered_streams: set[str] = set()
+    filtered_stream_bytes: dict[str, int] = {}
+    filtered_interval_duration: int | None = None
     try:
         for record in records_factory():
             value = record.value
@@ -376,7 +399,7 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                 if previous is not None and (start < previous[0] or end < previous[1]):
                     raise ValueError("conflicting or non-monotonic iperf receiver interval sequence")
                 last[stream] = (start, end)
-                _native_int(value.get("bytes"), "bytes")
+                byte_count = _native_int(value.get("bytes"), "bytes")
                 if value.get("role") != "receiver" or str(value.get("protocol", "")).lower() != "tcp":
                     raise ValueError("iperf interval is not native TCP receiver evidence")
                 if not isinstance(value.get("omitted"), bool):
@@ -409,6 +432,34 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                             _corroborate_iperf_interval(value, stream, origin, native_row,
                                                         native["server_output"])
                             matched_count += 1
+                if missing_native_row:
+                    outcome_value = getattr(outcome, "value", outcome)
+                    start_end = (start, end)
+                    duration = end - start
+                    eligible = (native.get("receiver_complete") is True
+                        and native.get("client_complete") is True and outcome_value in {None, "succeeded"}
+                        and not native.get("client_tail") and value.get("omitted") is False
+                        and byte_count == 0 and duration > 0
+                        and duration * 10 < int(settings["interval_us"]))
+                    if eligible:
+                        if filtered_group is None:
+                            filtered_group = start_end
+                            filtered_interval_duration = duration
+                        if start_end == filtered_group and stream not in filtered_streams:
+                            filtered_streams.add(stream)
+                            filtered_stream_bytes[stream] = byte_count
+                        else:
+                            filtered_group = None
+                            filtered_interval_duration = None
+                            filtered_streams.clear()
+                            filtered_stream_bytes.clear()
+                    elif filtered_group is not None:
+                        # A positive-byte stream or a different short interval
+                        # disproves the source-specific all-stream filter case.
+                        filtered_group = None
+                        filtered_interval_duration = None
+                        filtered_streams.clear()
+                        filtered_stream_bytes.clear()
                 interval_count += 1
     except ValueError as exc:
         if str(exc).startswith("truncated acquisition record at byte"):
@@ -426,7 +477,15 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     _check_iperf_settings(settings, native)
     outcome_value = getattr(outcome, "value", outcome)
     partial_allowed = (observation_tail or native_tail
-        or outcome_value not in {None, "succeeded"} or native.get("receiver_complete") is not True)
+        or outcome_value not in {None, "succeeded"} or native.get("receiver_complete") is not True
+        or native.get("client_tail") is True or native.get("client_complete") is not True)
+    filtered_tail = filtered_group is not None
+    if filtered_tail:
+        filtered_tail = (len(filtered_streams) == settings["num_streams"]
+            and len(filtered_stream_bytes) == settings["num_streams"]
+            and not any(filtered_stream_bytes.values()))
+    if filtered_tail:
+        partial_allowed = True
     if missing_native_row and not partial_allowed:
         raise ValueError("native iperf receiver output ends before the observed interval")
     try:
@@ -446,6 +505,8 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     native["partial_allowed"] = partial_allowed
     native["validated_interval_count"] = matched_count
     native["native_tail"] = native_tail
+    native["filtered_tail"] = ({"start_us": filtered_group[0], "end_us": filtered_group[1],
+        "duration_us": filtered_interval_duration} if filtered_tail and filtered_group is not None else None)
     native["_preflight_complete"] = True
 
 
@@ -603,7 +664,11 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
             ("binary_sha256", observed.binary_sha256), ("observation_capability", observed.observation_capability),
             ("observation_semantics", observed.observation_semantics),
             ("capabilities", ",".join(getattr(observed, "capabilities", ())))):
-        if identity.get(field) != expected:
+        actual = identity.get(field)
+        if field in {"compiler_version", "binary_version"} and isinstance(actual, str) and isinstance(expected, str):
+            actual = _canonical_version_text(actual)
+            expected = _canonical_version_text(expected)
+        if actual != expected:
             raise ValueError(f"build sidecar {field} does not match the supplied BuildObservation")
     request = command[0].request if isinstance(command[0].request, Mapping) else getattr(command[0].request, "model_dump", lambda **_: {})()
     argv = request.get("argv", []) if isinstance(request, Mapping) else []
@@ -874,26 +939,61 @@ def _native_iperf_cookie(path: Path, expected_cookie: str) -> bool:
                 return False
             start = _native_start(value)
             return start is not None and start.get("cookie") == expected_cookie
-        starts = 0
+        return _native_iperf_client_metadata(path, expected_cookie) is not None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+
+
+def _native_iperf_client_metadata(path: Path, expected_cookie: str) -> dict[str, object] | None:
+    """Read complete client JSONL events and tolerate only one incomplete EOF record."""
+    starts = 0
+    settings = None
+    ended = False
+    tail = False
+    try:
         with path.open("r", encoding="utf-8") as stream:
             for line in stream:
                 if not line.strip():
                     continue
-                if not line.endswith("\n"):
-                    return False
                 if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
-                    return False
-                value = _decode_json_line(line)
+                    return None
+                if not line.endswith("\n"):
+                    if ended or starts != 1:
+                        return None
+                    tail = True
+                    break
+                try:
+                    value = _decode_json_line(line)
+                except (json.JSONDecodeError, ValueError):
+                    return None
                 if value is None:
-                    continue
-                start = _native_start(value)
-                if start is not None and isinstance(start.get("cookie"), str):
+                    return None
+                event = value.get("event")
+                if event == "start":
                     starts += 1
-                    if start.get("cookie") != expected_cookie:
-                        return False
-        return starts == 1
+                    if starts != 1 or ended:
+                        return None
+                    start = _native_start(value)
+                    if start is None or start.get("cookie") != expected_cookie:
+                        return None
+                    settings = _native_settings(start)
+                    if settings is None:
+                        return None
+                elif event == "interval":
+                    if starts != 1 or ended or not isinstance(value.get("data"), Mapping):
+                        return None
+                elif event == "end":
+                    if starts != 1 or ended or not isinstance(value.get("data"), Mapping):
+                        return None
+                    ended = True
+                else:
+                    return None
+        if starts != 1 or settings is None:
+            return None
+        return {"cookie": expected_cookie, "client_settings": settings,
+                "client_complete": ended, "client_tail": tail}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return False
+        return None
 
 
 def _native_iperf_is_jsonl(path: Path) -> bool:
@@ -1032,38 +1132,17 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
             return {"cookie": expected_cookie, "client_settings": settings,
                 "receiver_settings": receiver_settings, "server_output": server_output,
                 "streams": streams, "stream_factory": lambda: iter(streams),
-                "receiver_complete": True}
-        starts = 0
-        settings = None
-        with path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if not line.strip():
-                    continue
-                if not line.endswith("\n"):
-                    return None
-                if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
-                    return None
-                value = _decode_json_line(line)
-                if value is None:
-                    continue
-                start = _native_start(value)
-                if start is None:
-                    continue
-                cookie = start.get("cookie")
-                if not isinstance(cookie, str):
-                    continue
-                starts += 1
-                if cookie != expected_cookie:
-                    return None
-                settings = _native_settings(start)
-        if starts != 1 or settings is None:
+                "receiver_complete": True, "client_complete": isinstance(value.get("end"), Mapping),
+                "client_tail": False}
+        client = _native_iperf_client_metadata(path, expected_cookie)
+        if client is None:
             return None
         if receiver_path is None:
             return None
         receiver = _native_server_metadata(receiver_path, expected_cookie)
         if receiver is None:
             return None
-        return {"cookie": expected_cookie, "client_settings": settings,
+        return {**client,
                 **receiver, "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie)}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
