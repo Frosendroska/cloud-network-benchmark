@@ -1004,6 +1004,8 @@ class BudgetLedger:
                 return StageDecision(False,("workflow_time_insufficient",),evidence_now.expires_at.value)
             monotonic_now = _duration(self.monotonic_now(), "monotonic time")
             elapsed = monotonic_now - rec["cap_start_monotonic"]
+            if elapsed < 0:
+                return StageDecision(False,("controller_session_changed",),effective_deadline)
             live = min(rec.get("cap_seconds",rec["allowance"]), rec.get("provider_trigger_monotonic",rec["cap_start_monotonic"]+rec["allowance"])-rec["cap_start_monotonic"]) - elapsed
             wait = max(0.0, rec["scheduled_start_monotonic"]-monotonic_now) if rec.get("scheduled_start_monotonic") is not None else 0.0
             required_fit = remaining.fit_seconds(now=_utc(self.utc_now()), preparation_can_overlap=True) + max(0.0, wait-remaining.preparation_seconds)
@@ -1016,6 +1018,12 @@ class BudgetLedger:
             reqs = {Provider(r.provider).value:r for r in expiry_requests}
             evs = {Provider(e.provider).value:e for e in expiry_evidence}
             if len(reqs) != len(expiry_requests) or len(evs) != len(expiry_evidence) or set(reqs) != providers or set(evs) != providers: return StageDecision(False,("expiry_required",),None)
+            expiry_fingerprint = hashlib.sha256(json.dumps({"requests":[reqs[k].model_dump(mode="json") for k in sorted(reqs)],"evidence":[evs[k].model_dump(mode="json") for k in sorted(evs)]},sort_keys=True,default=str).encode()).hexdigest()
+            if rec.get("expiry_fingerprint") and rec["expiry_fingerprint"] != expiry_fingerprint:
+                return StageDecision(False,("expiry_mismatch",),effective_deadline)
+            previously_accepted_expiry = rec.get("expiry_fingerprint") == expiry_fingerprint
+            utc_now = _utc(self.utc_now())
+            clock_discrepancy_added = False
             for name in providers:
                 req, ev = reqs[name], evs[name]
                 if (ev.state != "registered" or ev.run_id != req.run_id or ev.deployment_id != req.deployment_id
@@ -1026,25 +1034,36 @@ class BudgetLedger:
                     return StageDecision(False,("expiry_mismatch",),None)
                 cap_start = ReservationEvidence.model_validate(rec["evidence"]).cap_started_at.value
                 if (ev.registered_at.value is None or _utc(ev.registered_at.value) < _utc(cap_start)
-                    or _utc(ev.registered_at.value) > _utc(self.utc_now()) or req.expires_at.value is None
+                    or (_utc(ev.registered_at.value) > utc_now and not previously_accepted_expiry) or req.expires_at.value is None
                     or _utc(req.expires_at.value) <= _utc(ev.registered_at.value)):
                     return StageDecision(False,("expiry_mismatch",),None)
+            if previously_accepted_expiry and any(_utc(ev.registered_at.value) > utc_now for ev in evs.values()):
+                discrepancies = rec.setdefault("utc_clock_discrepancies", [])
+                for name, ev in evs.items():
+                    registered_at = _utc(ev.registered_at.value)
+                    if registered_at > utc_now:
+                        discrepancy = {"kind":"utc_behind_previously_accepted_registration", "provider":name,
+                            "registered_at":registered_at.isoformat(), "observed_at":utc_now.isoformat(),
+                            "behind_seconds":(registered_at-utc_now).total_seconds(), "expiry_fingerprint":expiry_fingerprint}
+                        if discrepancy not in discrepancies:
+                            discrepancies.append(discrepancy)
+                            clock_discrepancy_added = True
             deadline = min([ReservationEvidence.model_validate(rec["evidence"]).expires_at.value] + [_utc(r.expires_at.value) for r in reqs.values()])
             for name, req in reqs.items():
                 lead = _duration(rec["provider_leads"].get(name, -1), "provider lead")
                 cap_end = ReservationEvidence.model_validate(rec["evidence"]).expires_at.value
                 if _utc(req.expires_at.value) != cap_end - timedelta(seconds=lead):
                     return StageDecision(False,("expiry_mismatch",),deadline)
-            expiry_fingerprint = hashlib.sha256(json.dumps({"requests":[reqs[k].model_dump(mode="json") for k in sorted(reqs)],"evidence":[evs[k].model_dump(mode="json") for k in sorted(evs)]},sort_keys=True,default=str).encode()).hexdigest()
-            if rec.get("expiry_fingerprint") and rec["expiry_fingerprint"] != expiry_fingerprint:
-                return StageDecision(False,("expiry_mismatch",),deadline)
             # The locked mode-specific remaining-work fit above is compared against the
             # immutable monotonic cap/trigger; do not subtract elapsed time from the
             # original workflow estimate or consult wall-clock UTC for eligibility.
             rec["provider_deadline"] = deadline.isoformat()
             rec["expiry_fingerprint"] = expiry_fingerprint
             claims = rec.setdefault("creation_claims", [])
-            if Provider(provider).value in claims: return StageDecision(True,("creation_already_claimed",),deadline,False)
+            if Provider(provider).value in claims:
+                if clock_discrepancy_added:
+                    self._write(state)
+                return StageDecision(True,("creation_already_claimed",),deadline,False)
             claims.append(Provider(provider).value)
             rec["cleanup_open"] = True
             if reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(reservation_id)

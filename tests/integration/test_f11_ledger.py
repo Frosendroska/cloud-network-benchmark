@@ -638,7 +638,7 @@ def test_retained_calibration_admits_one_row_while_day_waits_for_common_n(tmp_pa
 def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode, minimum):
     now = datetime(2026, 10, 22, tzinfo=timezone.utc)
     utc_clock = [now]
-    monotonic_clock = [1.0]
+    monotonic_clock = [100.0]
     costs = load_cost_inputs(ROOT / "tests/fixtures/f11/cost-inputs.json")
     book = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:utc_clock[0],
         monotonic_now=lambda:monotonic_clock[0], controller_session_id="session-1")
@@ -665,10 +665,10 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
         plan.allowance.cleanup_seconds,"mode-stage-test",plan.allowance.provider_leads_seconds,("registration","preparation"))
     assert book.check_stage_fit(rid, stage="measurement", remaining=measurement_remainder).eligible
     utc_clock[0] = now + timedelta(days=2)
-    monotonic_clock[0] = 2.0
+    monotonic_clock[0] = 101.0
     assert book.check_stage_fit(rid, stage="registration", remaining=plan.allowance).eligible
     utc_clock[0] = now - timedelta(days=2)
-    monotonic_clock[0] = 3.0
+    monotonic_clock[0] = 102.0
     assert book.check_stage_fit(rid, stage="registration", remaining=plan.allowance).eligible
     expiry_requests, expiry_evidence = [], []
     for provider in providers:
@@ -684,25 +684,42 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
             provider=provider, action=action, state="registered", registration_id=Evidence[str](value=f"registration-{name}"),
             registered_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=trigger),
             target_selector=req.target_selector, provider_metadata=StructuredEvidence(value={"fixture":True})))
+    regressed = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:utc_clock[0],
+        monotonic_now=lambda:1.0, controller_session_id="session-1")
+    regressed_claim = regressed.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests,
+        expiry_evidence=expiry_evidence)
+    assert not regressed_claim.eligible and "controller_session_changed" in regressed_claim.reason_codes
+    assert book.inspect()["reservations"][rid].get("creation_claims", []) == []
     utc_clock[0] = now
     effective_seconds = request.lifetime_cap_seconds - max(plan.allowance.provider_leads_seconds.values())
     claim_remainder = WorkflowAllowance(0,plan.allowance.provision_seconds,plan.allowance.readiness_seconds,
         plan.allowance.stabilization_seconds,minimum,1,plan.allowance.retrieval_seconds,plan.allowance.cleanup_seconds,
         "creation-fit-test",plan.allowance.provider_leads_seconds,("registration",))
     remaining_fit = claim_remainder.fit_seconds(now=now)
-    monotonic_clock[0] = 1.0 + effective_seconds - remaining_fit
+    monotonic_clock[0] = 100.0 + effective_seconds - remaining_fit
     decision = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert decision.eligible and decision.creation_granted
     assert decision.effective_deadline == min(item.expires_at.value for item in expiry_requests)
     late = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
-        monotonic_now=lambda:1.0 + request.lifetime_cap_seconds + 1, controller_session_id="session-1")
+        monotonic_now=lambda:100.0 + request.lifetime_cap_seconds + 1, controller_session_id="session-1")
     expired = late.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert not expired.eligible and "workflow_time_insufficient" in expired.reason_codes
     replay = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert replay.eligible and not replay.creation_granted and "creation_already_claimed" in replay.reason_codes
     assert replay.effective_deadline == decision.effective_deadline
+    utc_clock[0] = now - timedelta(seconds=1)
+    backward_step = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+    assert backward_step.eligible and not backward_step.creation_granted
+    assert backward_step.effective_deadline == decision.effective_deadline
+    discrepancies = book.inspect()["reservations"][rid]["utc_clock_discrepancies"]
+    assert {item["provider"] for item in discrepancies} == {provider.value for provider in providers}
+    assert all(item["kind"] == "utc_behind_previously_accepted_registration" for item in discrepancies)
+    utc_clock[0] = now + timedelta(days=1)
+    forward_step = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+    assert forward_step.eligible and not forward_step.creation_granted
+    assert forward_step.effective_deadline == decision.effective_deadline
     resumed = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
-        monotonic_now=lambda:2.0, controller_session_id="new-controller-session")
+        monotonic_now=lambda:101.0, controller_session_id="new-controller-session")
     campaign2 = (resolve_campaign(config_path, ROOT)[0] if mode == "acceptance"
         else scheduled_campaign(config_path, f"{mode}-after-registration", now + timedelta(seconds=60)))
     if mode in {"short_study", "diagnostic_day"}:
