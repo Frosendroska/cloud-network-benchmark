@@ -25,8 +25,8 @@ def _record(artifact_id: str, path: str, kind: str, unit_id: str | None, *, prod
         sha256=StringEvidence(value=hashlib.sha256(payload).hexdigest()), retrieval_state="verified")
 
 
-def _input(records: list[ArtifactRecord], units=UNITS):
-    artifacts = artifact_inputs(ARTIFACTS, mode="diagnostic_day", measurement_units=units)
+def _input(records: list[ArtifactRecord], units=UNITS, artifacts_override=None):
+    artifacts = artifacts_override or artifact_inputs(ARTIFACTS, mode="diagnostic_day", measurement_units=units)
     return ValidatorInput(schema_version=2,
         identity=IdentityContext(experiment_id="EXP-900", config_id="exp-900-diagnostic-day", campaign_id="campaign",
             observation_id="campaign-aws-observation", run_id="campaign-aws", deployment_id="campaign-aws-deployment", provider="aws"),
@@ -105,3 +105,31 @@ def test_legacy_client_identity_is_admitted_against_original_declaration_too():
     value["artifact_records"] = [record.model_dump()]
     admitted = ValidatorInput.model_validate(value)
     assert admitted.artifact_records[0].unit_id is None
+
+
+@pytest.mark.parametrize(("family", "kind", "suffix"), [
+    ("day-probe-csv", "sockperf-csv", "csv"),
+    ("day-probe-log", "sockperf-log", "log"),
+    ("day-probe-observation", "sockperf-observation-stderr", "acquisition.stderr"),
+])
+def test_suffixed_modern_record_with_null_unit_cannot_fall_back_to_template_declaration(family, kind, suffix):
+    wrong_suffix = "probe-chunk-000001"
+    claimed_suffix = "probe-chunk-000002"
+    record = _record(f"{family}-{claimed_suffix}",
+        f"measurements/day/probes/{wrong_suffix}.{suffix}", kind, None)
+    with pytest.raises(ValueError, match="artifact evidence must match its declared input"):
+        _input([record])
+
+
+def test_concrete_family_id_declaration_cannot_shadow_canonical_template():
+    base = artifact_inputs(ARTIFACTS, mode="diagnostic_day", measurement_units=UNITS)
+    base["day-probe-csv-probe-chunk-000001"] = base["day-probe-csv"].model_copy(update={
+        "artifact_id": "day-probe-csv-probe-chunk-000001",
+        "path": "measurements/day/probes/probe-chunk-000001.csv",
+        "path_template": None,
+        "unit_id": DAY.unit_id,
+    })
+    record = _record("day-probe-csv-probe-chunk-000001",
+        "measurements/day/probes/probe-chunk-000001.csv", "sockperf-csv", DAY.unit_id)
+    with pytest.raises(ValueError, match="artifact evidence must match its declared input"):
+        _input([record], artifacts_override=base)
