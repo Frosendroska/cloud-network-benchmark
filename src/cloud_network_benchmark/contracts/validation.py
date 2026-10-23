@@ -129,10 +129,28 @@ class ValidatorInput(StrictModel):
         record_ids = [(item.artifact_id, item.path, item.unit_id) for item in self.artifact_records]
         if len(record_ids) != len(set(record_ids)):
             raise ValueError("artifact records must have unique concrete identity")
+        day_family_ids = {"day-probe-csv", "day-probe-log", "day-probe-observation"}
         for record in self.artifact_records:
             if record.deployment_id != self.identity.deployment_id:
                 raise ValueError("artifact evidence must match deployment")
-            declaration = self.artifacts.get(record.artifact_id)
+            declaration = None
+            concrete_family = None
+            modern_families = ([family_id for family_id in day_family_ids
+                                if record.artifact_id.startswith(family_id + "-")]
+                               if ExperimentMode(self.mode) == ExperimentMode.DIAGNOSTIC_DAY else [])
+            modern_family_record = bool(modern_families)
+            if modern_family_record:
+                if len(modern_families) != 1 or record.artifact_id in self.artifacts:
+                    raise ValueError("artifact evidence must match its declared input")
+                family_id = modern_families[0]
+                family_declaration = self.artifacts.get(family_id)
+                if (family_declaration is None or family_declaration.artifact_id != family_id
+                        or family_declaration.path_template is None or family_declaration.path is not None
+                        or family_declaration.unit_id is not None):
+                    raise ValueError("artifact evidence must match its declared input")
+                declaration = concrete_family = family_declaration
+            else:
+                declaration = self.artifacts.get(record.artifact_id)
             if declaration is None:
                 raise ValueError("artifact evidence must match its declared input")
             expected_path = declaration.path
@@ -141,14 +159,32 @@ class ValidatorInput(StrictModel):
                 path_matches = re.fullmatch(pattern, record.path) is not None
             else:
                 path_matches = record.path == expected_path
-            dynamic_day_record = (record.artifact_id in {"day-probe-csv", "day-probe-log", "day-probe-observation"}
-                                  and declaration.path_template is not None
-                                  and record.unit_id == next((unit.unit_id for unit in self.measurement_units if unit.kind == "continuous_day"), None))
+            day_unit_id = next((unit.unit_id for unit in self.measurement_units if unit.kind == "continuous_day"), None)
+            chunk_units = {unit.unit_id: unit for unit in self.measurement_units if unit.kind == "probe_chunk"}
+            dynamic_day_record = False
+            if modern_family_record and concrete_family is not None:
+                suffix = record.artifact_id[len(declaration.artifact_id) + 1:]
+                chunk = chunk_units.get(suffix)
+                expected_concrete_path = declaration.path_template.replace("{chunk_id}", suffix)
+                dynamic_day_record = (bool(suffix) and suffix == record.unit_id and chunk is not None
+                                      and chunk.parent_unit_id == day_unit_id
+                                      and record.path == expected_concrete_path)
+                if not dynamic_day_record:
+                    raise ValueError("artifact evidence must match its declared input")
+            legacy_fixed_day = (ExperimentMode(self.mode) == ExperimentMode.DIAGNOSTIC_DAY
+                                and record.artifact_id in {"day-iperf3-client", "day-iperf3-observation"}
+                                and record.unit_id is None and declaration.unit_id == day_unit_id)
+            legacy_template_day = (ExperimentMode(self.mode) == ExperimentMode.DIAGNOSTIC_DAY
+                                   and concrete_family is None
+                                   and record.artifact_id in {"day-probe-csv", "day-probe-log", "day-probe-observation"}
+                                   and declaration.path_template is not None and path_matches
+                                   and record.unit_id in {None, day_unit_id})
             compatible_legacy_kind = (record.artifact_id == "iperf3_server_error"
                                        and record.kind == "iperf3-server-error"
                                        and declaration.kind == "iperf3-observation-stderr")
             if not path_matches or (record.kind != declaration.kind and not compatible_legacy_kind) or record.producer != declaration.producer or (
                 record.unit_id != declaration.unit_id and not dynamic_day_record
+                and not legacy_fixed_day and not legacy_template_day
             ):
                 raise ValueError("artifact evidence must match its declared input")
             expected_hash = {
