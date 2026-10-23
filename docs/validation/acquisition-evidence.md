@@ -349,3 +349,13 @@ credentials, or benchmark traffic was run. The results establish offline source/
 plumbing, patch applicability, and framework replay behavior; they do not establish native
 compilation or cloud measurement capability. No CLI, workload, native file format, or research
 threshold changed.
+
+## Phase 10 convergence (T035)
+
+The pinned Sockperf checkout's `src/sockperf.cpp` prints `MODULE_NAME ", version %s"` at line
+370, and its `src/defs.h` defines `MODULE_NAME` as `sockperf`; the inspected source therefore
+prints `sockperf, version 3.10`. Bootstrap now accepts this numeric version grammar without
+accepting unrelated comma text. The regression includes upstream compiled/copyright lines and
+uses the actual bootstrap-created Sockperf BuildObservation and sidecar ArtifactRecord in public
+binding/replay alongside iperf3. Full test and patch applicability results for this phase follow
+after the final gate.

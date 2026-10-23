@@ -617,9 +617,16 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     evidence["compiler_version"] = version_text
                 elif index == 6:
                     version_text = _canonical_version_text(text)
-                    displayed_tools = {"iperf", "iperf3"} if source.tool == "iperf3" else {source.tool}
-                    if not any(re.search(rf"(?im)^\s*{re.escape(name)}(?:\s|:|$)", version_text)
-                               for name in displayed_tools):
+                    if source.tool == "sockperf":
+                        # Pinned Sockperf 3.10 prints "sockperf, version 3.10";
+                        # keep the older explicit "sockperf version" form for
+                        # unpatched builds while rejecting unrelated comma text.
+                        displayed = re.search(
+                            r"(?im)^\s*sockperf(?:,\s+version|\s+version)\s+\d+(?:\.\d+){1,3}(?:\s|$)",
+                            version_text)
+                    else:
+                        displayed = re.search(r"(?im)^\s*iperf3?(?:\s|:|$)", version_text)
+                    if displayed is None:
                         return _failure_result(connection, actions, vm, req, result, "binary_version_missing", f"{source.tool} binary version was not observed", builds, listeners)
                     evidence["binary_version"] = version_text
                 elif index == 7:

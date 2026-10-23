@@ -300,7 +300,7 @@ def test_run_bootstrap_build_observation_materializes_and_replays_exact_multilin
             aid = request.action_id
             tool = "sockperf" if "sockperf" in aid else "iperf3"
             source = next(item for item in config.sources if item.tool == tool)
-            version = ("sockperf 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
+            version = ("sockperf, version 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
                 if tool == "sockperf" else "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0")
             if "CNB_BUILD_V1" in request.argv[-1]:
                 build_config = (f"CC=${{CC:-cc}}; compiler={self.compiler}; "
@@ -334,6 +334,7 @@ def test_run_bootstrap_build_observation_materializes_and_replays_exact_multilin
         deadline=deadline(), clock=lambda: 100)
     assert bootstrap.succeeded
     production_build = next(item for item in bootstrap.builds if item.role == "vm_b" and item.tool == "iperf3")
+    production_sockperf_build = next(item for item in bootstrap.builds if item.role == "vm_a" and item.tool == "sockperf")
     expected_configuration = (f"CC=${{CC:-cc}}; compiler={production_build.compiler_version}; "
         f"./configure --prefix={config.install_prefix}; make -j2")
     assert production_build.build_configuration == expected_configuration
@@ -342,23 +343,35 @@ def test_run_bootstrap_build_observation_materializes_and_replays_exact_multilin
     log = (ROOT / "iperf-receiver.log").read_bytes().replace(b"native-cookie-1", cookie.encode())
     native = _native_iperf(cookie)
     records = [
+        _record(tmp_path, "actual-bootstrap-sock-log", "retrieval/actual-bootstrap-sockperf.stderr",
+            "sockperf-observation-stderr", VmRole.VM_A,
+            (ROOT / "sockperf-window.log").read_bytes(), "short-multiflow"),
+        _record(tmp_path, "actual-bootstrap-sock-csv", "measurements/short-multiflow/actual-bootstrap-sockperf.csv",
+            "sockperf-csv", VmRole.VM_A, b"Sockperf 3.10 native CSV fixture\n", "short-multiflow"),
         _record(tmp_path, "actual-bootstrap-log", "retrieval/actual-bootstrap.stderr",
             "iperf3-observation-stderr", VmRole.VM_B, log),
         _record(tmp_path, "actual-bootstrap-native", "retrieval/actual-bootstrap.json",
             "iperf3-json", VmRole.VM_A, native, "short-multiflow"),
-        *_build_records(tmp_path, DEPLOYMENT, [production_build]),
+        *_build_records(tmp_path, DEPLOYMENT, [production_build, production_sockperf_build]),
     ]
     client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
+    sockperf_client = _command("sockperf-short-multiflow", VmRole.VM_A, "short-multiflow")
+    sockperf_client.request["argv"] = [production_sockperf_build.binary_path, "under-load"]
+    sockperf_client.request["acquisition_invocation_id"] = "sockperf-short-multiflow"
     receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
     receiver.request["argv"] = ["systemd-run",
         "--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",
         f"{production_build.binary_path}", "-s", "--json-stream", "--forceflush"]
+    builds = [production_build, production_sockperf_build]
     sources = bind_acquisition_sources(child_root=tmp_path,
-        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
-        receiver_command_evidence=[receiver], build_evidence=[production_build], source_artifact_records=records)
-    assert len(sources) == 1
-    assert len(list(iter_source_windows(tmp_path, sources[0], records,
-        [client, receiver], [production_build]))) == 2
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client, sockperf_client],
+        receiver_command_evidence=[receiver], build_evidence=builds, source_artifact_records=records)
+    assert {source.tool for source in sources} == {"iperf3", "sockperf"}
+    all_commands = [client, sockperf_client, receiver]
+    replayed = {source.tool: list(iter_source_windows(tmp_path, source, records,
+        all_commands, builds)) for source in sources}
+    assert len(replayed["iperf3"]) == 2
+    assert replayed["sockperf"][0].has_positive_inner_support
 
 
 @pytest.mark.parametrize("mutation", ["cookie_only", "native_endpoint", "native_settings",

@@ -129,3 +129,8 @@ updated iperf patch applied to the pinned source with zero fuzz. See
 
 - [X] T033 Construct production BuildObservation.build_configuration from the same complete captured compiler representation as CNB_BUILD_V1. A public integration regression runs run_bootstrap with multiline tool/compiler output, materializes its actual BuildObservation sidecar as a build ArtifactRecord, binds it with source evidence, and replays source windows successfully; only output framing is normalized, while multiline contents remain intact.
 - [X] T034 Recognize the pinned native reporter's all-stream short zero-byte final filter using each stream's own observed terminal bounds. The source-hook replay accepts independently shifted per-stream endpoints when every expected stream has its own positive, sub-10%-period zero-byte terminal interval. It stores and reports each stream's bounds without synthesizing a common timestamp; positive bytes, later intervals and missing stream candidates do not qualify. Public replay retains the earlier corroborated windows and reports the unsupported terminal durations; native bytes, CLI and statistics are unchanged.
+
+
+## Phase 10: Convergence
+
+- [X] T035 Accept the exact pinned Sockperf banner `sockperf, version 3.10` using a version-number-specific pattern while retaining the legacy explicit `sockperf version N` form. Reject malformed comma banners, and preserve the complete compiled/copyright multiline output. The public integration regression runs actual bootstrap, materializes the authentic banner and sidecar in its BuildObservation, and binds/replays source records for both Sockperf and iperf3; native commands and source identity remain unchanged.

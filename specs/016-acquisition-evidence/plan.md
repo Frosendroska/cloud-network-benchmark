@@ -125,6 +125,12 @@ synthetic equality of endpoints sampled separately inside upstream's stream loop
 independently correlated windows remain available, with unsupported duration described per stream.
 No measurement flags, reporting thresholds, protocol decisions, or native files change.
 
+The serialized T035 repair recognizes Sockperf's authentic comma-bearing `sockperf, version N`
+banner only when followed by a numeric dotted version, while retaining the established explicit
+`sockperf version N` spelling used by legacy builds. This is a bounded upstream-format
+compatibility detail; unrelated comma text is rejected and all observed multiline banner bytes,
+sidecar identity, configuration and capability checks remain intact.
+
 ## Complexity Tracking
 
 No constitution violations. Two additive upstream observation patches are necessary because current native sources expose filtered samples and relative/statistical spans rather than source-bound enabled windows. A DTO alone cannot close the gap. No additional agent/platform abstraction is justified.
