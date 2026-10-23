@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -70,3 +71,23 @@ def test_guest_duration_uses_utc_and_subtracts_transport_and_clock_uncertainty()
         guest_duration(effective_deadline_utc=now+timedelta(seconds=5), guest_now_utc=now,
             controller_observed_remaining=5, transport_elapsed_seconds=4,
             clock_uncertainty_seconds=2)
+
+
+@pytest.mark.parametrize("role", ["vm_a", "vm_b"])
+def test_standalone_diagnostics_run_only_for_explicit_guest_role(tmp_path, role):
+    from tests.integration.test_diagnostics_collection import FakeClock, seed, snapshot
+    from cloud_network_benchmark.lifecycle_guest import run_local_diagnostics
+    output = tmp_path / role; output.mkdir()
+    context = {"deployment_id":"RUN-deployment", "vm_role":role, "provider":"aws", "interface":"eth0",
+        "output_root":str(output), "duration_seconds":1, "metadata_seed":seed(role)}
+    outcome = run_local_diagnostics(context, expected_deployment_id="RUN-deployment", expected_role=role,
+        root=Path(__file__).parents[1] / "fixtures/f04", clock=FakeClock(),
+        run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"fixture"},
+        snapshot_reader=lambda *_:snapshot(0), stop_requested=lambda:False)
+    assert outcome["vm_role"] == role and outcome["state"] == "completed"
+    assert (output / f"diagnostics/{role}.jsonl").is_file()
+    with pytest.raises(ValueError, match="does not match"):
+        run_local_diagnostics(context, expected_deployment_id="another-run", expected_role=role,
+            root=Path(__file__).parents[1] / "fixtures/f04", clock=FakeClock(),
+            run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"fixture"},
+            snapshot_reader=lambda *_:snapshot(0), stop_requested=lambda:False)

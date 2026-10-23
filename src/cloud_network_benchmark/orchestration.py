@@ -111,6 +111,40 @@ class SavedLifecycleRecovery(StrictModel):
         return parsed
 
 
+def write_recovery_journal(path: Path, recovery: SavedLifecycleRecovery) -> None:
+    """Create an exclusive private journal before lifecycle side effects."""
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError("private recovery journal destination must be absent")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise ValueError("private recovery journal path cannot contain symlinks")
+    temporary = path.with_name(f".{path.name}.tmp")
+    if temporary.exists() or temporary.is_symlink():
+        raise FileExistsError("private recovery journal temporary path must be absent")
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(recovery.model_dump_json(indent=2).encode("utf-8") + b"\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.link(temporary, path)
+        os.unlink(temporary)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        finally:
+            raise
+    written = path.stat()
+    if stat.S_IMODE(written.st_mode) & 0o077:
+        raise PermissionError("private recovery journal permissions are not restrictive")
+    SavedLifecycleRecovery.validate_unique(json.loads(path.read_text(encoding="utf-8")))
+
+
 @dataclass
 class CleanupLifecycleResult:
     attempt_id: str

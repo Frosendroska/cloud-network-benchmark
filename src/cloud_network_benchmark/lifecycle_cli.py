@@ -80,7 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=None) -> int:
     parser = _parser()
     try:
         args = parser.parse_args(argv)
@@ -109,6 +109,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the owning orchestration stage; absent those, fail closed without calls.
         if not args.recovery.is_file() or args.recovery.is_symlink():
             raise ValueError("recovery reference must be a regular non-symlink file")
+        if cleanup_actions is not None and reconcile is not None:
+            from .orchestration import cleanup_lifecycle
+            result = cleanup_lifecycle(args.recovery, current_session_id=args.controller_session,
+                cleanup_actions=cleanup_actions, reconcile=reconcile)
+            report = {"status": "complete" if result.complete else "blocked",
+                "execution": "not_resumed", "cleanup": "complete" if result.complete else "incomplete",
+                "attempt_id": result.attempt_id,
+                "original_session_id": result.original_session_id,
+                "current_session_id": result.current_session_id,
+                "providers": {provider: {key: value for key, value in item.items()
+                    if key in {"cleanup", "reconciled", "errors", "launch_blocked", "reason"}}
+                    for provider, item in result.providers.items()},
+                "external_calls": sum(item.get("cleanup") in {"attempted", "succeeded", "failed"}
+                                       for item in result.providers.values())}
+            print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                  f"Cleanup {report['status']}: execution was not resumed.",
+                  file=sys.stdout if result.complete else sys.stderr)
+            return 0 if result.complete else 1
         report = {"status": "incomplete", "execution": "not_resumed", "cleanup": "not_attempted",
                   "reason_codes": ["provider_cleanup_runtime_adapter_required"], "external_calls": 0}
         print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else

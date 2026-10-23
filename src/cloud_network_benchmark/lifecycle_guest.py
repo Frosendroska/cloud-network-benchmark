@@ -146,6 +146,22 @@ def _json_default(value):
     raise TypeError(type(value).__name__)
 
 
+def run_local_diagnostics(context: Mapping[str, Any], *, expected_deployment_id: str,
+                          expected_role: str, root: Path, clock: Any,
+                          run_command: Callable[..., Any], snapshot_reader: Callable[..., Any],
+                          stop_requested: Callable[[], bool]) -> dict[str, Any]:
+    """Invoke the existing F04 guest collector with a role-bound context.
+
+    A and B use this same guest entry with distinct explicit contexts. The
+    function never opens transport; the lifecycle adapter invokes it locally.
+    """
+    if context.get("deployment_id") != expected_deployment_id or context.get("vm_role") != expected_role:
+        raise ValueError("diagnostic context does not match the selected deployment and guest role")
+    from .diagnostics_guest import collect_local
+    return collect_local(dict(context), root=root, clock=clock, run_command=run_command,
+                         snapshot_reader=snapshot_reader, stop_requested=stop_requested)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Internal VM-A measurement entry point")
     parser.add_argument("--request", required=True, type=Path)
