@@ -298,7 +298,7 @@ class ProviderConfiguration(StrictModel):
         elif provider == Provider.AZURE:
             option_values = self.provider_options["priority"] == "Regular" and self.provider_options["eviction_policy"] == "Delete" and self.provider_options["max_price"] == -1.0
         else:
-            option_values = self.provider_options["provisioning_model"] == "STANDARD" and self.provider_options["instance_termination_action"] == "DELETE"
+            option_values = self.provider_options["provisioning_model"] == "STANDARD" and self.provider_options["instance_termination_action"] == "STOP"
         if not option_values:
             raise ValueError("only the declared On-Demand provider settings are supported")
         placement_kind = {
@@ -326,6 +326,24 @@ class ProviderConfiguration(StrictModel):
         if provider == Provider.GCP and self.placement.kind == "compact_placement_policy" and not self.placement.collocated:
             raise ValueError("GCP placement optimization requires collocated=true")
         return self
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        schema = handler(core_schema)
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"provider": {"const": "gcp"}}, "required": ["provider"]},
+            "then": {"properties": {"provider_options": {
+                "type": "object",
+                "required": ["provisioning_model", "instance_termination_action"],
+                "minProperties": 2,
+                "maxProperties": 2,
+                "properties": {
+                    "provisioning_model": {"const": "STANDARD"},
+                    "instance_termination_action": {"const": "STOP"},
+                },
+            }}},
+        })
+        return schema
 
 
 class CampaignConfiguration(StrictModel):
