@@ -44,3 +44,15 @@ def test_scenarios_and_security_inputs_are_exact_and_owned():
     assert 'source_ranges = ["${local.ips[0]}/32", "${local.ips[1]}/32"]' in hcl
     assert 'collocation = "COLLOCATED"' in hcl
     assert "max_distance" not in hcl
+
+
+def test_native_absolute_stop_is_controller_independent_and_templates_do_not_replace_cleanup():
+    protection = (ROOT / "terraform/gcp/protection/main.tf").read_text()
+    pair = (ROOT / "terraform/gcp/pair/main.tf").read_text()
+    traces = json.loads((ROOT / "tests/fixtures/gcp/operation-traces.json").read_text())
+    assert "termination_time            = var.expiry_time" in protection
+    assert 'instance_termination_action = "STOP"' in protection
+    assert "max_run_duration" not in protection
+    assert "time_sleep" not in protection and "local-exec" not in protection
+    assert traces["controller_loss"] == {"policy_survives_controller": True, "local_due_time_means_triggered": False, "template_deletion_cancels_live_policy": False}
+    assert pair.index('resource "google_compute_instance_from_template" "vm_a"') < pair.index('resource "google_compute_instance_from_template" "vm_b"')

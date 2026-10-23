@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from threading import local
 import time
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -76,6 +77,12 @@ class GcpRuntimeSettings(StrictModel):
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
             if field not in handoff:
                 raise ValueError(f"complete-workflow cost evidence must include {field}")
+        estimate = handoff["estimated_total_usd"]
+        if isinstance(estimate, bool) or not isinstance(estimate, (int, float)) or not isfinite(float(estimate)) or estimate <= 0:
+            raise ValueError("complete-workflow estimated cost must be positive finite USD")
+        units = handoff["units"]
+        if not isinstance(units, dict) or not units or any(not isinstance(key, str) or not key.strip() or not isinstance(value, (str, int, float)) or isinstance(value, bool) or (isinstance(value, str) and not value.strip()) or (isinstance(value, (int, float)) and (not isfinite(float(value)) or value <= 0)) for key, value in units.items()):
+            raise ValueError("complete-workflow resource units must be nonempty, explicit and positive where numeric")
         if handoff["source_path"] != self.cost_source_path or handoff["source_sha256"] != self.cost_input_sha256:
             raise ValueError("cost source identity must match the supplied dated source")
         return self
@@ -106,12 +113,32 @@ class GcpProviderError(RuntimeError):
 class GcpProviderDriver:
     def __init__(self, runner: CommandRunner, settings: GcpRuntimeSettings, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self.runner, self.settings, self.clock = runner, settings, clock
-        self._deadline: float | None = None
+        self._command_context = local()
+
+    @property
+    def _deadline(self) -> float | None:
+        return getattr(self._command_context, "deadline", None)
+
+    @_deadline.setter
+    def _deadline(self, value: float | None) -> None:
+        self._command_context.deadline = value
+
+    @property
+    def _active_attempt(self) -> Path | None:
+        return getattr(self._command_context, "attempt", None)
+
+    @_active_attempt.setter
+    def _active_attempt(self, value: Path | None) -> None:
+        self._command_context.attempt = value
 
     def register_expiry(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ExpiryEvidence:
+        self._deadline = None
         reservation = self._validate(deployment, request)
+        if deployment.scenario in {"cross_zone", "placement_optimization", "inter_region"}:
+            self._validate_review(deployment)
         trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
         attempt = self._attempt_dir(deployment)
+        self._active_attempt = attempt
         journal = self._load(attempt, deployment)
         self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         if journal.get("registered"):
@@ -124,12 +151,20 @@ class GcpProviderDriver:
             templates = self._outputs(out).get("templates", {})
             if set(templates) != {"vm_a", "vm_b"}:
                 raise GcpProviderError("both template identities were not observed", category="expiry_uncertain")
+            template_ids = [str(item.get("id", "")) for item in templates.values()]
+            template_links = [item.get("self_link_unique") for item in templates.values()]
+            if not all(template_ids) or len(set(template_ids)) != 2 or not all(template_links) or len(set(template_links)) != 2:
+                raise GcpProviderError("role templates must have distinct immutable numeric and unique-link identities", category="expiry_uncertain")
             journal["templates"] = templates
             placement_policy_id = self._outputs(out).get("compact_policy_id")
             journal["compact_policy_id"] = placement_policy_id
             if deployment.scenario == "placement_optimization" and not placement_policy_id:
                 raise GcpProviderError("S3 compact placement policy was not observed", category="placement_missing")
             self._save(attempt, journal)
+            now = self.clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise GcpProviderError("registration clock must be timezone-aware", category="cap_order")
+            now = now.astimezone(timezone.utc)
             observed = {}
             for role, template in templates.items():
                 described = self._gcloud_json(["compute", "instance-templates", "describe", template["name"], "--project", self.settings.project_id, "--format=json"], f"gcp-template-read-{role}")
@@ -138,10 +173,14 @@ class GcpProviderDriver:
                     raise GcpProviderError("template readback does not match immutable STOP policy", category="expiry_mismatch")
                 if not template.get("self_link_unique") or not template.get("id"):
                     raise GcpProviderError("unique template binding was not observed", category="expiry_uncertain")
+                if str(described.get("id")) != str(template["id"]):
+                    raise GcpProviderError("template name resolved to a different immutable numeric identity", category="expiry_mismatch")
                 observed[role] = {"id": str(template["id"]), "name": template["name"], "self_link_unique": template["self_link_unique"], "sha256": hashlib.sha256(json.dumps(described, sort_keys=True).encode()).hexdigest(), "creationTimestamp": described.get("creationTimestamp"), "scheduling": scheduling}
-            now = self.clock().astimezone(timezone.utc)
             if not reservation.cap_started_at.value <= now <= trigger:
                 raise GcpProviderError("expiry registration is outside the original reservation window", category="cap_order")
+            cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
+            for item in observed.values():
+                self._validate_template_created_at(item.get("creationTimestamp"), cap_start, now)
             evidence = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp", action="stop", state="registered", registration_id=Evidence[str](value=f"{observed['vm_a']['id']}:{observed['vm_b']['id']}"), registered_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=trigger), target_selector=request.target_selector, provider_metadata=StructuredEvidence(value={"templates": observed, "reservation_id": reservation.reservation_id.value, "cost_source_id": self.settings.cost_input_id, "cost_source_sha256": self.settings.cost_input_sha256, "native_absolute_stop": True}))
             journal.update({"registered": True, "expiry": evidence.model_dump(mode="json"), "templates": observed})
             self._save(attempt, journal)
@@ -151,6 +190,10 @@ class GcpProviderDriver:
             try:
                 self._terraform(attempt, "protection", "destroy", deployment, {})
                 journal["unused_protection_destroy_attempted"] = True
+                inventory = self._inventory(deployment)
+                if not inventory.get("pages_complete") or inventory.get("resources"):
+                    raise GcpProviderError("unused protection cleanup did not prove complete resource absence", category="cleanup_incomplete")
+                journal["unused_protection_inventory"] = inventory
             except Exception as cleanup_error:
                 journal["cleanup_failure"] = self._failure(cleanup_error).model_dump(mode="json")
                 journal["launch_blocked"] = True
@@ -158,11 +201,15 @@ class GcpProviderDriver:
             return ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp", action="stop", state="failed", registration_id=Evidence[str](unavailable_reason="both immutable templates were not confirmed"), registered_at=Evidence[datetime](unavailable_reason="registration incomplete"), expires_at=Evidence[datetime](value=trigger), target_selector=request.target_selector, provider_metadata=StructuredEvidence(value={"partial_protection": journal.get("templates", {}) or {}}), failure=self._failure(exc))
 
     def provision(self, deployment: ProviderDeploymentInput) -> ProviderDeploymentOutput:
+        self._deadline = None
         self._validate_deployment(deployment)
         attempt = self._attempt_dir(deployment)
+        self._active_attempt = attempt
         journal = self._load(attempt, deployment)
         if not journal.get("registered"):
             raise GcpProviderError("verified STOP templates are required before pair creation", category="expiry_required")
+        if journal.get("creation_may_have_started") or journal.get("deployment_output") or journal.get("cleanup_state") is not None or journal.get("launch_blocked"):
+            raise GcpProviderError("this attempt has already started creation or entered cleanup and cannot be relaunched", category="cleanup_open")
         supplied_expiry = deployment.expiry.value
         recorded_expiry = ExpiryEvidence.model_validate(journal["expiry"])
         if supplied_expiry is None or supplied_expiry.state != "registered" or supplied_expiry.registration_id != recorded_expiry.registration_id or supplied_expiry.expires_at != recorded_expiry.expires_at:
@@ -171,8 +218,9 @@ class GcpProviderDriver:
         trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
         self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         self._verify_registered_templates(journal, trigger)
-        if deployment.scenario in {"cross_zone", "inter_region"}:
+        if deployment.scenario in {"cross_zone", "placement_optimization", "inter_region"}:
             self._validate_review(deployment)
+        self._deadline = time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds)
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
@@ -181,13 +229,14 @@ class GcpProviderDriver:
             pair = self._terraform(attempt, "pair", "apply", deployment, {"template_a": templates["vm_a"]["self_link_unique"], "template_b": templates["vm_b"]["self_link_unique"]})
             values = self._outputs(pair).get("instances", {})
             output = {}
+            observed_disks = {}
             for role in ("vm_a", "vm_b"):
                 resource = values[role]
                 instance = self._gcloud_json(["compute", "instances", "describe", resource["name"], "--zone", resource["zone"], "--project", self.settings.project_id, "--format=json"], f"gcp-instance-read-{role}")
                 scheduling = instance.get("scheduling", {})
                 if scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP" or scheduling.get("terminationTime") != trigger.isoformat().replace("+00:00", "Z"):
                     raise GcpProviderError("observed VM does not inherit absolute STOP scheduling", category="instance_policy_mismatch")
-                self._validate_instance(instance, deployment, role)
+                observed_disks[role] = self._validate_instance(instance, deployment, role)
                 policies = instance.get("resourcePolicies", [])
                 expected_policy = journal.get("compact_policy_id")
                 if (deployment.scenario == "placement_optimization" and expected_policy not in policies) or (deployment.scenario != "placement_optimization" and policies):
@@ -200,10 +249,11 @@ class GcpProviderDriver:
             result = ProviderDeploymentOutput(schema_version=2, identity=IdentityContext(experiment_id=deployment.experiment_id, config_id=deployment.config_id, campaign_id=deployment.campaign_id, observation_id=deployment.observation_id, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp"), run_id=deployment.run_id, deployment_id=deployment.deployment_id, mode=deployment.mode, provider="gcp", scenario=deployment.scenario, apply_action_id="gcp-pair-apply", started_at=started, finished_at=finished, vm_a=vms[0], vm_b=vms[1], provider_metadata=StructuredEvidence(value={"template_bindings": {role: data["self_link_unique"] for role, data in templates.items()}, "readback": "instances.get", "no_source_template_response_claim": True}), documented_network_limit=StructuredEvidence(value=NETWORK_LIMIT), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])))
             self._write_private(attempt / "terraform-outputs.redacted.json", json.dumps(result.model_dump(mode="json"), sort_keys=True, indent=2).encode())
             journal["deployment_output"] = result.model_dump(mode="json")
-            journal["observed_resources"] = {role: {"id": output[role].get("id"), "zone": output[role].get("zone"), "disk_sources": [disk.get("source") for disk in output[role].get("disks", [])], "private_ip": output[role].get("networkInterfaces", [{}])[0].get("networkIP")} for role in ("vm_a", "vm_b")}
+            journal["observed_resources"] = {role: {"id": output[role].get("id"), "name": output[role].get("name"), "zone": output[role].get("zone", "").rsplit("/", 1)[-1], "disk_sources": [disk.get("source") for disk in output[role].get("disks", [])], "private_ip": output[role].get("networkInterfaces", [{}])[0].get("networkIP")} for role in ("vm_a", "vm_b")}
+            journal["observed_disks"] = [{"id": str(disk.get("id")), "name": disk.get("name"), "zone": disk.get("zone", "").rsplit("/", 1)[-1]} for disk in observed_disks.values()]
             self._save(attempt, journal)
             return result
-        except Exception as exc:
+        except BaseException as exc:
             journal["primary_failure"] = self._failure(exc).model_dump(mode="json")
             self._save(attempt, journal)
             try:
@@ -215,7 +265,10 @@ class GcpProviderDriver:
             raise
 
     def cleanup(self, deployment: ProviderDeploymentInput) -> GcpCleanupResult:
+        self._deadline = None
         attempt = self._attempt_dir(deployment)
+        self._active_attempt = attempt
+        self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
         journal = self._load(attempt, deployment)
         if journal.get("cleanup_state") == "succeeded":
             return GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=journal["inventory"]), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])) if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
@@ -234,7 +287,15 @@ class GcpProviderDriver:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
             expiry = journal.get("expiry")
             if expiry and expiry.get("state") == "registered":
-                expiry = {**expiry, "state": "cancelled", "provider_metadata": {"value": {**expiry.get("provider_metadata", {}).get("value", {}), "cancelled_after_full_deletion": True}}}
+                expires_at = datetime.fromisoformat(expiry["expires_at"]["value"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                now = self.clock()
+                if now.tzinfo is None or now.utcoffset() is None:
+                    raise GcpProviderError("cleanup clock must be timezone-aware", category="expiry_uncertain")
+                metadata = {**expiry.get("provider_metadata", {}).get("value", {})}
+                if now.astimezone(timezone.utc) < expires_at:
+                    expiry = {**expiry, "state": "cancelled", "provider_metadata": {"value": {**metadata, "cancelled_after_full_deletion": True}}}
+                else:
+                    expiry = {**expiry, "provider_metadata": {"value": {**metadata, "trigger_due_at_cleanup": True, "trigger_outcome": "unverified", "policy_removed_after_full_deletion": True}}}
                 journal["expiry"] = expiry
             result = GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
             journal.update({"cleanup_state": "succeeded", "launch_blocked": False, "inventory": inventory})
@@ -288,8 +349,9 @@ class GcpProviderDriver:
     def _validate_review(self, deployment: ProviderDeploymentInput) -> None:
         evidence = self.settings.primary_review_decision
         value = evidence.value if evidence else None
-        if not value or value.get("decision") != "approved" or value.get("scenario") != str(deployment.scenario):
-            raise GcpProviderError("S2/S4 launch requires a sourced approved review for this scenario", category="review_required")
+        scenario = getattr(deployment.scenario, "value", deployment.scenario)
+        if not value or value.get("decision") != "approved" or value.get("scenario") != scenario:
+            raise GcpProviderError("S2/S3/S4 launch requires a sourced approved review for this scenario", category="review_required")
         if not value.get("source_path") or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("source_sha256", ""))) or not value.get("reviewed_at"):
             raise GcpProviderError("review evidence requires a source path, SHA-256, and timestamp", category="review_required")
 
@@ -297,6 +359,9 @@ class GcpProviderDriver:
         templates = journal.get("templates", {})
         if set(templates) != {"vm_a", "vm_b"}:
             raise GcpProviderError("both registered template identities are required before pair creation", category="expiry_uncertain")
+        identities = {(str(item.get("id")), item.get("self_link_unique")) for item in templates.values()}
+        if len(identities) != 2 or any(not item[0] or not item[1] for item in identities):
+            raise GcpProviderError("role templates must retain distinct immutable identities", category="expiry_uncertain")
         expected_time = trigger.isoformat().replace("+00:00", "Z")
         for role, item in templates.items():
             described = self._gcloud_json(["compute", "instance-templates", "describe", item["name"], "--project", self.settings.project_id, "--format=json"], f"gcp-template-precreate-{role}")
@@ -315,23 +380,51 @@ class GcpProviderDriver:
                 raise GcpProviderError("attempt journal cannot be a symlink", category="state_path_unsafe")
             try: value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc: raise GcpProviderError("an attempt journal is unreadable; new launches are blocked", category="cleanup_unknown") from exc
-            if value.get("deployment_id") == deployment.deployment_id: continue
-            if value.get("launch_blocked") or value.get("cleanup_state") not in {None, "succeeded"} or value.get("registered"):
+            if value.get("deployment_id") == deployment.deployment_id:
+                if value.get("launch_blocked") or value.get("cleanup_state") is not None or value.get("creation_may_have_started"):
+                    raise GcpProviderError("this attempt already has creation or cleanup state and cannot be launched again", category="cleanup_open")
+                continue
+            if value.get("launch_blocked") or value.get("cleanup_state") not in {None, "succeeded"} or (value.get("registered") and value.get("cleanup_state") != "succeeded"):
                 raise GcpProviderError("another GCP attempt has open cleanup or native expiry", category="cleanup_open")
 
     @staticmethod
-    def _fit(reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
-        now = datetime.now(timezone.utc)
-        if reservation.cap_started_at.value > now or now + timedelta(seconds=seconds) > trigger:
+    def _validate_template_created_at(value: Any, cap_start: datetime, registered_at: datetime) -> datetime:
+        try:
+            created = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise GcpProviderError("template creation time is missing or invalid", category="cap_order") from exc
+        if created.tzinfo is None or created.utcoffset() is None or cap_start.tzinfo is None or registered_at.tzinfo is None:
+            raise GcpProviderError("template creation and reservation timestamps must be timezone-aware", category="cap_order")
+        created = created.astimezone(timezone.utc)
+        if not cap_start.astimezone(timezone.utc) <= created <= registered_at.astimezone(timezone.utc):
+            raise GcpProviderError("template creation must fall after reservation activation and before registration", category="cap_order")
+        return created
+
+    def _fit(self, reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None or trigger.tzinfo is None or trigger.utcoffset() is None:
+            raise GcpProviderError("reservation and trigger times must be timezone-aware", category="cap_order")
+        now = now.astimezone(timezone.utc)
+        trigger = trigger.astimezone(timezone.utc)
+        cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
+        cap_end = reservation.expires_at.value.astimezone(timezone.utc)
+        if not isfinite(seconds) or seconds <= 0:
+            raise GcpProviderError("complete remaining workflow estimate must be positive and finite", category="cap_insufficient")
+        if trigger != cap_end - timedelta(seconds=SAFETY_LEAD_SECONDS):
+            raise GcpProviderError("native STOP trigger must remain tied to the original reservation cap", category="cap_mismatch")
+        if cap_start > now or now > trigger or now + timedelta(seconds=seconds) > trigger:
             raise GcpProviderError("whole remaining workflow must fit before original native STOP initiation lead", category="cap_insufficient")
 
     def _attempt_dir(self, deployment: ProviderDeploymentInput) -> Path:
         root = self.settings.private_state_root.expanduser().absolute()
-        if root.is_symlink():
+        if any(parent.is_symlink() for parent in (root, *root.parents) if parent.exists()):
             raise GcpProviderError("private state root cannot be a symlink", category="state_path_unsafe")
+        for value, label in ((deployment.run_id, "run"), (deployment.deployment_id, "deployment")):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) or value in {".", ".."}:
+                raise GcpProviderError(f"{label} identity is not a safe single path component", category="state_path_unsafe")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = root / hashlib.sha256(deployment.run_id.encode()).hexdigest()[:12] / deployment.run_id / deployment.deployment_id
-        if any(part.is_symlink() for part in (path.parent.parent, path.parent, path)):
+        if os.path.commonpath((str(root), str(path.absolute()))) != str(root) or any(part.is_symlink() for part in (path.parent.parent, path.parent, path)):
             raise GcpProviderError("attempt path cannot contain symlinks", category="state_path_unsafe")
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path, 0o700)
@@ -346,11 +439,23 @@ class GcpProviderDriver:
         j = json.loads(p.read_text())
         if j.get("run_id") != deployment.run_id or j.get("deployment_id") != deployment.deployment_id:
             raise GcpProviderError("journal identity mismatch", category="state_identity_mismatch")
+        if not isinstance(j.get("commands", []), list):
+            raise GcpProviderError("command journal is malformed", category="cleanup_unknown")
         return j
 
     def _save(self, attempt: Path, journal: dict[str, Any]) -> None:
         target = attempt / "attempt.json"
         if target.is_symlink(): raise GcpProviderError("journal cannot be a symlink", category="state_path_unsafe")
+        if target.exists():
+            current = json.loads(target.read_text(encoding="utf-8"))
+            if (current.get("run_id"), current.get("deployment_id")) != (journal.get("run_id"), journal.get("deployment_id")):
+                raise GcpProviderError("journal identity changed during update", category="state_identity_mismatch")
+            old_events = current.get("commands", [])
+            supplied_events = journal.get("commands", [])
+            if not isinstance(old_events, list) or not isinstance(supplied_events, list):
+                raise GcpProviderError("command journal is malformed", category="cleanup_unknown")
+            if len(old_events) > len(supplied_events) and old_events[:len(supplied_events)] == supplied_events:
+                journal["commands"] = old_events
         fd, name = tempfile.mkstemp(dir=attempt)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -373,15 +478,40 @@ class GcpProviderDriver:
             if os.path.exists(name): os.unlink(name)
 
     def _run(self, action: str, argv: list[str], cwd: Path, timeout: int | None = None) -> CommandResult:
-        limit = timeout or self.settings.command_timeout_seconds
+        limit = min(timeout or self.settings.command_timeout_seconds, self.settings.command_timeout_seconds)
         if self._deadline is not None:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
             limit = min(limit, max(1, int(remaining)))
-        return self.runner.run(CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment_classification="contains_secret_references"))
+        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment_classification="contains_secret_references")
+        result = self.runner.run(request)
+        self._record_command(request, result)
+        return result
+
+    def _record_command(self, request: CommandRequest, result: CommandResult) -> None:
+        attempt = self._active_attempt
+        if attempt is None:
+            return
+        target = attempt / "attempt.json"
+        if not target.exists():
+            return
+        if target.is_symlink():
+            raise GcpProviderError("journal cannot be a symlink", category="state_path_unsafe")
+        journal = json.loads(target.read_text(encoding="utf-8"))
+        request_view = request.durable_view()
+        result_view = result.durable_view()
+        # Keep outcome/timing and content hashes while excluding provider response bodies
+        # that may contain host keys, addresses, or other attempt-specific material.
+        for field in ("stdout", "stderr"):
+            raw = getattr(result, field).encode("utf-8")
+            result_view[field] = f"[omitted sha256={hashlib.sha256(raw).hexdigest()} bytes={len(raw)}]"
+        journal.setdefault("commands", []).append({"request": request_view, "result": result_view})
+        self._save(attempt, journal)
 
     def _terraform(self, attempt: Path, root: str, action: str, deployment: ProviderDeploymentInput, extra: dict[str, Any]) -> dict[str, Any]:
         work = attempt / root
+        if work.is_symlink() or os.path.commonpath((str(attempt.absolute()), str(work.absolute()))) != str(attempt.absolute()):
+            raise GcpProviderError("Terraform work directory must remain inside its private attempt", category="state_path_unsafe")
         work.mkdir(mode=0o700, exist_ok=True)
         vars_path = work / "vars.json"
         if action == "destroy" and vars_path.exists():
@@ -399,7 +529,12 @@ class GcpProviderDriver:
         else:
             template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
         template.update(extra)
-        self._write_private(vars_path, json.dumps(template, sort_keys=True).encode("utf-8"))
+        serialized_vars = json.dumps(template, sort_keys=True).encode("utf-8")
+        self._write_private(vars_path, serialized_vars)
+        if root == "pair" and action == "apply":
+            journal = self._load(attempt, deployment)
+            journal["pair_binding"] = {"config_sha256": hashlib.sha256(serialized_vars).hexdigest(), "template_a": template["template_a"], "template_b": template["template_b"], "project_id": self.settings.project_id, "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
+            self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
@@ -424,21 +559,20 @@ class GcpProviderDriver:
         return f"{stem}-{hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:8]}"
 
     def _inventory(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
-        zones = sorted({deployment.vm_a.zone, deployment.vm_b.zone})
-        pages, instances, disks, addresses, support = [], [], [], [], []
+        instances, disks, addresses, support = [], [], [], []
         dep_hash = hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]
         namespace = self._namespace(deployment)
         journal = self._load(self._attempt_dir(deployment), deployment)
-        known_vms = {str(item.get("id")) for item in journal.get("observed_resources", {}).values() if item.get("id")}
-        known_disks = {str(source).rsplit("/", 1)[-1] for item in journal.get("observed_resources", {}).values() for source in item.get("disk_sources", []) if source}
-        known_templates = {str(item.get("id")) for item in journal.get("templates", {}).values() if item.get("id")}
-        for zone in zones:
-            response = self._gcloud_json(["compute", "instances", "list", f"--zones={zone}", "--project", self.settings.project_id, "--format=json"], f"gcp-inventory-{zone}")
-            if not isinstance(response, list): raise GcpProviderError("inventory pagination shape unknown", category="inventory_unknown")
-            pages.append(zone); instances.extend(item for item in response if str(item.get("id")) in known_vms or item.get("labels", {}).get("cnb-deploy") == dep_hash)
-            disk_response = self._gcloud_json(["compute", "disks", "list", f"--zones={zone}", "--project", self.settings.project_id, "--format=json"], f"gcp-disk-inventory-{zone}")
-            if not isinstance(disk_response, list): raise GcpProviderError("disk inventory pagination shape unknown", category="inventory_unknown")
-            disks.extend(item for item in disk_response if str(item.get("name")) in known_disks or item.get("labels", {}).get("cnb-deploy") == dep_hash)
+        known_vms = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_resources", {}).values() if item.get("id") and item.get("name") and item.get("zone")}
+        known_disks = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_disks", []) if item.get("id") and item.get("name") and item.get("zone")}
+        known_templates = {(str(item.get("id")), item.get("name")) for item in journal.get("templates", {}).values() if item.get("id") and item.get("name")}
+        owned_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": dep_hash}
+        response = self._gcloud_json(["compute", "instances", "list", "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
+        if not isinstance(response, list): raise GcpProviderError("all-zone instance inventory pagination shape unknown", category="inventory_unknown")
+        instances.extend(item for item in response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_vms or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()))
+        disk_response = self._gcloud_json(["compute", "disks", "list", "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
+        if not isinstance(disk_response, list): raise GcpProviderError("all-zone disk inventory pagination shape unknown", category="inventory_unknown")
+        disks.extend(item for item in disk_response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_disks or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()))
         for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
             result = self._gcloud_json(["compute", "addresses", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-address-inventory-{region}")
             if not isinstance(result, list): raise GcpProviderError("regional address inventory pagination shape unknown", category="inventory_unknown")
@@ -446,10 +580,10 @@ class GcpProviderDriver:
             result = self._gcloud_json(["compute", "subnetworks", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-subnet-inventory-{region}")
             if not isinstance(result, list): raise GcpProviderError("subnetwork inventory pagination shape unknown", category="inventory_unknown")
             support.extend(item for item in result if str(item.get("name", "")).startswith(namespace))
-        for collection, command in (("instance_templates", ["compute", "instance-templates", "list"]), ("networks", ["compute", "networks", "list"]), ("firewalls", ["compute", "firewall-rules", "list"])):
+        for collection, command in (("instance_templates", ["compute", "instance-templates", "list"]), ("networks", ["compute", "networks", "list"]), ("firewalls", ["compute", "firewall-rules", "list"]), ("routes", ["compute", "routes", "list"])):
             result = self._gcloud_json([*command, "--project", self.settings.project_id, "--format=json"], f"gcp-{collection}-inventory")
             if not isinstance(result, list): raise GcpProviderError(f"{collection} inventory pagination shape unknown", category="inventory_unknown")
-            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace) or (collection == "instance_templates" and str(item.get("id")) in known_templates))
+            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace) or (collection == "instance_templates" and (str(item.get("id")), item.get("name")) in known_templates))
         for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
             result = self._gcloud_json(["compute", "resource-policies", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-policy-inventory-{region}")
             if not isinstance(result, list): raise GcpProviderError("resource policy inventory pagination shape unknown", category="inventory_unknown")
@@ -458,7 +592,7 @@ class GcpProviderDriver:
         if not isinstance(global_addresses, list): raise GcpProviderError("global address inventory pagination shape unknown", category="inventory_unknown")
         addresses.extend(item for item in global_addresses if str(item.get("name", "")).startswith(namespace))
         resources = [*instances, *disks, *addresses, *support]
-        return {"pages_complete": True, "zones_scanned": pages, "regions_scanned": sorted({deployment.vm_a.region, deployment.vm_b.region}), "instances": instances, "disks": disks, "addresses": addresses, "support_resources": support, "resources": resources}
+        return {"pages_complete": True, "zone_scope": "all_project_zones", "regions_scanned": sorted({deployment.vm_a.region, deployment.vm_b.region}), "instances": instances, "disks": disks, "addresses": addresses, "support_resources": support, "resources": resources}
 
     @staticmethod
     def _failure(exc: Exception) -> FailureEvidence:
@@ -476,7 +610,7 @@ class GcpProviderDriver:
         known_hosts = self.settings.private_state_root / self._namespace(deployment) / "known_hosts"
         return ProviderVmOutput(role=vm_role, resource_id=str(raw.get("id")), private_ipv4=internal, image_identity=self.settings.images[intent.region], actual_shape=raw.get("machineType", "").rsplit("/", 1)[-1], region=region, zone=zone, placement_metadata=StructuredEvidence(value={"resource_policies": raw.get("resourcePolicies", []), "physical_zone_id": "unavailable"}), connection=RemoteConnectionData(role=vm_role, host=internal, user="benchmark", authentication_reference=self.settings.authentication_reference, host_key_reference=str(known_hosts)), public_ipv4=Evidence[str](value=public) if public else Evidence[str](unavailable_reason="no public management IPv4 observed"), physical_zone_id=StringEvidence(unavailable_reason="GCP physical zone identifier unavailable"))
 
-    def _validate_instance(self, instance: dict[str, Any], deployment: ProviderDeploymentInput, role: str) -> None:
+    def _validate_instance(self, instance: dict[str, Any], deployment: ProviderDeploymentInput, role: str) -> dict[str, Any]:
         intent = deployment.vm_a if role == "vm_a" else deployment.vm_b
         expected_ips = {
             "same_zone": ("10.80.1.10", "10.80.1.11"),
@@ -502,13 +636,24 @@ class GcpProviderDriver:
         if int(disk.get("sizeGb", 0)) != 32 or disk.get("type", "").rsplit("/", 1)[-1] != "pd-balanced":
             raise GcpProviderError("observed boot disk differs from selected 32-GiB pd-balanced disk", category="instance_shape_mismatch")
         expected_image = self.settings.images[intent.region]
-        if disk.get("sourceImage", "").rsplit("/", 1)[-1] != expected_image.rsplit("/", 1)[-1]:
+        observed_image = str(disk.get("sourceImage", ""))
+        if not observed_image or observed_image.split("projects/", 1)[-1] != expected_image.split("projects/", 1)[-1]:
             raise GcpProviderError("observed boot disk image differs from selected pinned image", category="image_mismatch")
         image = self._gcloud_json(["compute", "images", "describe", self.settings.images[intent.region].rsplit("/", 1)[-1], "--project", self.settings.images[intent.region].split("/")[1], "--format=json"], f"gcp-image-read-{role}")
-        if image.get("architecture", "X86_64") != "X86_64":
+        if image.get("architecture") != "X86_64":
             raise GcpProviderError("selected Ubuntu image is not amd64", category="image_mismatch")
+        if image.get("name") != expected_image.rsplit("/", 1)[-1]:
+            raise GcpProviderError("observed image identity differs from selected pinned image", category="image_mismatch")
+        return disk
 
     def _trusted_hostkey(self, name: str, zone: str, initial: dict[str, Any]) -> str:
+        namespace = self._namespace_from_name(name)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", namespace):
+            raise GcpProviderError("provider resource name does not map to a safe attempt namespace", category="state_path_unsafe")
+        hosts_file = self.settings.private_state_root / namespace / "known_hosts"
+        root = self.settings.private_state_root.expanduser().absolute()
+        if any(parent.is_symlink() for parent in (root, *root.parents) if parent.exists()) or hosts_file.parent.is_symlink() or hosts_file.is_symlink() or os.path.commonpath((str(root), str(hosts_file.absolute()))) != str(root):
+            raise GcpProviderError("known_hosts path must remain private and cannot contain symlinks", category="state_path_unsafe")
         before = self._gcloud_json(["compute", "instances", "describe", name, "--zone", zone, "--project", self.settings.project_id, "--format=json"], "gcp-hostkey-instance-before")
         if str(before.get("id")) != str(initial.get("id")) or before.get("zone", "").endswith(zone) is False:
             raise GcpProviderError("instance identity changed before host-key read", category="hostkey_identity_mismatch")
@@ -521,7 +666,6 @@ class GcpProviderDriver:
         key = next((line.strip() for value in candidates for line in value.splitlines() if re.match(r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+) [A-Za-z0-9+/]+={0,2}(?:\s|$)", line.strip())), None)
         if key is None:
             raise GcpProviderError("guest attributes contain no valid OpenSSH host public key", category="hostkey_unavailable")
-        hosts_file = self.settings.private_state_root / self._namespace_from_name(name) / "known_hosts"
         hosts_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(hosts_file.parent, 0o700)
         nic = after.get("networkInterfaces", [{}])[0]

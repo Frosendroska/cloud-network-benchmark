@@ -42,9 +42,128 @@ def test_runtime_requires_complete_sourced_cost_evidence(tmp_path):
         settings(tmp_path, complete_workflow_cost_handoff=StructuredEvidence(value={"source_path": "x", "source_sha256": "a" * 64}))
 
 
+@pytest.mark.parametrize("estimate", [0, -1, float("inf"), True])
+def test_runtime_rejects_invalid_complete_cost_total(tmp_path, estimate):
+    handoff = {"source_path": "tracking/run-register-2026-10-23.csv", "source_sha256": "a" * 64, "prices_checked_on": "2026-10-23", "estimated_total_usd": estimate, "units": {"compute": "hour"}}
+    with pytest.raises(ValidationError):
+        settings(tmp_path, complete_workflow_cost_handoff=StructuredEvidence(value=handoff))
+
+
 def test_runtime_rejects_nonfinite_complete_workflow_estimate(tmp_path):
     with pytest.raises(ValidationError):
         settings(tmp_path, complete_workflow_remaining_seconds=float("inf"))
+
+
+def test_attempt_namespaces_are_isolated_and_reject_traversal(tmp_path):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver, GcpProviderError
+
+    driver = GcpProviderDriver(object(), settings(tmp_path))
+    first = driver._attempt_dir(SimpleNamespace(run_id="run-1", deployment_id="deploy-1"))
+    second = driver._attempt_dir(SimpleNamespace(run_id="run-1", deployment_id="deploy-2"))
+    assert first != second
+    assert first.parent.parent == second.parent.parent
+    with pytest.raises(GcpProviderError, match="safe single path component"):
+        driver._attempt_dir(SimpleNamespace(run_id="../outside", deployment_id="deploy-3"))
+
+
+def test_hostkey_write_rejects_symlinked_attempt_namespace_before_provider_reads(tmp_path):
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver, GcpProviderError
+    root = tmp_path / "state"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "namespace-vm").symlink_to(outside, target_is_directory=True)
+    driver = GcpProviderDriver(object(), settings(tmp_path))
+    with pytest.raises(GcpProviderError, match="known_hosts path"):
+        driver._trusted_hostkey("namespace-vm-a", "europe-west3-a", {"id": "1"})
+
+
+def test_foreign_or_symlinked_attempt_journals_fail_closed(tmp_path):
+    from types import SimpleNamespace
+    import json
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver, GcpProviderError
+    driver=GcpProviderDriver(object(),settings(tmp_path))
+    deployment=SimpleNamespace(run_id="run-1",deployment_id="deploy-1")
+    attempt=driver._attempt_dir(deployment)
+    path=attempt/"attempt.json"
+    path.write_text(json.dumps({"run_id":"foreign-run","deployment_id":"deploy-1"}))
+    with pytest.raises(GcpProviderError,match="journal identity mismatch"):
+        driver._load(attempt,deployment)
+    path.unlink()
+    outside=tmp_path/"foreign.json"
+    outside.write_text("{}")
+    path.symlink_to(outside)
+    with pytest.raises(GcpProviderError,match="journal cannot be a symlink"):
+        driver._load(attempt,deployment)
+
+
+def test_command_deadline_and_journal_store_redacted_durable_views(tmp_path):
+    from datetime import datetime, timezone
+    import json
+    import time
+    from pathlib import Path
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver, GcpProviderError
+
+    class Runner:
+        def __init__(self): self.request = None
+        def run(self, request):
+            self.request = request
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now, finished_at=now, duration_seconds=0.0, exit_code=0, stdout="sensitive-provider-response", stderr="")
+
+    runner = Runner()
+    driver = GcpProviderDriver(runner, settings(tmp_path, command_timeout_seconds=5))
+    attempt = Path(tmp_path) / "state" / "attempt"
+    attempt.mkdir(parents=True)
+    driver._active_attempt = attempt
+    driver._save(attempt, {"run_id": "run-1", "deployment_id": "deploy-1", "commands": []})
+    driver._run("test-action", ["tool", "arg"], attempt, timeout=12)
+    assert runner.request.timeout_seconds == 5
+    driver._save(attempt, {"run_id": "run-1", "deployment_id": "deploy-1", "commands": [], "later_state": "saved"})
+    journal = json.loads((attempt / "attempt.json").read_text())
+    assert journal["later_state"] == "saved"
+    assert len(journal["commands"]) == 1
+    assert journal["commands"][0]["request"]["argv"] == ["tool", "arg"]
+    assert "sensitive-provider-response" not in json.dumps(journal)
+    assert "sha256=" in journal["commands"][0]["result"]["stdout"]
+    driver._deadline = time.monotonic() - 1
+    with pytest.raises(GcpProviderError, match="deadline elapsed"):
+        driver._run("expired-action", ["tool"], attempt)
+
+
+def test_shared_driver_keeps_concurrent_attempt_deadlines_and_journals_isolated(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
+    from threading import Barrier
+    import json
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    barrier=Barrier(2)
+    class Runner:
+        def run(self,request):
+            barrier.wait(timeout=5)
+            now=datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id,outcome="succeeded",started_at=now,finished_at=now,duration_seconds=0.0,exit_code=0,stdout=request.action_id,stderr="")
+    driver=GcpProviderDriver(Runner(),settings(tmp_path))
+    attempts=[]
+    for index in (1,2):
+        path=tmp_path/"state"/f"attempt-{index}"
+        path.mkdir(parents=True)
+        driver._save(path,{"run_id":f"run-{index}","deployment_id":f"deploy-{index}","commands":[]})
+        attempts.append(path)
+    def invoke(index):
+        driver._active_attempt=attempts[index-1]
+        driver._deadline=None
+        driver._run(f"action-{index}",["tool",str(index)],attempts[index-1])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(invoke,(1,2)))
+    for index,path in enumerate(attempts,1):
+        journal=json.loads((path/"attempt.json").read_text())
+        assert len(journal["commands"])==1
+        assert journal["commands"][0]["request"]["action_id"]==f"action-{index}"
+        assert f"action-{3-index}" not in json.dumps(journal)
 
 
 def test_cleanup_success_requires_observed_empty_inventory():

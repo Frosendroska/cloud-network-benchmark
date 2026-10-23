@@ -19,8 +19,40 @@ def test_expiry_time_is_original_cap_minus_initiation_lead():
 
 
 def test_expiry_fit_requires_entire_remaining_workflow_before_trigger():
-    start = datetime.now(timezone.utc) - timedelta(seconds=10)
-    end = datetime.now(timezone.utc) + timedelta(seconds=60)
+    now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+    start = now - timedelta(seconds=10)
+    end = now + timedelta(seconds=60)
     res = reservation(start, end)
+    driver = object.__new__(GcpProviderDriver)
+    driver.clock = lambda: now
     with pytest.raises(GcpProviderError, match="whole remaining workflow"):
-        GcpProviderDriver._fit(res, end-timedelta(seconds=30), 120)
+        driver._fit(res, end-timedelta(seconds=30), 120)
+
+
+def test_expiry_fit_accepts_exact_boundary_but_rejects_new_cap_or_expired_window():
+    now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+    end = now + timedelta(seconds=600)
+    res = reservation(now - timedelta(seconds=1), end)
+    driver = object.__new__(GcpProviderDriver)
+    driver.clock = lambda: now
+    trigger = end - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    assert driver._fit(res, trigger, (trigger - now).total_seconds()) is None
+    with pytest.raises(GcpProviderError, match="whole remaining workflow"):
+        driver._fit(res, trigger, (trigger - now).total_seconds() + 0.001)
+    with pytest.raises(GcpProviderError, match="original reservation cap"):
+        driver._fit(res, trigger + timedelta(seconds=1), 1)
+    future_start = reservation(now + timedelta(seconds=1), end)
+    with pytest.raises(GcpProviderError, match="whole remaining workflow"):
+        driver._fit(future_start, trigger, 1)
+    expired = reservation(now - timedelta(seconds=30), now + timedelta(seconds=20))
+    with pytest.raises(GcpProviderError, match="whole remaining workflow"):
+        driver._fit(expired, now - timedelta(seconds=10), 1)
+
+
+def test_template_creation_must_fall_inside_original_reservation_window():
+    cap_start = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+    registered = cap_start + timedelta(seconds=10)
+    assert GcpProviderDriver._validate_template_created_at("2026-10-23T12:00:05Z", cap_start, registered) == cap_start + timedelta(seconds=5)
+    for invalid in (None, "bad timestamp", "2026-10-23T11:59:59Z", "2026-10-23T12:00:11Z", "2026-10-23T12:00:05"):
+        with pytest.raises(GcpProviderError, match="template creation"):
+            GcpProviderDriver._validate_template_created_at(invalid, cap_start, registered)

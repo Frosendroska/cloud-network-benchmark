@@ -88,10 +88,14 @@ The initial optional extension-file cat returned 1 because no extension file exi
 
 ## Next stage
 
-Planning is complete. F01R_GCP_EXPIRY is integrated and verified. The initial prerequisite blocker above is resolved by PR #17 and the normal merge recorded above. Implementation evidence and remaining incomplete test cases are recorded in `docs/f07-gcp-provider.md`; this checkpoint is ready for Sol convergence review, not cloud acceptance or system readiness.
+Planning is complete. F01R_GCP_EXPIRY is integrated and verified. The initial prerequisite blocker above is resolved by PR #17 and the normal merge recorded above. The implementation checkpoints below update the original planner-stage status; Sol convergence remains separate from cloud acceptance or system readiness.
 
-## Implementation checkpoint (2026-10-23)
+## Earlier implementation checkpoint (2026-10-23)
 
 Current implementation base: `d2bd3bc296c85fb95be7debdcdbd61cbc759369e`; final implementation source commit: `4336ce8c5fe3a7f5dbe542fec365f0310ea7eeb6`. Subsequent commits only record and clarify evidence. The F07 changes are limited to the provider, its two Terraform roots, owned tests, fixture evidence, documentation, and task/handoff records. Latest focused GCP checks passed 19 tests; the full offline suite passed 1,078 tests with zero skips using the official PowerShell path. Both Terraform roots passed backend-disabled init and validate against locked Google provider 7.46.1; provider-schema assertions confirmed native absolute STOP fields, unique template references, and pair source-template binding. Terraform formatting and `git diff --check` passed.
 
-Not complete: T004, T006, T010–T012, T016–T022 and T026 remain unchecked where the full specified isolated-state, cap-edge, scenario matrix, controller-loss, exhaustive failure-injection, pagination/recovery and convergence handoff evidence is incomplete. The code's list commands rely on gcloud CLI pagination and fail closed on command/read shape errors, but do not expose page tokens for separate later-page injection. The task table records implementation status; no Terraform plan/apply/destroy, cloud API, credentials, SSH, benchmark traffic, paid admission, F10 readiness or research conclusions are claimed. The exact current implementation commit and complete command outcomes are in `docs/f07-gcp-provider.md`.
+This earlier checkpoint recorded 13/26 checked tasks and is superseded by the current follow-up evidence in `docs/f07-gcp-provider.md`.
+
+## Current implementation checkpoint (2026-10-23)
+
+The feature branch has continued from the earlier checkpoint. The task table records 25/26 implementation tasks complete; T026 awaits Spec Kit convergence. Current focused and full-suite counts, Terraform/schema commands, revisions and limitations are recorded in `docs/f07-gcp-provider.md`. The inventory commands rely on gcloud's internal pagination and do not expose page tokens for page-specific failure injection. No Terraform plan/apply/destroy, cloud API, credentials, SSH, benchmark traffic, paid admission, F10 readiness or research conclusions are claimed.
