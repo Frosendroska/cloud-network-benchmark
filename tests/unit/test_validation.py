@@ -99,6 +99,94 @@ def test_empty_materialized_bundle_is_unavailable_and_explains_missing_evidence(
     assert len(result.metrics.value["units"]) == 3
 
 
+def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_source(repository_root, tmp_path):
+    from cloud_network_benchmark.acquisition import bind_acquisition_sources
+    from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
+    from cloud_network_benchmark.contracts import ArtifactInput, ArtifactExpectation
+    from cloud_network_benchmark.validation import _acquisition_windows
+    from tests.integration.test_acquisition_producer import _build
+
+    value = make_input(repository_root)
+    unit = value.measurement_units[0]
+    root = tmp_path
+    csv_bytes = b"sockperf native CSV\n"
+    csv_path = root / "measurements" / unit.unit_id / "sockperf.csv"
+    csv_path.parent.mkdir(parents=True)
+    csv_path.write_bytes(csv_bytes)
+    log_id, csv_id = f"{unit.unit_id}-sockperf-observation", f"{unit.unit_id}-sockperf"
+    action_id = f"sockperf-{unit.unit_id}"
+    boot = "12345678-1234-1234-1234-123456789abc"
+    records_raw = [
+        {"format": 1, "tool": "sockperf", "semantics_id": "sockperf-3.10-enabled-v1",
+         "invocation_id": action_id, "pid": 42, "boot_id": boot, "clock": "CLOCK_MONOTONIC",
+         "record_kind": "clock_anchor", "mono_before_ns": 0, "realtime_ns": int(NOW.timestamp()*1e9),
+         "mono_after_ns": 1000},
+        {"format": 1, "tool": "sockperf", "semantics_id": "sockperf-3.10-enabled-v1",
+         "invocation_id": action_id, "pid": 42, "boot_id": boot, "clock": "CLOCK_MONOTONIC",
+         "record_kind": "probe_window", "sender_enabled_ns": 1_000_000_000,
+         "receiver_enabled_ns": 1_000_000_000, "termination_ns": 65_000_000_000,
+         "native_filter_start_ns": 5_000_000_000, "native_filter_end_ns": 65_000_000_000,
+         "termination_reason": "timer"},
+    ]
+    log_bytes = b"".join(b"CNB_ACQ_V1 " + json.dumps(row, separators=(",", ":")).encode() + b"\n"
+                         for row in records_raw)
+    log_path = root / "measurements" / unit.unit_id / "sockperf-acquisition.stderr"
+    log_path.write_bytes(log_bytes)
+
+    def record(artifact_id, path, kind, producer, unit_id, payload):
+        return ArtifactRecord(artifact_id=artifact_id, path=str(path.relative_to(root)), kind=kind,
+            producer=producer, unit_id=unit_id, deployment_id=value.identity.deployment_id,
+            closed=True, size_bytes={"value":len(payload)}, sha256={"value":hashlib.sha256(payload).hexdigest()},
+            retrieval_state="verified")
+
+    native_record = record(csv_id, csv_path, "sockperf-csv", "vm_a", unit.unit_id, csv_bytes)
+    log_record = record(log_id, log_path, "sockperf-observation-stderr", "vm_a", unit.unit_id, log_bytes)
+    build = _build("sockperf", __import__("cloud_network_benchmark.contracts", fromlist=["VmRole"]).VmRole.VM_A,
+                   "f08-vm-a-sockperf-build")
+    build_records = materialize_build_identity_artifacts(root, value.identity.deployment_id, [build])
+    build_record = build_records[0]
+    declarations = dict(value.artifacts)
+    declarations[log_id] = ArtifactInput(artifact_id=log_id, path=log_record.path,
+        kind=log_record.kind, producer=log_record.producer, unit_id=unit.unit_id,
+        expectation=ArtifactExpectation.REQUIRED)
+    declarations[csv_id] = ArtifactInput(artifact_id=csv_id, path=native_record.path,
+        kind=native_record.kind, producer=native_record.producer, unit_id=unit.unit_id,
+        expectation=ArtifactExpectation.REQUIRED)
+    declarations[build_record.artifact_id] = ArtifactInput(artifact_id=build_record.artifact_id,
+        path=build_record.path, kind=build_record.kind, producer=build_record.producer, unit_id=None,
+        expectation=ArtifactExpectation.REQUIRED)
+    mapping = ClockMapping(vm_role="vm_a", monotonic_seconds=0, utc_timestamp=NOW,
+        estimated_error_ms={"value":0}, synchronization_source={"value":"materialized source fixture"})
+    command = CommandEvidence(schema_version=2,
+        request={"action_id":action_id, "argv":[build.binary_path, "under-load", "-t", "65"],
+                 "acquisition_invocation_id":action_id},
+        result={"action_id":action_id, "outcome":"succeeded"}, producer="vm_a",
+        deployment_id=value.identity.deployment_id, unit_id=unit.unit_id,
+        binary_version={"value":build.binary_version}, source_identity={"value":build.source_reference},
+        monotonic_started={"value":0}, monotonic_finished={"value":65},
+        started_at={"value":NOW}, finished_at={"value":NOW+timedelta(seconds=65)})
+    base_records = [log_record, native_record, *build_records]
+    sources = bind_acquisition_sources(child_root=root, run_identity=value.identity, commands=[command],
+        build_evidence=[build], source_artifact_records=base_records, clock_mappings=[mapping])
+    assert len(sources) == 1
+    source = sources[0].model_copy(update={"mapping_indexes":[0]})
+    timing = value.timings[0].model_copy(update={"clock_mappings":[mapping],
+        "acquisition_sources":Evidence(value=[source])})
+    prepared = value.model_copy(update={"child_result_root":str(root), "artifacts":declarations,
+        "artifact_records":base_records, "commands":[command], "timings":[timing]})
+    windows, errors = _acquisition_windows(prepared, timing)
+    assert not errors
+    assert windows == [("sockperf", NOW.timestamp()+5, NOW.timestamp()+65)]
+    source_ref = SourceRef(csv_id, native_record.path, native_record.sha256.value, unit.unit_id,
+                           value.identity.deployment_id, "vm_a", "3.10")
+    sock = NativeParse(samples=(RttSample(0, 5.001, 5.001001, 1.0, source_ref, 1),
+                                RttSample(1, 64.999, 64.999001, 1.0, source_ref, 2)))
+    coverage = _coverage(prepared, unit, sock, None, {unit.unit_id:(windows, errors)})
+    assert coverage["active_probe_seconds"]["value"] == 60
+    assert coverage["complete"] is True
+    assert [sample.packet_index for sample in _measured_samples(prepared, unit, sock, {unit.unit_id:(windows, errors)})] == [0, 1]
+
+
 @pytest.mark.parametrize(("config_name", "mode", "units"), [
     ("exp-001-multi-provider.yaml", "acceptance", 3),
     ("exp-001-multi-provider.yaml", "short_study", 3),
@@ -235,7 +323,10 @@ def test_rtt_selection_excludes_warmup_and_samples_outside_half_open_measured_wi
     ref = SourceRef("sockperf-csv", "samples.csv", "f"*64, unit.unit_id, value.identity.deployment_id, "vm_a", "3.10")
     rows = [RttSample(i, tx, rx, (rx-tx)*1_000_000, ref, i+1) for i, (tx, rx) in enumerate([
         (104.999999, 105.0), (105.0, 105.000001), (164.999999, 164.999999), (165.0, 165.000001)])]
-    selected = _measured_samples(value, unit, NativeParse(samples=tuple(rows)))
+    native = NativeParse(samples=tuple(rows))
+    assert _measured_samples(value, unit, native) == ()
+    acquisition = {unit.unit_id: ([("sockperf", NOW.timestamp() + 5, NOW.timestamp() + 65)], [])}
+    selected = _measured_samples(value, unit, native, acquisition)
     assert [item.packet_index for item in selected] == [1, 2]
 
 

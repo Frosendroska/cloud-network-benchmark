@@ -27,6 +27,72 @@ from .manifests import CampaignManifest, ChildRunManifest
 from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
 
 
+def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming) -> tuple[list[Any], list[str]]:
+    """Replay producer-declared acquisition sources against their materialized F01R bytes."""
+    sources = timing.acquisition_sources.value
+    if not sources:
+        return [], []
+    from .acquisition import iter_source_windows
+    from .bootstrap import BuildObservation
+
+    root = Path(value.child_result_root)
+    windows: list[tuple[str, float, float]] = []
+    errors: list[str] = []
+    for source in sources:
+        referenced = {source.log_artifact_id, source.build_artifact_id, *source.native_artifact_ids}
+        candidates = [record for record in value.artifact_records if record.artifact_id in referenced]
+        # Day layouts reuse declaration IDs for chunk paths. Narrow each helper
+        # replay to the exact source log; the source's native and build IDs must
+        # still resolve uniquely within that same materialized context.
+        candidates = [record for record in candidates if record.artifact_id != source.log_artifact_id
+                      or record.path == source.log_path]
+        try:
+            build_records = [record for record in candidates if record.artifact_id == source.build_artifact_id]
+            if len(build_records) != 1:
+                raise ValueError("source build ArtifactRecord is missing or ambiguous")
+            build_record = build_records[0]
+            build_record.verify_materialized_file(root)
+            raw = _artifact_path(value, build_record).read_bytes()
+            from .acquisition import _parse_build_identity
+            identity = _parse_build_identity(raw)
+            build = BuildObservation(
+                role=str(getattr(build_record.producer, "value", build_record.producer)),
+                tool=str(identity["tool"]), source_reference=str(identity["source_reference"]),
+                source_sha256=str(identity["source_sha256"]), compiler_version=str(identity["compiler_version"]),
+                binary_path=str(identity["binary_path"]), binary_version=str(identity["binary_version"]),
+                binary_sha256=str(identity["binary_sha256"]),
+                capabilities=str(identity["capabilities"]).split(","), artifact_id=build_record.artifact_id,
+                upstream_commit=str(identity["upstream_commit"]), patch_path=str(identity["patch_path"]),
+                patch_sha256=str(identity["patch_sha256"]),
+                build_configuration=str(identity["build_configuration"]),
+                observation_capability=str(identity["observation_capability"]),
+                observation_semantics=str(identity["observation_semantics"]), identity_bytes=raw.decode("utf-8"))
+            source_commands = [command for command in value.commands
+                if (command.result.get("action_id") or command.request.get("action_id")) == source.command_action_id]
+            if len(source_commands) != 1:
+                raise ValueError("source build must match one recorded producing command")
+            command = source_commands[0]
+            if (command.binary_version.value != build.binary_version
+                    or command.source_identity.value != build.source_reference):
+                raise ValueError("producing command version/source identity contradicts its verified build")
+            mapping_indexes = source.mapping_indexes or [index for index, item in enumerate(timing.clock_mappings)
+                if str(getattr(item.vm_role, "value", item.vm_role)) == str(getattr(source.producer, "value", source.producer))]
+            mappings = [timing.clock_mappings[index] for index in mapping_indexes
+                        if index < len(timing.clock_mappings)]
+            if len(mappings) != 1 or mappings[0].estimated_error_ms.value is None:
+                raise ValueError("source clock domain lacks one bounded clock mapping")
+            mapping = mappings[0]
+            uncertainty = mapping.estimated_error_ms.value / 1000
+            for window in iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings):
+                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
+                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
+                if window.has_positive_inner_support and end > start:
+                    windows.append((source.tool, start, end))
+        except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
+    return windows, errors
+
+
 def _finding(code: str, severity: str, message: str, *, unit: str | None = None,
              artifact: str | None = None) -> ValidationFinding:
     return ValidationFinding(code=code, severity=severity, message=message,
@@ -667,8 +733,9 @@ def _invocation_probe_counts(sock: NativeParse) -> tuple[Any, ...]:
     return total or _valid_probe_counts(sock)
 
 
-def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse) -> tuple[Any, ...]:
-    """Keep only samples whose complete source-native RTT lies inside the measured window."""
+def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse,
+                      acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None) -> tuple[Any, ...]:
+    """Keep samples corroborated by native RTT, lifecycle, measured bounds, and gaps."""
     timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
     if timing is None or timing.measured_started_at.value is None or timing.measured_finished_at.value is None:
         return ()
@@ -679,11 +746,16 @@ def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse) -> tu
         return ()
     start, end = timing.measured_started_at.value.timestamp(), timing.measured_finished_at.value.timestamp()
     error = mapping.estimated_error_ms.value / 1000
+    lifecycle = [(left, right) for tool, left, right in (acquisition or {}).get(unit.unit_id, ([], []))[0]
+                 if tool == "sockperf"]
+    if not lifecycle:
+        return ()
     result = []
     for sample in sock.samples:
         tx = mapping.utc_timestamp.timestamp() + sample.tx_seconds - mapping.monotonic_seconds
         rx = mapping.utc_timestamp.timestamp() + sample.rx_seconds - mapping.monotonic_seconds
         if (tx - error >= start and rx + error < end
+                and any(tx - error >= left and rx + error <= right for left, right in lifecycle)
                 and not any(gap.started_at.timestamp() < rx + error
                             and gap.finished_at.timestamp() > tx - error for gap in timing.gaps)):
             result.append(sample)
@@ -895,7 +967,8 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
     return findings
 
 
-def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativeParse | None) -> dict[str, Any]:
+def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativeParse | None,
+              acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None) -> dict[str, Any]:
     requested = unit.measured_seconds
     unit_timings = [t for t in value.timings if t.unit_id == unit.unit_id]
     timing = unit_timings[0] if len(unit_timings) == 1 else None
@@ -921,216 +994,80 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
         if tcp is not None and len(tcp.sessions) != 1:
             contiguous = False
         full_duration = full_duration and contiguous
-    active = None
-    bracket = None
     phase = str(getattr(unit.phase, "value", unit.phase))
-    probe_start = timing.probe_test_started_at.value if timing else None
-    invocation_counts = _invocation_probe_counts(sock)
-    runtime_values = [item.runtime_seconds.value for item in invocation_counts if item.runtime_seconds.value is not None]
-    runtime = runtime_values[0] if len(runtime_values) == 1 else None
-    chunk_warmup = 5 if unit.kind == "probe_chunk" and next((u for u in value.measurement_units if u.kind == "probe_chunk"), None) == unit else 0
-    warmup = (5 if unit.kind != "probe_chunk" else chunk_warmup)
-    valid_duration_scope = len(invocation_counts) == 1 and invocation_counts[0].reporting_scope == "[Valid Duration]"
-    runtime_offset = warmup if valid_duration_scope else 0
-    probe_windows: list[tuple[float, float]] = []
-    probe_epoch = probe_start.timestamp() if probe_start else None
-    if probe_epoch is not None and runtime is not None and runtime > 0 and "vm_a" in clock_errors:
-        error = clock_errors["vm_a"]
-        probe_windows.append((probe_epoch + warmup + error, probe_epoch + runtime_offset + runtime - error))
-    if timing:
-        for gap in timing.gaps:
-            gap_start, gap_end = gap.started_at.timestamp(), gap.finished_at.timestamp()
-            split: list[tuple[float, float]] = []
-            for start, end in probe_windows:
-                if gap_end <= start or gap_start >= end:
-                    split.append((start, end))
-                else:
-                    if start < gap_start:
-                        split.append((start, gap_start))
-                    if gap_end < end:
-                        split.append((gap_end, end))
-            probe_windows = split
-    if unit.kind != "continuous_day":
-        probe_command = next((command for command in value.commands
-            if command.unit_id == unit.unit_id and command.producer == "vm_a"
-            and isinstance(command.request.get("argv"), list) and command.request["argv"]
-            and "sockperf" in str(command.request["argv"][0]).lower()
-            and "under-load" in command.request["argv"]), None)
-        if (probe_command is None or probe_command.result.get("outcome") != "succeeded"
-                or probe_command.started_at.value is None or probe_command.finished_at.value is None):
-            probe_windows = []
-        else:
-            command_start = probe_command.started_at.value.timestamp()
-            command_end = probe_command.finished_at.value.timestamp()
-            probe_windows = [(max(start, command_start), min(end, command_end))
-                             for start, end in probe_windows if min(end, command_end) > max(start, command_start)]
-    sample_support = None
-    sample_bounds_utc = None
-    if unit.kind not in {"continuous_day"} and sock.samples and timing:
-        mapping = next((m for m in timing.clock_mappings if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
-                        and m.estimated_error_ms.value is not None), None)
-        if mapping:
-            error = mapping.estimated_error_ms.value / 1000
-            sample_start = mapping.utc_timestamp.timestamp() + min(s.tx_seconds for s in sock.samples) - mapping.monotonic_seconds + error
-            sample_end = mapping.utc_timestamp.timestamp() + max(s.rx_seconds for s in sock.samples) - mapping.monotonic_seconds - error
-            sample_bounds_utc = (sample_start, sample_end)
-            sample_support = round(sum(max(0.0, min(end, sample_end) - max(start, sample_start))
-                                       for start, end in probe_windows), 6)
-
-    def overlap(start: float, duration: float) -> float:
-        end = start + duration
-        # Input wall-clock bounds are microsecond precision; round off binary timestamp
-        # representation noise at that source precision, never at a policy threshold.
-        return round(sum(max(0.0, min(end, p_end) - max(start, p_start))
-                         for p_start, p_end in probe_windows), 6)
-
-    tcp_start = timing.measured_started_at.value.timestamp() if timing and timing.measured_started_at.value else None
-    tcp_finish = timing.measured_finished_at.value.timestamp() if timing and timing.measured_finished_at.value else None
-    if phase == "idle_latency":
-        if probe_windows:
-            active = sum(end - start for start, end in probe_windows)
-            if timing and timing.measured_started_at.value and timing.measured_finished_at.value:
-                actual_start = timing.measured_started_at.value.timestamp()
-                actual_end = timing.measured_finished_at.value.timestamp()
-                active = min(active, max(0.0, min(actual_end, probe_windows[-1][1]) - max(actual_start, probe_windows[0][0])))
-    elif observed is not None and probe_windows:
-        if tcp_start is not None and tcp_finish is not None:
-            timing_duration = tcp_finish - tcp_start
-            if math.isclose(timing_duration, observed, rel_tol=0, abs_tol=1e-6) and "vm_b" in clock_errors:
-                error = clock_errors["vm_b"]
-                lower, upper = tcp_start - error, tcp_start + error
-                candidates = [lower, upper]
-                for p_start, p_end in probe_windows:
-                    candidates.extend((p_start - observed, p_end - observed, p_start, p_end))
-                possible = [candidate for candidate in candidates if lower <= candidate <= upper]
-                active = min((overlap(candidate, observed) for candidate in possible), default=0.0)
-            else:
-                bracket = {"unavailable_reason": "timing window duration contradicts native receiver duration"}
-        else:
-            command = next((c for c in value.commands if c.unit_id == unit.unit_id and c.producer == "vm_a"
-                            and isinstance(c.request.get("argv"), list)
-                            and any("iperf3" in str(token) for token in c.request.get("argv", []))), None)
-            mapping = next((m for m in timing.clock_mappings if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
-                            and m.estimated_error_ms.value is not None), None) if timing else None
-            omitted = sum(i.seconds for i in (tcp.receiver_intervals if tcp else ()) if i.omitted)
-            duration = observed
-            if command and mapping and omitted > 0 and duration > 0 and command.monotonic_started.value is not None and command.monotonic_finished.value is not None:
-                c0 = command.monotonic_started.value + omitted
-                c1 = command.monotonic_finished.value - duration
-                if c0 <= c1:
-                    error = mapping.estimated_error_ms.value / 1000
-                    utc0 = mapping.utc_timestamp.timestamp() + c0 - mapping.monotonic_seconds - error
-                    utc1 = mapping.utc_timestamp.timestamp() + c1 - mapping.monotonic_seconds + error
-                    candidates = [utc0, utc1]
-                    for p_start, p_end in probe_windows:
-                        candidates.extend((p_start - duration, p_end - duration, p_start, p_end))
-                    starts = [candidate for candidate in candidates if utc0 <= candidate <= utc1]
-                    minimum = min((overlap(candidate, duration) for candidate in starts), default=0.0)
-                    if sample_bounds_utc is not None:
-                        sample_supported = []
-                        for candidate in starts:
-                            left, right = max(candidate, sample_bounds_utc[0]), min(candidate + duration, sample_bounds_utc[1])
-                            sample_supported.append(sum(max(0.0, min(right, p_end) - max(left, p_start))
-                                for p_start, p_end in probe_windows) if right > left else 0.0)
-                        minimum = min(minimum, min(sample_supported, default=0.0))
-                    active = minimum
-                    bracket = {"start_utc_lower": utc0, "start_utc_upper": utc1,
-                               "coverage_lower_bound_seconds": minimum,
-                               "exact_utc_start_available": False}
-                else:
-                    bracket = {"unavailable_reason": "conservative TCP measured-start bracket is empty"}
-    if unit.kind not in {"continuous_day"}:
-        if sample_support is None:
-            active = None
-        elif phase == "idle_latency":
-            if sample_support < requested * .99:
-                active = None
-        elif active is not None:
-            # Sample support elsewhere in the run cannot corroborate a disjoint
-            # TCP measured window.
-            if tcp_start is not None and tcp_finish is not None and sample_bounds_utc is not None:
-                left, right = max(tcp_start, sample_bounds_utc[0]), min(tcp_finish, sample_bounds_utc[1])
-                corroborated = sum(max(0.0, min(right, p_end) - max(left, p_start))
-                                   for p_start, p_end in probe_windows) if right > left else 0.0
-                active = min(active, corroborated)
-            elif tcp_start is not None and tcp_finish is not None:
-                active = None
-    if unit.kind == "probe_chunk":
-        if probe_windows and sock.samples and timing:
-            mapping = next((m for m in timing.clock_mappings if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
-                            and m.estimated_error_ms.value is not None), None)
-            if mapping:
-                error = mapping.estimated_error_ms.value / 1000
-                first = min(sample.tx_seconds for sample in sock.samples)
-                last = max(sample.rx_seconds for sample in sock.samples)
-                native_start = mapping.utc_timestamp.timestamp() + first - mapping.monotonic_seconds - error
-                native_end = mapping.utc_timestamp.timestamp() + last - mapping.monotonic_seconds + error
-                probe_windows = [(max(start, native_start), min(end, native_end))
-                                 for start, end in probe_windows if min(end, native_end) > max(start, native_start)]
-        active = sum(end - start for start, end in probe_windows) if probe_windows else None
+    acquisition = acquisition or {}
+    source_windows = [(start, end) for tool, start, end in acquisition.get(unit.unit_id, ([], []))[0]
+                      if tool == "sockperf"]
+    source_errors = acquisition.get(unit.unit_id, ([], []))[1]
     if unit.kind == "continuous_day":
-        day_start = timing.measured_started_at.value.timestamp() if timing and timing.measured_started_at.value and "vm_b" in clock_errors else None
-        day_end = timing.measured_finished_at.value.timestamp() if timing and timing.measured_finished_at.value and "vm_b" in clock_errors else None
-        if day_start is not None and day_end is not None:
-            day_start += clock_errors["vm_b"]
-            day_end -= clock_errors["vm_b"]
-        chunk_windows: list[tuple[float, float]] = []
-        chunks = [item for item in value.measurement_units if item.kind == "probe_chunk"]
-        for chunk in chunks:
-            chunk_sock, _ = _parse_unit(value, chunk, {})
-            chunk_timing = next((t for t in value.timings if t.unit_id == chunk.unit_id), None)
-            starts_at = chunk_timing.probe_test_started_at.value if chunk_timing else None
-            invocation_counts = _invocation_probe_counts(chunk_sock)
-            runtimes = [count.runtime_seconds.value for count in invocation_counts if count.runtime_seconds.value is not None]
-            chunk_error = next((m.estimated_error_ms.value / 1000 for m in chunk_timing.clock_mappings
-                                if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
-                                and m.estimated_error_ms.value is not None), None) if chunk_timing else None
-            if starts_at is None or len(runtimes) != 1 or chunk_error is None or day_start is None or day_end is None:
-                continue
-            warmup_for_chunk = 5 if chunk == chunks[0] else 0
-            valid_scope = len(invocation_counts) == 1 and invocation_counts[0].reporting_scope == "[Valid Duration]"
-            start = starts_at.timestamp() + warmup_for_chunk + chunk_error
-            end = starts_at.timestamp() + warmup_for_chunk * (1 if valid_scope else 0) + runtimes[0] - chunk_error
-            if day_start is not None and day_end is not None:
-                start, end = max(start, day_start), min(end, day_end)
-            if chunk_sock.samples:
-                mapping = next((m for m in chunk_timing.clock_mappings if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
-                                and m.estimated_error_ms.value is not None), None)
-                if mapping:
-                    error = mapping.estimated_error_ms.value / 1000
-                    native_start = mapping.utc_timestamp.timestamp() + min(s.tx_seconds for s in chunk_sock.samples) - mapping.monotonic_seconds - error
-                    native_end = mapping.utc_timestamp.timestamp() + max(s.rx_seconds for s in chunk_sock.samples) - mapping.monotonic_seconds + error
-                    start, end = max(start, native_start), min(end, native_end)
-            segments = [(start, end)] if end > start else []
-            for gap in chunk_timing.gaps if chunk_timing else []:
-                left, right = gap.started_at.timestamp(), gap.finished_at.timestamp()
-                remainder = []
-                for seg_start, seg_end in segments:
-                    if right <= seg_start or left >= seg_end:
-                        remainder.append((seg_start, seg_end))
-                    else:
-                        if seg_start < left:
-                            remainder.append((seg_start, left))
-                        if right < seg_end:
-                            remainder.append((right, seg_end))
-                segments = remainder
-            chunk_windows.extend(segments)
-        merged: list[list[float]] = []
-        for start, end in sorted(chunk_windows):
-            if merged and start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], end)
-            else:
-                merged.append([start, end])
-        active = sum(end - start for start, end in merged) if merged else None
-    # F01R carries probe notification/runtime and measured sample timestamps,
-    # but no source-bound acquisition-window intervals. Those establish
-    # invocation and point observations; they do not prove continuous active-
-    # probe coverage between observations. Keep the derived candidates above
-    # as diagnostics only until such evidence exists in an owned materialized
-    # source.
+        source_windows = [(start, end) for chunk in value.measurement_units if chunk.kind == "probe_chunk"
+                          for tool, start, end in acquisition.get(chunk.unit_id, ([], []))[0]
+                          if tool == "sockperf"]
+        source_errors = [error for chunk in value.measurement_units if chunk.kind == "probe_chunk"
+                         for error in acquisition.get(chunk.unit_id, ([], []))[1]]
     active = None
     ratio = None
-    bracket = {"unavailable_reason": "source-bound active-probe acquisition intervals are not recorded"}
+    bracket: dict[str, Any] = {"unavailable_reason": source_errors[0] if source_errors else
+        "source-bound active-probe acquisition intervals are not recorded"}
+    probe_windows = source_windows
+    if source_windows and timing:
+        vm_role = "vm_a" if phase == "idle_latency" or unit.kind == "probe_chunk" else "vm_b"
+        clock_error = next((m.estimated_error_ms.value / 1000 for m in timing.clock_mappings
+                            if str(getattr(m.vm_role, "value", m.vm_role)) == vm_role
+                            and m.estimated_error_ms.value is not None), None)
+        if clock_error is not None:
+            if unit.kind == "probe_chunk" and timing.probe_test_started_at.value is not None:
+                left = timing.probe_test_started_at.value.timestamp() + clock_error
+                right = left - 2 * clock_error + unit.measured_seconds
+            elif timing.measured_started_at.value and timing.measured_finished_at.value:
+                left = timing.measured_started_at.value.timestamp() + clock_error
+                right = timing.measured_finished_at.value.timestamp() - clock_error
+            else:
+                left = right = 0.0
+            if right > left:
+                clipped = [(max(start, left), min(end, right)) for start, end in source_windows
+                           if min(end, right) > max(start, left)]
+            else:
+                clipped = []
+            for gap in timing.gaps:
+                gap_left, gap_right = gap.started_at.timestamp(), gap.finished_at.timestamp()
+                remaining: list[tuple[float, float]] = []
+                for start, end in clipped:
+                    if gap_right <= start or gap_left >= end:
+                        remaining.append((start, end))
+                    else:
+                        if start < gap_left:
+                            remaining.append((start, gap_left))
+                        if gap_right < end:
+                            remaining.append((gap_right, end))
+                clipped = remaining
+            active = sum(end - start for start, end in clipped)
+            probe_windows = clipped
+            bracket = {"source": "F01R acquisition helper", "interval_count": len(source_windows),
+                       "coverage_bound": "clock-adjusted inner support",
+                       "measured_window_seconds": max(0.0, right - left)}
+        else:
+            bracket = {"unavailable_reason": "measured-window clock error is unbounded"}
+    if source_errors:
+        active = None
+        bracket = {"unavailable_reason": source_errors[0]}
+    sample_support = None
+    sample_bounds_utc = None
+    if unit.kind != "continuous_day" and sock.samples and timing:
+        sample_mapping = next((m for m in timing.clock_mappings
+                               if str(getattr(m.vm_role, "value", m.vm_role)) == "vm_a"
+                               and m.estimated_error_ms.value is not None), None)
+        if sample_mapping:
+            sample_error = sample_mapping.estimated_error_ms.value / 1000
+            sample_start = (sample_mapping.utc_timestamp.timestamp()
+                            + min(sample.tx_seconds for sample in sock.samples)
+                            - sample_mapping.monotonic_seconds + sample_error)
+            sample_end = (sample_mapping.utc_timestamp.timestamp()
+                          + max(sample.rx_seconds for sample in sock.samples)
+                          - sample_mapping.monotonic_seconds - sample_error)
+            sample_bounds_utc = (sample_start, sample_end)
+            sample_support = sum(max(0.0, min(end, sample_end) - max(start, sample_start))
+                                 for start, end in probe_windows)
     if unit.kind == "probe_chunk":
         ratio = active / requested if active is not None and requested else None
     elif phase == "idle_latency":
@@ -1141,12 +1078,18 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
         ratio = active / requested if active is not None and requested else None
         complete = full_duration and ratio is not None and ratio >= .99 and tcp is not None and len(tcp.sessions) == 1
     elif phase == "idle_latency":
-        complete = active is not None and active >= requested and sample_support is not None and sample_support >= requested * .99
+        complete = active is not None and active >= requested
     elif unit.kind == "probe_chunk":
         complete = active is not None
     else:
         complete = full_duration and ratio is not None and ratio >= .99
     reason = None if complete else "required measured duration or active-probe coverage is unproven"
+    verified_tools = {tool for tool, _start, _end in acquisition.get(unit.unit_id, ([], []))[0]}
+    tcp_acquisition_errors = acquisition.get(unit.unit_id, ([], []))[1]
+    if unit.kind != "probe_chunk" and phase != "idle_latency" and "iperf3" not in verified_tools:
+        tcp_acquisition_errors = [*tcp_acquisition_errors, "receiver acquisition session is not source-verified"]
+    if phase != "idle_latency":
+        complete = complete and not tcp_acquisition_errors
     return {"requested_seconds": requested,
             "observed_receiver_seconds": _evidence(observed, "receiver measured duration is unavailable") if tcp_stats else _evidence(None, "receiver evidence unavailable"),
             "active_probe_seconds": _evidence(active, "active probe overlap is unavailable"),
@@ -1155,7 +1098,7 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
             "complete": complete,
             "tcp_start_bracket": bracket,
             "gaps": [gap.model_dump(mode="json") for gap in timing.gaps] if timing else [],
-            "unavailable_reason": reason}
+            "unavailable_reason": reason or (tcp_acquisition_errors[0] if tcp_acquisition_errors else None)}
 
 
 def _sequence_timing_findings(value: ValidatorInput, parsed: dict[str, NativeParse]) -> list[ValidationFinding]:
@@ -1201,6 +1144,12 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     resolved_findings, resolved_obj = _resolved_snapshot_findings(value)
     findings.extend(resolved_findings)
     findings.extend(_command_findings(value))
+    acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] = {}
+    for timing in value.timings:
+        windows, errors = _acquisition_windows(value, timing)
+        acquisition[timing.unit_id] = (windows, errors)
+        findings.extend(_finding("provenance.acquisition_source_invalid", "error", error,
+                                 unit=timing.unit_id) for error in errors)
     if value.retrieval_failure is not None:
         findings.append(_finding("retrieval.failed", "warning", "artifact retrieval failure is recorded; bundle cannot be complete"))
     units_payload: list[dict[str, Any]] = []
@@ -1215,7 +1164,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
         findings.extend(sock.findings)
         if tcp:
             findings.extend(tcp.findings)
-        measured_samples = _measured_samples(value, unit, sock)
+        measured_samples = _measured_samples(value, unit, sock, acquisition)
         rtt = rtt_statistics([s.rtt_us for s in measured_samples])
         tcp_stats = _tcp_statistics(tcp)
         counts = []
@@ -1243,7 +1192,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
             for item in sock.probe_counts
         ):
             findings.append(_finding("generation.unavailable", "warning", "valid-duration sent/runtime evidence is unavailable", unit=unit.unit_id))
-        coverage = _coverage(value, unit, sock, tcp)
+        coverage = _coverage(value, unit, sock, tcp, acquisition)
         if sock.samples or (tcp and (tcp.receiver_intervals or tcp.receiver_totals)):
             any_measurement = True
         if not coverage["complete"]:
