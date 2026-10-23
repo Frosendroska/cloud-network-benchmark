@@ -964,6 +964,185 @@ def test_f03_mode_commands_bind_and_replay_raw_sockperf_sources(mode, repository
     assert all(_tool_name(handle.request.argv) == "sockperf" for handle in processes.handles if _tool_name(handle.request.argv) == "sockperf")
 
 
+def test_diagnostic_day_real_retrieval_records_cross_validator_and_replay_boundaries(repository_root, tmp_path):
+    """Keep producer IDs unchanged through layout, retrieval, DTO and both source helpers."""
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.contracts.campaign import PhaseConfiguration
+    from cloud_network_benchmark.contracts.validation import ValidatorInput, artifact_inputs
+    from cloud_network_benchmark.contracts.artifacts import ARTIFACTS, ArtifactInput
+    from cloud_network_benchmark.retrieval import RetrievalItem, RetrievalManifest, run_retrieval
+    from fixtures.f02r.support import connection as fixture_connection, deadline, result as command_result
+
+    resolved = observation(repository_root, "diagnostic_day")
+    remote = fixture_connection(tmp_path)
+    identity = context(resolved, tmp_path).identity.model_copy(update={
+        "campaign_id": "campaign", "observation_id": "campaign-aws-observation",
+        "run_id": "campaign-aws", "deployment_id": "campaign-aws-deployment"})
+    remote = remote.model_copy(update={"identity": identity, "run_id": identity.run_id,
+        "deployment_id": identity.deployment_id})
+    runtime = dataclass_replace(context(resolved, tmp_path), identity=identity)
+    clock = FakeClock()
+    processes = _fixture_processes(clock)
+    builds = [_build("sockperf", VmRole.VM_A, "sock-build"),
+              _build("iperf3", VmRole.VM_A, "iperf-client-build"),
+              _build("iperf3", VmRole.VM_B, "iperf-build")]
+    runtime = dataclass_replace(runtime, build_observations=tuple(builds))
+    produced = run_measurement(resolved, runtime, processes=processes, clock=clock)
+    assert produced.outcome == "succeeded"
+    day = resolved.measurement_units[0]
+    probe_commands = [command for command in produced.command_evidence
+        if _tool_name(command.request.get("argv", [None])) == "sockperf"][:2]
+    assert len(probe_commands) == 2
+    chunk_units = []
+    for command in probe_commands:
+        note = next(note for note in produced.timing_notes if note.get("unit_id") == command.unit_id)
+        assert note["parent_unit_id"] == day.unit_id
+        seconds = int(command.request["argv"][command.request["argv"].index("-t") + 1])
+        chunk_units.append(PhaseConfiguration(unit_id=command.unit_id, kind="probe_chunk",
+            phase="multi_flow", measured_seconds=seconds, parent_unit_id=note["parent_unit_id"]))
+    units = [day, *chunk_units]
+    layout = ARTIFACTS.for_mode("diagnostic_day", units)
+    all_declarations = layout.declarations_for_mode("diagnostic_day", units)
+    declaration_by_id = {item.artifact_id: item for item in all_declarations}
+
+    # Source bytes are exactly those materialized by F03 plus the existing native fixture for
+    # the persistent receiver. The fake transfer verifies their exact size and SHA-256.
+    payloads: dict[str, bytes] = {}
+    tcp_handle = next(handle for handle in processes.handles if _tool_name(handle.request.argv) == "iperf3")
+    # The existing F03 fake process emits its bounded lifecycle JSON shape; replace it with the
+    # repository's native JSONL fixture at that same producer-owned path before retrieval.
+    client_payload = _native_iperf_client_jsonl("native-cookie-1", duration=86400)
+    tcp_handle.stdout_path.write_bytes(client_payload)
+    payloads["day-iperf3-client"] = client_payload
+    payloads["day-iperf3-observation"] = (tmp_path / "measurements/day/iperf3-acquisition.stderr").read_bytes()
+    native_receiver = _native_iperf_server_jsonl("native-cookie-1", duration=86400)
+    receiver_log = (ROOT / "iperf-receiver.log").read_bytes().replace(b'"duration":60', b'"duration":86400')
+    payloads["iperf3_server_log"] = native_receiver
+    payloads["iperf3_server_error"] = receiver_log
+    items = []
+    declarations = []
+
+    def add_item(declaration: ArtifactInput, artifact_id: str, path: str, unit_id: str | None,
+                 producer: str, payload: bytes):
+        if declaration.artifact_id not in {row.artifact_id for row in declarations}:
+            declarations.append(declaration)
+        vm = remote.vm_a if producer == "vm_a" else remote.vm_b
+        source_path = f"/var/lib/cnb/work/{artifact_id}.src"
+        item = RetrievalItem(artifact_id=artifact_id, deployment_id=remote.deployment_id,
+            source_vm=vm.host, source_role=producer, source_path=source_path, destination_path=path,
+            kind=declaration.kind, unit_id=unit_id, expected_size_bytes=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(), timeout_seconds=5)
+        items.append(item)
+        payloads[artifact_id] = payload
+
+    for fixed_id in ("day-iperf3-client", "day-iperf3-observation"):
+        declaration = declaration_by_id[fixed_id]
+        add_item(declaration, fixed_id, declaration.path, day.unit_id, "vm_a", payloads[fixed_id])
+    for command, chunk in zip(probe_commands, chunk_units):
+        handle = next(row for row in processes.handles if row.request.action_id == command.result["action_id"])
+        csv_path = Path(handle.request.argv[handle.request.argv.index("--full-log") + 1])
+        for family_id in ("day-probe-csv", "day-probe-log", "day-probe-observation"):
+            declaration = declaration_by_id[family_id]
+            path = declaration.path_template.replace("{chunk_id}", chunk.unit_id)
+            artifact_id = family_id + "-" + chunk.unit_id
+            payload = (csv_path.read_bytes() if family_id == "day-probe-csv" else
+                       handle.stderr_path.read_bytes())
+            add_item(declaration, artifact_id, path, chunk.unit_id, "vm_a", payload)
+    for fixed_id in ("iperf3_server_log", "iperf3_server_error"):
+        declaration = declaration_by_id[fixed_id]
+        add_item(declaration, fixed_id, declaration.path, None, "vm_b", payloads[fixed_id])
+
+    manifest_time = datetime.now(timezone.utc)
+    manifest = RetrievalManifest(identity=remote.identity.model_dump(), deployment_id=remote.deployment_id,
+        remote_workspace="/var/lib/cnb/work", declarations=declarations, items=items,
+        measurement_ended_at=manifest_time, producers_closed_at=manifest_time,
+        closure_evidence="fake producer observed closed files after F03 returned")
+
+    class TransferRunner:
+        def run(self, request):
+            if request.action_type == "ssh":
+                artifact_id = request.action_id.removeprefix("f02r-retrieve-observe-")
+                payload = payloads[artifact_id]
+                output = f"{len(payload)} {hashlib.sha256(payload).hexdigest()}"
+            else:
+                artifact_id = request.action_id.removeprefix("f02r-retrieve-").rsplit("-", 1)[0]
+                Path(request.argv[-1]).write_bytes(payloads[artifact_id])
+                output = ""
+            return command_result(request.action_id, output)
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    fetched = run_retrieval(remote, manifest, TransferRunner(), bundle, deadline=deadline(), clock=lambda: 100)
+    assert fetched.complete and len(fetched.records) == len(items)
+    retrieved = fetched.records
+    for record in retrieved:
+        record.verify_materialized_file(bundle)
+
+    # The DTO receives the actual retrieval output unchanged.
+    all_artifacts = artifact_inputs(layout, mode="diagnostic_day", measurement_units=units)
+    validator = ValidatorInput(schema_version=2, identity=runtime.identity, mode="diagnostic_day",
+        context="standard", campaign_manifest_path="results/manifests/campaign.json",
+        child_manifest_path="results/manifests/run.json", child_result_root="results/raw/run",
+        config_snapshot_path="results/raw/run/config.yaml", config_sha256="a" * 64,
+        resolved_snapshot_path="results/raw/run/config.resolved.json", provider="aws", scenario="same_zone",
+        enabled_phases=["multi_flow"], expected_vm_roles=["vm_a", "vm_b"],
+        measurement_direction="vm_a_to_vm_b", artifacts=all_artifacts, measurement_units=units,
+        artifact_records=retrieved, commands=[*probe_commands, *[row for row in produced.command_evidence
+            if _tool_name(row.request.get("argv", [None])) == "iperf3"]], execution_state="succeeded",
+        cleanup_state="not_started", failure=None, cleanup_failure=None,
+        vm_metadata={"unavailable_reason":"fixture"}, provider_metadata={"unavailable_reason":"fixture"},
+        tool_versions={"unavailable_reason":"fixture"}, implementation_git_commit={"unavailable_reason":"fixture"},
+        design_git_commit={"unavailable_reason":"fixture"})
+    assert validator.artifact_records == retrieved
+    all_records = [*retrieved, *_build_records(bundle, runtime.identity.deployment_id, builds)]
+    raw_hashes = {item.artifact_id: hashlib.sha256((bundle / item.path).read_bytes()).hexdigest()
+        for item in retrieved}
+    receiver_command = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None, runtime.identity.deployment_id)
+    sources = bind_acquisition_sources(child_root=bundle, run_identity=runtime.identity,
+        commands=produced.command_evidence, receiver_command_evidence=[receiver_command],
+        build_evidence=builds, source_artifact_records=all_records)
+    replayed = [(source, list(iter_source_windows(bundle, source, all_records,
+        (*produced.command_evidence, receiver_command), builds))) for source in sources]
+    sockperf = [windows for source, windows in replayed if source.tool == "sockperf"]
+    assert len(sockperf) == 2 and all(windows for windows in sockperf)
+    assert all(window.has_positive_inner_support for windows in sockperf for window in windows)
+    assert sum(source.tool == "iperf3" for source, _ in replayed) == 1
+    tcp_windows = next(windows for source, windows in replayed if source.tool == "iperf3")
+    assert len(tcp_windows) == 2 and any(window.omitted for window in tcp_windows)
+    sock_windows = sorted((window for windows in sockperf for window in windows),
+        key=lambda window: window.start_earliest_ns)
+    assert sock_windows[0].end_latest_ns < sock_windows[1].start_earliest_ns
+    assert raw_hashes == {item.artifact_id: hashlib.sha256((bundle / item.path).read_bytes()).hexdigest()
+        for item in retrieved}
+    # A historical base-family record is readable at the bundle boundary but cannot be
+    # promoted into a source reference; the other verified chunk remains independently usable.
+    first_observation = next(item for item in retrieved
+        if item.artifact_id == f"day-probe-observation-{chunk_units[0].unit_id}")
+    legacy_path = "measurements/day/probes/legacy-probe.acquisition.stderr"
+    legacy_target = bundle / legacy_path
+    legacy_target.parent.mkdir(parents=True, exist_ok=True)
+    legacy_target.write_bytes((bundle / first_observation.path).read_bytes())
+    legacy_observation = ArtifactRecord.model_validate({**first_observation.model_dump(),
+        "artifact_id": "day-probe-observation", "path": legacy_path, "unit_id": None})
+    legacy_records = [legacy_observation if item is first_observation else item for item in retrieved]
+    legacy_validator = ValidatorInput.model_validate({**validator.model_dump(), "artifact_records": legacy_records})
+    assert legacy_validator.artifact_records == legacy_records
+    legacy_sources = bind_acquisition_sources(child_root=bundle, run_identity=runtime.identity,
+        commands=produced.command_evidence, receiver_command_evidence=[receiver_command],
+        build_evidence=builds, source_artifact_records=[*legacy_records, *all_records[len(retrieved):]])
+    assert sum(source.tool == "sockperf" for source in legacy_sources) == 1
+    assert sum(source.tool == "iperf3" for source in legacy_sources) == 1
+    first_log = bundle / first_observation.path
+    closed_bytes = first_log.read_bytes()
+    first_log.write_bytes(b"corrupt after the verified retrieval record was materialized")
+    after_corruption = bind_acquisition_sources(child_root=bundle, run_identity=runtime.identity,
+        commands=produced.command_evidence, receiver_command_evidence=[receiver_command],
+        build_evidence=builds, source_artifact_records=all_records)
+    assert sum(source.tool == "sockperf" for source in after_corruption) == 1
+    assert sum(source.tool == "iperf3" for source in after_corruption) == 1
+    first_log.write_bytes(closed_bytes)
+
+
 @pytest.mark.parametrize("mutation", ["missing_start", "missing_filter", "missing_end", "failed_command", "interrupted"])
 def test_f03_incomplete_source_or_failed_action_cannot_create_replay_window(
         mutation, repository_root, tmp_path):

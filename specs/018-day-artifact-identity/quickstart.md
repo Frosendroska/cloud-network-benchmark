@@ -125,4 +125,34 @@ This is a focused contract checkpoint only. The canonical F03-to-retrieval-to-va
 integration proof, full regressions, schema check and complete offline suite are still pending;
 no real native-tool or cloud acceptance is claimed.
 
+## Integration and schema checkpoint
+
+Added the end-to-end DAY boundary fixture. It executes F03 with the existing fake process/clock,
+uses actual emitted command IDs and producer timing-note parents to define two chunk units, builds
+the real layout declarations, closes a fake retrieval inventory, and passes `run_retrieval` output
+unchanged into `ValidatorInput`. Those same retrieved records plus the existing synthetic build
+fixture materialization feed unchanged `bind_acquisition_sources` and `iter_source_windows`.
+The fixture confirms two independently supported Sockperf windows separated by a gap and one
+abbreviated receiver prefix; it does not establish full-day data completeness. It also reconstructs
+one historical base-family record at the read boundary and verifies the helper cannot promote it,
+while the other modern chunk and receiver remain usable. A corrupt candidate similarly does not
+erase the independent chunk.
+
+Focused regression command:
+
+```text
+test "$PWD" = /private/tmp/cnb-day-identity || exit 97
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/contract/test_day_artifact_identity.py tests/contract/test_acquisition_contract.py \
+  tests/contract/test_v2_handoffs.py tests/unit/test_retrieval.py \
+  tests/integration/test_acquisition_producer.py
+exit 0: 140 passed in 48.29s
+```
+
+Schema exporter/checker completed with exit 0 and no schema diff. Schema integrity completed with
+exit 0: 2 passed in 1.50s. Full offline suite remains pending. All acquisition/build evidence in
+these fixtures is synthetic; cloud access, real native execution and traffic remain unrun.
+
 Implementer records exact head/base, commands/exit results, focused test count, schema diff/no-diff and remaining limitations here when executing the tasks. Coordinator dispatches existing convergence after code/checks; a passing identity fixture is not F08 or F10 completion. No shared runtime state or PR is owned by this planner.
