@@ -296,11 +296,56 @@ and Sockperf `3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285`.
 No Linux native compilation, patched executable/help check, cloud or SSH access, credentials, or
 benchmark traffic was run. These checks establish patch applicability and offline framework
 behavior only; they do not establish a compiled native binary or cloud measurement capability.
-All 32 feature tasks are checked.
+All 34 feature tasks are checked.
 
 ## Phase 9 convergence (T033–T034)
 
-T033 and T034 address production-created build configuration and the pinned source's per-stream
-terminal reporting behavior. The implementation preserves full multiline compiler identity and
-stores independently qualified terminal bounds per stream; test and source patch proof results for
-this phase will be recorded after the integrated final gate.
+The final integrated code head after merging `origin/main` at `b0a728ba428c150abefc5f1b13382b6ee9de8a78` is
+`be63146f7f7f716cb89f02e558bafe3c5668a1e7`. The focused bootstrap and source-producer suite passed:
+
+```text
+PYTHONPATH=src:tests THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q \
+  tests/unit/test_bootstrap.py tests/integration/test_acquisition_producer.py
+exit 0: 71 passed in 47.41s
+```
+
+The final integrated full suite, with official PowerShell on `PATH`, passed:
+
+```text
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+exit 0: 1003 passed in 104.28s
+
+PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python \
+  -m cloud_network_benchmark.contracts.schema \
+  --output specs/003-v2-shared-contracts/contracts --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+The focused integration regression takes the actual multiline `BuildObservation` returned by
+`run_bootstrap`, materializes its captured sidecar bytes as a build `ArtifactRecord`, binds the
+source, and successfully replays receiver windows. The skewed terminal fixture shifts the second
+stream end by one microsecond; replay retains four earlier source/native-correlated windows and
+reports both terminal stream bounds as unsupported. Existing positive-byte, normal one-second
+zero-byte, and failed-receiver counterexamples remain covered.
+
+For source proof, the pinned Sockperf 3.10 and iperf3 3.17.1 patch files were each reverse-applied
+and reapplied with `patch --batch --fuzz=0`; all four operations exited 0. Pre-patch source hashes:
+iperf `src/iperf_api.c` `960341011c83b3990de0e431d082001d5126b05390cacdca23b23b6731e577fb`,
+`src/iperf_server_api.c` `12a19ecf2dc20d500dfb60af740d9c5a96b562c53552c5cc65af41f7a31646e5`,
+`src/iperf_client_api.c` `dfd7a23abc9be5d644bed38c756037024f31625da033a3e8cde35965a1b3a72b`,
+`src/iperf_time.c` `f7d52905eb00bb196f0930f50709dd872d7521d089feb9a0e28bdbeacc717a54`, and Sockperf
+`src/client.cpp` `a79a3b29dfad3f7c5adf8f93f770598d6cd6d380889c00d63a179f127534245f`. Packaged patch
+hashes: iperf `11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661`, Sockperf
+`3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285`.
+
+No Linux native compilation, installed patched executable/help check, cloud or SSH access,
+credentials, or benchmark traffic was run. The results establish offline source/build identity
+plumbing, patch applicability, and framework replay behavior; they do not establish native
+compilation or cloud measurement capability. No CLI, workload, native file format, or research
+threshold changed.
