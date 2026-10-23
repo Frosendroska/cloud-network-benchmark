@@ -1111,6 +1111,41 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "gcp"
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "properties": {
+          "provider_options": {
+            "maxProperties": 2,
+            "minProperties": 2,
+            "properties": {
+              "instance_termination_action": {
+                "const": "STOP"
+              },
+              "provisioning_model": {
+                "const": "STANDARD"
+              }
+            },
+            "required": [
+              "provisioning_model",
+              "instance_termination_action"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "admission": {
       "$ref": "#/$defs/AdmissionRequirements"
