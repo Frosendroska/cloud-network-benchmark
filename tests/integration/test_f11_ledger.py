@@ -329,9 +329,11 @@ def test_nonfinal_provider_liability_counts_against_budget_and_is_retained(tmp_p
     assert rec["provider_billing"]["aws"]["final"] is False
     assert Decimal(rec["provider_billing"]["aws"]["actual_usd" if actual else "estimate_usd"]) == Decimal("300")
     assert rid in book.inspect()["budget_blocked"]
-    # Resolve the remaining resources, but retain the overrun and refuse another launch.
-    for index, provider in enumerate((Provider.AZURE, Provider.GCP), 1):
+    # Verify absence for every provider, then retain the overrun and refuse another launch.
+    for index, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP), 1):
         record_absence(book, f"liability-absence-{index}", rid, provider, datetime(2026,10,22,0,2+index,tzinfo=timezone.utc))
+    assert rid not in book.inspect()["cleanup_open"]
+    assert rid in book.inspect()["budget_blocked"]
     status, _, _ = _reserve_same_claim_in_process((str(path), f"F11-blocked-{actual}"))
     assert status == "rejected"
 
