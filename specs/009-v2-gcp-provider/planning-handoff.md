@@ -115,3 +115,9 @@ At this point T001–T025 and T027–T043 are implementation-checked (42/43); T0
 T044–T045 are implemented. Current-attempt registered-session reuse and provision now fail closed after a controller-session change, while cleanup can resolve the prior attempt without changing its original cap/session. Instance and template policy identities are canonicalized and compared as exact sets: S3 has only its selected policy and all other scenarios have none. Full offline traces cover policy extra/duplicate/missing/foreign/wrong-region failures and cleanup, along with the successful S3 trace. Focused GCP provider unit/sequence tests pass 83/83. The full suite and final Terraform/schema/mock gates remain for the serialized post-T026 Sol stage and are not claimed passed here.
 
 Task state is now T001–T025 and T027–T045 implementation-checked (44/45); T026 remains the sole convergence task. No cloud API, credentials, real resources, Terraform plan/apply/destroy, SSH, benchmark traffic or paid run was used.
+
+## Phase 10 convergence record (2026-10-23)
+
+Sol completed convergence against `752d377ae133b7d3b0326b21f635763331533a2f`, assessed all 45 tasks, and reported zero findings. The tasks artifact remained unchanged during convergence. The focused post-convergence prerequisite/controller-session-change/cleanup offline probe was reported as 91 passing tests in 1.78 seconds. T026 is marked complete in `tasks.md`; the implementation base reviewed by Sol is unchanged.
+
+The serialized full offline suite and final schema, Terraform format/validation, and mock-provider gates remain assigned to the parent coordinator at the exact final head. They have not been run or claimed in this handoff. F07 remains offline-only and is not cloud acceptance or F10 readiness.
