@@ -224,9 +224,11 @@ class ArtifactLayout(StrictModel):
                                                   producer=producer, unit_id=unit_id,
                                                   expectation=ArtifactExpectation.REQUIRED))
         if mode == ExperimentMode.DIAGNOSTIC_DAY:
+            day_units = [unit for unit in measurement_units if getattr(unit, "kind", None) == "continuous_day"]
+            day_unit_id = str(getattr(day_units[0], "unit_id")) if len(day_units) == 1 else None
             declarations.extend([
-                ArtifactInput(artifact_id="day-iperf3-client", path=self.day_iperf3_client, kind="iperf3-client-jsonl", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
-                ArtifactInput(artifact_id="day-iperf3-observation", path=self.day_iperf3_observation, kind="iperf3-observation-stderr", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
+                ArtifactInput(artifact_id="day-iperf3-client", path=self.day_iperf3_client, kind="iperf3-client-jsonl", producer=VmRole.VM_A, unit_id=day_unit_id, expectation=ArtifactExpectation.REQUIRED),
+                ArtifactInput(artifact_id="day-iperf3-observation", path=self.day_iperf3_observation, kind="iperf3-observation-stderr", producer=VmRole.VM_A, unit_id=day_unit_id, expectation=ArtifactExpectation.REQUIRED),
                 ArtifactInput(artifact_id="day-probe-csv", path_template=self.day_probe_csv_template, kind="sockperf-csv", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
                 ArtifactInput(artifact_id="day-probe-log", path_template=self.day_probe_log_template, kind="sockperf-log", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
                 ArtifactInput(artifact_id="day-probe-observation", path_template=self.day_probe_observation_template, kind="sockperf-observation-stderr", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
