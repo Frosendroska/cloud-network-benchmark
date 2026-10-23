@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import Field, field_validator, model_validator
 
@@ -25,6 +25,7 @@ from ..contracts.deployment import ProviderDeploymentInput, ProviderDeploymentOu
 from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
 
 SAFETY_LEAD_SECONDS = 30
+CONTROLLER_SESSION_ID = str(uuid.uuid4())
 NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": True, "source": "https://cloud.google.com/compute/docs/network-bandwidth", "checked_on": "2026-10-23"}
 REGION_ZONES = {"europe-west3": ("europe-west3-a", "europe-west3-b"), "europe-west2": ("europe-west2-a",)}
 
@@ -172,7 +173,7 @@ class GcpProviderDriver:
         if journal.get("registration_may_have_started"):
             raise GcpProviderError("an earlier interrupted registration cannot be restarted under this attempt", category="cleanup_open")
         self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds, time.monotonic() + max(0.0, (trigger - self.clock()).total_seconds()))
-        journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": str(uuid.uuid4())})
+        journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": CONTROLLER_SESSION_ID})
         self._save(attempt, journal)
         try:
             out = self._terraform(attempt, "protection", "apply", deployment, {"expiry_time": trigger.isoformat().replace("+00:00", "Z")})
@@ -278,9 +279,9 @@ class GcpProviderDriver:
                 if str(instance.get("id")) != str(resource.get("id")) or instance.get("name") != resource.get("name") or instance.get("zone", "").rsplit("/", 1)[-1] != resource.get("zone"):
                     raise GcpProviderError("observed VM does not match Terraform's role-specific numeric identity", category="instance_identity_mismatch")
                 expected_vm_path=f"projects/{self.settings.project_id}/zones/{resource['zone']}/instances/{resource['name']}"
-                actual_vm_path=urlparse(str(instance.get("selfLink", ""))).path.split("/compute/v1/",1)[-1]
-                output_vm_path=urlparse(str(resource.get("self_link", ""))).path.split("/compute/v1/",1)[-1]
-                if not re.fullmatch(r"[0-9]+",str(instance.get("id",""))) or actual_vm_path.lstrip("/") != expected_vm_path or actual_vm_path.lstrip("/") != output_vm_path.lstrip("/"):
+                actual_vm_path=self._compute_path(instance.get("selfLink"))
+                output_vm_path=self._compute_path(resource.get("self_link"))
+                if not re.fullmatch(r"[1-9][0-9]*",str(instance.get("id",""))) or actual_vm_path != expected_vm_path or output_vm_path != expected_vm_path:
                     raise GcpProviderError("observed VM self link is outside the selected project, zone, or Terraform output", category="instance_identity_mismatch")
                 scheduling = instance.get("scheduling", {})
                 if scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP" or scheduling.get("terminationTime") != trigger.isoformat().replace("+00:00", "Z") or scheduling.get("automaticRestart") is not False or "maxRunDuration" in scheduling:
@@ -456,21 +457,23 @@ class GcpProviderDriver:
         exp_image = self.settings.images[expected_region]
         exp_zone = expected_zone
         exp_ip = expected_ip[deployment.scenario][role_index]
-        expected_subnet = f"/projects/{self.settings.project_id}/regions/{expected_region}/subnetworks/{self._namespace(deployment)}-" + ("b" if role == "vm_b" and deployment.scenario == "inter_region" else "a")
+        expected_network = f"projects/{self.settings.project_id}/global/networks/{self._namespace(deployment)}-net"
+        expected_subnet = f"projects/{self.settings.project_id}/regions/{expected_region}/subnetworks/{self._namespace(deployment)}-" + ("b" if role == "vm_b" and deployment.scenario == "inter_region" else "a")
         if item.get("zone") != exp_zone:
             raise GcpProviderError("template role is bound to a different selected zone", category="expiry_mismatch")
         link = str(item.get("self_link_unique", ""))
-        canonical_link = f"projects/{self.settings.project_id}/global/instanceTemplates/{item.get('name')}?uniqueId={item.get('id')}"
-        parsed_link = urlparse(str(described.get("selfLinkWithId", "")))
-        actual_path = parsed_link.path.split("/compute/v1/", 1)[-1].lstrip("/")
-        actual_unique_link = actual_path + ("?" + urlencode(sorted(parse_qsl(parsed_link.query))) if parsed_link.query else "")
+        described_id = self._int64(described.get("id"))
+        item_id = self._int64(item.get("id"))
+        rest_path = self._compute_path(described.get("selfLink"))
+        unique_path, unique_id = self._unique_compute_link(link)
+        expected_link = f"projects/{self.settings.project_id}/global/instanceTemplates/{expected_name}"
         disk = props.get("disks", [])
         nics = props.get("networkInterfaces", [])
         metadata = {x.get("key"): x.get("value") for x in props.get("metadata", {}).get("items", [])}
         labels = props.get("labels", {})
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
-        if (not re.fullmatch(r"[0-9]+", str(item.get("id", ""))) or str(described.get("id")) != str(item.get("id")) or described.get("name") != item.get("name") or item.get("name") != expected_name
-            or f"projects/{self.settings.project_id}/" not in link or link != canonical_link or actual_unique_link != canonical_link
+        if (described_id is None or item_id is None or described_id != item_id or described.get("name") != item.get("name") or item.get("name") != expected_name
+            or rest_path != expected_link or unique_path != expected_link or unique_id != str(described_id)
             or scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP"
             or scheduling.get("terminationTime") != trigger.isoformat().replace("+00:00", "Z")
             or scheduling.get("automaticRestart") is not False or "maxRunDuration" in scheduling
@@ -478,10 +481,11 @@ class GcpProviderDriver:
             or len(disk) != 1 or not disk[0].get("boot") or disk[0].get("autoDelete") is not True
             or disk[0].get("initializeParams", {}).get("sourceImage", "").split("projects/", 1)[-1] != exp_image.split("projects/", 1)[-1]
             or disk[0].get("initializeParams", {}).get("diskType", "").rsplit("/", 1)[-1] != "pd-balanced"
-            or disk[0].get("initializeParams", {}).get("diskSizeGb") != 32
+            or not self._matches_int(disk[0].get("initializeParams", {}).get("diskSizeGb"), 32)
             or disk[0].get("initializeParams", {}).get("diskName") != f"{self._namespace(deployment)}-{role[-1]}-boot" or disk[0].get("initializeParams", {}).get("labels") != expected_labels
-            or len(nics) != 1 or nics[0].get("nicType") != "GVNIC" or nics[0].get("networkIP") != exp_ip or expected_subnet not in nics[0].get("subnetwork", "")
-            or nics[0].get("networkPerformanceConfig", {}).get("totalEgressBandwidthTier") == "TIER_1"
+            or len(nics) != 1 or nics[0].get("nicType") != "GVNIC" or nics[0].get("networkIP") != exp_ip or self._compute_path(nics[0].get("network")) != expected_network or self._compute_path(nics[0].get("subnetwork")) != expected_subnet
+            or self._unsupported_network_tier(props.get("networkPerformanceConfig")) or props.get("minCpuPlatform")
+            or scheduling.get("nodeAffinities")
             or len(nics[0].get("accessConfigs", [])) != 1
             or metadata.get("enable-guest-attributes") != "TRUE" or metadata.get("enable-oslogin") != "FALSE" or metadata.get("block-project-ssh-keys") != "TRUE"
             or metadata.get("cnb-bootstrap-template") != deployment.bootstrap_template
@@ -507,10 +511,16 @@ class GcpProviderDriver:
                 if value.get("launch_blocked") or value.get("cleanup_state") is not None or value.get("creation_may_have_started"):
                     raise GcpProviderError("this attempt already has creation or cleanup state and cannot be launched again", category="cleanup_open")
                 continue
-            if value.get("registration_may_have_started") and not value.get("registered") and value.get("protection_cleanup_state") != "succeeded":
-                raise GcpProviderError("an interrupted registration has uncertain protection and blocks launches", category="cleanup_open")
-            if value.get("creation_may_have_started") and value.get("cleanup_state") != "succeeded":
-                raise GcpProviderError("another GCP attempt has unresolved creation or cleanup state", category="cleanup_open")
+            if value.get("cleanup_state") == "succeeded" or value.get("protection_cleanup_state") == "succeeded":
+                continue
+            session_is_live = value.get("controller_session_id") == CONTROLLER_SESSION_ID
+            if value.get("registration_may_have_started") and not value.get("registered"):
+                raise GcpProviderError("interrupted registration or unfinished protection blocks launches", category="cleanup_open")
+            if value.get("registered") and not session_is_live:
+                raise GcpProviderError("an earlier controller session has uncertain protection and blocks launches", category="cleanup_open")
+            if value.get("creation_may_have_started"):
+                if not session_is_live or not value.get("registered") or value.get("launch_blocked") or value.get("cleanup_state") is not None or value.get("primary_failure"):
+                    raise GcpProviderError("another GCP attempt has unresolved creation or cleanup state", category="cleanup_open")
             if value.get("launch_blocked") or value.get("cleanup_state") not in {None, "succeeded"}:
                 raise GcpProviderError("another GCP attempt has open cleanup or native expiry", category="cleanup_open")
 
@@ -577,12 +587,94 @@ class GcpProviderDriver:
             current = json.loads(target.read_text(encoding="utf-8"))
             if (current.get("run_id"), current.get("deployment_id")) != (journal.get("run_id"), journal.get("deployment_id")):
                 raise GcpProviderError("journal identity changed during update", category="state_identity_mismatch")
+            immutable = ("run_id", "deployment_id", "binding_sha256", "reservation_id", "cap_started_at", "cap_expires_at", "trigger", "controller_session_id")
+            for key in immutable:
+                if key in current and key in journal and current[key] != journal[key]:
+                    raise GcpProviderError(f"journal immutable ownership field {key} changed", category="state_identity_mismatch")
+                if key in current:
+                    journal[key] = current[key]
+            if "expiry" in current and "expiry" not in journal:
+                journal["expiry"] = current["expiry"]
+            elif (current.get("expiry") or {}).get("state") in {"cancelled", "failed"} and (journal.get("expiry") or {}).get("state") == "registered":
+                journal["expiry"] = current["expiry"]
             old_events = current.get("commands", [])
             supplied_events = journal.get("commands", [])
             if not isinstance(old_events, list) or not isinstance(supplied_events, list):
                 raise GcpProviderError("command journal is malformed", category="cleanup_unknown")
-            if len(old_events) > len(supplied_events) and old_events[:len(supplied_events)] == supplied_events:
-                journal["commands"] = old_events
+            events, event_hashes = [], set()
+            for event in (*old_events, *supplied_events):
+                fingerprint = hashlib.sha256(json.dumps(event, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+                if fingerprint not in event_hashes:
+                    event_hashes.add(fingerprint); events.append(event)
+            journal["commands"] = events
+            prior_disks = current.get("observed_disks", [])
+            incoming_disks = journal.get("observed_disks", [])
+            if not isinstance(prior_disks, list) or not isinstance(incoming_disks, list):
+                raise GcpProviderError("observed disk journal is malformed", category="cleanup_unknown")
+            disks, disk_keys = [], set()
+            for disk in (*prior_disks, *incoming_disks):
+                if not isinstance(disk, dict):
+                    raise GcpProviderError("observed disk identity is malformed", category="cleanup_unknown")
+                key = (str(disk.get("id")), disk.get("name"), disk.get("zone"))
+                if key not in disk_keys:
+                    disk_keys.add(key); disks.append(disk)
+            if disks or "observed_disks" in current or "observed_disks" in journal:
+                journal["observed_disks"] = disks
+            prior_resources = current.get("observed_resources", {})
+            incoming_resources = journal.get("observed_resources", {})
+            if not isinstance(prior_resources, dict) or not isinstance(incoming_resources, dict):
+                raise GcpProviderError("observed VM journal is malformed", category="cleanup_unknown")
+            resources = {role: dict(value) for role, value in prior_resources.items()}
+            for role, value in incoming_resources.items():
+                if role in resources and resources[role].get("id") and value.get("id") and str(resources[role]["id"]) != str(value["id"]):
+                    raise GcpProviderError("observed role VM identity changed in the journal", category="state_identity_mismatch")
+                resources[role] = {**resources.get(role, {}), **value}
+            if resources or "observed_resources" in current or "observed_resources" in journal:
+                journal["observed_resources"] = resources
+            prior_hosts = current.get("known_management_hosts", {})
+            incoming_hosts = journal.get("known_management_hosts", {})
+            if not isinstance(prior_hosts, dict) or not isinstance(incoming_hosts, dict):
+                raise GcpProviderError("management host binding journal is malformed", category="cleanup_unknown")
+            hosts = dict(prior_hosts)
+            for identity, address in incoming_hosts.items():
+                if identity in hosts and hosts[identity] != address:
+                    raise GcpProviderError("management host address changed for a bound VM identity", category="hostkey_identity_mismatch")
+                hosts[identity] = address
+            if hosts or "known_management_hosts" in current or "known_management_hosts" in journal:
+                journal["known_management_hosts"] = hosts
+            prior_templates = current.get("templates", {})
+            incoming_templates = journal.get("templates", {})
+            if not isinstance(prior_templates, dict) or not isinstance(incoming_templates, dict):
+                raise GcpProviderError("registered template journal is malformed", category="cleanup_unknown")
+            templates = {role: dict(value) for role, value in prior_templates.items()}
+            for role, value in incoming_templates.items():
+                if role in templates:
+                    for identity_field in ("id", "name", "self_link_unique"):
+                        if templates[role].get(identity_field) and value.get(identity_field) and templates[role][identity_field] != value[identity_field]:
+                            raise GcpProviderError("registered template identity changed in the journal", category="state_identity_mismatch")
+                templates[role] = {**templates.get(role, {}), **value}
+            if templates or "templates" in current or "templates" in journal:
+                journal["templates"] = templates
+            for key in ("registration_may_have_started", "registered", "creation_may_have_started"):
+                if current.get(key):
+                    journal[key] = True
+            if current.get("cleanup_state") is not None and journal.get("cleanup_state") is None:
+                journal["cleanup_state"] = current["cleanup_state"]
+            if current.get("protection_cleanup_state") is not None and journal.get("protection_cleanup_state") is None:
+                journal["protection_cleanup_state"] = current["protection_cleanup_state"]
+            if current.get("launch_blocked") and journal.get("cleanup_state") != "succeeded":
+                journal["launch_blocked"] = True
+            failures = list(current.get("failure_history", []))
+            for source in (current, journal):
+                for kind in ("primary_failure", "registration_failure", "cleanup_failure"):
+                    record = source.get(kind)
+                    if record and record not in failures:
+                        failures.append(record)
+            if failures:
+                journal["failure_history"] = failures
+            for key in ("primary_failure", "registration_failure", "cleanup_failure"):
+                if key in current and key not in journal:
+                    journal[key] = current[key]
         fd, name = tempfile.mkstemp(dir=attempt)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -687,6 +779,78 @@ class GcpProviderDriver:
         return {key: item.get("value", item) for key, item in value.items()}
 
     @staticmethod
+    def _compute_path(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme:
+            try:
+                unsafe_authority = parsed.username or parsed.password or parsed.port
+            except ValueError:
+                return None
+            if parsed.scheme != "https" or parsed.hostname not in {"www.googleapis.com", "compute.googleapis.com"} or unsafe_authority:
+                return None
+            path = parsed.path
+        else:
+            if value.startswith("//") or parsed.query or parsed.fragment:
+                return None
+            path = parsed.path
+        if parsed.scheme and (parsed.query or parsed.fragment):
+            return None
+        marker = "/compute/v1/"
+        if marker in path:
+            path = path.split(marker, 1)[1]
+        path = path.lstrip("/")
+        if not path or any(part in {".", ".."} for part in path.split("/")) or "%2f" in path.lower():
+            return None
+        return path
+
+    @classmethod
+    def _unique_compute_link(cls, value: Any) -> tuple[str | None, str | None]:
+        if not isinstance(value, str):
+            return None, None
+        parsed = urlparse(value)
+        if parsed.scheme:
+            try:
+                unsafe_authority = parsed.username or parsed.password or parsed.port
+            except ValueError:
+                return None, None
+            if parsed.scheme != "https" or parsed.hostname not in {"www.googleapis.com", "compute.googleapis.com"} or unsafe_authority or parsed.fragment:
+                return None, None
+        elif value.startswith("//") or parsed.fragment:
+            return None, None
+        path = cls._compute_path(parsed.path)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if len(pairs) != 1 or pairs[0][0] != "uniqueId" or not re.fullmatch(r"[1-9][0-9]*", pairs[0][1]):
+            return None, None
+        return path, pairs[0][1]
+
+    @staticmethod
+    def _int64(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+            return int(value)
+        return None
+
+    @classmethod
+    def _matches_int(cls, value: Any, expected: int) -> bool:
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value == expected
+        return isinstance(value, str) and re.fullmatch(r"[0-9]+", value) is not None and int(value) == expected
+
+    @staticmethod
+    def _unsupported_network_tier(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return bool(value)
+        tier = value.get("totalEgressBandwidthTier")
+        return tier not in (None, "", "TIER_UNSPECIFIED")
+
+    @staticmethod
     def _namespace(deployment: ProviderDeploymentInput) -> str:
         stem = re.sub(r"[^a-z0-9-]", "-", deployment.run_id.lower()).strip("-")[:25]
         stem = re.sub(r"-+", "-", stem).strip("-") or "run"
@@ -773,19 +937,29 @@ class GcpProviderDriver:
         actual_zone = instance.get("zone", "").rsplit("/", 1)[-1]
         if actual_zone != intent.zone:
             raise GcpProviderError("observed VM zone differs from selected zone", category="instance_shape_mismatch")
+        suffix = "a" if role == "vm_a" else "b"
+        expected_name = f"{self._namespace(deployment)}-{suffix}"
+        expected_instance_path = f"projects/{self.settings.project_id}/zones/{intent.zone}/instances/{expected_name}"
+        if instance.get("name") != expected_name or self._int64(instance.get("id")) is None or self._compute_path(instance.get("selfLink")) != expected_instance_path:
+            raise GcpProviderError("observed VM selfLink/name/ID differs from the exact project and role resource", category="instance_identity_mismatch")
         interfaces = instance.get("networkInterfaces", [])
         if len(interfaces) != 1 or interfaces[0].get("nicType") != "GVNIC":
             raise GcpProviderError("observed VM must have exactly one gVNIC interface", category="instance_shape_mismatch")
         accesses = interfaces[0].get("accessConfigs", [])
-        expected_subnet_suffix = f"/regions/{intent.region}/subnetworks/{self._namespace(deployment)}-" + ("b" if role == "vm_b" and deployment.scenario == "inter_region" else "a")
+        expected_subnet = f"projects/{self.settings.project_id}/regions/{intent.region}/subnetworks/{self._namespace(deployment)}-" + ("b" if role == "vm_b" and deployment.scenario == "inter_region" else "a")
+        expected_network = f"projects/{self.settings.project_id}/global/networks/{self._namespace(deployment)}-net"
         subnet = interfaces[0].get("subnetwork", "")
-        if interfaces[0].get("networkIP") != expected_ip or len(accesses) != 1 or not accesses[0].get("natIP") or expected_subnet_suffix not in subnet:
+        if (interfaces[0].get("networkIP") != expected_ip or len(accesses) != 1 or not accesses[0].get("natIP")
+                or self._compute_path(subnet) != expected_subnet or self._compute_path(interfaces[0].get("network")) != expected_network):
             raise GcpProviderError("observed VM private or public management address differs from selected topology", category="instance_shape_mismatch")
-        if interfaces[0].get("networkPerformanceConfig", {}).get("totalEgressBandwidthTier") == "TIER_1":
+        if self._unsupported_network_tier(instance.get("networkPerformanceConfig")):
             raise GcpProviderError("observed VM uses unsupported TIER_1 network performance", category="instance_shape_mismatch")
         if instance.get("machineType", "").rsplit("/", 1)[-1] != "n2-standard-4":
             raise GcpProviderError("observed VM machine type differs from selected shape", category="instance_shape_mismatch")
-        if instance.get("reservationAffinity", {}).get("consumeReservationType") != "NO_RESERVATION" or instance.get("minCpuPlatform") or instance.get("guestAccelerators") or instance.get("scheduling", {}).get("automaticRestart") is not False or "maxRunDuration" in instance.get("scheduling", {}):
+        scheduling = instance.get("scheduling", {})
+        if (instance.get("reservationAffinity", {}).get("consumeReservationType") != "NO_RESERVATION" or instance.get("minCpuPlatform")
+                or instance.get("guestAccelerators") or scheduling.get("automaticRestart") is not False or "maxRunDuration" in scheduling
+                or scheduling.get("nodeAffinities")):
             raise GcpProviderError("observed VM reservation, CPU platform, or accelerator policy differs", category="instance_shape_mismatch")
         observed_disks = instance.get("disks", [])
         boot = next((disk for disk in observed_disks if disk.get("boot")), None)
@@ -800,8 +974,9 @@ class GcpProviderDriver:
             journal = json.loads((self._active_attempt / "attempt.json").read_text(encoding="utf-8"))
             journal.setdefault("observed_disks", []).append({"id": str(disk.get("id")), "name": disk.get("name"), "zone": disk.get("zone", "").rsplit("/", 1)[-1]})
             self._save(self._active_attempt, journal)
-        if int(disk.get("sizeGb", 0)) != 32 or disk.get("type", "").rsplit("/", 1)[-1] != "pd-balanced":
+        if not self._matches_int(disk.get("sizeGb"), 32) or disk.get("type", "").rsplit("/", 1)[-1] != "pd-balanced":
             raise GcpProviderError("observed boot disk differs from selected 32-GiB pd-balanced disk", category="instance_shape_mismatch")
+        disk["sizeGb"] = 32
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
         if disk.get("name") != expected_disk_name or disk.get("labels") != expected_labels:
             raise GcpProviderError("observed boot disk name or attempt ownership labels differ", category="instance_shape_mismatch")
@@ -814,6 +989,9 @@ class GcpProviderDriver:
             raise GcpProviderError("selected Ubuntu image is not amd64", category="image_mismatch")
         if image.get("name") != expected_image.rsplit("/", 1)[-1]:
             raise GcpProviderError("observed image identity differs from selected pinned image", category="image_mismatch")
+        features = {entry.get("type") for entry in image.get("guestOsFeatures", []) if isinstance(entry, dict)}
+        if "GVNIC" not in features:
+            raise GcpProviderError("selected image does not advertise the GvNIC guest OS feature", category="image_gvnic_incompatible")
         return disk
 
     def _trusted_hostkey(self, name: str, zone: str, initial: dict[str, Any]) -> str:

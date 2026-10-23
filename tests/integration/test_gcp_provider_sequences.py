@@ -22,18 +22,27 @@ def _template_response(driver, deployment, role, template_id, trigger, created_a
         "cnb-network-intent": json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":")),
     }
     return {
-        "id": str(template_id), "name": f"{namespace}-{suffix}", "selfLinkWithId": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-{suffix}?uniqueId={template_id}", "creationTimestamp": created_at.isoformat().replace("+00:00", "Z"),
+        "id": str(template_id), "name": f"{namespace}-{suffix}", "selfLink": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-{suffix}", "creationTimestamp": created_at.isoformat().replace("+00:00", "Z"),
         "properties": {
             "machineType": "n2-standard-4", "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]},
             "scheduling": {"provisioningModel": "STANDARD", "instanceTerminationAction": "STOP", "terminationTime": trigger.isoformat().replace("+00:00", "Z"), "automaticRestart": False},
-            "networkInterfaces": [{"subnetwork": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/regions/{intent.region}/subnetworks/{namespace}-" + ("b" if role == "vm_b" and scenario == "inter_region" else "a"), "networkIP": ip, "nicType": "GVNIC", "accessConfigs": [{}]}],
-            "disks": [{"boot": True, "autoDelete": True, "initializeParams": {"sourceImage": driver.settings.images[intent.region], "diskType": "pd-balanced", "diskSizeGb": 32, "diskName": f"{namespace}-{suffix}-boot", "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}}],
+            "networkInterfaces": [{"network": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/global/networks/{namespace}-net", "subnetwork": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/regions/{intent.region}/subnetworks/{namespace}-" + ("b" if role == "vm_b" and scenario == "inter_region" else "a"), "networkIP": ip, "nicType": "GVNIC", "accessConfigs": [{}]}],
+            "disks": [{"boot": True, "autoDelete": True, "initializeParams": {"sourceImage": driver.settings.images[intent.region], "diskType": "pd-balanced", "diskSizeGb": "32", "diskName": f"{namespace}-{suffix}-boot", "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}}],
             "metadata": {"items": [{"key": key, "value": value} for key, value in sorted(metadata.items())]},
             "reservationAffinity": {"consumeReservationType": "NO_RESERVATION"}, "resourcePolicies": [],
         },
     }
 
 
+def _instance_response(driver, deployment, role):
+    intent = deployment.vm_a if role == "vm_a" else deployment.vm_b
+    suffix = "a" if role == "vm_a" else "b"
+    name = f"{driver._namespace(deployment)}-{suffix}"
+    addresses = {"same_zone": ("10.80.1.10", "10.80.1.11"), "cross_zone": ("10.80.1.10", "10.80.1.11"), "placement_optimization": ("10.80.1.10", "10.80.1.11"), "inter_region": ("10.80.1.10", "10.81.1.11")}
+    ip = addresses[deployment.scenario][0 if role == "vm_a" else 1]
+    subnet_role = "b" if role == "vm_b" and deployment.scenario == "inter_region" else "a"
+    base = f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}"
+    return {"id": "73101" if role == "vm_a" else "73102", "name": name, "selfLink": f"{base}/zones/{intent.zone}/instances/{name}", "zone": f"{base}/zones/{intent.zone}", "machineType": "n2-standard-4", "reservationAffinity": {"consumeReservationType": "NO_RESERVATION"}, "scheduling": {"automaticRestart": False}, "networkInterfaces": [{"network": f"{base}/global/networks/{driver._namespace(deployment)}-net", "networkIP": ip, "subnetwork": f"{base}/regions/{intent.region}/subnetworks/{driver._namespace(deployment)}-{subnet_role}", "nicType": "GVNIC", "accessConfigs": [{"natIP": "8.8.8.8"}]}], "disks": [{"boot": True, "source": f"{base}/zones/{intent.zone}/disks/{driver._namespace(deployment)}-{suffix}-boot"}]}
 def test_original_reservation_lead_is_immutable_across_retry_and_controller_delay():
     started = datetime.now(timezone.utc) - timedelta(seconds=5)
     original_end = datetime.now(timezone.utc) + timedelta(seconds=1800)
@@ -252,7 +261,7 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
                 return CommandResult(action_id=action,outcome="succeeded",started_at=started,finished_at=started,duration_seconds=0.0,exit_code=code,stdout=value if isinstance(value,str) else json.dumps(value),stderr="")
             if action == "gcp-protection-apply": return result()
             if action == "gcp-protection-outputs":
-                templates={role:{"id":str(111 if role=="vm_a" else 222),"name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","self_link_unique":f"projects/{settings.project_id}/global/instanceTemplates/{namespace}-{'a' if role=='vm_a' else 'b'}?uniqueId={111 if role=='vm_a' else 222}"} for role in ("vm_a","vm_b")}
+                templates={role:{"id":str(111 if role=="vm_a" else 222),"name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","self_link_unique":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/instanceTemplates/{namespace}-{'a' if role=='vm_a' else 'b'}?uniqueId={111 if role=='vm_a' else 222}"} for role in ("vm_a","vm_b")}
                 return result({"templates":{"value":templates},"compact_policy_id":{"value":policy_id}})
             if action == "gcp-pair-apply": return result()
             if action == "gcp-pair-outputs":
@@ -271,15 +280,14 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
                 template_id="111" if role=="vm_a" else "222"
                 template=_template_response(GcpProviderDriver(self,settings,clock=lambda:now),deployment,role,template_id,trigger,now-timedelta(seconds=1))
                 if policy_id: template["properties"]["resourcePolicies"]=[policy_id]
-                template["selfLinkWithId"]=f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/instanceTemplates/{vm_name}?uniqueId={template_id}"
                 return result(template)
             if action.startswith("gcp-instance-read") or action.startswith("gcp-hostkey-instance"):
-                instance={**identity,"machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/regions/{intent.region}/subnetworks/{namespace}-"+("b" if role=="vm_b" and scenario=="inter_region" else "a"),"nicType":"GVNIC","accessConfigs":[{"natIP":public}]}],"disks":[{"boot":True,"source":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/zones/{intent.zone}/disks/{namespace}-{suffix}-boot"}],"resourcePolicies":[policy_id] if policy_id else []}
+                instance={**identity,"machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"network":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/networks/{namespace}-net","networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/regions/{intent.region}/subnetworks/{namespace}-"+("b" if role=="vm_b" and scenario=="inter_region" else "a"),"nicType":"GVNIC","accessConfigs":[{"natIP":public}]}],"disks":[{"boot":True,"source":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/zones/{intent.zone}/disks/{namespace}-{suffix}-boot"}],"resourcePolicies":[policy_id] if policy_id else []}
                 return result(instance)
             if action == "gcp-guest-hostkeys": return result({"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":host_blob}]}})
             if action.startswith("gcp-boot-disk"):
-                return result({"id":str(2001 if role=="vm_a" else 2002),"name":f"{namespace}-{suffix}-boot","zone":zone_path,"sizeGb":32,"type":f"zones/{intent.zone}/diskTypes/pd-balanced","sourceImage":settings.images[intent.region],"labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}})
-            if action.startswith("gcp-image-read"): return result({"architecture":"X86_64","name":settings.images[intent.region].rsplit("/",1)[-1]})
+                return result({"id":str(2001 if role=="vm_a" else 2002),"name":f"{namespace}-{suffix}-boot","zone":zone_path,"sizeGb":"32","type":f"zones/{intent.zone}/diskTypes/pd-balanced","sourceImage":settings.images[intent.region],"labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}})
+            if action.startswith("gcp-image-read"): return result({"architecture":"X86_64","name":settings.images[intent.region].rsplit("/",1)[-1],"guestOsFeatures":[{"type":"GVNIC"}]})
             raise AssertionError(f"unexpected CommandRequest action {action}: {request.argv}")
     runner=FakeRunner()
     driver=GcpProviderDriver(runner,settings,clock=lambda:now)
@@ -343,15 +351,17 @@ def test_registration_observes_both_absolute_stop_templates_before_any_pair(tmp_
     assert restarted.register_expiry(deployment,request).registered_at == result.registered_at
     assert events == [("protection","apply")]
 
-    attempt=driver._attempt_dir(deployment)
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"commands":[]})
+    partial_deployment=deployment.model_copy(update={"run_id":"gcp-test-partial-gcp","deployment_id":"gcp-test-partial-gcp-deployment"})
+    partial_request=request.model_copy(update={"run_id":partial_deployment.run_id,"deployment_id":partial_deployment.deployment_id,"resource_namespace":partial_deployment.run_id,"target_selector":f"project={settings.project_id};run_id={partial_deployment.run_id};deployment_id={partial_deployment.deployment_id};roles=vm_a,vm_b"})
+    attempt=driver._attempt_dir(partial_deployment)
+    driver._save(attempt,{"run_id":partial_deployment.run_id,"deployment_id":partial_deployment.deployment_id,"commands":[]})
     partial=[]
     def partial_protection(_attempt, root_name, action, _deployment, _extra):
         partial.append((root_name,action))
         return {"templates":{"value":{"vm_a":{"id":"111","name":"fake-vm_a","self_link_unique":"projects/p/global/instanceTemplates/111"}}}} if action == "apply" else {}
     monkeypatch.setattr(driver,"_terraform",partial_protection)
     monkeypatch.setattr(driver,"_inventory",lambda _deployment:{"pages_complete":True,"resources":[],"instances":[],"disks":[],"addresses":[],"support_resources":[]})
-    failed=driver.register_expiry(deployment,request)
+    failed=driver.register_expiry(partial_deployment,partial_request)
     assert failed.state == "failed"
     assert partial == [("protection","apply"),("protection","destroy")]
 
@@ -470,12 +480,87 @@ def test_unknown_inventory_shape_fails_closed_and_keeps_native_protection(tmp_pa
 
 
 def test_healthy_registered_attempt_allows_independent_primary_launch(tmp_path):
+    import json
+    from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID
     deployment, driver = _cleanup_fixture(tmp_path)
     root=driver.settings.private_state_root
     path=root/"other"/"campaign-gcp"/"campaign-gcp-deployment"
     path.mkdir(parents=True)
-    (path/"attempt.json").write_text('{"run_id":"campaign-gcp","deployment_id":"campaign-gcp-deployment","registered":true}')
+    (path/"attempt.json").write_text(json.dumps({"run_id":"campaign-gcp","deployment_id":"campaign-gcp-deployment","registration_may_have_started":True,"registered":True,"creation_may_have_started":True,"controller_session_id":CONTROLLER_SESSION_ID,"cleanup_state":None,"launch_blocked":False}))
     assert driver._assert_no_open_cleanup(deployment) is None
+
+
+def test_registered_only_prior_session_blocks_until_cleanup_is_verified(tmp_path):
+    import json
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    path=driver.settings.private_state_root/"old"/"campaign-gcp"/"campaign-gcp-deployment"
+    path.mkdir(parents=True)
+    state={"run_id":"campaign-gcp","deployment_id":"campaign-gcp-deployment","registration_may_have_started":True,"registered":True,"controller_session_id":"dead-controller-session"}
+    (path/"attempt.json").write_text(json.dumps(state))
+    with pytest.raises(GcpProviderError,match="earlier controller session"):
+        driver._assert_no_open_cleanup(deployment)
+    state["protection_cleanup_state"]="succeeded"
+    (path/"attempt.json").write_text(json.dumps(state))
+    assert driver._assert_no_open_cleanup(deployment) is None
+
+
+def test_stale_provision_save_preserves_disk_and_management_host_checkpoints(tmp_path):
+    import hashlib
+    import json
+    from cloud_network_benchmark.contracts.common import FailureEvidence
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    attempt = driver._attempt_dir(deployment)
+    driver._active_attempt = attempt
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id, "commands": []})
+    stale = driver._load(attempt, deployment)
+    namespace = driver._namespace(deployment)
+    instance = _instance_response(driver, deployment, "vm_a")
+    image = driver.settings.images[deployment.vm_a.region].rsplit("/", 1)[-1]
+    labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
+    def fail_after_disk(args, action):
+        if action.startswith("gcp-boot-disk"):
+            return {"id": "201", "name": f"{namespace}-a-boot", "zone": "europe-west3-a", "sizeGb": "32", "type": "zones/europe-west3-a/diskTypes/pd-balanced", "sourceImage": driver.settings.images[deployment.vm_a.region], "labels": labels}
+        return {"architecture": "X86_64", "name": image, "guestOsFeatures": []}
+    driver._gcloud_json = fail_after_disk
+    with pytest.raises(GcpProviderError, match="does not advertise the GvNIC"):
+        driver._validate_instance(instance, deployment, "vm_a")
+    checkpoint = driver._load(attempt, deployment)
+    assert checkpoint["observed_disks"] == [{"id": "201", "name": f"{namespace}-a-boot", "zone": "europe-west3-a"}]
+    checkpoint["known_management_hosts"] = {"101": "8.8.8.8"}
+    checkpoint["commands"] = [{"action_id": "disk-read", "outcome": "succeeded"}]
+    driver._save(attempt, checkpoint)
+    # The failure handler still holds this pre-read local copy when it saves its primary failure.
+    stale["primary_failure"] = FailureEvidence(category="image_mismatch", message="image readback failed", occurred_at=datetime.now(timezone.utc)).model_dump(mode="json")
+    driver._save(attempt, stale)
+    recovered = GcpProviderDriver(object(), driver.settings)._load(attempt, deployment)
+    assert recovered["observed_disks"] == [{"id": "201", "name": f"{namespace}-a-boot", "zone": "europe-west3-a"}]
+    assert recovered["known_management_hosts"] == {"101": "8.8.8.8"}
+    assert any(event.get("action_id") == "disk-read" for event in recovered["commands"])
+    assert recovered["primary_failure"]["category"] == "image_mismatch"
+
+
+def test_restarted_controller_rejects_changed_address_for_saved_vm_identity(tmp_path, monkeypatch):
+    import base64
+    import struct
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, first = _cleanup_fixture(tmp_path)
+    attempt = first._attempt_dir(deployment)
+    name = f"{first._namespace(deployment)}-a"
+    zone = deployment.vm_a.zone
+    first._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id, "known_management_hosts": {"101": "8.8.8.8"}})
+    restarted = GcpProviderDriver(object(), first.settings)
+    restarted._active_attempt = attempt
+    blob = base64.b64encode(struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + b"k" * 32).decode()
+    identity = {"id": "101", "name": name, "zone": f"https://compute.googleapis.com/compute/v1/projects/{first.settings.project_id}/zones/{zone}", "selfLink": f"https://compute.googleapis.com/compute/v1/projects/{first.settings.project_id}/zones/{zone}/instances/{name}", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "1.1.1.1"}]}]}
+    def read(args, action):
+        if action == "gcp-guest-hostkeys":
+            return {"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]}}
+        return identity
+    monkeypatch.setattr(restarted, "_gcloud_json", read)
+    with pytest.raises(GcpProviderError, match="management IPv4 changed for an already bound VM identity"):
+        restarted._trusted_hostkey(name, zone, identity)
 
 
 def test_attempt_with_prior_creation_or_cleanup_cannot_be_relaunched(tmp_path):
@@ -491,7 +576,8 @@ def test_attempt_with_prior_creation_or_cleanup_cannot_be_relaunched(tmp_path):
     other.parent.mkdir(parents=True)
     other.write_text(json.dumps({"run_id":"older-gcp","deployment_id":"older-gcp-deployment","registered":True,"cleanup_state":"succeeded"}))
     driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id})
-    assert driver._assert_no_open_cleanup(deployment) is None
+    with pytest.raises(GcpProviderError,match="this attempt already has creation or cleanup state"):
+        driver._assert_no_open_cleanup(deployment)
 
 
 def test_pair_apply_records_exact_template_binding_input_hash(tmp_path,monkeypatch):
@@ -537,14 +623,14 @@ def test_s1_fake_provision_normalizes_authenticated_vm_disk_image_and_hostkey_re
         address="10.80.1.10" if role=="vm_a" else "10.80.1.11"
         zone_path=f"https://compute.googleapis.com/compute/v1/projects/test/zones/{intent.zone}"
         if action.startswith("gcp-boot-disk"):
-            return {"id":"201" if role=="vm_a" else "202","name":f"{driver._namespace(deployment)}-{'a' if role=='vm_a' else 'b'}-boot","zone":zone_path,"sizeGb":32,"type":"zones/europe-west3-a/diskTypes/pd-balanced","sourceImage":f"projects/ubuntu-os-cloud/global/images/{driver.settings.images[intent.region].rsplit('/',1)[-1]}","labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}
+            return {"id":"201" if role=="vm_a" else "202","name":f"{driver._namespace(deployment)}-{'a' if role=='vm_a' else 'b'}-boot","zone":zone_path,"sizeGb":"32","type":"zones/europe-west3-a/diskTypes/pd-balanced","sourceImage":f"projects/ubuntu-os-cloud/global/images/{driver.settings.images[intent.region].rsplit('/',1)[-1]}","labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}
         if action.startswith("gcp-image-read"):
-            return {"architecture":"X86_64","name":driver.settings.images[intent.region].rsplit("/",1)[-1]}
+            return {"architecture":"X86_64","name":driver.settings.images[intent.region].rsplit("/",1)[-1],"guestOsFeatures":[{"type":"GVNIC"}]}
         if action=="gcp-guest-hostkeys":
             return {"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":hostkey}]}}
         if action.startswith("gcp-hostkey-instance"):
             return {"id":"101" if role=="vm_a" else "102","name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","zone":zone_path,"selfLink":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/instances/{namespace}-{'a' if role=='vm_a' else 'b'}","networkInterfaces":[{"networkIP":address,"accessConfigs":[{"natIP":"8.8.8.8"}]}]}
-        return {"id":"101" if role=="vm_a" else "102","name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","zone":zone_path,"selfLink":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/instances/{namespace}-{'a' if role=='vm_a' else 'b'}","machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/regions/europe-west3/subnetworks/{namespace}-a","nicType":"GVNIC","accessConfigs":[{"natIP":"8.8.8.8"}]}],"disks":[{"boot":True,"source":f"https://compute.googleapis.com/compute/v1/projects/test/zones/{intent.zone}/disks/{namespace}-{'a' if role=='vm_a' else 'b'}-boot"}],"resourcePolicies":[]}
+        return {"id":"101" if role=="vm_a" else "102","name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","zone":zone_path,"selfLink":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/instances/{namespace}-{'a' if role=='vm_a' else 'b'}","machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"network":f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/global/networks/{namespace}-net","networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/regions/europe-west3/subnetworks/{namespace}-a","nicType":"GVNIC","accessConfigs":[{"natIP":"8.8.8.8"}]}],"disks":[{"boot":True,"source":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/disks/{namespace}-{'a' if role=='vm_a' else 'b'}-boot"}],"resourcePolicies":[]}
     monkeypatch.setattr(driver,"_gcloud_json",readback)
     result=driver.provision(deployment)
     assert result.vm_a.private_ipv4=="10.80.1.10" and result.vm_b.private_ipv4=="10.80.1.11"
@@ -553,6 +639,7 @@ def test_s1_fake_provision_normalizes_authenticated_vm_disk_image_and_hostkey_re
     assert result.provider_metadata.value["no_source_template_response_claim"] is True
     journal=json.loads((attempt/"attempt.json").read_text())
     assert journal["observed_disks"][0]["id"] in {"201","202"}
+    assert journal["known_management_hosts"] == {"101": "8.8.8.8", "102": "8.8.8.8"}
 
 
 def test_registered_template_replacement_or_weakened_stop_fails_precreate(tmp_path, monkeypatch):
@@ -575,7 +662,7 @@ def test_registered_template_replacement_or_weakened_stop_fails_precreate(tmp_pa
         driver._verify_registered_templates({"templates": {"vm_a": template, "vm_b": second}}, trigger, deployment)
 
 
-@pytest.mark.parametrize("change", ["swapped_role", "foreign_link", "wrong_shape", "wrong_disk", "wrong_subnet", "weak_metadata", "relative_runtime"])
+@pytest.mark.parametrize("change", ["swapped_role", "foreign_link", "wrong_shape", "wrong_disk", "wrong_subnet", "weak_metadata", "relative_runtime", "foreign_rest_link", "wrong_rest_id", "wrong_unique_id", "wrong_unique_name", "bad_disk_string", "bool_disk_size", "tier_one", "fixed_cpu", "node_affinity"])
 def test_template_role_binding_rejects_swapped_foreign_or_weakened_properties(tmp_path,change):
     from cloud_network_benchmark.providers.gcp import GcpProviderError
     deployment,driver=_cleanup_fixture(tmp_path)
@@ -598,6 +685,24 @@ def test_template_role_binding_rejects_swapped_foreign_or_weakened_properties(tm
         next(x for x in described["properties"]["metadata"]["items"] if x["key"]=="block-project-ssh-keys")["value"]="FALSE"
     elif change=="relative_runtime":
         described["properties"]["scheduling"]["maxRunDuration"]={"seconds":"3600"}
+    elif change=="foreign_rest_link":
+        described["selfLink"] = described["selfLink"].replace(driver.settings.project_id, "foreign-project")
+    elif change=="wrong_rest_id":
+        described["id"] = True
+    elif change=="wrong_unique_id":
+        item["self_link_unique"] = item["self_link_unique"].replace("uniqueId=111", "uniqueId=112")
+    elif change=="wrong_unique_name":
+        item["self_link_unique"] = item["self_link_unique"].replace(f"/{name}?", "/forged?")
+    elif change=="bad_disk_string":
+        described["properties"]["disks"][0]["initializeParams"]["diskSizeGb"] = "32GB"
+    elif change=="bool_disk_size":
+        described["properties"]["disks"][0]["initializeParams"]["diskSizeGb"] = True
+    elif change=="tier_one":
+        described["properties"]["networkPerformanceConfig"] = {"totalEgressBandwidthTier": "TIER_1"}
+    elif change=="fixed_cpu":
+        described["properties"]["minCpuPlatform"] = "Intel Cascade Lake"
+    elif change=="node_affinity":
+        described["properties"]["scheduling"]["nodeAffinities"] = [{"key": "compute.googleapis.com/node-group-name", "operator": "IN", "values": ["fixed"]}]
     with pytest.raises(GcpProviderError,match="template role|immutable template"):
         driver._validate_template(described,item,"vm_a",deployment,trigger)
 
@@ -612,8 +717,8 @@ def test_selected_topology_readback_checks_zone_addresses_disk_and_image(tmp_pat
         if action.startswith("gcp-boot-disk"):
             role="vm_a" if action.endswith("vm_a") else "vm_b"
             suffix="a" if role=="vm_a" else "b"
-            return {"id":"201","name":f"{driver._namespace(deployment)}-{suffix}-boot","zone":"europe-west3-a","sizeGb":32,"type":"zones/europe-west3-a/diskTypes/pd-balanced","sourceImage":f"projects/ubuntu-os-cloud/global/images/{pinned}","labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}
-        return {"architecture":"X86_64","name":pinned}
+            return {"id":"201","name":f"{driver._namespace(deployment)}-{suffix}-boot","zone":"europe-west3-a","sizeGb":"32","type":"zones/europe-west3-a/diskTypes/pd-balanced","sourceImage":f"projects/ubuntu-os-cloud/global/images/{pinned}","labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}}
+        return {"architecture":"X86_64","name":pinned,"guestOsFeatures":[{"type":"GVNIC"}]}
     monkeypatch.setattr(driver,"_gcloud_json",fake_disk)
 
     scenarios = [
@@ -625,25 +730,31 @@ def test_selected_topology_readback_checks_zone_addresses_disk_and_image(tmp_pat
     for scenario, region, zone, address in scenarios:
         vm_b = deployment.vm_b.model_copy(update={"region": region, "zone": zone})
         case = deployment.model_copy(update={"scenario": scenario, "vm_b": vm_b})
-        namespace = driver._namespace(case)
-        subnet = namespace + ("-b" if scenario == Scenario.INTER_REGION else "-a")
-        instance = {"zone": f"https://compute.googleapis.com/compute/v1/projects/test/zones/{zone}", "machineType": "n2-standard-4", "reservationAffinity": {"consumeReservationType": "NO_RESERVATION"}, "scheduling":{"automaticRestart":False}, "networkInterfaces": [{"networkIP": address, "subnetwork": f"https://compute.googleapis.com/compute/v1/projects/test/regions/{region}/subnetworks/{subnet}", "nicType": "GVNIC", "accessConfigs": [{"natIP": "8.8.8.8"}]}], "disks": [{"boot": True, "source": f"https://compute.googleapis.com/compute/v1/projects/test/zones/{zone}/disks/{driver._namespace(case)}-b-boot"}]}
+        instance = _instance_response(driver, case, "vm_b")
         assert driver._validate_instance(instance, case, "vm_b")["sizeGb"] == 32
         with pytest.raises(GcpProviderError,match="boot disk is missing"):
             driver._validate_instance({**instance,"disks":[*instance["disks"],{"boot":False,"source":"foreign-disk"}]},case,"vm_b")
         wrong = {**instance, "networkInterfaces": [{**instance["networkInterfaces"][0], "networkIP": "10.99.0.1"}]}
         with pytest.raises(GcpProviderError, match="private or public management address"):
             driver._validate_instance(wrong, case, "vm_b")
-        no_public = {**instance, "networkInterfaces": [{"networkIP": address, "subnetwork":f"https://compute.googleapis.com/compute/v1/projects/test/regions/{region}/subnetworks/{subnet}", "nicType": "GVNIC", "accessConfigs": []}]}
+        no_public = {**instance, "networkInterfaces": [{**instance["networkInterfaces"][0], "accessConfigs": []}]}
         with pytest.raises(GcpProviderError, match="private or public management address"):
             driver._validate_instance(no_public, case, "vm_b")
     wrong_zone={**instance,"zone":"https://compute.googleapis.com/compute/v1/projects/test/zones/europe-west3-c"}
     with pytest.raises(GcpProviderError,match="differs from selected zone"):
         driver._validate_instance(wrong_zone,case,"vm_b")
+    for unsupported in (
+        {**instance, "networkPerformanceConfig": {"totalEgressBandwidthTier": "TIER_1"}},
+        {**instance, "minCpuPlatform": "Intel Cascade Lake"},
+        {**instance, "scheduling": {**instance["scheduling"], "nodeAffinities": [{"key": "compute.googleapis.com/node-group-name", "operator": "IN", "values": ["fixed"]}]}},
+        {**instance, "networkInterfaces": [{**instance["networkInterfaces"][0], "network": f"https://www.googleapis.com/compute/v1/projects/foreign-project/global/networks/{driver._namespace(case)}-net"}]},
+    ):
+        with pytest.raises(GcpProviderError):
+            driver._validate_instance(unsupported, case, "vm_b")
     def other_project_disk(_args,action):
         if action.startswith("gcp-boot-disk"):
             return {"id":"201","name":f"{driver._namespace(case)}-b-boot","zone":zone,"sizeGb":32,"type":"pd-balanced","sourceImage":f"projects/other-project/global/images/{pinned}","labels":{"cnb-run":hashlib.sha256(case.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(case.deployment_id.encode()).hexdigest()[:20]}}
-        return {"architecture":"X86_64","name":pinned}
+        return {"architecture":"X86_64","name":pinned,"guestOsFeatures":[{"type":"GVNIC"}]}
     monkeypatch.setattr(driver,"_gcloud_json",other_project_disk)
     with pytest.raises(GcpProviderError,match="differs from selected pinned image"):
         driver._validate_instance(instance,case,"vm_b")
@@ -653,6 +764,13 @@ def test_selected_topology_readback_checks_zone_addresses_disk_and_image(tmp_pat
         return {"name":pinned}
     monkeypatch.setattr(driver,"_gcloud_json",wrong_arch_disk)
     with pytest.raises(GcpProviderError,match="not amd64"):
+        driver._validate_instance(instance,case,"vm_b")
+    def no_gvnic_disk(_args,action):
+        if action.startswith("gcp-boot-disk"):
+            return {"id":"201","name":f"{driver._namespace(case)}-b-boot","zone":zone,"sizeGb":32,"type":"pd-balanced","sourceImage":f"projects/ubuntu-os-cloud/global/images/{pinned}","labels":{"cnb-run":hashlib.sha256(case.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(case.deployment_id.encode()).hexdigest()[:20]}}
+        return {"architecture":"X86_64","name":pinned,"guestOsFeatures":[]}
+    monkeypatch.setattr(driver,"_gcloud_json",no_gvnic_disk)
+    with pytest.raises(GcpProviderError,match="does not advertise the GvNIC"):
         driver._validate_instance(instance,case,"vm_b")
 
 
@@ -676,20 +794,12 @@ def test_both_role_observations_match_each_supported_scenario(tmp_path, monkeypa
                 image = driver.settings.images[region]
                 zone = zone_a if action.endswith("vm_a") else zone_b
                 suffix="a" if action.endswith("vm_a") else "b"
-                return {"id":"201","name":f"{driver._namespace(case)}-{suffix}-boot","zone":f"zones/{zone}","sizeGb": 32, "type": f"zones/{zone}/diskTypes/pd-balanced", "sourceImage": image,"labels":{"cnb-run":hashlib.sha256(case.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(case.deployment_id.encode()).hexdigest()[:20]}}
+                return {"id":"201","name":f"{driver._namespace(case)}-{suffix}-boot","zone":f"zones/{zone}","sizeGb": "32", "type": f"zones/{zone}/diskTypes/pd-balanced", "sourceImage": image,"labels":{"cnb-run":hashlib.sha256(case.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(case.deployment_id.encode()).hexdigest()[:20]}}
             region = region_a if action.endswith("vm_a") else region_b
-            return {"architecture": "X86_64", "name": driver.settings.images[region].rsplit("/", 1)[-1]}
+            return {"architecture": "X86_64", "name": driver.settings.images[region].rsplit("/", 1)[-1],"guestOsFeatures":[{"type":"GVNIC"}]}
         monkeypatch.setattr(driver, "_gcloud_json", readback)
         for role, zone, address in (("vm_a", zone_a, ip_a), ("vm_b", zone_b, ip_b)):
-            instance = {
-                "zone": f"https://compute.googleapis.com/compute/v1/projects/test/zones/{zone}",
-                "machineType": "n2-standard-4",
-                "networkInterfaces": [{"networkIP": address, "subnetwork": f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/regions/{region_a if role == 'vm_a' else region_b}/subnetworks/{driver._namespace(case)}-" + ("b" if role == "vm_b" and scenario == Scenario.INTER_REGION else "a"), "nicType": "GVNIC", "accessConfigs": [{"natIP": "8.8.8.8"}]}],
-                "reservationAffinity": {"consumeReservationType": "NO_RESERVATION"},
-                "reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},
-                "scheduling":{"automaticRestart":False},
-                "disks": [{"boot": True, "source": f"https://compute.googleapis.com/compute/v1/projects/test/zones/{zone}/disks/{driver._namespace(case)}-{'a' if role=='vm_a' else 'b'}-boot"}],
-            }
+            instance = _instance_response(driver, case, role)
             observed = driver._validate_instance(instance, case, role)
             assert observed["sizeGb"] == 32
             assert observed["sourceImage"].endswith("ubuntu-2404-lts-amd64-v20261001")
