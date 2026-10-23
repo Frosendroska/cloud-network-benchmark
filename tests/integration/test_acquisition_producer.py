@@ -37,11 +37,14 @@ def _record(root: Path, artifact_id: str, path: str, kind: str, producer: VmRole
 def _native_iperf(cookie: str, *, duration: int = 60, stream: int = 17,
                   start: float = -1.0, end: float = 1.0, byte_count: int = 0,
                   local_host: str = "10.0.0.2", remote_host: str = "10.0.0.1",
-                  interval_count: int = 1, omit: int = 5) -> bytes:
+                  interval_count: int = 1, omit: int = 5, include_omitted: bool = True) -> bytes:
     settings = {"protocol": "TCP", "num_streams": 1, "omit": omit, "duration": duration,
         "interval": 1, "blksize": 131072, "reverse": False}
     rows = [{"socket": stream, "start": start + index, "end": end + index,
         "bytes": byte_count, "omitted": False, "sender": False} for index in range(interval_count)]
+    if include_omitted:
+        rows.insert(0, {"socket": stream, "start": -4, "end": 0,
+            "bytes": 250, "omitted": True, "sender": False})
     receiver = {"start": {"test_start": settings, "connected": [{"socket": stream,
         "local_host": local_host, "local_port": 5201, "remote_host": remote_host,
         "remote_port": 50100}]}, "intervals": [{"streams": [row]} for row in rows]}
@@ -335,7 +338,7 @@ def test_large_receiver_replay_is_repeatable_immutable_and_stream_bounded(tmp_pa
         "iperf3-observation-stderr", VmRole.VM_B, payload)
     native = _record(tmp_path, "large-receiver-native", "retrieval/large-iperf.json",
         "iperf3-json", VmRole.VM_A, _native_iperf(cookie, duration=86400, stream=1,
-            start=0, end=1, byte_count=0, interval_count=count), "day-iperf")
+            start=0, end=1, byte_count=0, interval_count=count, include_omitted=False), "day-iperf")
     client = _command("iperf3-day-iperf", VmRole.VM_A, "day-iperf")
     receiver = _command(invocation, VmRole.VM_B, None)
     build = _build("iperf3", VmRole.VM_B, "iperf-build")

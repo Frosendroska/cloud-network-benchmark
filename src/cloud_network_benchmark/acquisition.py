@@ -143,7 +143,7 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     last_interval: dict[str, tuple[int, int]] = {}
     settings: Mapping[str, object] | None = None
     interval_count = 0
-    measured_interval_count = 0
+    omitted_observations: list[tuple[Mapping[str, object], str]] = []
     for record in records:
         value = record.value
         _same_common(value, source)
@@ -220,15 +220,16 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
             if post_omit_origin is None:
                 raise ValueError("iperf post-omit statistic origin is missing before measured interval")
             origin_us = post_omit_origin
-        if native is not None and not omitted:
-            _corroborate_iperf_interval(value, stream, post_omit_origin, native)
+        if native is not None:
+            if omitted:
+                omitted_observations.append((value, stream))
+            else:
+                _corroborate_iperf_interval(value, stream, post_omit_origin, native)
         # reset_stats resets the native origin but the first interval may retain
         # its pre-reset interval start. Clip only temporal support to the reset;
         # preserve the native interval end and byte count without prorating.
         start_ns, end_ns = max(start_us, origin_us) * 1000, end_us * 1000
         interval_count += 1
-        if not omitted:
-            measured_interval_count += 1
         yield SourceWindow("receiver_measured", "iperf3", str(source.producer), source.boot_id,
             source.clock_domain, source.session_id, stream, start_ns, start_ns + 1000,
             end_ns, end_ns + 1000, omitted, record.byte_offset, record.byte_length)
@@ -241,6 +242,11 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     if interval_count == 0:
         raise ValueError("iperf receiver interval evidence is missing")
     if native is not None:
+        for value, stream in omitted_observations:
+            reset_origin = origins.get(("post_omit", stream))
+            if reset_origin is None:
+                raise ValueError("native iperf omitted interval has no later post-omit reset origin")
+            _corroborate_iperf_interval(value, stream, reset_origin, native)
         native_settings = native["receiver_settings"]
         assert isinstance(native_settings, Mapping)
         expected_settings = {"protocol": str(settings["protocol"]).lower(), "num_streams": settings["num_streams"],
@@ -261,7 +267,7 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
                 for key in ("protocol", "num_streams", "omit", "duration", "interval", "blksize", "reverse")):
             raise ValueError("native iperf client and receiver settings do not match")
         native_streams = native["streams"]
-        if not isinstance(native_streams, list) or len(native_streams) != measured_interval_count:
+        if not isinstance(native_streams, list) or len(native_streams) != interval_count:
             raise ValueError("native iperf receiver intervals do not match the observed interval count")
         if len(native.get("_matched_stream_indexes", set())) != len(native_streams):
             raise ValueError("native iperf output contains unmatched receiver intervals")
