@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cost_input_id": "v2-register-forecast-2026-10-14-scoped",
+  "cost_input_id": "2026-10-14-provider-price-inputs",
   "prices_checked_on": "2026-10-14",
   "acquired_on": "2026-10-21",
   "source_scope": ["Budget!A1:H35", "Runs!A1:Z40", "Cost model!A1:J65", "Runs!A41:I100"],

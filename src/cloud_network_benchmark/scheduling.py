@@ -23,6 +23,16 @@ WINDOWS = {"night", "morning", "afternoon", "evening"}
 
 
 @dataclass(frozen=True)
+class ExecutionIdentity:
+    entry_id: str
+    campaign_id: str
+    child_identities: Mapping[str, str]
+    resource_namespaces: Mapping[str, str]
+    state_namespaces: Mapping[str, str]
+    result_namespaces: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class ScheduleInspection:
     entries: tuple[ScheduleEntry, ...]
     pending_by_entry: Mapping[str, tuple[str, ...]]
@@ -32,6 +42,7 @@ class ScheduleInspection:
     namespace_collisions: tuple[str, ...]
     simultaneous_vm_demand: Mapping[str, int]
     complete_primary_week: bool
+    identities_by_entry: Mapping[str, ExecutionIdentity] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -148,14 +159,25 @@ def inspect_schedule(entries: Sequence[ScheduleEntry], *, campaigns_by_entry_id:
                 missed.append(e.entry_id)
             if e.window_label:
                 slots[(e.scheduled_start.date().isoformat(), e.window_label)].append(e)
+            elif e.priority in {"P0", "P1"}:
+                reasons.append("window_pending")
         if campaign and mode in {"short_study", "diagnostic_day"} and campaign.benchmark.common_n.state == "pending":
             reasons.append("calibration_pending")
+        if campaign and campaign.admission.requires_primary_review:
+            reasons.append("primary_review_pending")
+        if campaign:
+            for blocker in campaign.launch_blockers:
+                safe_blocker = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(blocker)).strip("_").lower()
+                if safe_blocker:
+                    reasons.append(f"launch_blocker:{safe_blocker}")
         if reasons:
             pending[e.entry_id] = tuple(reasons)
         if campaign:
             if mode in {"calibration", "diagnostic_day"}:
-                same_experiment = [item for item in entries if item.experiment_id == e.experiment_id]
-                if len(same_experiment) != 1:
+                same_mode = [item for item in entries if item.experiment_id == e.experiment_id
+                    and campaigns_by_entry_id.get(item.entry_id) is not None
+                    and str(getattr(campaigns_by_entry_id[item.entry_id].mode, "value", campaigns_by_entry_id[item.entry_id].mode)) == mode]
+                if len(same_mode) != 1:
                     errors.append(f"identity_mismatch:{e.entry_id}:retained_mode_requires_one_entry")
             if e.priority in {"P0", "P1"} and {str(getattr(p, "value", p)) for p in campaign.selected_providers} != {p.value for p in Provider}:
                 errors.append(f"identity_mismatch:{e.entry_id}:primary_requires_all_providers")
@@ -177,17 +199,50 @@ def inspect_schedule(entries: Sequence[ScheduleEntry], *, campaigns_by_entry_id:
         for d in dates for w in WINDOWS
     )
     aligned = aligned and all({e.window_label for e in primary if e.scheduled_start and e.scheduled_start.date() == d} == WINDOWS for d in dates)
+    for entry in primary:
+        campaign = campaigns_by_entry_id.get(entry.entry_id)
+        if campaign is not None:
+            mode = str(getattr(campaign.mode, "value", campaign.mode))
+            scenario = str(getattr(campaign.scenario, "value", campaign.scenario))
+            if mode != "short_study" or (entry.priority == "P0" and scenario != "same_zone") or (entry.priority == "P1" and scenario != "placement_optimization"):
+                aligned = False
+    if any(error.split(":", 2)[1] in {e.entry_id for e in primary} for error in errors if error.startswith("identity_mismatch:")):
+        aligned = False
     if require_primary_week and not aligned:
         errors.append("invalid_schedule: primary week requires 28+28 aligned entries")
+    identities = {}
+    all_namespaces: dict[str, tuple[str, str]] = {}
+    for entry in entries:
+        campaign = campaigns_by_entry_id.get(entry.entry_id)
+        if campaign is None:
+            continue
+        providers = sorted(Provider(provider).value for provider in campaign.selected_providers)
+        child = {provider: f"{entry.entry_id}-{provider}" for provider in providers}
+        resources = {provider: f"{entry.entry_id}-{provider}-resources" for provider in providers}
+        states = {provider: f"{entry.entry_id}-{provider}-state" for provider in providers}
+        results = {provider: f"{entry.entry_id}-{provider}-results" for provider in providers}
+        for category, values in (("resource", resources), ("state", states), ("result", results)):
+            for provider, namespace in values.items():
+                previous = all_namespaces.get(namespace)
+                identity = (entry.entry_id, provider)
+                if previous is not None and previous != identity:
+                    collisions.add(f"{category}:{namespace}")
+                all_namespaces[namespace] = identity
+        identities[entry.entry_id] = ExecutionIdentity(entry.entry_id, entry.entry_id, child, resources, states, results)
     return ScheduleInspection(tuple(entries), pending, tuple(errors), tuple(missed),
         tuple(sorted((d.isoformat(), w) for d, w in by_day_window)), tuple(sorted(collisions)),
-        {p.value: 4 for p in Provider}, aligned)
+        {p.value: 4 for p in Provider}, aligned, identities)
 
 
 def assess_provider_skew(phase_id: str, *, selected_providers: Sequence[Provider], actual_starts: Mapping[Provider, Evidence[datetime]]) -> SkewAssessment:
-    starts = {Provider(p).value: actual_starts.get(Provider(p), Evidence[datetime](unavailable_reason="missing_start")).value for p in selected_providers}
+    providers = [Provider(p) for p in selected_providers]
+    if len(providers) != len(set(providers)):
+        raise ValueError("identity_mismatch: selected providers must be unique")
+    starts = {provider.value: actual_starts.get(provider, Evidence[datetime](unavailable_reason="missing_start")).value for provider in providers}
     if not starts or any(value is None for value in starts.values()):
         return SkewAssessment(phase_id, starts, None, "unavailable", None, "provider_skew_unavailable")
+    if any(value.tzinfo is None or value.utcoffset() is None for value in starts.values() if value is not None):
+        raise ValueError("invalid_schedule: actual provider starts must be timezone-aware")
     values = [v.astimezone(timezone.utc) for v in starts.values() if v is not None]
     skew = (max(values) - min(values)).total_seconds()
     if skew <= 60:
