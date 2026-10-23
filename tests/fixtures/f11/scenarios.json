@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "fixture_scope": "synthetic-test-only",
+  "synthetic_week_start": "2026-10-01",
+  "synthetic_windows": {
+    "night": "23:00:00",
+    "morning": "07:00:00",
+    "afternoon": "13:00:00",
+    "evening": "19:00:00"
+  },
+  "minimum_protocol_seconds": {
+    "acceptance": 75,
+    "short_study": 225,
+    "calibration": 950,
+    "diagnostic_day": 86407
+  },
+  "synthetic_common_n": 4,
+  "synthetic_prerequisites": {
+    "calibration": "test-only frozen N fixture; does not imply research calibration",
+    "study_windows": "test-only UTC windows; exact study windows remain unresolved",
+    "paid_authorization": false,
+    "provider_support": {"aws": "dated fixture only", "azure": "unavailable", "gcp": "unavailable"}
+  },
+  "synthetic_event_ids": {
+    "partial_cleanup": "f11-synthetic-partial-cleanup",
+    "failure_observation": "f11-synthetic-failed-observation",
+    "optional_review": "f11-synthetic-optional-review"
+  },
+  "note": "These dates, windows, events, and mode thresholds are test values only; they are not the study schedule, N, provider evidence, or paid authorization."
+}

@@ -7,6 +7,7 @@ from typing import Annotated, Literal, Optional
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from .common import Evidence, IDENTIFIER_PATTERN, Provider, StrictModel, StringEvidence, StructuredEvidence, VmRole, utc_datetime
+from .artifacts import _normalized_relative_path
 from .execution import CommandResult
 
 
@@ -164,6 +165,37 @@ class ClockMapping(StrictModel):
         return value
 
 
+class AcquisitionSource(StrictModel):
+    """Raw, immutable references from which acquisition windows may be replayed."""
+
+    tool: Literal["sockperf", "iperf3"]
+    semantics_id: Literal["sockperf-3.10-enabled-v1", "iperf-3.17.1-stats-v1"]
+    producer: VmRole
+    command_action_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    invocation_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    session_id: Optional[str] = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    boot_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
+    clock_domain: Literal["CLOCK_MONOTONIC"]
+    log_artifact_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    log_path: str = Field(min_length=1)
+    native_artifact_ids: list[str] = Field(min_length=1)
+    build_artifact_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    mapping_indexes: list[Annotated[int, Field(strict=True, ge=0)]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def consistent_source_identity(self) -> "AcquisitionSource":
+        _normalized_relative_path(self.log_path)
+        if self.command_action_id != self.invocation_id:
+            raise ValueError("invocation_id must match the producing command action ID")
+        if len(set(self.native_artifact_ids)) != len(self.native_artifact_ids):
+            raise ValueError("native artifact references must be unique")
+        if self.tool == "sockperf":
+            if self.semantics_id != "sockperf-3.10-enabled-v1" or self.producer != VmRole.VM_A or self.session_id is not None:
+                raise ValueError("Sockperf source must identify vm_a Sockperf 3.10 and omit session_id")
+        elif self.semantics_id != "iperf-3.17.1-stats-v1" or self.session_id is None:
+            raise ValueError("iperf3 source must identify iperf3 3.17.1 and a native session cookie")
+        return self
+
 class TimingGap(StrictModel):
     started_at: datetime
     finished_at: datetime
@@ -193,6 +225,9 @@ class MeasurementTiming(StrictModel):
     overlap_seconds: Evidence[float]
     gaps: list[TimingGap] = Field(default_factory=list)
     clock_mappings: list[ClockMapping] = Field(default_factory=list)
+    acquisition_sources: Evidence[list[AcquisitionSource]] = Field(
+        default_factory=lambda: Evidence[list[AcquisitionSource]](unavailable_reason="acquisition observations not captured")
+    )
 
     @field_validator("omitted_seconds")
     @classmethod
@@ -203,6 +238,17 @@ class MeasurementTiming(StrictModel):
 
     @model_validator(mode="after")
     def ordered_interval(self) -> "MeasurementTiming":
+        if self.acquisition_sources.value is not None:
+            if not self.acquisition_sources.value:
+                raise ValueError("a populated acquisition source list must be nonempty")
+            for source in self.acquisition_sources.value:
+                if len(set(source.mapping_indexes)) != len(source.mapping_indexes):
+                    raise ValueError("clock mapping indexes must be unique per acquisition source")
+                for index in source.mapping_indexes:
+                    if index >= len(self.clock_mappings):
+                        raise ValueError("acquisition mapping index must reference an existing clock mapping")
+                    if self.clock_mappings[index].vm_role != source.producer:
+                        raise ValueError("referenced clock mapping VM role must match acquisition producer")
         start, end = self.measured_started_at.value, self.measured_finished_at.value
         if start is not None and end is not None and end < start:
             raise ValueError("measured finish must not precede start")

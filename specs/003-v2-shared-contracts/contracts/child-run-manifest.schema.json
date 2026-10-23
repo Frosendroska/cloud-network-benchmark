@@ -19,6 +19,110 @@
       "title": "AccelerationIntent",
       "type": "object"
     },
+    "AcquisitionSource": {
+      "additionalProperties": false,
+      "description": "Raw, immutable references from which acquisition windows may be replayed.",
+      "properties": {
+        "boot_id": {
+          "pattern": "^[0-9a-fA-F-]{36}$",
+          "title": "Boot Id",
+          "type": "string"
+        },
+        "build_artifact_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Build Artifact Id",
+          "type": "string"
+        },
+        "clock_domain": {
+          "const": "CLOCK_MONOTONIC",
+          "title": "Clock Domain",
+          "type": "string"
+        },
+        "command_action_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Command Action Id",
+          "type": "string"
+        },
+        "invocation_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Invocation Id",
+          "type": "string"
+        },
+        "log_artifact_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+          "title": "Log Artifact Id",
+          "type": "string"
+        },
+        "log_path": {
+          "minLength": 1,
+          "title": "Log Path",
+          "type": "string"
+        },
+        "mapping_indexes": {
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": "Mapping Indexes",
+          "type": "array"
+        },
+        "native_artifact_ids": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Native Artifact Ids",
+          "type": "array"
+        },
+        "producer": {
+          "$ref": "#/$defs/VmRole"
+        },
+        "semantics_id": {
+          "enum": [
+            "sockperf-3.10-enabled-v1",
+            "iperf-3.17.1-stats-v1"
+          ],
+          "title": "Semantics Id",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "tool": {
+          "enum": [
+            "sockperf",
+            "iperf3"
+          ],
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "semantics_id",
+        "producer",
+        "command_action_id",
+        "invocation_id",
+        "boot_id",
+        "clock_domain",
+        "log_artifact_id",
+        "log_path",
+        "native_artifact_ids",
+        "build_artifact_id"
+      ],
+      "title": "AcquisitionSource",
+      "type": "object"
+    },
     "AdmissionRequirements": {
       "additionalProperties": false,
       "properties": {
@@ -119,6 +223,11 @@
           "title": "Day Iperf3 Client",
           "type": "string"
         },
+        "day_iperf3_observation": {
+          "default": "measurements/day/iperf3-acquisition.stderr",
+          "title": "Day Iperf3 Observation",
+          "type": "string"
+        },
         "day_probe_csv_template": {
           "default": "measurements/day/probes/{chunk_id}.csv",
           "title": "Day Probe Csv Template",
@@ -127,6 +236,11 @@
         "day_probe_log_template": {
           "default": "measurements/day/probes/{chunk_id}.log",
           "title": "Day Probe Log Template",
+          "type": "string"
+        },
+        "day_probe_observation_template": {
+          "default": "measurements/day/probes/{chunk_id}.acquisition.stderr",
+          "title": "Day Probe Observation Template",
           "type": "string"
         },
         "iperf3_server_error": {
@@ -1619,6 +1733,85 @@
       "title": "Evidence[int]",
       "type": "object"
     },
+    "Evidence_list_AcquisitionSource__": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "unavailable_reason": {
+              "type": "null"
+            },
+            "value": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/$defs/AcquisitionSource"
+                  },
+                  "type": "array"
+                }
+              ],
+              "default": null,
+              "title": "Value"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "unavailable_reason": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                }
+              ],
+              "default": null,
+              "title": "Unavailable Reason"
+            },
+            "value": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "unavailable_reason"
+          ]
+        }
+      ],
+      "properties": {
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailable Reason"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/AcquisitionSource"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "title": "Evidence[list[AcquisitionSource]]",
+      "type": "object"
+    },
     "Evidence_str_": {
       "additionalProperties": false,
       "oneOf": [
@@ -2003,6 +2196,9 @@
     "MeasurementTiming": {
       "additionalProperties": false,
       "properties": {
+        "acquisition_sources": {
+          "$ref": "#/$defs/Evidence_list_AcquisitionSource__"
+        },
         "clock_mappings": {
           "items": {
             "$ref": "#/$defs/ClockMapping"
