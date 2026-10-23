@@ -1,6 +1,6 @@
 # F12 validation and user handoff
 
-Planning only. Assigned worktree `/private/tmp/cnb-f12`, branch `codex/f12-v2-analysis`, verified F08 merge base `4a80f4af86feddc86e4ab930d254a19e29b35591`. Shared DTOs/F08/F07/Thesis/state are outside ownership. See [contract](contracts/native-analysis.md) and [data model](data-model.md).
+Implementation in progress. Assigned worktree `/private/tmp/cnb-f12`, branch `codex/f12-v2-analysis`, verified F08 merge base `4a80f4af86feddc86e4ab930d254a19e29b35591`. At setup, HEAD was `fea5e449b77ca0259e5e5211b74094bb8ee7044f`; `origin/main` was the same verified F08 base. The worktree was clean. Shared DTOs/F08/F07/Thesis/state are outside ownership. See [contract](contracts/native-analysis.md) and [data model](data-model.md).
 
 ## Runtime and context
 
@@ -20,7 +20,15 @@ CNB_PYTHON=/private/tmp/cnb-offline-venv/bin/python
 test -x "$CNB_PYTHON"
 ```
 
-Optional dependency declaration is `analysis = ["matplotlib>=3.7,<4"]`. Coordinator reported installation/smoke success with Python3.11.13 x86_64 process (Darwin arm64 host), Matplotlib3.11.2 and NumPy2.4.6. Planner independently verified installed package metadata and Python process architecture; Agg smoke remains coordinator-reported. Do not confuse host/process architecture. Exact F12 renderer acceptance is not yet run. Verify actual runtime metadata before implementation checks; use existing official PowerShell PATH if the full suite needs it, without changing provider tests.
+Optional dependency declaration is `analysis = ["matplotlib>=3.7,<4"]` (added during T002). Verified in the assigned runtime with `MPLBACKEND=Agg` and `MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config`: Python 3.11.13, x86_64 process on macOS 15.2 x86_64, Matplotlib 3.11.2, NumPy 2.4.6, Agg backend, bundled Matplotlib data directory `/private/tmp/cnb-offline-venv/lib/python3.11/site-packages/matplotlib/mpl-data`; the DejaVu Sans TTF path is verified below during renderer QA. Official PowerShell on the supplied PATH is 7.5.11. Do not confuse host/process architecture. Exact F12 renderer acceptance is not yet run. Use the supplied official PowerShell PATH for full-suite checks without changing provider tests.
+
+Setup reconciliation: `.specify/extensions.yml` is absent (no implement hooks); both implementation checklists had 16/16 items checked. The existing `.gitignore` excludes Python caches/environments/build outputs and generated `results/processed/*`; `.terraformignore` excludes Terraform state/plan/secrets. The prerequisite script completed successfully with the assigned feature directory and task artifacts. Read-only F08 adapters confirmed available: `validate_bundle(value, evaluated_at=...)`, `evaluate_comparison(inputs, results)`, native parsers/statistics in `native.py`, plus `_acquisition_windows` and `_measured_samples` in `validation.py`; the existing integration fixture materializes real F08 lifecycle artifacts and is the planned F12 test wrapper. Baseline command:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider tests/integration/test_native_validation_replay.py
+```
+
+Result: exit 0, 10 passed in 52.41s. No F12 implementation/render/replay or full suite checks have been run yet. No cloud, benchmark traffic, or credentials used.
 
 ## Planned user command and inputs
 

@@ -17,6 +17,7 @@ test = [
   "pytest>=8.0,<9",
   "jsonschema>=4.16,<5",
 ]
+analysis = ["matplotlib>=3.7,<4"]
 
 [project.scripts]
 cloud-network-benchmark = "cloud_network_benchmark.cli:main"
