@@ -10,6 +10,7 @@ import json
 import os
 import re
 import base64
+import secrets
 import struct
 import shutil
 import tempfile
@@ -23,8 +24,8 @@ from typing import Any, Callable, Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
 
-from .contracts.admission import ExpiryEvidence, ExpiryRequest
-from .contracts.common import (CleanupState, Evidence, FailureEvidence, IdentityContext,
+from .contracts.admission import AdmissionRequirements, ExpiryEvidence, ExpiryRequest
+from .contracts.common import (CleanupState, Evidence, ExperimentMode, FailureEvidence, IdentityContext,
     Provider, Scenario, StrictModel, StringEvidence, StructuredEvidence, VmRole)
 from .contracts.deployment import (ProviderDeploymentInput, ProviderDeploymentOutput,
     ProviderVmOutput, RemoteConnectionData)
@@ -52,7 +53,7 @@ class AzureRuntimeOptions(StrictModel):
     cap_deadline_monotonic: float = Field(gt=0)
     admission_evidence: dict[str, Any]
     retry_end_at: datetime
-    poll_seconds: float = Field(gt=0)
+    poll_seconds: int = Field(ge=1, le=300)
     command_timeout_seconds: float = Field(gt=0)
     expiry_cost_input: dict[str, Any]
 
@@ -202,6 +203,15 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         raise ValueError("matching active reservation evidence is required")
     if reservation.campaign_id != d.campaign_id or reservation.expires_at.value is None or reservation.cap_started_at.value is None:
         raise ValueError("reservation identity and cap evidence must be complete")
+    mode_cap=int(AdmissionRequirements.expected_for(d.mode,d.scenario)["lifetime_cap_seconds"])
+    if d.admission.lifetime_cap_seconds != mode_cap:
+        raise ValueError("admitted lifetime cap does not match the selected mode")
+    mode_measurement_seconds={"acceptance":30,"short_study":180,"calibration":720,"diagnostic_day":86400}[ExperimentMode(d.mode).value]
+    if (o.complete_workflow_seconds < mode_measurement_seconds or o.post_registration_workflow_seconds < mode_measurement_seconds
+            or o.complete_workflow_seconds > mode_cap or o.post_registration_workflow_seconds > mode_cap):
+        raise ValueError("workflow bounds do not cover the selected mode or exceed its lifetime ceiling")
+    if now < reservation.cap_started_at.value or reservation.expires_at.value-reservation.cap_started_at.value > timedelta(seconds=mode_cap):
+        raise ValueError("reservation chronology or original mode lifetime ceiling is invalid")
     if o.admission_evidence.get("reservation_id") != reservation.reservation_id.value or o.admission_evidence.get("source_sha256") != reservation.source_sha256:
         raise ValueError("admission snapshot must bind this reservation and its source hash")
     expiry_cost_bound = float(o.expiry_cost_input["automation_rate_per_job_minute"]) * float(o.expiry_cost_input["job_minutes_bound"])
@@ -257,6 +267,38 @@ def _atomic_private(path: Path, value: dict[str, Any]) -> None:
         if os.path.exists(name): os.unlink(name)
 
 
+def _persist_tfvars(root: Path, journal: Path, name: str, values: dict[str, Any]) -> Path:
+    """Persist the exact root inputs once, privately, so destroy can reproduce state identity."""
+    path = root / f"{name}.auto.tfvars.json"
+    if path.is_symlink():
+        raise FileExistsError(f"{name} Terraform input file is a symlink")
+    if path.exists():
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if current != values:
+            raise FileExistsError(f"{name} Terraform inputs differ from the owned attempt")
+    else:
+        _atomic_private(path, values)
+    os.chmod(path, 0o600)
+    state = json.loads(journal.read_text(encoding="utf-8"))
+    state.setdefault("terraform_inputs", {})[name] = path.name
+    _atomic_private(journal, state)
+    return path
+
+
+def _recovery_tfvars(root: Path, journal: Path, name: str, expected: dict[str,Any]) -> Path:
+    """Return only the original private Terraform inputs recorded for this attempt."""
+    state=json.loads(journal.read_text(encoding="utf-8"))
+    if state.get("terraform_inputs",{}).get(name) != f"{name}.auto.tfvars.json":
+        raise RuntimeError(f"recovery journal lacks the original {name} Terraform inputs")
+    path=root/f"{name}.auto.tfvars.json"
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise RuntimeError(f"private {name} Terraform input is missing or has unsafe permissions")
+    try: payload=json.loads(path.read_text(encoding="utf-8"))
+    except (OSError,json.JSONDecodeError) as exc: raise RuntimeError(f"private {name} Terraform input is malformed") from exc
+    if payload!=expected: raise RuntimeError(f"private {name} Terraform input no longer matches this deployment")
+    return path
+
+
 def _redact(options: AzureRuntimeOptions, value: object) -> str:
     text = str(value)
     for secret in (options.authentication_reference, options.ssh_public_key, str(options.attempt_root)):
@@ -273,6 +315,10 @@ def _safe_result_view(options: AzureRuntimeOptions, result: CommandResult) -> di
         if len(view[field])>65536:
             view[field]=view[field][:65536]+"[TRUNCATED]"
     return view
+
+
+def _safe_cleanup_action(options: AzureRuntimeOptions, result: CommandResult) -> dict[str, Any]:
+    return _safe_result_view(options, result)
 
 
 def _journal_actions(journal: Path) -> list[dict[str, Any]]:
@@ -347,8 +393,20 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
         "active_priority": "Regular", "network_limit_mbps": 12500}
 
 
+def _is_exact_not_found(result: CommandResult) -> bool:
+    for text in (result.stdout, result.stderr):
+        try:
+            payload=json.loads(text)
+            code=payload.get("error",{}).get("code") if isinstance(payload,dict) else None
+            if code in {"ResourceNotFound","NotFound"}: return True
+        except (json.JSONDecodeError,AttributeError):
+            pass
+        if re.search(r"(?:^|\n)\s*(?:ERROR:\s*)?\(ResourceNotFound\)(?:\s|$)",text): return True
+    return False
+
+
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
-             clock: Callable[[], float]) -> CommandResult:
+             clock: Callable[[], float], *, allow_not_found: bool = False) -> CommandResult:
     remaining = options.cap_deadline_monotonic-clock()
     if remaining <= 0: raise TimeoutError("original reservation deadline elapsed")
     environment = dict(os.environ)
@@ -372,7 +430,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         state=json.loads(journal.read_text(encoding="utf-8"))
         state.setdefault("actions", []).append({"request":req.durable_view(),"result":_safe_result_view(options,result)})
         _atomic_private(journal,state)
-    if result.outcome != "succeeded": raise RuntimeError(_redact(options,f"{action} failed with {result.outcome}: {result.stderr[:1000]}"))
+    if result.outcome != "succeeded" and not (allow_not_found and _is_exact_not_found(result)):
+        raise RuntimeError(_redact(options,f"{action} failed with {result.outcome}: {result.stderr[:1000]}"))
     if len(result.stdout.encode("utf-8"))>1_000_000 or len(result.stderr.encode("utf-8"))>1_000_000:
         raise RuntimeError(f"{action} produced output above the 1 MiB bounded-response limit")
     return result
@@ -406,9 +465,62 @@ def _prove_vm_absent(runner: CommandRunner, options: AzureRuntimeOptions, root: 
     result = result.model_copy(update={"redactions":list(set(result.redactions + request.redactions))})
     if result.outcome == "succeeded":
         raise RuntimeError("VM remains present by direct resource ID: " + resource_id)
-    if result.outcome == "failed" and "ResourceNotFound" in result.stderr:
+    if result.outcome == "failed" and _is_exact_not_found(result):
         return result
     raise RuntimeError(f"direct VM absence query is not proof: {result.outcome}: {result.stderr[:500]}")
+
+
+def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
+                         endpoint: str, action: str, clock: Callable[[],float],
+                         required_fields: tuple[str,...]) -> tuple[list[dict[str,Any]],list[dict[str,Any]]]:
+    """Read all ARM continuation pages; malformed, repeated, or foreign links fail closed."""
+    next_url="https://management.azure.com"+endpoint
+    scope_prefix=next_url.split("?",1)[0]
+    seen_urls=set(); seen_ids=set(); values=[]; evidence=[]
+    for page in range(1000):
+        if next_url in seen_urls or not next_url.startswith("https://management.azure.com/"):
+            raise RuntimeError(f"{action} returned a repeated or non-ARM continuation URL")
+        seen_urls.add(next_url)
+        result=_command(runner,options,root,["az","rest","--method","GET","--url",next_url,"--output","json"],
+            action if page==0 else f"{action}_page_{page+1}",clock)
+        evidence.append(_safe_cleanup_action(options,result))
+        if not result.stdout.strip(): raise RuntimeError(f"{action} returned blank collection output")
+        try: payload=json.loads(result.stdout)
+        except json.JSONDecodeError as exc: raise RuntimeError(f"{action} returned malformed JSON") from exc
+        if not isinstance(payload,dict) or not isinstance(payload.get("value"),list):
+            raise RuntimeError(f"{action} response lacks a complete ARM value collection")
+        for item in payload["value"]:
+            if not isinstance(item,dict) or any(not isinstance(item.get(field),str) or not item[field].strip() for field in required_fields):
+                raise RuntimeError(f"{action} contains an incomplete resource observation")
+            identity=item[required_fields[0]].lower()
+            if identity in seen_ids: raise RuntimeError(f"{action} contains a duplicate resource identity")
+            seen_ids.add(identity); values.append(item)
+        link=payload.get("nextLink")
+        if link in (None,""): return values,evidence
+        if not isinstance(link,str) or not link.startswith(scope_prefix):
+            raise RuntimeError(f"{action} returned an invalid continuation URL")
+        next_url=link
+    raise RuntimeError(f"{action} exceeded the bounded 1000-page inventory limit")
+
+
+def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
+                            account: str, collection: str, child: str,
+                            clock: Callable[[],float], actions: list[dict[str,Any]]) -> None:
+    base=f"{account}/{collection}/{child}?api-version={AUTOMATION_API}"
+    read=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_before_delete",clock,allow_not_found=True)
+    actions.append(_safe_cleanup_action(options,read))
+    if read.outcome=="failed" and _is_exact_not_found(read): return
+    try: observed=json.loads(read.stdout)
+    except (json.JSONDecodeError,TypeError) as exc: raise RuntimeError(f"Azure {collection} readback is malformed") from exc
+    expected=base.split("?",1)[0]
+    if not isinstance(observed,dict) or not isinstance(observed.get("id"),str) or observed["id"].lower()!=expected.lower():
+        raise RuntimeError(f"Azure {collection} readback identity mismatch")
+    deleted=_command(runner,options,root,_azure_rest("DELETE",base),f"expiry_{collection}_delete",clock,allow_not_found=True)
+    actions.append(_safe_cleanup_action(options,deleted))
+    verify=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_absence",clock,allow_not_found=True)
+    actions.append(_safe_cleanup_action(options,verify))
+    if verify.outcome!="failed" or not _is_exact_not_found(verify):
+        raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 
 def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None) -> list[str]:
@@ -448,34 +560,58 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
     root, journal = _workspace(options, deployment)
+    pair_vars = _persist_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
+    expiry_values={"subscription_id":options.subscription_id,"tenant_id":options.tenant_id,
+        "resource_group_name":name,"deployment_id":deployment.deployment_id,"location":"germanywestcentral"}
+    expiry_vars = _persist_tfvars(root,journal,"expiry",expiry_values)
+    account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
+    rb = name + "-deallocate"
+    sched = name + "-once"
     state = json.loads(journal.read_text())
-    state.update({"expiry": {"state": "preparing", "targets": ids}, "expiry_state": "preparing"})
+    prior=state.setdefault("expiry",{})
+    job_id=str(prior.get("job_schedule_id") or uuid.uuid4())
+    prior.update({"state":"preparing","targets":ids,"automation_account_id":account,
+        "runbook":rb,"schedule":sched,"job_schedule_id":job_id})
+    prior.setdefault("children",{})
+    state["expiry_state"]="preparing"
     _atomic_private(journal, state)
     # Terraform creates only the attempt group, Basic Automation identity, and narrow role.
-    expiry_state = str(root / "expiry.tfstate")
-    _command(runner, options, root, ["terraform", "-chdir=terraform/azure/expiry", "init", "-input=false", f"-backend-config=path={expiry_state}"], "expiry_init", clock)
-    _command(runner, options, root, ["terraform", "-chdir=terraform/azure/expiry", "apply", "-auto-approve", "-input=false", "-state", expiry_state,
-        "-var", f"resource_group_name={name}", "-var", f"deployment_id={deployment.deployment_id}", "-var", f"subscription_id={options.subscription_id}", "-var", f"tenant_id={options.tenant_id}"], "expiry_prerequisites", clock)
-    expiry_outputs = json.loads(_command(runner, options, root, ["terraform", "-chdir=terraform/azure/expiry", "output", "-json", "-state", expiry_state], "expiry_outputs", clock).stdout)
+    _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_init")
+    _tf(root,options,runner,clock,"terraform/azure/expiry","apply","-auto-approve","-input=false",f"-var-file={expiry_vars}",action="expiry_prerequisites")
+    expiry_outputs = json.loads(_tf(root,options,runner,clock,"terraform/azure/expiry","output","-json",action="expiry_outputs").stdout)
     expiry_ids = {key: item.get("value") for key, item in expiry_outputs.items()}
     required_outputs = ("resource_group_id", "automation_account_id", "principal_id", "role_assignment_id", "role_definition_id")
     if any(not expiry_ids.get(key) for key in required_outputs):
         raise RuntimeError("expiry prerequisite outputs are incomplete")
-    account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
-    rb = name + "-deallocate"
+    account_read=json.loads(_command(runner,options,root,_azure_rest("GET",f"{account}?api-version={AUTOMATION_API}"),"automation_account_readback",clock).stdout)
+    account_identity=account_read.get("identity",{})
+    if account_identity.get("type")!="SystemAssigned" or account_identity.get("principalId","").lower()!=str(expiry_ids["principal_id"]).lower():
+        raise RuntimeError("Automation account system-assigned identity readback mismatch")
+    state=json.loads(journal.read_text(encoding="utf-8"))
+    state["expiry"].update({"resource_group_id":expiry_ids["resource_group_id"],"role_assignment_id":expiry_ids["role_assignment_id"],
+        "role_definition_id":expiry_ids["role_definition_id"],"principal_id":expiry_ids["principal_id"]})
+    _atomic_private(journal,state)
     base = f"{account}/runbooks/{rb}?api-version={AUTOMATION_API}"
     script_path = Path(__file__).resolve().parents[2] / "terraform/azure/expiry/deallocate.ps1"
     script = script_path.read_text(encoding="utf-8")
     runbook = {"location":"germanywestcentral","properties":{"runbookType":"PowerShell","logVerbose":False,"logProgress":True,"description":"F06 deallocate-only expiry"}}
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["runbook"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, _azure_rest("PUT", base, runbook), "runbook_draft", clock)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["runbook"]="draft"; _atomic_private(journal,state)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["content"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, ["az", "rest", "--method", "PUT", "--url", f"{account}/runbooks/{rb}/draft/content?api-version={AUTOMATION_API}", "--headers", "Content-Type=text/powershell", "--body", script], "runbook_content", clock)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["content"]="uploaded"; _atomic_private(journal,state)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["publish"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, _azure_rest("POST", f"{account}/runbooks/{rb}/publish?api-version={AUTOMATION_API}"), "runbook_publish", clock)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["publish"]="submitted"; _atomic_private(journal,state)
     publish_wall_deadline=time.monotonic()+options.command_timeout_seconds
     publish_mono_deadline=min(options.cap_deadline_monotonic,mono+options.command_timeout_seconds)
     published={}
     while True:
         published = json.loads(_command(runner, options, root, _azure_rest("GET", base), "runbook_readback", clock).stdout or "{}")
-        if published.get("properties", {}).get("state") == "Published":
+        if (published.get("properties", {}).get("state") == "Published"
+                and published.get("properties", {}).get("runbookType") == "PowerShell"
+                and published.get("properties", {}).get("runtimeEnvironment") in (None, "", "PowerShell-5.1")):
             break
         remaining=min(publish_mono_deadline-clock(),publish_wall_deadline-time.monotonic())
         if remaining <= 0:
@@ -485,12 +621,13 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     digest = hashlib.sha256(content.stdout.encode()).hexdigest()
     if published.get("properties", {}).get("state") != "Published" or digest != hashlib.sha256(script.encode()).hexdigest():
         raise RuntimeError("runbook publication/content readback did not match uploaded script")
-    sched = name + "-once"
     sched_url = f"{account}/schedules/{sched}?api-version={AUTOMATION_API}"
     schedule_body = {"name":sched,"properties":{"frequency":"OneTime","startTime":trigger.isoformat().replace("+00:00","Z"),"timeZone":"UTC","description":deployment.deployment_id}}
     if (trigger - utc_now().astimezone(UTC)).total_seconds() < 300:
         raise ValueError("Automation schedule requires at least 300 seconds lead before schedule mutation")
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["schedule"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, _azure_rest("PUT", sched_url, schedule_body), "schedule_create", clock)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["schedule"]="created"; _atomic_private(journal,state)
     sched_read = json.loads(_command(runner, options, root, _azure_rest("GET", sched_url), "schedule_readback", clock).stdout or "{}")
     props = sched_read.get("properties", {})
     if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
@@ -498,23 +635,28 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise RuntimeError("schedule readback mismatch")
     if (trigger - utc_now().astimezone(UTC)).total_seconds() < 300:
         raise ValueError("Automation schedule no longer has 300 seconds lead")
-    job_id = str(uuid.uuid4())
     binding = {"properties":{"runbook":{"name":rb},"schedule":{"name":sched},"parameters":{
         "vmaresourceid":ids[0],"vmbresourceid":ids[1],"subscriptionid":options.subscription_id,
         "resourcegroupname":name,
         "deploymentid":deployment.deployment_id,"retryendat":options.retry_end_at.isoformat().replace("+00:00","Z"),
         "pollseconds":str(options.poll_seconds)}}}
     job_url = f"{account}/jobSchedules/{job_id}?api-version={AUTOMATION_API}"
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["job_schedule"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, _azure_rest("PUT", job_url, binding), "job_binding_create", clock)
+    state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["job_schedule"]="created"; _atomic_private(journal,state)
     job_read = json.loads(_command(runner, options, root, _azure_rest("GET", job_url), "job_binding_readback", clock).stdout or "{}")
     actual = job_read.get("properties", {}).get("parameters", {})
-    if job_read.get("id", "").lower() != job_url.split("?", 1)[0].lower():
+    job_props=job_read.get("properties",{})
+    if (job_read.get("id", "").lower() != job_url.split("?", 1)[0].lower()
+            or job_props.get("runOn") not in (None,"")
+            or job_props.get("runbook",{}).get("name")!=rb
+            or job_props.get("schedule",{}).get("name")!=sched):
         raise RuntimeError("job binding identity readback mismatch")
-    if {k.lower():v for k,v in actual.items()} != binding["properties"]["parameters"]:
+    if not isinstance(actual,dict) or {k.lower():v for k,v in actual.items()} != binding["properties"]["parameters"]:
         raise RuntimeError("job binding readback mismatch")
     assignments = json.loads(_command(runner, options, root, ["az", "role", "assignment", "list", "--scope", expiry_ids["resource_group_id"], "--all", "--output", "json"], "role_assignment_readback", clock).stdout or "[]")
     assignment = next((x for x in assignments if x.get("id", "").lower() == expiry_ids["role_assignment_id"].lower()), None)
-    if assignment is None or assignment.get("principalId", "").lower() != expiry_ids["principal_id"].lower() or assignment.get("scope", "").lower() != expiry_ids["resource_group_id"].lower():
+    if assignment is None or assignment.get("principalId", "").lower() != expiry_ids["principal_id"].lower() or assignment.get("scope", "").lower() != expiry_ids["resource_group_id"].lower() or assignment.get("roleDefinitionId", "").lower()!=expiry_ids["role_definition_id"].lower():
         raise RuntimeError("Automation managed identity role assignment readback mismatch")
     roles = json.loads(_command(runner, options, root, ["az", "role", "definition", "list", "--name", name+"-deallocate-only", "--output", "json"], "role_definition_readback", clock).stdout or "[]")
     role = next((x for x in roles if x.get("id", "").lower() == expiry_ids["role_definition_id"].lower()), None)
@@ -543,7 +685,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         "post_registration_workflow_seconds":options.post_registration_workflow_seconds,"retry_end_at":options.retry_end_at.isoformat(),
         "schedule_readback":props,"binding_readback":actual,"effective_rbac_unproved":True}
     state=json.loads(journal.read_text(encoding="utf-8"))
-    state.update({"expiry":{"state":"registered","metadata":metadata},"expiry_state":"registered"})
+    state.setdefault("expiry",{}).update({"state":"registered","metadata":metadata})
+    state["expiry_state"]="registered"
     _atomic_private(journal,state)
     return ExpiryEvidence(schema_version=2,run_id=deployment.run_id,deployment_id=deployment.deployment_id,
         provider=Provider.AZURE,action="deallocate",state="registered",registration_id=Evidence(value=job_url),
@@ -576,6 +719,11 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     runbook = json.loads(_command(runner, options, root, _azure_rest("GET", runbook_url), "expiry_runbook_recheck", clock).stdout or "{}")
     if runbook.get("properties", {}).get("state") != "Published":
         raise RuntimeError("registered runbook is no longer Published")
+    if runbook.get("properties", {}).get("runbookType") != "PowerShell" or runbook.get("properties", {}).get("runtimeEnvironment") not in (None, "", "PowerShell-5.1"):
+        raise RuntimeError("registered runbook runtime changed")
+    account_read=json.loads(_command(runner,options,root,_azure_rest("GET",f"{account}?api-version={AUTOMATION_API}"),"expiry_account_recheck",clock).stdout)
+    if account_read.get("identity",{}).get("type") != "SystemAssigned" or account_read.get("identity",{}).get("principalId","").lower() != str(m.get("managed_identity_principal_id","")).lower():
+        raise RuntimeError("registered Automation system-assigned identity changed")
     content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{m['runbook']}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "expiry_content_recheck", clock)
     if hashlib.sha256(content.stdout.encode()).hexdigest() != m.get("published_content_sha256"):
         raise RuntimeError("registered runbook content changed after expiry registration")
@@ -583,11 +731,13 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     schedule = json.loads(_command(runner, options, root, _azure_rest("GET", schedule_url), "expiry_schedule_recheck", clock).stdout or "{}")
     props = schedule.get("properties", {})
     if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
+            or props.get("runOn") not in (None, "")
             or datetime.fromisoformat(props["startTime"].replace("Z", "+00:00")).astimezone(UTC) != expiry.expires_at.value):
         raise RuntimeError("registered expiry schedule is disabled or has changed")
     job_url = f"{account}/jobSchedules/{m['job_schedule_id']}?api-version={AUTOMATION_API}"
     job = json.loads(_command(runner, options, root, _azure_rest("GET", job_url), "expiry_binding_recheck", clock).stdout or "{}")
     if (job.get("id","").lower()!=job_url.split("?",1)[0].lower()
+            or job.get("properties",{}).get("runOn") not in (None, "")
             or job.get("properties", {}).get("parameters", {}) != m.get("binding_readback")
             or job.get("properties", {}).get("runbook", {}).get("name") != m.get("runbook")
             or job.get("properties", {}).get("schedule", {}).get("name") != m.get("schedule")):
@@ -595,7 +745,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     assignments = json.loads(_command(runner, options, root, ["az", "role", "assignment", "list", "--scope", m["resource_group_id"], "--all", "--output", "json"], "expiry_role_recheck", clock).stdout or "[]")
     assignment = next((x for x in assignments if x.get("id", "").lower() == m.get("role_assignment_id", "").lower()), None)
     if (assignment is None or assignment.get("principalId", "").lower() != m.get("managed_identity_principal_id", "").lower()
-            or assignment.get("scope","").lower()!=m.get("resource_group_id","").lower()):
+            or assignment.get("scope","").lower()!=m.get("resource_group_id","").lower()
+            or assignment.get("roleDefinitionId","").lower()!=m.get("role_definition_id","").lower()):
         raise RuntimeError("registered expiry role assignment is absent or changed")
     roles = json.loads(_command(runner, options, root, ["az", "role", "definition", "list", "--name", m["resource_group"]+"-deallocate-only", "--output", "json"], "expiry_role_definition_recheck", clock).stdout or "[]")
     role = next((x for x in roles if x.get("id", "").lower() == m.get("role_definition_id", "").lower()), None)
@@ -686,6 +837,55 @@ def _key_material(text: str) -> str:
     return algorithm + " " + encoded
 
 
+def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner, root: Path,
+                             clock: Callable[[],float]) -> dict[str,Any]:
+    image=options.selected_image
+    if image.startswith("/"):
+        version_id=image
+        definition_id=image.split("/versions/")[0]
+        definition=json.loads(_command(runner,options,root,["az","sig","image-definition","show","--ids",definition_id,"--output","json"],"image_preflight",clock).stdout)
+        version=json.loads(_command(runner,options,root,["az","sig","image-version","show","--ids",version_id,"--output","json"],"image_version_preflight",clock).stdout)
+        definition_props=definition.get("properties",{})
+        identifier=definition.get("identifier",definition_props.get("identifier",{}))
+        architecture=definition.get("architecture",definition_props.get("architecture"))
+        publisher=identifier.get("publisher")
+        offer=identifier.get("offer","")
+        sku=identifier.get("sku","")
+        actual={"id":version.get("id"),"architecture":architecture,"publisher":publisher,"offer":offer,"sku":sku,
+                "version":version.get("name") or version_id.rstrip("/").split("/")[-1],"source":"shared_gallery"}
+    else:
+        result=json.loads(_command(runner,options,root,["az","vm","image","show","--location","germanywestcentral","--urn",image,"--output","json"],"image_preflight",clock).stdout)
+        props=result.get("properties",{})
+        actual={"id":result.get("id"),"architecture":result.get("architecture",props.get("architecture")),"publisher":result.get("publisher",props.get("publisher")),
+                "offer":result.get("offer",props.get("offer")),"sku":result.get("sku",props.get("sku")),"version":result.get("version",props.get("version")),"source":"marketplace"}
+    if str(actual.get("architecture") or "").lower() not in {"x64","amd64"} or str(actual.get("publisher") or "").lower()!="canonical" or not re.search(r"(?i)(ubuntu-24_04|ubuntu-24\.04|ubuntu2404|noble)",str(actual.get("offer",""))+" "+str(actual.get("sku",""))):
+        raise ValueError("selected Azure image metadata does not prove x64 Canonical Ubuntu 24.04")
+    if image.startswith("/") and str(actual.get("id","")).lower()!=image.lower():
+        raise ValueError("selected shared gallery image version identity mismatch")
+    if not image.startswith("/") and (actual.get("publisher","").lower(),actual.get("offer","").lower(),actual.get("sku","").lower(),str(actual.get("version","")))!=tuple(x.lower() for x in image.split(":")):
+        raise ValueError("selected Marketplace image identity mismatch")
+    return actual
+
+
+def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root: Path,
+                      vm_id: str, clock: Callable[[],float], requested: str) -> str:
+    payload=json.loads(_command(runner,options,root,["az","vm","show","--ids",vm_id,"--output","json"],"vm_image_observation",clock).stdout)
+    storage=payload.get("storageProfile",payload.get("properties",{}).get("storageProfile",{}))
+    ref=storage.get("imageReference",{})
+    if requested.startswith("/"):
+        observed=ref.get("id")
+        if not isinstance(observed,str) or observed.lower()!=requested.lower():
+            raise ValueError("created VM shared image version differs from the requested image")
+        return observed
+    parts=[ref.get(k) for k in ("publisher","offer","sku","exactVersion")]
+    if not all(isinstance(x,str) and x for x in parts):
+        raise ValueError("created VM image reference lacks observed Marketplace identity and exact version")
+    wanted=requested.split(":")
+    if [x.lower() for x in parts[:3]] != [x.lower() for x in wanted[:3]] or parts[3].lower()!=wanted[3].lower():
+        raise ValueError("created VM Marketplace image identity or version differs from the request")
+    return ":".join(parts)
+
+
 def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
               clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureProviderResult:
     now=utc_now().astimezone(UTC); mono=clock(); name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
@@ -693,28 +893,51 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         raise ValueError("Azure expiry price input date cannot be in the future")
     root,journal=_workspace(options,deployment); state=json.loads(journal.read_text()); failures=[]; results=[]; apply=None; outputs=None; valid_outputs={}
     variables=build_pair_inputs(deployment,options)
+    pair_vars=_persist_tfvars(root,journal,"pair",variables)
     try:
         _verify_registered_expiry(deployment,options,root,runner,clock,now)
-        state["creation_may_have_started"]=True; state["pair_state"]="creating"; _atomic_private(journal,state)
         _tf(root,options,runner,clock,"terraform/azure/pair","init","-input=false",action="pair_init")
-        args=["apply","-auto-approve","-input=false"]
-        for k,v in variables.items(): args += ["-var",f"{k}={str(v).lower() if isinstance(v,bool) else v}"]
+        # Expiry readbacks and pair initialization may consume meaningful cap time.
+        fresh_utc=utc_now().astimezone(UTC); fresh_mono=clock()
+        _validate_request(deployment,options,fresh_utc,fresh_mono,require_registered=True)
+        if deployment.expiry.value.expires_at.value - fresh_utc < timedelta(seconds=options.post_registration_workflow_seconds):
+            raise TimeoutError("remaining complete workflow no longer fits before the registered trigger")
+        if options.cap_deadline_monotonic-fresh_mono < options.post_registration_workflow_seconds:
+            raise TimeoutError("remaining complete workflow no longer fits within the original monotonic cap")
+        image_probe=_validate_image_metadata(options,runner,root,clock)
+        state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=True; state["pair_state"]="creating"; _atomic_private(journal,state)
+        args=["apply","-auto-approve","-input=false",f"-var-file={pair_vars}"]
+        preapply_utc=utc_now().astimezone(UTC); preapply_mono=clock()
+        if deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds) or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds:
+            state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=False; state["pair_state"]="not_started"; _atomic_private(journal,state)
+            raise TimeoutError("complete workflow no longer fits immediately before pair apply")
         apply=_tf(root,options,runner,clock,"terraform/azure/pair",*args,action="pair_apply"); results.append(apply.durable_view())
         out=_tf(root,options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
         outputs=json.loads(out.stdout)
+        observed_images={}
         vms=[]; key_lines=[]
         for role in ("a","b"):
             data=_validate_vm_output_data(deployment,options,role,outputs["vm_"+role]["value"],ids[0 if role=="a" else 1])
+            data["image"]=_observe_vm_image(options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image)
+            observed_images[role]=data["image"]
             valid_outputs[role]=data
-            command=_command(runner,options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts","cat /etc/ssh/ssh_host_ed25519_key.pub","--output","json"],"host_key_identity",clock)
+            nonce=secrets.token_urlsafe(24)
+            script=f"printf 'CNB-AZ-HOSTKEY:{nonce}\\n'; cat /etc/ssh/ssh_host_ed25519_key.pub"
+            command=_command(runner,options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts",script,"--output","json"],"host_key_identity",clock)
             action=json.loads(command.stdout)
-            if not isinstance(action.get("resourceId"),str) or action["resourceId"].lower() != ids[0 if role=="a" else 1].lower():
-                raise ValueError("Run Command response resource identity mismatch")
             statuses=action.get("value",[])
-            if not any(str(x.get("code", "")).lower().endswith("/succeeded") for x in statuses):
+            success=[x for x in statuses if isinstance(x,dict) and str(x.get("code","")).lower()=="componentstatus/stdout/succeeded"]
+            if len(success)!=1 or any(str(x.get("level","")).lower()=="error" or str(x.get("code","")).lower().endswith("/failed") for x in statuses):
                 raise ValueError("authenticated Azure Run Command did not report successful completion")
-            script_out="\n".join(x.get("message", "") for x in statuses)
-            key=_key_material(script_out)
+            script_out=success[0].get("message","")
+            marker=f"CNB-AZ-HOSTKEY:{nonce}"
+            if not isinstance(script_out,str) or script_out.count(marker)!=1:
+                raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
+            suffix=script_out.split(marker,1)[1]
+            parsed_keys=[line.strip() for line in suffix.splitlines() if _KEY.fullmatch(line.strip())]
+            if len(parsed_keys)!=1:
+                raise ValueError("authenticated Azure Run Command stdout has malformed or ambiguous host key material")
+            key=_key_material(parsed_keys[0])
             key_lines.append(f"{data['public_ipv4']} {key}")
             vms.append(_vm_output(deployment,role,data,key,options))
         known=root/"known_hosts"
@@ -727,7 +950,7 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         output=ProviderDeploymentOutput(schema_version=2,identity=_identity(deployment),run_id=deployment.run_id,deployment_id=deployment.deployment_id,
             mode=deployment.mode,provider=Provider.AZURE,scenario=Scenario(deployment.scenario),apply_action_id=apply.action_id,
             started_at=started,finished_at=out.finished_at,vm_a=vms[0],vm_b=vms[1],
-            provider_metadata=StructuredEvidence(value={"purchase":"Regular","resource_group":name,"scenario":Scenario(deployment.scenario).value}),
+            provider_metadata=StructuredEvidence(value={"purchase":"Regular","resource_group":name,"scenario":Scenario(deployment.scenario).value,"image_preflight":image_probe,"observed_vm_images":observed_images}),
             documented_network_limit=StructuredEvidence(value={"value":12500,"unit":"Mbps","kind":"maximum_aggregate","source":"Azure Dsv5 documentation","not_measured":True}),
             expiry=deployment.expiry)
         _write_output_artifact(root,output)
@@ -772,7 +995,7 @@ def _validate_vm_output_data(deployment: ProviderDeploymentInput, options: Azure
         raise ValueError(f"Terraform output VM {role.upper()} resource identity mismatch")
     if data.get("size")!="Standard_D4s_v5" or data.get("region")!=intent.region or str(data.get("zone"))!=intent.zone:
         raise ValueError(f"Terraform output VM {role.upper()} shape or locality mismatch")
-    if data.get("image")!=options.selected_image or data.get("accelerated_networking") is not True:
+    if data.get("requested_image")!=options.selected_image or data.get("accelerated_networking") is not True:
         raise ValueError(f"Terraform output VM {role.upper()} image or Accelerated Networking evidence mismatch")
     expected_ppg=deployment.placement.name if deployment.scenario==Scenario.PLACEMENT_OPTIMIZATION else None
     if data.get("ppg")!=expected_ppg:
@@ -820,46 +1043,88 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         raise ValueError("recovery journal contains foreign target identities; refusing cleanup")
     try:
         # Pair destroy precedes inventory. Expiry remains until direct inventory proves both VMs absent.
-        result=_tf(root,options,runner,clock,"terraform/azure/pair","destroy","-auto-approve","-input=false",action="pair_destroy")
-        actions.append(result.durable_view())
+        input_names=state.get("terraform_inputs",{})
+        if "pair" not in input_names:
+            if state.get("creation_may_have_started"): raise RuntimeError("pair Terraform inputs are missing after resource creation may have started")
+            pair_vars=_persist_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
+        else: pair_vars=_recovery_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
+        expected_expiry={"subscription_id":options.subscription_id,"tenant_id":options.tenant_id,
+            "resource_group_name":_slug(deployment),"deployment_id":deployment.deployment_id,"location":"germanywestcentral"}
+        if "expiry" not in input_names:
+            if state.get("expiry_state") not in (None,"preparing","failed"): raise RuntimeError("expiry Terraform inputs are missing after expiry preparation")
+            expiry_vars=_persist_tfvars(root,journal,"expiry",expected_expiry)
+        else: expiry_vars=_recovery_tfvars(root,journal,"expiry",expected_expiry)
+        _tf(root,options,runner,clock,"terraform/azure/pair","init","-input=false",action="pair_recovery_init")
+        result=_tf(root,options,runner,clock,"terraform/azure/pair","destroy","-auto-approve","-input=false",f"-var-file={pair_vars}",action="pair_destroy")
+        actions.append(_safe_cleanup_action(options,result))
         for vm_id in expected_vm_ids:
-            actions.append(_prove_vm_absent(runner,options,root,vm_id,clock).durable_view())
-        inventory=_command(runner,options,root,["az","resource","list","--resource-group",state["resource_group"],"--output","json"],"pair_inventory",clock)
-        actions.append(inventory.durable_view())
-        found=json.loads(inventory.stdout or "[]")
+            actions.append(_safe_cleanup_action(options,_prove_vm_absent(runner,options,root,vm_id,clock)))
+        prereq=state.get("expiry",{})
+        applied=any(item.get("request",{}).get("action_type")=="expiry_prerequisites"
+                    and item.get("result",{}).get("outcome")=="succeeded" for item in state.get("actions",[]))
+        if applied and not prereq.get("role_assignment_id"):
+            _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_recovery_identity_init")
+            raw=_tf(root,options,runner,clock,"terraform/azure/expiry","output","-json",action="expiry_recovery_identity_output").stdout
+            outputs=json.loads(raw)
+            recovered={k:outputs.get(k,{}).get("value") for k in ("resource_group_id","automation_account_id","principal_id","role_assignment_id","role_definition_id")}
+            if not all(isinstance(value,str) and value for value in recovered.values()):
+                raise RuntimeError("interrupted expiry prerequisite identities cannot be recovered completely")
+            prereq.update(recovered); state["expiry"]=prereq; _atomic_private(journal,state)
+        found,inventory_evidence=_read_arm_collection(runner,options,root,
+            f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}/resources?api-version=2021-04-01",
+            "pair_inventory",clock,("id","type"))
+        actions.extend(inventory_evidence)
         metadata=state.get("expiry",{}).get("metadata",{})
-        allowed_expiry_ids={str(metadata.get(k,"")).lower() for k in ("automation_account_id","role_assignment_id","role_definition_id")}
+        prereq=state.get("expiry",{})
+        allowed_expiry_ids={str(prereq.get(k,"")).lower() for k in ("automation_account_id","role_assignment_id","role_definition_id")}
+        prereq_account=str(prereq.get("automation_account_id",""))
+        for collection,key in (("runbooks","runbook"),("schedules","schedule"),("jobSchedules","job_schedule_id")):
+            if prereq_account and prereq.get(key): allowed_expiry_ids.add(f"{prereq_account}/{collection}/{prereq[key]}".lower())
         if metadata:
             account=str(metadata.get("automation_account_id",""))
             for collection,key in (("runbooks","runbook"),("schedules","schedule"),("jobSchedules","job_schedule_id")):
-                if account and metadata.get(key):
-                    allowed_expiry_ids.add(f"{account}/{collection}/{metadata[key]}".lower())
+                if account and metadata.get(key): allowed_expiry_ids.add(f"{account}/{collection}/{metadata[key]}".lower())
         residual=[]
         for item in found:
-            resource={"id":item.get("id"),"type":item.get("type"),"state":"present","source":inventory.action_id}
+            resource={"id":item.get("id"),"type":item.get("type"),"state":"present","source":inventory_evidence[-1]["action_id"],
+                "observed_at":inventory_evidence[-1]["finished_at"]}
             resources.append(resource)
             if str(item.get("id","")).lower() not in allowed_expiry_ids:
                 residual.append(item.get("id", "unknown"))
         if residual:
             raise RuntimeError("VMs or pair resources remain after pair destroy: " + ", ".join(str(x) for x in residual))
-        expiry=deployment.expiry.value
-        if expiry is not None and expiry.state == "registered":
-            meta=expiry.provider_metadata.value or {}
-            account=meta.get("automation_account_id")
-            if not account: raise RuntimeError("registered expiry account identity is missing")
-            # Remove binding, schedule, and runbook in dependency order only after VM absence.
-            actions.append(_command(runner,options,root,_azure_rest("DELETE",f"{account}/jobSchedules/{meta['job_schedule_id']}?api-version={AUTOMATION_API}"),"expiry_unbind",clock).durable_view())
-            actions.append(_command(runner,options,root,_azure_rest("DELETE",f"{account}/schedules/{meta['schedule']}?api-version={AUTOMATION_API}"),"expiry_schedule_delete",clock).durable_view())
-            actions.append(_command(runner,options,root,_azure_rest("DELETE",f"{account}/runbooks/{meta['runbook']}?api-version={AUTOMATION_API}"),"expiry_runbook_delete",clock).durable_view())
-        exp=_tf(root,options,runner,clock,"terraform/azure/expiry","destroy","-auto-approve","-input=false",action="expiry_destroy")
-        actions.append(exp.durable_view())
+        account=prereq.get("automation_account_id")
+        if account:
+            child_info=prereq
+            for collection,key in (("jobSchedules","job_schedule_id"),("schedules","schedule"),("runbooks","runbook")):
+                child=child_info.get(key)
+                if child: _delete_owned_arm_child(runner,options,root,account,collection,str(child),clock,actions)
+        _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_recovery_init")
+        exp=_tf(root,options,runner,clock,"terraform/azure/expiry","destroy","-auto-approve","-input=false",f"-var-file={expiry_vars}",action="expiry_destroy")
+        actions.append(_safe_cleanup_action(options,exp))
+        if account:
+            account_absence=_command(runner,options,root,["az","resource","show","--ids",account,"--output","json"],"automation_account_absence",clock,allow_not_found=True)
+            actions.append(_safe_cleanup_action(options,account_absence))
+            if account_absence.outcome!="failed" or not _is_exact_not_found(account_absence):
+                raise RuntimeError("Automation account absence is not proven by exact resource identity")
         verify=_command(runner,options,root,["az","group","exists","--name",state["resource_group"],"--output","tsv"],"expiry_inventory",clock)
-        actions.append(verify.durable_view())
+        actions.append(_safe_cleanup_action(options,verify))
         if verify.stdout.strip().lower()!="false": raise RuntimeError("attempt resource group removal is not verified")
         residual_roles=_command(runner,options,root,["az","role","assignment","list","--scope",f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}","--all","--output","json"],"role_cleanup_inventory",clock)
-        if json.loads(residual_roles.stdout or "[]"):
+        if not residual_roles.stdout.strip(): raise RuntimeError("role assignment inventory is blank")
+        assignments=json.loads(residual_roles.stdout)
+        if not isinstance(assignments,list): raise RuntimeError("role assignment inventory is malformed")
+        if assignments:
             raise RuntimeError("role assignment inventory still contains resources after expiry destroy")
-        actions.append(residual_roles.durable_view())
+        actions.append(_safe_cleanup_action(options,residual_roles))
+        residual_defs=_command(runner,options,root,["az","role","definition","list","--name",_slug(deployment)+"-deallocate-only","--output","json"],"role_definition_cleanup_inventory",clock)
+        if not residual_defs.stdout.strip(): raise RuntimeError("custom role definition inventory is blank")
+        definitions=json.loads(residual_defs.stdout)
+        if not isinstance(definitions,list): raise RuntimeError("custom role definition inventory is malformed")
+        expected_role=str(prereq.get("role_definition_id","")).lower()
+        if any(isinstance(item,dict) and str(item.get("id","")).lower()==expected_role for item in definitions):
+            raise RuntimeError("attempt custom role definition remains after expiry destroy")
+        actions.append(_safe_cleanup_action(options,residual_defs))
         shutil.rmtree(root)
         cleanup=CleanupState.SUCCEEDED; blocked=False
     except Exception as exc:

@@ -7,7 +7,7 @@ import pytest
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, build_pair_inputs, _command, _workspace, _slug
 from cloud_network_benchmark.contracts import Evidence, ProviderDeploymentInput, StringEvidence
-from cloud_network_benchmark.contracts.admission import ReservationEvidence
+from cloud_network_benchmark.contracts.admission import AdmissionRequirements, ReservationEvidence
 
 UTC = timezone.utc
 
@@ -18,9 +18,10 @@ def deployment(root: Path, fixture: str = "exp-901-azure-single-provider.yaml"):
     resolved, _ = resolve_campaign(path, root)
     observation = next(o for o in resolved.observations if o.provider == "azure")
     now = datetime.now(UTC)
+    mode_cap=int(AdmissionRequirements.expected_for(observation.mode,observation.scenario)["lifetime_cap_seconds"])
     reservation = ReservationEvidence(schema_version=2, campaign_id="f06-campaign", reservation_id={"value":"res-f06"},
         state="reserved", reserved_cost_usd={"value":2.0}, cap_started_at={"value":now-timedelta(seconds=30)},
-        expires_at={"value":now+timedelta(hours=2)}, cap_start_policy_id={"value":"f11-policy"},
+        expires_at={"value":now+timedelta(seconds=mode_cap-30)}, cap_start_policy_id={"value":"f11-policy"},
         source_path="prices.csv", source_sha256="a"*64)
     return ProviderDeploymentInput.from_observation(observation, campaign_id="f06-campaign", run_id="f06-campaign-azure",
         bootstrap_template="cloud-init.yaml", terraform_directory="terraform/azure/pair", child_result_path="results/raw/f06-campaign-azure",
@@ -33,8 +34,8 @@ def options(tmp_path: Path, priority: str = "P0"):
     return AzureRuntimeOptions(subscription_id="00000000-0000-0000-0000-000000000001", tenant_id="00000000-0000-0000-0000-000000000002",
         controller_cidr="192.0.2.8/32", attempt_root=tmp_path/"attempt", authentication_reference="private:ssh-key",
         ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc f06", selected_image="/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/images/providers/Microsoft.Compute/galleries/ubuntu/images/ubuntu2404/versions/24.04.20261001",
-        complete_workflow_seconds=900, post_registration_workflow_seconds=600, cap_deadline_monotonic=3600,
-        admission_evidence={"priority":priority,"priority_review_reference":"offline-review","outstanding_cleanup":False,"reservation_id":"res-f06","source_sha256":"a"*64}, retry_end_at=datetime.now(UTC)+timedelta(hours=1),
+        complete_workflow_seconds=900, post_registration_workflow_seconds=600, cap_deadline_monotonic=1000,
+        admission_evidence={"priority":priority,"priority_review_reference":"offline-review","outstanding_cleanup":False,"reservation_id":"res-f06","source_sha256":"a"*64}, retry_end_at=datetime.now(UTC)+timedelta(minutes=16),
         poll_seconds=15, command_timeout_seconds=60, expiry_cost_input={"source_id":"automation-prices-2026-10-22","date":"2026-10-22","sha256":"d"*64,"automation_rate_per_job_minute":0.002,"job_minutes_bound":20})
 
 
@@ -111,7 +112,7 @@ def test_command_requests_clip_deadline_and_separate_root_data_dirs(repository_r
     runner=Runner()
     _command(runner,o,root,["terraform","-chdir=terraform/azure/pair","validate"],"pair_validate",lambda:1)
     _command(runner,o,root,["terraform","-chdir=terraform/azure/expiry","validate"],"expiry_validate",lambda:1)
-    _command(runner,o,root,["terraform","-chdir=terraform/azure/pair","validate"],"near_deadline",lambda:3599)
+    _command(runner,o,root,["terraform","-chdir=terraform/azure/pair","validate"],"near_deadline",lambda:999)
     assert all(request.timeout_seconds==60 for request in requests[:2])
     assert requests[2].timeout_seconds==1
     assert requests[0].environment["TF_DATA_DIR"] != requests[1].environment["TF_DATA_DIR"]
