@@ -55,9 +55,19 @@ def summarize_validation(value: ValidationResult) -> str:
         lines.append(f"  Coverage: {_value(coverage.get('active_probe_ratio'))}; active={_value(coverage.get('active_probe_seconds'))} s; native sample support={_value(coverage.get('native_sample_support_seconds'))} s; gaps={len(coverage.get('gaps', []))}; receiver intervals={unit.get('receiver_interval_count', 0)}; RTT samples={unit.get('sample_count', 0)}")
         if unit.get("command_invocation_count") is not None:
             lines.append(f"  Command invocations: {unit['command_invocation_count']}")
-        bounds = coverage.get("valid_bounds")
+        bounds = unit.get("valid_bounds")
         if bounds:
-            lines.append(f"  Valid interval bounds ({bounds.get('source_artifact_id', 'source unavailable')}): {bounds.get('start_seconds')}–{bounds.get('end_seconds')} s")
+            source_id = bounds.get("source_artifact_id", "source unavailable")
+            source = next((item for item in unit.get("sources", [])
+                           if item.get("artifact_id") == source_id), {})
+            source_ref = source.get("path", "path unavailable")
+            source_hash = source.get("sha256", "hash unavailable")
+            lines.append(f"  Valid interval bounds ({source_id}; {source_ref}; SHA-256 {source_hash}): {bounds.get('start_seconds')}–{bounds.get('end_seconds')} s")
+        else:
+            support = coverage.get("native_sample_support_seconds", {})
+            reason = (support.get("unavailable_reason") if isinstance(support, dict) else None)
+            reason = reason or coverage.get("unavailable_reason") or "receiver intervals unavailable"
+            lines.append(f"  Valid interval bounds unavailable: {reason}")
         gap_rows = coverage.get("gaps", [])
         for gap in gap_rows[:10]:
             lines.append(f"  Gap: {gap.get('started_at', 'start unavailable')}–{gap.get('finished_at', 'end unavailable')} ({gap.get('reason', 'reason unavailable')})")

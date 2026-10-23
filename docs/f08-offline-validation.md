@@ -50,3 +50,18 @@ The canonical task artifacts now mark T047 complete; the older progress entries 
 | Shared-contract ownership audit | No changed paths under contracts or F01R contract/bootstrap specs relative to merged main. |
 
 Commands used the offline Python at `/private/tmp/cnb-offline-venv/bin/python`, `PYTHONPATH=src`, the read-only Thesis source path, and for pytest `PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH`. No cloud, SSH, Terraform apply, network benchmark, paid experiment, or Thesis write was used. These checks validate synthetic offline bundle replay only.
+
+## T049–T051 convergence checkpoint
+
+The three appended convergence tasks are complete. F08 applies the strict F02R `systemd-run` listener identity when checking receiver settings, provenance, presence, and client target versus persistent listener bind. Native iperf3 `connected[]` list entries are checked against the matching client/listener settings; materialized mutations of the listener bind and saved receiver endpoint produce error findings. Comparison peers are paired to their own inputs by run ID, and each materialized result's frozen common-N value/source campaign/hash/plateau is checked against that input's saved `benchmark.common_n`. Summary rendering reads unit-level `valid_bounds`, includes source artifact/path/hash, reports unavailable reasons, and retains bounded gap output.
+
+| Check | Result |
+|---|---|
+| F08-focused native, validation, calibration, summary, contract and replay suite | Exit 0; 86 passed in 52.43 seconds. |
+| Full offline suite with official PowerShell on `PATH` | Exit 0; 1,163 passed in 178.99 seconds, no skips. |
+| Spec Kit task prerequisites | Exit 0; F08 feature directory and tasks found. |
+| F01R contract schema drift, CLI `--help`, compileall, `git diff --check` | Exit 0 for each. |
+| Generated test configs after pytest | No `configs/tests/f08-*` paths remained. |
+| Shared contract/bootstrap ownership audit | No changed paths under shared contracts or F01R contract/bootstrap specs relative to merged main. |
+
+The run used only synthetic, saved F01R fixture bundles. It does not establish Linux producer behavior, cloud behavior, clock accuracy, paid acceptance or research results.

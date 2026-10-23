@@ -809,15 +809,22 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
         unit_id=unit.unit_id, binary_version={"value":"3.17.1"}, source_identity={"value":"fixture"},
         started_at={"value":NOW+timedelta(seconds=7)}, finished_at={"value":NOW+timedelta(seconds=70)},
         monotonic_started={"value":7}, monotonic_finished={"value":70})
+    listener = CommandEvidence(schema_version=2,
+        request={"argv":["iperf3","-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"]},
+        result={"outcome":"succeeded"}, producer="vm_b", deployment_id=value.identity.deployment_id,
+        unit_id=value.measurement_units[0].unit_id, binary_version={"value":"3.17.1"}, source_identity={"value":"fixture"},
+        started_at={"value":NOW}, finished_at={"value":NOW+timedelta(seconds=1)},
+        monotonic_started={"value":0}, monotonic_finished={"value":1})
     timing = value.timings[1].model_copy(update={
         "tcp_started_at":Evidence[datetime](value=NOW+timedelta(seconds=7)),
         "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=10)),
         "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=70))})
-    value = value.model_copy(update={"commands":[command],"timings":[value.timings[0],timing,*value.timings[2:]]})
+    value = value.model_copy(update={"commands":[command,listener],"timings":[value.timings[0],timing,*value.timings[2:]]})
     source = SourceRef("iperf3_server_log","receiver.jsonl","a"*64)
     details = ({"session_id":"1","start":{"test_start":{"protocol":"TCP","num_streams":1,
         "omit":5,"duration":60,"blksize":131072},"timestamp":{"timesecs":(NOW+timedelta(seconds=7)).timestamp()},
-        "connected":{"host":"10.0.0.2","port":5201}}},)
+        "connected":[{"socket":17,"local_host":"10.0.0.2","local_port":5201,
+            "remote_host":"10.0.0.1","remote_port":50100}]}},)
     good = ReceiverInterval("1",3,63,60,1000,False,False,source,1)
     straddling = ReceiverInterval("1",1,4,3,100,False,False,source,2)
     parsed = NativeParse(source=source,sessions=("1",),session_details=details,
@@ -825,7 +832,8 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
     selected = _receiver_session_for_unit(value,unit,parsed)
     assert selected.receiver_intervals == (good,)
     assert any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
-    wrong_start = {**details[0]["start"],"connected":{"host":"10.0.0.3","port":5201}}
+    wrong_start = {**details[0]["start"],"connected":[{**details[0]["start"]["connected"][0],
+        "local_host":"10.0.0.9"}]}
     mismatch = _receiver_session_for_unit(value,unit,NativeParse(**{**parsed.__dict__,
         "session_details":({**details[0],"start":wrong_start},)}))
     assert any(item.code == "native.iperf3.endpoint_mismatch" for item in mismatch.findings)
@@ -968,6 +976,15 @@ def test_commands_require_private_targets_and_persistent_private_bound_listeners
     ]
     findings = _command_findings(value.model_copy(update={"commands":commands}))
     assert not any(item.severity == "error" for item in findings)
+    action="f02r-vm_b-listener-iperf3"
+    launcher=["systemd-run",f"--property=Environment=CNB_ACQUISITION_ID={action}","/usr/local/bin/iperf3",
+        "-s","-B","10.0.0.9","-p","5201","--json-stream","--forceflush"]
+    strict_listener=commands[1].model_copy(update={
+        "request":{"argv":launcher,"launcher_argv":launcher,"action_id":action,
+            "acquisition_invocation_id":action},
+        "result":{"outcome":"succeeded","action_id":action}})
+    findings = _command_findings(value.model_copy(update={"commands":[commands[0],strict_listener,commands[2]]}))
+    assert "command.target_bind_mismatch" in {item.code for item in findings}
     bad = commands[1].model_copy(update={"request":{"argv":["iperf3", "-s", "-B", "8.8.8.8", "-p", "5201"]}})
     findings = _command_findings(value.model_copy(update={"commands":[commands[0], bad]}))
     assert {item.code for item in findings} >= {"command.listener_bind", "command.streaming"}

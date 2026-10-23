@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import GeneratorType
 from datetime import datetime, timedelta
 import yaml
 
 from cloud_network_benchmark.native import SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
-from cloud_network_benchmark.validation import _json_records
+from cloud_network_benchmark.validation import _json_records, _receiver_session_for_unit
 from cloud_network_benchmark.manifests import (StaticGitProvenance, initialize_campaign,
     update_child_cleanup, update_child_execution)
 from cloud_network_benchmark.contracts import (
@@ -434,8 +435,13 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             "remote_host":"10.0.0.1","remote_port":50100}]
         day_start={"cookie":day_cookie,"test_start":day_settings,"connected":day_connected,
             "timestamp":{"timesecs":stamp}}
-        receiver_events.append({"event":"start","data":day_start if value.mode == "diagnostic_day" else
-            {"test_start":{"protocol":"TCP","num_streams":unit.streams or 1},"timestamp":{"timesecs":stamp}}})
+        short_settings={"protocol":"TCP","num_streams":unit.streams or 1,"omit":5,
+            "duration":unit.measured_seconds,"interval":1,"blksize":131072,"reverse":False}
+        short_connected=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201,
+            "remote_host":"10.0.0.1","remote_port":50100+i} for i in range(unit.streams or 1)]
+        short_start={"cookie":day_cookie,"test_start":short_settings,"connected":short_connected,
+            "timestamp":{"timesecs":stamp}}
+        receiver_events.append({"event":"start","data":day_start if value.mode == "diagnostic_day" else short_start})
         if value.mode == "diagnostic_day":
             receiver_events.extend({"event":"interval","data":{"streams":[{"socket":17,
                 "start":second,"end":second+1,"seconds":1,"bytes":125000000,"sender":False,"omitted":False}]}}
@@ -512,7 +518,9 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     expected_validity="partial" if value.mode=="short_study" and not frozen_n else "valid"
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.artifact_id,item.message) for item in result.findings]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
-    assert "EXP-001" in summarize_validation(result)
+    summary=summarize_validation(result)
+    assert "EXP-001" in summary
+    assert "Valid interval bounds (iperf3_server_log;" in summary
     assert validate_bundle(complete,evaluated_at=NOW).model_dump(mode="json")==result.model_dump(mode="json")
     assert evaluate_comparison([complete],[result])[run_id].validation_status.comparison_eligibility=="ineligible"
     csv_record=next(item for item in records if item.kind=="sockperf-csv")
@@ -580,6 +588,48 @@ def test_three_provider_short_study_with_prior_calibration_is_valid_and_comparab
     assert all(result.metrics.value["common_n"]["source_campaign_id"]=="prior-calibration-campaign" for result in results)
     paired=evaluate_comparison(bundles,results)
     assert all(item.validation_status.comparison_eligibility=="eligible" for item in paired.values())
+
+    def change_result_source(result, campaign, digest):
+        metrics=deepcopy(result.metrics.value)
+        metrics["common_n"]["source_campaign_id"]=campaign
+        metrics["common_n"]["source_sha256"]=digest
+        return result.model_copy(update={"metrics":result.metrics.model_copy(update={"value":metrics})})
+
+    result_only=[change_result_source(result,"unrelated-calibration","e"*64) for result in results]
+    result_only_pairs=evaluate_comparison(bundles,result_only)
+    assert all(item.validation_status.comparison_eligibility!="eligible" for item in result_only_pairs.values())
+    one_peer=[change_result_source(results[0],"unrelated-calibration","e"*64),*results[1:]]
+    one_peer_pairs=evaluate_comparison(bundles,one_peer)
+    assert all(item.validation_status.comparison_eligibility!="eligible" for item in one_peer_pairs.values())
+
+
+def test_materialized_persistent_listener_and_native_connected_endpoints_are_reconciled(repository_root,
+        tmp_path,frozen_clock,deterministic_token,fake_git_commits,request):
+    bundle,result=_materialize_complete_bundle(repository_root,tmp_path,frozen_clock,deterministic_token,
+        fake_git_commits,request,mode_override="acceptance")
+    listener=next(command for command in bundle.commands
+        if command.producer=="vm_b" and command.request.get("action_id")=="f02r-vm_b-listener-iperf3")
+    argv=list(listener.request["argv"])
+    argv[argv.index("-B")+1]="10.0.0.9"
+    wrong_listener=listener.model_copy(update={"request":{**listener.request,"argv":argv}})
+    wrong_commands=[wrong_listener if command is listener else command for command in bundle.commands]
+    wrong_bind_result=validate_bundle(bundle.model_copy(update={"commands":wrong_commands}),evaluated_at=result.evaluated_at)
+    assert any(finding.code=="command.target_bind_mismatch" and finding.severity=="error"
+        for finding in wrong_bind_result.findings)
+
+    record=next(item for item in bundle.artifact_records if item.artifact_id=="iperf3_server_log")
+    native_path=Path(bundle.child_result_root)/record.path
+    original=native_path.read_bytes()
+    try:
+        rows=[json.loads(line) for line in original.splitlines() if line.strip()]
+        start=next(row for row in rows if row.get("event")=="start")
+        start["data"]["connected"][0]["local_host"]="10.0.0.9"
+        native_path.write_text("\n".join(json.dumps(row) for row in rows)+"\n")
+        endpoint_result=validate_bundle(bundle,evaluated_at=result.evaluated_at)
+        assert any(finding.code=="native.iperf3.endpoint_mismatch" and finding.severity=="error"
+            for finding in endpoint_result.findings)
+    finally:
+        native_path.write_bytes(original)
 
 
 def test_diagnostic_day_materialized_bundle_replays_all_native_chunks(repository_root, tmp_path,

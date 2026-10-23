@@ -593,6 +593,18 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
     return sock, tcp
 
 
+def _f02r_iperf_listener(command: CommandEvidence, argv: list[str]) -> bool:
+    action = "f02r-vm_b-listener-iperf3"
+    lower = [token.lower() for token in argv]
+    return (command.producer == "vm_b" and len(lower) >= 4
+        and lower[0] == "systemd-run"
+        and lower[1] == f"--property=environment=cnb_acquisition_id={action}"
+        and lower[2].endswith("/iperf3") and "-s" in lower
+        and command.request.get("action_id") == action
+        and command.request.get("acquisition_invocation_id") == action
+        and command.result.get("action_id") == action)
+
+
 def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeParse) -> NativeParse:
     """Associate B's persistent listener session by resolved stream setting and recorded time."""
     if not parsed.sessions:
@@ -676,14 +688,65 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
                     f"receiver native {field} contradicts resolved client command", unit=unit.unit_id,
                     artifact=parsed.source.artifact_id if parsed.source else None))
         connected = start.get("connected") if isinstance(start, dict) else None
-        if isinstance(connected, dict):
-            expected_host, expected_port = _option(argv, "-c"), _option(argv, "-p")
-            observed_host, observed_port = connected.get("host"), connected.get("port")
-            if ((observed_host is not None and expected_host is not None and str(observed_host) != expected_host)
-                    or (observed_port is not None and expected_port is not None and str(observed_port) != expected_port)):
-                additions.append(_finding("native.iperf3.endpoint_mismatch", "error",
-                    "receiver session endpoint contradicts the resolved client target", unit=unit.unit_id,
+        if isinstance(connected, list):
+            listener = next((item for item in value.commands
+                if item.request.get("argv") and _f02r_iperf_listener(item, item.request["argv"])
+                or (item.producer == "vm_b" and item.request.get("argv")
+                    and "iperf3" in str(item.request["argv"][0]).lower()
+                    and "-s" in item.request["argv"])), None)
+            listener_argv = (listener.request["argv"][2:] if listener is not None
+                and _f02r_iperf_listener(listener, listener.request["argv"]) else
+                listener.request["argv"] if listener is not None else [])
+            expected_local = _option(listener_argv, "-B") if listener else None
+            expected_local_port = _option(listener_argv, "-p") if listener else None
+            client_target = _option(argv, "-c")
+            if listener is None:
+                additions.append(_finding("native.iperf3.endpoint_unavailable", "warning",
+                    "recorded VM B listener command is unavailable for native endpoint corroboration",
+                    unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+            if not connected:
+                additions.append(_finding("native.iperf3.endpoint_unavailable", "warning",
+                    "receiver connected endpoint list is empty", unit=unit.unit_id,
                     artifact=parsed.source.artifact_id if parsed.source else None))
+            if connected and len(connected) != expected_streams:
+                additions.append(_finding("native.iperf3.endpoint_mismatch", "error",
+                    "receiver connected endpoint count contradicts the resolved stream count", unit=unit.unit_id,
+                    artifact=parsed.source.artifact_id if parsed.source else None))
+            for endpoint in connected:
+                if not isinstance(endpoint, dict):
+                    additions.append(_finding("native.iperf3.endpoint_unavailable", "warning",
+                        "receiver connected endpoint is not a structured record", unit=unit.unit_id,
+                        artifact=parsed.source.artifact_id if parsed.source else None))
+                    continue
+                local_host, local_port = endpoint.get("local_host"), endpoint.get("local_port")
+                remote_host, remote_port = endpoint.get("remote_host"), endpoint.get("remote_port")
+                mismatch = ((expected_local is not None and str(local_host) != expected_local)
+                    or (expected_local_port is not None and str(local_port) != expected_local_port)
+                    or (client_target is not None and expected_local is not None and client_target != expected_local))
+                if remote_host is not None:
+                    try:
+                        remote_address = ipaddress.ip_address(str(remote_host))
+                        mismatch = mismatch or remote_address.version != 4 or not remote_address.is_private
+                    except ValueError:
+                        mismatch = True
+                if remote_port is not None:
+                    try:
+                        remote_port_value = int(remote_port)
+                        mismatch = mismatch or isinstance(remote_port, bool) or not 1 <= remote_port_value <= 65535
+                    except (TypeError, ValueError):
+                        mismatch = True
+                if mismatch:
+                    additions.append(_finding("native.iperf3.endpoint_mismatch", "error",
+                        "receiver connected local/remote endpoints contradict the VM A client and VM B listener commands",
+                        unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+                elif any(endpoint.get(field) is None for field in ("local_host", "local_port", "remote_host", "remote_port")):
+                    additions.append(_finding("native.iperf3.endpoint_unavailable", "warning",
+                        "receiver connected endpoint omits one or more local/remote address or port fields",
+                        unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+        else:
+            additions.append(_finding("native.iperf3.endpoint_unavailable", "warning",
+                "receiver start does not contain the native connected[] endpoint list", unit=unit.unit_id,
+                artifact=parsed.source.artifact_id if parsed.source else None))
     timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
     measured_start = timing.measured_started_at.value if timing else None
     measured_finish = timing.measured_finished_at.value if timing else None
@@ -802,15 +865,17 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
     findings: list[ValidationFinding] = []
 
     def is_persistent_iperf_listener(command: CommandEvidence, argv: list[str]) -> bool:
-        action = "f02r-vm_b-listener-iperf3"
-        lower_argv = [token.lower() for token in argv]
-        return (command.producer == "vm_b" and len(lower_argv) >= 4
-            and lower_argv[0] == "systemd-run"
-            and lower_argv[1] == f"--property=environment=cnb_acquisition_id={action}"
-            and lower_argv[2].endswith("/iperf3")
-            and command.request.get("action_id") == action
-            and command.request.get("acquisition_invocation_id") == action
-            and command.result.get("action_id") == action)
+        return _f02r_iperf_listener(command, argv)
+
+    def is_iperf_client(command: CommandEvidence, argv: list[str]) -> bool:
+        return command.producer == "vm_a" and bool(argv) and "iperf3" in str(argv[0]).lower()
+
+    def is_iperf_listener(command: CommandEvidence, argv: list[str]) -> bool:
+        return (command.producer == "vm_b" and bool(argv) and "-s" in argv
+                and ("iperf3" in str(argv[0]).lower() or is_persistent_iperf_listener(command, argv)))
+
+    def iperf_argv(command: CommandEvidence, argv: list[str]) -> list[str]:
+        return argv[2:] if is_persistent_iperf_listener(command, argv) else argv
 
     for command in value.commands:
         argv = command.request.get("argv")
@@ -825,7 +890,7 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             attached_short = any(token.startswith(flag) and token != flag for flag in ("-b", "-w", "-r", "-u"))
             if normalized in forbidden or token == "-R" or attached_short:
                 findings.append(_finding("command.protocol_extra", "error", f"unsupported protocol/rate option {token}", unit=command.unit_id))
-        if lower and "iperf3" in lower[0] and command.producer == "vm_a":
+        if is_iperf_client(command, argv):
             if "-c" not in lower:
                 findings.append(_finding("command.direction", "error", "iperf3 client command must target VM B", unit=command.unit_id))
             target = _option(argv, "-c")
@@ -914,9 +979,10 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             # acquisition identity is present in the unit environment. Recognize
             # that exact launcher shape while still requiring the installed
             # iperf3 executable and all receiver settings in the recorded argv.
-            receiver_executable = is_persistent_iperf_listener(command, argv)
-            if lower and (("iperf3" in lower[0]) or receiver_executable) and "-s" in lower:
-                target = _option(argv, "-B")
+            if is_iperf_listener(command, argv):
+                receiver_argv = iperf_argv(command, argv)
+                receiver_lower = [token.lower() for token in receiver_argv]
+                target = _option(receiver_argv, "-B")
                 try:
                     address = ipaddress.ip_address(target or "")
                     private_bind = address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local)
@@ -924,9 +990,9 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                     private_bind = False
                 if not private_bind:
                     findings.append(_finding("command.listener_bind", "error", "iperf3 listener must bind VM B's private IPv4 address", unit=command.unit_id))
-                if _option(argv, "-p") != "5201":
+                if _option(receiver_argv, "-p") != "5201":
                     findings.append(_finding("command.port", "error", "iperf3 server must listen on TCP 5201", unit=command.unit_id))
-                if "--json-stream" not in lower or "--forceflush" not in lower:
+                if "--json-stream" not in receiver_lower or "--forceflush" not in receiver_lower:
                     findings.append(_finding("command.streaming", "error", "iperf3 server must preserve incremental JSON Lines output", unit=command.unit_id))
     for unit in value.measurement_units:
         relevant = [command for command in value.commands if command.unit_id == unit.unit_id]
@@ -940,11 +1006,12 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                 findings.append(_finding("command.timing_unavailable", "warning",
                     "actual command start or completion timestamp is unavailable", unit=unit.unit_id))
             argv = command.request.get("argv", [])
-            if isinstance(argv, list) and argv and any(program in str(argv[0]).lower() for program in ("sockperf", "iperf3")):
+            if isinstance(argv, list) and argv and (any(program in str(argv[0]).lower() for program in ("sockperf", "iperf3"))
+                    or is_iperf_listener(command, argv)):
                 if command.binary_version.value is None or command.source_identity.value is None:
                     findings.append(_finding("provenance.command_build_unavailable", "warning",
                         "actual benchmark command lacks binary version or source/build identity", unit=unit.unit_id))
-                program = "iperf3" if "iperf3" in str(argv[0]).lower() else "sockperf"
+                program = "iperf3" if "iperf3" in str(argv[0]).lower() or is_iperf_listener(command, argv) else "sockperf"
                 role = str(getattr(command.producer, "value", command.producer))
                 metadata = next((item for item in value.vm_metadata_records
                                  if str(getattr(item.vm_role, "value", item.vm_role)) == role), None)
@@ -995,16 +1062,13 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                                          f"VM A {program} command evidence is unavailable for this unit", unit=unit.unit_id))
         if unit.phase != "idle_latency":
             clients = [command for command in value.commands if command.unit_id == unit.unit_id
-                       and command.producer == "vm_a" and command.request.get("argv")
-                       and "iperf3" in str(command.request["argv"][0]).lower()
-                       and (_option(command.request["argv"], "-c") is not None)]
-            listeners = [command for command in value.commands if command.producer == "vm_b"
-                         and command.producer == "vm_b" and command.request.get("argv")
-                         and "iperf3" in str(command.request["argv"][0]).lower()
-                         and "-s" in command.request["argv"]]
+                       and command.request.get("argv") and is_iperf_client(command, command.request["argv"])
+                       and _option(command.request["argv"], "-c") is not None]
+            listeners = [command for command in value.commands if command.request.get("argv")
+                         and is_iperf_listener(command, command.request["argv"])]
             if clients and listeners:
                 target = _option(clients[0].request["argv"], "-c")
-                bind = _option(listeners[0].request["argv"], "-B")
+                bind = _option(iperf_argv(listeners[0], listeners[0].request["argv"]), "-B")
                 if target != bind:
                     findings.append(_finding("command.target_bind_mismatch", "error",
                                              "iperf3 client target does not match VM B's recorded private bind", unit=unit.unit_id))
@@ -1272,6 +1336,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
                  "binary_version": _source(record, value).binary_version,
                  "source_identity": _source(record, value).source_identity}
                 for record in value.artifact_records if record.unit_id == unit.unit_id
+                or (tcp is not None and tcp.source is not None and record.artifact_id == tcp.source.artifact_id)
                 or (unit.kind == "probe_chunk" and record.artifact_id in {
                     f"day-probe-csv-{unit.unit_id}", f"day-probe-log-{unit.unit_id}",
                     "day-probe-csv", "day-probe-log"})
@@ -1377,6 +1442,7 @@ def evaluate_comparison(inputs: Sequence[ValidatorInput], results: Sequence[Vali
     if len(inputs) != len(results) or not inputs:
         raise ValueError("comparison requires matching nonempty input and result collections")
     by_run: dict[str, ValidationResult] = {}
+    input_by_run: dict[str, ValidatorInput] = {}
     for item, result in zip(inputs, results):
         run_id = item.identity.run_id
         if run_id in by_run or result.run_id != run_id:
@@ -1384,6 +1450,7 @@ def evaluate_comparison(inputs: Sequence[ValidatorInput], results: Sequence[Vali
         if result.mode != item.mode:
             raise ValueError("comparison result mode contradicts its ValidatorInput")
         by_run[run_id] = result
+        input_by_run[run_id] = item
         metrics = result.metrics.value or {}
         result_identity = metrics.get("identity", {})
         expected_identity = item.identity.model_dump(mode="json") | {
@@ -1464,22 +1531,24 @@ def evaluate_comparison(inputs: Sequence[ValidatorInput], results: Sequence[Vali
                     or any(char not in "0123456789abcdef" for char in required[1])
                     or required[2] not in {True, False}):
                 unavailable.append(f"{result.run_id} CommonNState lacks source campaign/hash/plateau evidence")
-            if item.resolved_snapshot_path:
-                resolved_path = _artifact_path(item, next((record for record in item.artifact_records
-                    if record.artifact_id == "resolved_snapshot"), None)) if any(
-                    record.artifact_id == "resolved_snapshot" for record in item.artifact_records) else None
-                if resolved_path is not None:
-                    try:
-                        saved = json.loads(resolved_path.read_text(encoding="utf-8"))
-                        saved_n = saved.get("common_n") if isinstance(saved, dict) else None
-                        if isinstance(saved_n, dict) and (saved_n.get("state") != "frozen"
-                                or saved_n.get("source_campaign_id") != required[0]
-                                or saved_n.get("source_sha256") != required[1]
-                                or saved_n.get("common_n") != common_n.get("common_n")
-                                or saved_n.get("plateau_found") != required[2]):
-                            unavailable.append(f"{result.run_id} CommonNState contradicts its saved resolved configuration")
-                    except (OSError, ValueError):
-                        unavailable.append(f"{result.run_id} saved resolved configuration is unavailable")
+            item = input_by_run[result.run_id]
+            resolved_record = next((record for record in item.artifact_records
+                                    if record.artifact_id == "resolved_snapshot"), None)
+            if resolved_record is not None:
+                try:
+                    saved = json.loads(_artifact_path(item, resolved_record).read_text(encoding="utf-8"))
+                    saved_benchmark = saved.get("benchmark") if isinstance(saved, dict) else None
+                    saved_n = saved_benchmark.get("common_n") if isinstance(saved_benchmark, dict) else None
+                    if not isinstance(saved_n, dict):
+                        unavailable.append(f"{result.run_id} saved resolved configuration has no BenchmarkPlan CommonNState")
+                    elif (saved_n.get("state") != "frozen"
+                            or saved_n.get("source_campaign_id") != required[0]
+                            or saved_n.get("source_sha256") != required[1]
+                            or saved_n.get("common_n") != common_n.get("common_n")
+                            or saved_n.get("plateau_found") != required[2]):
+                        ineligible.append(f"{result.run_id} CommonNState contradicts its saved resolved configuration")
+                except (OSError, UnicodeError, ValueError, TypeError):
+                    unavailable.append(f"{result.run_id} saved resolved configuration is unavailable")
             n_evidence.append(required)
     if len(n_values) == len(results) and (len(set(n_values)) != 1 or any(
         next((unit.streams for unit in item.measurement_units if unit.phase == "multi_flow"), None) != n_values[index]

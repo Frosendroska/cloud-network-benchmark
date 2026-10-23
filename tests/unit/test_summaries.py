@@ -22,8 +22,9 @@ def test_summary_separates_status_cleanup_and_preserves_sources_and_failures():
           "units":[{"unit_id":"single_flow","phase":"single_flow","data_validity":"partial","findings":[{"code":"timing.gap","message":"one gap"}],
                     "native_sample_source":{"artifact_id":"sockperf","binary_version":"3.10","source_identity":"source-build"},
                     "rtt":{"median_us":{"value":2.5},"p95_us":{"unavailable_reason":"few replies"}},
-                    "tcp":{"throughput_gbps":{"value":1.2}},"probe_counts":[{"sent":{"value":5},"received":{"value":4},"dropped":{"value":1},
-                    "duplicated":{"value":0},"out_of_order":{"value":0},"skipped":{"value":0},"reporting_scope":"[Valid Duration]"}],"coverage":{"active_probe_ratio":{"value":.98},"gaps":[{"reason":"gap"}],"valid_bounds":{"start_seconds":1,"end_seconds":61,"source_artifact_id":"receiver-jsonl"}},"command_invocation_count":2}]}},
+                    "tcp":{"throughput_gbps":{"value":1.2}},"valid_bounds":{"start_seconds":1,"end_seconds":61,"source_artifact_id":"receiver-jsonl"},
+                    "sources":[{"artifact_id":"receiver-jsonl","path":"receiver.jsonl","sha256":"a"*64}],"probe_counts":[{"sent":{"value":5},"received":{"value":4},"dropped":{"value":1},
+                    "duplicated":{"value":0},"out_of_order":{"value":0},"skipped":{"value":0},"reporting_scope":"[Valid Duration]"}],"coverage":{"active_probe_ratio":{"value":.98},"gaps":[{"reason":"gap"}],"native_sample_support_seconds":{"unavailable_reason":"partial receiver support"}},"command_invocation_count":2}]}},
         evaluated_at=datetime(2026,10,21,tzinfo=timezone.utc))
     summary=summarize_validation(result)
     assert "Data: partial" in summary
@@ -37,6 +38,6 @@ def test_summary_separates_status_cleanup_and_preserves_sources_and_failures():
     assert "iperf3 -c host -p 5201" in summary
     assert "commit=" in summary and "dirty=" in summary and "diff_sha256=" in summary
     assert "[Valid Duration]" in summary and "Command invocations: 2" in summary
-    assert "receiver-jsonl" in summary and "1–61 s" in summary
+    assert "receiver-jsonl" in summary and "receiver.jsonl" in summary and "SHA-256 " + "a"*64 in summary and "1–61 s" in summary
     assert "CPU total range 12.5–12.5%" in summary
     assert summarize_validation(result) == summary
