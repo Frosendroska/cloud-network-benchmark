@@ -41,7 +41,7 @@ Metrics: 18/18 buildable requirement/criterion coverage (100%); 26 ordered tasks
 
 ## Exact internal prerequisite: F01R_GCP_EXPIRY
 
-Coordinator assigned `specs/017-v2-gcp-expiry-contract/` to a serialized shared writer after the active acquisition amendment. At base e03a07e, `src/cloud_network_benchmark/contracts/campaign.py:301` requires DELETE, and `contracts/deployment.py:189` lists only DELETE. Official GCP template CLI says instanceTerminationAction applies to automatic time limits, so F07 cannot ignore the mismatch or pass DELETE to a STOP policy. Constitution/AGENTS already govern STOP: this is executable debt, not permission to change methodology.
+Coordinator assigned `specs/017-gcp-stop-contract/` to a serialized shared writer after the active acquisition amendment. At base e03a07e, `src/cloud_network_benchmark/contracts/campaign.py:301` requires DELETE, and `contracts/deployment.py:189` lists only DELETE. Official GCP template CLI says instanceTerminationAction applies to automatic time limits, so F07 cannot ignore the mismatch or pass DELETE to a STOP policy. Constitution/AGENTS already govern STOP: this is executable debt, not permission to change methodology.
 
 Observed affected live files (not F07-owned):
 

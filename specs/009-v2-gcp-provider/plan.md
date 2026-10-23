@@ -7,7 +7,7 @@
 
 Build one GCP-specific driver and two local Terraform roots: protection creates the run-scoped network, firewall, optional compact policy and two immutable instance templates containing absolute automatic STOP; pair creates only two standalone VMs from those verified templates. Separate roots enforce pre-create registration without targeted applies, a scheduler, a MIG or an extra service. Existing V2 contracts carry all public evidence. F09 later composes admission, preparation, measurement and retrieval.
 
-**Internal prerequisite**: coordinator-owned `F01R_GCP_EXPIRY`, allocated `specs/017-v2-gcp-expiry-contract/`, must migrate the existing GCP DELETE validators/configs/schemas/fixtures to governing STOP semantics and merge before F07 implementation. Current base does not accept STOP. This is implementation debt against existing governance, not a research decision. No F07 shared edits or silent DELETE-to-STOP override are allowed.
+**Internal prerequisite**: coordinator-owned `F01R_GCP_EXPIRY`, allocated `specs/017-gcp-stop-contract/`, must migrate the existing GCP DELETE validators/configs/schemas/fixtures to governing STOP semantics and merge before F07 implementation. Current base does not accept STOP. This is implementation debt against existing governance, not a research decision. No F07 shared edits or silent DELETE-to-STOP override are allowed.
 
 ## Technical Context
 
