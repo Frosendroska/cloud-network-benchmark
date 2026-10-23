@@ -36,6 +36,8 @@ AWS normal-work trigger is cap end minus360 seconds: 300-second discovery horizo
 
 **Alternatives considered**: Adding support on top of unchanged uncertainty duplicates funding; subtracting it without an inclusion record hides cost. Enlarging caps is unapproved.
 
+**Merged-contract alignment (implementation handoff)**: The planned F11 cap-start identifier `f11-activation-before-expiry-v1` is not accepted by the already-merged AWS contract. F11 records the merged value `reservation-activation-before-provider-expiry` verbatim. The lifecycle ordering remains durable reservation activation ≤ provider expiry registration ≤ resource creation. This is an identifier alignment only; it changes no research policy. The Azure F08 owning driver/spec currently contains no `cap_start_policy`, `reservation-activation`, or `activation-before` value, so F11 does not infer or modify an Azure contract.
+
 ## R4 — Cap and final-copy policy
 
 **Decision**: Durable accepted reservation activates original cap immediately before expiry registration. F09 registers all providers before creation. Record actual UTC and one live monotonic mapping; registration/setup/readiness/stabilization/mode/wait/final-copy/cleanup all consume cap. Recheck remaining allowances against earliest trigger without resets.

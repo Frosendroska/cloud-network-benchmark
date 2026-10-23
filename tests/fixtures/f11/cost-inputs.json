@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "cost_input_id": "v2-register-forecast-2026-10-14-scoped",
+  "prices_checked_on": "2026-10-14",
+  "acquired_on": "2026-10-21",
+  "source_scope": ["Budget!A1:H35", "Runs!A1:Z40", "Cost model!A1:J65", "Runs!A41:I100"],
+  "source_sha256": "a1683a880dc0ab5556cafd5f2faae7f7cccda41fa9ee22d9dff90dd485f1195c",
+  "continuation_sha256": "6a091f5f02f550ba4017c2d2e1049fdee536f66c180c6f2f233ce3a4e46e9b59",
+  "source_identity_kind": "bounded_extracts_not_workbook_hash",
+  "normalization": "selected-register-values-v1",
+  "currency": "USD",
+  "rows": {"required": 63, "conditional": 9, "deferred": 9, "m_s1": 28, "m_s3": 28},
+  "funding": {"primary": "100.40", "replacements": "1.95", "tax": "20.47", "uncertainty": "25.00", "primary_forecast": "147.82", "working_limit": "250.00", "protected_buffer": "50.00", "total_limit": "300.00"},
+  "refresh_required_before_paid_execution": true,
+  "live_quote": false,
+  "provider_support": {"aws": {"fixture": "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json", "sha256": "315d3e49755396597f97cac3512b9843fcf1c95083fadc11fae667c770215a61", "per_region_usd": "0.0139", "two_region_usd": "0.0278", "free_tier_assumed": false}, "azure": null, "gcp": null}
+}
