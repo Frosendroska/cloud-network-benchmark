@@ -1,0 +1,8 @@
+{
+  "fixture_only": true,
+  "successful_registration": ["protection_apply", "template_get_vm_a", "template_get_vm_b", "registered"],
+  "pair_creation_order": ["precreate_template_get_vm_a", "precreate_template_get_vm_b", "creation_may_have_started_journal", "pair_apply", "instance_get_vm_a", "instance_get_vm_b"],
+  "registration_failures_that_block_pair": ["apply_timeout", "template_missing", "template_id_changed", "stop_policy_mismatch", "expired_trigger", "workflow_cannot_fit"],
+  "cleanup_order": ["pair_destroy_if_may_have_started", "all_zone_compute_absence", "protection_destroy", "final_paginated_inventory"],
+  "controller_loss": {"policy_survives_controller": true, "local_due_time_means_triggered": false, "template_deletion_cancels_live_policy": false}
+}

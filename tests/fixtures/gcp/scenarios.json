@@ -1,0 +1,13 @@
+{
+  "fixture_only": true,
+  "scenarios": [
+    {"id":"S1","scenario":"same_zone","vm_a":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.10"},"vm_b":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.11"},"placement":"none"},
+    {"id":"S2","scenario":"cross_zone","vm_a":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.10"},"vm_b":{"region":"europe-west3","zone":"europe-west3-b","private_ipv4":"10.80.2.10"},"placement":"none"},
+    {"id":"S3","scenario":"placement_optimization","vm_a":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.10"},"vm_b":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.11"},"placement":{"collocation":"COLLOCATED"}},
+    {"id":"S4","scenario":"inter_region","vm_a":{"region":"europe-west3","zone":"europe-west3-a","private_ipv4":"10.80.1.10"},"vm_b":{"region":"europe-west2","zone":"europe-west2-a","private_ipv4":"10.81.1.11"},"placement":"none","vpc":"single-attempt-custom-vpc"}
+  ],
+  "selected_machine_type":"n2-standard-4",
+  "selected_boot_disk":{"type":"pd-balanced","size_gib":32},
+  "network_interface":{"count":1,"type":"GVNIC","tier_1":false},
+  "management_address":"ephemeral-public-ipv4"
+}

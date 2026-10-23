@@ -41,7 +41,7 @@ Metrics: 18/18 buildable requirement/criterion coverage (100%); 26 ordered tasks
 
 ## Exact internal prerequisite: F01R_GCP_EXPIRY
 
-Coordinator assigned `specs/017-gcp-stop-contract/` to a serialized shared writer after the active acquisition amendment. At base e03a07e, `src/cloud_network_benchmark/contracts/campaign.py:301` requires DELETE, and `contracts/deployment.py:189` lists only DELETE. Official GCP template CLI says instanceTerminationAction applies to automatic time limits, so F07 cannot ignore the mismatch or pass DELETE to a STOP policy. Constitution/AGENTS already govern STOP: this is executable debt, not permission to change methodology.
+Resolved before implementation: coordinator verified F01R_GCP_EXPIRY PR #17 merged to main at `2cd36e9ea7b12681545e8c6680ccda42388ffded`. This feature branch integrated that latest `origin/main` with a normal merge; integration base/head is `d2bd3bc296c85fb95be7debdcdbd61cbc759369e`. The STOP/DELETE regression corpus and deterministic canonical schema check passed on that head (see `docs/f07-gcp-provider.md`). The implementation proceeds against the governing STANDARD/STOP validators and active configurations. Historical F01/F02 artifacts remain untouched.
 
 Observed affected live files (not F07-owned):
 
@@ -84,8 +84,8 @@ All shell calls used assigned cwd `/private/tmp/cnb-f07`, `login:false`, with ex
 
 The initial optional extension-file cat returned 1 because no extension file exists; the absence was explicitly verified, so no hooks were skipped silently. An initial combined artifact patch was rejected for duplicate target operations before applying anything; it was split and applied successfully. Neither is a passing runtime test.
 
-**Not run**: F07 pytest (new files absent), Google provider init/schema/fmt/validate (new roots absent), existing runtime regression suite, F07 convergence, actual GCP APIs/credentials/SSH/traffic, paid IAM/zone/image/host identity/placement/routing/stop/billing/deletion acceptance. Planned commands in quickstart are not passing evidence.
+**Not run at planner handoff**: F07 pytest (new files absent), Google provider init/schema/fmt/validate (new roots absent), F07 convergence, actual GCP APIs/credentials/SSH/traffic, paid IAM/zone/image/host identity/placement/routing/stop/billing/deletion acceptance. See `docs/f07-gcp-provider.md` for implementation-stage evidence.
 
 ## Next stage
 
-Planner stage complete. Coordinator queues verified F01R_GCP_EXPIRY integration; then dispatches the configured implementer in this same assigned worktree to run speckit-implement with T001 first. The feature's public design needs no human artifact pause. Implementation/convergence/system readiness remain incomplete, and the shared prerequisite is not waived.
+Planning is complete. F01R_GCP_EXPIRY is integrated and verified; implementation and convergence evidence is in `docs/f07-gcp-provider.md`. Cloud acceptance and system readiness remain incomplete.
