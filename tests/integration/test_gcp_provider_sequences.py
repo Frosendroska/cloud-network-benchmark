@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import pytest
 
-from cloud_network_benchmark.providers.gcp import GcpProviderDriver, SAFETY_LEAD_SECONDS
+from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID, GcpProviderDriver, SAFETY_LEAD_SECONDS
 from cloud_network_benchmark.contracts.admission import ReservationEvidence
 from cloud_network_benchmark.contracts.common import Evidence, StringEvidence
 
@@ -129,7 +129,7 @@ def test_fit_is_rechecked_after_template_prereads_before_pair_apply(tmp_path,mon
     attempt=driver._attempt_dir(deployment)
     namespace=driver._namespace(deployment)
     templates={"vm_a":{"id":"111","name":"template-a","self_link_unique":"projects/test/global/instanceTemplates/unique-a"},"vm_b":{"id":"222","name":"template-b","self_link_unique":"projects/test/global/instanceTemplates/unique-b"}}
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
+    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"controller_session_id":CONTROLLER_SESSION_ID,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
     clock=[start]
     driver.clock=lambda:clock[0]
     monkeypatch.setattr(driver,"_verify_registered_templates",lambda *_args:clock.__setitem__(0,expiry_at-timedelta(seconds=100)))
@@ -164,7 +164,7 @@ def test_cost_undercoverage_and_changed_cap_are_rejected_before_provider_side_ef
     expiry=ExpiryEvidence(schema_version=2,run_id=deployment.run_id,deployment_id=deployment.deployment_id,provider="gcp",action="stop",state="registered",registration_id=Evidence[str](value="111:222"),registered_at=Evidence[datetime](value=datetime.now(timezone.utc)),expires_at=Evidence[datetime](value=trigger),target_selector=request.target_selector,provider_metadata=StructuredEvidence(value={"native_absolute_stop":True}))
     deployment=deployment.model_copy(update={"expiry":Evidence(value=expiry)})
     attempt=driver._attempt_dir(deployment)
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"expiry":expiry.model_dump(mode="json"),"templates":{"vm_a":{"id":"111","name":"template-a","self_link_unique":"projects/test/global/instanceTemplates/unique-a"},"vm_b":{"id":"222","name":"template-b","self_link_unique":"projects/test/global/instanceTemplates/unique-b"}},"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
+    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"controller_session_id":CONTROLLER_SESSION_ID,"expiry":expiry.model_dump(mode="json"),"templates":{"vm_a":{"id":"111","name":"template-a","self_link_unique":"projects/test/global/instanceTemplates/unique-a"},"vm_b":{"id":"222","name":"template-b","self_link_unique":"projects/test/global/instanceTemplates/unique-b"}},"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
     changed=deployment.reservation.value.model_copy(update={"expires_at":Evidence[datetime](value=deployment.reservation.value.expires_at.value+timedelta(minutes=5))})
     changed_deployment=deployment.model_copy(update={"reservation":Evidence(value=changed)})
     with pytest.raises(GcpProviderError,match="immutable reserved registration"):
@@ -181,7 +181,7 @@ def test_changed_project_or_cost_source_cannot_recover_registered_attempt(tmp_pa
     expiry=ExpiryEvidence(schema_version=2,run_id=deployment.run_id,deployment_id=deployment.deployment_id,provider="gcp",action="stop",state="registered",registration_id=Evidence[str](value="111:222"),registered_at=Evidence[datetime](value=datetime.now(timezone.utc)),expires_at=Evidence[datetime](value=trigger),target_selector="project=cnb-test-12345;roles=vm_a,vm_b",provider_metadata=StructuredEvidence(value={"native_absolute_stop":True}))
     deployment=deployment.model_copy(update={"expiry":Evidence(value=expiry)})
     attempt=driver._attempt_dir(deployment)
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"expiry":expiry.model_dump(mode="json"),"templates":{"vm_a":{"id":"111"},"vm_b":{"id":"222"}},"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
+    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"controller_session_id":CONTROLLER_SESSION_ID,"expiry":expiry.model_dump(mode="json"),"templates":{"vm_a":{"id":"111"},"vm_b":{"id":"222"}},"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
     settings=driver.settings.model_copy(update={"project_id":"cnb-other-project-12345"} if change=="project" else {"cost_input_sha256":"b"*64,"cost_source_path":"different-register.csv"})
     recovered=GcpProviderDriver(object(),settings)
     with pytest.raises(GcpProviderError,match="immutable reserved registration"):
@@ -226,8 +226,13 @@ def test_success_and_repeated_cleanup_keep_saved_primary_failure(tmp_path,monkey
     assert json.loads((attempt/"attempt.json").read_text())["primary_failure"]["message"]=="original pair failure"
 
 
-@pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization", "inter_region"])
-def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario):
+@pytest.mark.parametrize(("scenario", "policy_mutation"), [
+    ("same_zone", None), ("cross_zone", None), ("placement_optimization", None), ("inter_region", None),
+    ("placement_optimization", "extra"), ("placement_optimization", "duplicate"),
+    ("placement_optimization", "missing"), ("placement_optimization", "foreign"),
+    ("placement_optimization", "mismatched"),
+])
+def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario, policy_mutation):
     import base64, hashlib, json, struct
     from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
     from cloud_network_benchmark.contracts.execution import CommandResult
@@ -283,6 +288,15 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
                 return result(template)
             if action.startswith("gcp-instance-read") or action.startswith("gcp-hostkey-instance"):
                 instance={**identity,"machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"network":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/networks/{namespace}-net","networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/regions/{intent.region}/subnetworks/{namespace}-"+("b" if role=="vm_b" and scenario=="inter_region" else "a"),"nicType":"GVNIC","accessConfigs":[{"natIP":public}]}],"disks":[{"boot":True,"source":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/zones/{intent.zone}/disks/{namespace}-{suffix}-boot"}],"resourcePolicies":[policy_id] if policy_id else []}
+                if policy_mutation:
+                    extra = f"projects/{settings.project_id}/regions/europe-west3/resourcePolicies/{namespace}-extra"
+                    instance["resourcePolicies"] = {
+                        "extra": [policy_id, extra],
+                        "duplicate": [policy_id, policy_id],
+                        "missing": [],
+                        "foreign": [f"projects/foreign-project/regions/europe-west3/resourcePolicies/{namespace}-compact"],
+                        "mismatched": [f"projects/{settings.project_id}/regions/europe-west2/resourcePolicies/{namespace}-compact"],
+                    }[policy_mutation]
                 return result(instance)
             if action == "gcp-guest-hostkeys": return result({"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":host_blob}]}})
             if action.startswith("gcp-boot-disk"):
@@ -296,6 +310,18 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     expiry=driver.register_expiry(deployment,request)
     assert expiry.state == "registered"
     deployment=deployment.model_copy(update={"expiry":Evidence(value=expiry)})
+    if policy_mutation:
+        from cloud_network_benchmark.providers.gcp import GcpProviderError
+        with pytest.raises(GcpProviderError, match="placement policy"):
+            driver.provision(deployment)
+        actions=[item.action_id for item in runner.requests]
+        assert actions.count("gcp-pair-apply")==1
+        assert actions.count("gcp-instance-read-vm_a")==1
+        assert "gcp-pair-destroy" in actions and "gcp-protection-destroy" in actions
+        journal=json.loads((driver._attempt_dir(deployment)/"attempt.json").read_text())
+        assert journal["primary_failure"]["category"] == "placement_mismatch"
+        assert driver.cleanup(deployment).cleanup_state == "succeeded"
+        return
     output=driver.provision(deployment)
     assert (output.vm_a.private_ipv4,output.vm_b.private_ipv4)==(("10.80.1.10","10.80.1.11") if scenario!="inter_region" else ("10.80.1.10","10.81.1.11"))
     assert output.vm_a.connection.host == "8.8.8.8" and output.vm_b.connection.host == "1.1.1.1"
@@ -403,6 +429,41 @@ def test_cleanup_verifies_compute_absence_before_removing_protection_and_is_idem
     assert result.inventory.value["pages_complete"] is True
     driver.cleanup(deployment)
     assert commands == [("pair","destroy"),("protection","destroy")]
+
+
+def test_same_attempt_prior_controller_session_blocks_reuse_and_provision_but_allows_cleanup(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRequest
+    from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    now = datetime.now(timezone.utc)
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp", action="stop", state="registered", registration_id=Evidence[str](value="111:222"), registered_at=Evidence[datetime](value=now-timedelta(seconds=5)), expires_at=Evidence[datetime](value=trigger), target_selector=f"project={driver.settings.project_id};run_id={deployment.run_id};deployment_id={deployment.deployment_id};roles=vm_a,vm_b", provider_metadata=StructuredEvidence(value={"native_absolute_stop": True}))
+    attempt = driver._attempt_dir(deployment)
+    original_cap = {"cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "trigger": trigger.isoformat()}
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id, **original_cap, "reservation_id": deployment.reservation.value.reservation_id.value, "binding_sha256": driver._binding_fingerprint(deployment), "controller_session_id": "prior-session", "registration_may_have_started": True, "registered": True, "expiry": expiry.model_dump(mode="json"), "templates": {"vm_a": {"id": "111", "name": "template-a"}, "vm_b": {"id": "222", "name": "template-b"}}})
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp", action="stop", expires_at=Evidence[datetime](value=trigger), reservation_id=deployment.reservation.value.reservation_id, resource_namespace=deployment.run_id, target_selector=expiry.target_selector)
+    monkeypatch.setattr(gcp_provider, "CONTROLLER_SESSION_ID", "replacement-session")
+    terraform_actions = []
+    monkeypatch.setattr(driver, "_terraform", lambda _attempt, root, action, _deployment, _extra: terraform_actions.append((root, action)) or {})
+    monkeypatch.setattr(driver, "_inventory", lambda _deployment: {"pages_complete": True, "instances": [], "resources": [], "known": []})
+    with pytest.raises(GcpProviderError, match="earlier controller session"):
+        driver.register_expiry(deployment, request)
+    with pytest.raises(GcpProviderError, match="earlier controller session"):
+        driver.provision(deployment.model_copy(update={"expiry": Evidence(value=expiry)}))
+    assert not any(action == "apply" for _root, action in terraform_actions)
+    before_cleanup = json.loads((attempt / "attempt.json").read_text())
+    assert before_cleanup["controller_session_id"] == "prior-session"
+    assert {key: before_cleanup[key] for key in original_cap} == original_cap
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert terraform_actions == [("protection", "destroy")]
+    after_cleanup = json.loads((attempt / "attempt.json").read_text())
+    assert after_cleanup["controller_session_id"] == "prior-session"
+    assert {key: after_cleanup[key] for key in original_cap} == original_cap
+    assert after_cleanup["cleanup_state"] == "succeeded"
 
 
 def test_cleanup_does_not_claim_cancellation_or_trigger_after_native_deadline(tmp_path, monkeypatch):
@@ -612,7 +673,7 @@ def test_s1_fake_provision_normalizes_authenticated_vm_disk_image_and_hostkey_re
     attempt=driver._attempt_dir(deployment)
     namespace=driver._namespace(deployment)
     templates={"vm_a":{"id":"111","name":"template-a","self_link_unique":"projects/test/global/instanceTemplates/unique-a"},"vm_b":{"id":"222","name":"template-b","self_link_unique":"projects/test/global/instanceTemplates/unique-b"}}
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
+    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"controller_session_id":CONTROLLER_SESSION_ID,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
     monkeypatch.setattr(driver,"_verify_registered_templates",lambda *_args:None)
     monkeypatch.setattr(driver,"_terraform",lambda *_args:{"instances":{"value":{"vm_a":{"name":f"{namespace}-a","zone":deployment.vm_a.zone,"id":"101","self_link":f"projects/cnb-test-12345/zones/{deployment.vm_a.zone}/instances/{namespace}-a"},"vm_b":{"name":f"{namespace}-b","zone":deployment.vm_b.zone,"id":"102","self_link":f"projects/cnb-test-12345/zones/{deployment.vm_b.zone}/instances/{namespace}-b"}}}})
     import base64, struct
@@ -922,7 +983,7 @@ def test_post_create_failures_preserve_primary_and_attempt_pair_cleanup(tmp_path
     deployment=deployment.model_copy(update={"expiry":Evidence(value=expiry)})
     attempt=driver._attempt_dir(deployment)
     templates={"vm_a":{"id":"111","name":"template-a","self_link_unique":"projects/test/global/instanceTemplates/111"},"vm_b":{"id":"222","name":"template-b","self_link_unique":"projects/test/global/instanceTemplates/222"}}
-    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
+    driver._save(attempt,{"run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"registered":True,"controller_session_id":CONTROLLER_SESSION_ID,"expiry":expiry.model_dump(mode="json"),"templates":templates,"binding_sha256":driver._binding_fingerprint(deployment),"reservation_id":deployment.reservation.value.reservation_id.value})
     monkeypatch.setattr(driver,"_verify_registered_templates",lambda *_args:None)
     events=[]
     def terraform(_attempt,root,action,_deployment,_extra):

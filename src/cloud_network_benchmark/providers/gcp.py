@@ -167,6 +167,8 @@ class GcpProviderDriver:
         journal = self._load(attempt, deployment)
         self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         if journal.get("registered"):
+            if journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
+                raise GcpProviderError("an earlier controller session cannot reuse registered protection; resolve the attempt through cleanup", category="cleanup_open")
             if journal.get("binding_sha256") != self._binding_fingerprint(deployment):
                 raise GcpProviderError("registered attempt no longer matches its immutable inputs", category="state_identity_mismatch")
             return ExpiryEvidence.model_validate(journal["expiry"])
@@ -187,8 +189,9 @@ class GcpProviderDriver:
             journal["templates"] = templates
             placement_policy_id = self._outputs(out).get("compact_policy_id")
             journal["compact_policy_id"] = placement_policy_id
-            if deployment.scenario == "placement_optimization" and not placement_policy_id:
-                raise GcpProviderError("S3 compact placement policy was not observed", category="placement_missing")
+            expected_policy_path = self._selected_policy_path(deployment)
+            if (expected_policy_path and self._compute_path(placement_policy_id) != expected_policy_path) or (not expected_policy_path and placement_policy_id):
+                raise GcpProviderError("compact placement policy identity differs from the selected scenario", category="placement_missing")
             self._save(attempt, journal)
             observed = {}
             for role, template in templates.items():
@@ -237,6 +240,8 @@ class GcpProviderDriver:
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
+        if journal.get("registered") and journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
+            raise GcpProviderError("an earlier controller session cannot provision this registered attempt; resolve it through cleanup", category="cleanup_open")
         if not journal.get("registered"):
             raise GcpProviderError("verified STOP templates are required before pair creation", category="expiry_required")
         if journal.get("creation_may_have_started") or journal.get("deployment_output") or journal.get("cleanup_state") is not None or journal.get("launch_blocked"):
@@ -288,8 +293,9 @@ class GcpProviderDriver:
                     raise GcpProviderError("observed VM does not inherit absolute STOP scheduling", category="instance_policy_mismatch")
                 observed_disks[role] = self._validate_instance(instance, deployment, role)
                 policies = instance.get("resourcePolicies", [])
-                expected_policy = journal.get("compact_policy_id")
-                if (deployment.scenario == "placement_optimization" and expected_policy not in policies) or (deployment.scenario != "placement_optimization" and policies):
+                expected_policy = self._selected_policy_path(deployment)
+                policy_paths = [self._compute_path(policy) for policy in policies] if isinstance(policies, list) else None
+                if policy_paths != ([expected_policy] if expected_policy else []):
                     raise GcpProviderError("observed placement policy does not match selected scenario", category="placement_mismatch")
                 host_key = self._trusted_hostkey(resource["name"], resource["zone"], instance)
                 resource["_trusted_host_key"] = host_key
@@ -472,6 +478,10 @@ class GcpProviderDriver:
         metadata = {x.get("key"): x.get("value") for x in props.get("metadata", {}).get("items", [])}
         labels = props.get("labels", {})
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
+        expected_policy = self._selected_policy_path(deployment)
+        raw_policies = props.get("resourcePolicies", [])
+        policy_paths = [self._compute_path(policy) for policy in raw_policies] if isinstance(raw_policies, list) else None
+        policy_matches = policy_paths == ([expected_policy] if expected_policy else [])
         if (described_id is None or item_id is None or described_id != item_id or described.get("name") != item.get("name") or item.get("name") != expected_name
             or rest_path != expected_link or unique_path != expected_link or unique_id != str(described_id)
             or scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP"
@@ -493,7 +503,7 @@ class GcpProviderDriver:
             or metadata.get("cnb-network-intent") != json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
             or metadata.get("ssh-keys") != f"benchmark:{self.settings.public_key}"
             or props.get("reservationAffinity", {}).get("consumeReservationType") != "NO_RESERVATION"
-            or props.get("resourcePolicies", []) != ([item.get("expected_policy")] if item.get("expected_policy") else [])
+            or not policy_matches or (item.get("expected_policy") and self._compute_path(item.get("expected_policy")) != expected_policy)
             or labels != expected_labels or "maxRunDuration" in props or props.get("guestAccelerators")):
             raise GcpProviderError("immutable template properties or project-scoped unique identity differ from the selected role", category="expiry_mismatch")
 
@@ -508,6 +518,8 @@ class GcpProviderDriver:
             try: value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc: raise GcpProviderError("an attempt journal is unreadable; new launches are blocked", category="cleanup_unknown") from exc
             if value.get("deployment_id") == deployment.deployment_id:
+                if (value.get("registered") or value.get("registration_may_have_started")) and value.get("controller_session_id") != CONTROLLER_SESSION_ID:
+                    raise GcpProviderError("an earlier controller session has uncertain protection for this attempt", category="cleanup_open")
                 if value.get("launch_blocked") or value.get("cleanup_state") is not None or value.get("creation_may_have_started"):
                     raise GcpProviderError("this attempt already has creation or cleanup state and cannot be launched again", category="cleanup_open")
                 continue
@@ -849,6 +861,12 @@ class GcpProviderDriver:
             return bool(value)
         tier = value.get("totalEgressBandwidthTier")
         return tier not in (None, "", "TIER_UNSPECIFIED")
+
+    def _selected_policy_path(self, deployment: ProviderDeploymentInput) -> str | None:
+        if deployment.scenario != "placement_optimization":
+            return None
+        region = deployment.vm_a.region
+        return f"projects/{self.settings.project_id}/regions/{region}/resourcePolicies/{self._namespace(deployment)}-compact"
 
     @staticmethod
     def _namespace(deployment: ProviderDeploymentInput) -> str:
