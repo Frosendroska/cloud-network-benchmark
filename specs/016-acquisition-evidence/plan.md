@@ -78,6 +78,23 @@ Read AGENTS routes and the actual specify/clarify/plan/tasks/analyze skills. Ins
 
 Require contract/schema round trips, patch applicability, source inspection, observed build/cache identity, unchanged commands, four-mode producer replay, deterministic immutable bytes and hostile substitutions. See quickstart.md for commands/not-run limits. Without a suitable offline Linux compiler, record build checking as not run and do not call source-built capability proved. Convergence must inspect actual hooks, not accept hand-authored intervals or fake-only capability claims. No real traffic is authorized to remedy a check gap.
 
+## Serialized convergence ownership
+
+The coordinator assigned T021–T025 to the same serialized implementer and authorized only the
+small F02R/F03 plumbing required to materialize the exact `CNB_BUILD_V1` bytes captured from the
+remote bootstrap sidecar as a closed, hashed build-identity `ArtifactRecord`. The per-attempt local
+copy is tied to the original captured bytes; it does not synthesize provenance from a tool version
+or an in-memory build object. F03 returns those build records alongside its measurement result so
+the downstream bundle can retain the same references. Legacy builds without sidecar bytes remain
+unknown.
+
+The source-replay integration fixtures are owned by this feature's existing test harness. The
+repair adds realistic client/server JSON receiver records and binds native artifacts to the exact
+measurement-unit action and artifact path, preventing neighboring action-name collisions. The
+fixtures do not claim a real patched binary or cloud run. The approved workload, CLI, warm-up,
+native files, coverage denominator, and separate generation and alignment thresholds remain
+unchanged. No F08 runtime consumer or other feature worktree is part of this amendment.
+
 ## Complexity Tracking
 
 No constitution violations. Two additive upstream observation patches are necessary because current native sources expose filtered samples and relative/statistical spans rather than source-bound enabled windows. A DTO alone cannot close the gap. No additional agent/platform abstraction is justified.

@@ -140,3 +140,76 @@ F01R binder and replay helper, keeps the 100 ms diagnostics alignment test separ
 cross-host windows without a bounded common transform, preserves gap duration in the receiver
 denominator, and checks repeated replay hashes plus a generated 50,000-interval stream. The final
 day chunk without positive post-warm-up support remains unknown. Compilation is still not run.
+
+## Serialized convergence repair (T021–T025)
+
+The coordinator appended five trust-boundary tasks. The feature owner completed them in two code
+commits: `f29156c4c528034a2b8cbd6e073c5bc62b8747a2` and
+`f92232ed0f57f606d8bbeb35552e616155f4eda1`. The branch already contained verified `origin/main`
+at `e03a07eaa5ed9ea372c695db19fd6fbcffdad024`; a normal merge check returned “Already up to date.”
+
+Bootstrap now emits an immutable `CNB_BUILD_V1` sidecar with source/archive, upstream, patch,
+compiler, build configuration, installed executable path/version/digest, capability and semantics.
+The exact sidecar stdout bytes are materialized under the attempt's `metadata/build/` directory as
+a closed, hashed `build-identity` ArtifactRecord. F03 returns those records and requires their
+verified bytes to match the captured BuildObservation as well as the producing command path and
+environment. A legacy build with no captured sidecar remains unavailable. The normal iperf
+receiver hook records protocol/settings and initial/post-omit origins. Replay now corroborates
+receiver intervals against native client JSON/JSONL session settings, server-receiver stream rows,
+endpoints, offsets, omission and bytes; cookie-only files and self-consistent substituted logs do
+not authorize windows. Failed producer outcomes or malformed tails retain already closed windows
+and report an unknown tail per source. Other units' valid sources remain independent. The coverage
+numerator intersects probe inner support with the union of receiver inner support while retaining
+the full continuous receiver envelope in the denominator.
+
+Validation on the final code before documentation updates:
+
+```text
+env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q
+exit 0: 824 passed in 63.24s
+
+env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest \
+  tests/unit/test_acquisition.py tests/unit/test_measurement_timing.py \
+  tests/integration/test_acquisition_producer.py tests/unit/test_bootstrap.py \
+  tests/unit/test_measurement_commands.py tests/unit/test_measurement_modes.py \
+  tests/integration/test_measurement_runner.py -q
+exit 0: 114 passed in 28.50s
+
+env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python \
+  -m cloud_network_benchmark.contracts.schema \
+  --output specs/003-v2-shared-contracts/contracts --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+The updated iperf patch SHA-256 is
+`11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661`; Sockperf remains
+`3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285`. Both actual patch files
+applied with `--batch --fuzz=0` to clean extracted pinned-source copies. The iperf files matched
+the research hashes before application: `src/iperf_api.c`
+`960341011c83b3990de0e431d082001d5126b05390cacdca23b23b6731e577fb`,
+`src/iperf_server_api.c` `12a19ecf2dc20d500dfb60af740d9c5a96b562c53552c5cc65af41f7a31646e5`,
+`src/iperf_client_api.c` `dfd7a23abc9be5d644bed38c756037024f31625da033a3e8cde35965a1b3a72b`, and
+`src/iperf_time.c` `f7d52905eb00bb196f0930f50709dd872d7521d089feb9a0e28bdbeacc717a54`. Sockperf
+`src/client.cpp` matched research hash
+`a79a3b29dfad3f7c5adf8f93f770598d6cd6d380889c00d63a179f127534245f`.
+
+The source application commands returned 0:
+
+```text
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-repair2-source-check/iperf \
+  < src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-repair2-source-check/sockperf \
+  < src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch
+```
+
+These checks establish source-context applicability and offline fake-boundary behavior only. A
+Linux compile, installed tool help check, patched executable run, guest clock verification, cloud,
+SSH, benchmark traffic, and credential use were not run. The retrieval integration fixture now
+matches exact unit command IDs and artifact paths so similarly prefixed actions cannot be mistaken
+for the producing client; this fixture repair stays inside the assigned feature test harness.
+Convergence task markers T021–T025 are checked, for 25 total feature tasks.
