@@ -49,7 +49,7 @@
 
 - [x] T021 Add read-only `--help`/`preview` module entry point in `src/cloud_network_benchmark/admission.py` and coverage in `tests/integration/test_f11_ledger.py` for contract flags, deterministic JSON/reason identities, valid-pending exit0 vs invalid exit2, no ledger creation and zero external calls; existing CLI remains untouched. FR-001/003/007/012/014/016; SC-001/006.
 - [x] T022 Document verified actual APIs/preview usage, shared local path, funding/cap/earlier-trigger/copy/restart assumptions and provider/paid evidence limits in `docs/f11-schedule-budget.md`; preserve research authority and no real-readiness claim. FR-016; SC-006.
-- [ ] T023 Run quickstart.md's actual focused/full-suite/schema/preview/diff checks after implementation; repair only owned paths and record exact head, environment, commands/exits/counts/no skips or explicit gaps in `docs/f11-schedule-budget.md`. Leave unavailable/not-run checks clearly distinct from passing; deliver to Spec Kit convergence without cloud/SSH/paid actions. FR-001–016; SC-001–006.
+- [x] T023 Run quickstart.md's actual focused/full-suite/schema/preview/diff checks after implementation; repair only owned paths and record exact head, environment, commands/exits/counts/no skips or explicit gaps in `docs/f11-schedule-budget.md`. Leave unavailable/not-run checks clearly distinct from passing; deliver to Spec Kit convergence without cloud/SSH/paid actions. FR-001–016; SC-001–006.
 
 ## Dependencies and execution order
 

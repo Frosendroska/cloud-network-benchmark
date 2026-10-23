@@ -38,4 +38,16 @@ The cap-start identifier in F11 evidence is `reservation-activation-before-provi
 
 ## Validation record
 
-The final integrated commit, exact command exits, test counts and no-skip status will be recorded after F11 is integrated with the latest merged main branch. The checks prove only offline admission behavior. F09 integration, the F10 clean-checkout gate and separately authorized provider acceptance remain future stages. Provider billing, expiry timing, quota, cleanup behavior and real measurements are not established here.
+At integrated head `5d2be0f6faf1ed3f064c0b872d350051822f68e8` (F11 commit `fa46763`, merged with `origin/main` at Azure PR14 commit `24a964505210b2e4e8593861bcabf8ce5ec2e9d6`), the offline checks were:
+
+| Check | Command/result |
+| --- | --- |
+| Focused F11 tests | `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_f11_schedule.py tests/unit/test_f11_budget.py tests/contract/test_f11_admission.py tests/integration/test_f11_ledger.py` — exit 0, 56 passed, no skips |
+| Full suite | `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m pytest -q` — exit 0, 904 passed, 3 skipped because PowerShell is not installed (`tests/integration/test_azure_provider_flow.py:627`) |
+| Contract schema check | `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` — exit 0 |
+| F11 module `--help` | `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.admission --help` — exit 0 |
+| Existing CLI `--help` | `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark --help` — exit 0 |
+| Pending preview | `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.admission preview --schedule tests/fixtures/f11/schedule-pending.csv --config-map tests/fixtures/f11/config-map.json --cost-inputs tests/fixtures/f11/cost-inputs.json --now 2026-10-22T00:00:00Z` — exit 0, `status=inspectable`, `paid_eligible=false`, `external_calls=0` |
+| `git diff --check` | Exit 0 |
+
+Commands ran in `/private/tmp/cnb-f11` with the offline virtualenv and `PYTHONPATH=src`; `THESIS_ROOT` was set to the canonical Thesis path only for commands that need it. The three PowerShell-dependent skips are the only skipped tests. These checks establish offline behavior only. F09 composition, the F10 clean-checkout gate and separately authorized provider acceptance remain future stages. Provider billing, expiry timing, quota, cleanup behavior and real measurements are not established here.
