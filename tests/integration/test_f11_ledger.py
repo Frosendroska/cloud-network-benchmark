@@ -303,6 +303,10 @@ def test_final_billing_and_all_provider_absence_release_only_proved_unused_fundi
     assert not state["cleanup_blocked"]
     terminal = book.claim_creation(rid, provider=Provider.AWS, expiry_requests=[], expiry_evidence=[])
     assert not terminal.eligible and terminal.reason_codes == ("reservation_terminal",)
+    with pytest.raises(ValueError, match="conflicting_final_billing"):
+        book.reconcile(Reconciliation("conflicting-aws-final",rid,Provider.AWS,
+            hashlib.sha256(b"conflicting-final").hexdigest(),incurred_usd=Decimal("0.09"),actual=True,
+            billing_final=True,occurred_at=datetime(2026,10,22,0,4,tzinfo=timezone.utc),source_path="local/conflict.json"))
 
 
 def test_replacement_is_bound_to_one_failed_short_observation_and_original_provider(tmp_path):
@@ -598,6 +602,13 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
     reserved = book.reserve(request, plan=plan)
     assert reserved.status == "reserved", reserved.reasons
     rid = reserved.evidence.reservation_id.value
+    assert book.check_stage_fit(rid, stage="registration", remaining=plan.allowance).eligible
+    omitted = WorkflowAllowance(10,0,plan.allowance.readiness_seconds,60,minimum,1,
+        plan.allowance.retrieval_seconds,plan.allowance.cleanup_seconds,"mode-stage-test",plan.allowance.provider_leads_seconds)
+    assert not book.check_stage_fit(rid, stage="registration", remaining=omitted).eligible
+    measurement_remainder = WorkflowAllowance(0,0,0,0,minimum,1,plan.allowance.retrieval_seconds,
+        plan.allowance.cleanup_seconds,"mode-stage-test",plan.allowance.provider_leads_seconds,("registration","preparation"))
+    assert book.check_stage_fit(rid, stage="measurement", remaining=measurement_remainder).eligible
     expiry_requests, expiry_evidence = [], []
     for provider in providers:
         name = provider.value
@@ -880,10 +891,13 @@ def test_same_session_can_hold_two_independent_primary_reservations(tmp_path):
         book.reconcile(Reconciliation("event-1", rid, Provider.AWS, costs.payload_sha256,
             incurred_usd=Decimal("0.11"), billable_resources_present=None,
             occurred_at=datetime(2026,10,22,0,1,tzinfo=timezone.utc),source_path=costs.source_path))
+    book.reconcile(Reconciliation("event-1-final", rid, Provider.AWS, costs.payload_sha256,
+        incurred_usd=Decimal("0.10"), actual=True, billing_final=True, billable_resources_present=None,
+        occurred_at=datetime(2026,10,22,0,1,30,tzinfo=timezone.utc),source_path=costs.source_path))
     req_c, plan_c = reserve("F11-primary-third")
     assert book.reserve(req_c, plan=plan_c).reasons == ("cleanup_open",)
     for idx, provider in enumerate((Provider.AWS, Provider.AZURE, Provider.GCP), 2):
         record_absence(book,f"event-{idx}",rid,provider,datetime(2026,10,22,0,2+idx,tzinfo=timezone.utc))
-    req_c = req_c.model_copy(update={"incurred_cost_usd": Evidence[float](value=0),
-        "active_reserved_usd": Evidence[float](value=1.0)})
+    req_c = req_c.model_copy(update={"incurred_cost_usd": Evidence[float](value=.1),
+        "active_reserved_usd": Evidence[float](value=.9)})
     assert book.reserve(req_c, plan=plan_c).status == "reserved"
