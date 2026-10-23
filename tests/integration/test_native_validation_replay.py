@@ -115,15 +115,13 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     from tests.integration.test_acquisition_producer import _build
     from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
     from cloud_network_benchmark.contracts import VmRole
-    builds = []
-    if value.mode != "diagnostic_day":
-        builds = [_build("sockperf", VmRole.VM_A, "f08-vma-sockperf-build"),
-                  _build("iperf3", VmRole.VM_A, "f08-vma-iperf3-build"),
-                  _build("sockperf", VmRole.VM_B, "f08-vmb-sockperf-build"),
-                  _build("iperf3", VmRole.VM_B, "f08-vmb-iperf3-build")]
+    builds = [_build("sockperf", VmRole.VM_A, "f08-vma-sockperf-build"),
+              _build("iperf3", VmRole.VM_A, "f08-vma-iperf3-build"),
+              _build("sockperf", VmRole.VM_B, "f08-vmb-sockperf-build"),
+              _build("iperf3", VmRole.VM_B, "f08-vmb-iperf3-build")]
     if value.mode=="diagnostic_day":
         day_id=units[0].unit_id
-        units.extend(PhaseConfiguration(unit_id=f"probe-{index:03d}",kind="probe_chunk",
+        units.extend(PhaseConfiguration(unit_id=f"probe-chunk-{index:06d}",kind="probe_chunk",
             phase="multi_flow",measured_seconds=300,parent_unit_id=day_id)
             for index in range(1,289))
     declarations = artifact_inputs(ArtifactLayout.for_mode(value.mode, units), mode=value.mode,
@@ -204,14 +202,14 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         if value.mode=="calibration":
             start_offset=index*400
         elif value.mode=="diagnostic_day":
-            start_offset=0 if unit.kind=="continuous_day" else 2+(index-1)*300
+            start_offset=0 if unit.kind=="continuous_day" else (index-1)*300
         else:
             start_offset=(0, 100, 500)[index]
         probe_start = NOW + timedelta(seconds=start_offset)
         idle_phase=unit.phase=="idle_latency"
         day_unit=unit.kind=="continuous_day"
         chunk_unit=unit.kind=="probe_chunk"
-        measured_offset = 5 if idle_phase or (chunk_unit and unit.unit_id=="probe-001") else (2 if day_unit else 10 if not chunk_unit else 0)
+        measured_offset = 5 if idle_phase else (7 if day_unit else 0 if chunk_unit else 10)
         measured_start = probe_start + timedelta(seconds=measured_offset)
         duration=unit.measured_seconds
         measured_finish = measured_start + timedelta(seconds=duration)
@@ -241,38 +239,64 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                     "source_identity":Evidence[str](value=sock_build.source_reference)})
         if day_unit:
             day_argv=["iperf3","-c","10.0.0.2","-z","-P","1","-t","86400","-O","5","-l","131072","-i","1","-p","5201","-C","cubic","--json-stream","--forceflush"]
-            commands.append(command(unit.unit_id,"vm_a",day_argv,start_offset+2))
+            day_build=next(b for b in builds if b.tool=="iperf3" and b.role==VmRole.VM_A)
+            day_action=f"iperf3-{unit.unit_id}"
+            commands.append(command(unit.unit_id,"vm_a",[day_build.binary_path,*day_argv[1:]],start_offset+2))
+            commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
+                "action_id":day_action,"acquisition_invocation_id":day_action},
+                "result":{**commands[-1].result,"action_id":day_action},
+                "binary_version":Evidence[str](value=day_build.binary_version),
+                "source_identity":Evidence[str](value=day_build.source_reference)})
         if chunk_unit:
             chunk_index=index-1
             start_offset=chunk_index*300
-            measured_offset=5 if chunk_index==0 else 0
+            measured_offset=0
             duration=300
-            measured_start=NOW+timedelta(seconds=start_offset+measured_offset)
-            timing=timing.model_copy(update={"probe_test_started_at":Evidence[datetime](value=NOW+timedelta(seconds=start_offset)),
+            measured_start=NOW+timedelta(seconds=7+start_offset)
+            timing=timing.model_copy(update={"probe_test_started_at":Evidence[datetime](value=NOW+timedelta(seconds=start_offset+7)),
                 "tcp_started_at":Evidence[datetime](unavailable_reason="persistent TCP session is not restarted for probe rotation"),
-                "measured_started_at":Evidence[datetime](unavailable_reason="chunk bounds come from probe data"),
-                "measured_finished_at":Evidence[datetime](unavailable_reason="chunk bounds come from probe data"),
-                "monotonic_started":Evidence[float](value=float(start_offset)),"monotonic_finished":Evidence[float](value=float(start_offset+300+measured_offset)),
-                "omitted_seconds":float(measured_offset),"clock_mappings":[mapping_a]})
+                "measured_started_at":Evidence[datetime](value=measured_start),
+                "measured_finished_at":Evidence[datetime](value=measured_start+timedelta(seconds=300)),
+                "monotonic_started":Evidence[float](value=float(start_offset+7)),"monotonic_finished":Evidence[float](value=float(start_offset+307)),
+                "omitted_seconds":0.0,"clock_mappings":[mapping_a]})
             timings[-1]=timing
             sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t","300","--full-log"]
-            commands.append(command(unit.unit_id,"vm_a",sockperf_argv,start_offset))
+            sock_build=next(b for b in builds if b.tool=="sockperf" and b.role==VmRole.VM_A)
+            action=f"sockperf-{unit.unit_id}"
+            commands.append(command(unit.unit_id,"vm_a",[sock_build.binary_path,*sockperf_argv[1:]],start_offset+7))
+            commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
+                "action_id":action,"acquisition_invocation_id":action},
+                "result":{**commands[-1].result,"action_id":action},
+                "binary_version":Evidence[str](value=sock_build.binary_version),
+                "source_identity":Evidence[str](value=sock_build.source_reference)})
         materialize(f"{unit.unit_id}-timing", unit.unit_id, timing.model_dump_json().encode())
         sample_at=float(start_offset+measured_offset+.001)
         sample_end=float(start_offset+measured_offset+duration-.001)
         csv=("sockperf: test output\n------------------------------\npacket, txTime(sec), rxTime(sec), rtt(usec)\n"
              f"0, {sample_at:.6f}, {sample_at+.000001:.6f}, 1.000\n"
              f"1, {sample_end:.6f}, {sample_end+.000001:.6f}, 1.000\n")
-        valid_runtime=duration if idle_phase else duration+5
+        valid_runtime=duration if idle_phase or chunk_unit or day_unit else duration+5
         valid_sent=valid_runtime*1000
         total_runtime=valid_runtime+(5 if index==0 else 5)
         total_sent=total_runtime*1000
         log=(f"[Total Run] RunTime={total_runtime:.3f} sec; Warm up time=5000 msec; SentMessages={total_sent}; ReceivedMessages=2\n"
              f"[Valid Duration] RunTime={valid_runtime:.3f} sec; SentMessages={valid_sent}; ReceivedMessages=2\n")
         if chunk_unit:
-            materialize("day-probe-csv",unit.unit_id,csv,concrete_path=f"measurements/day/probes/{unit.unit_id}.csv",record_unit_id=units[0].unit_id)
-            materialize_extra("day-probe-log",units[0].unit_id,f"measurements/day/probes/{unit.unit_id}.log",
-                "sockperf-log","vm_a",log)
+            chunk_index=index-1
+            materialize_extra(f"day-probe-csv-{unit.unit_id}",unit.unit_id,
+                f"measurements/day/probes/{unit.unit_id}.csv","sockperf-csv","vm_a",csv)
+            materialize_extra(f"day-probe-log-{unit.unit_id}",unit.unit_id,
+                f"measurements/day/probes/{unit.unit_id}.log","sockperf-log","vm_a",log)
+            action=f"sockperf-{unit.unit_id}"
+            boot="12345678-1234-1234-1234-123456789abc"
+            left=int((7+chunk_index*300)*1_000_000_000)
+            ns=int(NOW.timestamp()*1_000_000_000)
+            source_rows=[
+                {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1","invocation_id":action,"pid":42,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"clock_anchor","mono_before_ns":left,"realtime_ns":ns+left,"mono_after_ns":left+1000},
+                {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1","invocation_id":action,"pid":42,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"probe_window","sender_enabled_ns":left,"receiver_enabled_ns":left,"termination_ns":left+300_000_000_000,"native_filter_start_ns":left,"native_filter_end_ns":left+300_000_000_000,"termination_reason":"timer"}]
+            materialize_extra(f"day-probe-observation-{unit.unit_id}",unit.unit_id,
+                f"measurements/day/probes/{unit.unit_id}.acquisition.stderr","sockperf-observation-stderr","vm_a",
+                b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":" )).encode()+b"\n" for row in source_rows))
         elif not day_unit:
             materialize(f"{unit.unit_id}-sockperf",unit.unit_id,csv)
             materialize_extra("sockperf-log",unit.unit_id,f"measurements/{unit.unit_id}/sockperf.log",
@@ -331,11 +355,37 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                         {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":str(5201+i),"remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
                 receiver_source_rows.extend(rows)
         if day_unit:
+            cookie=f"f08-{unit.unit_id}-session"
             stamp=(NOW+timedelta(seconds=2)).timestamp()
-            start_event={"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":1},"timestamp":{"timesecs":stamp}}}
-            interval_event={"event":"interval","data":{"sum":{"start":2,"end":86402,"seconds":86400,"bytes":86400000000,"sender":False,"omitted":False}}}
-            end_event={"event":"end","data":{"sum_received":{"bytes":86400000000,"seconds":86400}}}
-            materialize("day-iperf3-client",None,"\n".join(json.dumps(item) for item in (start_event,interval_event,end_event))+"\n")
+            settings={"protocol":"TCP","num_streams":1,"omit":5,"duration":86400,
+                "interval":1,"blksize":131072,"reverse":False}
+            connected=[{"socket":17,"local_host":"10.0.0.2","local_port":5201,
+                "remote_host":"10.0.0.1","remote_port":50100}]
+            start_data={"cookie":cookie,"test_start":settings,"connected":connected,
+                "timestamp":{"timesecs":stamp}}
+            start_event={"event":"start","data":start_data}
+            interval_events=({"event":"interval","data":{"streams":[{"socket":17,
+                "start":second,"end":second+1,"seconds":1,"bytes":125000000,"omitted":False,"sender":False}]}}
+                for second in range(86400))
+            end_event={"event":"end","data":{"sum_received":{"bytes":10800000000000,"seconds":86400}}}
+            client_payload="\n".join(json.dumps(item,separators=(",",":"))
+                for item in (start_event,*interval_events,end_event))+"\n"
+            materialize("day-iperf3-client",unit.unit_id,client_payload)
+            materialize("day-iperf3-observation",unit.unit_id,
+                "day client process stdout/stderr closure evidence is retained separately\n")
+            boot="12345678-1234-1234-1234-123456789def"
+            mono_initial=2_000_000_000
+            mono_post=7_000_000_000
+            listener="f02r-vm_b-listener-iperf3"
+            source_rows=[
+                {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"clock_anchor","cookie":cookie,"mono_before_ns":mono_initial,"realtime_ns":int(NOW.timestamp()*1_000_000_000)+mono_initial,"mono_after_ns":mono_initial+1000},
+                {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"session_settings","cookie":cookie,"protocol":"TCP","num_streams":1,"omit":5,"duration":86400,"interval_us":1000000,"block_size":131072,"reverse":False},
+                {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"initial","origin_us":mono_initial//1000,"start_time_fixed_us":mono_initial//1000},
+                {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":"17","phase":"post_omit","origin_us":mono_post//1000,"start_time_fixed_us":mono_initial//1000}]
+            for second in range(86400):
+                source_rows.append({"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":listener,"pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":"17","role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":"5201","remote_host":"10.0.0.1","remote_port":"50100","interval_start_us":mono_post//1000+second*1000000,"interval_end_us":mono_post//1000+(second+1)*1000000,"bytes":125000000,"omitted":False})
+            materialize("iperf3_server_error",None,
+                b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":" )).encode()+b"\n" for row in source_rows))
 
     commands.extend([
         command(units[0].unit_id,"vm_b",["sockperf","server","-i","10.0.0.2","-p","11111"],0),
@@ -358,29 +408,6 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         if receiver_source_rows:
             materialize("iperf3_server_error",None,
                 b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":")).encode()+b"\n" for row in receiver_source_rows))
-        from cloud_network_benchmark.acquisition import bind_acquisition_sources
-        receiver_command=commands[-1]
-        sources=bind_acquisition_sources(child_root=child_root,run_identity=identity,commands=commands,
-            receiver_command_evidence=[receiver_command],build_evidence=builds,source_artifact_records=records)
-        if not sources:
-            raise AssertionError("materialized fixture acquisition sources did not bind")
-        for index,timing in enumerate(timings):
-            matching=[]
-            for source in sources:
-                if source.tool=="sockperf" and source.log_path.endswith(f"{timing.unit_id}/sockperf-acquisition.stderr"):
-                    matching.append(source)
-                elif source.tool=="iperf3" and source.native_artifact_ids[0]==f"{timing.unit_id}-iperf3":
-                    matching.append(source)
-            if matching:
-                updated=timing.model_copy(update={"acquisition_sources":Evidence[list](value=matching)})
-                timings[index]=updated
-                timing_record=next(r for r in records if r.artifact_id==f"{timing.unit_id}-timing")
-                raw=updated.model_dump_json().encode()
-                target=child_root/timing_record.path
-                target.write_bytes(raw)
-                records[records.index(timing_record)]=timing_record.model_copy(update={
-                    "size_bytes":Evidence[int](value=len(raw)),"sha256":StringEvidence(value=hashlib.sha256(raw).hexdigest())})
-        # The clock records above use the same monotonic epoch as the frozen UTC mappings.
     for unit in units:
         if unit.kind!="probe_chunk":
             materialize(f"{unit.unit_id}-commands",unit.unit_id,json.dumps(
@@ -397,19 +424,52 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     for unit in loaded_units:
         offset=offset_by_unit[unit.unit_id]
         stamp=(NOW+timedelta(seconds=offset+(2 if value.mode=="diagnostic_day" else 7))).timestamp()
-        received_bytes=86400000000 if value.mode=="diagnostic_day" else 125000000
+        received_bytes=10800000000000 if value.mode=="diagnostic_day" else 125000000
         receiver_seconds=86400 if value.mode=="diagnostic_day" else unit.measured_seconds
         interval_start=0 if value.mode=="diagnostic_day" else 3
-        receiver_events.append({"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":unit.streams or 1},"timestamp":{"timesecs":stamp}}})
+        day_cookie=f"f08-{unit.unit_id}-session"
+        day_settings={"protocol":"TCP","num_streams":1,"omit":5,"duration":86400,
+            "interval":1,"blksize":131072,"reverse":False}
+        day_connected=[{"socket":17,"local_host":"10.0.0.2","local_port":5201,
+            "remote_host":"10.0.0.1","remote_port":50100}]
+        day_start={"cookie":day_cookie,"test_start":day_settings,"connected":day_connected,
+            "timestamp":{"timesecs":stamp}}
+        receiver_events.append({"event":"start","data":day_start if value.mode == "diagnostic_day" else
+            {"test_start":{"protocol":"TCP","num_streams":unit.streams or 1},"timestamp":{"timesecs":stamp}}})
         if value.mode == "diagnostic_day":
-            receiver_events.extend({"event":"interval","data":{"sum":{"start":second,"end":second+1,
-                "seconds":1,"bytes":1_000_000,"sender":False,"omitted":False}}}
+            receiver_events.extend({"event":"interval","data":{"streams":[{"socket":17,
+                "start":second,"end":second+1,"seconds":1,"bytes":125000000,"sender":False,"omitted":False}]}}
                 for second in range(86_400))
         else:
             receiver_events.append({"event":"interval","data":{"sum":{"start":interval_start,"end":interval_start+receiver_seconds,
                 "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
         receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
     materialize("iperf3_server_log",None,"\n".join(json.dumps(event) for event in receiver_events)+"\n")
+    from cloud_network_benchmark.acquisition import bind_acquisition_sources
+    receiver_command=commands[-1]
+    sources=bind_acquisition_sources(child_root=child_root,run_identity=identity,commands=commands,
+        receiver_command_evidence=[receiver_command],build_evidence=builds,source_artifact_records=records)
+    if not sources:
+        raise AssertionError("materialized fixture acquisition sources did not bind")
+    for index,timing in enumerate(timings):
+        matching=[]
+        for source in sources:
+            if source.tool=="sockperf" and (source.log_path.endswith(f"{timing.unit_id}/sockperf-acquisition.stderr")
+                    or source.log_path.endswith(f"{timing.unit_id}.acquisition.stderr")):
+                matching.append(source)
+            elif source.tool=="iperf3" and (source.native_artifact_ids[0]==f"{timing.unit_id}-iperf3"
+                    or (timing.unit_id==units[0].unit_id and source.native_artifact_ids[0]=="day-iperf3-client")):
+                matching.append(source)
+        if matching:
+            updated=timing.model_copy(update={"acquisition_sources":Evidence[list](value=matching)})
+            timings[index]=updated
+            timing_record=next(r for r in records if r.artifact_id==f"{timing.unit_id}-timing")
+            raw=updated.model_dump_json().encode()
+            target=child_root/timing_record.path
+            target.write_bytes(raw)
+            records[records.index(timing_record)]=timing_record.model_copy(update={
+                "size_bytes":Evidence[int](value=len(raw)),"sha256":StringEvidence(value=hashlib.sha256(raw).hexdigest())})
+    # The clock records above use the same monotonic epoch as the frozen UTC mappings.
     for offset, state in enumerate(("provision_ready","running","collecting","validating","succeeded")):
         update_child_execution(child_path,state,NOW+timedelta(seconds=offset+1))
     update_child_cleanup(child_path,"attempted",NOW+timedelta(seconds=7))
@@ -449,7 +509,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "schedule_snapshot_path":Evidence[str](value="schedule.csv"),"diagnostics":diagnostics})
     before={record.path:hashlib.sha256((child_root/record.path).read_bytes()).hexdigest() for record in records}
     result=validate_bundle(complete,evaluated_at=NOW)
-    expected_validity="partial" if value.mode=="diagnostic_day" or (value.mode=="short_study" and not frozen_n) else "valid"
+    expected_validity="partial" if value.mode=="short_study" and not frozen_n else "valid"
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.artifact_id,item.message) for item in result.findings]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     assert "EXP-001" in summarize_validation(result)
@@ -524,8 +584,38 @@ def test_three_provider_short_study_with_prior_calibration_is_valid_and_comparab
 
 def test_diagnostic_day_materialized_bundle_replays_all_native_chunks(repository_root, tmp_path,
         frozen_clock, deterministic_token, fake_git_commits, request):
-    _materialize_complete_bundle(repository_root,tmp_path,frozen_clock,deterministic_token,
+    bundle,result=_materialize_complete_bundle(repository_root,tmp_path,frozen_clock,deterministic_token,
         fake_git_commits,request,config_name="exp-001-diagnostic-day.yaml")
+    day=next(unit for unit in bundle.measurement_units if unit.kind=="continuous_day")
+    chunks=[unit for unit in bundle.measurement_units if unit.kind=="probe_chunk"]
+    coverage=result.metrics.value["units"][0]["coverage"]
+    assert len(chunks)==288 and all(chunk.measured_seconds==300 for chunk in chunks)
+    assert result.validation_status.data_validity=="valid"
+    assert result.metrics.value["execution"]["bundle_complete"] is True
+    assert coverage["requested_seconds"]==86400
+    assert coverage["observed_receiver_seconds"]["value"]==86400
+    assert coverage["active_probe_seconds"]["value"]>=86400*.99
+    assert coverage["active_probe_ratio"]["value"]>=.99
+    assert coverage["tcp_start_bracket"]["source"]=="F01R acquisition helper"
+    assert result.metrics.value["units"][0]["receiver_interval_count"]==86400
+    dynamic={record.artifact_id for record in bundle.artifact_records
+        if record.artifact_id.startswith("day-probe-csv-")}
+    assert dynamic=={f"day-probe-csv-{chunk.unit_id}" for chunk in chunks}
+    assert all(record.unit_id==record.artifact_id.removeprefix("day-probe-csv-")
+        for record in bundle.artifact_records if record.artifact_id.startswith("day-probe-csv-"))
+    summary=summarize_validation(result)
+    assert "day-probe-csv-probe-chunk-000288" in summary
+    assert validate_bundle(bundle,evaluated_at=result.evaluated_at).model_dump(mode="json")==result.model_dump(mode="json")
+    day_timing=next(timing for timing in bundle.timings if timing.unit_id==day.unit_id)
+    day_sources=day_timing.acquisition_sources.value
+    assert len(day_sources)==1 and day_sources[0].tool=="iperf3"
+    assert day_sources[0].native_artifact_ids==["day-iperf3-client","iperf3_server_log"]
+    chunk_timings=[timing for timing in bundle.timings if timing.unit_id in {chunk.unit_id for chunk in chunks}]
+    assert len(chunk_timings)==288
+    assert all(len(timing.acquisition_sources.value)==1 and timing.acquisition_sources.value[0].tool=="sockperf"
+        and timing.acquisition_sources.value[0].native_artifact_ids==[f"day-probe-csv-{timing.unit_id}"]
+        for timing in chunk_timings)
+    assert not any(finding.severity=="error" for finding in result.findings)
 
 
 def test_materialized_native_replay_keeps_mode_unit_deployment_and_status_inputs_separate():

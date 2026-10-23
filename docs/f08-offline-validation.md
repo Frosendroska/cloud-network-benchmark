@@ -1,5 +1,7 @@
 # F08 Offline Validation Record
 
+The first result table and the initial status narrative below are historical checkpoints from before the later F08 convergence fixes. Their results apply to the named commits only. The post-F018 T047 section records the current completed replay evidence.
+
 This record covers the credential-free F08 implementation in `/private/tmp/cnb-f08`, branch `codex/f08-v2-validation`. No cloud API, SSH, Terraform apply, benchmark traffic, secrets, paid work or Thesis write was used. Sockperf and iperf3 artifacts are synthetic, source-format fixtures.
 
 Environment: Python 3.11.13, `/private/tmp/cnb-offline-venv/bin/python`, `PYTHONPATH=src`, `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis`.
@@ -28,7 +30,23 @@ F08 now materializes acquisition observation bytes and four role/tool build-iden
 
 Observed focused result at the current uncommitted checkpoint: acceptance bundles are valid and complete; all three materialized provider calibration bundles are valid and `select_common_n` selects N=2 with plateau evidence and a source digest; three frozen-N short-study bundles with prior-calibration provenance are valid and `evaluate_comparison` marks the three peers eligible; pending-N short-study bundles remain partial and ineligible. The helper invokes validation and summaries against saved bundle bytes, repeats validation deterministically, checks recorded hashes, and confirms a native CSV mutation is invalid before restoring the bytes. These remain synthetic offline contract fixtures, not cloud, Linux runtime, or research observations.
 
-T047 remains unchecked because continuous DAY still depends on the serialized F018 shared-layout/identity repair. Its current replay remains partial and does not yet prove 86,400 one-second source-supported receiver intervals intersected with 288 native probe chunks. The earlier status entry above is historical at its checkpoint; subsequent merged source capability now supports the non-DAY evidence described here.
+The statements above record historical checkpoints. F018 PR #18 merged on `main` at `027c9cc483f87da89f853e94a68a4c4d9280a503`, resolving the shared DAY family identity mismatch. F08 merged that dependency in feature merge commit `7f3845067a5e2dfa5015096304335bfe862184d2` and now consumes only canonical chunk-suffixed artifact IDs and paths.
 
+T047 DAY proof now replays one source-verified persistent receiver session with 86,400 one-second native intervals and all 288 actual 300-second Sockperf chunk source windows. The session and source sidecars agree on 5-second omit, settings, cookie, endpoints, listener identity, build identity, monotonic/UTC mapping and measured duration. Actual `validate_bundle` returns valid/complete with 86,400 observed seconds and 86,400 source-supported probe seconds (100%); `summarize_validation`, `evaluate_comparison`, repeated deterministic validation, source hash checks and the native-file mutation integrity regression run on the same materialized bundle. The fixture is synthetic F01R evidence and proves no Linux producer behavior, cloud behavior, clock accuracy or research result. The earlier status showing a partial DAY fixture was accurate at that earlier checkpoint and is superseded by this completed proof.
 
-Verification after the non-DAY replay update (working tree based on `e8f319a`): F08-focused native/validation/calibration/summary/replay suite: 82 passed; full credential-free offline suite: 1,088 passed in 133.33 seconds with the bundled PowerShell on `PATH`; schema drift check, `compileall`, and `git diff --check`: exit 0. The full suite includes the existing 288-chunk DAY fixture, which remains partial and is not treated as evidence that T047 DAY acceptance is complete.
+## Final T047 validation checkpoint
+
+The canonical task artifacts now mark T047 complete; the older progress entries above are retained as historical checkpoints. Latest credential-free checks on the post-F018 F08 worktree:
+
+| Check | Result |
+|---|---|
+| Focused native, validation, calibration, summary, contract and materialized replay suite | Exit 0; 85 passed in 53.25 seconds. |
+| Full offline suite with official PowerShell on `PATH` | Exit 0; 1,162 passed in 163.55 seconds, no skips. |
+| F01R contract schema drift check | Exit 0. |
+| CLI `--help` | Exit 0; validate/resolve/dry-run/init commands listed. |
+| `compileall -q src/cloud_network_benchmark` | Exit 0. |
+| `git diff --check` | Exit 0. |
+| Generated materialized configs | `find configs/tests -maxdepth 1 -name 'f08-*'` returned no paths after pytest teardown. |
+| Shared-contract ownership audit | No changed paths under contracts or F01R contract/bootstrap specs relative to merged main. |
+
+Commands used the offline Python at `/private/tmp/cnb-offline-venv/bin/python`, `PYTHONPATH=src`, the read-only Thesis source path, and for pytest `PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH`. No cloud, SSH, Terraform apply, network benchmark, paid experiment, or Thesis write was used. These checks validate synthetic offline bundle replay only.

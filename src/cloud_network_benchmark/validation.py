@@ -145,7 +145,10 @@ def _validate_artifacts(value: ValidatorInput) -> tuple[list[ValidationFinding],
         if key not in records:
             records[key] = record
         declaration = declarations.get(record.artifact_id)
-        dynamic_day_record = record.artifact_id in {"day-probe-csv", "day-probe-log"}
+        dynamic_day_record = (record.artifact_id in {"day-probe-csv", "day-probe-log"}
+                              or any(record.artifact_id.startswith(family + "-") and
+                                     record.unit_id == record.artifact_id[len(family) + 1:]
+                                     for family in ("day-probe-csv", "day-probe-log", "day-probe-observation")))
         if declaration is not None and ((not dynamic_day_record and declaration.unit_id != record.unit_id)
                 or declaration.producer != record.producer or declaration.kind != record.kind):
             findings.append(_finding("artifact.identity", "error",
@@ -169,7 +172,9 @@ def _validate_artifacts(value: ValidatorInput) -> tuple[list[ValidationFinding],
         if record.size_bytes.value != size or record.sha256.value != payload_hash:
             findings.append(_finding("artifact.integrity", "error", "materialized artifact size or SHA-256 differs from its record", unit=record.unit_id, artifact=record.artifact_id))
     for artifact_id, declaration in declarations.items():
-        relevant = [r for r in value.artifact_records if r.artifact_id == artifact_id]
+        relevant = [r for r in value.artifact_records if r.artifact_id == artifact_id or
+                    (artifact_id in {"day-probe-csv", "day-probe-log", "day-probe-observation"}
+                     and r.artifact_id.startswith(artifact_id + "-"))]
         if declaration.expectation == "not_expected":
             if relevant:
                 findings.append(_finding("artifact.unexpected", "error", "artifact was recorded although not_expected", artifact=artifact_id))
@@ -530,15 +535,15 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
     tcp_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "iperf3-json"), None)
     if unit.kind == "probe_chunk":
         day_id = next((u.unit_id for u in value.measurement_units if u.kind == "continuous_day"), None)
-        chunks = sorted((r for r in value.artifact_records if r.artifact_id == "day-probe-csv" and r.unit_id == day_id), key=lambda r: r.path)
-        logs = sorted((r for r in value.artifact_records if r.artifact_id == "day-probe-log" and r.unit_id == day_id), key=lambda r: r.path)
-        declared_chunks = [u for u in value.measurement_units if u.kind == "probe_chunk"]
-        try:
-            index = declared_chunks.index(unit)
-            csv_record = next((r for r in chunks if Path(r.path).stem == unit.unit_id), chunks[index])
-            log_record = next((r for r in logs if Path(r.path).stem == unit.unit_id), logs[index] if index < len(logs) else None)
-        except (ValueError, IndexError):
-            csv_record = log_record = None
+        def chunk_record(family: str, kind: str):
+            expected_id = f"{family}-{unit.unit_id}"
+            return next((record for record in value.artifact_records
+                         if record.kind == kind and (
+                             (record.artifact_id == expected_id and record.unit_id == unit.unit_id)
+                             or (record.artifact_id == family and record.unit_id == day_id
+                                 and Path(record.path).stem == unit.unit_id))), None)
+        csv_record = chunk_record("day-probe-csv", "sockperf-csv")
+        log_record = chunk_record("day-probe-log", "sockperf-log")
     empty = NativeParse()
     sock = empty
     if csv_record:
@@ -684,10 +689,18 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     measured_finish = timing.measured_finished_at.value if timing else None
     intervals = tuple(item for item in parsed.receiver_intervals if item.session_id == selected)
     if measured_start is not None and measured_finish is not None and session_stamp is not None:
+        post_omit_offset = 0
+        if unit.kind == "continuous_day" and isinstance(test, dict):
+            try:
+                post_omit_offset = int(test.get("omit", 0))
+            except (TypeError, ValueError):
+                post_omit_offset = 0
         kept = []
         for interval in intervals:
-            absolute_start = session_stamp + interval.start_seconds
-            absolute_end = session_stamp + interval.end_seconds
+            # iperf3's JSON stream receiver intervals reset to the post-omit
+            # origin. Re-anchor those measured seconds to the session start.
+            absolute_start = session_stamp + post_omit_offset + interval.start_seconds
+            absolute_end = session_stamp + post_omit_offset + interval.end_seconds
             if absolute_start < measured_start.timestamp() - .002 or absolute_end > measured_finish.timestamp() + .002:
                 additions.append(_finding("native.iperf3.interval_outside_window", "error",
                     "receiver interval lies outside or straddles the measured window; its bytes are excluded",
@@ -1259,7 +1272,9 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
                  "binary_version": _source(record, value).binary_version,
                  "source_identity": _source(record, value).source_identity}
                 for record in value.artifact_records if record.unit_id == unit.unit_id
-                or (unit.kind == "probe_chunk" and record.artifact_id in {"day-probe-csv", "day-probe-log"})
+                or (unit.kind == "probe_chunk" and record.artifact_id in {
+                    f"day-probe-csv-{unit.unit_id}", f"day-probe-log-{unit.unit_id}",
+                    "day-probe-csv", "day-probe-log"})
             ],
             "receiver_interval_count": len(tcp.receiver_intervals) if tcp else 0,
             "command_invocation_count": sum(command.unit_id == unit.unit_id for command in value.commands),
