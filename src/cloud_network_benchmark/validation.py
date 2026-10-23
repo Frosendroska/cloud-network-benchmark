@@ -787,6 +787,18 @@ def _measured_samples(value: ValidatorInput, unit: Any, sock: NativeParse,
 
 def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
     findings: list[ValidationFinding] = []
+
+    def is_persistent_iperf_listener(command: CommandEvidence, argv: list[str]) -> bool:
+        action = "f02r-vm_b-listener-iperf3"
+        lower_argv = [token.lower() for token in argv]
+        return (command.producer == "vm_b" and len(lower_argv) >= 4
+            and lower_argv[0] == "systemd-run"
+            and lower_argv[1] == f"--property=environment=cnb_acquisition_id={action}"
+            and lower_argv[2].endswith("/iperf3")
+            and command.request.get("action_id") == action
+            and command.request.get("acquisition_invocation_id") == action
+            and command.result.get("action_id") == action)
+
     for command in value.commands:
         argv = command.request.get("argv")
         if not isinstance(argv, list) or not all(isinstance(token, str) for token in argv):
@@ -885,7 +897,12 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                     findings.append(_finding("command.listener_bind", "error", "Sockperf listener must bind VM B's private IPv4 address", unit=command.unit_id))
                 if _option(argv, "-p") != "11111":
                     findings.append(_finding("command.port", "error", "Sockperf server must listen on UDP 11111", unit=command.unit_id))
-            if lower and "iperf3" in lower[0] and "-s" in lower:
+            # F02R launches the persistent receiver through systemd-run so its
+            # acquisition identity is present in the unit environment. Recognize
+            # that exact launcher shape while still requiring the installed
+            # iperf3 executable and all receiver settings in the recorded argv.
+            receiver_executable = is_persistent_iperf_listener(command, argv)
+            if lower and (("iperf3" in lower[0]) or receiver_executable) and "-s" in lower:
                 target = _option(argv, "-B")
                 try:
                     address = ipaddress.ip_address(target or "")
@@ -929,7 +946,8 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                             f"{program} command build contradicts producer metadata", unit=unit.unit_id))
     for role, program in (("vm_b", "sockperf"), ("vm_b", "iperf3")):
         present = any(command.producer == role and isinstance(command.request.get("argv"), list)
-                      and command.request["argv"] and program in str(command.request["argv"][0]).lower()
+                      and command.request["argv"] and (program in str(command.request["argv"][0]).lower()
+                          or (program == "iperf3" and is_persistent_iperf_listener(command, command.request["argv"])))
                       and ("server" in command.request["argv"] if program == "sockperf"
                            else "-s" in command.request["argv"])
                       for command in value.commands)

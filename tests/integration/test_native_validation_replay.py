@@ -112,6 +112,15 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         deployment_id=deployment_id, provider=provider)
     from cloud_network_benchmark.contracts.campaign import PhaseConfiguration
     units = [PhaseConfiguration.model_validate(item) for item in child["measurement_units"]]
+    from tests.integration.test_acquisition_producer import _build
+    from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
+    from cloud_network_benchmark.contracts import VmRole
+    builds = []
+    if value.mode != "diagnostic_day":
+        builds = [_build("sockperf", VmRole.VM_A, "f08-vma-sockperf-build"),
+                  _build("iperf3", VmRole.VM_A, "f08-vma-iperf3-build"),
+                  _build("sockperf", VmRole.VM_B, "f08-vmb-sockperf-build"),
+                  _build("iperf3", VmRole.VM_B, "f08-vmb-iperf3-build")]
     if value.mode=="diagnostic_day":
         day_id=units[0].unit_id
         units.extend(PhaseConfiguration(unit_id=f"probe-{index:03d}",kind="probe_chunk",
@@ -120,6 +129,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     declarations = artifact_inputs(ArtifactLayout.for_mode(value.mode, units), mode=value.mode,
         measurement_units=units,schedule_supplied=True)
     records, commands, timings, samples = [], [], [], []
+    receiver_source_rows=[]
 
     def materialize(artifact_id, unit_id, content, *, concrete_path=None, record_unit_id=None):
         declaration = declarations[artifact_id]
@@ -157,8 +167,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         item = VmMetadata(schema_version=2, deployment_id=deployment_id, vm_role=role, provider=provider,
             cpu_model={"value":"synthetic CPU"}, nic_driver={"value":"synthetic NIC"},
             acceleration={"value":"synthetic"}, image={"value":"ubuntu"}, kernel={"value":"6.8"},
-            congestion_control={"value":"cubic"}, tool_versions={"value":{"sockperf":"3.10","iperf3":"3.17.1"}},
-            source_builds={"value":{"sockperf":"synthetic fixture build","iperf3":"synthetic fixture build"}},
+            congestion_control={"value":"cubic"}, tool_versions={"value":{tool:next((b.binary_version for b in builds if b.tool==tool and b.role.value==role),"3.10" if tool=="sockperf" else "3.17.1") for tool in ("sockperf","iperf3")}},
+            source_builds={"value":{tool:next((b.source_reference for b in builds if b.tool==tool and b.role.value==role),"synthetic fixture build") for tool in ("sockperf","iperf3")}},
             documented_network_limit={"unavailable_reason":"not specified in synthetic fixture"}, mtu={"value":1500},
             observed_region={"value":"us-east-1"}, observed_zone={"value":"us-east-1a"},
             physical_zone_id={"unavailable_reason":"not observed"}, actual_shape={"value":"synthetic"})
@@ -171,8 +181,9 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             interface_rx_errors={"value":0}, interface_tx_errors={"value":0}, rx_bytes={"value":1000}, tx_bytes={"value":1000})
         diagnostics.append(diagnostic)
         materialize(f"{role}_diagnostics", None, (diagnostic.model_dump_json()+"\n").encode())
-    for artifact_id, content in (("sockperf_server_log", ""), ("iperf3_server_error", "")):
-        materialize(artifact_id, None, content)
+    materialize("sockperf_server_log", None, "")
+    if not builds:
+        materialize("iperf3_server_error", None, "")
 
     def command(unit_id, producer, argv, stamp):
         runtime=1
@@ -219,6 +230,15 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         if not day_unit and not chunk_unit:
             sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t",str(duration+5 if idle_phase else duration+10 if not chunk_unit else duration),"--full-log"]
             commands.append(command(unit.unit_id,"vm_a",sockperf_argv,start_offset))
+            if builds:
+                sock_build=next(b for b in builds if b.tool=="sockperf")
+                sock_action=f"sockperf-{unit.unit_id}"
+                commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
+                    "action_id":sock_action,"acquisition_invocation_id":sock_action,
+                    "argv":[sock_build.binary_path,*sockperf_argv[1:]]},
+                    "result":{**commands[-1].result,"action_id":sock_action},
+                    "binary_version":Evidence[str](value=sock_build.binary_version),
+                    "source_identity":Evidence[str](value=sock_build.source_reference)})
         if day_unit:
             day_argv=["iperf3","-c","10.0.0.2","-z","-P","1","-t","86400","-O","5","-l","131072","-i","1","-p","5201","-C","cubic","--json-stream","--forceflush"]
             commands.append(command(unit.unit_id,"vm_a",day_argv,start_offset+2))
@@ -257,17 +277,59 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             materialize(f"{unit.unit_id}-sockperf",unit.unit_id,csv)
             materialize_extra("sockperf-log",unit.unit_id,f"measurements/{unit.unit_id}/sockperf.log",
                 "sockperf-log","vm_a",log)
+            if builds:
+                action=f"sockperf-{unit.unit_id}"
+                boot="12345678-1234-1234-1234-123456789abc"
+                ns=int(NOW.timestamp()*1_000_000_000)
+                left=int((start_offset+measured_offset)*1_000_000_000)
+                right=left+duration*1_000_000_000
+                source_rows=[
+                    {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1","invocation_id":action,"pid":42,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"clock_anchor","mono_before_ns":left,"realtime_ns":ns+left,"mono_after_ns":left+1000},
+                    {"format":1,"tool":"sockperf","semantics_id":"sockperf-3.10-enabled-v1","invocation_id":action,"pid":42,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"probe_window","sender_enabled_ns":left,"receiver_enabled_ns":left,"termination_ns":right,"native_filter_start_ns":left,"native_filter_end_ns":right,"termination_reason":"timer"}]
+                materialize(f"{unit.unit_id}-sockperf-observation",unit.unit_id,
+                    b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":")).encode()+b"\n" for row in source_rows))
             materialize(f"{unit.unit_id}-stdout",unit.unit_id,"")
             materialize(f"{unit.unit_id}-stderr",unit.unit_id,"")
         samples.append({"unit_id":unit.unit_id,"sample":sample_at})
         if not idle_phase and not day_unit and not chunk_unit:
             n=unit.streams or 1
             client_argv=["iperf3","-c","10.0.0.2","-z","-P",str(n),"-t",str(duration),"-O","5","-l","131072","-i","1","-p","5201","-C","cubic","-J","--get-server-output"]
+            iperf_build=next((b for b in builds if b.tool=="iperf3"),None)
+            cookie=f"f08-{unit.unit_id}-session"
+            action=f"iperf3-{unit.unit_id}"
             commands.append(command(unit.unit_id,"vm_a",client_argv,start_offset+7))
-            client={"start":{"test_start":{"protocol":"TCP","num_streams":n}},
-                "intervals":[{"sum":{"start":start_offset+10,"end":start_offset+10+duration,"seconds":duration,"bytes":125000000,"sender":False,"omitted":False}}],
-                "end":{"sum_received":{"bytes":125000000,"seconds":duration}}}
+            if iperf_build:
+                commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
+                    "action_id":action,"argv":[iperf_build.binary_path,*client_argv[1:]]},
+                    "result":{**commands[-1].result,"action_id":action},
+                    "binary_version":Evidence[str](value=iperf_build.binary_version),
+                    "source_identity":Evidence[str](value=iperf_build.source_reference)})
+            streams=[{"socket":17+i,"start":0,"end":duration,"bytes":125000000//n,
+                "omitted":False,"sender":False} for i in range(n)]
+            connections=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201+i,
+                "remote_host":"10.0.0.1","remote_port":50100+i} for i in range(n)]
+            settings={"protocol":"TCP","num_streams":n,"omit":5,"duration":duration,
+                "interval":1,"blksize":131072,"reverse":False}
+            receiver={"start":{"cookie":cookie,"test_start":settings,"connected":connections},
+                "intervals":[{"streams":streams}]}
+            client={"start":{"cookie":cookie,"test_start":settings},"server_output_json":receiver,
+                "intervals":[{"streams":streams}],"end":{"sum_received":{"bytes":125000000,"seconds":duration}}}
             materialize(f"{unit.unit_id}-iperf3",unit.unit_id,json.dumps(client))
+            materialize(f"{unit.unit_id}-iperf3-observation",unit.unit_id,
+                "client acquisition stderr captured separately from receiver observations\n")
+            if iperf_build:
+                boot="12345678-1234-1234-1234-123456789def"
+                left=int((start_offset+10)*1_000_000_000)
+                right=left+duration*1_000_000_000
+                rows=[{"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"clock_anchor","cookie":cookie,"mono_before_ns":left,"realtime_ns":int(NOW.timestamp()*1_000_000_000)+left,"mono_after_ns":left+1000},
+                    {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"session_settings","cookie":cookie,"protocol":"TCP","num_streams":n,"omit":5,"duration":duration,"interval_us":1000000,"block_size":131072,"reverse":False}]
+                for i in range(n):
+                    stream=str(17+i)
+                    rows.extend([
+                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"initial","origin_us":left//1000,"start_time_fixed_us":left//1000},
+                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"post_omit","origin_us":left//1000,"start_time_fixed_us":left//1000},
+                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":str(5201+i),"remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
+                receiver_source_rows.extend(rows)
         if day_unit:
             stamp=(NOW+timedelta(seconds=2)).timestamp()
             start_event={"event":"start","data":{"test_start":{"protocol":"TCP","num_streams":1},"timestamp":{"timesecs":stamp}}}
@@ -278,6 +340,47 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     commands.extend([
         command(units[0].unit_id,"vm_b",["sockperf","server","-i","10.0.0.2","-p","11111"],0),
         command(units[0].unit_id,"vm_b",["iperf3","-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"],0)])
+    if builds:
+        sockperf_server_build=next(b for b in builds if b.tool=="sockperf" and b.role==VmRole.VM_B)
+        commands[-2]=commands[-2].model_copy(update={"request":{**commands[-2].request,
+            "argv":[sockperf_server_build.binary_path,"server","-i","10.0.0.2","-p","11111"]},
+            "binary_version":Evidence[str](value=sockperf_server_build.binary_version),
+            "source_identity":Evidence[str](value=sockperf_server_build.source_reference)})
+        iperf_build=next(b for b in builds if b.tool=="iperf3" and b.role==VmRole.VM_B)
+        commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
+            "action_id":"f02r-vm_b-listener-iperf3","acquisition_invocation_id":"f02r-vm_b-listener-iperf3",
+            "launcher_argv":["systemd-run","--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,"-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"],
+            "argv":["systemd-run","--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,"-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"]},
+            "result":{**commands[-1].result,"action_id":"f02r-vm_b-listener-iperf3"},
+            "binary_version":Evidence[str](value=iperf_build.binary_version),
+            "source_identity":Evidence[str](value=iperf_build.source_reference)})
+        records.extend(materialize_build_identity_artifacts(child_root,deployment_id,builds))
+        if receiver_source_rows:
+            materialize("iperf3_server_error",None,
+                b"".join(b"CNB_ACQ_V1 "+json.dumps(row,separators=(",",":")).encode()+b"\n" for row in receiver_source_rows))
+        from cloud_network_benchmark.acquisition import bind_acquisition_sources
+        receiver_command=commands[-1]
+        sources=bind_acquisition_sources(child_root=child_root,run_identity=identity,commands=commands,
+            receiver_command_evidence=[receiver_command],build_evidence=builds,source_artifact_records=records)
+        if not sources:
+            raise AssertionError("materialized fixture acquisition sources did not bind")
+        for index,timing in enumerate(timings):
+            matching=[]
+            for source in sources:
+                if source.tool=="sockperf" and source.log_path.endswith(f"{timing.unit_id}/sockperf-acquisition.stderr"):
+                    matching.append(source)
+                elif source.tool=="iperf3" and source.native_artifact_ids[0]==f"{timing.unit_id}-iperf3":
+                    matching.append(source)
+            if matching:
+                updated=timing.model_copy(update={"acquisition_sources":Evidence[list](value=matching)})
+                timings[index]=updated
+                timing_record=next(r for r in records if r.artifact_id==f"{timing.unit_id}-timing")
+                raw=updated.model_dump_json().encode()
+                target=child_root/timing_record.path
+                target.write_bytes(raw)
+                records[records.index(timing_record)]=timing_record.model_copy(update={
+                    "size_bytes":Evidence[int](value=len(raw)),"sha256":StringEvidence(value=hashlib.sha256(raw).hexdigest())})
+        # The clock records above use the same monotonic epoch as the frozen UTC mappings.
     for unit in units:
         if unit.kind!="probe_chunk":
             materialize(f"{unit.unit_id}-commands",unit.unit_id,json.dumps(
@@ -346,11 +449,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         "schedule_snapshot_path":Evidence[str](value="schedule.csv"),"diagnostics":diagnostics})
     before={record.path:hashlib.sha256((child_root/record.path).read_bytes()).hexdigest() for record in records}
     result=validate_bundle(complete,evaluated_at=NOW)
-    # Current F01R materialized evidence has no source-bound active-probe
-    # acquisition intervals, so native invocation/runtime and RTT point spans
-    # cannot yield a complete validity claim.
-    expected_validity="partial"
-    assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.message) for item in result.findings[:35]]
+    expected_validity="partial" if value.mode=="diagnostic_day" or (value.mode=="short_study" and not frozen_n) else "valid"
+    assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.artifact_id,item.message) for item in result.findings]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     assert "EXP-001" in summarize_validation(result)
     assert validate_bundle(complete,evaluated_at=NOW).model_dump(mode="json")==result.model_dump(mode="json")
@@ -383,8 +483,9 @@ def test_three_provider_materialized_calibrations_recommend_from_saved_bundles(r
             for record in bundle.artifact_records)
         results.append(result)
     recommendation=select_common_n(results)
-    assert recommendation.common_n.value is None
-    assert recommendation.unavailable_reason
+    assert recommendation.common_n.value == 2
+    assert recommendation.plateau_found.value is True
+    assert recommendation.source_sha256.value
 
 
 def test_three_provider_short_study_replay_keeps_pending_common_n_ineligible(repository_root,
@@ -400,12 +501,14 @@ def test_three_provider_short_study_replay_keeps_pending_common_n_ineligible(rep
     paired=evaluate_comparison(bundles,results)
     assert set(paired)=={item.identity.run_id for item in bundles}
     assert all(item.validation_status.comparison_eligibility=="ineligible" for item in paired.values())
+    assert all(item.validation_status.data_validity=="partial" for item in results)
     reasons=[item.validation_status.comparison_reasons for item in paired.values()]
-    assert all("all compared data must be valid" in item and "execution or cleanup is incomplete" in item for item in reasons)
+    assert all("all compared data must be valid" in item and "execution or cleanup is incomplete" in item
+        for item in reasons)
     assert all(item.metrics.value["common_n"]["state"]=="pending" for item in results)
 
 
-def test_three_provider_short_study_with_prior_calibration_remains_ineligible_without_acquisition_windows(repository_root,
+def test_three_provider_short_study_with_prior_calibration_is_valid_and_comparable(repository_root,
         tmp_path,frozen_clock,deterministic_token,fake_git_commits,request):
     bundles,results=[],[]
     for provider in ("aws","azure","gcp"):
@@ -413,12 +516,10 @@ def test_three_provider_short_study_with_prior_calibration_remains_ineligible_wi
             deterministic_token,fake_git_commits,request,provider=provider,frozen_n=True,shared_slot=True)
         bundles.append(bundle)
         results.append(result)
-    assert all(result.validation_status.data_validity=="partial" for result in results)
+    assert all(result.validation_status.data_validity=="valid" for result in results)
     assert all(result.metrics.value["common_n"]["source_campaign_id"]=="prior-calibration-campaign" for result in results)
     paired=evaluate_comparison(bundles,results)
-    assert all(item.validation_status.comparison_eligibility=="ineligible" for item in paired.values())
-    assert all(any("all compared data must be valid" in reason for reason in item.validation_status.comparison_reasons)
-        for item in paired.values())
+    assert all(item.validation_status.comparison_eligibility=="eligible" for item in paired.values())
 
 
 def test_diagnostic_day_materialized_bundle_replays_all_native_chunks(repository_root, tmp_path,
