@@ -119,6 +119,11 @@
           "title": "Day Iperf3 Client",
           "type": "string"
         },
+        "day_iperf3_observation": {
+          "default": "measurements/day/iperf3-acquisition.stderr",
+          "title": "Day Iperf3 Observation",
+          "type": "string"
+        },
         "day_probe_csv_template": {
           "default": "measurements/day/probes/{chunk_id}.csv",
           "title": "Day Probe Csv Template",
@@ -127,6 +132,11 @@
         "day_probe_log_template": {
           "default": "measurements/day/probes/{chunk_id}.log",
           "title": "Day Probe Log Template",
+          "type": "string"
+        },
+        "day_probe_observation_template": {
+          "default": "measurements/day/probes/{chunk_id}.acquisition.stderr",
+          "title": "Day Probe Observation Template",
           "type": "string"
         },
         "iperf3_server_error": {

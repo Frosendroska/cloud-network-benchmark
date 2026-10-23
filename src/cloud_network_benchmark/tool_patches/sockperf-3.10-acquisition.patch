@@ -1,0 +1,119 @@
+--- a/src/client.cpp
++++ b/src/client.cpp
+@@ -35,9 +35,60 @@
+ 
+ #include <math.h>
+ #include <map>
++#include <atomic>
++#include <time.h>
++#include <unistd.h>
+ 
+ TicksTime s_startTime, s_endTime;
+ 
++// CNB_ACQ_V1 observational state: fixed-size, no measured-path output or waits.
++static std::atomic<int64_t> cnb_sender_ns(0), cnb_receiver_ns(0);
++static std::atomic<int64_t> cnb_filter_start_ns(0), cnb_filter_end_ns(0);
++static volatile sig_atomic_t cnb_stop_signal = 0;
++static char cnb_invocation_id[193] = {0};
++static char cnb_boot_id[64] = {0};
++
++static int64_t cnb_monotonic_ns() {
++    TicksTime value;
++    value.setNowNonInline();
++    return value.toNsec();
++}
++
++static void cnb_observe_entry(std::atomic<int64_t> &slot) {
++    if (slot.load(std::memory_order_relaxed) == 0) {
++        int64_t now = cnb_monotonic_ns();
++        int64_t empty = 0;
++        slot.compare_exchange_strong(empty, now, std::memory_order_release, std::memory_order_relaxed);
++    }
++}
++
++static void cnb_prepare_observation() {
++    const char *id = getenv("CNB_ACQUISITION_ID");
++    if (!id || !*id || strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != strlen(id) || strlen(id) > 192) return;
++    snprintf(cnb_invocation_id, sizeof(cnb_invocation_id), "%s", id);
++    FILE *boot = fopen("/proc/sys/kernel/random/boot_id", "r");
++    if (!boot || !fgets(cnb_boot_id, sizeof(cnb_boot_id), boot)) { if (boot) fclose(boot); cnb_boot_id[0] = 0; return; }
++    fclose(boot);
++    cnb_boot_id[strcspn(cnb_boot_id, "\r\n")] = 0;
++    struct timespec before, realtime, after;
++    if (clock_gettime(CLOCK_MONOTONIC, &before) || clock_gettime(CLOCK_REALTIME, &realtime) || clock_gettime(CLOCK_MONOTONIC, &after)) return;
++    int64_t before_ns = (int64_t)before.tv_sec * 1000000000LL + before.tv_nsec;
++    int64_t realtime_ns = (int64_t)realtime.tv_sec * 1000000000LL + realtime.tv_nsec;
++    int64_t after_ns = (int64_t)after.tv_sec * 1000000000LL + after.tv_nsec;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"sockperf\",\"semantics_id\":\"sockperf-3.10-enabled-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"clock_anchor\",\"mono_before_ns\":%lld,\"realtime_ns\":%lld,\"mono_after_ns\":%lld}\n", cnb_invocation_id, (long)getpid(), cnb_boot_id, (long long)before_ns, (long long)realtime_ns, (long long)after_ns);
++    fflush(stderr);
++}
++
++static void cnb_emit_window() {
++    int64_t sender = cnb_sender_ns.load(std::memory_order_acquire);
++    int64_t receiver = cnb_receiver_ns.load(std::memory_order_acquire);
++    int64_t start = cnb_filter_start_ns.load(std::memory_order_acquire);
++    int64_t end = cnb_filter_end_ns.load(std::memory_order_acquire);
++    if (!cnb_invocation_id[0] || !cnb_boot_id[0] || cnb_stop_signal != SIGALRM || sender <= 0 || receiver <= 0 || start <= 0 || end <= 0 || end < start) return;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"sockperf\",\"semantics_id\":\"sockperf-3.10-enabled-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"probe_window\",\"sender_enabled_ns\":%lld,\"receiver_enabled_ns\":%lld,\"termination_ns\":%lld,\"native_filter_start_ns\":%lld,\"native_filter_end_ns\":%lld,\"termination_reason\":\"timer\"}\n", cnb_invocation_id, (long)getpid(), cnb_boot_id, (long long)sender, (long long)receiver, (long long)s_endTime.toNsec(), (long long)start, (long long)end);
++    fflush(stderr);
++}
++
+ //==============================================================================
+ //==============================================================================
+ 
+@@ -451,6 +502,10 @@
+         log_msg_file2(f, "Test end before test start. Ending statistics early");
+         return;
+     }
++    if (g_pApp->m_const_params.measurement == TIME_BASED && !g_pApp->m_const_params.pPlaybackVector && !g_pApp->m_const_params.b_client_ping_pong && !g_pApp->m_const_params.b_stream) {
++        cnb_filter_start_ns.store(testStart.toNsec(), std::memory_order_release);
++        cnb_filter_end_ns.store(testEnd.toNsec(), std::memory_order_release);
++    }
+ 
+     TicksDuration *pLat = new TicksDuration[SIZE];
+     RecordLog *pFullLog = g_pApp->m_const_params.fileFullLog ? new RecordLog[SIZE] : NULL;
+@@ -654,6 +709,7 @@
+         return;
+     }
+     s_endTime.setNowNonInline();
++    cnb_stop_signal = signum;
+     g_b_exit = true;
+ 
+     // Just in case not Activity updates where logged add a '\n'
+@@ -718,6 +774,7 @@
+           class SwitchCycleDuration, class SwitchMsgSize, class PongModeCare>
+ void Client<IoType, SwitchDataIntegrity, SwitchActivityInfo, SwitchCycleDuration, SwitchMsgSize,
+             PongModeCare>::client_receiver_thread() {
++    cnb_observe_entry(cnb_receiver_ns);
+     while (!g_b_exit) {
+         client_receive();
+     }
+@@ -787,6 +844,8 @@
+ 
+     if (g_pApp->m_const_params.fileFullLog) fclose(g_pApp->m_const_params.fileFullLog);
+ 
++    cnb_emit_window();
++
+     if (g_pApp->m_const_params.cycleDuration > TicksDuration::TICKS0 && !g_cycle_wait_loop_counter)
+         log_msg("Info: The requested message-per-second rate is too high. Try tuning --mps or "
+                 "--burst arguments");
+@@ -994,6 +1053,7 @@
+             if (rc == SOCKPERF_ERR_NONE) {
+                 if (!g_pApp->m_const_params.b_client_ping_pong &&
+                     !g_pApp->m_const_params.b_stream) { // latency_under_load
++                    cnb_prepare_observation();
+                     if (0 != os_thread_exec(&m_receiverTid, ::client_receiver_thread, this)) {
+                         log_err("Creating thread has failed");
+                         rc = SOCKPERF_ERR_FATAL;
+@@ -1103,8 +1163,10 @@
+ void Client<IoType, SwitchDataIntegrity, SwitchActivityInfo, SwitchCycleDuration, SwitchMsgSize,
+             PongModeCare>::doSendLoop() {
+     // cycle through all set fds in the array (with wrap around to beginning)
+-    for (int curr_fds = m_ioHandler.m_fd_min; !g_b_exit; curr_fds = g_fds_array[curr_fds]->next_fd)
++    cnb_observe_entry(cnb_sender_ns);
++    for (int curr_fds = m_ioHandler.m_fd_min; !g_b_exit; curr_fds = g_fds_array[curr_fds]->next_fd) {
+         client_send_burst(curr_fds);
++    }
+ }
+ 
+ //------------------------------------------------------------------------------

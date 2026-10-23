@@ -505,7 +505,9 @@ def test_production_adapter_preserves_monotonic_duration_on_kill_cancellation(
     handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     clock.value += 1.25
     clock.adjustment = timedelta(seconds=-3600)
-    result = runner.stop(handle, clock.value)
+    # Cancellation has completed its measured interval; give bounded cleanup
+    # workers a real shutdown budget to reap the killed process and drain pipes.
+    result = runner.stop(handle, clock.value + 1.0)
     assert handle.process.returncode == -9
     assert result.outcome == "interrupted"
     assert result.exit_code is None

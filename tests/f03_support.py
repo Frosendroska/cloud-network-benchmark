@@ -71,17 +71,18 @@ class FakeProcesses:
         self.stop_calls: list[object] = []
 
     def start(self, request, *, stdout_path: Path, stderr_path: Path):
+        executable = Path(request.argv[0]).name
         if request.action_id == self.start_failure:
             raise OSError("scripted process start failure")
         self.clock.value += self.start_delay
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout_path.open("xb").write((self.notification + "\n" if request.argv[0] == "sockperf" else "").encode())
+        stdout_path.open("xb").write((self.notification + "\n" if executable == "sockperf" else "").encode())
         stderr_path.open("xb").write(b"")
         if request.action_id == self.write_failure_action:
             raise OSError("scripted disk full while writing native evidence")
         seconds = int(request.argv[request.argv.index("-t") + 1])
-        if request.argv[0] == "sockperf":
+        if executable == "sockperf":
             native_csv = Path(request.argv[request.argv.index("--full-log") + 1])
             native_csv.parent.mkdir(parents=True, exist_ok=True)
             native_csv.open("xb").write(
@@ -91,18 +92,18 @@ class FakeProcesses:
                 b"------------------------------\n"
                 b"[Total Run] RunTime=%.3f sec; Warm up time=400 msec; SentMessages=100; ReceivedMessages=99\n" % seconds
                 + b"[Valid Duration] RunTime=%.3f sec; SentMessages=100; ReceivedMessages=99\n" % max(0, seconds - 0.45))
-        receiver_seconds = seconds - 0.01 if self.receiver_short and request.argv[0] == "iperf3" and seconds > 10 else seconds
-        duration = seconds if request.argv[0] == "sockperf" else receiver_seconds + 5
+        receiver_seconds = seconds - 0.01 if self.receiver_short and executable == "iperf3" and seconds > 10 else seconds
+        duration = seconds if executable == "sockperf" else receiver_seconds + 5
         if request.action_id == self.early_exit_action:
             duration = min(duration, 2.0)
-            if request.argv[0] == "iperf3":
+            if executable == "iperf3":
                 receiver_seconds = 0.0
         if request.action_id == self.hang_action:
             duration = float("inf")
         handle = FakeHandle(request, self.clock.monotonic(), self.clock.utc_now(), self.clock.monotonic() + duration,
                             stdout_path=stdout_path, stderr_path=stderr_path)
         self.handles.append(handle)
-        if request.argv[0] == "sockperf":
+        if executable == "sockperf":
             chunks = [self.notification]
             if self.split_notification:
                 chunks = [self.notification[:8], self.notification[8:]]

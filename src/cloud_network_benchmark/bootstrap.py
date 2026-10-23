@@ -2,19 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import base64
 import math
 import re
 import shlex
 import time
 from typing import Callable, Dict, List, Literal, Optional
 from urllib.parse import urlparse
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from pydantic import Field, field_validator, model_validator
 
 from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
 from .contracts.common import CommandOutcome, IdentityContext, StrictModel
 from .contracts.execution import CommandRequest, CommandRunner
+from .contracts.artifacts import ArtifactRecord
+from .contracts.common import Evidence, StringEvidence, VmRole
 
 
 def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
@@ -47,6 +50,9 @@ class SourceBuild(StrictModel):
     source_reference: str = Field(min_length=1)
     archive_name: str = Field(min_length=1)
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_patch_path: str | None = None
+    observation_patch_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    upstream_commit: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
 
     @model_validator(mode="after")
     def safe_source(self):
@@ -56,6 +62,38 @@ class SourceBuild(StrictModel):
         for name, value in (("source_reference", self.source_reference), ("archive_name", self.archive_name)):
             if value.startswith("-") or "/" in value or "\\" in value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", value):
                 raise ValueError(f"{name} must be a safe identifier or basename")
+        if (self.observation_patch_path is None) != (self.observation_patch_sha256 is None):
+            raise ValueError("observation patch path and digest must be supplied together")
+        if self.observation_patch_path is not None and (
+            self.observation_patch_path.startswith("/") or ".." in PurePosixPath(self.observation_patch_path).parts
+            or "\\" in self.observation_patch_path
+        ):
+            raise ValueError("observation patch path must be a safe package-relative path")
+        pinned = {
+            "5ebd327da983225321818c0355db922515e026bd": (
+                "tool_patches/sockperf-3.10-acquisition.patch",
+                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
+            "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
+                "tool_patches/iperf-3.17.1-acquisition.patch",
+                "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661",
+                "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe", "iperf-"),
+        }
+        expected_prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
+        pinned_reference = next((commit for commit, values in pinned.items()
+                                 if values[3] == expected_prefix and self.source_reference == values[3] + commit), None)
+        if pinned_reference is not None and self.upstream_commit != pinned_reference:
+            raise ValueError("pinned source reference requires its exact observation source identity")
+        if self.upstream_commit in pinned:
+            expected_path, expected_digest, expected_source_digest, prefix = pinned[self.upstream_commit]
+            if self.observation_patch_path != expected_path or self.observation_patch_sha256 != expected_digest:
+                raise ValueError("pinned upstream source requires its exact packaged observation patch identity")
+            if self.source_reference != prefix + self.upstream_commit:
+                raise ValueError("pinned source archive extraction directory does not match its upstream commit")
+            if self.source_sha256 != expected_source_digest:
+                raise ValueError("pinned upstream source requires the official archive digest")
+        elif self.observation_patch_path is not None:
+            raise ValueError("observation patching is supported only for the pinned upstream commits")
         return self
 
 
@@ -93,6 +131,14 @@ class BuildObservation(StrictModel):
     binary_version: str
     binary_sha256: str
     capabilities: List[str]
+    artifact_id: str | None = None
+    upstream_commit: str | None = None
+    patch_path: str | None = None
+    patch_sha256: str | None = None
+    build_configuration: str | None = None
+    observation_capability: str | None = None
+    observation_semantics: str | None = None
+    identity_bytes: str | None = None
 
     @model_validator(mode="after")
     def complete_observation(self):
@@ -102,7 +148,44 @@ class BuildObservation(StrictModel):
             raise ValueError("source and binary observations require lowercase SHA-256")
         if not set(_required_capabilities(self.tool)) <= set(self.capabilities):
             raise ValueError("build observation is missing required capability evidence")
+        observed_fields = (self.upstream_commit, self.patch_path, self.patch_sha256,
+                           self.build_configuration, self.observation_capability, self.observation_semantics)
+        if any(value is not None for value in observed_fields) and not all(value is not None for value in observed_fields):
+            raise ValueError("observation build identity must be complete or unavailable")
+        if self.observation_capability is not None:
+            expected = "sockperf-3.10-enabled-v1" if self.tool == "sockperf" else "iperf-3.17.1-stats-v1"
+            if self.observation_capability != "CNB_ACQ_V1" or self.observation_semantics != expected:
+                raise ValueError("observation build capability does not match tool semantics")
+            if not re.fullmatch(r"[a-f0-9]{40}", self.upstream_commit or "") or not re.fullmatch(r"[a-f0-9]{64}", self.patch_sha256 or ""):
+                raise ValueError("observation build requires pinned upstream commit and patch digest")
+            if not self.identity_bytes:
+                raise ValueError("observation build requires captured original build identity sidecar bytes")
         return self
+
+
+def materialize_build_identity_artifacts(root: Path, deployment_id: str,
+        builds: List[BuildObservation] | tuple[BuildObservation, ...]) -> tuple[ArtifactRecord, ...]:
+    """Persist exact remote sidecar bytes captured by the bootstrap command."""
+    records: list[ArtifactRecord] = []
+    for build in builds:
+        if build.identity_bytes is None or build.artifact_id is None:
+            continue
+        raw = build.identity_bytes.encode("utf-8")
+        path = f"metadata/build/{build.role}-{build.tool}.identity"
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() != raw:
+            raise ValueError("build identity sidecar conflicts with existing attempt evidence")
+        if not target.exists():
+            target.write_bytes(raw)
+        role = VmRole(build.role)
+        record = ArtifactRecord(artifact_id=build.artifact_id, path=path, kind="build-identity",
+            producer=role, unit_id=None, deployment_id=deployment_id, closed=True,
+            size_bytes=Evidence[int](value=len(raw)), sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()),
+            retrieval_state="verified")
+        record.verify_materialized_file(root)
+        records.append(record)
+    return tuple(records)
 
 
 class ListenerObservation(StrictModel):
@@ -148,6 +231,15 @@ def _required_capabilities(tool: str) -> List[str]:
     return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "cubic", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
 
 
+def _build_config_prelude(config: BootstrapConfig) -> str:
+    spec = shlex.quote(f"./configure --prefix={config.install_prefix}; make -j2")
+    # Command substitution removes the terminal newline but retains the complete
+    # multiline version banner used by BuildObservation and the sidecar.
+    return ("compiler=$(cc --version) || exit 42; "
+            f"cfg=$(printf '%s\\n' \"${{CC:-cc}}\" \"$compiler\" {spec} | sha256sum) || exit 42; "
+            "set -- $cfg; config_sha=$1; ")
+
+
 def _capabilities_observed(text: str, tool: str, *, required: List[str] | None = None) -> bool:
     if not text.strip() or "usage" not in text.lower() or "error" in text.lower() or "unknown option" in text.lower():
         return False
@@ -155,7 +247,8 @@ def _capabilities_observed(text: str, tool: str, *, required: List[str] | None =
     return set(required if required is not None else _required_capabilities(tool)) <= tokens
 
 
-def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str) -> bool:
+def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str,
+                  observation_id: str | None = None) -> bool:
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     match = re.search(r"argv\[\]=(.*?);", fields.get("ExecStart", ""))
     if not match:
@@ -171,7 +264,8 @@ def _unit_matches(text: str, config_text: str, tool: str, address: str, port: in
             and argv == expected and fields.get("Restart") == "no"
             and fields.get("StandardOutput") == "append"
             and fields.get("StandardError") == "append"
-            and _unit_log_destinations_match(config_text, stdout_path, stderr_path))
+            and _unit_log_destinations_match(config_text, stdout_path, stderr_path)
+            and (observation_id is None or _unit_environment_matches(text, config_text, observation_id)))
 
 
 def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
@@ -192,6 +286,20 @@ def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) 
             # subsequent effective value must still be explicit and exact.
             effective[key] = value or None
     return effective == {"StandardOutput": f"append:{stdout_path}", "StandardError": f"append:{stderr_path}"}
+
+
+def _unit_environment_matches(show_text: str, config_text: str, observation_id: str) -> bool:
+    expected = f"CNB_ACQUISITION_ID={observation_id}"
+    fields = dict(line.split("=", 1) for line in show_text.splitlines() if "=" in line)
+    effective = None
+    section = None
+    for raw in config_text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Service" and line.startswith("Environment="):
+            effective = line.split("=", 1)[1]
+    return expected in fields.get("Environment", "") and effective == expected
 
 
 def _process_identity_command(unit: str, binary: str) -> list[str]:
@@ -247,11 +355,28 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
     marker_q, binary_q = shlex.quote(marker), shlex.quote(binary)
     ref_q, digest_q = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
     build = "./autogen.sh && " if source.tool == "sockperf" else ""
-    build_script = (f"if [ -f {marker_q} ]; then IFS=' ' read -r old_ref old_sha old_bin < {marker_q}; "
+    patch_clause = ""
+    cache_patch = "legacy"
+    if source.observation_patch_path is not None:
+        patch_path = Path(__file__).parent / source.observation_patch_path
+        patch_bytes = patch_path.read_bytes()
+        patch_digest = hashlib.sha256(patch_bytes).hexdigest()
+        if patch_digest != source.observation_patch_sha256:
+            raise ValueError("packaged observation patch digest does not match requested identity")
+        patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+        encoded = base64.b64encode(patch_bytes).decode("ascii")
+        patch_clause = (f"printf '%s' {shlex.quote(encoded)} | base64 -d > {patch_q} && "
+                        f"printf '%s  %s\\n' {shlex.quote(patch_digest)} {patch_q} | sha256sum -c - && "
+                        f"cd {source_dir_q} && patch --batch --fuzz=0 -p1 < {patch_q} && ")
+        cache_patch = patch_digest
+    patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+    cache_q = shlex.quote(cache_patch)
+    build_script = (_build_config_prelude(config) +
+                    f"if [ -f {marker_q} ]; then IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker_q}; "
                     f"current=$(sha256sum {binary_q}) || exit 42; set -- $current; "
-                    f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
-                    f"[ ! -e {binary_q} ] || exit 43; cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
-                    f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s\\n' {ref_q} {digest_q} \"$1\" > {marker_q}")
+                    f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_patch\" = {cache_q} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
+                    f"[ ! -e {binary_q} ] || exit 43; {patch_clause}cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
+                    f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s %s %s\\n' {ref_q} {digest_q} {cache_q} \"$config_sha\" \"$1\" > {marker_q}")
     commands = [
         ["sudo", "apt-get", "install", "-y", *config.bootstrap_packages],
         ["curl", "--fail", "--location", "--silent", "--show-error", "--output", archive, source.source_url],
@@ -266,6 +391,32 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
     if source.tool == "sockperf":
         commands.extend([[f"{prefix}/bin/sockperf", "server", "--help"],
                          [f"{prefix}/bin/sockperf", "under-load", "--help"]])
+    if source.observation_patch_path is not None:
+        commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {binary_q} >/dev/null && printf CNB_ACQ_V1"])
+        identity_plain = f"{prefix}/.f02r-{source.tool}.build-identity"
+        identity_path = shlex.quote(identity_plain)
+        identity_tmp = identity_plain + ".$$.tmp"
+        # Keep this description byte-for-byte aligned with BuildObservation's
+        # captured config; shell-expand only the observed compiler version.
+        build_config_prefix = "CC=${CC:-cc}; compiler="
+        build_config_suffix = f"; ./configure --prefix={prefix}; make -j2"
+        config_prelude = _build_config_prelude(config)
+        identity_script = (config_prelude +
+            f"binary_version=$(\"{binary}\" --version) || exit 42; "
+            f"binary_hash=$(sha256sum {binary_q}) || exit 42; set -- $binary_hash; binary_sha=$1; "
+            "compiler_b64=$(printf '%s' \"$compiler\" | base64 -w0) || exit 42; "
+            "version_b64=$(printf '%s' \"$binary_version\" | base64 -w0) || exit 42; "
+            f"config_b64=$(printf '%s%s%s' {shlex.quote(build_config_prefix)} \"$compiler\" {shlex.quote(build_config_suffix)} | base64 -w0) || exit 42; "
+            f"printf '%s\\n' 'CNB_BUILD_V1' 'tool={source.tool}' 'source_reference={source.source_reference}' "
+            f"'source_sha256={source.source_sha256}' 'upstream_commit={source.upstream_commit or ''}' "
+            f"'patch_path={source.observation_patch_path}' 'patch_sha256={source.observation_patch_sha256}' "
+            "\"compiler_version_b64=$compiler_b64\" \"build_configuration_b64=$config_b64\" "
+            f"'binary_path={binary}' \"binary_version_b64=$version_b64\" \"binary_sha256=$binary_sha\" "
+            f"'observation_capability=CNB_ACQ_V1' 'observation_semantics={'sockperf-3.10-enabled-v1' if source.tool == 'sockperf' else 'iperf-3.17.1-stats-v1'}' "
+            f"'capabilities={','.join(_required_capabilities(source.tool))}' > {identity_tmp} && "
+            f"if [ -f {identity_path} ]; then cmp -s {identity_tmp} {identity_path} || exit 43; rm {identity_tmp}; "
+            f"else mv {identity_tmp} {identity_path}; fi && cat {identity_path}")
+        commands.append(["sh", "-c", identity_script])
     return commands
 
 
@@ -273,9 +424,11 @@ def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> 
     binary = shlex.quote(f"{config.install_prefix}/bin/{source.tool}")
     marker = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.identity")
     reference, digest = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
-    return (f"if [ ! -e {marker} ]; then [ ! -e {binary} ] || exit 43; printf 'missing\\n'; exit 0; fi; "
-            f"IFS=' ' read -r old_ref old_sha old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
-            f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
+    patch_digest = shlex.quote(source.observation_patch_sha256 or "legacy")
+    return (_build_config_prelude(config) +
+            f"if [ ! -e {marker} ]; then [ ! -e {binary} ] || exit 43; printf 'missing\\n'; exit 0; fi; "
+            f"IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
+            f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_patch\" = {patch_digest} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
 
 
 def _sha256sum_output(text: str, expected_path: str) -> str | None:
@@ -286,6 +439,40 @@ def _sha256sum_output(text: str, expected_path: str) -> str | None:
     return match.group(1) if match and match.group(2) == expected_path else None
 
 
+def _parse_build_identity(text: str, source: SourceBuild) -> dict[str, str]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "CNB_BUILD_V1":
+        raise ValueError("remote build identity sidecar is missing its format marker")
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep or key in fields:
+            raise ValueError("remote build identity sidecar has malformed or duplicate fields")
+        fields[key] = value
+    required = {"tool", "source_reference", "source_sha256", "upstream_commit", "patch_path",
+        "patch_sha256", "compiler_version_b64", "build_configuration_b64", "binary_path",
+        "binary_version_b64", "binary_sha256", "observation_capability", "observation_semantics", "capabilities"}
+    if fields.keys() != required:
+        raise ValueError("remote build identity sidecar fields are incomplete or unexpected")
+    for key, expected in (("tool", source.tool), ("source_reference", source.source_reference),
+            ("source_sha256", source.source_sha256), ("upstream_commit", source.upstream_commit or ""),
+            ("patch_path", source.observation_patch_path or ""),
+            ("patch_sha256", source.observation_patch_sha256 or ""),
+            ("observation_capability", "CNB_ACQ_V1")):
+        if fields[key] != expected:
+            raise ValueError(f"remote build identity sidecar {key} does not match requested build")
+    for key in ("compiler_version_b64", "build_configuration_b64", "binary_version_b64"):
+        try:
+            fields[key + "_decoded"] = base64.b64decode(fields[key], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"remote build identity sidecar {key} is invalid") from exc
+    if not re.fullmatch(r"/[^\n]+/bin/" + re.escape(source.tool), fields["binary_path"]):
+        raise ValueError("remote build identity sidecar executable path is invalid")
+    if not re.fullmatch(r"[a-f0-9]{64}", fields["binary_sha256"]):
+        raise ValueError("remote build identity sidecar binary digest is invalid")
+    return fields
+
+
 def _compiler_identity_observed(text: str) -> bool:
     value = text.strip()
     if not value or re.search(r"(?i)\b(error|not found|unknown option)\b", value):
@@ -293,6 +480,11 @@ def _compiler_identity_observed(text: str) -> bool:
     identified = re.search(r"(?im)^(?:gcc|g\+\+|clang|Apple clang|cc\s*\()", value) is not None
     versioned = re.search(r"\b\d+(?:\.\d+){1,3}\b", value) is not None
     return identified and versioned
+
+
+def _canonical_version_text(text: str) -> str:
+    """Use the complete banner, removing only command-output framing whitespace."""
+    return text.strip()
 
 
 def _sha256sum_output(text: str, expected_path: str) -> str | None:
@@ -350,7 +542,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
                 observed = _execute(runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
                 if observed.outcome == CommandOutcome.SUCCEEDED:
@@ -362,7 +554,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
                         cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if (cat_result.outcome != CommandOutcome.SUCCEEDED or
-                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}")):
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
@@ -391,6 +584,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             recipe = _recipe(source, config)
             evidence: Dict[str, str] = {}
             capability_outputs: list[str] = []
+            identity_text: str | None = None
             for index, argv in enumerate(recipe):
                 if not _identity_references_available(vm):
                     failed_request, failed_result = _request_failure(f"f02r-{role}-{source.tool}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
@@ -417,18 +611,43 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         return _failure_result(connection, actions, vm, req, result, "source_digest_mismatch", f"{source.tool} source archive digest did not match", builds, listeners)
                     evidence["source_sha256"] = observed_hash
                 elif index == 5:
-                    if not _compiler_identity_observed(text):
+                    version_text = _canonical_version_text(text)
+                    if not _compiler_identity_observed(version_text):
                         return _failure_result(connection, actions, vm, req, result, "compiler_identity_missing", "compiler version was not observed", builds, listeners)
-                    evidence["compiler_version"] = text
+                    evidence["compiler_version"] = version_text
                 elif index == 6:
-                    if source.tool not in text.lower():
+                    version_text = _canonical_version_text(text)
+                    if source.tool == "sockperf":
+                        # Pinned Sockperf 3.10 prints "sockperf, version 3.10";
+                        # keep the older explicit "sockperf version" form for
+                        # unpatched builds while rejecting unrelated comma text.
+                        displayed = re.search(
+                            r"(?im)^\s*sockperf(?:,\s+version|\s+version)\s+\d+(?:\.\d+){1,3}(?:\s|$)",
+                            version_text)
+                    else:
+                        displayed = re.search(r"(?im)^\s*iperf3?(?:\s|:|$)", version_text)
+                    if displayed is None:
                         return _failure_result(connection, actions, vm, req, result, "binary_version_missing", f"{source.tool} binary version was not observed", builds, listeners)
-                    evidence["binary_version"] = text
+                    evidence["binary_version"] = version_text
                 elif index == 7:
                     observed_hash = _sha256sum_output(text, f"{config.install_prefix}/bin/{source.tool}")
                     if not observed_hash:
                         return _failure_result(connection, actions, vm, req, result, "binary_hash_missing", f"{source.tool} binary hash was not observed", builds, listeners)
                     evidence["binary_sha256"] = observed_hash
+                elif source.observation_patch_path is not None and index == len(recipe) - 2:
+                    if text != "CNB_ACQ_V1":
+                        return _failure_result(connection, actions, vm, req, result, "observation_capability_missing", f"{source.tool} installed binary lacks CNB_ACQ_V1 capability", builds, listeners)
+                    evidence["observation_capability"] = text
+                elif source.observation_patch_path is not None and index == len(recipe) - 1:
+                    try:
+                        identity = _parse_build_identity(result.stdout, source)
+                    except ValueError as exc:
+                        return _failure_result(connection, actions, vm, req, result, "build_identity_invalid", str(exc), builds, listeners)
+                    if (identity["binary_sha256"] != evidence.get("binary_sha256")
+                            or _canonical_version_text(identity["binary_version_b64_decoded"]) != evidence.get("binary_version")
+                            or _canonical_version_text(identity["compiler_version_b64_decoded"]) != evidence.get("compiler_version")):
+                        return _failure_result(connection, actions, vm, req, result, "build_identity_mismatch", "build identity sidecar does not match the observed compiler or installed executable", builds, listeners)
+                    identity_text = result.stdout
                 elif index >= 8:
                     if source.tool == "sockperf":
                         required = (["server", "-i", "-p"] if index == 9 else
@@ -443,7 +662,15 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             builds.append(BuildObservation(role=role, tool=source.tool, source_reference=source.source_reference,
                                            source_sha256=evidence["source_sha256"], compiler_version=evidence["compiler_version"],
                                            binary_path=binary_path, binary_version=evidence["binary_version"], binary_sha256=evidence["binary_sha256"],
-                                           capabilities=_required_capabilities(source.tool)))
+                                           capabilities=_required_capabilities(source.tool),
+                                           artifact_id=f"f02r-{role}-{source.tool}-build",
+                                           upstream_commit=source.upstream_commit,
+                                           patch_path=source.observation_patch_path,
+                                           patch_sha256=source.observation_patch_sha256,
+                                           build_configuration=(f"CC=${{CC:-cc}}; compiler={evidence['compiler_version']}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
+                                           observation_capability=evidence.get("observation_capability"),
+                                           observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None,
+                                           identity_bytes=identity_text))
         if role == "vm_b":
             # Establish the private-only ingress chain before starting either listener.
             chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
@@ -486,7 +713,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, remaining))
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
                 inspect_result = _execute(runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
                 if inspect_result.outcome == CommandOutcome.SUCCEEDED:
@@ -500,7 +727,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                         cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}"):
+                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
                         proc_id = f"f02r-vm_b-listener-process-{tool}"
                         proc_remaining = deadline.remaining(clock, readiness=True)
@@ -529,7 +757,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
                 if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
-                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs, *server_argv]
+                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs]
+                if tool == "iperf3" and sources[tool].observation_patch_path:
+                    command.append("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
+                command.extend(server_argv)
                 aid = f"f02r-vm_b-listener-{tool}"
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
@@ -543,7 +774,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 verify_remaining = deadline.remaining(clock, readiness=True)
                 if verify_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener identity verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart"], min(connection.timeouts.server_seconds, verify_remaining))
+                verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, verify_remaining))
                 verify_result = _execute(runner, verify_request)
                 actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
                 cat_remaining = deadline.remaining(clock, readiness=True)
@@ -552,7 +783,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                 cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                 if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
-                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs)):
+                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
+                            "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                     return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
                 proc_id = f"f02r-vm_b-listener-process-{tool}"
                 proc_remaining = deadline.remaining(clock, readiness=True)
