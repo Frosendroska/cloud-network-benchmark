@@ -9,6 +9,138 @@ from cloud_network_benchmark.measurement import (
 )
 
 
+def test_acquisition_coverage_uses_inner_probe_support_and_outer_receiver_bounds():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    receiver = SourceWindow("receiver_measured", "iperf3", "vm_a", "12345678-1234-1234-1234-123456789abc",
+        "CLOCK_MONOTONIC", "cookie", "stream", 0, 0, 1000, 1000, False, 0, 1)
+    exact = SourceWindow("probe_enabled", "sockperf", "vm_a", receiver.boot_id,
+        "CLOCK_MONOTONIC", None, None, 0, 0, 990, 990, None, 0, 1)
+    straddling = SourceWindow("probe_enabled", "sockperf", "vm_a", receiver.boot_id,
+        "CLOCK_MONOTONIC", None, None, 0, 0, 989, 989, None, 0, 1)
+    assert overlap_coverage_lower_bound([exact], [receiver]) == 0.99
+    assert overlap_coverage_lower_bound([straddling], [receiver]) < 0.99
+    different = SourceWindow("receiver_measured", "iperf3", "vm_a", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "CLOCK_MONOTONIC", "cookie", "stream", 0, 0, 1000, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([exact], [different]) is None
+
+
+def test_acquisition_coverage_keeps_missing_receiver_intervals_in_denominator():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    boot = "12345678-1234-1234-1234-123456789abc"
+    receiver = [
+        SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+            "cookie", "stream", 0, 0, 40, 40, False, 0, 1),
+        SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+            "cookie", "stream", 60, 60, 100, 100, False, 0, 1),
+    ]
+    probes = [
+        SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+            None, None, 0, 0, 40, 40, None, 0, 1),
+        SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+            None, None, 60, 60, 100, 100, None, 0, 1),
+    ]
+    # 80ns of observed receiver support over the continuous 100ns outer envelope.
+    assert overlap_coverage_lower_bound(probes, receiver) == pytest.approx(0.8)
+
+
+def test_acquisition_coverage_intersects_probe_with_receiver_inner_support_and_gaps():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    boot = "12345678-1234-1234-1234-123456789abc"
+    probe = SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+        None, None, 0, 0, 1000, 1000, None, 0, 1)
+    # Endpoint uncertainty leaves only [100,900] guaranteed receiver support.
+    uncertain = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream", 0, 100, 900, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [uncertain]) == pytest.approx(0.8)
+
+    # Known receiver gaps are not covered merely because the probe spans them.
+    first = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream-1", 0, 0, 100, 100, False, 0, 1)
+    second = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream-1", 900, 900, 1000, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [first, second]) == pytest.approx(0.2)
+
+    # Overlapping streams count once; an omitted stream adds neither support nor duration.
+    from dataclasses import replace
+    duplicate = replace(second, stream_id="stream-2")
+    assert overlap_coverage_lower_bound([probe], [first, second, duplicate]) == pytest.approx(0.2)
+
+
+def test_cross_vm_and_utc_step_source_windows_stay_unknown_without_transform():
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    from cloud_network_benchmark.contracts import ClockMapping, Evidence, StringEvidence
+    from cloud_network_benchmark.diagnostics import alignment_eligibility
+
+    boot_a = "12345678-1234-1234-1234-123456789abc"
+    boot_b = "12345678-1234-1234-1234-123456789def"
+    probe = SourceWindow("probe_enabled", "sockperf", "vm_a", boot_a, "CLOCK_MONOTONIC",
+        None, None, 1_000_000_000, 1_000_000_000, 2_000_000_000, 2_000_000_000, None, 0, 1)
+    receiver = SourceWindow("receiver_measured", "iperf3", "vm_b", boot_b, "CLOCK_MONOTONIC",
+        "cookie", "stream", 3_601_000_000_000, 3_601_000_000_000,
+        3_602_000_000_000, 3_602_000_000_000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [receiver]) is None
+
+    # An hour step in wall-clock mapping is not converted into monotonic source
+    # support by an error estimate. Keep the source comparison unknown.
+    now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+    mapping_a = ClockMapping(vm_role="vm_a", monotonic_seconds=1,
+        utc_timestamp=now, estimated_error_ms=Evidence[float](value=1),
+        synchronization_source=StringEvidence(value="chrony synchronized"))
+    mapping_b = ClockMapping(vm_role="vm_b", monotonic_seconds=1,
+        utc_timestamp=now + timedelta(hours=1), estimated_error_ms=Evidence[float](value=1),
+        synchronization_source=StringEvidence(value="chrony synchronized"))
+    assert overlap_coverage_lower_bound([probe], [receiver]) is None
+    missing = ClockMapping(vm_role="vm_b", monotonic_seconds=1, utc_timestamp=now,
+        estimated_error_ms=Evidence[float](unavailable_reason="clock error unavailable"),
+        synchronization_source=StringEvidence(unavailable_reason="synchronization source unavailable"))
+    eligible, reasons = alignment_eligibility(mapping_a, missing)
+    assert not eligible and reasons
+    over_limit = mapping_b.model_copy(update={"estimated_error_ms": Evidence[float](value=100.001)})
+    eligible, reasons = alignment_eligibility(mapping_a, over_limit)
+    assert not eligible and any("100 ms" in reason for reason in reasons)
+
+
+def test_source_window_rejects_boolean_or_reversed_bounds_and_omitted_is_not_coverage():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    values = dict(kind="probe_enabled", tool="sockperf", producer="vm_a", boot_id="12345678-1234-1234-1234-123456789abc",
+        clock_domain="CLOCK_MONOTONIC", session_id=None, stream_id=None, start_earliest_ns=1,
+        start_latest_ns=1, end_earliest_ns=2, end_latest_ns=2, omitted=None, source_byte_offset=0, source_byte_length=1)
+    with pytest.raises(ValueError, match="integer"):
+        SourceWindow(**{**values, "start_earliest_ns": True})
+    with pytest.raises(ValueError, match="ordered"):
+        SourceWindow(**{**values, "start_earliest_ns": 3})
+    omitted = SourceWindow(**{**values, "kind": "receiver_measured", "tool": "iperf3", "session_id": "cookie", "stream_id": "s", "omitted": True})
+    assert not omitted.has_positive_inner_support
+
+
+def test_acquisition_coverage_memory_is_bounded_from_1000_to_100000_intervals():
+    import tracemalloc
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+
+    boot = "12345678-1234-1234-1234-123456789abc"
+
+    def windows(count, tool):
+        for index in range(count):
+            start = index * 2_000
+            yield SourceWindow("receiver_measured" if tool == "iperf3" else "probe_enabled", tool,
+                "vm_a", boot, "CLOCK_MONOTONIC", "session" if tool == "iperf3" else None,
+                "stream" if tool == "iperf3" else None, start, start, start + 1_000, start + 1_000,
+                False if tool == "iperf3" else None, index, 1)
+
+    tracemalloc.start()
+    small = overlap_coverage_lower_bound(windows(1_000, "sockperf"), windows(1_000, "iperf3"))
+    _small_current, small_peak = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    large = overlap_coverage_lower_bound(windows(100_000, "sockperf"), windows(100_000, "iperf3"))
+    _large_current, large_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert small > large > 0.5
+    assert small == pytest.approx(0.5, abs=0.0003)
+    assert large == pytest.approx(0.5, abs=0.00001)
+    assert small_peak < 250_000 and large_peak < 250_000
+
+
 def test_receiver_duration_uses_only_receiver_side_sum_received():
     assert receiver_duration(json.dumps({"end": {"sum_sent": {"seconds": 60}}})) is None
     assert receiver_duration(json.dumps({"server_output": {"end": {"sum_received": {"seconds": 60.0}}}})) == 60.0

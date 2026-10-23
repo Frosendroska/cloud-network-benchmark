@@ -19,6 +19,7 @@ class CommandRequest(StrictModel):
     cwd: str = Field(min_length=1)
     environment: Dict[str, str] = Field(default_factory=dict, exclude=True)
     environment_classification: Literal["none", "non_secret", "contains_secret_references"] = "none"
+    acquisition_invocation_id: Optional[str] = None
     timeout_seconds: float = Field(gt=0)
     stdin: Optional[str] = Field(default=None, exclude=True)
     redactions: List[str] = Field(default_factory=list, exclude=True)
@@ -26,6 +27,7 @@ class CommandRequest(StrictModel):
     def durable_view(self) -> Dict[str, object]:
         payload = self.model_dump()
         payload["environment_keys"] = sorted(self.environment)
+        payload["acquisition_invocation_id"] = self.acquisition_invocation_id
         payload["stdin_supplied"] = self.stdin is not None
         for secret in sorted((item for item in self.redactions if item), key=len, reverse=True):
             payload["argv"] = [item.replace(secret, "[REDACTED]") for item in payload["argv"]]

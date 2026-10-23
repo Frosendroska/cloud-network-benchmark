@@ -124,8 +124,10 @@ class ArtifactLayout(StrictModel):
     validation_result: str = "validation/result.json"
     validation_summary: str = "validation/summary.txt"
     day_iperf3_client: str = "measurements/day/iperf3-client.jsonl"
+    day_iperf3_observation: str = "measurements/day/iperf3-acquisition.stderr"
     day_probe_csv_template: str = "measurements/day/probes/{chunk_id}.csv"
     day_probe_log_template: str = "measurements/day/probes/{chunk_id}.log"
+    day_probe_observation_template: str = "measurements/day/probes/{chunk_id}.acquisition.stderr"
 
     @model_validator(mode="after")
     def safe_paths(self) -> "ArtifactLayout":
@@ -151,6 +153,8 @@ class ArtifactLayout(StrictModel):
             "stdout": f"{root}/stdout.log",
             "stderr": f"{root}/stderr.log",
             "iperf3": f"{root}/iperf3.json",
+            "sockperf-observation": f"{root}/sockperf-acquisition.stderr",
+            "iperf3-observation": f"{root}/iperf3-acquisition.stderr",
         }
 
     @classmethod
@@ -191,7 +195,7 @@ class ArtifactLayout(StrictModel):
             ("vm_b_diagnostics", self.vm_b_diagnostics, "diagnostics", VmRole.VM_B, ArtifactExpectation.REQUIRED),
             ("sockperf_server_log", self.sockperf_server_log, "sockperf-server-log", VmRole.VM_B, ArtifactExpectation.REQUIRED),
             ("iperf3_server_log", self.iperf3_server_log, "iperf3-server-jsonl", VmRole.VM_B, ArtifactExpectation.REQUIRED),
-            ("iperf3_server_error", self.iperf3_server_error, "iperf3-server-error", VmRole.VM_B, ArtifactExpectation.REQUIRED),
+            ("iperf3_server_error", self.iperf3_server_error, "iperf3-observation-stderr", VmRole.VM_B, ArtifactExpectation.REQUIRED),
             ("validation_result", self.validation_result, "validation_result", "controller", ArtifactExpectation.OPTIONAL),
             ("validation_summary", self.validation_summary, "validation_summary", "controller", ArtifactExpectation.OPTIONAL),
         ]
@@ -208,11 +212,13 @@ class ArtifactLayout(StrictModel):
             if mode != ExperimentMode.DIAGNOSTIC_DAY:
                 unit_files.update({
                     "sockperf": (paths["sockperf"], "sockperf-csv", VmRole.VM_A),
+                    "sockperf-observation": (paths["sockperf-observation"], "sockperf-observation-stderr", VmRole.VM_A),
                     "stdout": (paths["stdout"], "stdout", "controller"),
                     "stderr": (paths["stderr"], "stderr", "controller"),
                 })
                 if phase != "idle_latency":
                     unit_files["iperf3"] = (paths["iperf3"], "iperf3-json", VmRole.VM_A)
+                    unit_files["iperf3-observation"] = (paths["iperf3-observation"], "iperf3-observation-stderr", VmRole.VM_A)
             for artifact, (path, kind, producer) in unit_files.items():
                 declarations.append(ArtifactInput(artifact_id=f"{unit_id}-{artifact}", path=path, kind=kind,
                                                   producer=producer, unit_id=unit_id,
@@ -220,8 +226,10 @@ class ArtifactLayout(StrictModel):
         if mode == ExperimentMode.DIAGNOSTIC_DAY:
             declarations.extend([
                 ArtifactInput(artifact_id="day-iperf3-client", path=self.day_iperf3_client, kind="iperf3-client-jsonl", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
+                ArtifactInput(artifact_id="day-iperf3-observation", path=self.day_iperf3_observation, kind="iperf3-observation-stderr", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
                 ArtifactInput(artifact_id="day-probe-csv", path_template=self.day_probe_csv_template, kind="sockperf-csv", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
                 ArtifactInput(artifact_id="day-probe-log", path_template=self.day_probe_log_template, kind="sockperf-log", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
+                ArtifactInput(artifact_id="day-probe-observation", path_template=self.day_probe_observation_template, kind="sockperf-observation-stderr", producer=VmRole.VM_A, unit_id=None, expectation=ArtifactExpectation.REQUIRED),
             ])
         return declarations
 
