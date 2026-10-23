@@ -58,12 +58,13 @@ def test_iperf_receiver_intervals_are_session_bound_microsecond_intervals_and_ze
         rows = parse_observation_stream(stream)
         receiver = list(_iperf_windows((r for r in rows if r.value.get("cookie") == iperf.session_id
                                         and r.value["record_kind"] != "clock_anchor"), iperf))
-    assert len(receiver) == 1
-    window = receiver[0]
+    assert len(receiver) == 2
+    assert receiver[0].omitted is True
+    window = receiver[1]
     assert (window.start_earliest_ns, window.start_latest_ns) == (5_000_000_000, 5_000_001_000)
     assert (window.end_earliest_ns, window.end_latest_ns) == (6_000_000_000, 6_000_001_000)
     assert window.omitted is False and window.has_positive_inner_support
-    assert window.stream_id == "stream-1"
+    assert window.stream_id == "17"
 
 
 def test_receiver_stream_replay_keeps_memory_bounded_for_large_interval_logs():
@@ -77,12 +78,14 @@ def test_receiver_stream_replay_keeps_memory_bounded_for_large_interval_logs():
     common = {"format": 1, "tool": "iperf3", "semantics_id": source_ref.semantics_id,
         "invocation_id": source_ref.invocation_id, "pid": 51, "boot_id": source_ref.boot_id,
         "clock": source_ref.clock_domain, "cookie": source_ref.session_id}
-    payload = [b"ordinary server notice\n", (b"CNB_ACQ_V1 " + json.dumps({**common,
-        "record_kind": "stats_origin", "stream_id": "stream-1", "phase": "post_omit",
-        "origin_us": 0}).encode() + b"\n")]
+    settings = {**common, "record_kind": "session_settings", "protocol": "TCP", "num_streams": 1,
+        "omit": 5, "duration": 60, "interval_us": 1000000, "block_size": 131072, "reverse": False}
+    payload = [b"ordinary server notice\n", b"CNB_ACQ_V1 " + json.dumps(settings).encode() + b"\n", *[(b"CNB_ACQ_V1 " + json.dumps({**common,
+        "record_kind": "stats_origin", "stream_id": "1", "phase": phase,
+        "origin_us": 0, "start_time_fixed_us": 0}).encode() + b"\n") for phase in ("initial", "post_omit")]]
     count = 50_000
     for index in range(count):
-        value = {**common, "record_kind": "receiver_interval", "stream_id": "stream-1",
+        value = {**common, "record_kind": "receiver_interval", "stream_id": "1",
             "role": "receiver", "protocol": "tcp", "local_host": "10.0.0.2", "local_port": "5201",
             "remote_host": "10.0.0.1", "remote_port": "50100", "interval_start_us": index,
             "interval_end_us": index + 1, "bytes": 0, "omitted": False}
@@ -101,7 +104,7 @@ def test_receiver_stream_replay_keeps_memory_bounded_for_large_interval_logs():
 
 @pytest.mark.parametrize("patch,reason", [
     (lambda value: {**value, "cookie": "wrong-session"}, "session cookie"),
-    (lambda value: {**value, "interval_start_us": 4_000_000}, "precedes"),
+    (lambda value: {**value, "stream_id": "999"}, "initial statistic origin"),
     (lambda value: {**value, "role": "sender"}, "receiver evidence"),
 ])
 def test_iperf_receiver_record_mutations_are_rejected(patch, reason):

@@ -16,6 +16,8 @@ from pydantic import Field, field_validator, model_validator
 from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
 from .contracts.common import CommandOutcome, IdentityContext, StrictModel
 from .contracts.execution import CommandRequest, CommandRunner
+from .contracts.artifacts import ArtifactRecord
+from .contracts.common import Evidence, StringEvidence, VmRole
 
 
 def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
@@ -74,7 +76,7 @@ class SourceBuild(StrictModel):
                 "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
             "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
                 "tool_patches/iperf-3.17.1-acquisition.patch",
-                "2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df",
+                "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661",
                 "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe", "iperf-"),
         }
         expected_prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
@@ -136,6 +138,7 @@ class BuildObservation(StrictModel):
     build_configuration: str | None = None
     observation_capability: str | None = None
     observation_semantics: str | None = None
+    identity_bytes: str | None = None
 
     @model_validator(mode="after")
     def complete_observation(self):
@@ -155,7 +158,34 @@ class BuildObservation(StrictModel):
                 raise ValueError("observation build capability does not match tool semantics")
             if not re.fullmatch(r"[a-f0-9]{40}", self.upstream_commit or "") or not re.fullmatch(r"[a-f0-9]{64}", self.patch_sha256 or ""):
                 raise ValueError("observation build requires pinned upstream commit and patch digest")
+            if not self.identity_bytes:
+                raise ValueError("observation build requires captured original build identity sidecar bytes")
         return self
+
+
+def materialize_build_identity_artifacts(root: Path, deployment_id: str,
+        builds: List[BuildObservation] | tuple[BuildObservation, ...]) -> tuple[ArtifactRecord, ...]:
+    """Persist exact remote sidecar bytes captured by the bootstrap command."""
+    records: list[ArtifactRecord] = []
+    for build in builds:
+        if build.identity_bytes is None or build.artifact_id is None:
+            continue
+        raw = build.identity_bytes.encode("utf-8")
+        path = f"metadata/build/{build.role}-{build.tool}.identity"
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() != raw:
+            raise ValueError("build identity sidecar conflicts with existing attempt evidence")
+        if not target.exists():
+            target.write_bytes(raw)
+        role = VmRole(build.role)
+        record = ArtifactRecord(artifact_id=build.artifact_id, path=path, kind="build-identity",
+            producer=role, unit_id=None, deployment_id=deployment_id, closed=True,
+            size_bytes=Evidence[int](value=len(raw)), sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()),
+            retrieval_state="verified")
+        record.verify_materialized_file(root)
+        records.append(record)
+    return tuple(records)
 
 
 class ListenerObservation(StrictModel):
@@ -361,6 +391,30 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
                          [f"{prefix}/bin/sockperf", "under-load", "--help"]])
     if source.observation_patch_path is not None:
         commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {binary_q} >/dev/null && printf CNB_ACQ_V1"])
+        identity_plain = f"{prefix}/.f02r-{source.tool}.build-identity"
+        identity_path = shlex.quote(identity_plain)
+        identity_tmp = identity_plain + ".$$.tmp"
+        # Keep this description byte-for-byte aligned with BuildObservation's
+        # captured config; shell-expand only the observed compiler version.
+        build_config_prefix = "CC=${CC:-cc}; compiler="
+        build_config_suffix = f"; ./configure --prefix={prefix}; make -j2"
+        config_prelude = _build_config_prelude(config)
+        identity_script = (config_prelude +
+            f"binary_version=$(\"{binary}\" --version | head -n 1) || exit 42; "
+            f"binary_hash=$(sha256sum {binary_q}) || exit 42; set -- $binary_hash; binary_sha=$1; "
+            "compiler_b64=$(printf '%s' \"$compiler\" | base64 -w0) || exit 42; "
+            "version_b64=$(printf '%s' \"$binary_version\" | base64 -w0) || exit 42; "
+            f"config_b64=$(printf '%s%s%s' {shlex.quote(build_config_prefix)} \"$compiler\" {shlex.quote(build_config_suffix)} | base64 -w0) || exit 42; "
+            f"printf '%s\\n' 'CNB_BUILD_V1' 'tool={source.tool}' 'source_reference={source.source_reference}' "
+            f"'source_sha256={source.source_sha256}' 'upstream_commit={source.upstream_commit or ''}' "
+            f"'patch_path={source.observation_patch_path}' 'patch_sha256={source.observation_patch_sha256}' "
+            "\"compiler_version_b64=$compiler_b64\" \"build_configuration_b64=$config_b64\" "
+            f"'binary_path={binary}' \"binary_version_b64=$version_b64\" \"binary_sha256=$binary_sha\" "
+            f"'observation_capability=CNB_ACQ_V1' 'observation_semantics={'sockperf-3.10-enabled-v1' if source.tool == 'sockperf' else 'iperf-3.17.1-stats-v1'}' "
+            f"'capabilities={','.join(_required_capabilities(source.tool))}' > {identity_tmp} && "
+            f"if [ -f {identity_path} ]; then cmp -s {identity_tmp} {identity_path} || exit 43; rm {identity_tmp}; "
+            f"else mv {identity_tmp} {identity_path}; fi && cat {identity_path}")
+        commands.append(["sh", "-c", identity_script])
     return commands
 
 
@@ -381,6 +435,40 @@ def _sha256sum_output(text: str, expected_path: str) -> str | None:
         return None
     match = re.fullmatch(r"([a-f0-9]{64})\s+\*?(.+)", lines[0].strip())
     return match.group(1) if match and match.group(2) == expected_path else None
+
+
+def _parse_build_identity(text: str, source: SourceBuild) -> dict[str, str]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "CNB_BUILD_V1":
+        raise ValueError("remote build identity sidecar is missing its format marker")
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep or key in fields:
+            raise ValueError("remote build identity sidecar has malformed or duplicate fields")
+        fields[key] = value
+    required = {"tool", "source_reference", "source_sha256", "upstream_commit", "patch_path",
+        "patch_sha256", "compiler_version_b64", "build_configuration_b64", "binary_path",
+        "binary_version_b64", "binary_sha256", "observation_capability", "observation_semantics", "capabilities"}
+    if fields.keys() != required:
+        raise ValueError("remote build identity sidecar fields are incomplete or unexpected")
+    for key, expected in (("tool", source.tool), ("source_reference", source.source_reference),
+            ("source_sha256", source.source_sha256), ("upstream_commit", source.upstream_commit or ""),
+            ("patch_path", source.observation_patch_path or ""),
+            ("patch_sha256", source.observation_patch_sha256 or ""),
+            ("observation_capability", "CNB_ACQ_V1")):
+        if fields[key] != expected:
+            raise ValueError(f"remote build identity sidecar {key} does not match requested build")
+    for key in ("compiler_version_b64", "build_configuration_b64", "binary_version_b64"):
+        try:
+            fields[key + "_decoded"] = base64.b64decode(fields[key], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"remote build identity sidecar {key} is invalid") from exc
+    if not re.fullmatch(r"/[^\n]+/bin/" + re.escape(source.tool), fields["binary_path"]):
+        raise ValueError("remote build identity sidecar executable path is invalid")
+    if not re.fullmatch(r"[a-f0-9]{64}", fields["binary_sha256"]):
+        raise ValueError("remote build identity sidecar binary digest is invalid")
+    return fields
 
 
 def _compiler_identity_observed(text: str) -> bool:
@@ -489,6 +577,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             recipe = _recipe(source, config)
             evidence: Dict[str, str] = {}
             capability_outputs: list[str] = []
+            identity_text: str | None = None
             for index, argv in enumerate(recipe):
                 if not _identity_references_available(vm):
                     failed_request, failed_result = _request_failure(f"f02r-{role}-{source.tool}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
@@ -527,10 +616,20 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if not observed_hash:
                         return _failure_result(connection, actions, vm, req, result, "binary_hash_missing", f"{source.tool} binary hash was not observed", builds, listeners)
                     evidence["binary_sha256"] = observed_hash
-                elif source.observation_patch_path is not None and index == len(recipe) - 1:
+                elif source.observation_patch_path is not None and index == len(recipe) - 2:
                     if text != "CNB_ACQ_V1":
                         return _failure_result(connection, actions, vm, req, result, "observation_capability_missing", f"{source.tool} installed binary lacks CNB_ACQ_V1 capability", builds, listeners)
                     evidence["observation_capability"] = text
+                elif source.observation_patch_path is not None and index == len(recipe) - 1:
+                    try:
+                        identity = _parse_build_identity(result.stdout, source)
+                    except ValueError as exc:
+                        return _failure_result(connection, actions, vm, req, result, "build_identity_invalid", str(exc), builds, listeners)
+                    if (identity["binary_sha256"] != evidence.get("binary_sha256")
+                            or identity["binary_version_b64_decoded"] != evidence.get("binary_version")
+                            or identity["compiler_version_b64_decoded"] != evidence.get("compiler_version")):
+                        return _failure_result(connection, actions, vm, req, result, "build_identity_mismatch", "build identity sidecar does not match the observed compiler or installed executable", builds, listeners)
+                    identity_text = result.stdout
                 elif index >= 8:
                     if source.tool == "sockperf":
                         required = (["server", "-i", "-p"] if index == 9 else
@@ -552,7 +651,8 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                                            patch_sha256=source.observation_patch_sha256,
                                            build_configuration=(f"CC=${{CC:-cc}}; compiler={evidence['compiler_version'].splitlines()[0]}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
                                            observation_capability=evidence.get("observation_capability"),
-                                           observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None))
+                                           observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None,
+                                           identity_bytes=identity_text))
         if role == "vm_b":
             # Establish the private-only ingress chain before starting either listener.
             chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"

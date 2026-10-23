@@ -6,7 +6,7 @@ import sys
 import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
-from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap
+from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap, _required_capabilities
 from cloud_network_benchmark.bootstrap import _build_config_prelude, _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
 
 
@@ -161,6 +161,23 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
         def run(self, request):
             aid = request.action_id
             tool = "sockperf" if "sockperf" in aid else "iperf3"
+            if "CNB_BUILD_V1" in request.argv[-1]:
+                import base64
+                source = next(item for item in config.sources if item.tool == tool)
+                version = "sockperf version 3.10" if tool == "sockperf" else "iperf3 version 3.17"
+                compiler = "gcc version synthetic 1.0"
+                build_configuration = f"CC=${{CC:-cc}}; compiler={compiler}; ./configure --prefix=/var/lib/cnb/install; make -j2"
+                semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
+                fields = ["CNB_BUILD_V1", f"tool={tool}", f"source_reference={source.source_reference}",
+                    f"source_sha256={source.source_sha256}", f"upstream_commit={source.upstream_commit}",
+                    f"patch_path={source.observation_patch_path}", f"patch_sha256={source.observation_patch_sha256}",
+                    "compiler_version_b64=" + base64.b64encode(compiler.encode()).decode(),
+                    "build_configuration_b64=" + base64.b64encode(build_configuration.encode()).decode(),
+                    f"binary_path=/var/lib/cnb/install/bin/{tool}",
+                    "binary_version_b64=" + base64.b64encode(version.encode()).decode(),
+                    f"binary_sha256={'c' * 64}", "observation_capability=CNB_ACQ_V1",
+                    f"observation_semantics={semantics}", "capabilities=" + ",".join(_required_capabilities(tool))]
+                return result(aid, "\n".join(fields))
             if aid.endswith(f"{tool}-2"):
                 digest = config.sources[0 if tool == "sockperf" else 1].source_sha256
                 archive = "sockperf.tar.gz" if tool == "sockperf" else "iperf3.tar.gz"

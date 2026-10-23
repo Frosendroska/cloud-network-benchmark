@@ -8,14 +8,15 @@
  
  #include "cjson.h"
  #include "units.h"
-@@ -2021,6 +2022,11 @@
+@@ -2021,6 +2022,12 @@
      SLIST_FOREACH(sp, &test->streams, streams) {
  	sp->result->start_time = sp->result->start_time_fixed = now;
      }
 +	if (test->role == 's') {
 +	    cnb_acq_anchor(test->cookie);
++	    cnb_acq_settings(test);
 +	    SLIST_FOREACH(sp, &test->streams, streams)
-+	        cnb_acq_origin(test, sp, "initial");
++	        cnb_acq_origin(test, sp, &sp->result->start_time, "initial");
 +	}
  
      if (test->on_test_start)
@@ -24,7 +25,7 @@
  	}
  	rp->stream_retrans = 0;
  	rp->start_time = now;
-+	if (test->role == 's') cnb_acq_origin(test, sp, "post_omit");
++	if (test->role == 's') cnb_acq_origin(test, sp, &rp->start_time, "post_omit");
      }
  }
  
@@ -39,7 +40,7 @@
  		save_tcpinfo(sp, &temp);
 --- a/src/cnb_acquisition.h
 +++ b/src/cnb_acquisition.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,105 @@
 +/* Additive source observations for the CNB_ACQ_V1 evidence stream. */
 +#ifndef CNB_ACQUISITION_H
 +#define CNB_ACQUISITION_H
@@ -89,14 +90,30 @@
 +#endif
 +}
 +
-+static void cnb_acq_origin(struct iperf_test *test, struct iperf_stream *sp, const char *phase)
++static void cnb_acq_settings(struct iperf_test *test)
++{
++#if defined(HAVE_CLOCK_GETTIME)
++    char id[193] = {0}, boot[64] = {0};
++    if (test->role != 's' || !cnb_acq_context(id, boot)) return;
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"session_settings\",\"cookie\":\"%s\",\"protocol\":\"%s\",\"num_streams\":%d,\"omit\":%d,\"duration\":%d,\"interval_us\":%llu,\"block_size\":%d,\"reverse\":%s}\n",
++        id, (long)getpid(), boot, test->cookie, test->protocol->name, test->num_streams,
++        test->omit, test->duration, (unsigned long long)(test->stats_interval * 1000000.0),
++        test->settings->blksize, test->reverse ? "true" : "false");
++    fflush(stderr);
++#else
++    (void)test;
++#endif
++}
++
++static void cnb_acq_origin(struct iperf_test *test, struct iperf_stream *sp,
++                           struct iperf_time *origin_time, const char *phase)
 +{
 +#if defined(HAVE_CLOCK_GETTIME)
 +    char id[193] = {0}, boot[64] = {0};
 +    if (test->role != 's' || !cnb_acq_context(id, boot)) return;
 +    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"stats_origin\",\"cookie\":\"%s\",\"stream_id\":\"%d\",\"phase\":\"%s\",\"origin_us\":%llu,\"start_time_fixed_us\":%llu}\n",
 +        id, (long)getpid(), boot, test->cookie, sp->socket, phase,
-+        (unsigned long long)iperf_time_in_usecs(&sp->result->start_time),
++        (unsigned long long)iperf_time_in_usecs(origin_time),
 +        (unsigned long long)iperf_time_in_usecs(&sp->result->start_time_fixed));
 +    fflush(stderr);
 +#else
@@ -117,8 +134,8 @@
 +        getpeername(sp->socket, (struct sockaddr *)&remote, &rlen) != 0 ||
 +        getnameinfo((struct sockaddr *)&local, llen, local_host, sizeof(local_host), local_port, sizeof(local_port), NI_NUMERICHOST | NI_NUMERICSERV) != 0 ||
 +        getnameinfo((struct sockaddr *)&remote, rlen, remote_host, sizeof(remote_host), remote_port, sizeof(remote_port), NI_NUMERICHOST | NI_NUMERICSERV) != 0) return;
-+    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"receiver_interval\",\"cookie\":\"%s\",\"stream_id\":\"%d\",\"role\":\"receiver\",\"local_host\":\"%s\",\"local_port\":\"%s\",\"remote_host\":\"%s\",\"remote_port\":\"%s\",\"interval_start_us\":%llu,\"interval_end_us\":%llu,\"bytes\":%llu,\"omitted\":%s}\n",
-+        id, (long)getpid(), boot, test->cookie, sp->socket, local_host, local_port, remote_host, remote_port,
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"iperf3\",\"semantics_id\":\"iperf-3.17.1-stats-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"receiver_interval\",\"cookie\":\"%s\",\"stream_id\":\"%d\",\"role\":\"receiver\",\"protocol\":\"%s\",\"local_host\":\"%s\",\"local_port\":\"%s\",\"remote_host\":\"%s\",\"remote_port\":\"%s\",\"interval_start_us\":%llu,\"interval_end_us\":%llu,\"bytes\":%llu,\"omitted\":%s}\n",
++        id, (long)getpid(), boot, test->cookie, sp->socket, test->protocol->name, local_host, local_port, remote_host, remote_port,
 +        (unsigned long long)iperf_time_in_usecs(&ir->interval_start_time),
 +        (unsigned long long)iperf_time_in_usecs(&ir->interval_end_time),
 +        (unsigned long long)ir->bytes_transferred, ir->omitted ? "true" : "false");

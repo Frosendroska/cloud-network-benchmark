@@ -43,6 +43,29 @@ def test_acquisition_coverage_keeps_missing_receiver_intervals_in_denominator():
     assert overlap_coverage_lower_bound(probes, receiver) == pytest.approx(0.8)
 
 
+def test_acquisition_coverage_intersects_probe_with_receiver_inner_support_and_gaps():
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+    boot = "12345678-1234-1234-1234-123456789abc"
+    probe = SourceWindow("probe_enabled", "sockperf", "vm_a", boot, "CLOCK_MONOTONIC",
+        None, None, 0, 0, 1000, 1000, None, 0, 1)
+    # Endpoint uncertainty leaves only [100,900] guaranteed receiver support.
+    uncertain = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream", 0, 100, 900, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [uncertain]) == pytest.approx(0.8)
+
+    # Known receiver gaps are not covered merely because the probe spans them.
+    first = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream-1", 0, 0, 100, 100, False, 0, 1)
+    second = SourceWindow("receiver_measured", "iperf3", "vm_a", boot, "CLOCK_MONOTONIC",
+        "cookie", "stream-1", 900, 900, 1000, 1000, False, 0, 1)
+    assert overlap_coverage_lower_bound([probe], [first, second]) == pytest.approx(0.2)
+
+    # Overlapping streams count once; an omitted stream adds neither support nor duration.
+    from dataclasses import replace
+    duplicate = replace(second, stream_id="stream-2")
+    assert overlap_coverage_lower_bound([probe], [first, second, duplicate]) == pytest.approx(0.2)
+
+
 def test_cross_vm_and_utc_step_source_windows_stay_unknown_without_transform():
     from datetime import datetime, timedelta, timezone
     from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound

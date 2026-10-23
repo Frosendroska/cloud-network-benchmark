@@ -53,6 +53,7 @@ class MeasurementResult:
     outcome: str
     failures: tuple[FailureEvidence, ...] = ()
     timing_notes: tuple[Mapping[str, object], ...] = ()
+    artifact_records: tuple[ArtifactRecord, ...] = ()
 
 
 class MeasurementError(RuntimeError):
@@ -325,6 +326,7 @@ def _request(action: str, argv: list[str], root: Path, deadline: float, clock: M
     return CommandRequest(action_id=action, action_type="measurement", argv=argv, cwd=str(root),
                           environment=environment,
                           environment_classification="non_secret" if environment else "none",
+                          acquisition_invocation_id=acquisition_id,
                           timeout_seconds=remaining)
 
 
@@ -335,11 +337,12 @@ def _paths(observation: ResolvedObservation, root: Path, unit: PhaseConfiguratio
 def _record(request: CommandRequest, result: CommandResult, context: MeasurementContext,
             unit_id: Optional[str], role: VmRole = VmRole.VM_A,
             started_monotonic: Optional[float] = None, finished_monotonic: Optional[float] = None) -> CommandEvidence:
+    tool_name = Path(request.argv[0]).name
     return CommandEvidence(
         schema_version=2, request=request.durable_view(), result=result.durable_view(), producer=role,
         deployment_id=context.identity.deployment_id, unit_id=unit_id,
-        binary_version=context.tool_identity.get(request.argv[0], StringEvidence(unavailable_reason="tool identity not supplied")),
-        source_identity=context.tool_identity.get(request.argv[0], StringEvidence(unavailable_reason="source identity not supplied")),
+        binary_version=context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="tool identity not supplied")),
+        source_identity=context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="source identity not supplied")),
         monotonic_started=_evidence(
             result.monotonic_started if result.duration_basis == "monotonic" else started_monotonic,
             "process start not captured"),
@@ -472,6 +475,12 @@ class _Runner:
                 raise MeasurementError("measurement deadline exhausted while process remained active", "deadline")
             self._event_until([handle], usable_deadline)
 
+    def _tool_argv(self, tool: str, argv: list[str]) -> list[str]:
+        build = next((item for item in self.context.build_observations
+                      if item.role == "vm_a" and item.tool == tool
+                      and item.observation_capability == "CNB_ACQ_V1"), None)
+        return [build.binary_path, *argv[1:]] if build is not None else argv
+
     def _run_unit(self, unit: PhaseConfiguration, *, seconds: int, probe_seconds: int,
                   tcp: bool = True, streams: Optional[int] = None, day: bool = False) -> None:
         usable_deadline = self.context.deadline_monotonic - self.context.shutdown_grace_seconds
@@ -489,7 +498,7 @@ class _Runner:
                 raise ValueError(f"measurement artifact already exists: {path.relative_to(self.root)}")
         self.artifacts.extend(path.relative_to(self.root).as_posix() for path in (p["sockperf"], probe_stdout, p_err))
         probe_action = f"sockperf-{unit.unit_id}"
-        probe_req = _request(probe_action, sockperf_argv(self.context.b_private_ipv4, p["sockperf"], probe_seconds), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=probe_action)
+        probe_req = _request(probe_action, self._tool_argv("sockperf", sockperf_argv(self.context.b_private_ipv4, p["sockperf"], probe_seconds)), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=probe_action)
         probe = self._start(probe_req, probe_stdout, p_err)
         pmono, putc = self._start_times(probe)
         handles = [probe]
@@ -513,7 +522,7 @@ class _Runner:
                 tcp_err_dest = self.root / self.observation.artifact_layout.day_iperf3_observation if day else tcp_err
                 self.artifacts.extend((tcp_dest.relative_to(self.root).as_posix(), tcp_err_dest.relative_to(self.root).as_posix()))
                 tcp_action = f"iperf3-{unit.unit_id}"
-                tcp_req = _request(tcp_action, iperf3_argv(self.context.b_private_ipv4, streams or unit.streams or 1, seconds, day=day), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=tcp_action)
+                tcp_req = _request(tcp_action, self._tool_argv("iperf3", iperf3_argv(self.context.b_private_ipv4, streams or unit.streams or 1, seconds, day=day)), self.root, self.context.deadline_monotonic - self.context.shutdown_grace_seconds, self.clock, acquisition_id=tcp_action)
                 tcp_handle = self._start(tcp_req, tcp_dest, tcp_err_dest)
                 tcp_mono, tcp_utc = self._start_times(tcp_handle)
                 handles.append(tcp_handle)
@@ -687,9 +696,9 @@ class _Runner:
     def _day_continuous(self, parent: PhaseConfiguration, tcp_path: Path, tcp_err: Path, deadline: float) -> None:
         layout = self.observation.artifact_layout
         tcp_action = f"iperf3-{parent.unit_id}"
-        tcp_req = _request(tcp_action, iperf3_argv(
+        tcp_req = _request(tcp_action, self._tool_argv("iperf3", iperf3_argv(
             self.context.b_private_ipv4, self._streams(parent) or 1,
-            86400, day=True), self.root, deadline, self.clock, acquisition_id=tcp_action)
+            86400, day=True)), self.root, deadline, self.clock, acquisition_id=tcp_action)
         tcp_handle: Optional[object] = None
         tcp_result: Optional[CommandResult] = None
         tcp_mono: Optional[float] = None
@@ -728,7 +737,7 @@ class _Runner:
                                                for path in (csv_path, log_path, stderr_path))
                     self.artifacts.extend(intended_artifacts)
                     probe_action = f"sockperf-{probe_id}"
-                    probe_req = _request(probe_action, sockperf_argv(self.context.b_private_ipv4, csv_path, chunk_seconds),
+                    probe_req = _request(probe_action, self._tool_argv("sockperf", sockperf_argv(self.context.b_private_ipv4, csv_path, chunk_seconds)),
                                          self.root, deadline, self.clock, acquisition_id=probe_action)
                     try:
                         probe_handle = self._start(probe_req, log_path, stderr_path)
@@ -891,28 +900,38 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
     """Execute the supplied resolved units on A, returning unvalidated source evidence."""
     validated = ResolvedObservation.model_validate(observation.model_dump(mode="python"))
     result = _Runner(validated, context, processes, clock).run()
+    from .bootstrap import materialize_build_identity_artifacts
+    build_records = materialize_build_identity_artifacts(Path(context.root), context.identity.deployment_id,
+        context.build_observations)
+    if build_records:
+        result = replace(result, artifact_records=build_records)
     if not context.source_artifact_records or not context.build_observations:
         return result
     from .acquisition import bind_acquisition_sources, iter_source_windows
+    source_artifact_records = (*context.source_artifact_records, *build_records)
     try:
         sources = bind_acquisition_sources(child_root=Path(context.root), run_identity=context.identity,
             commands=result.command_evidence, receiver_command_evidence=context.receiver_command_evidence,
-            build_evidence=context.build_observations, source_artifact_records=context.source_artifact_records,
+            build_evidence=context.build_observations, source_artifact_records=source_artifact_records,
             clock_mappings=context.clock_mappings)
-        verified: list[tuple[AcquisitionSource, str | None]] = []
+        verified: list[tuple[AcquisitionSource, str | None, str | None]] = []
         all_commands = (*result.command_evidence, *context.receiver_command_evidence)
         for source in sources:
             has_window = False
-            for _window in iter_source_windows(Path(context.root), source, context.source_artifact_records,
-                    all_commands, context.build_observations, context.clock_mappings):
-                has_window = True
+            replay_error = None
+            try:
+                for _window in iter_source_windows(Path(context.root), source, source_artifact_records,
+                        all_commands, context.build_observations, context.clock_mappings):
+                    has_window = True
+            except (OSError, ValueError) as exc:
+                replay_error = f"partial source replay; closed intervals retained; unknown tail: {type(exc).__name__}: {exc}"
             if not has_window:
                 continue
-            refs = {item.artifact_id: item for item in context.source_artifact_records}
+            refs = {item.artifact_id: item for item in source_artifact_records}
             unit_id = next((refs[item].unit_id for item in source.native_artifact_ids if item in refs and refs[item].unit_id), None)
             if unit_id is None:
                 unit_id = refs[source.log_artifact_id].unit_id
-            verified.append((source, unit_id))
+            verified.append((source, unit_id, replay_error))
         timings = []
         replay_notes = []
         child_parent = {str(note.get("unit_id")): str(note.get("parent_unit_id"))
@@ -920,23 +939,28 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
         for timing in result.timings:
             related_units = {timing.unit_id}
             related_units.update(unit_id for unit_id, parent_id in child_parent.items() if parent_id == timing.unit_id)
-            rows = [source for source, unit_id in verified if unit_id in related_units]
+            rows = [source for source, unit_id, _error in verified if unit_id in related_units]
             if rows:
                 timings.append(timing.model_copy(update={
                     "acquisition_sources": Evidence[list[AcquisitionSource]](value=rows)}))
             else:
                 timings.append(timing)
-            probes = sorted((source for source, unit_id in verified
+            errors = [error for source, unit_id, error in verified if unit_id in related_units and error]
+            if errors:
+                replay_notes.append({"unit_id": timing.unit_id,
+                    "acquisition_coverage_lower_bound": None,
+                    "acquisition_coverage_reason": errors[0]})
+            probes = sorted((source for source, unit_id, _error in verified
                 if unit_id in related_units and source.tool == "sockperf"), key=lambda source: source.command_action_id)
-            receivers = sorted((source for source, unit_id in verified
+            receivers = sorted((source for source, unit_id, _error in verified
                 if unit_id in related_units and source.tool == "iperf3"), key=lambda source: source.command_action_id)
-            if probes and receivers:
+            if probes and receivers and not errors:
                 from .acquisition import overlap_coverage_lower_bound
 
                 def replay(group):
                     for source in group:
                         yield from iter_source_windows(Path(context.root), source,
-                            context.source_artifact_records, all_commands, context.build_observations,
+                            source_artifact_records, all_commands, context.build_observations,
                             context.clock_mappings)
 
                 coverage = overlap_coverage_lower_bound(replay(probes), replay(receivers))
