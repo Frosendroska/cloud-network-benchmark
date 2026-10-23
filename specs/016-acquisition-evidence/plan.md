@@ -115,6 +115,16 @@ records remain invalid. These repairs add no benchmark flags, protocol or native
 make no research-policy decisions. The multiline banner capture and interrupted-A materialized
 fixture are feature-owned test/source plumbing.
 
+The serialized T033–T034 convergence closes two production-path mismatches. The bootstrap's
+BuildObservation configuration must use the same full multiline compiler text captured in its
+sidecar, and the end-to-end fixture carries the actual run_bootstrap object through artifact
+materialization, binding, and replay. The native iperf reporter independently filters short
+all-zero per-stream intervals; terminal proof therefore requires the exact expected stream set,
+with each stream's own observed bounds and no later interval for that stream, but does not require
+synthetic equality of endpoints sampled separately inside upstream's stream loop. Earlier
+independently correlated windows remain available, with unsupported duration described per stream.
+No measurement flags, reporting thresholds, protocol decisions, or native files change.
+
 ## Complexity Tracking
 
 No constitution violations. Two additive upstream observation patches are necessary because current native sources expose filtered samples and relative/statistical spans rather than source-bound enabled windows. A DTO alone cannot close the gap. No additional agent/platform abstraction is justified.

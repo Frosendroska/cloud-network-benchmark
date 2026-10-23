@@ -230,9 +230,11 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         if (native is not None and native.get("_preflight_complete")
                 and interval_count >= int(native.get("validated_interval_count", 0))):
             filtered = native.get("filtered_tail")
-            if (isinstance(filtered, Mapping) and omitted is False
-                    and start_us == filtered.get("start_us") and end_us == filtered.get("end_us")
-                    and value.get("bytes") == 0):
+            filtered_stream = (filtered.get("streams", {}).get(stream)
+                if isinstance(filtered, Mapping) and isinstance(filtered.get("streams"), Mapping) else None)
+            if (isinstance(filtered_stream, Mapping) and omitted is False
+                    and start_us == filtered_stream.get("start_us")
+                    and end_us == filtered_stream.get("end_us") and value.get("bytes") == 0):
                 continue
             raise ValueError("native iperf receiver output has an unknown unmatched interval tail")
         if native_streams is not None:
@@ -264,9 +266,10 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         raise ValueError("native iperf receiver JSONL has an unknown truncated tail")
     if native is not None and native.get("filtered_tail"):
         filtered = native["filtered_tail"]
-        raise ValueError("native iperf reporter filtered the final all-stream zero-byte interval "
-            f"[{filtered['start_us']}, {filtered['end_us']}) us ({filtered['duration_us']} us); "
-            "duration remains unsupported")
+        bounds = ", ".join(f"stream {stream} [{item['start_us']}, {item['end_us']}) us "
+            f"({item['duration_us']} us)" for stream, item in sorted(filtered["streams"].items()))
+        raise ValueError("native iperf reporter filtered the final all-stream zero-byte interval(s) "
+            f"({bounds}); duration remains unsupported")
     if native is not None and native.get("client_tail"):
         raise ValueError("A-side diagnostic iperf client JSONL has an unknown truncated final event")
     if native is not None and native.get("client_complete") is not True:
@@ -353,10 +356,7 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     stream_rows = native["stream_factory"]()
     settings_checked = False
     missing_native_row = False
-    filtered_group: tuple[int, int] | None = None
-    filtered_streams: set[str] = set()
-    filtered_stream_bytes: dict[str, int] = {}
-    filtered_interval_duration: int | None = None
+    filtered_streams: dict[str, dict[str, int]] = {}
     try:
         for record in records_factory():
             value = record.value
@@ -399,6 +399,10 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                 if previous is not None and (start < previous[0] or end < previous[1]):
                     raise ValueError("conflicting or non-monotonic iperf receiver interval sequence")
                 last[stream] = (start, end)
+                # A later interval for this stream proves a previously missing
+                # short interval was not terminal and cannot be treated as the
+                # reporter's final all-zero suppression.
+                filtered_streams.pop(stream, None)
                 byte_count = _native_int(value.get("bytes"), "bytes")
                 if value.get("role") != "receiver" or str(value.get("protocol", "")).lower() != "tcp":
                     raise ValueError("iperf interval is not native TCP receiver evidence")
@@ -434,7 +438,6 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                             matched_count += 1
                 if missing_native_row:
                     outcome_value = getattr(outcome, "value", outcome)
-                    start_end = (start, end)
                     duration = end - start
                     eligible = (native.get("receiver_complete") is True
                         and native.get("client_complete") is True and outcome_value in {None, "succeeded"}
@@ -442,24 +445,12 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                         and byte_count == 0 and duration > 0
                         and duration * 10 < int(settings["interval_us"]))
                     if eligible:
-                        if filtered_group is None:
-                            filtered_group = start_end
-                            filtered_interval_duration = duration
-                        if start_end == filtered_group and stream not in filtered_streams:
-                            filtered_streams.add(stream)
-                            filtered_stream_bytes[stream] = byte_count
-                        else:
-                            filtered_group = None
-                            filtered_interval_duration = None
-                            filtered_streams.clear()
-                            filtered_stream_bytes.clear()
-                    elif filtered_group is not None:
-                        # A positive-byte stream or a different short interval
-                        # disproves the source-specific all-stream filter case.
-                        filtered_group = None
-                        filtered_interval_duration = None
-                        filtered_streams.clear()
-                        filtered_stream_bytes.clear()
+                        filtered_streams[stream] = {"start_us": start, "end_us": end,
+                            "duration_us": duration, "bytes": byte_count}
+                    else:
+                        # Positive bytes, omitted data or an ineligible short
+                        # interval disproves this stream's terminal candidate.
+                        filtered_streams.pop(stream, None)
                 interval_count += 1
     except ValueError as exc:
         if str(exc).startswith("truncated acquisition record at byte"):
@@ -479,11 +470,10 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     partial_allowed = (observation_tail or native_tail
         or outcome_value not in {None, "succeeded"} or native.get("receiver_complete") is not True
         or native.get("client_tail") is True or native.get("client_complete") is not True)
-    filtered_tail = filtered_group is not None
-    if filtered_tail:
-        filtered_tail = (len(filtered_streams) == settings["num_streams"]
-            and len(filtered_stream_bytes) == settings["num_streams"]
-            and not any(filtered_stream_bytes.values()))
+    expected_streams = {stream for phase, stream in origins if phase == "initial"}
+    filtered_tail = (len(expected_streams) == settings["num_streams"]
+        and set(filtered_streams) == expected_streams
+        and all(item["bytes"] == 0 for item in filtered_streams.values()))
     if filtered_tail:
         partial_allowed = True
     if missing_native_row and not partial_allowed:
@@ -505,8 +495,7 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     native["partial_allowed"] = partial_allowed
     native["validated_interval_count"] = matched_count
     native["native_tail"] = native_tail
-    native["filtered_tail"] = ({"start_us": filtered_group[0], "end_us": filtered_group[1],
-        "duration_us": filtered_interval_duration} if filtered_tail and filtered_group is not None else None)
+    native["filtered_tail"] = ({"streams": filtered_streams} if filtered_tail else None)
     native["_preflight_complete"] = True
 
 

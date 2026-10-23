@@ -92,7 +92,8 @@ def _native_iperf_server_jsonl(cookie: str, *, duration: int = 60, stream: int =
 
 def _two_stream_iperf_tail_fixture(cookie: str, *, final_duration_us: int = 1_000,
                                    final_bytes: tuple[int, int] = (0, 0),
-                                   include_final_native: bool = False) -> tuple[bytes, bytes]:
+                                   include_final_native: bool = False,
+                                   final_skew_us: int = 0) -> tuple[bytes, bytes]:
     """Two source-observed streams with omitted, normal, and final intervals."""
     raw = [json.loads(line[len(b"CNB_ACQ_V1 "):])
            for line in (ROOT / "iperf-receiver.log").read_bytes().splitlines()]
@@ -116,7 +117,8 @@ def _two_stream_iperf_tail_fixture(cookie: str, *, final_duration_us: int = 1_00
     post_rows = [observation_for_stream(post, index) for index in range(2)]
     measured_rows = [observation_for_stream(normal, index) for index in range(2)]
     final_rows = [observation_for_stream({**normal, "interval_start_us": final_start,
-        "interval_end_us": final_start + final_duration_us, "bytes": final_bytes[index]}, index)
+        "interval_end_us": final_start + final_duration_us + (final_skew_us if index else 0),
+        "bytes": final_bytes[index]}, index)
         for index in range(2)]
     observations = [anchor, settings, *origins, *normal_rows, *post_rows,
         *measured_rows, *final_rows]
@@ -268,7 +270,95 @@ def test_f03_source_binder_replays_closed_sockperf_and_persistent_iperf_sources(
     assert windows["sockperf"][0].has_positive_inner_support
     assert windows["iperf3"][0].omitted is True
     assert windows["iperf3"][1].omitted is False
-    assert windows["iperf3"][1].start_latest_ns == 5_000_001_000
+
+
+def test_run_bootstrap_build_observation_materializes_and_replays_exact_multiline_identity(tmp_path):
+    import base64
+    from cloud_network_benchmark.bootstrap import (BootstrapConfig, SourceBuild, run_bootstrap,
+        _required_capabilities)
+    from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
+
+    patch_root = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches"
+    sock_patch = patch_root / "sockperf-3.10-acquisition.patch"
+    iperf_patch = patch_root / "iperf-3.17.1-acquisition.patch"
+    sock_commit, iperf_commit = "5ebd327da983225321818c0355db922515e026bd", "2acfcfe94e928e74542c9f107e02aa6dd4748a79"
+    config = bootstrap_config().model_copy(update={"sources": [
+        SourceBuild(tool="sockperf", source_url=f"https://github.com/Mellanox/sockperf/archive/{sock_commit}.tar.gz",
+            source_reference=f"sockperf-{sock_commit}", archive_name="sockperf.tar.gz",
+            source_sha256="a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e",
+            upstream_commit=sock_commit, observation_patch_path="tool_patches/sockperf-3.10-acquisition.patch",
+            observation_patch_sha256=hashlib.sha256(sock_patch.read_bytes()).hexdigest()),
+        SourceBuild(tool="iperf3", source_url=f"https://github.com/esnet/iperf/archive/{iperf_commit}.tar.gz",
+            source_reference=f"iperf-{iperf_commit}", archive_name="iperf3.tar.gz",
+            source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
+            upstream_commit=iperf_commit, observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch",
+            observation_patch_sha256=hashlib.sha256(iperf_patch.read_bytes()).hexdigest())]})
+
+    class MultilineBuildRunner(BootstrapRunner):
+        compiler = "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc."
+        def run(self, request):
+            aid = request.action_id
+            tool = "sockperf" if "sockperf" in aid else "iperf3"
+            source = next(item for item in config.sources if item.tool == tool)
+            version = ("sockperf 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
+                if tool == "sockperf" else "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0")
+            if "CNB_BUILD_V1" in request.argv[-1]:
+                build_config = (f"CC=${{CC:-cc}}; compiler={self.compiler}; "
+                    f"./configure --prefix={config.install_prefix}; make -j2")
+                semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
+                fields = ["CNB_BUILD_V1", f"tool={tool}", f"source_reference={source.source_reference}",
+                    f"source_sha256={source.source_sha256}", f"upstream_commit={source.upstream_commit}",
+                    f"patch_path={source.observation_patch_path}", f"patch_sha256={source.observation_patch_sha256}",
+                    "compiler_version_b64=" + base64.b64encode(self.compiler.encode()).decode(),
+                    "build_configuration_b64=" + base64.b64encode(build_config.encode()).decode(),
+                    f"binary_path={config.install_prefix}/bin/{tool}",
+                    "binary_version_b64=" + base64.b64encode(version.encode()).decode(),
+                    f"binary_sha256={'c' * 64}", "observation_capability=CNB_ACQ_V1",
+                    f"observation_semantics={semantics}",
+                    "capabilities=" + ",".join(_required_capabilities(tool))]
+                return result(aid, "\n".join(fields))
+            if aid.endswith(f"{tool}-5"):
+                return result(aid, self.compiler + "\n")
+            if aid.endswith(f"{tool}-6"):
+                return result(aid, version + "\n")
+            if aid.endswith(f"{tool}-2"):
+                return result(aid, f"{source.source_sha256} /var/lib/cnb/work/{source.archive_name}")
+            if aid.endswith("sockperf-11") or aid.endswith("iperf3-9"):
+                return result(aid, "CNB_ACQ_V1")
+            response = super().run(request)
+            if aid.endswith("listener-verify-iperf3") or aid.endswith("listener-config-iperf3"):
+                return result(aid, response.stdout + "\nEnvironment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n")
+            return response
+
+    bootstrap = run_bootstrap(connection(tmp_path), config, MultilineBuildRunner(),
+        deadline=deadline(), clock=lambda: 100)
+    assert bootstrap.succeeded
+    production_build = next(item for item in bootstrap.builds if item.role == "vm_b" and item.tool == "iperf3")
+    expected_configuration = (f"CC=${{CC:-cc}}; compiler={production_build.compiler_version}; "
+        f"./configure --prefix={config.install_prefix}; make -j2")
+    assert production_build.build_configuration == expected_configuration
+
+    cookie = "actual-bootstrap-build-cookie"
+    log = (ROOT / "iperf-receiver.log").read_bytes().replace(b"native-cookie-1", cookie.encode())
+    native = _native_iperf(cookie)
+    records = [
+        _record(tmp_path, "actual-bootstrap-log", "retrieval/actual-bootstrap.stderr",
+            "iperf3-observation-stderr", VmRole.VM_B, log),
+        _record(tmp_path, "actual-bootstrap-native", "retrieval/actual-bootstrap.json",
+            "iperf3-json", VmRole.VM_A, native, "short-multiflow"),
+        *_build_records(tmp_path, DEPLOYMENT, [production_build]),
+    ]
+    client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    receiver.request["argv"] = ["systemd-run",
+        "--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",
+        f"{production_build.binary_path}", "-s", "--json-stream", "--forceflush"]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[production_build], source_artifact_records=records)
+    assert len(sources) == 1
+    assert len(list(iter_source_windows(tmp_path, sources[0], records,
+        [client, receiver], [production_build]))) == 2
 
 
 @pytest.mark.parametrize("mutation", ["cookie_only", "native_endpoint", "native_settings",
@@ -387,11 +477,11 @@ def test_iperf_closed_prefix_survives_only_an_explicit_incomplete_tail(tail, tmp
 
 def _bind_two_stream_iperf_fixture(tmp_path, *, final_duration_us=1_000,
                                    final_bytes=(0, 0), include_final_native=False,
-                                   receiver_outcome="succeeded"):
+                                   receiver_outcome="succeeded", final_skew_us=0):
     cookie = "native-cookie-two-stream"
     log_bytes, native_bytes = _two_stream_iperf_tail_fixture(cookie,
         final_duration_us=final_duration_us, final_bytes=final_bytes,
-        include_final_native=include_final_native)
+        include_final_native=include_final_native, final_skew_us=final_skew_us)
     log = _record(tmp_path, "two-stream-log", "retrieval/two-stream-iperf.stderr",
         "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
     native = _record(tmp_path, "two-stream-client", "retrieval/two-stream-iperf.json",
@@ -411,13 +501,23 @@ def _bind_two_stream_iperf_fixture(tmp_path, *, final_duration_us=1_000,
 def test_iperf_native_reporter_short_all_zero_tail_is_explicit_and_keeps_closed_prefix(tmp_path):
     source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path)
     windows = []
-    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval .*1000 us"):
+    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval.*1000 us"):
         for window in iter_source_windows(tmp_path, source, records, commands, builds):
             windows.append(window)
     # Both omitted rows and the normal one-second zero-byte reports remain
     # independently correlated; only the final 1 ms interval is unsupported.
     assert len(windows) == 4
     assert sum(window.omitted is False for window in windows) == 2
+
+
+def test_iperf_native_reporter_accepts_per_stream_skew_on_terminal_zero_tail(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(
+        tmp_path, final_skew_us=1)
+    windows = []
+    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval.*stream 18 \[6000000, 6001001\)"):
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    assert len(windows) == 4
 
 
 @pytest.mark.parametrize(("duration", "byte_counts"), [

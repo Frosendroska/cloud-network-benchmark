@@ -208,6 +208,8 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
         assert build.patch_sha256 == (sock_sha if build.tool == "sockperf" else iperf_sha)
         assert build.observation_semantics == ("sockperf-3.10-enabled-v1" if build.tool == "sockperf" else "iperf-3.17.1-stats-v1")
         assert build.build_configuration and build.artifact_id
+        assert build.build_configuration == (f"CC=${{CC:-cc}}; compiler={build.compiler_version}; "
+            "./configure --prefix=/var/lib/cnb/install; make -j2")
     assert "compiler=$(cc --version)" in _recipe(config.sources[0], config)[-1][-1]
     assert "--version | head -n 1" not in _recipe(config.sources[0], config)[-1][-1]
 

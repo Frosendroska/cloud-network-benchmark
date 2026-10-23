@@ -660,7 +660,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                                            upstream_commit=source.upstream_commit,
                                            patch_path=source.observation_patch_path,
                                            patch_sha256=source.observation_patch_sha256,
-                                           build_configuration=(f"CC=${{CC:-cc}}; compiler={evidence['compiler_version'].splitlines()[0]}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
+                                           build_configuration=(f"CC=${{CC:-cc}}; compiler={evidence['compiler_version']}; ./configure --prefix={config.install_prefix}; make -j2") if source.observation_patch_path else None,
                                            observation_capability=evidence.get("observation_capability"),
                                            observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None,
                                            identity_bytes=identity_text))

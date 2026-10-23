@@ -297,3 +297,10 @@ No Linux native compilation, patched executable/help check, cloud or SSH access,
 benchmark traffic was run. These checks establish patch applicability and offline framework
 behavior only; they do not establish a compiled native binary or cloud measurement capability.
 All 32 feature tasks are checked.
+
+## Phase 9 convergence (T033–T034)
+
+T033 and T034 address production-created build configuration and the pinned source's per-stream
+terminal reporting behavior. The implementation preserves full multiline compiler identity and
+stores independently qualified terminal bounds per stream; test and source patch proof results for
+this phase will be recorded after the integrated final gate.
