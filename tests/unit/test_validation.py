@@ -308,12 +308,8 @@ def test_day_requires_one_continuous_receiver_span_and_unions_chunk_tails(reposi
     assert rejected["complete"] is False
 
 
-@pytest.mark.parametrize(("command_finish", "expected", "available"), [
-    (165, 60.0, True),   # exact admissible measured-start bracket
-    (225, 0.0, True),    # broad bracket includes a start after the probe window
-    (164, None, False),  # command cannot contain omission plus receiver duration
-])
-def test_conservative_command_native_bracket_uses_worst_case_overlap(repository_root, command_finish, expected, available):
+@pytest.mark.parametrize("command_finish", [165, 225, 164])
+def test_conservative_command_native_bracket_cannot_prove_continuous_coverage(repository_root, command_finish):
     value, unit, sock, tcp = _coverage_inputs(repository_root)
     ref = SourceRef("iperf3_receiver", "iperf3.json", "e" * 64)
     tcp = NativeParse(receiver_intervals=(
