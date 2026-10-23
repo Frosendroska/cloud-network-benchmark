@@ -90,7 +90,7 @@ class AutomationRunner:
             if "--urn" in request.argv:
                 _,offer,sku,version=request.argv[request.argv.index("--urn")+1].split(":")
                 image_id=(f"/subscriptions/{self.o.subscription_id}/providers/Microsoft.Compute/locations/germanywestcentral/publishers/{self.image_publisher}/artifacttypes/vmimage/offers/{self.image_offer or offer}/skus/{self.image_sku or sku}/versions/{version}")
-                payload={"id":image_id,"name":version,"location":"germanywestcentral","properties":{"architecture":self.image_architecture,"osDiskImage":{"operatingSystem":self.image_os}}}
+                payload={"id":image_id,"name":version,"location":"germanywestcentral","architecture":self.image_architecture,"osDiskImage":{"operatingSystem":self.image_os}}
                 out=json.dumps(self.marketplace_response if self.marketplace_response is not None else payload)
             else:
                 out=json.dumps({"architecture":self.image_architecture,"identifier":{"publisher":self.image_publisher,"offer":self.image_offer or "ubuntu2404","sku":self.image_sku or "ubuntu2404"}})
@@ -362,21 +362,26 @@ def test_marketplace_image_metadata_uses_exact_x64_canonical_urn(repository_root
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"selected_image":selected})
     runner=AutomationRunner(d,o,datetime.now(timezone.utc))
     image=_validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.)
-    assert image["architecture"]=="x64" and image["publisher"]=="Canonical" and image["version"]=="24.04.20261001"
-    assert image["operating_system"]=="Linux"
+    assert image=={
+        "id":f"/subscriptions/{o.subscription_id}/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
+        "architecture":"x64","operating_system":"Linux","publisher":"Canonical","offer":"ubuntu-24_04-lts",
+        "sku":"server","version":"24.04.20261001","source":"marketplace",
+    }
+    request=next(request for request in runner.requests if request.action_type=="image_preflight")
+    assert request.argv==["az","vm","image","show","--location","germanywestcentral","--urn",selected,"--output","json"]
 
 
 @pytest.mark.parametrize("response", [
     {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
-     "name":"24.04.20261001","properties":{"osDiskImage":{"operatingSystem":"Linux"}}},
+     "name":"24.04.20261001","osDiskImage":{"operatingSystem":"Linux"}},
     {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
-     "name":"24.04.20261002","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}}},
+     "name":"24.04.20261002","architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}},
     {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/debian/skus/server/versions/24.04.20261001",
-     "name":"24.04.20261001","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}}},
+     "name":"24.04.20261001","architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}},
     {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
-     "name":"24.04.20261001","properties":{"architecture":"Arm64","osDiskImage":{"operatingSystem":"Linux"}}},
+     "name":"24.04.20261001","architecture":"Arm64","osDiskImage":{"operatingSystem":"Linux"}},
     {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
-     "name":"24.04.20261001","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Windows"}}},
+     "name":"24.04.20261001","architecture":"x64","osDiskImage":{"operatingSystem":"Windows"}},
 ])
 def test_marketplace_compute_readback_requires_complete_matching_x64_linux_identity(repository_root:Path,tmp_path:Path,response):
     from cloud_network_benchmark.azure_provider import _validate_image_metadata, _workspace

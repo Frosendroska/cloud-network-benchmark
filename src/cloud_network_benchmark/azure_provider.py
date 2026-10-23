@@ -869,17 +869,16 @@ def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner
                 "version":version.get("name") or version_id.rstrip("/").split("/")[-1],"source":"shared_gallery"}
     else:
         result=json.loads(_command(runner,options,root,["az","vm","image","show","--location","germanywestcentral","--urn",image,"--output","json"],"image_preflight",clock).stdout)
-        props=result.get("properties") if isinstance(result,dict) else None
         image_id=result.get("id") if isinstance(result,dict) else None
         image_name=result.get("name") if isinstance(result,dict) else None
-        if not isinstance(props,dict) or not isinstance(image_id,str) or not isinstance(image_name,str):
-            raise ValueError("Marketplace image response lacks Compute image identity or properties")
+        if not isinstance(image_id,str) or not isinstance(image_name,str):
+            raise ValueError("Marketplace image response lacks Compute image identity")
         match=re.search(r"/publishers/([^/]+)/artifacttypes/vmimage/offers/([^/]+)/skus/([^/]+)/versions/([^/]+)$",image_id,re.IGNORECASE)
         if match is None:
             raise ValueError("Marketplace image resource ID does not contain the requested Compute identity")
         publisher,offer,sku,version=match.groups()
-        os_metadata=props.get("osDiskImage")
-        actual={"id":image_id,"architecture":props.get("architecture"),"operating_system":os_metadata.get("operatingSystem") if isinstance(os_metadata,dict) else None,
+        os_metadata=result.get("osDiskImage")
+        actual={"id":image_id,"architecture":result.get("architecture"),"operating_system":os_metadata.get("operatingSystem") if isinstance(os_metadata,dict) else None,
                 "publisher":publisher,"offer":offer,"sku":sku,"version":image_name,"source":"marketplace"}
         if image_name.lower()!=version.lower():
             raise ValueError("Marketplace image name and resource version identity disagree")
