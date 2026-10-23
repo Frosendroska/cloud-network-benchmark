@@ -1,0 +1,170 @@
+{
+  "common_fields": [
+    "F01R identity",
+    "resolved configuration/schedule hashes",
+    "declared units",
+    "commands",
+    "measurement timings",
+    "artifact records",
+    "execution state",
+    "cleanup state"
+  ],
+  "source_contract": {
+    "identity_models": ["F01R CampaignManifest", "F01R ChildRunManifest", "F01R ValidatorInput"],
+    "resolved_snapshot": "F01R ResolvedCampaign/ResolvedObservation serialized by the existing resolver",
+    "schedule": "F01R ScheduleEntry with original header/row, source path/hash and row hash",
+    "commands": "F01R CommandEvidence durable redacted argv/result, producer, unit/deployment, monotonic bounds and tool identity",
+    "timing": "F01R MeasurementTiming notification, TCP launch, measured interval, monotonic bounds, clock mappings and gaps",
+    "materialization": "F01R ArtifactLayout declarations and closed verified ArtifactRecord size/SHA-256 using safe child-root paths",
+    "provenance": "F01R configuration/resolved/schedule SHA-256, implementation/design commits, tool versions, VM metadata and provider outputs",
+    "source_boundary": "synthetic examples of source-documented Sockperf 3.10 and iperf3 3.17.1 grammar; no run or cloud evidence"
+  },
+  "native_artifact_paths": {
+    "short_study_and_acceptance": "measurements/{unit_id}/sockperf.csv and measurements/{unit_id}/iperf3.json for loaded units",
+    "calibration": "measurements/{unit_id}/sockperf.csv and measurements/{unit_id}/iperf3.json for each of twelve trials",
+    "diagnostic_day": "day-iperf3-client.jsonl and measurements/probes/{chunk_id}.sockperf.csv/.sockperf.log; each chunk <=300 seconds"
+  },
+  "mode_expectations": {
+    "acceptance": {
+      "measured_seconds": 10,
+      "research_eligible": false,
+      "units": 3
+    },
+    "calibration": {
+      "measured_seconds": 60,
+      "one_retained_deployment": true,
+      "units": 12
+    },
+    "diagnostic_day": {
+      "continuous_tcp_seconds": 86400,
+      "max_probe_chunk_seconds": 300,
+      "one_retained_deployment": true
+    },
+    "short_study": {
+      "measured_seconds": 60,
+      "research_eligible": true,
+      "units": 3
+    }
+  },
+  "mode_inputs": {
+    "acceptance": {
+      "config": "configs/experiments/exp-001-multi-provider.yaml",
+      "measured_seconds": 10,
+      "research_eligible": false,
+      "resolved_mode_override": "acceptance",
+      "unit_shape": [
+        "idle_latency",
+        "single_flow",
+        "multi_flow"
+      ]
+    },
+    "calibration": {
+      "config": "configs/experiments/exp-001-calibration.yaml",
+      "one_retained_deployment": true,
+      "trial_order_by_provider": {
+        "aws": [
+          1,
+          4,
+          2,
+          8,
+          8,
+          2,
+          4,
+          1,
+          2,
+          8,
+          1,
+          4
+        ],
+        "azure": [
+          1,
+          4,
+          2,
+          8,
+          8,
+          2,
+          4,
+          1,
+          2,
+          8,
+          1,
+          4
+        ],
+        "gcp": [
+          1,
+          4,
+          2,
+          8,
+          8,
+          2,
+          4,
+          1,
+          2,
+          8,
+          1,
+          4
+        ]
+      },
+      "unit_count": 12
+    },
+    "diagnostic_day": {
+      "config": "configs/experiments/exp-001-diagnostic-day.yaml",
+      "continuous_tcp_seconds": 86400,
+      "max_probe_chunk_seconds": 300,
+      "one_retained_deployment": true,
+      "probe_chunks_materialized_dynamically": true,
+      "unit_shape": [
+        "continuous_day"
+      ]
+    },
+    "short_study": {
+      "config": "configs/experiments/exp-001-multi-provider.yaml",
+      "measured_seconds": 60,
+      "research_eligible": true,
+      "unit_shape": [
+        "idle_latency",
+        "single_flow",
+        "multi_flow"
+      ]
+    }
+  },
+  "mutations": [
+    "missing artifact",
+    "modified hash",
+    "unsafe symlink path",
+    "failed command",
+    "missing timing",
+    "partial receiver intervals",
+    "malformed tail",
+    "receiver reset"
+  ],
+  "native_source_hashes": {
+    "iperf3-duplicate.jsonl": "2a81c64bebcb288837d406140e5860ea335841ef332f5418adaf839854847dd1",
+    "iperf3-malformed-tail.jsonl": "10fcd4c5f06efafb744b9039803a8f41e6b80fd56456e9568aa7fe740b9be26d",
+    "iperf3-reset.jsonl": "6b4505ca525edbd138b7d6b0e25dac74721de22bf990bde6e682babca3b5b591",
+    "iperf3-sender-only.json": "ff21e042270f0310bc231a26da554d4f3dce5df5843a86b2335e2f7ba622be42",
+    "iperf3.json": "51498f4f8ce5fe37f366314e1d8090962d24dfc00a61ae0859cb9f6f39a83218",
+    "iperf3.jsonl": "68d4736bf9499d51142dd666520c9762a681da222ca01af29576b420cda393e4",
+    "sockperf-corrupt.csv": "2fa4cddb1a806619d0c36c6a4e9325483b1f620363ca3d335d75b0f0f9277f4a",
+    "sockperf.csv": "45668448f2813825f3d13717dcdaae4286183d7fafeeda4b2c782a2642165914",
+    "sockperf.log": "19e5176c396406e49c1dd0f96e65d22ba1dbbd26da385a30d203c846bed4ba0a"
+  },
+  "native_sources": {
+    "iperf3-duplicate.jsonl": "2a81c64bebcb288837d406140e5860ea335841ef332f5418adaf839854847dd1",
+    "iperf3-malformed-tail.jsonl": "10fcd4c5f06efafb744b9039803a8f41e6b80fd56456e9568aa7fe740b9be26d",
+    "iperf3-reset.jsonl": "6b4505ca525edbd138b7d6b0e25dac74721de22bf990bde6e682babca3b5b591",
+    "iperf3-sender-only.json": "ff21e042270f0310bc231a26da554d4f3dce5df5843a86b2335e2f7ba622be42",
+    "iperf3.json": "51498f4f8ce5fe37f366314e1d8090962d24dfc00a61ae0859cb9f6f39a83218",
+    "iperf3.jsonl": "68d4736bf9499d51142dd666520c9762a681da222ca01af29576b420cda393e4",
+    "sockperf-corrupt.csv": "2fa4cddb1a806619d0c36c6a4e9325483b1f620363ca3d335d75b0f0f9277f4a",
+    "sockperf.csv": "45668448f2813825f3d13717dcdaae4286183d7fafeeda4b2c782a2642165914",
+    "sockperf.log": "19e5176c396406e49c1dd0f96e65d22ba1dbbd26da385a30d203c846bed4ba0a"
+  },
+  "required_modes": [
+    "acceptance",
+    "short_study",
+    "calibration",
+    "diagnostic_day"
+  ],
+  "source": "Synthetic non-secret test descriptions; files do not represent benchmark execution."
+}
