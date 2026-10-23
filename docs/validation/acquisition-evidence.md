@@ -357,5 +357,20 @@ The pinned Sockperf checkout's `src/sockperf.cpp` prints `MODULE_NAME ", version
 prints `sockperf, version 3.10`. Bootstrap now accepts this numeric version grammar without
 accepting unrelated comma text. The regression includes upstream compiled/copyright lines and
 uses the actual bootstrap-created Sockperf BuildObservation and sidecar ArtifactRecord in public
-binding/replay alongside iperf3. Full test and patch applicability results for this phase follow
-after the final gate.
+binding/replay alongside iperf3. The focused authentic-banner/bootstrap-and-replay regressions
+passed:
+
+```text
+PYTHONPATH=src:tests THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q \
+  tests/unit/test_bootstrap.py::test_pinned_bootstrap_records_observed_patch_and_capability_identity \
+  tests/integration/test_acquisition_producer.py::test_run_bootstrap_build_observation_materializes_and_replays_exact_multiline_identity
+exit 0: 2 passed in 0.41s
+```
+
+The full integrated suite on code head `09e7d5039bd369f32ab32dfdcff77b98f05a08d9`, with the
+official PowerShell executable on `PATH`, passed: `1003 passed in 104.41s`. Canonical schema
+validation and `git diff --check` exited 0. The exact pinned Sockperf source banner format was
+inspected in the zero-fuzz patch proof checkout (`src/sockperf.cpp:370`; `src/defs.h:286`); both
+packaged native patches again reverse-applied and reapplied with `--fuzz=0`, all four operations
+exiting 0. No native compilation/help, cloud, SSH, credentials, or benchmark traffic was run.
