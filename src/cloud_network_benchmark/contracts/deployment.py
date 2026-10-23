@@ -186,10 +186,10 @@ class ProviderDeploymentInput(StrictModel):
         purchase_values = {
             Provider.AWS: {"instance_market_type": {"on_demand"}},
             Provider.AZURE: {"priority": {"Regular"}, "eviction_policy": {"Delete"}},
-            Provider.GCP: {"provisioning_model": {"STANDARD"}, "instance_termination_action": {"DELETE"}},
+            Provider.GCP: {"provisioning_model": {"STANDARD"}, "instance_termination_action": {"STOP"}},
         }
         for name, allowed in purchase_values[provider].items():
-            if self.provider_options.get(name) not in allowed:
+            if not any(self.provider_options.get(name) == value for value in allowed):
                 raise ValueError(f"invalid provider option {name} for {provider.value}")
         if provider == Provider.AZURE:
             price = self.provider_options.get("max_price")
@@ -224,6 +224,25 @@ class ProviderDeploymentInput(StrictModel):
         if self.scenario == Scenario.INTER_REGION and not (not region_equal and self.placement.kind == "none"):
             raise ValueError("inter_region deployment requires distinct regions and no placement optimization")
         return self
+
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> Dict[str, Any]:
+        schema = handler(core_schema)
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"provider": {"const": "gcp"}}, "required": ["provider"]},
+            "then": {"properties": {"provider_options": {
+                "type": "object",
+                "required": ["provisioning_model", "instance_termination_action"],
+                "minProperties": 2,
+                "maxProperties": 2,
+                "properties": {
+                    "provisioning_model": {"const": "STANDARD"},
+                    "instance_termination_action": {"const": "STOP"},
+                },
+            }}},
+        })
+        return schema
 
 
 class ProviderVmOutput(StrictModel):
