@@ -1,0 +1,13 @@
+{
+  "id": "gcp-template-placement-support-2026-10-23",
+  "prices_checked_on": "2026-10-23",
+  "source_path": "tests/fixtures/gcp/zero-support-cost-source.md",
+  "source_sha256": "ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf",
+  "official_sources": [
+    "https://docs.cloud.google.com/compute/docs/instance-templates",
+    "https://docs.cloud.google.com/compute/docs/instances/use-compact-placement-policies"
+  ],
+  "template_support_cost_usd": 0,
+  "placement_policy_support_cost_usd": 0,
+  "rationale": "Templates are explicitly documented as having no additional charge. Compact placement policy is recorded as no separate support line item; verify before paid admission. Compute, disks, public IPv4, transfer, tax and uncertainty remain separately priced."
+}
