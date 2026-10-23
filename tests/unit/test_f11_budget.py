@@ -94,9 +94,9 @@ def test_full_remaining_and_reserved_liabilities_obey_working_and_total_caps(tmp
 def test_preparation_can_overlap_slot_wait_but_wait_consumes_original_cap():
     start=datetime(2026,10,22,tzinfo=timezone.utc)
     allowance=WorkflowAllowance(10,20,10,60,76,1,10,10,"slot-policy",{"aws":60})
-    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=50)) == 196
-    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=200)) == 296
-    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=200),preparation_can_overlap=False) == 396
+    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=50)) == 197
+    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=200)) == 297
+    assert allowance.fit_seconds(now=start,scheduled_start=start+timedelta(seconds=200),preparation_can_overlap=False) == 397
 
 
 def test_mode_minimums_match_explicit_test_only_policy_cases():
@@ -114,8 +114,8 @@ def test_complete_workflow_exact_earliest_trigger_boundary(tmp_path,workflow_sec
     book.initialize(costs)
     campaign,_=resolve_campaign(ROOT/"configs/tests/exp-903-three-provider-smoke.yaml",ROOT)
     providers=[Provider.AWS,Provider.AZURE,Provider.GCP]
-    # Shared required work is fixed at 176s; provision absorbs the remaining test-only duration.
-    fixed=10+10+60+76+10+10
+    # Shared required work includes one second of shutdown grace; provision absorbs the remainder.
+    fixed=10+10+60+76+1+10+10
     allowance=WorkflowAllowance(10,workflow_seconds-fixed,10,60,76,1,10,10,"trigger-policy",
         {provider.value:60 for provider in providers})
     request=ReservationRequest(schema_version=2,campaign_id=f"F11-trigger-{workflow_seconds}",config_id=campaign.config_id,

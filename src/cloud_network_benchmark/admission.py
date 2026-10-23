@@ -313,7 +313,7 @@ class WorkflowAllowance:
     @property
     def total_seconds(self) -> float:
         return sum(getattr(self, name) for name in ("registration_seconds", "provision_seconds", "readiness_seconds",
-                   "stabilization_seconds", "measurement_seconds", "retrieval_seconds", "cleanup_seconds"))
+                   "stabilization_seconds", "measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"))
 
     @property
     def preparation_seconds(self) -> float:
@@ -327,7 +327,7 @@ class WorkflowAllowance:
             preparation = max(preparation, wait)
         else:
             preparation += wait
-        return preparation + self.measurement_seconds + self.retrieval_seconds + self.cleanup_seconds
+        return preparation + self.measurement_seconds + self.measurement_shutdown_seconds + self.retrieval_seconds + self.cleanup_seconds
 
 
 @dataclass(frozen=True)
@@ -755,6 +755,8 @@ class BudgetLedger:
             reasons.append("identity_mismatch")
         min_measurement = minimum_protocol_seconds(campaign.mode)
         if plan.allowance.stabilization_seconds != 60 or plan.allowance.measurement_shutdown_seconds <= 0 or plan.allowance.measurement_seconds < min_measurement + plan.allowance.measurement_shutdown_seconds:
+            reasons.append("workflow_time_insufficient")
+        if plan.allowance.completed_stages:
             reasons.append("workflow_time_insufficient")
         if campaign.admission.requires_schedule and campaign.scheduled_start is None:
             reasons.append("schedule_pending")
