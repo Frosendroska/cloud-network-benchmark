@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, register_expiry, provision, destroy
+from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, register_expiry, provision, destroy, build_pair_inputs
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
 from cloud_network_benchmark.contracts.execution import CommandResult
@@ -27,10 +27,12 @@ def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: P
 class AutomationRunner:
     def __init__(self, deployment_input, options_input, now, fail_at=None, publish_delay=0, bad_key_for=None, wrong_vm_id_for=None,
                  stale_nonce_for=None, image_architecture="x64", wrong_role_definition=False,
-                 image_publisher="Canonical", image_offer="ubuntu2404", image_sku="ubuntu2404", vm_image_mismatch=False):
+                 image_publisher="Canonical", image_offer=None, image_sku=None, vm_image_mismatch=False,
+                 image_os="Linux", module_recheck=None, marketplace_response=None):
         self.d=deployment_input; self.o=options_input; self.now=now; self.fail_at=fail_at; self.publish_delay=publish_delay; self.bad_key_for=bad_key_for; self.wrong_vm_id_for=wrong_vm_id_for
         self.stale_nonce_for=stale_nonce_for; self.image_architecture=image_architecture; self.wrong_role_definition=wrong_role_definition
         self.image_publisher=image_publisher; self.image_offer=image_offer; self.image_sku=image_sku; self.vm_image_mismatch=vm_image_mismatch
+        self.image_os=image_os; self.module_recheck=module_recheck; self.marketplace_response=marketplace_response
         self.publish_reads=0; self.requests=[]; self.script=""; self.schedule={}; self.binding={}; self.tamper_recheck=None
         self.name=_slug(deployment_input)
         self.account=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Automation/automationAccounts/{self.name}-auto"
@@ -82,13 +84,16 @@ class AutomationRunner:
         elif request.action_type=="expiry_role_definition_recheck":
             out=json.dumps([{"id":self.role_id,"assignableScopes":[self.group_id],"permissions":[{"actions":["Microsoft.Compute/virtualMachines/read","Microsoft.Compute/virtualMachines/instanceView/read","Microsoft.Compute/virtualMachines/deallocate/action"],"notActions":[],"dataActions":[],"notDataActions":[]}]}])
         elif request.action_type=="automation_module_readback": out=json.dumps({"properties":{"provisioningState":"Succeeded","version":"3.0.0"}})
+        elif request.action_type=="expiry_module_recheck": out=json.dumps(self.module_recheck if self.module_recheck is not None else {"properties":{"provisioningState":"Succeeded","version":"3.0.0"}})
         elif request.action_type in {"automation_account_readback","expiry_account_recheck"}: out=json.dumps({"identity":{"type":"SystemAssigned","principalId":"00000000-0000-0000-0000-000000000003"}})
         elif request.action_type=="image_preflight":
             if "--urn" in request.argv:
                 _,offer,sku,version=request.argv[request.argv.index("--urn")+1].split(":")
-                out=json.dumps({"architecture":self.image_architecture,"publisher":self.image_publisher,"offer":offer,"sku":sku,"version":version})
+                image_id=(f"/subscriptions/{self.o.subscription_id}/providers/Microsoft.Compute/locations/germanywestcentral/publishers/{self.image_publisher}/artifacttypes/vmimage/offers/{self.image_offer or offer}/skus/{self.image_sku or sku}/versions/{version}")
+                payload={"id":image_id,"name":version,"location":"germanywestcentral","properties":{"architecture":self.image_architecture,"osDiskImage":{"operatingSystem":self.image_os}}}
+                out=json.dumps(self.marketplace_response if self.marketplace_response is not None else payload)
             else:
-                out=json.dumps({"architecture":self.image_architecture,"identifier":{"publisher":self.image_publisher,"offer":self.image_offer,"sku":self.image_sku}})
+                out=json.dumps({"architecture":self.image_architecture,"identifier":{"publisher":self.image_publisher,"offer":self.image_offer or "ubuntu2404","sku":self.image_sku or "ubuntu2404"}})
         elif request.action_type=="image_version_preflight":
             out=json.dumps({"id":request.argv[request.argv.index("--ids")+1],"name":"24.04.20261001"})
         elif request.action_type=="vm_image_observation":
@@ -101,10 +106,11 @@ class AutomationRunner:
 
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
-                 account_present=True, present_children=None, **kwargs):
+                 account_present=True, present_children=None, role_definition_inventory="[]", **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
+        self.role_definition_inventory=role_definition_inventory
         self.present_children=set(present_children if present_children is not None else {"jobSchedules","schedules","runbooks"})
     def run(self, request):
         if request.action_type=="pair_destroy" and self.secret_output:
@@ -124,7 +130,7 @@ class CleanupRunner(AutomationRunner):
             out="" if self.blank_inventory else json.dumps({"value":resources,"nextLink":url+"?api-version=2021-04-01&$skiptoken=two"})
         elif request.action_type=="expiry_inventory": self.requests.append(request); out="false"
         elif request.action_type=="role_cleanup_inventory": self.requests.append(request); out="[]"
-        elif request.action_type=="role_definition_cleanup_inventory": self.requests.append(request); out="[]"
+        elif request.action_type=="role_definition_cleanup_inventory": self.requests.append(request); out=self.role_definition_inventory
         elif request.action_type=="automation_account_absence":
             self.requests.append(request)
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr='{"error":{"code":"ResourceNotFound"}}')
@@ -252,6 +258,27 @@ def test_provision_rechecks_schedule_binding_and_role_before_pair_apply(reposito
     assert "pair_apply" not in [r.action_type for r in runner.requests]
 
 
+@pytest.mark.parametrize("module", [
+    {},
+    {"properties":{"provisioningState":"Failed","version":"3.0.0"}},
+    {"properties":{"provisioningState":"Succeeded"}},
+    {"properties":{"provisioningState":"Succeeded","version":"3.1.0"}},
+])
+def test_provision_rechecks_current_az_accounts_module_before_pair_apply(repository_root: Path,tmp_path: Path,module):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    runner=AutomationRunner(d,o,now,module_recheck=module)
+    runner.script=registration.script; runner.schedule=registration.schedule; runner.binding=registration.binding
+    runner.publish_reads=registration.publish_reads
+    result=provision(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    actions=[request.action_type for request in runner.requests]
+    assert result.cleanup_required and result.deployment is None
+    assert "expiry_module_recheck" in actions
+    assert "pair_apply" not in actions
+
+
 def test_registered_pair_provision_normalizes_both_vms_and_materializes_authenticated_known_hosts(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
@@ -334,6 +361,46 @@ def test_marketplace_image_metadata_uses_exact_x64_canonical_urn(repository_root
     runner=AutomationRunner(d,o,datetime.now(timezone.utc))
     image=_validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.)
     assert image["architecture"]=="x64" and image["publisher"]=="Canonical" and image["version"]=="24.04.20261001"
+    assert image["operating_system"]=="Linux"
+
+
+@pytest.mark.parametrize("response", [
+    {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
+     "name":"24.04.20261001","properties":{"osDiskImage":{"operatingSystem":"Linux"}}},
+    {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
+     "name":"24.04.20261002","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}}},
+    {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/debian/skus/server/versions/24.04.20261001",
+     "name":"24.04.20261001","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Linux"}}},
+    {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
+     "name":"24.04.20261001","properties":{"architecture":"Arm64","osDiskImage":{"operatingSystem":"Linux"}}},
+    {"id":"/subscriptions/x/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
+     "name":"24.04.20261001","properties":{"architecture":"x64","osDiskImage":{"operatingSystem":"Windows"}}},
+])
+def test_marketplace_compute_readback_requires_complete_matching_x64_linux_identity(repository_root:Path,tmp_path:Path,response):
+    from cloud_network_benchmark.azure_provider import _validate_image_metadata, _workspace
+    d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    selected="Canonical:ubuntu-24_04-lts:server:24.04.20261001"
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"selected_image":selected})
+    runner=AutomationRunner(d,o,datetime.now(timezone.utc),marketplace_response=response)
+    with pytest.raises(ValueError):
+        _validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.)
+
+
+def test_absolute_nonzero_monotonic_origin_survives_mapping_registration_provision_and_cleanup(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16),"cap_deadline_monotonic":501001})
+    assert build_pair_inputs(d,o)["scenario"]=="same_zone"
+    registration=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:500001.,utc_now=lambda:now)
+    assert expiry.state=="registered"
+    runner=AutomationRunner(d,o,now)
+    runner.script=registration.script; runner.schedule=registration.schedule; runner.binding=registration.binding
+    runner.publish_reads=registration.publish_reads
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    result=provision(registered,o,runner,clock=lambda:500002.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.deployment is not None and "pair_apply" in [r.action_type for r in runner.requests], result.failures
+    cleanup=destroy(registered,o,CleanupRunner(d,o,now),clock=lambda:500003.,utc_now=lambda:now+timedelta(seconds=2))
+    assert cleanup.cleanup_state=="succeeded" and not cleanup.launch_blocked, cleanup.failures
 
 
 def test_fresh_cap_is_rechecked_after_last_expiry_read_and_before_apply(repository_root: Path,tmp_path: Path):
@@ -464,6 +531,19 @@ def test_blank_complete_inventory_fails_closed_and_preserves_launch_block(reposi
     assert result.cleanup_state=="failed" and result.launch_blocked
     assert "pair_inventory_page_2" not in [r.action_type for r in runner.requests]
     assert not any(r.action_type.endswith("_delete") for r in runner.requests)
+
+
+@pytest.mark.parametrize("inventory", ["[{\"malformed\":\"no id\"}]", "[null]", "[{\"id\":\"foreign-role\"}]"])
+def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_blocks_launch(repository_root:Path,tmp_path:Path,inventory):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    runner=CleanupRunner(d,o,now,role_definition_inventory=inventory)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.cleanup_state=="failed" and result.launch_blocked
+    assert "role definition inventory" in result.failures[0].message
+    assert (o.attempt_root/"recovery.json").exists()
 
 
 def test_interrupted_registration_reuses_observed_job_identity(repository_root:Path,tmp_path:Path):

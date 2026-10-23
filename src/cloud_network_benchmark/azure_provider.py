@@ -174,7 +174,8 @@ def _slug(d: ProviderDeploymentInput) -> str:
 
 
 def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: datetime,
-                     mono: float, *, require_registered: bool = False) -> tuple[str, list[str]]:
+                     mono: float | None, *, require_registered: bool = False,
+                     check_live_clock: bool = True) -> tuple[str, list[str]]:
     if Provider(d.provider) != Provider.AZURE:
         raise ValueError("Azure driver requires provider=azure")
     if d.vm_a.vm_shape != "Standard_D4s_v5" or d.vm_b.vm_shape != "Standard_D4s_v5":
@@ -217,16 +218,19 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
     expiry_cost_bound = float(o.expiry_cost_input["automation_rate_per_job_minute"]) * float(o.expiry_cost_input["job_minutes_bound"])
     if expiry_cost_bound > reservation.reserved_cost_usd.value:
         raise ValueError("bounded Azure expiry job cost exceeds the explicitly reserved deployment cost")
-    if reservation.expires_at.value <= now or mono >= o.cap_deadline_monotonic:
-        raise ValueError("reservation/deadline has expired")
-    if now + timedelta(seconds=o.cap_deadline_monotonic-mono) > reservation.expires_at.value:
-        raise ValueError("original monotonic deadline extends beyond the reserved UTC cap")
-    if o.retry_end_at <= now or o.retry_end_at > reservation.expires_at.value:
-        raise ValueError("retry end must follow trigger and remain within original reservation")
-    if reservation.cap_started_at.value + timedelta(seconds=o.complete_workflow_seconds) > now + timedelta(seconds=(o.cap_deadline_monotonic-mono)):
-        raise ValueError("complete workflow bound exceeds original cap")
-    if (reservation.expires_at.value - now).total_seconds() < o.post_registration_workflow_seconds:
-        raise ValueError("post-registration workflow does not fit before trigger")
+    if check_live_clock:
+        if mono is None:
+            raise ValueError("live Azure request validation requires the injected monotonic clock")
+        if reservation.expires_at.value <= now or mono >= o.cap_deadline_monotonic:
+            raise ValueError("reservation/deadline has expired")
+        if now + timedelta(seconds=o.cap_deadline_monotonic-mono) > reservation.expires_at.value:
+            raise ValueError("original monotonic deadline extends beyond the reserved UTC cap")
+        if o.retry_end_at <= now or o.retry_end_at > reservation.expires_at.value:
+            raise ValueError("retry end must follow trigger and remain within original reservation")
+        if reservation.cap_started_at.value + timedelta(seconds=o.complete_workflow_seconds) > now + timedelta(seconds=(o.cap_deadline_monotonic-mono)):
+            raise ValueError("complete workflow bound exceeds original cap")
+        if (reservation.expires_at.value - now).total_seconds() < o.post_registration_workflow_seconds:
+            raise ValueError("post-registration workflow does not fit before trigger")
     if reservation.cap_started_at.value + timedelta(seconds=o.complete_workflow_seconds) > reservation.expires_at.value:
         raise ValueError("complete workflow exceeds reserved cap")
     if d.admission.priority in {"P2", "P3"} and not o.admission_evidence.get("priority_review_reference"):
@@ -378,8 +382,7 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
     if reservation is None or reservation.cap_started_at.value is None:
         raise ValueError("matching active reservation evidence is required")
     now = reservation.cap_started_at.value
-    mono = 0.0
-    _validate_request(deployment, options, now, mono)
+    _validate_request(deployment, options, now, None, check_live_clock=False)
     scenario = Scenario(deployment.scenario)
     return {"resource_group_name": _slug(deployment), "location": "germanywestcentral",
         "subscription_id": options.subscription_id, "deployment_id": deployment.deployment_id,
@@ -756,6 +759,17 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
             or permissions[0].get("notActions", []) or permissions[0].get("dataActions", [])
             or permissions[0].get("notDataActions", [])):
         raise RuntimeError("registered expiry custom role is absent or broader than deallocate-only")
+    module_url = f"{account}/modules/Az.Accounts?api-version={AUTOMATION_API}"
+    module = json.loads(_command(runner, options, root, _azure_rest("GET", module_url), "expiry_module_recheck", clock).stdout or "{}")
+    module_props = module.get("properties") if isinstance(module, dict) else None
+    expected_module = m.get("module") if isinstance(m.get("module"), dict) else {}
+    if (not isinstance(module_props, dict)
+            or module_props.get("provisioningState") != "Succeeded"
+            or not isinstance(module_props.get("version"), str)
+            or not module_props["version"].strip()
+            or module_props["version"] != expected_module.get("version")
+            or expected_module.get("name") != "Az.Accounts"):
+        raise RuntimeError("registered Az.Accounts Automation module is absent, not ready, or changed")
     if expiry.expires_at.value <= now or (expiry.expires_at.value - now).total_seconds() < options.post_registration_workflow_seconds:
         raise ValueError("registered expiry no longer covers the complete remaining workflow")
 
@@ -855,11 +869,25 @@ def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner
                 "version":version.get("name") or version_id.rstrip("/").split("/")[-1],"source":"shared_gallery"}
     else:
         result=json.loads(_command(runner,options,root,["az","vm","image","show","--location","germanywestcentral","--urn",image,"--output","json"],"image_preflight",clock).stdout)
-        props=result.get("properties",{})
-        actual={"id":result.get("id"),"architecture":result.get("architecture",props.get("architecture")),"publisher":result.get("publisher",props.get("publisher")),
-                "offer":result.get("offer",props.get("offer")),"sku":result.get("sku",props.get("sku")),"version":result.get("version",props.get("version")),"source":"marketplace"}
+        props=result.get("properties") if isinstance(result,dict) else None
+        image_id=result.get("id") if isinstance(result,dict) else None
+        image_name=result.get("name") if isinstance(result,dict) else None
+        if not isinstance(props,dict) or not isinstance(image_id,str) or not isinstance(image_name,str):
+            raise ValueError("Marketplace image response lacks Compute image identity or properties")
+        match=re.search(r"/publishers/([^/]+)/artifacttypes/vmimage/offers/([^/]+)/skus/([^/]+)/versions/([^/]+)$",image_id,re.IGNORECASE)
+        if match is None:
+            raise ValueError("Marketplace image resource ID does not contain the requested Compute identity")
+        publisher,offer,sku,version=match.groups()
+        os_metadata=props.get("osDiskImage")
+        actual={"id":image_id,"architecture":props.get("architecture"),"operating_system":os_metadata.get("operatingSystem") if isinstance(os_metadata,dict) else None,
+                "publisher":publisher,"offer":offer,"sku":sku,"version":image_name,"source":"marketplace"}
+        if image_name.lower()!=version.lower():
+            raise ValueError("Marketplace image name and resource version identity disagree")
     if str(actual.get("architecture") or "").lower() not in {"x64","amd64"} or str(actual.get("publisher") or "").lower()!="canonical" or not re.search(r"(?i)(ubuntu-24_04|ubuntu-24\.04|ubuntu2404|noble)",str(actual.get("offer",""))+" "+str(actual.get("sku",""))):
         raise ValueError("selected Azure image metadata does not prove x64 Canonical Ubuntu 24.04")
+    if ((not image.startswith("/") and actual.get("operating_system") != "Linux")
+            or (image.startswith("/") and actual.get("operating_system") not in (None, "Linux"))):
+        raise ValueError("selected Azure image metadata does not prove a Linux operating system")
     if image.startswith("/") and str(actual.get("id","")).lower()!=image.lower():
         raise ValueError("selected shared gallery image version identity mismatch")
     if not image.startswith("/") and (actual.get("publisher","").lower(),actual.get("offer","").lower(),actual.get("sku","").lower(),str(actual.get("version","")))!=tuple(x.lower() for x in image.split(":")):
@@ -1122,8 +1150,15 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         definitions=json.loads(residual_defs.stdout)
         if not isinstance(definitions,list): raise RuntimeError("custom role definition inventory is malformed")
         expected_role=str(prereq.get("role_definition_id","")).lower()
-        if any(isinstance(item,dict) and str(item.get("id","")).lower()==expected_role for item in definitions):
+        if not expected_role.strip() and definitions:
+            raise RuntimeError("custom role definition identity is missing while inventory contains entries")
+        for item in definitions:
+            if not isinstance(item,dict) or not isinstance(item.get("id"),str) or not item["id"].strip():
+                raise RuntimeError("custom role definition inventory contains an unknown or malformed entry")
+        if any(item["id"].lower()==expected_role for item in definitions):
             raise RuntimeError("attempt custom role definition remains after expiry destroy")
+        if definitions:
+            raise RuntimeError("custom role definition inventory contains an unexpected identity")
         actions.append(_safe_cleanup_action(options,residual_defs))
         shutil.rmtree(root)
         cleanup=CleanupState.SUCCEEDED; blocked=False
