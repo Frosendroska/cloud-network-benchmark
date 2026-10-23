@@ -51,7 +51,7 @@ Exact patch digests packaged for the pinned commits:
 | Patch | SHA-256 |
 | --- | --- |
 | `sockperf-3.10-acquisition.patch` | `3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285` |
-| `iperf-3.17.1-acquisition.patch` | `2619b1070eabbef72dd648372f7eecec2140d08f87e5a237685d98c5802f49df` |
+| `iperf-3.17.1-acquisition.patch` | `11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661` |
 
 The source archives were fetched from the official GitHub repository archive endpoints at the
 pinned commits. Their downloaded gzip bytes had SHA-256
@@ -143,9 +143,10 @@ day chunk without positive post-warm-up support remains unknown. Compilation is 
 
 ## Serialized convergence repair (T021–T025)
 
-The coordinator appended five trust-boundary tasks. The feature owner completed them in two code
-commits: `f29156c4c528034a2b8cbd6e073c5bc62b8747a2` and
-`f92232ed0f57f606d8bbeb35552e616155f4eda1`. The branch already contained verified `origin/main`
+The coordinator appended five trust-boundary tasks. The feature owner completed them in three code
+commits: `f29156c4c528034a2b8cbd6e073c5bc62b8747a2`,
+`f92232ed0f57f606d8bbeb35552e616155f4eda1`, and
+`a89442c49dfc56d241337261c54fb557fc10b534`. The branch already contained verified `origin/main`
 at `e03a07eaa5ed9ea372c695db19fd6fbcffdad024`; a normal merge check returned “Already up to date.”
 
 Bootstrap now emits an immutable `CNB_BUILD_V1` sidecar with source/archive, upstream, patch,
@@ -162,12 +163,18 @@ and report an unknown tail per source. Other units' valid sources remain indepen
 numerator intersects probe inner support with the union of receiver inner support while retaining
 the full continuous receiver envelope in the denominator.
 
-Validation on the final code before documentation updates:
+Validation on the final code before documentation updates, including native omitted-row
+corroboration against each stream's post-omit reset origin:
 
 ```text
 env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
   /private/tmp/cnb-offline-venv/bin/python -m pytest -q
-exit 0: 824 passed in 63.24s
+  exit 0: 824 passed in 63.21s
+
+env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest \
+  tests/integration/test_acquisition_producer.py -q
+  exit 0: 26 passed in 19.01s
 
 env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
   /private/tmp/cnb-offline-venv/bin/python -m pytest \
@@ -175,7 +182,7 @@ env PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
   tests/integration/test_acquisition_producer.py tests/unit/test_bootstrap.py \
   tests/unit/test_measurement_commands.py tests/unit/test_measurement_modes.py \
   tests/integration/test_measurement_runner.py -q
-exit 0: 114 passed in 28.50s
+  exit 0: 114 passed in 28.96s
 
 env PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python \
   -m cloud_network_benchmark.contracts.schema \
@@ -198,12 +205,17 @@ the research hashes before application: `src/iperf_api.c`
 `src/client.cpp` matched research hash
 `a79a3b29dfad3f7c5adf8f93f770598d6cd6d380889c00d63a179f127534245f`.
 
-The source application commands returned 0:
+For a final patch-application check, the exact extracted pinned-source trees previously used for
+patch validation were copied into `/private/tmp/cnb-acquisition-final-patch-proof/`. The
+coordinator-verified patch that had been applied to each copy was first reverse-applied with
+`--fuzz=0`; the resulting original source files matched the listed upstream SHA-256 values. The
+current packaged patches were then applied to those same reconstructed trees with `--fuzz=0`; all
+reverse and forward patch commands returned 0. The forward commands were:
 
 ```text
-patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-repair2-source-check/iperf \
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-final-patch-proof/iperf \
   < src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch
-patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-repair2-source-check/sockperf \
+patch --batch --fuzz=0 -p1 -d /private/tmp/cnb-acquisition-final-patch-proof/sockperf \
   < src/cloud_network_benchmark/tool_patches/sockperf-3.10-acquisition.patch
 ```
 
@@ -212,4 +224,5 @@ Linux compile, installed tool help check, patched executable run, guest clock ve
 SSH, benchmark traffic, and credential use were not run. The retrieval integration fixture now
 matches exact unit command IDs and artifact paths so similarly prefixed actions cannot be mistaken
 for the producing client; this fixture repair stays inside the assigned feature test harness.
-Convergence task markers T021–T025 are checked, for 25 total feature tasks.
+Convergence task markers T021–T025 are checked, for 25 total feature tasks. The final code head
+before this documentation update was `a89442c49dfc56d241337261c54fb557fc10b534`.
