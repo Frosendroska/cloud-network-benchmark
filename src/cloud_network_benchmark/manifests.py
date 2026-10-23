@@ -660,6 +660,81 @@ def update_child_evidence(
     return updated
 
 
+def update_child_runtime_evidence(
+    manifest_path: Path,
+    occurred_at: datetime,
+    *,
+    reservation: Optional[ReservationEvidence] = None,
+    expiry: Optional[ExpiryEvidence] = None,
+    commands: Optional[List[CommandEvidence]] = None,
+    timings: Optional[List[MeasurementTiming]] = None,
+    artifact_records: Optional[List[ArtifactRecord]] = None,
+    retrieval_failure: Optional[FailureEvidence] = None,
+    validation_status: Optional[ValidationStatus] = None,
+    parent_manifest_path: Optional[Path] = None,
+    fault: FaultInjector = no_fault,
+) -> ChildRunManifest:
+    """Atomically append/update existing lifecycle evidence without widening its schema.
+
+    The function validates the complete resulting ChildRunManifest before writing.
+    Retrieval failure is first-cause evidence and is never replaced by a later error.
+    """
+    supplied = (reservation, expiry, commands, timings, artifact_records,
+                retrieval_failure, validation_status)
+    if all(value is None for value in supplied):
+        raise ValueError("at least one runtime evidence field must be supplied")
+    manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None or occurred_at < manifest.updated_at:
+        raise ValueError("occurred_at must be timezone-aware and not earlier than manifest updated_at")
+    updates: Dict[str, Any] = {"updated_at": occurred_at}
+    if reservation is not None:
+        reservation = type(manifest.reservation.value).model_validate(reservation) if manifest.reservation.value else ReservationEvidence.model_validate(reservation)
+        if reservation.campaign_id != manifest.campaign_id:
+            raise ValueError("reservation must match child campaign identity")
+        updates["reservation"] = Evidence[ReservationEvidence](value=reservation)
+    if expiry is not None:
+        expiry = ExpiryEvidence.model_validate(expiry)
+        if (expiry.run_id, expiry.deployment_id, expiry.provider) != (manifest.run_id, manifest.deployment_id, manifest.provider):
+            raise ValueError("expiry must match child run, deployment and provider")
+        updates["expiry"] = Evidence[ExpiryEvidence](value=expiry)
+    for name, supplied_value in (("commands", commands), ("timings", timings), ("artifact_records", artifact_records)):
+        if supplied_value is None:
+            continue
+        model = {"commands": CommandEvidence, "timings": MeasurementTiming,
+                 "artifact_records": ArtifactRecord}[name]
+        observed = [model.model_validate(item) for item in supplied_value]
+        prior = getattr(manifest, name)
+        if name == "commands":
+            key = lambda item: (item.request.get("action_id"), item.deployment_id, item.unit_id)
+        elif name == "timings":
+            key = lambda item: item.unit_id
+        else:
+            key = lambda item: (item.artifact_id, item.path, item.unit_id)
+        combined = list(prior)
+        existing = {key(item) for item in prior}
+        for item in observed:
+            if key(item) in existing:
+                if item not in prior:
+                    raise ValueError(f"{name} update cannot overwrite existing evidence")
+                continue
+            existing.add(key(item))
+            combined.append(item)
+        updates[name] = combined
+    if retrieval_failure is not None and manifest.retrieval_failure is None:
+        failure = FailureEvidence.model_validate(retrieval_failure)
+        if not manifest.created_at <= failure.occurred_at <= occurred_at:
+            raise ValueError("retrieval failure time must be within the manifest timeline")
+        updates["retrieval_failure"] = failure
+    if validation_status is not None:
+        updates["validation_status"] = ValidationStatus.model_validate(validation_status)
+    updated = _validated_copy(manifest, updates)
+    atomic_write_json(manifest_path, _manifest_payload(updated), fault)
+    parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
+    if parent_path.exists():
+        recompute_parent_manifest(parent_path, occurred_at, "child runtime evidence updated", fault)
+    return updated
+
+
 def update_child_execution(
     manifest_path: Path,
     target: ExecutionState,

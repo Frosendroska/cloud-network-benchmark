@@ -1,0 +1,7 @@
+{
+  "evidence_label": "synthetic offline lifecycle evidence; not a provider observation",
+  "providers": ["aws", "azure", "gcp"],
+  "modes": ["acceptance", "short_study", "calibration", "diagnostic_day"],
+  "failure_stages": ["reserve", "protect", "claim", "create", "prepare", "ready", "measure", "diagnostics", "close", "inventory", "copy", "retry", "hash", "destination", "cleanup", "reconcile", "persistence"],
+  "invariants": ["no_create_before_all_protection", "no_automatic_replacement", "cleanup_all_started_providers", "preserve_primary_failure", "retry_only_failed_items_once"]
+}

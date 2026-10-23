@@ -210,7 +210,14 @@ def _evidence_failure(item: RetrievalItem, category: str, message: str, action_i
     return FailureEvidence(category=category, message=message, action_id=action_id, occurred_at=datetime.now(timezone.utc), details={"artifact_id": item.artifact_id})
 
 
-def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> RetrievalResult:
+def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic, max_attempts: int = 2, attempt_offset: int = 0, retry_admission: Callable[[RetrievalItem], bool] | None = None) -> RetrievalResult:
+    # Keep the historical two-attempt default for existing F02 callers. F09
+    # supplies an explicit one-retry ceiling and a fresh F11 check immediately
+    # before that retry. Validate before path creation or command execution.
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts not in (1, 2):
+        raise ValueError("max_attempts must be the strict integer 1 or 2")
+    if isinstance(attempt_offset, bool) or not isinstance(attempt_offset, int) or attempt_offset not in (0, 1) or attempt_offset + max_attempts > 2:
+        raise ValueError("attempt_offset and max_attempts must keep the total attempt number at or below 2")
     if manifest.deployment_id != connection.deployment_id or manifest.identity != connection.identity.model_dump():
         raise ValueError("retrieval manifest identity does not match connection")
     child_root = filesystem.resolve()
@@ -341,7 +348,17 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
         item_verified = False
         reason = "cleanup_allowance_reached_before_transfer"
         last_attempt = None
-        for attempt in (1, 2):
+        for attempt in range(attempt_offset + 1, attempt_offset + max_attempts + 1):
+            if attempt > 1 and retry_admission is not None:
+                try:
+                    admitted = retry_admission(item)
+                except Exception as exc:
+                    admitted = False
+                    reason = f"retry_admission_error:{type(exc).__name__}"
+                if not admitted:
+                    reason = reason or "retry_not_admitted"
+                    failures.append(_evidence_failure(item, reason, "failed artifact retry was refused by the fresh admission check").model_dump(mode="json"))
+                    break
             remaining = deadline.remaining(clock, cleanup=True)
             if remaining <= 0:
                 reason = "cleanup_allowance_reached_before_transfer"

@@ -1,6 +1,6 @@
 # F09 offline implementation acceptance
 
-This is a future implementation validation guide. Planning has not run the following F09 code checks; the modules/tests/commands do not yet exist. Never run lifecycle paid commands as part of this gate.
+This guide records the credential-free implementation checks. Never run lifecycle paid commands as part of this gate. Module-level preview is inspect-only; root CLI dispatch and final integrated checks wait for coordinator confirmation of F12 CLI integration.
 
 ## Environment
 
