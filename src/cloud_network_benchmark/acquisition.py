@@ -241,7 +241,7 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     if interval_count == 0:
         raise ValueError("iperf receiver interval evidence is missing")
     if native is not None:
-        native_settings = native["settings"]
+        native_settings = native["receiver_settings"]
         assert isinstance(native_settings, Mapping)
         expected_settings = {"protocol": str(settings["protocol"]).lower(), "num_streams": settings["num_streams"],
             "omit": settings["omit"], "duration": settings["duration"],
@@ -252,6 +252,14 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         if (any(actual_settings.get(key) != value for key, value in expected_settings.items())
                 or actual_settings.get("interval") != settings["interval_us"] / 1_000_000):
             raise ValueError("native iperf client settings do not corroborate receiver session settings")
+        client_settings = native.get("client_settings")
+        normalized_client_settings = dict(client_settings) if isinstance(client_settings, Mapping) else {}
+        if isinstance(normalized_client_settings.get("protocol"), str):
+            normalized_client_settings["protocol"] = normalized_client_settings["protocol"].lower()
+        if not isinstance(client_settings, Mapping) or any(
+                normalized_client_settings.get(key) != actual_settings.get(key)
+                for key in ("protocol", "num_streams", "omit", "duration", "interval", "blksize", "reverse")):
+            raise ValueError("native iperf client and receiver settings do not match")
         native_streams = native["streams"]
         if not isinstance(native_streams, list) or len(native_streams) != measured_interval_count:
             raise ValueError("native iperf receiver intervals do not match the observed interval count")
@@ -693,6 +701,12 @@ def _native_iperf_metadata(path: Path, expected_cookie: str) -> dict[str, object
                             return None
         if starts != 1 or settings is None or server_output is None:
             return None
+        receiver_start = server_output.get("start")
+        receiver_settings = (receiver_start.get("test_start")
+            if isinstance(receiver_start, dict) and isinstance(receiver_start.get("test_start"), dict)
+            else receiver_start)
+        if not isinstance(receiver_settings, dict):
+            return None
         intervals = server_output.get("intervals")
         if not isinstance(intervals, list) or not intervals:
             return None
@@ -703,7 +717,8 @@ def _native_iperf_metadata(path: Path, expected_cookie: str) -> dict[str, object
             streams.extend(item for item in interval["streams"] if isinstance(item, dict))
         if not streams:
             return None
-        return {"cookie": expected_cookie, "settings": settings, "server_output": server_output,
+        return {"cookie": expected_cookie, "client_settings": settings,
+                "receiver_settings": receiver_settings, "server_output": server_output,
                 "streams": streams}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None

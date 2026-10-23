@@ -37,8 +37,8 @@ def _record(root: Path, artifact_id: str, path: str, kind: str, producer: VmRole
 def _native_iperf(cookie: str, *, duration: int = 60, stream: int = 17,
                   start: float = -1.0, end: float = 1.0, byte_count: int = 0,
                   local_host: str = "10.0.0.2", remote_host: str = "10.0.0.1",
-                  interval_count: int = 1) -> bytes:
-    settings = {"protocol": "TCP", "num_streams": 1, "omit": 5, "duration": duration,
+                  interval_count: int = 1, omit: int = 5) -> bytes:
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": omit, "duration": duration,
         "interval": 1, "blksize": 131072, "reverse": False}
     rows = [{"socket": stream, "start": start + index, "end": end + index,
         "bytes": byte_count, "omitted": False, "sender": False} for index in range(interval_count)]
@@ -172,7 +172,8 @@ def test_f03_source_binder_replays_closed_sockperf_and_persistent_iperf_sources(
     assert windows["iperf3"][1].start_latest_ns == 5_000_001_000
 
 
-@pytest.mark.parametrize("mutation", ["cookie_only", "native_endpoint", "observation_bytes"])
+@pytest.mark.parametrize("mutation", ["cookie_only", "native_endpoint", "native_settings",
+    "native_stream", "observation_endpoint", "observation_bytes", "client_action_collision"])
 def test_iperf_replay_requires_native_receiver_corroboration(mutation, tmp_path):
     log_bytes = (ROOT / "iperf-receiver.log").read_bytes()
     native_bytes = _native_iperf("native-cookie-1")
@@ -180,6 +181,10 @@ def test_iperf_replay_requires_native_receiver_corroboration(mutation, tmp_path)
         native_bytes = b'{"start":{"cookie":"native-cookie-1"},"intervals":[]}\n'
     elif mutation == "native_endpoint":
         native_bytes = _native_iperf("native-cookie-1", remote_host="10.0.0.99")
+    elif mutation == "native_settings":
+        native_bytes = _native_iperf("native-cookie-1", omit=4)
+    elif mutation == "native_stream":
+        native_bytes = _native_iperf("native-cookie-1", stream=18)
     log = _record(tmp_path, "iperf-log", "retrieval/iperf.stderr", "iperf3-observation-stderr",
         VmRole.VM_B, log_bytes)
     native = _record(tmp_path, "iperf-client", "retrieval/iperf.json", "iperf3-json",
@@ -198,6 +203,17 @@ def test_iperf_replay_requires_native_receiver_corroboration(mutation, tmp_path)
         log = _record(tmp_path, "iperf-log", "retrieval/iperf.stderr", "iperf3-observation-stderr",
             VmRole.VM_B, changed)
         records = [log, native, *records[2:]]
+    elif mutation == "observation_endpoint":
+        changed = log_bytes.replace(b'"remote_host":"10.0.0.1"', b'"remote_host":"10.0.0.99"')
+        assert changed != log_bytes
+        log = _record(tmp_path, "iperf-log", "retrieval/iperf.stderr", "iperf3-observation-stderr",
+            VmRole.VM_B, changed)
+        records = [log, native, *records[2:]]
+    if mutation == "client_action_collision":
+        collision = _command("iperf3-short-multiflow-extra", VmRole.VM_A, "short-multiflow")
+        with pytest.raises(ValueError, match="one client command"):
+            list(iter_source_windows(tmp_path, sources[0], records, [collision, receiver], [build]))
+        return
     with pytest.raises(ValueError, match="native iperf|native iperf JSON"):
         list(iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]))
 
