@@ -1,9 +1,9 @@
 locals {
   subnet_a = var.scenario == "inter_region" ? "10.80.1.0/24" : "10.80.1.0/24"
-  subnet_b = var.scenario == "inter_region" ? "10.81.1.0/24" : var.scenario == "cross_zone" ? "10.80.2.0/24" : "10.80.1.0/24"
+  subnet_b = "10.81.1.0/24"
   region_a = join("-", slice(split("-", var.zone_a), 0, length(split("-", var.zone_a)) - 1))
   region_b = join("-", slice(split("-", var.zone_b), 0, length(split("-", var.zone_b)) - 1))
-  ips      = var.scenario == "cross_zone" ? ["10.80.1.10", "10.80.2.10"] : var.scenario == "inter_region" ? ["10.80.1.10", "10.81.1.11"] : ["10.80.1.10", "10.80.1.11"]
+  ips      = var.scenario == "inter_region" ? ["10.80.1.10", "10.81.1.11"] : ["10.80.1.10", "10.80.1.11"]
 }
 resource "google_compute_network" "attempt" {
   name                    = "${var.namespace}-net"
@@ -17,7 +17,7 @@ resource "google_compute_subnetwork" "a" {
   ip_cidr_range = local.subnet_a
 }
 resource "google_compute_subnetwork" "b" {
-  count         = var.scenario == "inter_region" || var.scenario == "cross_zone" ? 1 : 0
+  count         = var.scenario == "inter_region" ? 1 : 0
   name          = "${var.namespace}-b"
   region        = local.region_b
   network       = google_compute_network.attempt.id
@@ -66,8 +66,8 @@ resource "google_compute_resource_policy" "compact" {
   }
 }
 resource "google_compute_instance_template" "role" {
-  for_each       = { vm_a = { image = var.image_a, ip = local.ips[0], tag = "${var.namespace}-vm-a" }, vm_b = { image = var.image_b, ip = local.ips[1], tag = "${var.namespace}-vm-b" } }
-  name_prefix    = "${var.namespace}-${each.key}-"
+  for_each       = { vm_a = { image = var.image_a, ip = local.ips[0], tag = "${var.namespace}-vm-a", suffix = "a" }, vm_b = { image = var.image_b, ip = local.ips[1], tag = "${var.namespace}-vm-b", suffix = "b" } }
+  name           = "${var.namespace}-${each.value.suffix}"
   machine_type   = "n2-standard-4"
   can_ip_forward = false
   tags           = [each.value.tag]
@@ -84,6 +84,8 @@ resource "google_compute_instance_template" "role" {
     source_image = each.value.image
     disk_type    = "pd-balanced"
     disk_size_gb = 32
+    disk_name    = "${var.namespace}-${each.value.suffix}-boot"
+    labels       = var.labels
   }
   scheduling {
     provisioning_model          = "STANDARD"
@@ -92,5 +94,14 @@ resource "google_compute_instance_template" "role" {
     termination_time            = var.expiry_time
   }
   resource_policies = length(google_compute_resource_policy.compact) == 1 ? [google_compute_resource_policy.compact[0].id] : null
-  metadata          = { ssh-keys = "benchmark:${var.public_key}" }
+  reservation_affinity { type = "NO_RESERVATION" }
+  metadata = {
+    ssh-keys                = "benchmark:${var.public_key}"
+    enable-guest-attributes = "TRUE"
+    enable-oslogin          = "FALSE"
+    block-project-ssh-keys  = "TRUE"
+    cnb-bootstrap-template  = var.bootstrap_template
+    cnb-bootstrap-inputs    = jsonencode(var.bootstrap_inputs)
+    cnb-network-intent      = jsonencode(var.network_intent)
+  }
 }

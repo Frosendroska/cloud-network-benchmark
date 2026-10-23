@@ -12,3 +12,6 @@ variable "public_key" {
   sensitive = true
 }
 variable "labels" { type = map(string) }
+variable "bootstrap_template" { type = string }
+variable "bootstrap_inputs" { type = any }
+variable "network_intent" { type = any }
