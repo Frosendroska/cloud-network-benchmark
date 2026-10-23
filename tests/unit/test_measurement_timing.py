@@ -114,6 +114,33 @@ def test_source_window_rejects_boolean_or_reversed_bounds_and_omitted_is_not_cov
     assert not omitted.has_positive_inner_support
 
 
+def test_acquisition_coverage_memory_is_bounded_from_1000_to_100000_intervals():
+    import tracemalloc
+    from cloud_network_benchmark.acquisition import SourceWindow, overlap_coverage_lower_bound
+
+    boot = "12345678-1234-1234-1234-123456789abc"
+
+    def windows(count, tool):
+        for index in range(count):
+            start = index * 2_000
+            yield SourceWindow("receiver_measured" if tool == "iperf3" else "probe_enabled", tool,
+                "vm_a", boot, "CLOCK_MONOTONIC", "session" if tool == "iperf3" else None,
+                "stream" if tool == "iperf3" else None, start, start, start + 1_000, start + 1_000,
+                False if tool == "iperf3" else None, index, 1)
+
+    tracemalloc.start()
+    small = overlap_coverage_lower_bound(windows(1_000, "sockperf"), windows(1_000, "iperf3"))
+    _small_current, small_peak = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    large = overlap_coverage_lower_bound(windows(100_000, "sockperf"), windows(100_000, "iperf3"))
+    _large_current, large_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert small > large > 0.5
+    assert small == pytest.approx(0.5, abs=0.0003)
+    assert large == pytest.approx(0.5, abs=0.00001)
+    assert small_peak < 250_000 and large_peak < 250_000
+
+
 def test_receiver_duration_uses_only_receiver_side_sum_received():
     assert receiver_duration(json.dumps({"end": {"sum_sent": {"seconds": 60}}})) is None
     assert receiver_duration(json.dumps({"server_output": {"end": {"sum_received": {"seconds": 60.0}}}})) == 60.0

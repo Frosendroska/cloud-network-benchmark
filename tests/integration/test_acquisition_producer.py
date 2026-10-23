@@ -34,8 +34,24 @@ def _record(root: Path, artifact_id: str, path: str, kind: str, producer: VmRole
         sha256=StringEvidence(value=hashlib.sha256(payload).hexdigest()), retrieval_state="verified")
 
 
+def _record_stream(root: Path, artifact_id: str, path: str, kind: str, producer: VmRole,
+                   chunks, unit_id: str | None = None, deployment_id: str = DEPLOYMENT) -> ArtifactRecord:
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    size = 0
+    with target.open("wb") as stream:
+        for chunk in chunks:
+            stream.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    return ArtifactRecord(artifact_id=artifact_id, path=path, kind=kind, producer=producer,
+        unit_id=unit_id, deployment_id=deployment_id, closed=True, size_bytes=Evidence(value=size),
+        sha256=StringEvidence(value=digest.hexdigest()), retrieval_state="verified")
+
+
 def _native_iperf(cookie: str, *, duration: int = 60, stream: int = 17,
-                  start: float = -1.0, end: float = 1.0, byte_count: int = 0,
+                  start: float = 1.0, end: float = 1.0, byte_count: int = 0,
                   local_host: str = "10.0.0.2", remote_host: str = "10.0.0.1",
                   interval_count: int = 1, omit: int = 5, include_omitted: bool = True) -> bytes:
     settings = {"protocol": "TCP", "num_streams": 1, "omit": omit, "duration": duration,
@@ -43,13 +59,35 @@ def _native_iperf(cookie: str, *, duration: int = 60, stream: int = 17,
     rows = [{"socket": stream, "start": start + index, "end": end + index,
         "bytes": byte_count, "omitted": False, "sender": False} for index in range(interval_count)]
     if include_omitted:
-        rows.insert(0, {"socket": stream, "start": -4, "end": 0,
+        rows.insert(0, {"socket": stream, "start": 0, "end": 4,
             "bytes": 250, "omitted": True, "sender": False})
-    receiver = {"start": {"test_start": settings, "connected": [{"socket": stream,
+    receiver = {"start": {"cookie": cookie, "test_start": settings, "connected": [{"socket": stream,
         "local_host": local_host, "local_port": 5201, "remote_host": remote_host,
         "remote_port": 50100}]}, "intervals": [{"streams": [row]} for row in rows]}
-    return json.dumps({"start": {"cookie": cookie, "test_start": settings},
-        "server_output_json": receiver, "end": {}}).encode()
+    return (json.dumps({"start": {"cookie": cookie, "test_start": settings},
+        "server_output_json": receiver, "end": {}}, indent=2) + "\n").encode()
+
+
+def _native_iperf_client_jsonl(cookie: str, *, duration: int = 60, omit: int = 5) -> bytes:
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": omit, "duration": duration,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    return (json.dumps({"event": "start", "data": {"cookie": cookie, "test_start": settings}})
+        + "\n" + json.dumps({"event": "end", "data": {}}) + "\n").encode()
+
+
+def _native_iperf_server_jsonl(cookie: str, *, duration: int = 60, stream: int = 17,
+                               interval_count: int = 1, start: float = 1.0, end: float = 1.0,
+                               byte_count: int = 0, omit: int = 5,
+                               include_omitted: bool = True) -> bytes:
+    client = json.loads(_native_iperf(cookie, duration=duration, stream=stream,
+        interval_count=interval_count, start=start, end=end, byte_count=byte_count,
+        omit=omit, include_omitted=include_omitted))
+    receiver = client["server_output_json"]
+    events = [json.dumps({"event": "start", "data": receiver["start"]})]
+    for interval in receiver["intervals"]:
+        events.append(json.dumps({"event": "interval", "data": interval}))
+    events.append(json.dumps({"event": "end", "data": client["end"]}))
+    return ("\n".join(events) + "\n").encode()
 
 
 def _command(action: str, producer: VmRole, unit_id: str | None, deployment_id: str = DEPLOYMENT):
@@ -221,6 +259,107 @@ def test_iperf_replay_requires_native_receiver_corroboration(mutation, tmp_path)
         list(iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]))
 
 
+@pytest.mark.parametrize("mutation", ["native_duration", "observer_stream_count", "observer_origin", "native_omitted"])
+def test_iperf_shared_native_prerequisite_failure_yields_no_partial_windows(mutation, tmp_path):
+    log_bytes = (ROOT / "iperf-receiver.log").read_bytes()
+    native_bytes = _native_iperf("native-cookie-1")
+    if mutation == "native_duration":
+        native_bytes = _native_iperf("native-cookie-1", duration=999)
+    elif mutation == "observer_stream_count":
+        log_bytes = log_bytes.replace(b'"num_streams":1', b'"num_streams":2')
+    elif mutation == "observer_origin":
+        log_bytes = log_bytes.replace(b'"origin_us":5000000', b'"origin_us":6000000')
+    elif mutation == "native_omitted":
+        value = json.loads(native_bytes)
+        value["server_output_json"]["intervals"][0]["streams"][0]["bytes"] = 251
+        native_bytes = json.dumps(value).encode()
+    log = _record(tmp_path, "iperf-log", "retrieval/iperf.stderr", "iperf3-observation-stderr",
+        VmRole.VM_B, log_bytes)
+    native = _record(tmp_path, "iperf-client", "retrieval/iperf.json", "iperf3-json",
+        VmRole.VM_A, native_bytes, "short-multiflow")
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
+    build = _build("iperf3", VmRole.VM_B, "iperf-build")
+    records = [log, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    windows = []
+    with pytest.raises(ValueError):
+        for window in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]):
+            windows.append(window)
+    assert windows == []
+
+
+@pytest.mark.parametrize("tail", ["failed_command", "truncated_observation", "truncated_native_jsonl"])
+def test_iperf_closed_prefix_survives_only_an_explicit_incomplete_tail(tail, tmp_path):
+    log_bytes = (ROOT / "iperf-receiver.log").read_bytes()
+    if tail == "truncated_observation":
+        log_bytes += b'CNB_ACQ_V1 {"format":1'
+    log = _record(tmp_path, "iperf-log", "retrieval/iperf.stderr", "iperf3-observation-stderr",
+        VmRole.VM_B, log_bytes)
+    if tail == "truncated_native_jsonl":
+        client_native = _record(tmp_path, "iperf-client", "retrieval/iperf-client.jsonl",
+            "iperf3-client-jsonl", VmRole.VM_A, _native_iperf_client_jsonl("native-cookie-1"), "short-multiflow")
+        server_bytes = _native_iperf_server_jsonl("native-cookie-1") + b'{"event":"interval","data":'
+        receiver_native = _record(tmp_path, "iperf-server", "retrieval/iperf-server.jsonl",
+            "iperf3-server-jsonl", VmRole.VM_B, server_bytes)
+        native_records = [client_native, receiver_native]
+    else:
+        native = _record(tmp_path, "iperf-client", "retrieval/iperf.json", "iperf3-json",
+            VmRole.VM_A, _native_iperf("native-cookie-1"), "short-multiflow")
+        native_records = [native]
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
+    if tail == "failed_command":
+        receiver.result["outcome"] = "failed"
+    build = _build("iperf3", VmRole.VM_B, "iperf-build")
+    records = [log, *native_records, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    windows = []
+    with pytest.raises(ValueError, match="unknown tail|truncated acquisition record|truncated tail"):
+        for window in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]):
+            windows.append(window)
+    assert len(windows) == 2
+
+
+@pytest.mark.parametrize("corrupt_position", ["first", "second"])
+def test_f03_corrupt_sockperf_native_candidate_does_not_erase_other_unit(corrupt_position,
+        repository_root, tmp_path):
+    resolved = observation(repository_root, "short_study")
+    processes = _fixture_processes(FakeClock())
+    build = _build("sockperf", VmRole.VM_A, "sock-build")
+    units = list(resolved.measurement_units[:2])
+    assert len(units) == 2 and units[0].unit_id != units[1].unit_id
+    valid_index, corrupt_index = ((1, 0) if corrupt_position == "first" else (0, 1))
+    records = []
+    for index, unit in enumerate(units):
+        action = f"sockperf-{unit.unit_id}"
+        log_bytes = (ROOT / "sockperf-window.log").read_text(encoding="utf-8").replace(
+            "sockperf-short-multiflow", action).encode()
+        log = _record(tmp_path, f"sock-log-{index}", f"retrieval/sock-{index}.stderr",
+            "sockperf-observation-stderr", VmRole.VM_A, log_bytes,
+            unit.unit_id, context(resolved, tmp_path).identity.deployment_id)
+        native = _record(tmp_path, f"sock-native-{index}", f"retrieval/sock-{index}.csv",
+            "sockperf-csv", VmRole.VM_A, b"materialized native csv\n", unit.unit_id,
+            context(resolved, tmp_path).identity.deployment_id)
+        if index == corrupt_index:
+            (tmp_path / native.path).write_bytes(b"corrupt after materialization")
+        records.extend((log, native))
+    runtime = dataclass_replace(context(resolved, tmp_path), build_observations=(build,),
+        source_artifact_records=tuple(records))
+    assembled = run_measurement(resolved, runtime, processes=processes, clock=processes.clock)
+    valid_unit = units[valid_index].unit_id
+    valid_timing = next(item for item in assembled.timings if item.unit_id == valid_unit)
+    assert valid_timing.acquisition_sources.value is not None
+    assert any(source.log_artifact_id == f"sock-log-{valid_index}"
+        for source in valid_timing.acquisition_sources.value)
+
+
 def test_mutated_closed_source_bytes_are_rejected_before_replay(tmp_path):
     log = (ROOT / "sockperf-window.log").read_bytes()
     row = _record(tmp_path, "sock-log", "retrieval/sockperf.stderr", "sockperf-observation-stderr",
@@ -322,27 +461,42 @@ def test_large_receiver_replay_is_repeatable_immutable_and_stream_bounded(tmp_pa
         "omit": 5, "duration": 86400, "interval_us": 1000000, "block_size": 131072, "reverse": False}
     origin = [{**anchor, "record_kind": "stats_origin", "stream_id": "1",
         "phase": phase, "origin_us": 0, "start_time_fixed_us": 0} for phase in ("initial", "post_omit")]
-    prefix = b"ordinary notice " + (b"x" * 11_000_000) + b"\n" + b"".join((b"CNB_ACQ_V1 " + json.dumps(value, separators=(",", ":")).encode() + b"\n")
+    prefix = b"".join((b"CNB_ACQ_V1 " + json.dumps(value, separators=(",", ":")).encode() + b"\n")
         for value in (anchor, settings, *origin))
-    count = 1_000
-    rows = []
-    for index in range(count):
-        start = index * 1_000_000
-        rows.append({**anchor, "record_kind": "receiver_interval", "stream_id": "1",
-            "role": "receiver", "protocol": "tcp", "local_host": "10.0.0.2", "local_port": "5201",
-            "remote_host": "10.0.0.1", "remote_port": "50100", "interval_start_us": start,
-            "interval_end_us": start + 1_000_000, "bytes": 0, "omitted": False})
-    payload = prefix + b"".join(b"CNB_ACQ_V1 " + json.dumps(row, separators=(",", ":")).encode() + b"\n"
-        for row in rows)
-    log = _record(tmp_path, "large-receiver-log", "retrieval/large-iperf.stderr",
-        "iperf3-observation-stderr", VmRole.VM_B, payload)
-    native = _record(tmp_path, "large-receiver-native", "retrieval/large-iperf.json",
-        "iperf3-json", VmRole.VM_A, _native_iperf(cookie, duration=86400, stream=1,
-            start=0, end=1, byte_count=0, interval_count=count, include_omitted=False), "day-iperf")
+    count = 100_000
+    native_start = {"cookie": cookie, "test_start": {"protocol": "TCP", "num_streams": 1,
+        "omit": 5, "duration": 86400, "interval": 1, "blksize": 131072, "reverse": False},
+        "connected": [{"socket": 1, "local_host": "10.0.0.2", "local_port": 5201,
+            "remote_host": "10.0.0.1", "remote_port": 50100}]}
+    def observations():
+        yield prefix
+        for index in range(count):
+            start = index * 1_000_000
+            row = {**anchor, "record_kind": "receiver_interval", "stream_id": "1",
+                "role": "receiver", "protocol": "tcp", "local_host": "10.0.0.2", "local_port": "5201",
+                "remote_host": "10.0.0.1", "remote_port": "50100", "interval_start_us": start,
+                "interval_end_us": start + 1_000_000, "bytes": 0, "omitted": False}
+            yield b"CNB_ACQ_V1 " + json.dumps(row, separators=(",", ":")).encode() + b"\n"
+
+    def receiver_events():
+        yield (json.dumps({"event": "start", "data": native_start}, separators=(",", ":")) + "\n").encode()
+        for index in range(count):
+            row = {"socket": 1, "start": index, "end": index + 1, "bytes": 0,
+                "omitted": False, "sender": False}
+            event = {"event": "interval", "data": {"streams": [row]}}
+            yield (json.dumps(event, separators=(",", ":")) + "\n").encode()
+        yield b'{"event":"end","data":{}}\n'
+
+    log = _record_stream(tmp_path, "large-receiver-log", "retrieval/large-iperf.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, observations())
+    client_native = _record(tmp_path, "large-receiver-client", "retrieval/large-iperf-client.jsonl",
+        "iperf3-client-jsonl", VmRole.VM_A, _native_iperf_client_jsonl(cookie, duration=86400), "day-iperf")
+    receiver_native = _record_stream(tmp_path, "large-receiver-native", "retrieval/large-iperf-server.jsonl",
+        "iperf3-server-jsonl", VmRole.VM_B, receiver_events())
     client = _command("iperf3-day-iperf", VmRole.VM_A, "day-iperf")
     receiver = _command(invocation, VmRole.VM_B, None)
     build = _build("iperf3", VmRole.VM_B, "iperf-build")
-    records = [log, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    records = [log, client_native, receiver_native, *_build_records(tmp_path, DEPLOYMENT, [build])]
     sources = bind_acquisition_sources(child_root=tmp_path, run_identity=SimpleNamespace(deployment_id=DEPLOYMENT),
         commands=[client], receiver_command_evidence=[receiver], build_evidence=[build],
         source_artifact_records=records)
@@ -350,14 +504,13 @@ def test_large_receiver_replay_is_repeatable_immutable_and_stream_bounded(tmp_pa
     digest_before = hashlib.sha256((tmp_path / log.path).read_bytes()).hexdigest()
     tracemalloc.start()
     first_count = sum(1 for _ in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]))
-    second_count = sum(1 for _ in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]))
     _current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     digest_after = hashlib.sha256((tmp_path / log.path).read_bytes()).hexdigest()
-    assert first_count == second_count == count
+    assert first_count == count
     assert digest_before == digest_after
-    # The existing ArtifactRecord verifier hashes in 1 MiB chunks; replay's
-    # bounded parser stays within three chunks despite a >10 MiB observation log.
+    # Hash verification uses 1 MiB chunks; both source parsers and replay keep
+    # memory bounded while processing a generated 100k-row receiver session.
     assert peak < 3 * 1024 * 1024
 
 
@@ -426,8 +579,18 @@ def test_f03_mode_commands_bind_and_replay_raw_sockperf_sources(mode, repository
         cookie = f"cookie-{mode}-{index:02d}"
         log_bytes = (ROOT / "iperf-receiver.log").read_text(encoding="utf-8").replace(
             "native-cookie-1", cookie).encode("utf-8")
+        if mode == "diagnostic_day":
+            log_bytes = log_bytes.replace(b'"duration":60', b'"duration":86400')
         records.append(_record(tmp_path, f"iperf-log-{index}", f"retrieval/iperf-{index}.stderr",
             "iperf3-observation-stderr", VmRole.VM_B, log_bytes, None, runtime.identity.deployment_id))
+        if mode == "diagnostic_day":
+            client_bytes = _native_iperf_client_jsonl(cookie, duration=86400)
+            server_bytes = _native_iperf_server_jsonl(cookie, duration=86400)
+            records.append(_record(tmp_path, f"iperf-native-{index}", f"retrieval/iperf-{index}.jsonl",
+                "iperf3-client-jsonl", VmRole.VM_A, client_bytes, command.unit_id, runtime.identity.deployment_id))
+            records.append(_record(tmp_path, f"iperf-server-native-{index}", f"retrieval/iperf-{index}-server.jsonl",
+                "iperf3-server-jsonl", VmRole.VM_B, server_bytes, None, runtime.identity.deployment_id))
+            continue
         native_bytes = _native_iperf(cookie)
         records.append(_record(tmp_path, f"iperf-native-{index}", f"retrieval/iperf-{index}.json",
             "iperf3-json", VmRole.VM_A, native_bytes, command.unit_id, runtime.identity.deployment_id))

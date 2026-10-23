@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import math
 import base64
@@ -143,7 +144,8 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     last_interval: dict[str, tuple[int, int]] = {}
     settings: Mapping[str, object] | None = None
     interval_count = 0
-    omitted_observations: list[tuple[Mapping[str, object], str]] = []
+    native_streams = (native["stream_factory"]() if native is not None
+                      and not native.get("_preflight_complete") else None)
     for record in records:
         value = record.value
         _same_common(value, source)
@@ -220,11 +222,16 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
             if post_omit_origin is None:
                 raise ValueError("iperf post-omit statistic origin is missing before measured interval")
             origin_us = post_omit_origin
-        if native is not None:
-            if omitted:
-                omitted_observations.append((value, stream))
-            else:
-                _corroborate_iperf_interval(value, stream, post_omit_origin, native)
+        if (native is not None and native.get("_preflight_complete")
+                and interval_count >= int(native.get("validated_interval_count", 0))):
+            raise ValueError("native iperf receiver output has an unknown unmatched interval tail")
+        if native_streams is not None:
+            native_row = next(native_streams, None)
+            if native_row is None:
+                raise ValueError("native iperf receiver output ends before the observed interval")
+            origin = initial_origin if omitted else post_omit_origin
+            assert origin is not None
+            _corroborate_iperf_interval(value, stream, origin, native_row, native["server_output"])
         # reset_stats resets the native origin but the first interval may retain
         # its pre-reset interval start. Clip only temporal support to the reset;
         # preserve the native interval end and byte count without prorating.
@@ -241,36 +248,10 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         raise ValueError("iperf post-omit statistic origin is missing")
     if interval_count == 0:
         raise ValueError("iperf receiver interval evidence is missing")
-    if native is not None:
-        for value, stream in omitted_observations:
-            reset_origin = origins.get(("post_omit", stream))
-            if reset_origin is None:
-                raise ValueError("native iperf omitted interval has no later post-omit reset origin")
-            _corroborate_iperf_interval(value, stream, reset_origin, native)
-        native_settings = native["receiver_settings"]
-        assert isinstance(native_settings, Mapping)
-        expected_settings = {"protocol": str(settings["protocol"]).lower(), "num_streams": settings["num_streams"],
-            "omit": settings["omit"], "duration": settings["duration"],
-            "blksize": settings["block_size"], "reverse": settings["reverse"]}
-        actual_settings = dict(native_settings)
-        if isinstance(actual_settings.get("protocol"), str):
-            actual_settings["protocol"] = actual_settings["protocol"].lower()
-        if (any(actual_settings.get(key) != value for key, value in expected_settings.items())
-                or actual_settings.get("interval") != settings["interval_us"] / 1_000_000):
-            raise ValueError("native iperf client settings do not corroborate receiver session settings")
-        client_settings = native.get("client_settings")
-        normalized_client_settings = dict(client_settings) if isinstance(client_settings, Mapping) else {}
-        if isinstance(normalized_client_settings.get("protocol"), str):
-            normalized_client_settings["protocol"] = normalized_client_settings["protocol"].lower()
-        if not isinstance(client_settings, Mapping) or any(
-                normalized_client_settings.get(key) != actual_settings.get(key)
-                for key in ("protocol", "num_streams", "omit", "duration", "interval", "blksize", "reverse")):
-            raise ValueError("native iperf client and receiver settings do not match")
-        native_streams = native["streams"]
-        if not isinstance(native_streams, list) or len(native_streams) != interval_count:
-            raise ValueError("native iperf receiver intervals do not match the observed interval count")
-        if len(native.get("_matched_stream_indexes", set())) != len(native_streams):
-            raise ValueError("native iperf output contains unmatched receiver intervals")
+    if native is not None and native.get("receiver_complete") is not True:
+        raise ValueError("native iperf receiver JSONL has an unknown session tail")
+    if native is not None and native.get("native_tail"):
+        raise ValueError("native iperf receiver JSONL has an unknown truncated tail")
 
 
 def _validate_anchor(record: ParsedRecord, source: AcquisitionSource) -> None:
@@ -283,39 +264,29 @@ def _validate_anchor(record: ParsedRecord, source: AcquisitionSource) -> None:
         raise ValueError("clock anchor bounds are invalid")
 
 
-def _corroborate_iperf_interval(value: Mapping[str, object], stream: str, fixed_origin_us: int,
-                               native: Mapping[str, object]) -> None:
-    streams = native.get("streams")
-    server_output = native.get("server_output")
-    if not isinstance(streams, list) or not isinstance(server_output, Mapping):
+def _corroborate_iperf_interval(value: Mapping[str, object], stream: str, origin_us: int,
+                               native_row: Mapping[str, object], server_output: Mapping[str, object]) -> None:
+    if not isinstance(server_output, Mapping):
         raise ValueError("native iperf receiver stream evidence is incomplete")
-    matched = native.setdefault("_matched_stream_indexes", set())
-    if not isinstance(matched, set):
-        raise ValueError("native iperf receiver stream match state is invalid")
-    start_us = _native_int(value.get("interval_start_us"), "interval_start_us") - fixed_origin_us
-    end_us = _native_int(value.get("interval_end_us"), "interval_end_us") - fixed_origin_us
-    byte_count = _native_int(value.get("bytes"), "bytes")
+    observed_start = _native_int(value.get("interval_start_us"), "interval_start_us")
     omitted = value.get("omitted")
-    candidates: list[int] = []
-    for index, row in enumerate(streams):
-        if index in matched or not isinstance(row, Mapping):
-            continue
-        socket_id = row.get("socket")
-        if isinstance(socket_id, bool) or not isinstance(socket_id, int) or str(socket_id) != stream:
-            continue
-        try:
-            raw_start = row.get("start")
-            if isinstance(raw_start, bool) or not isinstance(raw_start, (int, float)) or not math.isfinite(raw_start):
-                continue
-            native_start = round(raw_start * 1_000_000)
-            native_end = round(_finite_number(row.get("end"), "native interval end") * 1_000_000)
-        except ValueError:
-            continue
-        if (abs(native_start - start_us) <= 1 and abs(native_end - end_us) <= 1
-                and row.get("bytes") == byte_count and row.get("omitted") is omitted
-                and row.get("sender") is False):
-            candidates.append(index)
-    if len(candidates) != 1:
+    # iperf_time_diff returns a nonnegative magnitude. For the first interval
+    # crossing reset, its prior end precedes result->start_time, so JSON reports
+    # abs(start - reset) while end remains end - reset.
+    start_us = (observed_start - origin_us if omitted is True
+                else abs(observed_start - origin_us))
+    end_us = _native_int(value.get("interval_end_us"), "interval_end_us") - origin_us
+    byte_count = _native_int(value.get("bytes"), "bytes")
+    socket_id = native_row.get("socket")
+    raw_start, raw_end = native_row.get("start"), native_row.get("end")
+    if (isinstance(socket_id, bool) or not isinstance(socket_id, int) or str(socket_id) != stream
+            or isinstance(raw_start, bool) or not isinstance(raw_start, (int, float)) or not math.isfinite(raw_start)
+            or isinstance(raw_end, bool) or not isinstance(raw_end, (int, float)) or not math.isfinite(raw_end)):
+        raise ValueError("native iperf receiver stream identity or offsets are invalid")
+    if (abs(round(raw_start * 1_000_000) - start_us) > 1
+            or abs(round(raw_end * 1_000_000) - end_us) > 1
+            or native_row.get("bytes") != byte_count or native_row.get("omitted") is not omitted
+            or native_row.get("sender") is not False):
         raise ValueError("native iperf interval offsets, bytes, omission or stream do not match receiver observation")
     connected = server_output.get("start", {}).get("connected", []) if isinstance(server_output.get("start"), Mapping) else []
     connection = next((item for item in connected if isinstance(item, Mapping)
@@ -326,7 +297,156 @@ def _corroborate_iperf_interval(value: Mapping[str, object], stream: str, fixed_
                                          ("local_port", "local_port"), ("remote_port", "remote_port")):
         if str(value.get(observation_key)) != str(connection.get(native_key)):
             raise ValueError("native iperf receiver endpoints do not match the observation")
-    matched.add(candidates[0])
+
+
+def _normalized_native_settings(value: object) -> dict[str, object]:
+    result = dict(value) if isinstance(value, Mapping) else {}
+    if isinstance(result.get("protocol"), str):
+        result["protocol"] = result["protocol"].lower()
+    return result
+
+
+def _check_iperf_settings(settings: Mapping[str, object], native: Mapping[str, object]) -> None:
+    expected = {"protocol": str(settings["protocol"]).lower(), "num_streams": settings["num_streams"],
+        "omit": settings["omit"], "duration": settings["duration"],
+        "blksize": settings["block_size"], "reverse": settings["reverse"],
+        "interval": settings["interval_us"] / 1_000_000}
+    receiver = _normalized_native_settings(native.get("receiver_settings"))
+    client = _normalized_native_settings(native.get("client_settings"))
+    if any(receiver.get(key) != value for key, value in expected.items()):
+        raise ValueError("native iperf receiver settings do not corroborate the source session")
+    if any(client.get(key) != value for key, value in expected.items()):
+        raise ValueError("native iperf client settings do not corroborate the source session")
+
+
+def _preflight_iperf_source(records_factory, source: AcquisitionSource,
+                            native: Mapping[str, object], outcome: object) -> None:
+    """Check shared session proof and interval/native correspondence before any yield."""
+    settings: Mapping[str, object] | None = None
+    origins: dict[tuple[str, str], int] = {}
+    fixed: dict[str, int] = {}
+    last: dict[str, tuple[int, int]] = {}
+    measured_streams: set[str] = set()
+    interval_count = 0
+    observation_tail = False
+    native_tail = False
+    matched_count = 0
+    stream_rows = native["stream_factory"]()
+    settings_checked = False
+    missing_native_row = False
+    try:
+        for record in records_factory():
+            value = record.value
+            _same_common(value, source)
+            if value.get("cookie") != source.session_id:
+                raise ValueError("iperf native session cookie does not match source reference")
+            kind = value.get("record_kind")
+            if kind == "session_settings":
+                if settings is not None:
+                    raise ValueError("conflicting duplicate iperf session settings")
+                if str(value.get("protocol", "")).lower() != "tcp" or value.get("reverse") is not False:
+                    raise ValueError("iperf receiver settings are not the approved forward TCP mode")
+                for name in ("num_streams", "omit", "duration", "interval_us", "block_size"):
+                    _native_int(value.get(name), name)
+                settings = value
+            elif kind == "stats_origin":
+                phase, stream = value.get("phase"), value.get("stream_id")
+                if phase not in {"initial", "post_omit"} or not isinstance(stream, str) or not stream.isdecimal():
+                    raise ValueError("iperf stats origin identity is invalid")
+                origin = _native_int(value.get("origin_us"), "origin_us")
+                fixed_value = _native_int(value.get("start_time_fixed_us"), "start_time_fixed_us")
+                if stream in fixed and fixed[stream] != fixed_value:
+                    raise ValueError("conflicting iperf stream start origin")
+                fixed[stream] = fixed_value
+                identity = (str(phase), stream)
+                if identity in origins and origins[identity] != origin:
+                    raise ValueError("conflicting duplicate iperf stats origin")
+                origins[identity] = origin
+            elif kind == "receiver_interval":
+                if settings is None:
+                    raise ValueError("iperf session settings are missing before receiver intervals")
+                stream = value.get("stream_id")
+                if not isinstance(stream, str) or not stream.isdecimal():
+                    raise ValueError("iperf receiver interval stream identity is invalid")
+                start = _native_int(value.get("interval_start_us"), "interval_start_us")
+                end = _native_int(value.get("interval_end_us"), "interval_end_us")
+                if end < start:
+                    raise ValueError("iperf receiver interval is non-monotonic")
+                previous = last.get(stream)
+                if previous is not None and (start < previous[0] or end < previous[1]):
+                    raise ValueError("conflicting or non-monotonic iperf receiver interval sequence")
+                last[stream] = (start, end)
+                _native_int(value.get("bytes"), "bytes")
+                if value.get("role") != "receiver" or str(value.get("protocol", "")).lower() != "tcp":
+                    raise ValueError("iperf interval is not native TCP receiver evidence")
+                if not isinstance(value.get("omitted"), bool):
+                    raise ValueError("iperf omitted marker must be boolean")
+                phase = "initial" if value["omitted"] is True else "post_omit"
+                if (phase, stream) not in origins:
+                    raise ValueError("iperf statistic origin is missing before receiver interval")
+                if phase == "post_omit":
+                    measured_streams.add(stream)
+                for key in ("local_host", "local_port", "remote_host", "remote_port"):
+                    if not isinstance(value.get(key), str) or not value[key]:
+                        raise ValueError("iperf receiver interval lacks native endpoint identity")
+                if not settings_checked:
+                    _check_iperf_settings(settings, native)
+                    settings_checked = True
+                origin = origins[(phase, stream)]
+                if not missing_native_row:
+                    try:
+                        native_row = next(stream_rows, None)
+                    except ValueError as exc:
+                        if str(exc).startswith("native iperf JSONL ends with a truncated event"):
+                            native_tail = True
+                            missing_native_row = True
+                        else:
+                            raise
+                    else:
+                        if native_row is None:
+                            missing_native_row = True
+                        else:
+                            _corroborate_iperf_interval(value, stream, origin, native_row,
+                                                        native["server_output"])
+                            matched_count += 1
+                interval_count += 1
+    except ValueError as exc:
+        if str(exc).startswith("truncated acquisition record at byte"):
+            observation_tail = True
+        else:
+            raise
+    if settings is None or not interval_count:
+        raise ValueError("iperf source lacks session settings or closed receiver intervals")
+    initial_streams = {stream for phase, stream in origins if phase == "initial"}
+    post_streams = {stream for phase, stream in origins if phase == "post_omit"}
+    if len(initial_streams) != settings["num_streams"]:
+        raise ValueError("iperf stream origins do not match native stream count")
+    if measured_streams and not measured_streams.issubset(post_streams):
+        raise ValueError("iperf post-omit statistic origin is missing for a measured stream")
+    _check_iperf_settings(settings, native)
+    outcome_value = getattr(outcome, "value", outcome)
+    partial_allowed = (observation_tail or native_tail
+        or outcome_value not in {None, "succeeded"} or native.get("receiver_complete") is not True)
+    if missing_native_row and not partial_allowed:
+        raise ValueError("native iperf receiver output ends before the observed interval")
+    try:
+        extra = next(stream_rows, None)
+    except ValueError as exc:
+        if str(exc).startswith("native iperf JSONL ends with a truncated event"):
+            extra = None
+            native_tail = True
+            partial_allowed = True
+        else:
+            raise
+    partial_allowed = partial_allowed or native_tail
+    if extra is not None and not partial_allowed:
+        raise ValueError("native iperf receiver intervals do not match the source count")
+    if matched_count == 0:
+        raise ValueError("native iperf receiver has no independently corroborated interval")
+    native["partial_allowed"] = partial_allowed
+    native["validated_interval_count"] = matched_count
+    native["native_tail"] = native_tail
+    native["_preflight_complete"] = True
 
 
 def _expected_build_identity(tool: str) -> tuple[str, str, str, str]:
@@ -405,33 +525,48 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
         raise ValueError("acquisition command producer does not match source")
     if log.unit_id not in {None, command[0].unit_id}:
         raise ValueError("acquisition log unit does not match its producing command")
+    native_client: ArtifactRecord | None = None
+    native_receiver: ArtifactRecord | None = None
     for item in native:
         if item.deployment_id != log.deployment_id:
             raise ValueError("native acquisition artifacts must share the source deployment")
         if source.tool == "sockperf" and (item.producer != source.producer or item.kind != "sockperf-csv"):
             raise ValueError("Sockperf source must reference its native client CSV")
-        if source.tool == "iperf3" and (item.producer != VmRole.VM_A or item.kind not in {"iperf3-json", "iperf3-client-jsonl"}):
-            raise ValueError("iperf3 receiver source must reference a native client artifact")
+        if source.tool == "iperf3":
+            if item.producer == VmRole.VM_A and item.kind in {"iperf3-json", "iperf3-client-jsonl"}:
+                if native_client is not None:
+                    raise ValueError("iperf3 source must reference exactly one native client artifact")
+                native_client = item
+            elif item.producer == VmRole.VM_B and item.kind == "iperf3-server-jsonl":
+                if native_receiver is not None:
+                    raise ValueError("iperf3 source must reference at most one native receiver artifact")
+                native_receiver = item
+            else:
+                raise ValueError("iperf3 source references an unsupported native artifact")
         if source.tool == "sockperf" and item.unit_id not in {None, command[0].unit_id}:
             raise ValueError("Sockperf native artifact must match its producing measurement unit")
-        if source.tool == "iperf3":
-            client_command = [row for row in commands if row.deployment_id == log.deployment_id
-                and row.producer == VmRole.VM_A and row.unit_id == item.unit_id
-                and (row.result.get("action_id") or row.request.get("action_id")) == f"iperf3-{item.unit_id}"]
-            if len(client_command) != 1:
-                raise ValueError("iperf3 native artifact must match one client command in its unit")
         item.verify_materialized_file(child_root)
-        if source.tool == "iperf3" and not _native_iperf_cookie(
-            resolve_artifact_path(child_root, item.path), source.session_id
-        ):
-            raise ValueError("native iperf client JSON start.cookie does not match the referenced session")
-    native_metadata_by_artifact: dict[str, Mapping[str, object]] = {}
+    native_metadata: Mapping[str, object] | None = None
     if source.tool == "iperf3":
-        for item in native:
-            metadata = _native_iperf_metadata(resolve_artifact_path(child_root, item.path), source.session_id)
-            if metadata is None:
-                raise ValueError("native iperf JSON/JSONL lacks a unique session and receiver interval output")
-            native_metadata_by_artifact[item.artifact_id] = metadata
+        if native_client is None:
+            raise ValueError("iperf3 source must reference one native client artifact")
+        client_commands = [row for row in commands if row.deployment_id == log.deployment_id
+            and row.producer == VmRole.VM_A and row.unit_id == native_client.unit_id
+            and (row.result.get("action_id") or row.request.get("action_id"))
+                == f"iperf3-{native_client.unit_id}"]
+        if len(client_commands) != 1:
+            raise ValueError("iperf3 native client artifact must match one client command in its unit")
+        receiver_path = None
+        if native_receiver is not None:
+            if native_receiver.unit_id is not None:
+                raise ValueError("persistent iperf3 receiver artifact must be deployment-scoped")
+            receiver_path = resolve_artifact_path(child_root, native_receiver.path)
+        if not _native_iperf_cookie(resolve_artifact_path(child_root, native_client.path), source.session_id):
+            raise ValueError("native iperf client JSON start.cookie does not match the referenced session")
+        native_metadata = _native_iperf_metadata(resolve_artifact_path(child_root, native_client.path),
+            source.session_id, receiver_path)
+        if native_metadata is None:
+            raise ValueError("native iperf client/receiver JSON lacks a unique session and receiver interval output")
     builds = [item for item in build_evidence if getattr(item, "artifact_id", None) == source.build_artifact_id
               and getattr(item, "role", None) == source.producer]
     if len(builds) != 1:
@@ -537,7 +672,9 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
             yield record
         if not found_session_anchor:
             raise ValueError("iperf session clock anchor is missing")
-    yield from _iperf_windows(iperf_records(), source, native_metadata_by_artifact[native[0].artifact_id])
+    if native_metadata is not None:
+        _preflight_iperf_source(iperf_records, source, native_metadata, outcome)
+    yield from _iperf_windows(iperf_records(), source, native_metadata)
     if outcome not in {None, "succeeded"}:
         raise ValueError(f"acquisition producer command outcome {outcome!r} leaves an unknown tail")
 
@@ -615,7 +752,12 @@ def bind_acquisition_sources(*, child_root: Path, run_identity: object, commands
                       and item.unit_id == record.unit_id and item.producer == record.producer and item.kind == "sockperf-csv"]
             if len(matching) != 1 or len(native) != 1:
                 continue
-            native[0].verify_materialized_file(child_root)
+            try:
+                native[0].verify_materialized_file(child_root)
+            except (OSError, ValueError):
+                # A corrupt unit-local native file only makes this candidate
+                # unavailable. It must not erase independent units below.
+                continue
             result.append(AcquisitionSource(tool=tool, semantics_id="sockperf-3.10-enabled-v1", producer=record.producer,
                 command_action_id=invocation, invocation_id=invocation, boot_id=str(anchor.value["boot_id"]),
                 clock_domain=str(anchor.value["clock"]), log_artifact_id=record.artifact_id, log_path=record.path,
@@ -629,30 +771,49 @@ def bind_acquisition_sources(*, child_root: Path, run_identity: object, commands
             matching_receiver = [item for item in receiver_command_evidence if item.deployment_id == deployment_id
                                  and item.producer == record.producer
                                  and (item.result.get("action_id") == invocation or item.request.get("action_id") == invocation)]
-            native = [item for item in source_artifact_records if item.deployment_id == deployment_id
+            native_clients = [item for item in source_artifact_records if item.deployment_id == deployment_id
                       and item.producer == VmRole.VM_A and item.kind in {"iperf3-json", "iperf3-client-jsonl"}]
-            valid_native: list[ArtifactRecord] = []
-            for item in native:
+            matching_clients: list[ArtifactRecord] = []
+            for item in native_clients:
                 try:
                     item.verify_materialized_file(child_root)
                 except (OSError, ValueError):
                     continue
-                valid_native.append(item)
-            native = valid_native
-            native = [item for item in native if _native_iperf_cookie(
-                resolve_artifact_path(child_root, item.path), cookie)]
-            if len(matching_receiver) != 1 or len(native) != 1:
+                if _native_iperf_cookie(resolve_artifact_path(child_root, item.path), cookie):
+                    matching_clients.append(item)
+            if len(matching_receiver) != 1 or len(matching_clients) != 1:
                 continue
+            client = matching_clients[0]
             client_commands = [item for item in commands if item.deployment_id == deployment_id
-                               and item.producer == VmRole.VM_A and item.unit_id == native[0].unit_id
-                               and (item.result.get("action_id") or "").startswith("iperf3-")]
+                               and item.producer == VmRole.VM_A and item.unit_id == client.unit_id
+                               and (item.result.get("action_id") or item.request.get("action_id"))
+                                   == f"iperf3-{client.unit_id}"]
             if len(client_commands) != 1:
                 continue
-            native[0].verify_materialized_file(child_root)
+            client_path = resolve_artifact_path(child_root, client.path)
+            client_metadata = _native_iperf_metadata(client_path, cookie)
+            native_ids = [client.artifact_id]
+            if client_metadata is None and _native_iperf_is_jsonl(client_path):
+                server_candidates = [item for item in source_artifact_records
+                    if item.deployment_id == deployment_id and item.producer == VmRole.VM_B
+                    and item.unit_id is None and item.kind == "iperf3-server-jsonl"]
+                matching_servers = []
+                for item in server_candidates:
+                    try:
+                        item.verify_materialized_file(child_root)
+                        metadata = _native_iperf_metadata(client_path, cookie,
+                            resolve_artifact_path(child_root, item.path))
+                    except (OSError, ValueError):
+                        continue
+                    if metadata is not None:
+                        matching_servers.append(item)
+                if len(matching_servers) != 1:
+                    continue
+                native_ids.append(matching_servers[0].artifact_id)
             result.append(AcquisitionSource(tool=tool, semantics_id="iperf-3.17.1-stats-v1", producer=record.producer,
                 command_action_id=invocation, invocation_id=invocation, session_id=cookie,
                 boot_id=str(anchor.value["boot_id"]), clock_domain=str(anchor.value["clock"]),
-                log_artifact_id=record.artifact_id, log_path=record.path, native_artifact_ids=[native[0].artifact_id],
+                log_artifact_id=record.artifact_id, log_path=record.path, native_artifact_ids=native_ids,
                 build_artifact_id=str(getattr(build, "artifact_id")), mapping_indexes=[]))
     return tuple(result)
 
@@ -670,160 +831,321 @@ def _file_contains(path: Path, needle: bytes) -> bool:
             overlap = data[-max(0, len(needle) - 1):]
 
 
-def _native_iperf_metadata(path: Path, expected_cookie: str) -> dict[str, object] | None:
-    """Read native iperf JSON/JSONL session, settings and receiver result evidence."""
-    starts = 0
-    settings: Mapping[str, object] | None = None
-    server_output: Mapping[str, object] | None = None
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if not line.strip():
-                    continue
-                value = json.loads(line, object_pairs_hook=_unique_json_object,
-                    parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
-                if not isinstance(value, dict):
-                    continue
-                if value.get("event") == "start":
-                    data = value.get("data")
-                    start = data.get("start") if isinstance(data, dict) else None
-                    test_start = start.get("test_start") if isinstance(start, dict) else None
-                    settings = test_start if isinstance(test_start, dict) else start if isinstance(start, dict) else None
-                elif value.get("event") == "server_output_json":
-                    data = value.get("data")
-                    server_output = data if isinstance(data, dict) else None
-                else:
-                    start = value.get("start")
-                    server = value.get("server_output_json")
-                    if isinstance(server, dict):
-                        server_output = server
-                    test_start = start.get("test_start") if isinstance(start, dict) else None
-                    settings = test_start if isinstance(test_start, dict) else start if isinstance(start, dict) else None
-                if isinstance(start, dict):
-                    cookie = start.get("cookie")
-                    if isinstance(cookie, str):
-                        starts += 1
-                        if cookie != expected_cookie:
-                            return None
-        if starts != 1 or settings is None or server_output is None:
-            return None
-        receiver_start = server_output.get("start")
-        receiver_settings = (receiver_start.get("test_start")
-            if isinstance(receiver_start, dict) and isinstance(receiver_start.get("test_start"), dict)
-            else receiver_start)
-        if not isinstance(receiver_settings, dict):
-            return None
-        intervals = server_output.get("intervals")
-        if not isinstance(intervals, list) or not intervals:
-            return None
-        streams: list[Mapping[str, object]] = []
-        for interval in intervals:
-            if not isinstance(interval, dict) or not isinstance(interval.get("streams"), list):
-                continue
-            streams.extend(item for item in interval["streams"] if isinstance(item, dict))
-        if not streams:
-            return None
-        return {"cookie": expected_cookie, "client_settings": settings,
-                "receiver_settings": receiver_settings, "server_output": server_output,
-                "streams": streams}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return None
+MAX_PRETTY_IPERF_JSON_BYTES = 16 * 1024 * 1024
+MAX_IPERF_JSONL_RECORD_BYTES = 1024 * 1024
+
+
+def _native_start(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    """The pinned JSONStream_Output puts json_start directly in event.data."""
+    if value.get("event") == "start":
+        data = value.get("data")
+        return data if isinstance(data, Mapping) else None
+    start = value.get("start")
+    return start if isinstance(start, Mapping) else None
+
+
+def _native_settings(start: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = start.get("test_start")
+    return value if isinstance(value, Mapping) else None
+
+
+def _decode_json_line(line: str) -> Mapping[str, object] | None:
+    value = json.loads(line, object_pairs_hook=_unique_json_object,
+        parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+    return value if isinstance(value, Mapping) else None
 
 
 def _native_iperf_cookie(path: Path, expected_cookie: str) -> bool:
-    """Exact cookie lookup for binding; full session checks happen during replay."""
+    """Find one exact native start cookie in pretty JSON or source JSONL."""
     try:
+        with path.open("r", encoding="utf-8") as stream:
+            first = next((line for line in stream if line.strip()), "")
+        try:
+            first_event = _decode_json_line(first)
+        except (json.JSONDecodeError, ValueError):
+            first_event = None
+        if first_event is None or first_event.get("event") != "start":
+            if path.stat().st_size > MAX_PRETTY_IPERF_JSON_BYTES:
+                return False
+            with path.open("r", encoding="utf-8") as stream:
+                value = json.load(stream, object_pairs_hook=_unique_json_object,
+                    parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+            if not isinstance(value, Mapping):
+                return False
+            start = _native_start(value)
+            return start is not None and start.get("cookie") == expected_cookie
         starts = 0
         with path.open("r", encoding="utf-8") as stream:
             for line in stream:
                 if not line.strip():
                     continue
-                value = json.loads(line, object_pairs_hook=_unique_json_object)
-                if not isinstance(value, dict):
+                if not line.endswith("\n"):
+                    return False
+                if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
+                    return False
+                value = _decode_json_line(line)
+                if value is None:
                     continue
-                start = (value.get("data", {}).get("start") if value.get("event") == "start"
-                         and isinstance(value.get("data"), dict) else value.get("start"))
-                if isinstance(start, dict) and isinstance(start.get("cookie"), str):
+                start = _native_start(value)
+                if start is not None and isinstance(start.get("cookie"), str):
                     starts += 1
-                    if start["cookie"] != expected_cookie:
+                    if start.get("cookie") != expected_cookie:
                         return False
         return starts == 1
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return False
 
 
-def _union(intervals: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted((start, end) for start, end in intervals if end > start):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+def _native_iperf_is_jsonl(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            first = next((line for line in stream if line.strip()), "")
+        value = _decode_json_line(first)
+        return value is not None and value.get("event") == "start"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+
+
+def _native_server_metadata(path: Path, expected_cookie: str) -> dict[str, object] | None:
+    """Validate one receiver session in the persistent server JSONL log."""
+    active = False
+    starts = 0
+    settings = None
+    server_start = None
+    rows = 0
+    ended = False
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                if not line.endswith("\n"):
+                    break
+                if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
+                    return None
+                try:
+                    value = _decode_json_line(line)
+                except (json.JSONDecodeError, ValueError):
+                    if not line.endswith("\n"):
+                        break
+                    return None
+                if value is None:
+                    continue
+                event = value.get("event")
+                if event == "start":
+                    start = _native_start(value)
+                    cookie = start.get("cookie") if start is not None else None
+                    active = cookie == expected_cookie
+                    if active:
+                        starts += 1
+                        if starts != 1:
+                            return None
+                        settings = _native_settings(start)
+                        server_start = start
+                elif event == "interval" and active:
+                    data = value.get("data")
+                    if isinstance(data, Mapping) and isinstance(data.get("streams"), list):
+                        rows += sum(1 for row in data["streams"]
+                                    if isinstance(row, Mapping) and row.get("sender") is False)
+                elif event == "end" and active:
+                    active = False
+                    ended = True
+        if starts != 1 or settings is None or server_start is None or rows == 0:
+            return None
+        return {"receiver_settings": settings, "server_output": {"start": server_start},
+                "receiver_complete": ended}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _iter_server_streams(path: Path, expected_cookie: str) -> Iterator[Mapping[str, object]]:
+    active = False
+    starts = 0
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            if not line.endswith("\n"):
+                raise ValueError("native iperf JSONL ends with a truncated event")
+            if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
+                raise ValueError("native iperf JSONL event exceeds its bounded record size")
+            try:
+                value = _decode_json_line(line)
+            except (json.JSONDecodeError, ValueError) as exc:
+                if not line.endswith("\n"):
+                    raise ValueError("native iperf JSONL ends with a truncated event") from exc
+                raise ValueError("native iperf JSONL contains an invalid event") from exc
+            if value is None:
+                continue
+            event = value.get("event")
+            if event == "start":
+                start = _native_start(value)
+                active = start is not None and start.get("cookie") == expected_cookie
+                if active:
+                    starts += 1
+            elif event == "interval" and active:
+                data = value.get("data")
+                streams = data.get("streams") if isinstance(data, Mapping) else None
+                if isinstance(streams, list):
+                    yield from (row for row in streams if isinstance(row, Mapping)
+                                and row.get("sender") is False)
+            elif event == "end" and active:
+                active = False
+    if starts != 1:
+        raise ValueError("native iperf receiver JSONL session is missing or ambiguous")
+
+
+def _native_iperf_metadata(path: Path, expected_cookie: str,
+                           receiver_path: Path | None = None) -> dict[str, object] | None:
+    """Read bounded pretty -J or stream only the small JSONL session header."""
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            first = next((line for line in stream if line.strip()), "")
+        try:
+            first_event = _decode_json_line(first)
+        except (json.JSONDecodeError, ValueError):
+            first_event = None
+        if first_event is None or first_event.get("event") != "start":
+            if path.stat().st_size > MAX_PRETTY_IPERF_JSON_BYTES:
+                return None
+            with path.open("r", encoding="utf-8") as stream:
+                value = json.load(stream, object_pairs_hook=_unique_json_object,
+                    parse_constant=lambda item: (_ for _ in ()).throw(ValueError(item)))
+            if not isinstance(value, Mapping):
+                return None
+            start = _native_start(value)
+            if start is None or start.get("cookie") != expected_cookie:
+                return None
+            settings = _native_settings(start)
+            server_output = value.get("server_output_json")
+            if settings is None or not isinstance(server_output, Mapping):
+                return None
+            receiver_start = server_output.get("start")
+            receiver_settings = _native_settings(receiver_start) if isinstance(receiver_start, Mapping) else None
+            if receiver_settings is None or not isinstance(server_output.get("intervals"), list):
+                return None
+            streams = tuple(row for interval in server_output["intervals"]
+                if isinstance(interval, Mapping) and isinstance(interval.get("streams"), list)
+                for row in interval["streams"] if isinstance(row, Mapping))
+            if not streams:
+                return None
+            return {"cookie": expected_cookie, "client_settings": settings,
+                "receiver_settings": receiver_settings, "server_output": server_output,
+                "streams": streams, "stream_factory": lambda: iter(streams),
+                "receiver_complete": True}
+        starts = 0
+        settings = None
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                if not line.endswith("\n"):
+                    return None
+                if len(line.encode("utf-8")) > MAX_IPERF_JSONL_RECORD_BYTES:
+                    return None
+                value = _decode_json_line(line)
+                if value is None:
+                    continue
+                start = _native_start(value)
+                if start is None:
+                    continue
+                cookie = start.get("cookie")
+                if not isinstance(cookie, str):
+                    continue
+                starts += 1
+                if cookie != expected_cookie:
+                    return None
+                settings = _native_settings(start)
+        if starts != 1 or settings is None:
+            return None
+        if receiver_path is None:
+            return None
+        receiver = _native_server_metadata(receiver_path, expected_cookie)
+        if receiver is None:
+            return None
+        return {"cookie": expected_cookie, "client_settings": settings,
+                **receiver, "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie)}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _merged_support(items: Iterable[SourceWindow], domain: tuple[str, str, str], *,
+                    receiver: bool, envelope: dict[str, int | None] | None = None
+                    ) -> Iterator[tuple[int, int]]:
+    """Yield chronological union support with one pending interval of state."""
+    pending: tuple[int, int] | None = None
+    previous_start: int | None = None
+    for item in items:
+        if (item.producer, item.boot_id, item.clock_domain) != domain:
+            raise ValueError("acquisition sources do not share a proven clock domain")
+        if receiver:
+            if item.omitted is None:
+                raise ValueError("receiver omission state is unknown")
+            if item.omitted:
+                continue
+            assert envelope is not None
+            envelope["start"] = item.start_earliest_ns if envelope["start"] is None else min(
+                int(envelope["start"]), item.start_earliest_ns)
+            envelope["end"] = item.end_latest_ns if envelope["end"] is None else max(
+                int(envelope["end"]), item.end_latest_ns)
+        if not item.has_positive_inner_support:
+            continue
+        start, end = item.start_latest_ns, item.end_earliest_ns
+        if previous_start is not None and start < previous_start:
+            raise ValueError("acquisition support is not in chronological order")
+        previous_start = start
+        if pending is None:
+            pending = (start, end)
+        elif start <= pending[1]:
+            pending = (pending[0], max(pending[1], end))
         else:
-            merged.append((start, end))
-    return merged
+            yield pending
+            pending = (start, end)
+    if pending is not None:
+        yield pending
 
 
 def overlap_coverage_lower_bound(probes: Iterable[SourceWindow], receivers: Iterable[SourceWindow]) -> float | None:
-    """Return conservative inner acquisition/outer receiver coverage in one proven domain.
+    """Stream inner-support intersections over the outer continuous receiver duration.
 
-    None means identities or boundaries do not support a finite ratio. Gaps stay
-    absent from both unions, and omitted receiver intervals never enter the denominator.
+    Inputs must be emitted in chronological order by source replay. Only a single
+    union interval from each stream is retained, so diagnostic-day coverage does
+    not allocate storage proportional to interval count.
     """
-    domain: tuple[str, str, str] | None = None
-    receiver_start: int | None = None
-    receiver_end: int | None = None
-    receiver_support: list[tuple[int, int]] = []
-    included = False
-    for item in receivers:
-        item_domain = (item.producer, item.boot_id, item.clock_domain)
-        if domain is None:
-            domain = item_domain
-        elif domain != item_domain:
-            return None
-        if item.omitted is None:
-            return None
-        if item.omitted:
-            continue
-        included = True
-        receiver_start = item.start_earliest_ns if receiver_start is None else min(receiver_start, item.start_earliest_ns)
-        receiver_end = item.end_latest_ns if receiver_end is None else max(receiver_end, item.end_latest_ns)
-        if item.has_positive_inner_support:
-            receiver_support.append((item.start_latest_ns, item.end_earliest_ns))
-    if not included or domain is None or receiver_start is None or receiver_end is None:
+    receiver_iter = iter(receivers)
+    first = next(receiver_iter, None)
+    if first is None:
         return None
-    # Keep the continuous receiver-session envelope in the denominator. Using
-    # the union here would silently forgive missing intervals and inflate coverage.
-    receiver_duration = receiver_end - receiver_start
-    if receiver_duration <= 0:
-        return None
-    supported_receiver = _union(receiver_support)
-    probe_support: list[tuple[int, int]] = []
-    has_probe_evidence = False
-    for item in probes:
-        if (item.producer, item.boot_id, item.clock_domain) != domain:
+    domain = (first.producer, first.boot_id, first.clock_domain)
+    envelope: dict[str, int | None] = {"start": None, "end": None}
+    receiver_support = _merged_support(itertools.chain((first,), receiver_iter), domain,
+                                       receiver=True, envelope=envelope)
+    probe_support = _merged_support(probes, domain, receiver=False)
+    try:
+        receiver_interval = next(receiver_support, None)
+        probe_interval = next(probe_support, None)
+        numerator = 0
+        has_probe_support = False
+        while receiver_interval is not None and probe_interval is not None:
+            has_probe_support = True
+            start = max(receiver_interval[0], probe_interval[0])
+            end = min(receiver_interval[1], probe_interval[1])
+            if end > start:
+                numerator += end - start
+            receiver_end, probe_end = receiver_interval[1], probe_interval[1]
+            if receiver_end <= probe_end:
+                receiver_interval = next(receiver_support, None)
+            if probe_end <= receiver_end:
+                probe_interval = next(probe_support, None)
+        for _interval in receiver_support:
+            pass
+        for _interval in probe_support:
+            has_probe_support = True
+        if (not has_probe_support or envelope["start"] is None or envelope["end"] is None):
             return None
-        if not item.has_positive_inner_support:
-            continue
-        has_probe_evidence = True
-        start = max(receiver_start, item.start_latest_ns)
-        end = min(receiver_end, item.end_earliest_ns)
-        if end <= start:
-            continue
-        probe_support.append((start, end))
-    if not has_probe_evidence:
+        denominator = int(envelope["end"]) - int(envelope["start"])
+        if denominator <= 0:
+            return None
+        return min(1.0, numerator / denominator)
+    except ValueError:
         return None
-    denominator = receiver_duration
-    # Coverage is supported only where both the probe and receiver have certain
-    # inner support. The continuous outer receiver envelope remains the denominator.
-    probe_union = _union(probe_support)
-    numerator = 0
-    i = j = 0
-    while i < len(probe_union) and j < len(supported_receiver):
-        left = max(probe_union[i][0], supported_receiver[j][0])
-        right = min(probe_union[i][1], supported_receiver[j][1])
-        if right > left:
-            numerator += right - left
-        if probe_union[i][1] <= supported_receiver[j][1]:
-            i += 1
-        else:
-            j += 1
-    return min(1.0, numerator / denominator)
