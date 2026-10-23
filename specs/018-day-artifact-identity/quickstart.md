@@ -96,8 +96,8 @@ fixture, affected generated 003 schemas only, and 018 feature documentation.
 | Specify/clarify/plan/tasks/analyze | Completed by artifact review; see stage results reported with planning commit |
 | 017 merge / writer release | Verified `2cd36e9ea7b12681545e8c6680ccda42388ffded`; implementation release received after planning gates |
 | Latest-main integration | Merged normally; main base `2cd36e9ea7b12681545e8c6680ccda42388ffded`, integrated head `79dc82d930d7c4aa23650aaa88612e6e55c78912` |
-| Application code/schema changes | Implemented in commits `11f7079` and `7782fd9`; no schema output changed |
-| Focused tests / regression suite / schema check | Completed; see final implementation gate below |
+| Application code/schema changes | Implemented in commits `11f7079`, `7782fd9`, and `ff5a1ef`; no schema output changed |
+| Focused tests / regression suite / schema check | Completed, including convergence T013; see final implementation gate below |
 | Real native-tool/cloud acceptance | Not run; outside this feature |
 
 ## Implementation checkpoint
@@ -155,7 +155,7 @@ exit 0: 2 passed in 1.50s. The full offline suite was run after this checkpoint 
 All acquisition/build evidence in these fixtures is synthetic; cloud access, real native execution
 and traffic remain unrun.
 
-The full credential-free suite then completed at code head `7782fd91aa628385bf7f72739417f24bf70a5bdf`:
+The initial full credential-free suite completed at code head `7782fd91aa628385bf7f72739417f24bf70a5bdf`:
 
 ```text
 test "$PWD" = /private/tmp/cnb-day-identity || exit 97
@@ -170,6 +170,48 @@ At the same head, the schema checker command above exited 0 without a generated 
 is the normal merge head `79dc82d930d7c4aa23650aaa88612e6e55c78912` integrating latest `origin/main`
 `2cd36e9ea7b12681545e8c6680ccda42388ffded`. The current `origin/main` still resolves to that SHA.
 No research choice, F08 consumer, helper, native artifact format or cross-record schema was changed.
+
+## Convergence T013 repair
+
+Convergence exposed a validator fall-through: a suffixed DAY family record with `unit_id=None`
+could compare equal to the template declaration's `None` unit, and a direct concrete declaration
+could bypass template resolution. Parameterized regressions first reproduced both forms: the
+focused identity suite returned 4 failed, 13 passed. Validation now routes every suffixed record
+in the three known probe families through its canonical base template before ordinary map lookup,
+requires exact registered chunk suffix/unit/path/parent, and rejects direct concrete map entries.
+The historical unsuffixed base-family forms remain separately admitted under the documented
+legacy rules.
+
+At code head `ff5a1ef102a98670449444e9abfd588098eae3ce`, validation completed with:
+
+```text
+test "$PWD" = /private/tmp/cnb-day-identity || exit 97
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/contract/test_day_artifact_identity.py tests/contract/test_acquisition_contract.py \
+  tests/contract/test_v2_handoffs.py tests/unit/test_retrieval.py \
+  tests/integration/test_acquisition_producer.py
+exit 0: 144 passed in 50.12s
+
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider
+exit 0: 1077 passed in 129.66s (0:02:09), no skips
+
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema \
+  --output specs/003-v2-shared-contracts/contracts --check
+exit 0: no generated diff
+
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+  THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
+  /private/tmp/cnb-offline-venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/contract/test_schema_integrity.py
+exit 0: 2 passed in 1.29s
+git diff --check
+exit 0
+```
 
 ## Final evidence boundary
 
