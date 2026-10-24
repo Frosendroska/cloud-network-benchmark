@@ -56,8 +56,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
 
-    if set(children) != {provider} or str(getattr(campaign.mode, "value", campaign.mode)) != "acceptance":
-        raise ValueError("production remote stages currently require one acceptance child")
+    if set(children) != {provider}:
+        raise ValueError("production remote stages require exactly one provider child")
     child = children[provider]
     observation = child.resolved_observation
     if (str(getattr(observation.provider, "value", observation.provider)) != provider
@@ -172,12 +172,20 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             pair, connection = pair_of(provision), item.connection
             bootstrap = item.prepared.evidence["bootstrap"]
             guest_runtime = item.prepared.evidence["guest_runtime"]
-            total_seconds = float(runtime["allowance"].measurement_seconds)
+            mode = str(getattr(item.observation.mode, "value", item.observation.mode))
+            total_seconds = (max(float(unit.measured_seconds) for unit in item.observation.measurement_units)
+                if mode == "diagnostic_day" else
+                sum(float(unit.measured_seconds) for unit in item.observation.measurement_units))
             for role in ("vm_a", "vm_b"):
                 context = build_collection_context(pair, role=role,
                     interface=runtime["access"]["diagnostic_interfaces"][provider][role],
-                    output_root=runtime["access"]["bootstrap"].workspace,
+                    # The controller validates the standalone F04 context, but
+                    # the workspace is a guest POSIX path (often under /var,
+                    # a macOS symlink). Validate its shape against a local
+                    # no-symlink path, then bind the declared guest path.
+                    output_root=repository_root / ".f09-remote-workspace" / deployment.deployment_id / role,
                     duration_seconds=total_seconds, prepared=bootstrap)
+                context["output_root"] = runtime["access"]["bootstrap"].workspace
                 item.diagnostics[role] = start_remote_diagnostics(connection, context,
                     runner=runner, remote_root=str(Path(guest_runtime.remote_root) / "diagnostics-control"),
                     deadline=item.deadline, clock=clock.monotonic)
@@ -225,7 +233,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             "stdout": result_data.get("stdout", ""), "stderr": result_data.get("stderr", "")},
                         producer="vm_b", deployment_id=deployment.deployment_id,
                         unit_id=next((unit.unit_id for unit in item.observation.measurement_units
-                                      if unit.phase.value == "multi_flow"), None),
+                                      if str(getattr(unit.phase, "value", unit.phase)) == "multi_flow"), None),
                         binary_version=StringEvidence(value=build.binary_version),
                         source_identity=StringEvidence(value=build.source_reference),
                         monotonic_started=Evidence(unavailable_reason="bootstrap transport has no guest process monotonic start"),

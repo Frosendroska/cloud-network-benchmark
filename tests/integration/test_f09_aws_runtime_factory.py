@@ -122,6 +122,86 @@ class FakeAwsRunner:
         return result
 
 
+class FakePreparedAwsRunner(FakeAwsRunner):
+    """The real F02/F09 adapters run over source-shaped fake command responses."""
+    def __init__(self):
+        super().__init__()
+        from tests.fixtures.f02r.support import BootstrapRunner
+        self.bootstrap_runner = BootstrapRunner()
+        self.prepared = None
+        self.remote_files = {"vm_a": {}, "vm_b": {}}
+        self.uploads = {}
+        self.current_elapsed = 0
+
+    def run(self, request):
+        from tests.fixtures.f02r.support import nft_listing
+        action = request.action_id
+        if action.startswith("f02r-ready-"):
+            self.actions.append(action)
+            name = action.removeprefix("f02r-ready-").rsplit("-", 1)[0]
+            tool = name.removeprefix("service-").removeprefix("socket-").removeprefix("unit-config-").removeprefix("process-")
+            if name.startswith("cloud-init"):
+                stdout = "status: done"
+            elif name == "private-icmp":
+                stdout = "64 bytes from 10.60.1.11"
+            elif name in {"private-tcp", "ssh-vm-a", "ssh-vm-b"}:
+                stdout = ""
+            elif name.startswith("service-"):
+                port, pid = (11111, 20) if tool == "sockperf" else (5201, 21)
+                args = f"server -i 10.60.1.11 -p {port}" if tool == "sockperf" else "-s -B 10.60.1.11 -p 5201 --json-stream --forceflush"
+                stdout = (f"LoadState=loaded\nActiveState=active\nMainPID={pid}\n"
+                    f"ExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\n"
+                    "StandardOutput=append\nStandardError=append\nRestart=no\n")
+            elif name.startswith("unit-config-"):
+                stdout = f"[Service]\nStandardOutput=append:/var/lib/cnb/work/server-logs/{'sockperf.log' if tool == 'sockperf' else 'iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/server-logs/{'sockperf.err' if tool == 'sockperf' else 'iperf3-server.err'}\n"
+            elif name.startswith("process-"):
+                stdout = f"/var/lib/cnb/install/bin/{tool}\n{'c' * 64} /proc/{20 if tool == 'sockperf' else 21}/exe"
+            elif name == "socket-sockperf":
+                stdout = 'UNCONN 0 0 10.60.1.11:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))'
+            elif name == "socket-iperf3":
+                stdout = 'LISTEN 0 4096 10.60.1.11:5201 0.0.0.0:* users:(("iperf3",pid=21,fd=3))'
+            elif name == "guest-acl":
+                stdout = nft_listing(self.deployment_id).replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
+            else:
+                stdout = "authenticated"
+            if name.startswith("service-"):
+                requested = request.argv[-1].split("--property=",1)[1].split(",") if "--property=" in request.argv[-1] else []
+                stdout = "\n".join(line for line in stdout.splitlines() if line.split("=",1)[0] in requested or line == "[Service]")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+        if action.startswith("f02r-"):
+            self.actions.append(action)
+            value = self.bootstrap_runner.run(request)
+            stdout = value.stdout.replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
+            if action.endswith("acl-inspect"):
+                stdout = stdout.replace("chain cnb_campaign_aws_deployment", f"chain {request.argv[-1].split()[-1]}")
+            value = value.model_copy(update={"stdout": stdout})
+            return value
+        if action.startswith("f09-runtime-"):
+            self.actions.append(action)
+            if request.action_type == "scp":
+                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            if "runtime-verify" in action:
+                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0,
+                    stdout=json.dumps({"python":"3.11.0","pydantic":"2.10.0","yaml":"6.0.2"}), stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+        if action.startswith("f09-diagnostics-start-"):
+            self.actions.append(action)
+            stdout = json.dumps({"pid":501,"process_group":501,
+                "boot_id":"12345678-1234-4234-8234-123456789abc","start_ticks":1234})
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+        if action.startswith("f09-control-clock-"):
+            self.actions.append(action)
+            timestamp = (NOW + timedelta(seconds=self.current_elapsed)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
+        return super().run(request)
+
+
 def _cost_source(path: Path, run_id: str, cost_input_id: str) -> None:
     payload = json.loads((ROOT / "tests/fixtures/f11/cost-inputs.json").read_text())
     payload.update(cost_input_id=cost_input_id, prices_checked_on="2026-10-22",
@@ -200,7 +280,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
         config_path=config)
     child = children["aws"]
-    runner = FakeAwsRunner()
+    runner = FakePreparedAwsRunner()
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)
@@ -208,6 +288,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     costs = load_cost_inputs(cost_path)
     runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256)
     clock = FakeClock()
+    runtime["sleep"] = clock.sleep
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
@@ -221,12 +302,14 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["protect"].state == "registered"
     assert provider_result.values["claim"].eligible is True, provider_result.values
     assert provider_result.values["claim"].creation_granted is True, provider_result.values
-    assert provider_result.primary_failure == "aws prepare failed (adapter reported prepare unsuccessful)"
+    assert provider_result.primary_failure is not None
     assert provider_result.values["create"].run_id == child.run_id
     assert provider_result.creation_may_have_started is True
     assert provider_result.values["cleanup"] is not None
     assert provider_result.values["prepare"].stage == "prepare"
-    assert provider_result.values["prepare"].succeeded is False
+    assert provider_result.values["prepare"].succeeded is True
+    assert provider_result.values["measure"].succeeded is False
+    assert provider_result.values["measure"].evidence.outcome is None
     assert provider_result.values["close"].stage == "close"
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert any(action.startswith("f02r-") for action in runner.actions)

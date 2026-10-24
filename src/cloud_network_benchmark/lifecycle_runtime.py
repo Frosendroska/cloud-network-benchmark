@@ -464,9 +464,9 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
     if set(children) != selected or set(runtime["providers"]) != selected:
         raise ValueError("the production runtime requires exactly the initialized selected-provider set")
-    if (str(getattr(campaign.mode, "value", campaign.mode)) != "acceptance"
-            or any(child.execution_state != "initialized" for child in children.values())):
-        raise ValueError("the production runtime currently requires unlaunched acceptance children")
+    if any(child.execution_state != "initialized" or child.mode != campaign.mode
+            for child in children.values()):
+        raise ValueError("the production runtime requires matching unlaunched initialized children")
     ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=controller_session_id)
@@ -559,8 +559,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
     requests = {}
     options_by_provider = {}
     for provider, child in children.items():
-        if child.mode != "acceptance" or child.execution_state != "initialized":
-            raise ValueError("default provider factory currently requires unlaunched acceptance children")
+        if child.mode != campaign.mode or child.execution_state != "initialized":
+            raise ValueError("default provider factory requires matching unlaunched initialized children")
         row = runtime["providers"][provider]
         observation = observations[provider]
         child_root = Path(refs[provider].result_path)
