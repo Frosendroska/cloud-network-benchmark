@@ -21,7 +21,7 @@ Coordinator integrates latest main before implementation; use `/private/tmp/cnb-
 ## Focused gates after implementation
 
 ```sh
-/private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_f09_lifecycle.py tests/unit/test_f09_guest.py tests/unit/test_f09_bundle.py tests/unit/test_f09_cli.py tests/contract/test_f09_interfaces.py
+/private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_f09_lifecycle.py tests/unit/test_f09_guest.py tests/unit/test_f09_bundle.py tests/unit/test_f09_cli.py tests/unit/test_retrieval.py tests/contract/test_f09_interfaces.py tests/integration/test_f09_bundle_replay.py
 /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/integration/test_f09_lifecycle_modes.py tests/integration/test_f09_lifecycle_failures.py tests/integration/test_f09_lifecycle_recovery.py
 /private/tmp/cnb-offline-venv/bin/python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check
 /private/tmp/cnb-offline-venv/bin/python -m pytest -q

@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from .admission import load_cost_inputs
 from .config import resolve_campaign
 from .scheduling import load_schedule
+from .lifecycle_bundle import recommend_calibration_common_n
 
 
 def preview_lifecycle(*, config_path: Path, repository_root: Path,
@@ -77,6 +78,10 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--private-root", required=True, type=Path)
     cleanup.add_argument("--controller-session", required=True)
     cleanup.add_argument("--format", choices=("human", "json"), default="human")
+    recommendation = commands.add_parser("recommend-common-n")
+    recommendation.add_argument("--validation-results", required=True, type=Path,
+        help="JSON array of saved F08 calibration ValidationResult objects")
+    recommendation.add_argument("--format", choices=("human", "json"), default="human")
     return parser
 
 
@@ -104,6 +109,27 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
             return 0 if report["status"] != "invalid" else 2
+        if args.action == "recommend-common-n":
+            if not args.validation_results.is_file() or args.validation_results.is_symlink():
+                raise ValueError("validation results must be a regular non-symlink file")
+            payload = json.loads(args.validation_results.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                raise ValueError("validation results must be a JSON array")
+            recommendation = recommend_calibration_common_n(payload)
+            report = {"status": "recommended" if recommendation.common_n.value is not None else "pending",
+                "common_n": recommendation.common_n.model_dump(mode="json"),
+                "plateau_found": recommendation.plateau_found.model_dump(mode="json"),
+                "provider_medians_gbps": recommendation.provider_medians_gbps,
+                "qualifying_ratios": recommendation.qualifying_ratios,
+                "source_campaign_id": recommendation.source_campaign_id.model_dump(mode="json"),
+                "source_run_ids": list(recommendation.source_run_ids),
+                "source_sha256": recommendation.source_sha256.model_dump(mode="json"),
+                "reason": recommendation.unavailable_reason,
+                "config_mutated": False}
+            print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                  (f"Recommended common N: {recommendation.common_n.value}" if recommendation.common_n.value is not None
+                   else f"Common N pending: {recommendation.unavailable_reason}"))
+            return 0 if recommendation.common_n.value is not None else 1
         # A cleanup command must never guess runtime adapters from a public file.
         # The direct Python API uses provider journals/settings and is supplied by
         # the owning orchestration stage; absent those, fail closed without calls.

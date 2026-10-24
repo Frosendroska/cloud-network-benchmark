@@ -71,3 +71,11 @@ def test_recovery_journal_is_private_exclusive_and_cli_cleanup_never_resumes(tmp
     report = json.loads(capsys.readouterr().out)
     assert code == 0 and report["status"] == "complete" and report["execution"] == "not_resumed"
     assert actions == ["aws"] and report["external_calls"] == 1
+
+
+def test_common_n_command_exposes_existing_recommendation_without_freezing_config(tmp_path, capsys):
+    results = tmp_path / "results.json"; results.write_text("[]")
+    code = main(["recommend-common-n", "--validation-results", str(results), "--format", "json"])
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1 and report["status"] == "pending"
+    assert report["common_n"]["value"] is None and report["config_mutated"] is False

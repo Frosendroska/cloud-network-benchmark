@@ -73,6 +73,65 @@ def test_guest_duration_uses_utc_and_subtracts_transport_and_clock_uncertainty()
             clock_uncertainty_seconds=2)
 
 
+def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(
+        repository_root, tmp_path):
+    import json
+    import tarfile
+    from cloud_network_benchmark.lifecycle_adapters import stage_guest_runtime
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_type == "scp":
+                archive = Path(request.argv[-2])
+                with tarfile.open(archive, "r:gz") as tar:
+                    names = tar.getnames()
+                    assert "runtime-source-revision.txt" in names
+                    assert "source/cloud_network_benchmark/lifecycle_guest.py" in names
+                    assert tar.extractfile("runtime-source-revision.txt").read() == b"a" * 40 + b"\n"
+                assert request.argv[-1].endswith("/runtime-source.tar.gz")
+                return result(request.action_id)
+            assert request.action_type == "ssh"
+            assert "sha256sum" in request.argv[-1] and "python3 -m venv" in request.argv[-1]
+            return result(request.action_id, json.dumps({"python":"3.11.13", "pydantic":"2.14.0", "yaml":"6.0.2"}))
+    runner = Runner()
+    evidence = stage_guest_runtime(connected, source_root=repository_root, source_revision="a" * 40,
+        remote_root=f"/var/lib/cnb/runtime/{connected.deployment_id}", runner=runner,
+        deadline=deadline(), clock=lambda:100)
+    assert evidence.source_revision == "a" * 40
+    assert evidence.python_version == "3.11.13" and evidence.pydantic_version == "2.14.0"
+    assert evidence.yaml_version == "6.0.2" and len(evidence.archive_sha256) == 64
+    assert [request.action_type for request in runner.requests] == ["scp", "ssh"]
+    assert all(request.redactions for request in runner.requests)
+
+
+def test_stage_guest_runtime_fails_closed_when_transfer_or_readiness_budget_fails(repository_root, tmp_path):
+    from cloud_network_benchmark.lifecycle_adapters import stage_guest_runtime
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            return result(request.action_id, success=False, stderr="synthetic failure")
+    runner = Runner()
+    with pytest.raises(RuntimeError, match="archive transfer"):
+        stage_guest_runtime(connected, source_root=repository_root, source_revision="a" * 40,
+            remote_root=f"/var/lib/cnb/runtime/{connected.deployment_id}", runner=runner,
+            deadline=deadline(), clock=lambda:100)
+    assert len(runner.requests) == 1
+    runner = Runner()
+    with pytest.raises(TimeoutError, match="readiness remainder"):
+        stage_guest_runtime(connected, source_root=repository_root, source_revision="a" * 40,
+            remote_root=f"/var/lib/cnb/runtime/{connected.deployment_id}", runner=runner,
+            deadline=deadline(), clock=lambda:200)
+    assert runner.requests == []
+
+
 @pytest.mark.parametrize("role", ["vm_a", "vm_b"])
 def test_standalone_diagnostics_run_only_for_explicit_guest_role(tmp_path, role):
     from tests.integration.test_diagnostics_collection import FakeClock, seed, snapshot

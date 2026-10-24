@@ -276,6 +276,116 @@ def finalize_validation(*, root: Path, validator_input_path: Path, value: Valida
     return result, summary, digest, hashes
 
 
+def recommend_calibration_common_n(results: Sequence[Any]):
+    """Expose the existing F08 evidence recommendation without editing config."""
+    from .calibration import select_common_n
+    from .contracts.validation import ValidationResult
+    validated = [ValidationResult.model_validate(item) for item in results]
+    return select_common_n(validated)
+
+
+def bind_retrieved_acquisition_sources(*, value: ValidatorInput,
+        child_root: Path, source_artifact_records: Sequence[ArtifactRecord],
+        build_evidence: Sequence[Any], receiver_command_evidence: Sequence[Any],
+        clock_mappings: Sequence[Any]) -> tuple[ValidatorInput, tuple[Any, ...], dict[str, str]]:
+    """Bind verified raw sources and the nearest actual producer clock map.
+
+    Clock anchors come from the retrieved observation stream; the selected
+    clock map comes from a retrieved, verified F04 clock artifact. Missing or
+    ambiguous anchors/maps remain unavailable and are never synthesized.
+    """
+    from datetime import datetime, timezone
+    from .acquisition import bind_acquisition_sources, parse_observation_stream
+    from .contracts.common import Evidence
+    from .contracts.measurements import AcquisitionSource, MeasurementTiming
+
+    records = list(source_artifact_records)
+    by_key = {(record.artifact_id, record.path, record.unit_id): record for record in records}
+    by_id = {record.artifact_id: record for record in records}
+    if len(by_id) != len(records):
+        raise ValueError("source artifact IDs must be unique within one deployment projection")
+    if len(by_key) != len(records):
+        raise ValueError("source artifact records contain duplicate concrete identities")
+    sources = bind_acquisition_sources(child_root=child_root, run_identity=value.identity,
+        commands=value.commands, receiver_command_evidence=receiver_command_evidence,
+        build_evidence=build_evidence, source_artifact_records=records,
+        clock_mappings=clock_mappings)
+    selected: list[tuple[Any, str, Any]] = []
+    unavailable: dict[str, str] = {}
+    for source in sources:
+        log = next((record for record in records if record.artifact_id == source.log_artifact_id
+                    and record.path == source.log_path and record.retrieval_state == "verified"), None)
+        if log is None:
+            unavailable[source.log_artifact_id] = "verified source log record is missing"
+            continue
+        try:
+            log.verify_materialized_file(child_root)
+            anchor_utc = None
+            with resolve_artifact_path(child_root, log.path).open("rb") as stream:
+                for parsed in parse_observation_stream(stream):
+                    row = parsed.value
+                    if (row.get("record_kind") == "clock_anchor" and row.get("invocation_id") == source.invocation_id
+                            and row.get("tool") == source.tool
+                            and row.get("cookie") == source.session_id):
+                        anchor_utc = datetime.fromtimestamp(int(row["realtime_ns"]) / 1_000_000_000,
+                                                            tz=timezone.utc)
+                        break
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            anchor_utc = None
+        if anchor_utc is None:
+            unavailable[source.log_artifact_id] = "matching native clock anchor is absent or malformed"
+            continue
+        role = str(getattr(source.producer, "value", source.producer))
+        candidates = [mapping for mapping in clock_mappings
+                      if str(getattr(mapping.vm_role, "value", mapping.vm_role)) == role
+                      and mapping.estimated_error_ms.value is not None
+                      and mapping.estimated_error_ms.value <= 100.0]
+        if not candidates:
+            unavailable[source.log_artifact_id] = "no bounded clock mapping for the source producer"
+            continue
+        candidates.sort(key=lambda mapping: abs((mapping.utc_timestamp - anchor_utc).total_seconds()))
+        if len(candidates) > 1 and abs((candidates[0].utc_timestamp - anchor_utc).total_seconds()) == abs((candidates[1].utc_timestamp - anchor_utc).total_seconds()):
+            unavailable[source.log_artifact_id] = "clock mapping selection is ambiguous"
+            continue
+        native_records = [by_id.get(artifact_id) for artifact_id in source.native_artifact_ids]
+        unit_id = next((record.unit_id for record in native_records if record and record.unit_id), log.unit_id)
+        if unit_id is None:
+            unavailable[source.log_artifact_id] = "source has no exact measurement unit identity"
+            continue
+        selected.append((source, unit_id, candidates[0]))
+
+    timings: list[MeasurementTiming] = []
+    for timing in value.timings:
+        local_sources: list[AcquisitionSource] = []
+        local_mappings: list[Any] = []
+        for source, unit_id, mapping in selected:
+            if unit_id != timing.unit_id:
+                continue
+            try:
+                index = local_mappings.index(mapping)
+            except ValueError:
+                local_mappings.append(mapping)
+                index = len(local_mappings) - 1
+            local_sources.append(AcquisitionSource.model_validate({
+                **source.model_dump(mode="python"), "mapping_indexes": [index]}))
+        payload = timing.model_dump(mode="python")
+        if local_sources:
+            payload["clock_mappings"] = [item.model_dump(mode="python") for item in local_mappings]
+            payload["acquisition_sources"] = Evidence[list[AcquisitionSource]](value=local_sources).model_dump(mode="python")
+        timings.append(MeasurementTiming.model_validate(payload))
+    merged_records: dict[tuple[str, str, str | None], ArtifactRecord] = {
+        (record.artifact_id, record.path, record.unit_id): record for record in value.artifact_records}
+    for key, record in by_key.items():
+        existing = merged_records.get(key)
+        if existing is not None and existing != record:
+            raise ValueError("retrieved artifact conflicts with an existing ValidatorInput record")
+        merged_records[key] = record
+    validated = ValidatorInput.model_validate({**value.model_dump(mode="python"),
+        "artifact_records": [item.model_dump(mode="python") for item in merged_records.values()],
+        "timings": [item.model_dump(mode="python") for item in timings]})
+    return validated, sources, unavailable
+
+
 def _write_exclusive(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
