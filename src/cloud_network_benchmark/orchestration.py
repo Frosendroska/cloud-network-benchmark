@@ -62,6 +62,7 @@ class ProviderHooks:
     close: Callable[[], Any]
     retrieve: Callable[[], Any]
     cleanup: Callable[[], Any]
+    cancel: Callable[[], Any] = lambda: None
 
 
 @dataclass
@@ -116,9 +117,13 @@ def write_recovery_journal(path: Path, recovery: SavedLifecycleRecovery) -> None
     path = Path(path)
     if path.exists() or path.is_symlink():
         raise FileExistsError("private recovery journal destination must be absent")
-    path.parent.mkdir(parents=True, exist_ok=True)
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise ValueError("private recovery journal path cannot contain symlinks")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise ValueError("private recovery journal path cannot contain symlinks")
+    if stat.S_IMODE(path.parent.stat().st_mode) & 0o077:
+        raise PermissionError("private recovery journal directory permissions must be restrictive")
     temporary = path.with_name(f".{path.name}.tmp")
     if temporary.exists() or temporary.is_symlink():
         raise FileExistsError("private recovery journal temporary path must be absent")
@@ -222,10 +227,23 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
             errors.append(f"reconciliation failed ({type(exc).__name__})")
         absence_proved = bool(getattr(reconciliation, "absence_proved", False) if not isinstance(reconciliation, Mapping)
                               else reconciliation.get("absence_proved") is True)
+        billable_resources_present = (getattr(reconciliation, "billable_resources_present", None)
+            if not isinstance(reconciliation, Mapping) else reconciliation.get("billable_resources_present"))
+        ledger_cleanup_open = (getattr(reconciliation, "cleanup_open", None)
+            if not isinstance(reconciliation, Mapping) else reconciliation.get("cleanup_open"))
+        reconciled = absence_proved and billable_resources_present is False and ledger_cleanup_open is False
         outcomes[record.provider] = {"cleanup": "attempted" if not errors else "failed",
-                                     "reconciled": absence_proved, "cleanup_result": cleanup_result,
+                                     "reconciled": reconciled,
+                                     "absence_proved": absence_proved,
+                                     "billable_resources_present": billable_resources_present,
+                                     "cleanup_open": ledger_cleanup_open,
+                                     "billing_final": (getattr(reconciliation, "billing_final", None)
+                                         if not isinstance(reconciliation, Mapping) else reconciliation.get("billing_final")),
+                                     "incurred_usd": (getattr(reconciliation, "incurred_usd", None)
+                                         if not isinstance(reconciliation, Mapping) else reconciliation.get("incurred_usd")),
+                                     "cleanup_result": cleanup_result,
                                      "reconciliation": reconciliation, "errors": errors,
-                                     "launch_blocked": not absence_proved}
+                                     "launch_blocked": not reconciled}
     complete = all(item.get("cleanup") in {"succeeded", "not_required"} and item.get("reconciled", True)
                    for item in outcomes.values())
     # Cleanup callbacks do not get to claim success from a requested delete;
@@ -243,7 +261,7 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
     try:
         result.values[stage] = action()
         return True
-    except BaseException as exc:
+    except Exception as exc:
         failure = f"{provider} {stage} failed ({type(exc).__name__})"
         if result.primary_failure is None:
             result.primary_failure = failure
@@ -310,12 +328,36 @@ def execute_provider_workflows(
                     result.execution_state = "failed"
 
             with ThreadPoolExecutor(max_workers=min(max_workers, len(workflows))) as pool:
-                futures = [pool.submit(run_one, provider, workflows[provider]) for provider in claim_ok]
+                futures = {pool.submit(run_one, provider, workflows[provider]): provider for provider in claim_ok}
+                interrupted = False
                 for future in as_completed(futures):
                     try:
                         future.result()
                     except BaseException as exc:  # defensive: worker implementation must not strand peers
-                        results[next(iter(workflows))].secondary_failures.append(f"worker failed ({type(exc).__name__})")
+                        provider = futures[future]
+                        result = results[provider]
+                        message = f"{provider} worker {'interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed'} ({type(exc).__name__})"
+                        if result.primary_failure is None:
+                            result.primary_failure = message
+                        else:
+                            result.secondary_failures.append(message)
+                        result.execution_state = "failed"
+                        if isinstance(exc, KeyboardInterrupt):
+                            interrupted = True
+                            for active_future, active_provider in futures.items():
+                                if active_provider == provider or not active_future.done():
+                                    _call(active_provider, "cancel", workflows[active_provider].cancel,
+                                          results[active_provider])
+                if interrupted:
+                    for provider in claim_ok:
+                        result = results[provider]
+                        if "create" in result.values:
+                            for stage in ("close", "retrieve"):
+                                if stage not in result.values:
+                                    _call(provider, stage, getattr(workflows[provider], stage), result)
+                        if result.execution_state not in {"succeeded", "failed"}:
+                            result.primary_failure = result.primary_failure or f"{provider} workflow interrupted"
+                            result.execution_state = "failed"
 
     # Cleanup is attempted for every selected provider: protection may have
     # allocated safety resources even when VM creation was never reached.

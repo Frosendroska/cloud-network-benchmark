@@ -92,6 +92,19 @@ def test_claim_failure_is_provider_local_after_complete_protection():
     assert not result.completed
 
 
+def test_worker_interrupt_requests_scoped_cancel_then_closes_and_cleans_created_pair():
+    trace = Trace()
+    base = hooks("aws", trace)
+    interrupted = ProviderHooks(**{**base.__dict__,
+        "measure":lambda:(_ for _ in ()).throw(KeyboardInterrupt()),
+        "cancel":lambda:trace.add("aws", "cancel")})
+    result = execute_provider_workflows({"aws":interrupted},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for _, stage in trace.events]
+    assert "cancel" in stages and "close" in stages and "retrieve" in stages and "cleanup" in stages
+    assert not result.completed and result.provider_results["aws"].primary_failure
+
+
 def test_controller_session_and_cap_are_immutable_for_stage_checks():
     context = LifecycleContext("session-1", 100.0, 1000.0, 1200, {"measurement": 900.0})
     with pytest.raises(ValueError, match="cap"):

@@ -27,7 +27,9 @@ def test_changed_session_performs_cleanup_only_and_keeps_unknown_liability_block
         return {"requested_delete": True}
     actions = {name: cleanup for name in ("aws", "gcp")}
     outcome = cleanup_lifecycle(recovery, current_session_id="new-session", cleanup_actions=actions,
-        reconcile=lambda record, result: {"absence_proved": record.provider == "aws"})
+        reconcile=lambda record, result: {"absence_proved": record.provider == "aws",
+            "billable_resources_present": False if record.provider == "aws" else None,
+            "cleanup_open": False if record.provider == "aws" else True})
     assert called == [("aws", "cleanup"), ("gcp", "cleanup")]
     assert outcome.original_session_id == "old-session"
     assert outcome.current_session_id == "new-session"
@@ -42,7 +44,8 @@ def test_no_resource_side_effect_evidence_skips_provider_cleanup(tmp_path):
     called = []
     outcome = cleanup_lifecycle(recovery, current_session_id="new-session",
         cleanup_actions={"azure": lambda record: called.append(record.provider)},
-        reconcile=lambda record, result: {"absence_proved": True})
+        reconcile=lambda record, result: {"absence_proved": True, "billable_resources_present": False,
+                                         "cleanup_open": False})
     assert called == []
     assert outcome.complete
     assert outcome.providers["azure"]["cleanup"] == "not_required"

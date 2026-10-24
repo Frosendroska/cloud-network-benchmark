@@ -66,7 +66,8 @@ def test_recovery_journal_is_private_exclusive_and_cli_cleanup_never_resumes(tmp
     code = main(["cleanup", "--recovery", str(recovery_path), "--runtime-config", "unused.json",
         "--private-root", str(tmp_path / "private"), "--controller-session", "new", "--format", "json"],
         cleanup_actions={"aws":lambda record: actions.append(record.provider) or {"delete_requested":True}},
-        reconcile=lambda record, result:{"absence_proved":True, "provider":record.provider})
+        reconcile=lambda record, result:{"absence_proved":True, "billable_resources_present":False,
+            "cleanup_open":False, "billing_final":False, "incurred_usd":None, "provider":record.provider})
     report = json.loads(capsys.readouterr().out)
     assert code == 0 and report["status"] == "complete" and report["execution"] == "not_resumed"
     assert actions == ["aws"] and report["external_calls"] == 1

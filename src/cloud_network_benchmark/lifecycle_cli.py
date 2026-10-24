@@ -119,7 +119,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 "original_session_id": result.original_session_id,
                 "current_session_id": result.current_session_id,
                 "providers": {provider: {key: value for key, value in item.items()
-                    if key in {"cleanup", "reconciled", "errors", "launch_blocked", "reason"}}
+                    if key in {"cleanup", "reconciled", "absence_proved", "billable_resources_present",
+                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason"}}
                     for provider, item in result.providers.items()},
                 "external_calls": sum(item.get("cleanup") in {"attempted", "succeeded", "failed"}
                                        for item in result.providers.values())}
