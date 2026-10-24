@@ -12,6 +12,7 @@ from .admission import load_cost_inputs
 from .config import resolve_campaign
 from .scheduling import load_schedule
 from .lifecycle_bundle import recommend_calibration_common_n
+from .lifecycle_runtime import load_runtime_config, load_initialized_campaign
 
 
 def preview_lifecycle(*, config_path: Path, repository_root: Path,
@@ -93,18 +94,37 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             for path in (args.config, args.cost_inputs, args.runtime_config):
                 if not path.is_file() or path.is_symlink():
                     raise ValueError(f"required local input is unavailable: {path.name}")
-            runtime = json.loads(args.runtime_config.read_text(encoding="utf-8"))
-            if not isinstance(runtime, dict):
-                raise ValueError("runtime config must be a JSON object containing sourced non-secret references")
+            resolved, _ = resolve_campaign(args.config, Path.cwd())
+            runtime = load_runtime_config(args.runtime_config,
+                selected_providers={str(provider) for provider in resolved.selected_providers})
             report = preview_lifecycle(config_path=args.config, repository_root=Path.cwd(),
                 schedule_path=args.schedule, row_id=args.row_id, cost_inputs_path=args.cost_inputs,
                 now=datetime.now(timezone.utc))
             if args.action == "run":
-                report["status"] = "rejected"
-                report["reason_codes"] = sorted(set(report["reason_codes"] + ["paid_prerequisites_not_authorized_or_incomplete"]))
-                report["execution_scope"] = args.execution_scope
+                try:
+                    initialized, children = load_initialized_campaign(
+                        runtime["initialized_campaign_manifest"], repository_root=Path.cwd(),
+                        config_path=args.config, schedule_path=args.schedule)
+                    if initialized.config_id != resolved.config_id or initialized.mode != resolved.mode:
+                        raise ValueError("initialized campaign identity differs from the selected config")
+                    if set(children) != {str(provider) for provider in resolved.selected_providers}:
+                        raise ValueError("initialized provider set differs from the selected campaign")
+                except (OSError, ValueError) as exc:
+                    report.update(status="rejected", reason_codes=sorted(set(report["reason_codes"] +
+                        ["initialized_campaign_unavailable_or_mismatched"])), detail=str(exc),
+                        execution_scope=args.execution_scope, external_calls=0)
+                    print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                          "Lifecycle run rejected: initialized campaign identity is unavailable or mismatched.")
+                    return 1
+                # Production composition is deliberately downstream of source-bound
+                # initialization. The paid executor is supplied by the explicit
+                # runtime factory once every required F11 gate can be evaluated.
+                report.update(status="rejected", reason_codes=sorted(set(report["reason_codes"] +
+                    ["f11_production_admission_required"])), execution_scope=args.execution_scope,
+                    campaign_id=initialized.campaign_id, run_ids={k: v.run_id for k, v in children.items()},
+                    external_calls=0)
                 print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
-                      "Lifecycle run rejected: current offline stage has no verified paid prerequisites.")
+                      "Lifecycle run rejected: complete F11 production admission is required.")
                 return 1
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")

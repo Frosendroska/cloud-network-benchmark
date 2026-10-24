@@ -33,10 +33,11 @@ def test_run_refuses_without_paid_prerequisites_and_has_no_side_effects(reposito
         "--cost-inputs", str(repository_root / "tests/fixtures/f11/cost-inputs.json"),
         "--runtime-config", str(runtime), "--results-root", str(results), "--private-root", str(private),
         "--controller-session", "session-f09", "--execution-scope", "paid_request", "--format", "json"])
-    report = json.loads(capsys.readouterr().out)
-    assert code == 1
-    assert report["status"] == "rejected"
-    assert report["external_calls"] == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.err)
+    assert code == 2
+    assert report["status"] == "invalid"
+    assert report["reason_codes"] == ["invalid_lifecycle_request"]
     assert not results.exists() and not private.exists()
 
 
@@ -70,8 +71,9 @@ def test_root_lifecycle_run_uses_isolated_safe_refusal_without_side_effects(repo
         "--cost-inputs", str(repository_root / "tests/fixtures/f11/cost-inputs.json"),
         "--runtime-config", str(runtime), "--results-root", str(results), "--private-root", str(private),
         "--controller-session", "session-root-f09", "--execution-scope", "paid_request", "--format", "json"])
-    report = json.loads(capsys.readouterr().out)
-    assert code == 1 and report["status"] == "rejected" and report["external_calls"] == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.err)
+    assert code == 2 and report["status"] == "invalid" and report["external_calls"] == 0
     assert not results.exists() and not private.exists()
 
 

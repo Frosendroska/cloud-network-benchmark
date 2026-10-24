@@ -76,13 +76,23 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         "source_id", "provider_leads_seconds", "completed_stages"}, "allowance")
     access = _keys(root["access"], {"timeouts", "readiness", "bootstrap", "guest_remote_root",
         "diagnostic_interfaces"}, "access")
-    if not isinstance(access["guest_remote_root"], str) or not access["guest_remote_root"].startswith("/"):
-        raise ValueError("guest_remote_root must be absolute")
+    remote_root = access["guest_remote_root"]
+    if (not isinstance(remote_root, str) or not remote_root.startswith("/")
+            or Path(remote_root).as_posix() != remote_root
+            or any(part in {".", ".."} for part in Path(remote_root).parts)):
+        raise ValueError("guest_remote_root must be a normalized absolute path")
     providers = root["providers"]
     if not isinstance(providers, dict) or not providers or set(providers) - {"aws", "azure", "gcp"}:
         raise ValueError("providers must select one or more supported providers")
     if selected_providers is not None and set(providers) != selected_providers:
         raise ValueError("runtime providers must exactly match the selected campaign providers")
+    interfaces = access["diagnostic_interfaces"]
+    if not isinstance(interfaces, dict) or set(interfaces) != set(providers):
+        raise ValueError("diagnostic interfaces must exactly match selected providers")
+    for provider, roles in interfaces.items():
+        if not isinstance(roles, dict) or set(roles) != {"vm_a", "vm_b"} or any(
+                not isinstance(name, str) or not name.strip() for name in roles.values()):
+            raise ValueError(f"diagnostic interfaces for {provider} must name vm_a and vm_b")
     if not isinstance(allowance["provider_leads_seconds"], dict) or set(allowance["provider_leads_seconds"]) != set(providers):
         raise ValueError("allowance provider leads must exactly match selected providers")
     if allowance["completed_stages"] != []:
@@ -133,6 +143,23 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs names an unknown F11 gate")
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")
                               for key, value in root["approval_refs"].items()}
+    root["approval_evidence"] = {}
+    for key, reference in root["approval_refs"].items():
+        try:
+            evidence = json.loads(reference.read_text(encoding="utf-8"), object_pairs_hook=_object,
+                                  parse_constant=_constant)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"approval evidence {key} is not valid source JSON") from exc
+        if not isinstance(evidence, dict):
+            raise ValueError(f"approval evidence {key} must be a JSON object")
+        declared_path = evidence.get("source_path")
+        declared_hash = evidence.get("source_sha256")
+        if not isinstance(declared_path, str) or not isinstance(declared_hash, str):
+            raise ValueError(f"approval evidence {key} must identify source_path and source_sha256")
+        source = _source_path(reference.parent, declared_path, f"approval_evidence.{key}.source_path")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != declared_hash:
+            raise ValueError(f"approval evidence {key} source hash does not match its bytes")
+        root["approval_evidence"][key] = evidence
     return root
 
 
@@ -186,3 +213,72 @@ def load_initialized_campaign(parent_path: Path, *, repository_root: Path,
             verified_snapshot(child.config_provenance.schedule_snapshot_path.value,
                 child.config_provenance.schedule_sha256.value, "schedule")
     return parent, children
+
+
+def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, Any],
+                            costs: Any, runtime: dict[str, Any]):
+    """Build F11 inputs from the initialized identities and exact sourced cost rows."""
+    from decimal import Decimal
+    from .admission import AdmissionPlan, WorkflowAllowance
+    from .contracts.admission import ReservationRequest
+    from .contracts.common import Evidence, Provider
+
+    providers = {Provider(item.provider).value: item for item in campaign.observations}
+    child_ids = {provider: child.run_id for provider, child in children.items()}
+    if set(providers) != set(child_ids) or set(runtime["providers"]) != set(child_ids):
+        raise ValueError("runtime, initialized manifests and resolved provider set must match")
+    if any(child.execution_state != "initialized" for child in children.values()):
+        raise ValueError("initialized child already contains lifecycle execution")
+    rows = costs.payload.get("provider_run_envelopes")
+    if not isinstance(rows, dict) or set(rows) != set(child_ids):
+        raise ValueError("refreshed cost input must contain exact per-provider run envelopes")
+    envelopes = {}
+    funding: dict[str, Decimal] = {}
+    for provider, row in rows.items():
+        if not isinstance(row, dict) or row.get("run_id") != child_ids[provider]:
+            raise ValueError("cost envelope run identity differs from initialized child")
+        envelopes[provider] = {**row, "source_path": costs.source_path,
+                               "source_sha256": costs.payload_sha256}
+        components = row.get("components")
+        if not isinstance(components, dict):
+            raise ValueError("cost envelope components are unavailable")
+        for component in components.values():
+            if not isinstance(component, dict) or not isinstance(component.get("funding_bucket"), str):
+                raise ValueError("cost envelope funding source is invalid")
+            bucket = component["funding_bucket"]
+            try:
+                amount = Decimal(str(component["amount_usd"]))
+            except Exception as exc:
+                raise ValueError("cost envelope amount is invalid") from exc
+            funding[bucket] = funding.get(bucket, Decimal("0")) + amount
+    estimated = sum((Decimal(str(component["amount_usd"]))
+        for row in rows.values() for component in row["components"].values()), Decimal("0"))
+    allowance = runtime["allowance"]
+    if set(allowance.provider_leads_seconds) != set(child_ids):
+        raise ValueError("allowance provider set differs from initialized campaign")
+    schedule = campaign.schedule_entry.value
+    request = ReservationRequest(schema_version=2, campaign_id=parent.campaign_id,
+        config_id=campaign.config_id,
+        schedule_entry_id=(Evidence[str](value=schedule.entry_id) if schedule else
+            Evidence[str](unavailable_reason="acceptance has no schedule row")),
+        selected_providers=[Provider(name) for name in child_ids], mode=campaign.mode,
+        priority=campaign.admission.priority, lifetime_cap_seconds=campaign.admission.lifetime_cap_seconds,
+        estimated_cost_usd=Evidence[float](value=float(estimated)), source_path=costs.source_path,
+        source_sha256=costs.payload_sha256,
+        incurred_cost_usd=Evidence[float](unavailable_reason="F11 ledger derives current incurred charges"),
+        active_reserved_usd=Evidence[float](unavailable_reason="F11 ledger derives active reservations"),
+        outstanding_cleanup=False)
+    namespaces = {provider: f"cnb-{child.run_id}-{child.deployment_id}"
+                  for provider, child in children.items()}
+    prerequisites = runtime.get("approval_evidence", {})
+    support = costs.payload.get("provider_support", {})
+    plan = AdmissionPlan(campaign, child_ids, namespaces, costs, allowance,
+        execution_scope="paid_request", prerequisites=prerequisites,
+        funding=funding, provider_support=support,
+        original_failure=prerequisites.get("original_failure"),
+        optional_reviewed="optional_review" in prerequisites,
+        optional_review_evidence=({"priority": prerequisites["optional_review"]}
+            if "optional_review" in prerequisites else {}),
+        observation_id=next(iter(children.values())).observation_id,
+        cost_envelopes=envelopes)
+    return request, plan
