@@ -7,7 +7,9 @@ from cloud_network_benchmark.contracts.artifacts import ArtifactInput
 from cloud_network_benchmark.contracts.common import ArtifactExpectation, VmRole
 from cloud_network_benchmark.contracts.campaign import PhaseConfiguration
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout
-from cloud_network_benchmark.lifecycle_bundle import build_closed_inventory, finalize_validation, lifecycle_declarations, retry_failed_items, retry_manifest, retrieve_closed_bundle, seal_bundle
+from cloud_network_benchmark.lifecycle_bundle import (build_closed_inventory, build_remote_closed_inventory,
+    finalize_validation, lifecycle_declarations, retry_failed_items, retry_manifest,
+    retrieve_closed_bundle, seal_bundle)
 from cloud_network_benchmark.retrieval import RetrievalResult
 
 
@@ -37,6 +39,34 @@ def test_closed_inventory_hashes_only_real_files_and_expands_day_families(tmp_pa
     assert probe.expected_sha256 == hashlib.sha256(b"synthetic,not-native\n").hexdigest()
     assert manifest.unavailable_items["missing"]["reason"]
     assert manifest.closure_evidence.startswith("observed")
+
+
+def test_remote_inventory_manifest_uses_observed_remote_hashes_and_controller_sidecar_origin():
+    ended = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    declarations = [
+        ArtifactInput(artifact_id="day-family", path_template="probe/{chunk_id}.csv",
+            kind="sockperf-csv", producer="vm_a", expectation="required"),
+        ArtifactInput(artifact_id="build-b", path="metadata/build/vm_b-iperf3.identity",
+            kind="build-identity", producer="vm_b", expectation="required"),
+        ArtifactInput(artifact_id="missing", path="metadata/vm_a.json", kind="vm_metadata",
+            producer="vm_a", expectation="required"),
+    ]
+    files = {
+        "vm_a":[{"path":"probe/chunk-01.csv", "size_bytes":7, "sha256":hashlib.sha256(b"native\n").hexdigest()}],
+        "vm_b":[{"path":"metadata/build/vm_b-iperf3.identity", "size_bytes":9,
+                  "sha256":hashlib.sha256(b"sidecar!!").hexdigest()}],
+    }
+    manifest = build_remote_closed_inventory(identity={"provider":"aws"},
+        deployment_id="run-aws-deployment", remote_workspace="/var/lib/cnb/work",
+        declarations=declarations, remote_files=files,
+        source_vm_ids={"vm_a":"10.1.0.1", "vm_b":"10.1.0.2"},
+        measurement_ended_at=ended,
+        closure={"vm_a":ended+timedelta(seconds=1), "vm_b":ended+timedelta(seconds=2)},
+        controller_materialized_ids=("build-b",))
+    assert [item.artifact_id for item in manifest.items] == ["day-family-chunk-01"]
+    assert manifest.items[0].expected_sha256 == hashlib.sha256(b"native\n").hexdigest()
+    assert manifest.declarations[1].producer == "controller"
+    assert "missing" in manifest.unavailable_items
 
 
 def test_retry_selects_only_failed_concrete_ids_and_drops_siblings():

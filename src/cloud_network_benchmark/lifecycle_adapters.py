@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import shlex
 import tarfile
 import tempfile
@@ -36,6 +37,54 @@ class RemoteGuestExecution:
     outcome: Any | None
     actions: tuple[Any, ...]
     failure: str | None = None
+
+
+@dataclass(frozen=True)
+class RemoteDiagnosticsProcess:
+    deployment_id: str
+    role: str
+    invocation_id: str
+    pid: int
+    process_group: int
+    boot_id: str
+    start_ticks: int
+    remote_root: str
+    context_path: str
+    outcome_path: str
+    context: Mapping[str, Any]
+    actions: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class RemoteDiagnosticsClosure:
+    deployment_id: str
+    role: str
+    state: str
+    closed_at: datetime | None
+    outcome: Mapping[str, Any] | None
+    actions: tuple[Any, ...]
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RemoteListenerClosure:
+    deployment_id: str
+    role: str
+    closed: bool
+    closed_at: datetime | None
+    observations: Mapping[str, Mapping[str, str]]
+    actions: tuple[Any, ...]
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RemoteFileInventory:
+    deployment_id: str
+    role: str
+    workspace: str
+    files: tuple[Mapping[str, Any], ...]
+    actions: tuple[Any, ...]
+    failures: tuple[str, ...] = ()
 
 
 def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: str,
@@ -304,6 +353,325 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     except BaseException as exc:
         return RemoteGuestExecution(None, tuple(actions),
             f"{type(exc).__name__}: F03 remote handoff failed; cancellation={cancellation_status}")
+
+
+def start_remote_diagnostics(connection: Any, context: Mapping[str, Any], *, runner: Any,
+        remote_root: str, deadline: Any,
+        clock: Callable[[], float] = __import__("time").monotonic) -> RemoteDiagnosticsProcess:
+    """Start the existing standalone F04 collector on one selected VM.
+
+    The collector runs in a unique session/process group. Its boot ID, PID,
+    process group and kernel start ticks are captured so closure can signal only
+    this invocation, even if a stale PID is reused.
+    """
+    import uuid
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+    from .diagnostics_guest import validate_context
+
+    context = dict(context)
+    # Validate all standalone collector fields on a local temporary path; the
+    # configured output_root belongs to the guest filesystem and must not be
+    # followed through host-specific symlinks during controller validation.
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="cnb-f09-context-", dir=Path(__file__).resolve().parents[2]) as temp_root:
+        validate_context({**context, "output_root": str(Path(temp_root) / "output")})
+    role = context["vm_role"]
+    if context["deployment_id"] != connection.deployment_id or role not in {"vm_a", "vm_b"}:
+        raise ValueError("diagnostics context must match a selected deployment role")
+    root = PurePosixPath(remote_root)
+    if not remote_root.startswith("/") or root.as_posix() != remote_root or ".." in root.parts:
+        raise ValueError("diagnostics control root must be normalized absolute POSIX")
+    invocation = uuid.uuid4().hex
+    vm = connection.vm_a if role == "vm_a" else connection.vm_b
+    actions = []
+    context_path = str(root / f"{invocation}.context.json")
+    outcome_path = str(root / f"{invocation}.outcome.json")
+    process_path = str(root / f"{invocation}.process.json")
+    try:
+        with TemporaryDirectory(prefix="cnb-f09-diagnostics-") as temp_dir:
+            temp = Path(temp_dir)
+            helper = Path(__file__).with_name("diagnostics_guest.py")
+            context_file = temp / "context.json"
+            context_file.write_text(json.dumps(context, sort_keys=True, separators=(",", ":")) + "\n",
+                                    encoding="utf-8")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("diagnostics staging is outside the active cap")
+            mkdir = _request(f"f09-diagnostics-mkdir-{invocation}", vm,
+                ["sh", "-c", f"mkdir -p {shlex.quote(str(root))}"],
+                min(connection.timeouts.command_seconds, remaining))
+            mkdir_result = _execute(runner, mkdir)
+            actions.append(_action(mkdir.action_id, mkdir.action_type, vm, mkdir, mkdir_result))
+            if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
+                raise RuntimeError("diagnostics control directory creation failed")
+            for suffix, local_path, remote_path in (("helper", helper, str(root / "diagnostics_guest.py")),
+                                                     ("context", context_file, context_path)):
+                remaining = deadline.remaining(clock)
+                if remaining <= 0:
+                    raise TimeoutError("diagnostics input transfer is outside the active cap")
+                upload = _request(f"f09-diagnostics-{suffix}-{invocation}", vm,
+                    [str(local_path), f"{vm.user}@{vm.host}:{remote_path}"],
+                    min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
+                upload_result = _execute(runner, upload)
+                actions.append(_action(upload.action_id, upload.action_type, vm, upload, upload_result))
+                if upload_result.outcome != CommandOutcome.SUCCEEDED:
+                    raise RuntimeError(f"diagnostics {suffix} transfer failed")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("diagnostics collector start is outside the active cap")
+            script = (
+                "set -eu; test ! -e " + shlex.quote(process_path) + "; "
+                "setsid python3 " + shlex.quote(str(root / "diagnostics_guest.py")) + " --context "
+                + shlex.quote(context_path) + " > " + shlex.quote(outcome_path) + " 2>&1 </dev/null & pid=$!; "
+                "python3 -c " + shlex.quote(
+                    "import json,os,pathlib,sys; p=int(sys.argv[1]); "
+                    "s=pathlib.Path(f'/proc/{p}/stat').read_text(); f=s[s.rfind(')')+2:].split(); "
+                    "r={'pid':p,'process_group':os.getpgid(p),'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'start_ticks':int(f[19])}; "
+                    "pathlib.Path(sys.argv[2]).write_text(json.dumps(r,sort_keys=True)+'\\n'); print(json.dumps(r,sort_keys=True)"
+                    ) + " \"$pid\" " + shlex.quote(process_path))
+            start = _request(f"f09-diagnostics-start-{invocation}", vm,
+                ["sh", "-c", script], min(connection.timeouts.command_seconds, remaining))
+            start_result = _execute(runner, start)
+            actions.append(_action(start.action_id, start.action_type, vm, start, start_result))
+            if start_result.outcome != CommandOutcome.SUCCEEDED:
+                raise RuntimeError("diagnostics collector start failed")
+            try:
+                process = json.loads(start_result.stdout.strip().splitlines()[-1])
+                pid, pgid, boot_id, start_ticks = (process[key] for key in
+                    ("pid", "process_group", "boot_id", "start_ticks"))
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise ValueError("diagnostics process identity evidence is malformed") from exc
+            if (any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in (pid, pgid, start_ticks)) or pid != pgid
+                    or not isinstance(boot_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", boot_id)):
+                raise ValueError("diagnostics process identity evidence is incomplete")
+            return RemoteDiagnosticsProcess(connection.deployment_id, role, invocation,
+                pid, pgid, boot_id, start_ticks, str(root), context_path, outcome_path,
+                context, tuple(actions))
+    except BaseException:
+        raise
+
+
+def stop_remote_diagnostics(connection: Any, process: RemoteDiagnosticsProcess, *, runner: Any,
+        deadline: Any, clock: Callable[[], float] = __import__("time").monotonic) -> RemoteDiagnosticsClosure:
+    """Stop one captured F04 process group, observe exit, then read its flushed outcome."""
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+
+    if process.deployment_id != connection.deployment_id:
+        raise ValueError("diagnostics process belongs to another deployment")
+    vm = connection.vm_a if process.role == "vm_a" else connection.vm_b
+    actions = []
+    failures = []
+    closed_at = None
+    outcome = None
+    remaining = deadline.remaining(clock, cleanup=True)
+    if remaining <= 0:
+        return RemoteDiagnosticsClosure(process.deployment_id, process.role, "unverified", None,
+            None, process.actions, ("cleanup allowance exhausted before diagnostics stop",))
+    source = "exec(" + repr("\n".join((
+        "import datetime,json,os,pathlib,signal,sys,time",
+        "path=pathlib.Path(sys.argv[1]); expected=(int(sys.argv[2]),int(sys.argv[3]),sys.argv[4],int(sys.argv[5]))",
+        "r=json.loads(path.read_text())",
+        "(r['pid'],r['process_group'],r['boot_id'],r['start_ticks'])==expected or sys.exit(3)",
+        "pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==expected[2] or sys.exit(4)",
+        "stat=pathlib.Path(f'/proc/{expected[0]}/stat')",
+        "(not stat.exists() or int(stat.read_text()[stat.read_text().rfind(')')+2:].split()[19])==expected[3]) or sys.exit(5)",
+        "try:",
+        " os.killpg(expected[1],0)",
+        "except ProcessLookupError:",
+        " exists=False",
+        "else:",
+        " exists=True",
+        "if exists:",
+        " os.killpg(expected[1],signal.SIGTERM)",
+        " deadline=time.monotonic()+10",
+        " while True:",
+        "  try: os.killpg(expected[1],0)",
+        "  except ProcessLookupError: break",
+        "  if time.monotonic()>=deadline: sys.exit(6)",
+        "  time.sleep(0.1)",
+        "print(json.dumps({'state':'stopped','closed_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z')}))",
+    ))) + ")"
+    command = "python3 -c " + shlex.quote(source) + " " + " ".join(shlex.quote(str(value)) for value in
+        (str(PurePosixPath(process.remote_root) / f"{process.invocation_id}.process.json"), process.pid,
+         process.process_group, process.boot_id, process.start_ticks))
+    stop = _request(f"f09-diagnostics-stop-{process.invocation_id}", vm,
+        ["sh", "-c", command], min(connection.timeouts.command_seconds, remaining))
+    stop_result = _execute(runner, stop)
+    actions.append(_action(stop.action_id, stop.action_type, vm, stop, stop_result))
+    if stop_result.outcome == CommandOutcome.SUCCEEDED:
+        try:
+            report = json.loads(stop_result.stdout.strip().splitlines()[-1])
+            if report.get("state") != "stopped":
+                raise ValueError("diagnostics stop result did not confirm stop")
+            closed_at = datetime.fromisoformat(report["closed_at_utc"].replace("Z", "+00:00"))
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            failures.append(f"diagnostics stop evidence is malformed ({type(exc).__name__})")
+    else:
+        failures.append("diagnostics process group was not observed stopped")
+    remaining = deadline.remaining(clock, cleanup=True)
+    if remaining > 0 and closed_at is not None:
+        read = _request(f"f09-diagnostics-outcome-{process.invocation_id}", vm,
+            ["cat", "--", process.outcome_path], min(connection.timeouts.command_seconds, remaining))
+        read_result = _execute(runner, read)
+        actions.append(_action(read.action_id, read.action_type, vm, read, read_result))
+        if read_result.outcome == CommandOutcome.SUCCEEDED:
+            try:
+                outcome = json.loads(read_result.stdout.strip().splitlines()[-1])
+                if (outcome.get("deployment_id") != process.deployment_id
+                        or outcome.get("vm_role") != process.role or outcome.get("state") != "interrupted"
+                        or set(outcome.get("closed_paths", ())) != {
+                            str(Path(process.context["output_root"]) / f"metadata/{process.role}.json"),
+                            str(Path(process.context["output_root"]) / f"diagnostics/{process.role}.jsonl"),
+                            str(Path(process.context["output_root"]) / f"diagnostics/{process.role}-clock.jsonl")}):
+                    raise ValueError("diagnostics outcome does not prove the selected collector closed its files")
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                failures.append(f"diagnostics outcome is unavailable or invalid ({type(exc).__name__})")
+        else:
+            failures.append("diagnostics outcome retrieval failed")
+    elif closed_at is None:
+        failures.append("diagnostics outcome was not read because process stop is unverified")
+    state = "closed" if closed_at is not None and outcome is not None and not failures else "failed"
+    return RemoteDiagnosticsClosure(process.deployment_id, process.role, state, closed_at,
+        outcome, (*process.actions, *actions), tuple(failures))
+
+
+def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
+        clock: Callable[[], float] = __import__("time").monotonic) -> RemoteListenerClosure:
+    """Stop only this deployment's two F02 B-side systemd listeners and verify exit.
+
+    systemd owns these listeners; stopping the selected unit waits for its
+    process and append-log descriptors to close. No broad process-name kill is
+    used. Guest terminal timestamps and MainPID/ActiveState must agree.
+    """
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+
+    vm = connection.vm_b
+    actions = []
+    observations: dict[str, dict[str, str]] = {}
+    failures = []
+    for tool in ("sockperf", "iperf3"):
+        unit = f"cnb-{connection.deployment_id}-{tool}"
+        remaining = deadline.remaining(clock, cleanup=True)
+        if remaining <= 0:
+            failures.append(f"{tool} listener stop exceeded the cleanup allowance")
+            continue
+        stop = _request(f"f09-listener-stop-{connection.deployment_id}-{tool}", vm,
+            ["sudo", "systemctl", "stop", unit],
+            min(connection.timeouts.command_seconds, remaining))
+        result = _execute(runner, stop)
+        actions.append(_action(stop.action_id, stop.action_type, vm, stop, result))
+        if result.outcome != CommandOutcome.SUCCEEDED:
+            failures.append(f"{tool} listener stop command failed")
+        remaining = deadline.remaining(clock, cleanup=True)
+        if remaining <= 0:
+            failures.append(f"{tool} listener exit observation exceeded the cleanup allowance")
+            continue
+        inspect = _request(f"f09-listener-exit-{connection.deployment_id}-{tool}", vm,
+            ["systemctl", "show", unit,
+             "--property=LoadState,ActiveState,MainPID,InactiveEnterTimestamp"],
+            min(connection.timeouts.server_seconds, remaining))
+        inspected = _execute(runner, inspect)
+        actions.append(_action(inspect.action_id, inspect.action_type, vm, inspect, inspected))
+        if inspected.outcome != CommandOutcome.SUCCEEDED:
+            failures.append(f"{tool} listener terminal state could not be observed")
+            continue
+        fields = dict(line.split("=", 1) for line in inspected.stdout.splitlines() if "=" in line)
+        observations[tool] = fields
+        if (fields.get("LoadState") != "loaded" or fields.get("ActiveState") != "inactive"
+                or fields.get("MainPID") != "0"):
+            failures.append(f"{tool} listener is not observed inactive with MainPID=0")
+            continue
+        raw_time = fields.get("InactiveEnterTimestamp", "")
+        try:
+            observed = datetime.strptime(raw_time, "%a %Y-%m-%d %H:%M:%S %Z")
+            if raw_time.endswith(" UTC"):
+                observed = observed.replace(tzinfo=timezone.utc)
+            if observed.tzinfo is None or observed.utcoffset() is None:
+                raise ValueError("systemd terminal timestamp is not timezone-aware")
+            observations[tool]["closed_at_utc"] = observed.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            failures.append(f"{tool} listener terminal timestamp is unavailable or malformed")
+    times = [datetime.fromisoformat(row["closed_at_utc"]) for row in observations.values()
+             if "closed_at_utc" in row]
+    closed_at = max(times) if len(times) == 2 and not failures else None
+    return RemoteListenerClosure(connection.deployment_id, "vm_b", closed_at is not None,
+        closed_at, observations, tuple(actions), tuple(failures))
+
+
+def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, runner: Any,
+        deadline: Any, clock: Callable[[], float] = __import__("time").monotonic,
+        maximum_files: int = 10000) -> RemoteFileInventory:
+    """Read a bounded, symlink-free inventory and hashes from one closed VM workspace."""
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+
+    if role not in {"vm_a", "vm_b"}:
+        raise ValueError("inventory role must identify a selected VM")
+    root = PurePosixPath(workspace)
+    if not workspace.startswith("/") or root.as_posix() != workspace or ".." in root.parts:
+        raise ValueError("remote workspace must be normalized absolute POSIX")
+    if isinstance(maximum_files, bool) or not isinstance(maximum_files, int) or maximum_files < 1:
+        raise ValueError("inventory file bound must be a positive integer")
+    vm = connection.vm_a if role == "vm_a" else connection.vm_b
+    remaining = deadline.remaining(clock, cleanup=True)
+    if remaining <= 0:
+        return RemoteFileInventory(connection.deployment_id, role, workspace, (), (),
+            ("cleanup allowance exhausted before remote inventory",))
+    source = "\n".join((
+        "import hashlib,json,pathlib,sys",
+        "root=pathlib.Path(sys.argv[1]); bound=int(sys.argv[2])",
+        "root.is_dir() and not root.is_symlink() or sys.exit(2)",
+        "rows=[]",
+        "for path in sorted(root.rglob('*')):",
+        " if path.is_symlink(): sys.exit(3)",
+        " if path.is_file():",
+        "  rel=path.relative_to(root).as_posix()",
+        "  rel and not rel.startswith('/') and '..' not in pathlib.PurePosixPath(rel).parts or sys.exit(4)",
+        "  h=hashlib.sha256(); size=0",
+        "  with path.open('rb') as stream:",
+        "   while True:",
+        "    chunk=stream.read(1048576)",
+        "    if not chunk: break",
+        "    h.update(chunk); size+=len(chunk)",
+        "  rows.append({'path':rel,'size_bytes':size,'sha256':h.hexdigest()})",
+        "  len(rows)<=bound or sys.exit(5)",
+        "print(json.dumps({'files':rows},sort_keys=True,separators=(',',':')))",
+    ))
+    command = "python3 -c " + shlex.quote("exec(" + repr(source) + ")") + " " + shlex.quote(workspace) + " " + str(maximum_files)
+    request = _request(f"f09-inventory-{connection.deployment_id}-{role}", vm,
+        ["sh", "-c", command], min(connection.timeouts.transfer_seconds, remaining))
+    result = _execute(runner, request)
+    action = _action(request.action_id, request.action_type, vm, request, result)
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return RemoteFileInventory(connection.deployment_id, role, workspace, (), (action,),
+            ("remote actual-file inventory failed or exceeded its bound",))
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        rows = payload["files"]
+        if not isinstance(rows, list) or len(rows) > maximum_files:
+            raise ValueError("remote file inventory is not a bounded array")
+        checked = []
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {"path", "size_bytes", "sha256"}
+                    or not isinstance(row["path"], str) or not row["path"]
+                    or PurePosixPath(row["path"]).is_absolute()
+                    or PurePosixPath(row["path"]).as_posix() != row["path"]
+                    or ".." in PurePosixPath(row["path"]).parts
+                    or isinstance(row["size_bytes"], bool) or not isinstance(row["size_bytes"], int)
+                    or row["size_bytes"] < 0 or not re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"]))):
+                raise ValueError("remote file inventory row is invalid")
+            checked.append(row)
+        if len({row["path"] for row in checked}) != len(checked):
+            raise ValueError("remote file inventory paths must be unique")
+        return RemoteFileInventory(connection.deployment_id, role, workspace,
+            tuple(checked), (action,))
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        return RemoteFileInventory(connection.deployment_id, role, workspace, (), (action,),
+            (f"remote file inventory evidence is malformed ({type(exc).__name__})",))
 
 
 def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,

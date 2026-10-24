@@ -195,6 +195,132 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
     assert cancel.result["stdout"] == "process_group_stopped"
 
 
+def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.lifecycle_adapters import start_remote_diagnostics, stop_remote_diagnostics
+    from tests.fixtures.f02r.support import connection, deadline, result
+    from tests.integration.test_diagnostics_collection import seed
+
+    connected = connection(tmp_path)
+    metadata = seed("vm_b")
+    metadata["deployment_id"] = connected.deployment_id
+    context = {"deployment_id": connected.deployment_id, "vm_role": "vm_b", "provider": "aws",
+        "interface": "eth0", "output_root": "/var/lib/cnb/work", "duration_seconds": 60,
+        "metadata_seed": metadata}
+    boot_id = "12345678-1234-1234-1234-123456789abc"
+
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.startswith("f09-diagnostics-start-"):
+                assert "setsid python3" in request.argv[-1]
+                assert "process_group" in request.argv[-1] and "/proc/sys/kernel/random/boot_id" in request.argv[-1]
+                return result(request.action_id, json.dumps({"pid": 4321, "process_group": 4321,
+                    "boot_id": boot_id, "start_ticks": 7654}))
+            if request.action_id.startswith("f09-diagnostics-stop-"):
+                assert "killpg" in request.argv[-1] and "SIGTERM" in request.argv[-1]
+                assert "4321" in request.argv[-1] and boot_id in request.argv[-1]
+                assert "pkill" not in request.argv[-1]
+                import shlex
+                import ast
+                remote = shlex.split(request.argv[-1])
+                python = shlex.split(remote[2])
+                outer = ast.parse(python[2])
+                compile(ast.literal_eval(outer.body[0].value.args[0]), "remote-diagnostics-stop", "exec")
+                return result(request.action_id, json.dumps({"state":"stopped",
+                    "closed_at_utc":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}))
+            if request.action_id.startswith("f09-diagnostics-outcome-"):
+                return result(request.action_id, json.dumps({"deployment_id":connected.deployment_id,
+                    "vm_role":"vm_b", "state":"interrupted", "closed_paths":[
+                        "/var/lib/cnb/work/metadata/vm_b.json",
+                        "/var/lib/cnb/work/diagnostics/vm_b.jsonl",
+                        "/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"]}))
+            return result(request.action_id)
+
+    runner = Runner()
+    process = start_remote_diagnostics(connected, context, runner=runner,
+        remote_root=f"/var/lib/cnb/control/{connected.deployment_id}", deadline=deadline(), clock=lambda:100)
+    assert process.role == "vm_b" and process.pid == process.process_group == 4321
+    assert process.boot_id == boot_id and process.start_ticks == 7654
+    closure = stop_remote_diagnostics(connected, process, runner=runner,
+        deadline=deadline(), clock=lambda:100)
+    assert closure.state == "closed" and closure.closed_at is not None
+    assert closure.outcome["state"] == "interrupted" and len(closure.outcome["closed_paths"]) == 3
+    assert [item.action_id.split("-")[2] for item in runner.requests if item.action_id.startswith("f09-diagnostics-")] == [
+        "mkdir", "helper", "context", "start", "stop", "outcome"]
+
+
+def test_vm_b_listener_closure_stops_selected_systemd_units_and_observes_closed_logs(tmp_path):
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.startswith("f09-listener-exit-"):
+                return result(request.action_id,
+                    "LoadState=loaded\nActiveState=inactive\nMainPID=0\n"
+                    "InactiveEnterTimestamp=Fri 2026-10-23 10:11:00 UTC\n")
+            return result(request.action_id)
+    runner = Runner()
+    closure = stop_vm_b_listeners(connected, runner=runner, deadline=deadline(), clock=lambda:100)
+    assert closure.closed and closure.closed_at is not None
+    assert set(closure.observations) == {"sockperf", "iperf3"}
+    stops = [item.argv[-1] for item in runner.requests if "systemctl stop" in item.argv[-1]]
+    assert len(stops) == 2
+    assert all(connected.deployment_id in item for item in stops)
+    assert all("pkill" not in item for item in stops)
+
+
+def test_vm_b_listener_closure_fails_closed_when_unit_is_still_active(tmp_path):
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+    connected = connection(tmp_path)
+    class Runner:
+        def run(self, request):
+            if request.action_id.startswith("f09-listener-exit-"):
+                return result(request.action_id,
+                    "LoadState=loaded\nActiveState=active\nMainPID=4321\n"
+                    "InactiveEnterTimestamp=n/a\n")
+            return result(request.action_id)
+    closure = stop_vm_b_listeners(connected, runner=Runner(), deadline=deadline(), clock=lambda:100)
+    assert not closure.closed and closure.closed_at is None
+    assert len(closure.failures) == 2
+
+
+def test_remote_workspace_inventory_is_hash_bound_bounded_and_symlink_failing(tmp_path):
+    import ast
+    import hashlib
+    import json
+    import shlex
+    from cloud_network_benchmark.lifecycle_adapters import inventory_remote_workspace
+    from tests.fixtures.f02r.support import connection, deadline, result
+    connected = connection(tmp_path)
+    rows = [{"path":"measurements/unit/native.log", "size_bytes":7,
+        "sha256":hashlib.sha256(b"native\n").hexdigest()}]
+    class Runner:
+        def __init__(self, payload): self.payload=payload; self.requests=[]
+        def run(self, request):
+            self.requests.append(request)
+            python = shlex.split(shlex.split(request.argv[-1])[2])
+            outer = ast.parse(python[2])
+            compile(ast.literal_eval(outer.body[0].value.args[0]), "remote-inventory", "exec")
+            return result(request.action_id, json.dumps({"files":self.payload}))
+    runner = Runner(rows)
+    inventory = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
+        runner=runner, deadline=deadline(), clock=lambda:100)
+    assert inventory.failures == () and inventory.files == tuple(rows)
+    assert inventory.files[0]["sha256"] == hashlib.sha256(b"native\n").hexdigest()
+    malformed = Runner([{**rows[0], "sha256":"bad"}])
+    rejected = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
+        runner=malformed, deadline=deadline(), clock=lambda:100)
+    assert rejected.files == () and rejected.failures
+
+
 def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(
         repository_root, tmp_path):
     import json

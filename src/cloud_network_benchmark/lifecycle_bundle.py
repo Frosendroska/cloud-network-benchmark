@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -34,7 +35,7 @@ def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied
             artifact_id = f"{unit_id}-sockperf-stdout"
             if artifact_id not in seen:
                 additions.append(ArtifactInput(artifact_id=artifact_id,
-                    path=f"measurements/{unit_id}/sockperf.stdout.log", kind="sockperf-stdout",
+                    path=f"measurements/{unit_id}/sockperf.stdout.log", kind="sockperf-log",
                     producer="vm_a", unit_id=unit_id, expectation="required"))
                 seen.add(artifact_id)
     return [*declarations, *additions]
@@ -129,6 +130,94 @@ def build_closed_inventory(*, identity: Mapping[str, Any], deployment_id: str,
         measurement_ended_at=measurement_ended_at, producers_closed_at=closed_at,
         closure_evidence="observed producer stop/flush/exit for both VM roles",
     )
+
+
+def build_remote_closed_inventory(*, identity: Mapping[str, Any], deployment_id: str,
+        remote_workspace: str, declarations: Sequence[ArtifactInput],
+        remote_files: Mapping[str, Sequence[Mapping[str, Any]]], source_vm_ids: Mapping[str, str],
+        measurement_ended_at: datetime, closure: Mapping[str, datetime],
+        timeout_seconds: float = 30.0,
+        controller_materialized_ids: Sequence[str] = ()) -> RetrievalManifest:
+    """Build a retrieval manifest only from observed remote inventory rows."""
+    workspace = PurePosixPath(remote_workspace)
+    if (not remote_workspace.startswith("/") or workspace.as_posix() != remote_workspace
+            or ".." in workspace.parts):
+        raise ValueError("remote workspace must be normalized absolute POSIX")
+    if measurement_ended_at.tzinfo is None or measurement_ended_at.utcoffset() is None:
+        raise ValueError("measurement end must be timezone-aware")
+    if set(closure) != {"vm_a", "vm_b"} or set(remote_files) != {"vm_a", "vm_b"} or set(source_vm_ids) != {"vm_a", "vm_b"}:
+        raise ValueError("remote inventory, producer closure and VM identities must cover both roles")
+    if any(value.tzinfo is None or value.utcoffset() is None or value < measurement_ended_at
+           for value in closure.values()):
+        raise ValueError("producer closure must be observed at or after measurement end")
+    by_role: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for role, rows in remote_files.items():
+        by_path: dict[str, Mapping[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping) or set(row) != {"path", "size_bytes", "sha256"}:
+                raise ValueError("remote inventory row must contain observed path, size and SHA-256")
+            rel = row["path"]
+            if (not isinstance(rel, str) or not rel or PurePosixPath(rel).is_absolute()
+                    or PurePosixPath(rel).as_posix() != rel or ".." in PurePosixPath(rel).parts
+                    or isinstance(row["size_bytes"], bool) or not isinstance(row["size_bytes"], int)
+                    or row["size_bytes"] < 0 or not re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"]))):
+                raise ValueError("remote inventory row is malformed")
+            if rel in by_path:
+                raise ValueError("remote inventory paths must be unique")
+            by_path[rel] = row
+        by_role[role] = by_path
+    items: list[RetrievalItem] = []
+    unavailable: dict[str, dict[str, str]] = {}
+    controller_ids = set(controller_materialized_ids)
+    effective_declarations = [
+        (ArtifactInput.model_validate({**item.model_dump(mode="python"), "producer":"controller"})
+         if item.artifact_id in controller_ids else item)
+        for item in declarations]
+    remote_declarations = [item for item in effective_declarations if item.producer != "controller"]
+    declaration_ids = [item.artifact_id for item in remote_declarations]
+    if len(set(declaration_ids)) != len(declaration_ids):
+        raise ValueError("remote artifact declarations must have unique IDs")
+    for declaration in remote_declarations:
+        role = str(getattr(declaration.producer, "value", declaration.producer))
+        if role not in by_role:
+            raise ValueError(f"unsupported producer role {role}")
+        concrete: list[tuple[str, str, str | None, Mapping[str, Any]]] = []
+        if declaration.path is not None:
+            row = by_role[role].get(declaration.path)
+            if row is not None:
+                concrete.append((declaration.artifact_id, declaration.path, declaration.unit_id, row))
+            else:
+                unavailable[declaration.artifact_id] = {"role":role, "path":declaration.path,
+                    "reason":"declared file was absent from the closed remote inventory"}
+        else:
+            template = declaration.path_template
+            if template is None or template.count("{chunk_id}") != 1:
+                raise ValueError("dynamic declaration requires exactly one chunk_id template")
+            parent, name = PurePosixPath(template).parent, PurePosixPath(template).name
+            prefix, suffix = name.split("{chunk_id}")
+            for rel, row in sorted(by_role[role].items()):
+                path = PurePosixPath(rel)
+                item_name = path.name
+                if path.parent == parent and item_name.startswith(prefix) and item_name.endswith(suffix):
+                    chunk = item_name[len(prefix):len(item_name)-len(suffix) if suffix else None]
+                    if chunk and all(char.isalnum() or char in "._-" for char in chunk):
+                        concrete.append((f"{declaration.artifact_id}-{chunk}", rel, chunk, row))
+            if not concrete:
+                unavailable[declaration.artifact_id] = {"role":role, "path":template,
+                    "reason":"no concrete declared chunk file was present in the closed remote inventory"}
+        for artifact_id, rel, unit_id, row in concrete:
+            items.append(RetrievalItem(artifact_id=artifact_id, deployment_id=deployment_id,
+                source_vm=source_vm_ids[role], source_role=role,
+                source_path=str(workspace / rel), destination_path=rel, kind=declaration.kind,
+                unit_id=unit_id, expectation=declaration.expectation, closed=True,
+                expected_size_bytes=row["size_bytes"], expected_sha256=row["sha256"],
+                timeout_seconds=timeout_seconds))
+    closed_at = max(closure.values())
+    return RetrievalManifest(identity=dict(identity), deployment_id=deployment_id,
+        remote_workspace=remote_workspace, declarations=effective_declarations, items=items,
+        unavailable_items=unavailable, measurement_ended_at=measurement_ended_at,
+        producers_closed_at=closed_at,
+        closure_evidence="observed F03/F04 exit, flush and bounded remote actual-file inventories for both VM roles")
 
 
 def retry_failed_items(result: RetrievalResult, *, already_retried: Sequence[str]) -> tuple[str, ...]:
@@ -256,12 +345,28 @@ def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
     journal consumer fsyncs the attempt identity before the second transfer;
     repeated finalization therefore cannot obtain a third attempt.
     """
-    from .orchestration import consume_retry_attempt
+    from .orchestration import SavedLifecycleRecovery, consume_retry_attempt
+
+    # A prior invocation may have durably consumed the second transfer and
+    # then lost the controller before recording its result. Re-running the
+    # first copy would be a third transfer in disguise, so fail closed and
+    # preserve the unknown artifact state for explicit recovery.
+    recovery = SavedLifecycleRecovery.validate_unique(
+        json.loads(Path(recovery_path).read_text(encoding="utf-8")))
+    consumed = set(recovery.retry_consumed_ids)
+    items = kwargs["manifest"].items
+    if consumed.intersection(item.artifact_id for item in items):
+        return RetrievalResult(complete=False, cleanup_required=True,
+            failures=[{"artifact_id": artifact_id,
+                "reason": "a prior retry was durably consumed; transfer state is unknown"}
+                for artifact_id in sorted(consumed.intersection(item.artifact_id for item in items))],
+            failure=None)
 
     def admitted(_item: RetrievalItem) -> bool:
         decision = ledger.check_stage_fit(reservation_id, stage="retrieval", remaining=allowance)
         return getattr(decision, "eligible", None) is True
 
+    kwargs["already_retried"] = tuple(consumed)
     return retrieve_closed_bundle(**kwargs, retry_admission=admitted,
         consume_retry=lambda artifact_id: consume_retry_attempt(recovery_path, artifact_id))
 
