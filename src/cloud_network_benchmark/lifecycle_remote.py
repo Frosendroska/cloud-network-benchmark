@@ -247,6 +247,8 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
                 source_artifact_records=[])
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic)
+            item.guest = __import__("dataclasses").replace(item.guest,
+                receiver_command_evidence=tuple(receiver_commands))
             item.measurement_ended_at = (item.guest.outcome.guest_finished_at
                 if item.guest.outcome is not None else after_utc)
             return ProviderStageOutcome("measure", item.guest.outcome is not None

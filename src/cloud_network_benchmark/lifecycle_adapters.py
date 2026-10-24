@@ -37,6 +37,7 @@ class RemoteGuestExecution:
     outcome: Any | None
     actions: tuple[Any, ...]
     failure: str | None = None
+    receiver_command_evidence: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)

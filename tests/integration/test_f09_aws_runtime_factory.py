@@ -234,6 +234,18 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert "aws-pair-apply" in runner.actions
     assert "aws-pair-output" in runner.actions
     assert "aws-pair-destroy" in runner.actions
+    from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
+    from cloud_network_benchmark.contracts.validation import ValidatorInput
+    from cloud_network_benchmark.validation import validate_bundle
+    finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
+        parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=NOW + timedelta(minutes=1))
+    result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+    result_root = (repository_root / result_ref.result_path).resolve()
+    result_file = result_root / "validation" / "input.json"
+    saved = ValidatorInput.model_validate_json(result_file.read_text(encoding="utf-8"))
+    replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
+    assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
+    assert (result_file.parent.parent / "checksums.sha256").is_file()
 
 
 def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, repository_root, monkeypatch):
@@ -272,3 +284,51 @@ def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, r
     assert provider_result.values["stabilize"].evidence["elapsed_seconds"] >= 60
     assert clock.elapsed >= 60
     assert provider_result.values["cleanup"] is not None
+
+
+def test_post_cleanup_batch_projects_all_selected_providers_before_sealing(tmp_path, repository_root):
+    from cloud_network_benchmark.manifests import initialize_campaign
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence
+    from cloud_network_benchmark.contracts.common import Evidence, StringEvidence
+    from cloud_network_benchmark.orchestration import LifecycleResult, ProviderLifecycleResult
+    from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
+    from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+    from cloud_network_benchmark.contracts.validation import ValidatorInput
+    from cloud_network_benchmark.validation import validate_bundle
+
+    config = repository_root / "configs/tests/exp-903-three-provider-smoke.yaml"
+    initialized = initialize_campaign(config, repository_root, tmp_path / "results",
+        clock=lambda: NOW, token_source=lambda: "batch")
+    parent_path = Path(initialized.parent_manifest_path)
+    parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
+        config_path=config)
+    reservation = ReservationEvidence(schema_version=2, campaign_id=parent.campaign_id,
+        reservation_id=Evidence[str](value="synthetic-batch-reservation"), state="reserved",
+        reserved_cost_usd=Evidence[float](value=1), cap_started_at=Evidence[datetime](value=NOW),
+        expires_at=Evidence[datetime](value=NOW + timedelta(hours=1)),
+        cap_start_policy_id=StringEvidence(value="synthetic-policy"), source_path="synthetic-test.json",
+        source_sha256="a" * 64)
+    provider_results = {provider: ProviderLifecycleResult(provider=provider,
+        execution_state="failed", primary_failure=f"synthetic {provider} stage failure")
+        for provider in children}
+    lifecycle = LifecycleResult(provider_results, completed=False,
+        reservation_evidence=reservation, started_at=NOW, finished_at=NOW + timedelta(minutes=1))
+    evaluated_at = NOW + timedelta(minutes=2)
+    finalized = finalize_production_batch(parent_path=parent_path, children=children,
+        parent=parent, lifecycle=lifecycle, repository_root=repository_root, evaluated_at=evaluated_at)
+    assert set(finalized) == {"aws", "azure", "gcp"}
+    saved_inputs = {}
+    for provider, child in children.items():
+        ref = next(row for row in parent.child_runs if str(row.provider) == provider)
+        root = (repository_root / ref.result_path).resolve()
+        saved = ValidatorInput.model_validate_json((root / "validation/input.json").read_text())
+        saved_inputs[provider] = saved
+        assert (root / "checksums.sha256").is_file()
+    preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
+        for provider, value in saved_inputs.items()}
+    from cloud_network_benchmark.validation import evaluate_comparison
+    compared = evaluate_comparison(list(saved_inputs.values()), list(preliminary.values()))
+    for provider, value in saved_inputs.items():
+        replay = compared[value.identity.run_id]
+        assert replay.model_dump(mode="json") == finalized[provider][0].model_dump(mode="json")
+    assert Path(initialized.parent_manifest_path).is_file()

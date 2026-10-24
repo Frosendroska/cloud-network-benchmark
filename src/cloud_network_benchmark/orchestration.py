@@ -97,6 +97,7 @@ class ProviderLifecycleResult:
     secondary_failures: list[str] = field(default_factory=list)
     interrupted: bool = False
     creation_may_have_started: bool = False
+    stage_times: dict[str, dict[str, datetime]] = field(default_factory=dict)
 
 
 @dataclass
@@ -617,6 +618,10 @@ def execute_provider_workflows(
     protection_failed = False
     interrupted = False
 
+    def utc_now() -> datetime:
+        source = getattr(clock, "utc_now", None) or getattr(clock, "now", None)
+        return source() if callable(source) else datetime.now(timezone.utc)
+
     def record_interruption(provider: str, exc: BaseException) -> None:
         nonlocal interrupted
         interrupted = True
@@ -631,6 +636,7 @@ def execute_provider_workflows(
 
     def call(provider: str, stage: str, action: Callable[[], Any]) -> bool:
         nonlocal interrupted
+        started_at = utc_now()
         try:
             before = None if stage == "cancel" else lambda: _before_stage(context, clock, provider, stage, workflows[provider])
             if recovery_path is not None and stage != "cancel":
@@ -646,8 +652,12 @@ def execute_provider_workflows(
                 after = None
             succeeded = _call(provider, stage, action, results[provider], before=before, after=after)
         except BaseException as exc:
+            results[provider].stage_times[stage] = {
+                "started_at": started_at, "finished_at": utc_now()}
             record_interruption(provider, exc)
             return False
+        results[provider].stage_times[stage] = {
+            "started_at": started_at, "finished_at": utc_now()}
         if results[provider].interrupted:
             interrupted = True
         return succeeded

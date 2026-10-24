@@ -27,3 +27,9 @@ The selected package source is transferred with the existing trusted SCP options
 ## Remaining acceptance limits
 
 Offline mocks do not prove real cloud expiry, paid admission, guest package installation on Ubuntu, Linux guest behavior, native traffic or cloud cleanup. Those are separate gates; F10 is the end of this implementation stage.
+
+## Production lifecycle wiring checkpoint (2026-10-24)
+
+The default lifecycle CLI now reserves through F11 and composes the AWS driver and production remote-stage callbacks. Post-cleanup projection in `lifecycle_projection.py` updates the existing strict child-manifest evidence, reconstructs a strict `ValidatorInput` from materialized sources, binds retrieved acquisition evidence, saves and reparses each input, runs fixed-time per-provider validation with selected-peer comparison, updates validation status and the parent manifest, then seals result roots only after the batch mutations. A synthetic three-provider failure-path integration test exercises the batch ordering and strict replay; the AWS factory test exercises the admitted default factory through provider apply and cleanup with fake commands, then verifies strict input replay and checksum sealing.
+
+Focused command at this checkpoint: `PYTHONPATH=src /private/tmp/cnb-offline-venv/bin/python -m pytest tests/integration/test_f09_aws_runtime_factory.py tests/integration/test_f09_lifecycle_failures.py tests/unit/test_f09_lifecycle.py tests/unit/test_f09_cli.py tests/unit/test_f09_bundle.py tests/integration/test_f09_bundle_replay.py -q` — passed, 70 tests in 3.26s. `git diff --check` passed. This is not full F09 convergence evidence: the default AWS fake runner stops during guest preparation, so successful captured F03/F04/native retrieval is not demonstrated; Azure/GCP production factories, durable retry consumption and actual provider cleanup/reconciliation remain incomplete. No cloud or real paid calls were made.

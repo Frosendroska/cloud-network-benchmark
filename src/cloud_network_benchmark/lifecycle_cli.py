@@ -120,6 +120,7 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 from .contracts.execution import SubprocessCommandRunner
                 from .lifecycle_runtime import build_runtime
                 from .orchestration import run_lifecycle
+                from .lifecycle_projection import finalize_production_batch
 
                 class Clock:
                     @staticmethod
@@ -155,9 +156,17 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     allowance=built["allowance"], workflow_factory=built["workflow_factory"],
                     clock=clock, recovery_path=built["recovery_path"],
                     recovery_factory=built["recovery_factory"])
+                validations = {}
+                if lifecycle.provider_results and lifecycle.reservation_evidence is not None:
+                    validations = finalize_production_batch(
+                        parent_path=runtime["initialized_campaign_manifest"], children=children,
+                        parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
+                data_valid = bool(validations) and all(
+                    value[0].validation_status.data_validity == "valid"
+                    for value in validations.values())
                 unevaluated = {"f11_reservation_not_evaluated", "paid_acceptance_prerequisites_not_evaluated",
                     "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"}
-                report.update(status=("complete" if lifecycle.completed else
+                report.update(status=("complete" if lifecycle.completed and data_valid else
                     "rejected" if lifecycle.admission_status != "reserved" else "failed"),
                     reason_codes=sorted((set(lifecycle.admission_reasons)
                         | ({lifecycle.primary_failure} if lifecycle.primary_failure else set()))
@@ -169,13 +178,15 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         if lifecycle.reservation_evidence is not None else None),
                     providers={provider: {"execution_state": item.execution_state,
                         "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
-                        "secondary_failures": item.secondary_failures}
+                        "secondary_failures": item.secondary_failures,
+                        "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
+                            if provider in validations else None)}
                         for provider, item in lifecycle.provider_results.items()},
                     external_calls=len(runner.actions))
                 print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                       f"Lifecycle run {report['status']}; admission: {report['admission_status']}; external calls: {report['external_calls']}",
                       file=sys.stdout if lifecycle.completed else sys.stderr)
-                return 0 if lifecycle.completed else 1
+                return 0 if report["status"] == "complete" else 1
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
             return 0 if report["status"] != "invalid" else 2
