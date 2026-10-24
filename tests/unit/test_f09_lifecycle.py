@@ -15,6 +15,7 @@ from cloud_network_benchmark.orchestration import (
     consume_retry_attempt,
     write_recovery_journal,
     _remaining_f11_allowance,
+    _typed_outcome,
 )
 from cloud_network_benchmark.admission import WorkflowAllowance
 from tests.fixtures.f09.helpers import FakeClock, Trace
@@ -144,6 +145,26 @@ def test_returned_provider_failure_and_unregistered_expiry_are_not_success():
     assert not outcome.completed
     assert outcome.provider_results["aws"].cleanup_state == "failed"
     assert "cleanup is failed" in outcome.provider_results["aws"].primary_failure
+
+
+@pytest.mark.parametrize("provider,inventory", [
+    ("aws", {"complete": True, "safety_absent": {"eu-central-1": True},
+        "regions": {"eu-central-1": {"complete": True, "resources": {"instances": [], "known_ids": {}}}}}),
+    ("gcp", {"pages_complete": True, "zone_scope": "all_project_zones",
+        "completed_scopes": ["all_project_zones", "global"], "resources": []}),
+    ("azure", []),
+])
+def test_cleanup_requires_provider_inventory_proving_absence(provider, inventory):
+    from types import SimpleNamespace
+    valid = SimpleNamespace(cleanup_state="succeeded", launch_blocked=False,
+        failures=[], inventory=SimpleNamespace(value=inventory), resources=inventory if provider == "azure" else None)
+    assert _typed_outcome(provider, "cleanup", valid)[0]
+    if provider == "azure":
+        valid.resources = [{"id": "still-present"}]
+    else:
+        valid.inventory = SimpleNamespace(value={**inventory,
+            ("safety_absent" if provider == "aws" else "resources"): {"zone": False} if provider == "aws" else [{"id": "still-present"}]})
+    assert not _typed_outcome(provider, "cleanup", valid)[0]
 
 
 @pytest.mark.parametrize("now,deadline,trigger", [(999.0, 1000.0, 200.0), (201.0, 200.0, None)])

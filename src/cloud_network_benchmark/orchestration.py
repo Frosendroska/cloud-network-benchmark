@@ -449,7 +449,35 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
             state = value.get("cleanup_state", state)
             blocked = value.get("launch_blocked", blocked)
             failures = value.get("failures", failures)
-        good = state == "succeeded" and blocked is False and not failures
+        inventory = getattr(getattr(value, "inventory", None), "value", None)
+        if isinstance(value, Mapping):
+            inventory = value.get("inventory", inventory)
+        inventory_proves_absence = False
+        def empty_inventory(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                return all(empty_inventory(item) for item in value.values())
+            if isinstance(value, (list, tuple, set)):
+                return len(value) == 0
+            return value in (None, False, {}, [])
+        if provider == "aws" and isinstance(inventory, Mapping):
+            safety = inventory.get("safety_absent")
+            regions = inventory.get("regions")
+            inventory_proves_absence = (inventory.get("complete") is True
+                and isinstance(safety, Mapping) and bool(safety) and all(item is True for item in safety.values())
+                and isinstance(regions, Mapping) and bool(regions)
+                and all(isinstance(item, Mapping) and item.get("complete") is True
+                        and empty_inventory(item.get("resources")) for item in regions.values()))
+        elif provider == "gcp" and isinstance(inventory, Mapping):
+            inventory_proves_absence = (inventory.get("pages_complete") is True
+                and inventory.get("zone_scope") == "all_project_zones"
+                and inventory.get("completed_scopes") and inventory.get("resources") == [])
+        elif provider == "azure":
+            resources = getattr(value, "resources", None)
+            if isinstance(value, Mapping):
+                resources = value.get("resources", resources)
+            inventory_proves_absence = (blocked is False and state == "succeeded"
+                                        and isinstance(resources, list) and not resources)
+        good = state == "succeeded" and blocked is False and not failures and inventory_proves_absence
         return good, "provider cleanup is failed, blocked, unknown or lacks typed success evidence"
     return False, f"no typed result contract exists for stage {stage}"
 
@@ -469,6 +497,14 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
         value = action()
         result.values[stage] = value
         succeeded, reason = _typed_outcome(provider, stage, value)
+        if succeeded and stage == "create" and not isinstance(value, ProviderStageOutcome):
+            protected = result.values.get("protect")
+            from .contracts.deployment import ProviderDeploymentOutput
+            deployment = value if isinstance(value, ProviderDeploymentOutput) else getattr(value, "deployment", None)
+            registered = getattr(getattr(deployment, "expiry", None), "value", None)
+            if (protected is None or registered is None or registered != protected
+                    or registered.state != "registered" or registered.provider != provider):
+                succeeded, reason = False, "created deployment does not retain the exact registered expiry evidence"
         if after is not None:
             after(value, succeeded)
         if succeeded:

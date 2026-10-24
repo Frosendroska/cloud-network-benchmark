@@ -351,10 +351,16 @@ def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
     # then lost the controller before recording its result. Re-running the
     # first copy would be a third transfer in disguise, so fail closed and
     # preserve the unknown artifact state for explicit recovery.
+    recovery_path = Path(recovery_path)
+    if recovery_path.is_symlink() or not recovery_path.is_file():
+        raise ValueError("retry journal must be a regular non-symlink file")
     recovery = SavedLifecycleRecovery.validate_unique(
-        json.loads(Path(recovery_path).read_text(encoding="utf-8")))
-    consumed = set(recovery.retry_consumed_ids)
-    items = kwargs["manifest"].items
+        json.loads(recovery_path.read_text(encoding="utf-8")))
+    manifest = kwargs["manifest"]
+    prefix = f"{manifest.deployment_id}:"
+    consumed_keys = {key for key in recovery.retry_consumed_ids if key.startswith(prefix)}
+    consumed = {key[len(prefix):] for key in consumed_keys}
+    items = manifest.items
     if consumed.intersection(item.artifact_id for item in items):
         return RetrievalResult(complete=False, cleanup_required=True,
             failures=[{"artifact_id": artifact_id,
@@ -368,7 +374,8 @@ def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
 
     kwargs["already_retried"] = tuple(consumed)
     return retrieve_closed_bundle(**kwargs, retry_admission=admitted,
-        consume_retry=lambda artifact_id: consume_retry_attempt(recovery_path, artifact_id))
+        consume_retry=lambda artifact_id: consume_retry_attempt(
+            recovery_path, f"{manifest.deployment_id}:{artifact_id}"))
 
 
 def save_validator_input(path: Path, value: ValidatorInput) -> ValidatorInput:

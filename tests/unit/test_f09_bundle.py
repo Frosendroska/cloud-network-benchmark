@@ -110,7 +110,9 @@ def test_supplemental_declarations_use_actual_f03_paths_and_day_family_ids():
                                    mode="acceptance", measurement_units=short_units)
     assert {item.artifact_id for item in short if item.kind == "build-identity"} == {
         f"f02r-{role}-{tool}-build" for role in ("vm_a", "vm_b") for tool in ("sockperf", "iperf3")}
-    assert next(item for item in short if item.artifact_id == "phase-single-sockperf-stdout").path == "measurements/phase-single/sockperf.stdout.log"
+    stdout = next(item for item in short if item.artifact_id == "phase-single-sockperf-stdout")
+    assert stdout.path == "measurements/phase-single/sockperf.stdout.log"
+    assert stdout.kind == "sockperf-log"
     day_units = [PhaseConfiguration(unit_id="study-day", kind="continuous_day", phase="multi_flow", measured_seconds=86400)]
     day = lifecycle_declarations(ArtifactLayout.for_mode("diagnostic_day", day_units), mode="diagnostic_day", measurement_units=day_units)
     assert next(item for item in day if item.artifact_id == "day-probe-csv").path_template.endswith("{chunk_id}.csv")
