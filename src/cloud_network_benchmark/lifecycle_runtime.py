@@ -411,7 +411,8 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
 
 def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs: Any, runtime: dict[str, Any], controller_session_id: str,
-        runner: Any, clock: Any, stages: Any, private_root: Path):
+        runner: Any, clock: Any, private_root: Path, stages: Any = None,
+        repository_root: Path | None = None):
     """Build the source-bound AWS acceptance runtime around the real F11 ledger.
 
     The returned workflow factory is intentionally lazy. ``run_lifecycle``
@@ -437,9 +438,17 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         controller_session_id=controller_session_id)
 
     def workflow_factory(reservation: Any):
+        actual_stages = stages
+        if actual_stages is None:
+            from .lifecycle_remote import build_aws_remote_stages
+            actual_stages = build_aws_remote_stages(campaign=campaign, parent=parent,
+                children=children, runtime=runtime, ledger=ledger, reservation=reservation,
+                runner=runner, clock=clock, repository_root=repository_root or Path.cwd(),
+                recovery_path=Path(private_root) / "lifecycle-recovery.json",
+                sleep=runtime.get("sleep", __import__("time").sleep))
         return build_aws_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
-            ledger=ledger, runner=runner, clock=clock, stages=stages,
+            ledger=ledger, runner=runner, clock=clock, stages=actual_stages,
             private_root=private_root)
 
     child = children["aws"]

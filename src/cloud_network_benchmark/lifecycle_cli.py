@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -116,16 +117,65 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                           "Lifecycle run rejected: initialized campaign identity is unavailable or mismatched.")
                     return 1
-                # Production composition is deliberately downstream of source-bound
-                # initialization. The paid executor is supplied by the explicit
-                # runtime factory once every required F11 gate can be evaluated.
-                report.update(status="rejected", reason_codes=sorted(set(report["reason_codes"] +
-                    ["f11_production_admission_required"])), execution_scope=args.execution_scope,
-                    campaign_id=initialized.campaign_id, run_ids={k: v.run_id for k, v in children.items()},
-                    external_calls=0)
+                from .contracts.execution import SubprocessCommandRunner
+                from .lifecycle_runtime import build_runtime
+                from .orchestration import run_lifecycle
+
+                class Clock:
+                    @staticmethod
+                    def monotonic():
+                        return time.monotonic()
+
+                    @staticmethod
+                    def utc_now():
+                        return datetime.now(timezone.utc)
+
+                class CountingRunner:
+                    def __init__(self):
+                        self.delegate = SubprocessCommandRunner()
+                        self.actions = []
+
+                    def run(self, request):
+                        self.actions.append(request.action_id)
+                        return self.delegate.run(request)
+
+                costs = load_cost_inputs(args.cost_inputs)
+                selected_campaign, _ = resolve_campaign(args.config, Path.cwd(),
+                    schedule_entry=(None if args.schedule is None else
+                        next((entry for entry in load_schedule(args.schedule,
+                            config_paths={resolved.config_id: args.config}, repository_root=Path.cwd())
+                            if entry.entry_id == args.row_id), None)))
+                runner, clock = CountingRunner(), Clock()
+                built = build_runtime(campaign=selected_campaign, parent=initialized,
+                    children=children, costs=costs, runtime=runtime,
+                    controller_session_id=args.controller_session, runner=runner, clock=clock,
+                    private_root=args.private_root, repository_root=Path.cwd())
+                lifecycle = run_lifecycle(ledger=built["ledger"],
+                    reservation_request=built["request"], admission_plan=built["plan"],
+                    allowance=built["allowance"], workflow_factory=built["workflow_factory"],
+                    clock=clock, recovery_path=built["recovery_path"],
+                    recovery_factory=built["recovery_factory"])
+                unevaluated = {"f11_reservation_not_evaluated", "paid_acceptance_prerequisites_not_evaluated",
+                    "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"}
+                report.update(status=("complete" if lifecycle.completed else
+                    "rejected" if lifecycle.admission_status != "reserved" else "failed"),
+                    reason_codes=sorted((set(lifecycle.admission_reasons)
+                        | ({lifecycle.primary_failure} if lifecycle.primary_failure else set()))
+                        | (set(report["reason_codes"]) - unevaluated)),
+                    execution_scope=args.execution_scope, campaign_id=initialized.campaign_id,
+                    run_ids={k: v.run_id for k, v in children.items()},
+                    admission_status=lifecycle.admission_status,
+                    reservation_id=(lifecycle.reservation_evidence.reservation_id.value
+                        if lifecycle.reservation_evidence is not None else None),
+                    providers={provider: {"execution_state": item.execution_state,
+                        "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
+                        "secondary_failures": item.secondary_failures}
+                        for provider, item in lifecycle.provider_results.items()},
+                    external_calls=len(runner.actions))
                 print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
-                      "Lifecycle run rejected: complete F11 production admission is required.")
-                return 1
+                      f"Lifecycle run {report['status']}; admission: {report['admission_status']}; external calls: {report['external_calls']}",
+                      file=sys.stdout if lifecycle.completed else sys.stderr)
+                return 0 if lifecycle.completed else 1
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
             return 0 if report["status"] != "invalid" else 2

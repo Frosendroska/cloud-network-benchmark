@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,20 +11,25 @@ from cloud_network_benchmark.admission import load_cost_inputs
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.common import Provider
 from cloud_network_benchmark.contracts.execution import CommandResult
-from cloud_network_benchmark.lifecycle_adapters import RemoteStages
 from cloud_network_benchmark.lifecycle_runtime import build_runtime
-from cloud_network_benchmark.orchestration import ProviderStageOutcome, run_lifecycle
+from cloud_network_benchmark.orchestration import run_lifecycle
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 
 
 class FakeClock:
+    def __init__(self):
+        self.elapsed = 0.0
+
     def utc_now(self):
-        return NOW
+        return NOW + timedelta(seconds=self.elapsed)
 
     def monotonic(self):
-        return 100.0
+        return 100.0 + self.elapsed
+
+    def sleep(self, seconds):
+        self.elapsed += seconds
 
 
 class FakeAwsRunner:
@@ -61,9 +66,9 @@ class FakeAwsRunner:
                     "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-b",
                     "placement_group": None, "placement_group_strategy": None}},
                 "network": {}, "placement": {}}}})
-        elif action == "aws-sts-get-caller-identity":
+        elif action.startswith("aws-get-caller-identity"):
             stdout = json.dumps({"Account": "123456789012"})
-        elif action == "aws-ec2-describe-instances":
+        elif action.startswith("aws-describe-instances"):
             instance_id = request.argv[request.argv.index("--instance-ids") + 1]
             role = "vm_a" if instance_id == "i-vm-a" else "vm_b"
             private_ip = "10.60.1.10" if role == "vm_a" else "10.60.1.11"
@@ -77,20 +82,20 @@ class FakeAwsRunner:
                 "NetworkInterfaces": [{"InterfaceType": "interface"}],
                 "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-a" if role == "vm_a" else "vol-b",
                     "DeleteOnTermination": True}}], "LaunchTime": "2026-10-22T11:50:00Z"}]}]})
-        elif action == "aws-ec2-describe-instance-topology":
+        elif action.startswith("aws-describe-instance-topology"):
             stdout = json.dumps({"Instances": [{"ZoneId": "use1-az2"}]})
-        elif action == "aws-ec2-describe-images":
+        elif action.startswith("aws-describe-images"):
             stdout = json.dumps({"Images": [{"ImageId": "ami-0123456789abcdef0", "OwnerId": "099720109477",
                 "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
                 "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]})
-        elif action == "aws-ec2-describe-volumes":
+        elif action.startswith("aws-describe-volumes"):
             stdout = json.dumps({"Volumes": [{"VolumeId": "vol-a", "Size": 32, "VolumeType": "gp3"}]})
-        elif action == "aws-ec2-describe-instance-types":
+        elif action.startswith("aws-describe-instance-types"):
             stdout = json.dumps({"InstanceTypes": [{"InstanceType": "m7i.xlarge",
                 "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
                 "VCpuInfo": {"DefaultVCpus": 4}, "MemoryInfo": {"SizeInMiB": 16384}}]})
-        elif action.startswith("aws-get-console-output-"):
-            instance_id = action.removeprefix("aws-get-console-output-")
+        elif action.startswith("aws-get-console-output"):
+            instance_id = request.argv[request.argv.index("--instance-id") + 1]
             stdout = json.dumps({"InstanceId": instance_id, "Timestamp": "2026-10-22T11:51:00Z",
                 "Output": "CNB_HOSTKEY_BOOT_ID=12345678-1234-4234-8234-123456789abc\nCNB_ED25519_HOST_FINGERPRINT=SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAA\n"})
         elif action.startswith("aws-host-keyscan-"):
@@ -150,16 +155,35 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
         refs[gate] = evidence_path
     key = tmp_path / "test.pub"
     key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test\n")
+    identity = tmp_path / "fake-private-key"
+    identity.write_text("synthetic private identity for fake runner only\n")
+    identity.chmod(0o600)
     from cloud_network_benchmark.admission import WorkflowAllowance
+    from cloud_network_benchmark.access import TimeoutPolicy
+    from cloud_network_benchmark.bootstrap import BootstrapConfig, SourceBuild
+    from cloud_network_benchmark.readiness import ReadinessConfig
+    bootstrap = BootstrapConfig(sources=[
+        SourceBuild(tool="sockperf", source_url="https://example.invalid/sockperf.tar.gz",
+            source_reference="sockperf-src", archive_name="sockperf.tar.gz", source_sha256="a"*64),
+        SourceBuild(tool="iperf3", source_url="https://example.invalid/iperf3.tar.gz",
+            source_reference="iperf3-src", archive_name="iperf3.tar.gz", source_sha256="b"*64)],
+        remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work",
+        install_prefix="/var/lib/cnb/install")
+    access = {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
+            cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
+        "readiness": ReadinessConfig(poll_interval_seconds=.01, attempt_ceiling=1),
+        "bootstrap": bootstrap, "guest_remote_root": "/var/lib/cnb/runtime",
+        "diagnostic_interfaces": {"aws": {"vm_a":"ens5", "vm_b":"ens5"}}}
     return {"initialized_campaign_manifest": initialized_parent,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "test-aws", "initialize_if_missing": True},
         "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10,
             "synthetic-test-policy", {"aws": 360}), "copy_retry_seconds": 1,
         "approval_refs": refs,
         "approval_evidence": {gate: json.loads(path.read_text()) for gate, path in refs.items()},
+        "access": access,
         "providers": {"aws": {"options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
             "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}, "public_key_path": key,
-            "authentication_reference": "fake-key-reference"},
+            "authentication_reference": str(identity)},
             "bootstrap_template": repository_root / "terraform/aws/pair/main.tf",
             "terraform_directory": repository_root / "terraform/aws",
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
@@ -184,17 +208,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     costs = load_cost_inputs(cost_path)
     runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256)
     clock = FakeClock()
-    stages = RemoteStages(
-        prepare=lambda *_args: ProviderStageOutcome("prepare", False, {"reason": "fake remote boundary stops after provision"}),
-        stabilize=lambda *_args: ProviderStageOutcome("stabilize", False, "unreached"),
-        measure=lambda *_args: ProviderStageOutcome("measure", False, "unreached"),
-        close=lambda *_args: ProviderStageOutcome("close", True, {"fake": "closed"}),
-        retrieve=lambda *_args: ProviderStageOutcome("retrieve", True, {"fake": "retrieved"}),
-        claim=lambda *_args: None)
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
-        stages=stages, private_root=tmp_path / "private")
+        private_root=tmp_path / "private", repository_root=repository_root)
     result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
         admission_plan=built["plan"], allowance=built["allowance"],
         workflow_factory=built["workflow_factory"], clock=clock,
@@ -204,11 +221,54 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["protect"].state == "registered"
     assert provider_result.values["claim"].eligible is True, provider_result.values
     assert provider_result.values["claim"].creation_granted is True, provider_result.values
-    assert provider_result.primary_failure == "aws create failed (AwsProviderError)"
+    assert provider_result.primary_failure == "aws prepare failed (adapter reported prepare unsuccessful)"
+    assert provider_result.values["create"].run_id == child.run_id
     assert provider_result.creation_may_have_started is True
-    assert "create" not in provider_result.values  # failed driver result is not misreported as typed success
     assert provider_result.values["cleanup"] is not None
+    assert provider_result.values["prepare"].stage == "prepare"
+    assert provider_result.values["prepare"].succeeded is False
+    assert provider_result.values["close"].stage == "close"
+    assert provider_result.values["retrieve"].stage == "retrieve"
+    assert any(action.startswith("f02r-") for action in runner.actions)
     assert "aws-expiry-start-eu-central-1" in runner.actions
     assert "aws-pair-apply" in runner.actions
     assert "aws-pair-output" in runner.actions
     assert "aws-pair-destroy" in runner.actions
+
+
+def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, repository_root, monkeypatch):
+    from cloud_network_benchmark.manifests import initialize_campaign
+    from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+    from cloud_network_benchmark.orchestration import ProviderStageOutcome
+    import cloud_network_benchmark.lifecycle_adapters as adapters
+
+    config = repository_root / "configs/tests/exp-900-single-provider.yaml"
+    initialized = initialize_campaign(config, repository_root, tmp_path / "results",
+        clock=lambda: NOW, token_source=lambda: "campaign")
+    parent_path = Path(initialized.parent_manifest_path)
+    parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
+        config_path=config)
+    child = children["aws"]
+    runner = FakeAwsRunner()
+    runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
+    cost_path = tmp_path / "refreshed-costs.json"
+    campaign, _ = resolve_campaign(config, repository_root)
+    _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id)
+    costs = load_cost_inputs(cost_path)
+    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256)
+    clock = FakeClock()
+    runtime["sleep"] = clock.sleep
+    monkeypatch.setattr(adapters, "prepare_remote_pair", lambda *args, **kwargs:
+        ProviderStageOutcome("prepare", True, {"bootstrap": object(), "guest_runtime": object()}))
+    built = build_runtime(campaign=campaign, parent=parent, children={"aws": child},
+        costs=costs, runtime=runtime, controller_session_id="fake-session", runner=runner,
+        clock=clock, private_root=tmp_path / "private", repository_root=repository_root)
+    result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
+        admission_plan=built["plan"], allowance=built["allowance"],
+        workflow_factory=built["workflow_factory"], clock=clock,
+        recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    provider_result = result.provider_results["aws"]
+    assert provider_result.values["stabilize"].succeeded is True
+    assert provider_result.values["stabilize"].evidence["elapsed_seconds"] >= 60
+    assert clock.elapsed >= 60
+    assert provider_result.values["cleanup"] is not None
