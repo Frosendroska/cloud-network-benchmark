@@ -579,7 +579,8 @@ def test_truncated_diagnostic_client_retains_only_correlated_closed_receiver_pre
     receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
     client = _command("iperf3-diagnostic-day", VmRole.VM_A, "diagnostic-day")
     build = _build("iperf3", VmRole.VM_B, "diagnostic-iperf-build")
-    build_records = _build_records(tmp_path, DEPLOYMENT, [build])
+    build_a = _build("iperf3", VmRole.VM_A, "diagnostic-iperf-client-build")
+    build_records = _build_records(tmp_path, DEPLOYMENT, [build, build_a])
     records = [log, client_native, server_native, *build_records]
     sources = bind_acquisition_sources(child_root=tmp_path,
         run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
@@ -611,7 +612,7 @@ def test_truncated_diagnostic_client_retains_only_correlated_closed_receiver_pre
     f03_receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None, deployment_id)
     f03_receiver.result["outcome"] = "succeeded"
     runtime = dataclass_replace(runtime_context, source_artifact_records=tuple(f03_records),
-        build_observations=(build,), receiver_command_evidence=(f03_receiver,))
+        build_observations=(build, build_a), receiver_command_evidence=(f03_receiver,))
     clock = FakeClock()
     result = run_measurement(resolved, runtime, processes=_fixture_processes(clock), clock=clock)
     timing = next(row for row in result.timings if row.unit_id == "diagnostic-day")
@@ -1212,6 +1213,7 @@ def test_f03_timing_assembly_keeps_cross_host_coverage_unknown_and_attaches_raw_
     receiver = _command(receiver_action, VmRole.VM_B, None, runtime.identity.deployment_id)
     receiver.result["outcome"] = "failed"
     builds = [_build("sockperf", VmRole.VM_A, "assembly-sock-build"),
+        _build("iperf3", VmRole.VM_A, "assembly-iperf-client-build"),
         _build("iperf3", VmRole.VM_B, "assembly-iperf-build")]
     runtime = dataclass_replace(runtime, source_artifact_records=tuple(records),
         build_observations=tuple(builds), receiver_command_evidence=(receiver,))

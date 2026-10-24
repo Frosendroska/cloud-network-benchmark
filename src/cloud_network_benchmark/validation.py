@@ -111,18 +111,57 @@ def _evidence(value: Any, reason: str) -> dict[str, Any]:
     return Evidence(value=value).model_dump(mode="json") if value is not None else Evidence(unavailable_reason=reason).model_dump(mode="json")
 
 
+def _provenance_evidence(metadata: Any, program: str) -> dict[str, Any]:
+    """Read F04's current nested output and the older scalar metadata shape."""
+    builds = metadata.source_builds.value if metadata and isinstance(metadata.source_builds.value, dict) else {}
+    versions = metadata.tool_versions.value if metadata and isinstance(metadata.tool_versions.value, dict) else {}
+    build = builds.get(program)
+    supplied = build.get("supplied") if isinstance(build, dict) else None
+    if not isinstance(supplied, dict) and isinstance(build, dict):
+        supplied = build
+    if isinstance(build, str):
+        source_reference = build
+        supplied_version = None
+        supplied_hash = None
+    elif isinstance(supplied, dict):
+        source_reference = supplied.get("source_reference")
+        supplied_version = supplied.get("binary_version")
+        raw_hash = supplied.get("binary_sha256")
+        supplied_hash = raw_hash.get("value") if isinstance(raw_hash, dict) else raw_hash
+    else:
+        source_reference = supplied_version = supplied_hash = None
+
+    version_entry = versions.get(program)
+    if isinstance(version_entry, dict) and "version" in version_entry:
+        observed_version = version_entry.get("version")
+        observed_version = observed_version.get("value") if isinstance(observed_version, dict) else observed_version
+        current_hash = version_entry.get("binary_sha256")
+        current_hash = current_hash.get("value") if isinstance(current_hash, dict) else current_hash
+    elif isinstance(version_entry, dict) and "value" in version_entry:
+        observed_version = version_entry.get("value")
+        current_hash = None
+    elif isinstance(version_entry, str):
+        observed_version, current_hash = version_entry, None
+    else:
+        observed_version, current_hash = None, None
+    return {"source_reference": source_reference if isinstance(source_reference, str) else None,
+        "supplied_version": supplied_version if isinstance(supplied_version, str) else None,
+        "observed_version": observed_version if isinstance(observed_version, str) else None,
+        "supplied_hash": supplied_hash if isinstance(supplied_hash, str) else None,
+        "current_hash": current_hash if isinstance(current_hash, str) else None}
+
+
 def _source(record: Any, value: ValidatorInput) -> SourceRef:
     versions = value.tool_versions.value if isinstance(value.tool_versions.value, dict) else {}
     role = str(getattr(record.producer, "value", record.producer))
     metadata = next((item for item in value.vm_metadata_records
                      if str(getattr(item.vm_role, "value", item.vm_role)) == role), None)
-    builds = metadata.source_builds.value if metadata and isinstance(metadata.source_builds.value, dict) else {}
-    tool_versions = metadata.tool_versions.value if metadata and isinstance(metadata.tool_versions.value, dict) else {}
     program = "iperf3" if "iperf3" in record.kind else "sockperf"
+    provenance = _provenance_evidence(metadata, program)
     return SourceRef(record.artifact_id, record.path, record.sha256.value or "0" * 64,
                      record.unit_id, value.identity.deployment_id, role,
-                     versions.get(program) or tool_versions.get(program),
-                     str(builds.get(program)) if builds.get(program) is not None else None)
+                     provenance["observed_version"] or versions.get(program),
+                     provenance["source_reference"])
 
 
 def _artifact_path(value: ValidatorInput, record: Any) -> Path:
@@ -1016,14 +1055,40 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                 metadata = next((item for item in value.vm_metadata_records
                                  if str(getattr(item.vm_role, "value", item.vm_role)) == role), None)
                 if metadata is not None:
-                    expected_version = (metadata.tool_versions.value or {}).get(program) if metadata.tool_versions.value else None
-                    expected_build = (metadata.source_builds.value or {}).get(program) if metadata.source_builds.value else None
-                    if expected_version is not None and command.binary_version.value is not None and str(expected_version) != command.binary_version.value:
+                    provenance = _provenance_evidence(metadata, program)
+                    observed_version = provenance["observed_version"]
+                    supplied_version = provenance["supplied_version"]
+                    source_reference = provenance["source_reference"]
+                    if observed_version is not None and command.binary_version.value is not None:
+                        if observed_version != command.binary_version.value:
+                            # Older F04 output kept only the first line for
+                            # display. It cannot contradict a full command and
+                            # sidecar banner, but it is not complete metadata.
+                            compact = (supplied_version.strip().splitlines()[0][:240]
+                                if supplied_version and supplied_version.strip() else None)
+                            if (compact is not None and observed_version == compact
+                                    and command.binary_version.value == supplied_version):
+                                findings.append(_finding("provenance.observed_version_incomplete", "warning",
+                                    f"{program} metadata retains only the historical compact version display", unit=unit.unit_id))
+                            else:
+                                findings.append(_finding("provenance.command_version_mismatch", "error",
+                                    f"{program} command version contradicts producer metadata", unit=unit.unit_id))
+                    elif command.binary_version.value is None:
+                        findings.append(_finding("provenance.command_build_unavailable", "warning",
+                            f"{program} command binary version is unavailable", unit=unit.unit_id))
+                    if supplied_version is not None and command.binary_version.value is not None and supplied_version != command.binary_version.value:
                         findings.append(_finding("provenance.command_version_mismatch", "error",
-                            f"{program} command version contradicts producer metadata", unit=unit.unit_id))
-                    if expected_build is not None and command.source_identity.value is not None and str(expected_build) != command.source_identity.value:
+                            f"{program} command version contradicts supplied build metadata", unit=unit.unit_id))
+                    if source_reference is not None and command.source_identity.value is not None and source_reference != command.source_identity.value:
                         findings.append(_finding("provenance.command_build_mismatch", "error",
                             f"{program} command build contradicts producer metadata", unit=unit.unit_id))
+                    elif source_reference is None or command.source_identity.value is None:
+                        findings.append(_finding("provenance.command_build_unavailable", "warning",
+                            f"{program} source/build identity is unavailable", unit=unit.unit_id))
+                    supplied_hash, current_hash = provenance["supplied_hash"], provenance["current_hash"]
+                    if supplied_hash is not None and current_hash is not None and supplied_hash != current_hash:
+                        findings.append(_finding("provenance.command_binary_hash_mismatch", "error",
+                            f"{program} observed binary hash contradicts bootstrap", unit=unit.unit_id))
     for role, program in (("vm_b", "sockperf"), ("vm_b", "iperf3")):
         present = any(command.producer == role and isinstance(command.request.get("argv"), list)
                       and command.request["argv"] and (program in str(command.request["argv"][0]).lower()

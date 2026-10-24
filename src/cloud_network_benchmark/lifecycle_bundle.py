@@ -16,19 +16,23 @@ from .retrieval import RetrievalItem, RetrievalManifest, RetrievalResult, run_re
 from .admission import bounded_copy_handoff
 
 
-def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied: bool = False) -> list[ArtifactInput]:
+def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied: bool = False,
+        build_observations: Sequence[Any] | None = None) -> list[ArtifactInput]:
     """Return existing layout declarations plus exact F09-produced local logs/builds."""
     declarations = layout.declarations_for_mode(mode, measurement_units, schedule_supplied=schedule_supplied)
     seen = {item.artifact_id for item in declarations}
     additions: list[ArtifactInput] = []
-    for role in ("vm_a", "vm_b"):
-        for tool in ("sockperf", "iperf3"):
-            artifact_id = f"f02r-{role}-{tool}-build"
-            if artifact_id not in seen:
-                additions.append(ArtifactInput(artifact_id=artifact_id,
-                    path=f"metadata/build/{role}-{tool}.identity", kind="build-identity",
-                    producer=role, unit_id=None, expectation="required"))
-                seen.add(artifact_id)
+    identities = ({(item.role, item.tool) for item in build_observations
+                  if item.identity_bytes is not None and item.artifact_id is not None}
+        if build_observations is not None else
+        {(role, tool) for role in ("vm_a", "vm_b") for tool in ("sockperf", "iperf3")})
+    for role, tool in sorted(identities):
+        artifact_id = f"f02r-{role}-{tool}-build"
+        if artifact_id not in seen:
+            additions.append(ArtifactInput(artifact_id=artifact_id,
+                path=f"metadata/build/{role}-{tool}.identity", kind="build-identity",
+                producer=role, unit_id=None, expectation="required"))
+            seen.add(artifact_id)
     if str(getattr(mode, "value", mode)) != "diagnostic_day":
         for unit in measurement_units:
             unit_id = unit.unit_id
@@ -146,7 +150,7 @@ def build_remote_closed_inventory(*, identity: Mapping[str, Any], deployment_id:
     if measurement_ended_at.tzinfo is None or measurement_ended_at.utcoffset() is None:
         raise ValueError("measurement end must be timezone-aware")
     if set(closure) != {"vm_a", "vm_b"} or set(remote_files) != {"vm_a", "vm_b"} or set(source_vm_ids) != {"vm_a", "vm_b"}:
-        raise ValueError("remote inventory, producer closure and VM identities must cover both roles")
+        raise ValueError(f"remote inventory, producer closure and VM identities must cover both roles: {set(remote_files)}, {set(closure)}, {set(source_vm_ids)}")
     if any(value.tzinfo is None or value.utcoffset() is None or value < measurement_ended_at
            for value in closure.values()):
         raise ValueError("producer closure must be observed at or after measurement end")
@@ -213,6 +217,16 @@ def build_remote_closed_inventory(*, identity: Mapping[str, Any], deployment_id:
                 expected_size_bytes=row["size_bytes"], expected_sha256=row["sha256"],
                 timeout_seconds=timeout_seconds))
     closed_at = max(closure.values())
+    unresolved_required = [item.artifact_id for item in remote_declarations
+        if item.expectation == "required" and item.artifact_id in unavailable]
+    if unresolved_required:
+        raise ValueError(f"required closed remote artifacts are unavailable: {sorted(unresolved_required)}")
+    unresolved = [item.artifact_id for item in remote_declarations
+        if not any(concrete.artifact_id == item.artifact_id or
+            (item.path_template is not None and concrete.artifact_id.startswith(item.artifact_id + "-"))
+            for concrete in items) and item.artifact_id not in unavailable]
+    if unresolved:
+        raise ValueError(f"remote declarations have no inventory resolution: {sorted(unresolved)}")
     return RetrievalManifest(identity=dict(identity), deployment_id=deployment_id,
         remote_workspace=remote_workspace, declarations=effective_declarations, items=items,
         unavailable_items=unavailable, measurement_ended_at=measurement_ended_at,
@@ -240,9 +254,10 @@ def retry_manifest(manifest: RetrievalManifest, artifact_ids: Sequence[str]) -> 
         raise ValueError("retry must contain at least one failed concrete item")
     selected_bases = set()
     for item in selected:
-        base = next((d.artifact_id for d in manifest.declarations
-                     if d.producer != "controller" and
-                     (item.artifact_id == d.artifact_id or item.artifact_id.startswith(d.artifact_id + "-"))), None)
+        exact = next((d.artifact_id for d in manifest.declarations
+                      if d.producer != "controller" and item.artifact_id == d.artifact_id), None)
+        base = exact or next((d.artifact_id for d in manifest.declarations
+                     if d.producer != "controller" and item.artifact_id.startswith(d.artifact_id + "-")), None)
         if base is None:
             raise ValueError("retry item has no matching remote declaration")
         selected_bases.add(base)
@@ -373,6 +388,7 @@ def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
         return getattr(decision, "eligible", None) is True
 
     kwargs["already_retried"] = tuple(consumed)
+    kwargs["reservation_id"] = reservation_id
     return retrieve_closed_bundle(**kwargs, retry_admission=admitted,
         consume_retry=lambda artifact_id: consume_retry_attempt(
             recovery_path, f"{manifest.deployment_id}:{artifact_id}"))

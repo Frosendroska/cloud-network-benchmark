@@ -266,6 +266,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     local_outcome = None
     actions = []
     cancellation_status = "not_needed"
+    stage = "request staging"
     vm = connection.vm_a
     try:
         import tempfile
@@ -293,9 +294,11 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             actions.append(_action(upload.action_id, upload.action_type, vm, upload, upload_result))
             if upload_result.outcome != CommandOutcome.SUCCEEDED:
                 raise RuntimeError("F03 request transfer failed")
+            stage = "guest execution request"
             remaining = deadline.remaining(clock)
             if remaining <= 0:
                 raise TimeoutError("F03 execution is outside the active cap")
+            stage = "guest command construction"
             python = str(PurePosixPath(runtime.remote_root) / "venv" / "bin" / "python")
             module_root = str(PurePosixPath(runtime.remote_root) / "source")
             pid_path = root / f"{invocation}.pid"
@@ -311,7 +314,9 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                        "wait \"$child\"; status=$?; rm -f -- \"$pidfile\"; exit \"$status\"")
             execute = _request(f"f09-guest-run-{invocation}", vm,
                 ["sh", "-c", command], remaining)
+            stage = "guest command execution"
             execute_result = _execute(runner, execute)
+            stage = "guest command evidence"
             actions.append(_action(execute.action_id, execute.action_type, vm, execute, execute_result))
             if execute_result.outcome != CommandOutcome.SUCCEEDED:
                 if execute_result.outcome in {CommandOutcome.INTERRUPTED, CommandOutcome.TIMED_OUT}:
@@ -353,7 +358,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             return RemoteGuestExecution(outcome, tuple(actions))
     except BaseException as exc:
         return RemoteGuestExecution(None, tuple(actions),
-            f"{type(exc).__name__}: F03 remote handoff failed; cancellation={cancellation_status}")
+            f"{type(exc).__name__}: F03 {stage} failed ({exc}); cancellation={cancellation_status}")
 
 
 def start_remote_diagnostics(connection: Any, context: Mapping[str, Any], *, runner: Any,

@@ -338,11 +338,23 @@ def _record(request: CommandRequest, result: CommandResult, context: Measurement
             unit_id: Optional[str], role: VmRole = VmRole.VM_A,
             started_monotonic: Optional[float] = None, finished_monotonic: Optional[float] = None) -> CommandEvidence:
     tool_name = Path(request.argv[0]).name
+    build = None
+    if context.build_observations:
+        matches = [item for item in context.build_observations
+                   if str(getattr(item.role, "value", item.role)) == str(getattr(role, "value", role))
+                   and item.tool == tool_name
+                   and Path(item.binary_path).name == tool_name]
+        if len(matches) != 1:
+            raise MeasurementError("command requires one matching role/tool build observation", "provenance")
+        build = matches[0]
+    binary_version = (StringEvidence(value=build.binary_version) if build is not None else
+        context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="tool identity not supplied")))
+    source_identity = (StringEvidence(value=build.source_reference) if build is not None else
+        context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="source identity not supplied")))
     return CommandEvidence(
         schema_version=2, request=request.durable_view(), result=result.durable_view(), producer=role,
         deployment_id=context.identity.deployment_id, unit_id=unit_id,
-        binary_version=context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="tool identity not supplied")),
-        source_identity=context.tool_identity.get(tool_name, StringEvidence(unavailable_reason="source identity not supplied")),
+        binary_version=binary_version, source_identity=source_identity,
         monotonic_started=_evidence(
             result.monotonic_started if result.duration_basis == "monotonic" else started_monotonic,
             "process start not captured"),

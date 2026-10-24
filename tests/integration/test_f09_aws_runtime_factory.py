@@ -132,6 +132,14 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.remote_files = {"vm_a": {}, "vm_b": {}}
         self.uploads = {}
         self.current_elapsed = 0
+        self.guest_request = None
+        self.guest_outcome = None
+        self.guest_exception = None
+        self.native_root = None
+        self.workspace_roots = {}
+        self.diagnostics_contexts = {}
+        self.diagnostics_outcomes = {}
+        self.inventory_roles = {}
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -169,7 +177,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 stdout = "\n".join(line for line in stdout.splitlines() if line.split("=",1)[0] in requested or line == "[Service]")
             return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
-        if action.startswith("f02r-"):
+        if action.startswith("f02r-") and not action.startswith(("f02r-retrieve-observe-", "f02r-retrieve-")):
             self.actions.append(action)
             value = self.bootstrap_runner.run(request)
             stdout = value.stdout.replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
@@ -188,12 +196,155 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     stdout=json.dumps({"python":"3.11.0","pydantic":"2.10.0","yaml":"6.0.2"}), stderr="")
             return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+        if action.startswith("f09-guest-request-"):
+            self.actions.append(action)
+            local_source = next(Path(value) for value in request.argv
+                if value.endswith("request.json") and Path(value).is_file())
+            self.guest_request = local_source.read_text(encoding="utf-8")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+        if action.startswith("f09-guest-run-"):
+            self.actions.append(action)
+            from cloud_network_benchmark.lifecycle_guest import GuestRequest, execute_request
+            from tests.f03_support import FakeClock as GuestClock, FakeProcesses
+            class NativeFixtureProcesses(FakeProcesses):
+                """Run the actual F03 driver while returning captured F08 grammar bytes."""
+                def start(self, request, *, stdout_path, stderr_path):
+                    handle = super().start(request, stdout_path=stdout_path, stderr_path=stderr_path)
+                    executable = Path(request.argv[0]).name
+                    fixture_root = ROOT / "tests/fixtures/f08/native"
+                    if executable == "sockperf":
+                        native = Path(request.argv[request.argv.index("--full-log") + 1])
+                        native.write_bytes((fixture_root / "sockperf.csv").read_bytes())
+                    elif executable == "iperf3":
+                        stdout_path.write_bytes((fixture_root / "iperf3.json").read_bytes())
+                    return handle
+            guest_clock = GuestClock()
+            guest_clock.utc_adjustment = NOW - guest_clock.origin
+            guest_request = GuestRequest.model_validate_json(self.guest_request).model_copy(update={
+                "output_root": self.native_root,
+                "package_root": ROOT / "src/cloud_network_benchmark"})
+            self.native_root.mkdir(parents=True, exist_ok=True)
+            try:
+                outcome = execute_request(guest_request, processes=NativeFixtureProcesses(guest_clock), clock=guest_clock)
+            except Exception as exc:
+                self.guest_exception = f"{type(exc).__name__}: {exc}"
+                raise
+            self.guest_outcome = outcome.model_dump_json()
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+        if action.startswith("f09-guest-outcome-"):
+            self.actions.append(action)
+            if self.guest_outcome is not None:
+                Path(request.argv[-1]).write_text(self.guest_outcome, encoding="utf-8")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+        if action.startswith("f09-diagnostics-context-"):
+            self.actions.append(action)
+            source = next(Path(value) for value in request.argv
+                if value.endswith("context.json") and Path(value).is_file())
+            invocation = action.removeprefix("f09-diagnostics-context-")
+            self.diagnostics_contexts[invocation] = json.loads(source.read_text(encoding="utf-8"))
+            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-diagnostics-start-"):
             self.actions.append(action)
+            invocation = action.removeprefix("f09-diagnostics-start-")
+            context = self.diagnostics_contexts[invocation]
+            role, root = context["vm_role"], self.workspace_roots[context["vm_role"]]
+            if role == "vm_b":
+                logs = root / "server-logs"
+                logs.mkdir(parents=True, exist_ok=True)
+                (logs / "sockperf.log").write_text("Sockperf listener captured by offline source fixture\n", encoding="utf-8")
+                (logs / "iperf3-server.jsonl").write_text(json.dumps({"event":"server_listening","data":{}})+"\n", encoding="utf-8")
+                (logs / "iperf3-server.err").write_text("No server stderr bytes in offline fixture.\n", encoding="utf-8")
+            from cloud_network_benchmark.contracts.measurements import VmMetadata, DiagnosticSample, ClockMapping
+            metadata_path = root / "metadata" / f"{role}.json"
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_seed = dict(context["metadata_seed"])
+            supplied_builds = metadata_seed.get("source_builds", {}).get("value", {})
+            metadata_seed["tool_versions"] = {"value": {tool: {
+                "version": {"value": build["binary_version"]},
+                "binary_sha256": {"value": build["binary_sha256"]}}
+                for tool, build in supplied_builds.items()}}
+            metadata_seed["source_builds"] = {"value": {tool: {
+                "supplied": build,
+                "current_binary_sha256": {"value": build["binary_sha256"]},
+                "matches_bootstrap_binary": {"value": True},
+                "matches_bootstrap_version": {"value": True}}
+                for tool, build in supplied_builds.items()}}
+            metadata_path.write_text(VmMetadata.model_validate(metadata_seed).model_dump_json()+"\n", encoding="utf-8")
+            diag_path = root / "diagnostics" / f"{role}.jsonl"
+            diag_path.parent.mkdir(parents=True, exist_ok=True)
+            sample = DiagnosticSample(schema_version=2, deployment_id=context["deployment_id"], vm_role=role,
+                sampled_at=NOW, monotonic_seconds=1, interval_seconds=1,
+                cpu_total_percent={"value":5}, cpu_max_core_percent={"value":10}, cpu_steal_percent={"value":0},
+                tcp_retransmissions={"value":0}, interface_rx_drops={"value":0}, interface_tx_drops={"value":0},
+                interface_rx_errors={"value":0}, interface_tx_errors={"value":0}, rx_bytes={"value":1000}, tx_bytes={"value":1000})
+            diag_path.write_text(sample.model_dump_json()+"\n", encoding="utf-8")
+            mapping = ClockMapping(vm_role=role, monotonic_seconds=1, utc_timestamp=NOW,
+                estimated_error_ms={"value":1}, synchronization_source={"value":"synthetic chrony fixture"})
+            (root / "diagnostics" / f"{role}-clock.jsonl").write_text(mapping.model_dump_json()+"\n", encoding="utf-8")
+            output_root = context["output_root"]
+            self.diagnostics_outcomes[invocation] = {"deployment_id":context["deployment_id"],"vm_role":role,
+                "state":"interrupted","closed_paths":[f"{output_root}/metadata/{role}.json",
+                    f"{output_root}/diagnostics/{role}.jsonl",f"{output_root}/diagnostics/{role}-clock.jsonl"]}
             stdout = json.dumps({"pid":501,"process_group":501,
                 "boot_id":"12345678-1234-4234-8234-123456789abc","start_ticks":1234})
             return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+        if action.startswith("f09-diagnostics-stop-"):
+            self.actions.append(action)
+            closed_at = NOW + timedelta(minutes=5)
+            return CommandResult(action_id=action,outcome="succeeded",started_at=closed_at,finished_at=closed_at,
+                duration_seconds=0,exit_code=0,stdout=json.dumps({"state":"stopped","closed_at_utc":closed_at.isoformat()}),stderr="")
+        if action.startswith("f09-diagnostics-outcome-"):
+            self.actions.append(action)
+            invocation = action.removeprefix("f09-diagnostics-outcome-")
+            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+                duration_seconds=0,exit_code=0,stdout=json.dumps(self.diagnostics_outcomes[invocation]),stderr="")
+        if action.startswith("f09-listener-exit-"):
+            self.actions.append(action)
+            stamp = (NOW + timedelta(minutes=5)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+            stdout = f"LoadState=loaded\nActiveState=inactive\nMainPID=0\nInactiveEnterTimestamp={stamp}\n"
+            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+                duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
+        if action.startswith("f09-inventory-"):
+            self.actions.append(action)
+            role = "vm_a" if action.endswith("vm_a") else "vm_b"
+            root = self.workspace_roots[role]
+            rows=[]
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    data=path.read_bytes(); rows.append({"path":path.relative_to(root).as_posix(),
+                        "size_bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()})
+                    self.inventory_roles[path.relative_to(root).as_posix()] = role
+            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+                duration_seconds=0,exit_code=0,stdout=json.dumps({"files":rows},sort_keys=True,separators=(",",":")),stderr="")
+        if action.startswith("f02r-retrieve-observe-"):
+            self.actions.append(action)
+            import re
+            match = re.search(r"\[ -f (.+?) \] &&", request.argv[-1])
+            assert match is not None, request.argv[-1]
+            source = __import__("shlex").split(match.group(1))[0]
+            from pathlib import PurePosixPath
+            relative = PurePosixPath(source).relative_to("/var/lib/cnb/work").as_posix()
+            artifact_id = action.removeprefix("f02r-retrieve-observe-")
+            role = "vm_b" if artifact_id.startswith("vm_b_") or artifact_id in {
+                "sockperf_server_log", "iperf3_server_log", "iperf3_server_error"} else "vm_a"
+            local = self.workspace_roots[role] / relative
+            data = local.read_bytes()
+            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+                duration_seconds=0,exit_code=0,stdout=f"{len(data)} {hashlib.sha256(data).hexdigest()}",stderr="")
+        if action.startswith("f02r-retrieve-") and request.action_type == "scp":
+            self.actions.append(action)
+            remote = next(value for value in request.argv if ":/var/lib/cnb/work/" in value)
+            from pathlib import PurePosixPath
+            role = "vm_a" if "8.8.8.8" in remote else "vm_b"
+            local = self.workspace_roots[role] / PurePosixPath(remote.split(":",1)[1]).relative_to("/var/lib/cnb/work")
+            Path(request.argv[-1]).write_bytes(local.read_bytes())
+            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+                duration_seconds=0,exit_code=0,stdout="",stderr="")
         if action.startswith("f09-control-clock-"):
             self.actions.append(action)
             timestamp = (NOW + timedelta(seconds=self.current_elapsed)).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -281,6 +432,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         config_path=config)
     child = children["aws"]
     runner = FakePreparedAwsRunner()
+    runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
+    runner.native_root = runner.workspace_roots["vm_a"]
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)
@@ -308,10 +461,23 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["cleanup"] is not None
     assert provider_result.values["prepare"].stage == "prepare"
     assert provider_result.values["prepare"].succeeded is True
-    assert provider_result.values["measure"].succeeded is False
-    assert provider_result.values["measure"].evidence.outcome is None
+    assert provider_result.values["measure"].succeeded is True, (runner.guest_exception, provider_result.values["measure"].evidence,
+        clock.elapsed, built["ledger"].inspect()["reservations"])
+    observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
+    from cloud_network_benchmark.contracts.measurements import CommandEvidence
+    for raw_command in provider_result.values["measure"].evidence.outcome.commands:
+        command = CommandEvidence.model_validate(raw_command)
+        role = str(command.producer)
+        tool = Path(command.request["argv"][0]).name
+        build = next(item for item in observed_builds if str(item.role) == role and item.tool == tool)
+        assert command.binary_version.value == build.binary_version
+        assert command.source_identity.value == build.source_reference
+    receiver_commands = provider_result.values["measure"].evidence.receiver_command_evidence
+    assert {Path(command.request["argv"][0]).name for command in receiver_commands} == {"sockperf", "iperf3"}
     assert provider_result.values["close"].stage == "close"
+    assert provider_result.values["close"].succeeded is True, provider_result.values["close"].evidence
     assert provider_result.values["retrieve"].stage == "retrieve"
+    assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
     assert any(action.startswith("f02r-") for action in runner.actions)
     assert "aws-expiry-start-eu-central-1" in runner.actions
     assert "aws-pair-apply" in runner.actions
@@ -328,6 +494,9 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     saved = ValidatorInput.model_validate_json(result_file.read_text(encoding="utf-8"))
     replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
     assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
+    assert replay.validation_status.data_validity == "partial", replay.findings
+    assert not [item for item in replay.findings if item.severity == "error"], replay.findings
+    assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
 
 

@@ -64,6 +64,11 @@ def _guest_from(result: Any) -> Any:
     return getattr(evidence, "outcome", None)
 
 
+def _guest_execution_from(result: Any) -> Any:
+    measured = _outcome(result, "measure")
+    return getattr(measured, "evidence", None)
+
+
 def _records_from(result: Any) -> list[Any]:
     retrieved = _outcome(result, "retrieve")
     evidence = getattr(retrieved, "evidence", None)
@@ -124,10 +129,11 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
         records.append(record)
 
     guest = _guest_from(result)
+    remote = _guest_execution_from(result)
     commands = [CommandEvidence.model_validate(item) for item in
         (getattr(guest, "commands", ()) or ())]
     commands.extend(CommandEvidence.model_validate(item) for item in
-        (getattr(guest, "receiver_command_evidence", ()) or ()))
+        (getattr(remote, "receiver_command_evidence", ()) or ()))
     timings = [MeasurementTiming.model_validate(item) for item in
         (getattr(guest, "timings", ()) or ())]
     if _value(child.mode) == "diagnostic_day":
@@ -218,15 +224,20 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
 
     commands, timings = [], []
     guest = _guest_from(result)
+    remote = _guest_execution_from(result)
     if guest is not None:
         from .contracts.measurements import CommandEvidence, MeasurementTiming
         commands = [CommandEvidence.model_validate(item) for item in guest.commands]
-        commands.extend(CommandEvidence.model_validate(item) for item in guest.receiver_command_evidence)
         timings = [MeasurementTiming.model_validate(item) for item in guest.timings]
+    from .contracts.measurements import CommandEvidence
+    commands.extend(CommandEvidence.model_validate(item) for item in
+        (getattr(remote, "receiver_command_evidence", ()) or ()))
     from .lifecycle_bundle import lifecycle_declarations
+    builds = _builds_from(result)
     declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
         measurement_units=child.measurement_units,
-        schedule_supplied=child.schedule_entry.value is not None)
+        schedule_supplied=child.schedule_entry.value is not None,
+        build_observations=builds)
     for role in ("vm_a", "vm_b"):
         from .diagnostics import _declarations
         declarations.extend(_declarations(role))
@@ -237,7 +248,6 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         commands = [item for item in commands if item.unit_id in parent_units]
         timings = [item for item in timings if item.unit_id in parent_units]
         records = [item for item in records if item.unit_id is None or item.unit_id in parent_units]
-    builds = _builds_from(result)
     if builds:
         from .bootstrap import materialize_build_identity_artifacts
         records.extend(materialize_build_identity_artifacts(root, child.deployment_id, builds))
@@ -270,7 +280,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
             record.verify_materialized_file(root)
             from .contracts.measurements import VmMetadata
             parsed = VmMetadata.model_validate_json((root / record.path).read_bytes())
-            if parsed.deployment_id != child.deployment_id or parsed.vm_role.value != role:
+            if parsed.deployment_id != child.deployment_id or str(parsed.vm_role) != role:
                 raise ValueError("materialized VM metadata identity differs from the child deployment")
             observed_metadata[role] = parsed.model_dump(mode="json")
     if observed_metadata:
@@ -292,8 +302,10 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     guest = _guest_from(result)
     units = _day_units(child, guest)
     observation = child.resolved_observation
+    builds = _builds_from(result)
     declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
-        measurement_units=units, schedule_supplied=child.schedule_entry.value is not None)
+        measurement_units=units, schedule_supplied=child.schedule_entry.value is not None,
+        build_observations=builds)
     for role in ("vm_a", "vm_b"):
         declarations.extend(_declarations(role))
     artifacts = {}
@@ -306,8 +318,10 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     timings = [MeasurementTiming.model_validate(value) for value in child.timings]
     if guest is not None:
         commands.extend(CommandEvidence.model_validate(value) for value in guest.commands)
-        commands.extend(CommandEvidence.model_validate(value) for value in guest.receiver_command_evidence)
         timings.extend(MeasurementTiming.model_validate(value) for value in guest.timings)
+    remote = _guest_execution_from(result)
+    commands.extend(CommandEvidence.model_validate(value) for value in
+        (getattr(remote, "receiver_command_evidence", ()) or ()))
     commands_by_key = {}
     for command in commands:
         key = (command.request.get("action_id"), command.deployment_id, command.unit_id)
@@ -325,7 +339,6 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     commands = [item for item in commands if item.unit_id in allowed_units]
     timings = [item for item in timings if item.unit_id in allowed_units]
     records = list(child.artifact_records) + _records_from(result)
-    builds = _builds_from(result)
     record_map = {}
     for record in records:
         key = (record.artifact_id, record.path, record.unit_id)
@@ -353,7 +366,8 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
                 diagnostics.extend(DiagnosticSample.model_validate(item) for item in parsed)
             else:
                 clock_mappings.extend(parsed)
-    receiver_commands = list(getattr(guest, "receiver_command_evidence", ()) or ()) if guest is not None else []
+    remote = _guest_execution_from(result)
+    receiver_commands = list(getattr(remote, "receiver_command_evidence", ()) or ())
     resolved_path = root / child.config_provenance.resolved_snapshot_path
     config_path = root / child.config_provenance.snapshot_path
     schedule_path = (Evidence[str](value=str(root / "schedule.csv"))

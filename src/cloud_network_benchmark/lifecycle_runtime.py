@@ -489,7 +489,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                     campaign=campaign, parent=parent, children={provider: child}, runtime=runtime,
                     ledger=ledger, reservation=reservation, runner=runner, clock=clock,
                     repository_root=repository_root or Path.cwd(),
-                    recovery_path=Path(private_root) / f"{provider}-lifecycle-recovery.json",
+                    recovery_path=Path(private_root) / "lifecycle-recovery.json",
                     sleep=runtime.get("sleep", __import__("time").sleep))
         return build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,

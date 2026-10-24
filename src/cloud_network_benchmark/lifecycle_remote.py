@@ -1,7 +1,6 @@
 """Source-bound provider remote-stage composition for F09."""
 from __future__ import annotations
 
-import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -176,6 +175,11 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             total_seconds = (max(float(unit.measured_seconds) for unit in item.observation.measurement_units)
                 if mode == "diagnostic_day" else
                 sum(float(unit.measured_seconds) for unit in item.observation.measurement_units))
+            # Diagnostics span the admitted measurement-stage allowance, not
+            # only measured probe seconds; the separate shutdown allowance
+            # keeps them alive through bounded F03/F04 closure.
+            diagnostic_duration = (float(runtime["allowance"].measurement_seconds)
+                + float(runtime["allowance"].measurement_shutdown_seconds))
             for role in ("vm_a", "vm_b"):
                 context = build_collection_context(pair, role=role,
                     interface=runtime["access"]["diagnostic_interfaces"][provider][role],
@@ -184,7 +188,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     # a macOS symlink). Validate its shape against a local
                     # no-symlink path, then bind the declared guest path.
                     output_root=repository_root / ".f09-remote-workspace" / deployment.deployment_id / role,
-                    duration_seconds=total_seconds, prepared=bootstrap)
+                    duration_seconds=max(total_seconds, diagnostic_duration), prepared=bootstrap)
                 context["output_root"] = runtime["access"]["bootstrap"].workspace
                 item.diagnostics[role] = start_remote_diagnostics(connection, context,
                     runner=runner, remote_root=str(Path(guest_runtime.remote_root) / "diagnostics-control"),
@@ -213,33 +217,40 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             builds = bootstrap.builds
             tool_identity = {str(build.tool): StringEvidence(value=build.binary_version)
                 for build in builds if build.role == "vm_a"}
-            listener_action = next((action for action in bootstrap.actions
-                if action.action_id == "f02r-vm_b-listener-iperf3"), None)
             receiver_commands = []
-            if listener_action is not None:
-                build = next((row for row in builds if row.role == "vm_b" and row.tool == "iperf3"), None)
-                argv = listener_action.request.get("argv")
-                remote_argv = shlex.split(argv[-1]) if isinstance(argv, list) and argv else []
-                if build is not None and remote_argv:
-                    result_data = listener_action.result
-                    receiver_commands.append(CommandEvidence(schema_version=2,
-                        request={"argv": remote_argv, "action_id": listener_action.action_id},
-                        result={"action_id": listener_action.action_id,
-                            "outcome": result_data.get("outcome", "succeeded"),
-                            "started_at": result_data.get("started_at"),
-                            "finished_at": result_data.get("finished_at"),
-                            "duration_seconds": result_data.get("duration_seconds", 0),
-                            "exit_code": result_data.get("exit_code"),
-                            "stdout": result_data.get("stdout", ""), "stderr": result_data.get("stderr", "")},
-                        producer="vm_b", deployment_id=deployment.deployment_id,
-                        unit_id=next((unit.unit_id for unit in item.observation.measurement_units
-                                      if str(getattr(unit.phase, "value", unit.phase)) == "multi_flow"), None),
-                        binary_version=StringEvidence(value=build.binary_version),
-                        source_identity=StringEvidence(value=build.source_reference),
-                        monotonic_started=Evidence(unavailable_reason="bootstrap transport has no guest process monotonic start"),
-                        monotonic_finished=Evidence(unavailable_reason="bootstrap transport has no guest process monotonic finish"),
-                        started_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing"),
-                        finished_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing")))
+            for listener in bootstrap.listeners:
+                build = next((row for row in builds if row.role == "vm_b" and row.tool == listener.tool
+                              and row.binary_path == listener.binary_path), None)
+                if build is None or listener.state != "active":
+                    continue
+                action_id = f"f02r-vm_b-listener-{listener.tool}"
+                listener_action = next((action for action in bootstrap.actions
+                    if action.action_id == action_id), None)
+                if listener.tool == "sockperf":
+                    remote_argv = [listener.binary_path, "server", "-i", listener.address, "-p", str(listener.port)]
+                elif listener.tool == "iperf3":
+                    remote_argv = [listener.binary_path, "-s", "-B", listener.address, "-p", str(listener.port), "--json-stream", "--forceflush"]
+                else:
+                    continue
+                result_data = listener_action.result if listener_action is not None else {}
+                receiver_commands.append(CommandEvidence(schema_version=2,
+                    request={"argv": remote_argv, "action_id": action_id},
+                    result={"action_id": action_id,
+                        "outcome": result_data.get("outcome", "succeeded"),
+                        "started_at": result_data.get("started_at"),
+                        "finished_at": result_data.get("finished_at"),
+                        "duration_seconds": result_data.get("duration_seconds", 0),
+                        "exit_code": result_data.get("exit_code"),
+                        "stdout": result_data.get("stdout", ""), "stderr": result_data.get("stderr", "")},
+                    producer="vm_b", deployment_id=deployment.deployment_id,
+                    unit_id=next((unit.unit_id for unit in item.observation.measurement_units
+                                  if str(getattr(unit.phase, "value", unit.phase)) == "multi_flow"), None),
+                    binary_version=StringEvidence(value=build.binary_version),
+                    source_identity=StringEvidence(value=build.source_reference),
+                    monotonic_started=Evidence(unavailable_reason="bootstrap transport has no guest process monotonic start"),
+                    monotonic_finished=Evidence(unavailable_reason="bootstrap transport has no guest process monotonic finish"),
+                    started_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing"),
+                    finished_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing")))
             guest_request = GuestRequest(schema_version=2, identity=pair.identity,
                 observation=item.observation, b_private_ipv4=connection.private_ipv4_b,
                 output_root=Path(runtime["access"]["bootstrap"].workspace),
@@ -263,7 +274,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 and item.guest.outcome.outcome == "succeeded", item.guest)
         except Exception as exc:
             return ProviderStageOutcome("measure", False,
-                {"failure": f"{type(exc).__name__}: remote measurement handoff failed"})
+                {"failure": f"{type(exc).__name__}: remote measurement handoff failed ({exc})"})
 
     def close(deployment: Any, provision: Any):
         try:
@@ -310,7 +321,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     {"failure": "one or more remote inventories are incomplete", "inventories": item.inventories})
             declarations = lifecycle_declarations(item.observation.artifact_layout,
                 mode=item.observation.mode, measurement_units=item.observation.measurement_units,
-                schedule_supplied=item.observation.schedule_entry.value is not None)
+                schedule_supplied=item.observation.schedule_entry.value is not None,
+                build_observations=item.prepared.evidence["bootstrap"].builds)
             for role in ("vm_a", "vm_b"):
                 declarations.extend(_declarations(role))
             unique = {}
@@ -348,7 +360,9 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 and not item.retrieval.failures, item.retrieval)
         except Exception as exc:
             return ProviderStageOutcome("retrieve", False,
-                {"failure": f"{type(exc).__name__}: closed bundle retrieval failed"})
+                {"failure": f"{type(exc).__name__}: closed bundle retrieval failed",
+                 "details": [(error.get("loc"), error.get("msg")) for error in exc.errors()]
+                    if hasattr(exc, "errors") else str(exc)})
 
     return RemoteStages(prepare=prepare, stabilize=stabilize, measure=measure,
         close=close, retrieve=retrieve, claim=lambda *_: None)

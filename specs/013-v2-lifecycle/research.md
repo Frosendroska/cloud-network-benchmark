@@ -1,5 +1,19 @@
 # F09 engineering decisions and source evidence
 
+## F03/F04/F08 build identity integration
+
+F03 command evidence keeps the complete observed build version banner and its independent
+`source_reference`; the legacy `tool_identity` map remains version-only. When build observations
+are supplied, command recording requires exactly one matching role, tool and executable and fails
+closed on missing or ambiguous identity. F04 preserves the full version banner and accepts the
+plain bootstrap SHA-256 value produced by `build_collection_context` (while retaining the earlier
+evidence-object input form). F08 reads the actual nested F04 source/version/hash fields as scalars;
+legacy scalar metadata remains readable, and structured dictionaries are never compared through
+their string representation. Historical compact version displays remain limited diagnostics and
+do not replace sidecar, command, hash or acquisition checks. This is a narrow producer/consumer
+repair across F03, F04 and F08 using existing fields; no shared DTO, schema, acquisition proof or
+research rule changed. Focused regression ownership is serialized to the F09 implementation stage.
+
 ## Authority and baseline
 
 Read implementation `AGENTS.md`, constitution 2.0.0 and `docs/autonomous/WORKFLOW.md`; canonical Thesis `advisor/docs/design_document.md`, `DECISIONS.md` (19 October concurrency and 18 October local-copy/expiry decisions), `experiments/FRAMEWORK_IMPLEMENTATION_NOTES.md` (runtime149–155, tests167–175, remaining engineering213–216), `experiments/EXPERIMENTS.md` (mode/cap/cleanup), `tracking/IMPLEMENTATION_PROMPTS.md:155–163`, `tracking/M04_implementation.md` and dependency roadmap. Current dated decisions supersede old FLENT/alternating studies. No source conflict remains. Base `527451d8697917c795d8dc9224cf8a17947c4311` includes the required component merges; integration with latest main is required before implementation and at final convergence.
