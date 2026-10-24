@@ -1,6 +1,6 @@
 # F09 V2 lifecycle implementation evidence
 
-This record covers feature commit `eeba05c08d30ccea7687f55a762a9cb025524b1f` in the credential-free implementation worktree only. The module-level preview is inspect-only. Paid lifecycle execution and provider-specific recovery adapters remain blocked pending complete paid prerequisites and a separately authorized stage. No provider APIs, credentials, Terraform plans, SSH, or native benchmark traffic were used; guest staging was exercised only through fake SCP/SSH runners.
+This record covers F09 code commit `9a66147277f188a1473d58f2346bbff4b20f99bb` after normal integration of verified F12 `origin/main` at `5028ab97c3a906e51a42ad11dade746251847e71` (merge commit `57fec394ecd57f58f03e5c4b1989120022a07df5`). Validation ran in the credential-free implementation worktree only. The root CLI lifecycle command delegates to the isolated parser, while F12 `analyze` and existing config commands remain available. Paid lifecycle execution and provider-specific recovery adapters remain blocked pending complete paid prerequisites and a separately authorized stage. No provider APIs, credentials, Terraform plans, SSH, or native benchmark traffic were used; guest staging was exercised only through fake SCP/SSH runners.
 
 ## Commands run
 
@@ -8,14 +8,15 @@ Environment: `/private/tmp/cnb-f09`, `login=false`, `PYTHONPATH=src`, `THESIS_RO
 
 | Check | Result |
 | --- | --- |
-| Focused F09 lifecycle/guest/bundle/CLI/retrieval/contract and four-mode replay suites | Passed, 73 tests in 2.30s |
-| F09 mode/failure/recovery/replay plus F04 diagnostics integration suites | Passed, 63 tests in 9.93s |
-| Full `python -m pytest -q` regression | Passed, 1342 tests in 168.38s |
+| F09 focused lifecycle/guest/bundle/CLI/retrieval/contract and four-mode replay suites | Passed, 75 tests in 3.09s |
+| F09 mode/failure/recovery integration suites | Passed, 45 tests in 0.22s |
+| F09 CLI + F12 analysis replay + existing config CLI compatibility suites | Passed, 70 tests in 215.44s |
+| Full `python -m pytest -q` regression after F12 integration and T026 | Passed, 1387 tests in 397.23s |
 | `python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | Passed, exit 0; no shared schema changes |
-| `python -m cloud_network_benchmark.lifecycle_cli --help` and `... preview --help` | Passed; isolated module-level parser only |
-| Root CLI lifecycle dispatch and final integrated-head gates | Pending coordinator confirmation that F12 CLI integration is merged |
+| Root `cli --help`, root `cli lifecycle --help`, lifecycle module `--help` and `preview --help` | Passed, exit 0; all four commands |
+| `git diff --check` | Passed, exit 0 |
 
-The full regression ran at this feature content before the final adjustment that stores transport actions through the existing redacted `RemoteActionEvidence` helper. The affected guest-staging and bundle-replay suites were rerun after that adjustment and passed 12 tests; `git diff --check` passed at the committed head. The final integrated-head gate remains pending.
+All checks above used `/private/tmp/cnb-offline-venv/bin/python` with `PYTHONPATH=src`, `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis`, `PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH`, and `MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config`, from `/private/tmp/cnb-f09` with `login=false`. The full regression ran against the exact code committed as `9a661477`; subsequent changes are limited to this evidence record and the T029 completion marker. The root lifecycle safe-run test returned rejected with zero external calls and created neither results nor private state paths.
 
 The retrieval API accepts strict integer `max_attempts=1` or `2`, retaining the legacy default of two. F09 calls the API once per round with `max_attempts=1`; its only retry filters to one previously failed concrete artifact, recomputes the existing bounded copy handoff using the original deadline and cleanup reserve, checks admission again, and preserves both round records with unique action IDs (`attempt_offset=1`). An interrupted transfer is never retried. Tests cover the legacy default, rejection before side effects for invalid limits, one-attempt refusal, retry action identity and F09 retry admitted/refused/interrupted paths.
 
@@ -25,4 +26,4 @@ The selected package source is transferred with the existing trusted SCP options
 
 ## Remaining acceptance limits
 
-The final root `cli.py` dispatch depends on coordinator confirmation that the F12 CLI merge is integrated; T026 remains pending. The full regression and shared-schema check above were run on the current pre-F12-integration feature head and must be repeated after integration. Offline mocks do not prove real cloud expiry, paid admission, guest package installation on Ubuntu, Linux guest behavior, native traffic or cloud cleanup. Those are separate gates; F10 is the end of this implementation stage.
+Offline mocks do not prove real cloud expiry, paid admission, guest package installation on Ubuntu, Linux guest behavior, native traffic or cloud cleanup. Those are separate gates; F10 is the end of this implementation stage.
