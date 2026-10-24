@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import subprocess
+import shlex
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 
 @dataclass
@@ -226,15 +227,23 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 action_id = f"f02r-vm_b-listener-{listener.tool}"
                 listener_action = next((action for action in bootstrap.actions
                     if action.action_id == action_id), None)
-                if listener.tool == "sockperf":
-                    remote_argv = [listener.binary_path, "server", "-i", listener.address, "-p", str(listener.port)]
-                elif listener.tool == "iperf3":
-                    remote_argv = [listener.binary_path, "-s", "-B", listener.address, "-p", str(listener.port), "--json-stream", "--forceflush"]
-                else:
+                if listener.tool not in {"sockperf", "iperf3"}:
                     continue
-                result_data = listener_action.result if listener_action is not None else {}
+                if listener_action is None or not isinstance(listener_action.request, Mapping):
+                    raise ValueError(f"prepared {listener.tool} listener lacks its original launch request")
+                request_argv = listener_action.request.get("argv")
+                if not isinstance(request_argv, list) or len(request_argv) < 1:
+                    raise ValueError(f"prepared {listener.tool} listener launch argv is unavailable")
+                remote_command = request_argv[-1]
+                if not isinstance(remote_command, str):
+                    raise ValueError(f"prepared {listener.tool} listener launch command is unavailable")
+                remote_argv = shlex.split(remote_command)
+                if not remote_argv or remote_argv[0] != "sudo" or "systemd-run" not in remote_argv:
+                    raise ValueError(f"prepared {listener.tool} listener launch request is not the recorded F02 systemd unit")
+                result_data = listener_action.result
                 receiver_commands.append(CommandEvidence(schema_version=2,
-                    request={"argv": remote_argv, "action_id": action_id},
+                    request={"argv": list(remote_argv), "action_id": action_id,
+                        "acquisition_invocation_id": action_id},
                     result={"action_id": action_id,
                         "outcome": result_data.get("outcome", "succeeded"),
                         "started_at": result_data.get("started_at"),

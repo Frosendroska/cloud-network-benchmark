@@ -538,6 +538,11 @@ class _Runner:
                 tcp_handle = self._start(tcp_req, tcp_dest, tcp_err_dest)
                 tcp_mono, tcp_utc = self._start_times(tcp_handle)
                 handles.append(tcp_handle)
+            else:
+                # Idle phases still need the native test-start event for phase
+                # ordering and source-bound timing; no TCP lead is required.
+                notification = self._wait_notification(
+                    probe, self.context.deadline_monotonic - self.context.shutdown_grace_seconds)
             results: dict[object, Optional[CommandResult]] = {handle: None for handle in handles}
             requests = {probe: probe_req}
             if tcp_handle is not None and tcp_req is not None:
@@ -576,7 +581,7 @@ class _Runner:
             self.executed.append(unit.unit_id)
             self.timings.append(_timing(unit.unit_id, self.context,
                 notification=notification.utc if notification else None,
-                tcp_started=None, omitted=5, idle=not tcp,
+                tcp_started=tcp_utc, omitted=5, idle=not tcp,
                 clocks=self.context.clock_mappings))
             observed_receiver_seconds = None
             observed_omit_seconds = None
@@ -618,7 +623,7 @@ class _Runner:
                 self._failure(primary, category=getattr(primary, "category", "measurement"))
             if not timing_recorded and (probe is not None):
                 self.timings.append(_timing(unit.unit_id, self.context,
-                    notification=notification.utc if notification else None, tcp_started=None,
+                    notification=notification.utc if notification else None, tcp_started=tcp_utc,
                     omitted=5, idle=not tcp, clocks=self.context.clock_mappings))
                 self.notes.append({"unit_id": unit.unit_id, "measured_window": "unavailable",
                                    "reason": "unit ended before defensible native measurement bounds were available"})
@@ -723,6 +728,8 @@ class _Runner:
         previous_probe_finish: Optional[float] = None
         notification: Optional[ProcessEvent] = None
         initial_notification_monotonic: Optional[float] = None
+        initial_notification_utc: Optional[datetime] = None
+        tcp_utc: Optional[datetime] = None
         first = True
         day_failure: Optional[BaseException] = None
         unresolved_probe: Optional[BaseException] = None
@@ -764,10 +771,11 @@ class _Runner:
                         notification = self._wait_notification(probe_handle, deadline)
                         self._lead(probe_handle, notification)
                         initial_notification_monotonic = notification.monotonic
+                        initial_notification_utc = notification.utc
                         if self.clock.monotonic() + 86405 > deadline:
                             raise MeasurementError("diagnostic TCP duration and shutdown grace no longer fit the deadline", "deadline")
                         tcp_handle = self._start(tcp_req, tcp_path, tcp_err)
-                        tcp_mono, _ = self._start_times(tcp_handle)
+                        tcp_mono, tcp_utc = self._start_times(tcp_handle)
                         first = False
                     else:
                         # The same TCP handle stays active; later probe chunks do not gate or delay it.
@@ -827,7 +835,8 @@ class _Runner:
             if tcp_result.outcome != CommandOutcome.SUCCEEDED:
                 raise MeasurementError(f"diagnostic TCP exited {tcp_result.exit_code}", "tcp_failure")
             self.executed.append(parent.unit_id)
-            self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,
+            self.timings.append(_timing(parent.unit_id, self.context,
+                notification=initial_notification_utc, tcp_started=tcp_utc,
                 omitted=5, clocks=self.context.clock_mappings))
             receiver_seconds, omitted_seconds = _receiver_timing_file(tcp_path, json_stream=True)
             bounds = None
@@ -897,7 +906,8 @@ class _Runner:
                             unresolved_probe = shutdown_exc
                     continue
             if not any(t.unit_id == parent.unit_id for t in self.timings):
-                self.timings.append(_timing(parent.unit_id, self.context, notification=None, tcp_started=None,
+                self.timings.append(_timing(parent.unit_id, self.context,
+                    notification=initial_notification_utc, tcp_started=tcp_utc,
                     omitted=5, clocks=self.context.clock_mappings))
             if unresolved_probe is not None and day_failure is None:
                 unresolved = MeasurementError(

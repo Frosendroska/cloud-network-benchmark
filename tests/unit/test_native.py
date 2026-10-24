@@ -111,6 +111,29 @@ def test_native_stream_variants_preserve_only_trustworthy_intervals(filename, fi
     assert any(item.code == finding for item in parsed.findings)
 
 
+
+def test_iperf_omitted_and_postomit_reset_offsets_are_distinct_phases(tmp_path):
+    path = tmp_path / "reset-phases.jsonl"
+    rows = [
+        {"event": "start", "data": {"cookie": "session"}},
+        {"event": "interval", "data": {"streams": [
+            {"socket": 17, "start": 0, "end": 4, "seconds": 4, "bytes": 250,
+             "omitted": True, "sender": False}] }},
+        {"event": "interval", "data": {"streams": [
+            {"socket": 17, "start": 0, "end": 10, "seconds": 10, "bytes": 1000,
+             "omitted": False, "sender": False}] }},
+        {"event": "interval", "data": {"streams": [
+            {"socket": 17, "start": 5, "end": 7, "seconds": 2, "bytes": 200,
+             "omitted": False, "sender": False}] }},
+        {"event": "end", "data": {}},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    parsed = parse_iperf3(path, source=source(path), format="jsonl")
+    assert [(item.start_seconds, item.end_seconds, item.omitted) for item in parsed.receiver_intervals] == [
+        (0, 4, True), (0, 10, False)]
+    assert any(item.code == "native.iperf3.interval_overlap" for item in parsed.findings)
+
+
 def test_sockperf_truncated_row_keeps_valid_rows():
     path = FIXTURES / "sockperf-corrupt.csv"
     parsed = parse_sockperf(path, None, source=source(path))

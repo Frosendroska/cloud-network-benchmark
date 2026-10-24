@@ -440,9 +440,42 @@ def finalize_production_batch(*, parent_path: Path, children: Mapping[str, Any],
             child_path=child_path, root=root, result=result, reservation=reservation)
         value = ValidatorInput.model_validate(value.model_dump(mode="python"))
         from .lifecycle_bundle import bind_retrieved_acquisition_sources
+        from .contracts.common import Evidence, StringEvidence
+        from .contracts.validation import ValidatorInput
+        from .paths import atomic_write_json
+        from .contracts.artifacts import resolve_artifact_path
         bound, _sources, _unavailable = bind_retrieved_acquisition_sources(value=value, child_root=root,
             source_artifact_records=value.artifact_records, build_evidence=builds,
             receiver_command_evidence=receiver_commands, clock_mappings=clock_mappings)
+        projected_records = { (record.artifact_id, record.path, record.unit_id): record
+            for record in bound.artifact_records }
+        changed_timing_records = []
+        for timing in bound.timings:
+            prior_timing = next((item for item in value.timings if item.unit_id == timing.unit_id), None)
+            if prior_timing == timing:
+                continue
+            record = next((item for item in value.artifact_records
+                if item.kind == "measurement_timing" and item.unit_id == timing.unit_id
+                and item.retrieval_state == "verified"), None)
+            if record is None:
+                raise ValueError("projected timing lacks its initialized saved timing artifact")
+            record.verify_materialized_file(root)
+            payload = [timing.model_dump(mode="json")]
+            timing_path = resolve_artifact_path(root, record.path)
+            atomic_write_json(timing_path, payload)
+            raw = timing_path.read_bytes()
+            updated_record = record.model_copy(update={
+                "size_bytes": Evidence[int](value=len(raw)),
+                "sha256": StringEvidence(value=hashlib.sha256(raw).hexdigest())})
+            updated_record = type(record).model_validate(updated_record.model_dump(mode="python"))
+            changed_timing_records.append(updated_record)
+            projected_records[(record.artifact_id, record.path, record.unit_id)] = updated_record
+        bound = ValidatorInput.model_validate({**bound.model_dump(mode="python"),
+            "artifact_records": [item.model_dump(mode="python") for item in projected_records.values()]})
+        child = update_child_runtime_evidence(child_path, fixed_at, timings=bound.timings,
+            artifact_records=changed_timing_records or None, parent_manifest_path=parent_path)
+        if child.timings != bound.timings:
+            raise ValueError("child manifest timings differ from strict retrieved-source projection")
         inputs[provider], roots[provider], paths[provider] = bound, root, child_path
     preliminary = {provider: validate_bundle(value, evaluated_at=fixed_at)
         for provider, value in inputs.items()}

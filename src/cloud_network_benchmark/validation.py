@@ -27,7 +27,9 @@ from .manifests import CampaignManifest, ChildRunManifest
 from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
 
 
-def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming) -> tuple[list[Any], list[str]]:
+def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
+                         verified_iperf_origins: dict[str, dict[str, Any]] | None = None
+                         ) -> tuple[list[Any], list[str]]:
     """Replay producer-declared acquisition sources against their materialized F01R bytes."""
     sources = timing.acquisition_sources.value
     if not sources:
@@ -83,11 +85,80 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming) -> tu
                 raise ValueError("source clock domain lacks one bounded clock mapping")
             mapping = mappings[0]
             uncertainty = mapping.estimated_error_ms.value / 1000
-            for window in iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings):
+            replayed_windows = list(iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings))
+            for window in replayed_windows:
                 start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
                 end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
                 if window.has_positive_inner_support and end > start:
                     windows.append((source.tool, start, end))
+            if source.tool == "iperf3" and verified_iperf_origins is not None:
+                origin_record = next((item for item in candidates
+                    if item.artifact_id == source.log_artifact_id and item.path == source.log_path), None)
+                if (origin_record is None or str(getattr(source.producer, "value", source.producer)) != "vm_b"
+                        or not source.session_id or str(getattr(mapping.vm_role, "value", mapping.vm_role)) != "vm_b"):
+                    raise ValueError("verified receiver origin lacks exact B source identity")
+                origin_record.verify_materialized_file(root)
+                from .acquisition import parse_observation_stream
+                by_stream: dict[str, int] = {}
+                expected_streams: int | None = None
+                crossing = False
+                measured_starts: dict[str, list[int]] = {}
+                with _artifact_path(value, origin_record).open("rb") as stream:
+                    for parsed_record in parse_observation_stream(stream):
+                        row = parsed_record.value
+                        if (row.get("record_kind") not in {"session_settings", "stats_origin", "receiver_interval"}
+                                or row.get("tool") != source.tool
+                                or row.get("semantics_id") != source.semantics_id
+                                or row.get("invocation_id") != source.invocation_id
+                                or row.get("boot_id") != source.boot_id
+                                or row.get("clock") != source.clock_domain
+                                or row.get("cookie") != source.session_id):
+                            continue
+                        if row.get("record_kind") == "session_settings":
+                            count = row.get("num_streams")
+                            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                                raise ValueError("verified receiver settings lack stream count")
+                            if expected_streams is not None and expected_streams != count:
+                                raise ValueError("verified receiver stream count conflicts within one session")
+                            expected_streams = count
+                            continue
+                        if row.get("record_kind") == "receiver_interval":
+                            if row.get("omitted") is False:
+                                stream_id = row.get("stream_id")
+                                start_us = row.get("interval_start_us")
+                                if isinstance(stream_id, str) and isinstance(start_us, int) and not isinstance(start_us, bool):
+                                    measured_starts.setdefault(stream_id, []).append(start_us)
+                            continue
+                        if row.get("phase") != "post_omit":
+                            continue
+                        stream_id = row.get("stream_id")
+                        origin_us = row.get("origin_us")
+                        if (not isinstance(stream_id, str) or not stream_id.isdecimal()
+                                or isinstance(origin_us, bool) or not isinstance(origin_us, int) or origin_us < 0):
+                            raise ValueError("post-omit origin has invalid stream or monotonic identity")
+                        previous = by_stream.get(stream_id)
+                        if previous is not None and previous != origin_us:
+                            raise ValueError("post-omit origin conflicts within one receiver stream")
+                        by_stream[stream_id] = origin_us
+                if not by_stream:
+                    raise ValueError("verified receiver post-omit origin is absent")
+                if expected_streams is None or len(by_stream) != expected_streams:
+                    raise ValueError("verified post-omit origins do not cover every declared receiver stream")
+                if set(measured_starts) - set(by_stream):
+                    raise ValueError("receiver interval stream lacks its verified post-omit origin")
+                crossing = any(start_us < by_stream[stream_id]
+                    for stream_id, starts in measured_starts.items() for start_us in starts)
+                origins = [mapping.utc_timestamp.timestamp() + value_us / 1_000_000
+                    - mapping.monotonic_seconds for value_us in by_stream.values()]
+                if max(origins) - min(origins) > 0.000002:
+                    raise ValueError("receiver streams disagree on their observed post-omit origin")
+                origin_utc = sum(origins) / len(origins)
+                previous_origin = verified_iperf_origins.get(source.session_id)
+                observed = {"origin_utc": origin_utc, "uncertainty_seconds": uncertainty + 0.000001,
+                    "crossing_reset": crossing, "stream_count": len(by_stream)}
+                if previous_origin is not None and previous_origin != observed:
+                    raise ValueError("receiver cookie has contradictory verified post-omit origins")
+                verified_iperf_origins[source.session_id] = observed
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
             errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
     return windows, errors
@@ -568,7 +639,8 @@ def _option_values(argv: list[str], name: str) -> list[str]:
     return values
 
 
-def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str | None], Any]) -> tuple[NativeParse, NativeParse | None]:
+def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str | None], Any],
+                verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> tuple[NativeParse, NativeParse | None]:
     csv_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-csv"), None)
     log_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-log"), None)
     tcp_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "iperf3-json"), None)
@@ -608,7 +680,7 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
     if server_record:
         try:
             receiver = parse_iperf3(_artifact_path(value, server_record), source=_source(server_record, value), format="jsonl")
-            receiver = _receiver_session_for_unit(value, unit, receiver)
+            receiver = _receiver_session_for_unit(value, unit, receiver, verified_iperf_origins or {})
             if tcp is not None:
                 client_stats, receiver_stats = _tcp_statistics(tcp), _tcp_statistics(receiver)
                 client_bytes = client_stats["received_bytes"].value
@@ -634,17 +706,73 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
 
 def _f02r_iperf_listener(command: CommandEvidence, argv: list[str]) -> bool:
     action = "f02r-vm_b-listener-iperf3"
-    lower = [token.lower() for token in argv]
-    return (command.producer == "vm_b" and len(lower) >= 4
-        and lower[0] == "systemd-run"
-        and lower[1] == f"--property=environment=cnb_acquisition_id={action}"
-        and lower[2].endswith("/iperf3") and "-s" in lower
-        and command.request.get("action_id") == action
-        and command.request.get("acquisition_invocation_id") == action
-        and command.result.get("action_id") == action)
+    if (command.producer != "vm_b" or command.request.get("action_id") != action
+            or command.request.get("acquisition_invocation_id") != action
+            or command.result.get("action_id") != action):
+        return False
+    offset = 1 if argv[:1] == ["sudo"] else 0
+    if len(argv) <= offset or argv[offset] != "systemd-run":
+        return False
+    env = f"--property=Environment=CNB_ACQUISITION_ID={action}"
+    if argv.count(env) != 1:
+        return False
+    binary_indexes = [index for index, token in enumerate(argv)
+                      if token.endswith("/bin/iperf3")]
+    if len(binary_indexes) != 1:
+        return False
+    binary_index = binary_indexes[0]
+    tail = argv[binary_index + 1:]
+    try:
+        bind = ipaddress.ip_address(_option(tail, "-B") or "")
+    except ValueError:
+        return False
+    return (binary_index > offset and "-s" in tail and "-p" in tail
+        and _option(tail, "-p") == "5201" and "--json-stream" in tail
+        and "--forceflush" in tail and isinstance(bind, ipaddress.IPv4Address)
+        and bind.is_private and not (bind.is_loopback or bind.is_link_local))
 
 
-def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeParse) -> NativeParse:
+def _f02r_persistent_listener(command: CommandEvidence, argv: list[str]) -> bool:
+    """Recognize only the exact F02R deployment-scoped listener launch records."""
+    action = command.request.get("action_id")
+    if action not in {"f02r-vm_b-listener-sockperf", "f02r-vm_b-listener-iperf3"}:
+        return False
+    tool = "sockperf" if action.endswith("sockperf") else "iperf3"
+    if (command.producer != "vm_b" or command.result.get("action_id") != action
+            or command.deployment_id == "" or len(argv) < 12
+            or argv[:2] != ["sudo", "systemd-run"]):
+        return False
+    unit = f"cnb-{command.deployment_id}-{tool}"
+    if ("--unit" not in argv or argv[argv.index("--unit") + 1] != unit
+            or "--property=Restart=no" not in argv or "--property=UMask=0022" not in argv
+            or not any(token.startswith("--property=StandardOutput=append:")
+                       and token.endswith(f"/server-logs/{tool}{'.log' if tool == 'sockperf' else '-server.jsonl'}")
+                       for token in argv)
+            or not any(token.startswith("--property=StandardError=append:")
+                       and token.endswith(f"/server-logs/{tool}{'.err' if tool == 'sockperf' else '-server.err'}")
+                       for token in argv)):
+        return False
+    binary_indexes = [index for index, token in enumerate(argv)
+                      if token.endswith(f"/bin/{tool}")]
+    if len(binary_indexes) != 1:
+        return False
+    tail = argv[binary_indexes[0] + 1:]
+    if tool == "sockperf":
+        if tail[:1] != ["server"] or "-i" not in tail or "-p" not in tail:
+            return False
+        try:
+            port = tail[tail.index("-p") + 1]
+        except IndexError:
+            return False
+        return port == "11111"
+    return ("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3" in argv
+            and tail[:1] == ["-s"] and "-B" in tail and "-p" in tail
+            and tail[tail.index("-p") + 1:tail.index("-p") + 2] == ["5201"]
+            and "--json-stream" in tail and "--forceflush" in tail)
+
+
+def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeParse,
+                                verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> NativeParse:
     """Associate B's persistent listener session by resolved stream setting and recorded time."""
     if not parsed.sessions:
         return parsed
@@ -733,9 +861,12 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
                 or (item.producer == "vm_b" and item.request.get("argv")
                     and "iperf3" in str(item.request["argv"][0]).lower()
                     and "-s" in item.request["argv"])), None)
-            listener_argv = (listener.request["argv"][2:] if listener is not None
-                and _f02r_iperf_listener(listener, listener.request["argv"]) else
-                listener.request["argv"] if listener is not None else [])
+            if listener is not None and _f02r_iperf_listener(listener, listener.request["argv"]):
+                listener_start = next(index for index, token in enumerate(listener.request["argv"])
+                    if token.endswith("/bin/iperf3"))
+                listener_argv = listener.request["argv"][listener_start:]
+            else:
+                listener_argv = listener.request["argv"] if listener is not None else []
             expected_local = _option(listener_argv, "-B") if listener else None
             expected_local_port = _option(listener_argv, "-p") if listener else None
             client_target = _option(argv, "-c")
@@ -790,25 +921,40 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     measured_start = timing.measured_started_at.value if timing else None
     measured_finish = timing.measured_finished_at.value if timing else None
     intervals = tuple(item for item in parsed.receiver_intervals if item.session_id == selected)
+    verified_origins = verified_iperf_origins or {}
+    cookie = detail.get("start", {}).get("cookie") if isinstance(detail.get("start"), dict) else None
+    verified_origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
     if measured_start is not None and measured_finish is not None and session_stamp is not None:
-        post_omit_offset = 0
-        if unit.kind == "continuous_day" and isinstance(test, dict):
-            try:
-                post_omit_offset = int(test.get("omit", 0))
-            except (TypeError, ValueError):
-                post_omit_offset = 0
         kept = []
-        for interval in intervals:
-            # iperf3's JSON stream receiver intervals reset to the post-omit
-            # origin. Re-anchor those measured seconds to the session start.
-            absolute_start = session_stamp + post_omit_offset + interval.start_seconds
-            absolute_end = session_stamp + post_omit_offset + interval.end_seconds
-            if absolute_start < measured_start.timestamp() - .002 or absolute_end > measured_finish.timestamp() + .002:
-                additions.append(_finding("native.iperf3.interval_outside_window", "error",
-                    "receiver interval lies outside or straddles the measured window; its bytes are excluded",
-                    unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
-            else:
-                kept.append(interval)
+        if verified_origin is None:
+            additions.append(_finding("native.iperf3.window_unavailable", "warning",
+                "verified same-session post-omit receiver origin is unavailable; native offsets were not re-anchored",
+                unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+            kept.extend(intervals)
+        elif verified_origin.get("crossing_reset"):
+            additions.append(_finding("native.iperf3.window_unavailable", "warning",
+                "a receiver interval crosses the verified reset; source-clipped containment is retained without re-anchoring aggregate offsets",
+                unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+            kept.extend(intervals)
+        else:
+            origin_utc = float(verified_origin["origin_utc"])
+            uncertainty = float(verified_origin["uncertainty_seconds"])
+            tolerance = max(.002, uncertainty)
+            for interval in intervals:
+                # Keep omitted warm-up as native evidence, but exclude it from
+                # measured containment and every measured denominator.
+                if interval.omitted:
+                    kept.append(interval)
+                    continue
+                absolute_start = origin_utc + interval.start_seconds
+                absolute_end = origin_utc + interval.end_seconds
+                if (absolute_start < measured_start.timestamp() - tolerance
+                        or absolute_end > measured_finish.timestamp() + tolerance):
+                    additions.append(_finding("native.iperf3.interval_outside_window", "error",
+                        "receiver interval lies outside or straddles the independently projected measured window; its bytes are excluded",
+                        unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
+                else:
+                    kept.append(interval)
         intervals = tuple(kept)
     return replace(parsed,
         receiver_intervals=intervals,
@@ -914,7 +1060,10 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                 and ("iperf3" in str(argv[0]).lower() or is_persistent_iperf_listener(command, argv)))
 
     def iperf_argv(command: CommandEvidence, argv: list[str]) -> list[str]:
-        return argv[2:] if is_persistent_iperf_listener(command, argv) else argv
+        if not is_persistent_iperf_listener(command, argv):
+            return argv
+        start = next(index for index, token in enumerate(argv) if token.endswith("/bin/iperf3"))
+        return argv[start:]
 
     for command in value.commands:
         argv = command.request.get("argv")
@@ -1041,10 +1190,12 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             outcome = command.result.get("outcome")
             if outcome != "succeeded":
                 findings.append(_finding("command.failed", "warning", f"command outcome is {outcome}", unit=unit.unit_id))
-            if command.started_at.value is None or command.finished_at.value is None:
+            argv = command.request.get("argv", [])
+            persistent_listener = (isinstance(argv, list) and all(isinstance(token, str) for token in argv)
+                and _f02r_persistent_listener(command, argv))
+            if (command.started_at.value is None or command.finished_at.value is None) and not persistent_listener:
                 findings.append(_finding("command.timing_unavailable", "warning",
                     "actual command start or completion timestamp is unavailable", unit=unit.unit_id))
-            argv = command.request.get("argv", [])
             if isinstance(argv, list) and argv and (any(program in str(argv[0]).lower() for program in ("sockperf", "iperf3"))
                     or is_iperf_listener(command, argv)):
                 if command.binary_version.value is None or command.source_identity.value is None:
@@ -1091,8 +1242,9 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
                             f"{program} observed binary hash contradicts bootstrap", unit=unit.unit_id))
     for role, program in (("vm_b", "sockperf"), ("vm_b", "iperf3")):
         present = any(command.producer == role and isinstance(command.request.get("argv"), list)
-                      and command.request["argv"] and (program in str(command.request["argv"][0]).lower()
-                          or (program == "iperf3" and is_persistent_iperf_listener(command, command.request["argv"])))
+                      and command.request["argv"] and (
+                          program in str(command.request["argv"][0]).lower()
+                          or _f02r_persistent_listener(command, command.request["argv"]))
                       and ("server" in command.request["argv"] if program == "sockperf"
                            else "-s" in command.request["argv"])
                       for command in value.commands)
@@ -1204,11 +1356,11 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
                             and m.estimated_error_ms.value is not None), None)
         if clock_error is not None:
             if unit.kind == "probe_chunk" and timing.probe_test_started_at.value is not None:
-                left = timing.probe_test_started_at.value.timestamp() + clock_error
-                right = left - 2 * clock_error + unit.measured_seconds
+                left = timing.probe_test_started_at.value.timestamp()
+                right = left + unit.measured_seconds
             elif timing.measured_started_at.value and timing.measured_finished_at.value:
-                left = timing.measured_started_at.value.timestamp() + clock_error
-                right = timing.measured_finished_at.value.timestamp() - clock_error
+                left = timing.measured_started_at.value.timestamp()
+                right = timing.measured_finished_at.value.timestamp()
             else:
                 left = right = 0.0
             if right > left:
@@ -1231,7 +1383,7 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
             active = sum(end - start for start, end in clipped)
             probe_windows = clipped
             bracket = {"source": "F01R acquisition helper", "interval_count": len(source_windows),
-                       "coverage_bound": "clock-adjusted inner support",
+                       "coverage_bound": "source-inner support within declared measured window",
                        "measured_window_seconds": max(0.0, right - left)}
         else:
             bracket = {"unavailable_reason": "measured-window clock error is unbounded"}
@@ -1332,8 +1484,11 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     findings.extend(resolved_findings)
     findings.extend(_command_findings(value))
     acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] = {}
+    verified_origins_by_unit: dict[str, dict[str, dict[str, Any]]] = {}
     for timing in value.timings:
-        windows, errors = _acquisition_windows(value, timing)
+        verified_origins: dict[str, dict[str, Any]] = {}
+        windows, errors = _acquisition_windows(value, timing, verified_iperf_origins=verified_origins)
+        verified_origins_by_unit[timing.unit_id] = verified_origins
         acquisition[timing.unit_id] = (windows, errors)
         findings.extend(_finding("provenance.acquisition_source_invalid", "error", error,
                                  unit=timing.unit_id) for error in errors)
@@ -1344,7 +1499,11 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     all_complete = True
     parsed_sock: dict[str, NativeParse] = {}
     for unit in value.measurement_units:
-        sock, tcp = _parse_unit(value, unit, records)
+        unit_origins = verified_origins_by_unit.get(unit.unit_id, {})
+        if unit_origins:
+            sock, tcp = _parse_unit(value, unit, records, unit_origins)
+        else:
+            sock, tcp = _parse_unit(value, unit, records)
         if value.mode in {ExperimentMode.ACCEPTANCE, ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION}:
             parsed_sock[unit.unit_id] = NativeParse(probe_counts=sock.probe_counts, findings=sock.findings,
                 source=sock.source, sessions=sock.sessions)

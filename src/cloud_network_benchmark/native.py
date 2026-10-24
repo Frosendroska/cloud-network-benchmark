@@ -488,9 +488,13 @@ def _extract_totals(root: Any, source: SourceRef, line: int, session: str) -> li
 
 def _dedupe_intervals(items: list[ReceiverInterval], findings: list[ValidationFinding]) -> list[ReceiverInterval]:
     result: list[ReceiverInterval] = []
-    last_by_session: dict[str, ReceiverInterval] = {}
+    # iperf resets each stream's displayed counters after the omitted phase.
+    # Compare intervals only within one counter-origin phase; equal numeric
+    # offsets across omitted and measured phases are not overlapping time.
+    last_by_session_phase: dict[tuple[str, bool], ReceiverInterval] = {}
     for item in sorted(items, key=lambda i: (i.session_id, i.line)):
-        prev = last_by_session.get(item.session_id)
+        phase_key = (item.session_id, item.omitted)
+        prev = last_by_session_phase.get(phase_key)
         if prev and item.start_seconds < prev.start_seconds:
             findings.append(_finding("native.iperf3.session_reset", f"line {item.line}: receiver interval clock moved backwards", item.source, "warning"))
             continue
@@ -499,7 +503,7 @@ def _dedupe_intervals(items: list[ReceiverInterval], findings: list[ValidationFi
             findings.append(_finding(code, f"line {item.line}: duplicate/overlapping receiver interval was not added", item.source, "warning"))
             continue
         result.append(item)
-        last_by_session[item.session_id] = item
+        last_by_session_phase[phase_key] = item
     return result
 
 

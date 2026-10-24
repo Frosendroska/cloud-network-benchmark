@@ -711,13 +711,45 @@ def update_child_runtime_evidence(
         else:
             key = lambda item: (item.artifact_id, item.path, item.unit_id)
         combined = list(prior)
-        existing = {key(item) for item in prior}
+        existing = {key(item): index for index, item in enumerate(prior)}
         for item in observed:
-            if key(item) in existing:
-                if item not in prior:
-                    raise ValueError(f"{name} update cannot overwrite existing evidence")
-                continue
-            existing.add(key(item))
+            item_key = key(item)
+            if item_key in existing:
+                index = existing[item_key]
+                previous = combined[index]
+                if item == previous:
+                    continue
+                if name == "timings":
+                    prior_payload = previous.model_dump(mode="python")
+                    item_payload = item.model_dump(mode="python")
+                    refinable = {"measured_started_at", "measured_finished_at",
+                                 "clock_mappings", "acquisition_sources"}
+                    prior_core = {field: value for field, value in prior_payload.items() if field not in refinable}
+                    item_core = {field: value for field, value in item_payload.items() if field not in refinable}
+                    old_sources = previous.acquisition_sources.value or []
+                    new_sources = item.acquisition_sources.value or []
+                    old_bounds_missing = (previous.measured_started_at.value is None
+                        and previous.measured_finished_at.value is None)
+                    new_bounds_complete = (item.measured_started_at.value is not None
+                        and item.measured_finished_at.value is not None)
+                    new_bounds_missing = (item.measured_started_at.value is None
+                        and item.measured_finished_at.value is None)
+                    if (prior_core == item_core and not old_sources and new_sources
+                            and old_bounds_missing and (new_bounds_complete or new_bounds_missing)):
+                        combined[index] = item
+                        continue
+                elif name == "artifact_records":
+                    prior_payload = previous.model_dump(mode="python")
+                    item_payload = item.model_dump(mode="python")
+                    mutable = {"size_bytes", "sha256"}
+                    prior_core = {field: value for field, value in prior_payload.items() if field not in mutable}
+                    item_core = {field: value for field, value in item_payload.items() if field not in mutable}
+                    if (previous.kind == "measurement_timing" and prior_core == item_core
+                            and previous.retrieval_state == item.retrieval_state == "verified"):
+                        combined[index] = item
+                        continue
+                raise ValueError(f"{name} update cannot overwrite existing evidence")
+            existing[item_key] = len(combined)
             combined.append(item)
         updates[name] = combined
     if retrieval_failure is not None and manifest.retrieval_failure is None:

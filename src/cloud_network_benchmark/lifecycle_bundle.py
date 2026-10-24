@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
@@ -466,7 +466,7 @@ def bind_retrieved_acquisition_sources(*, value: ValidatorInput,
     ambiguous anchors/maps remain unavailable and are never synthesized.
     """
     from datetime import datetime, timezone
-    from .acquisition import bind_acquisition_sources, parse_observation_stream
+    from .acquisition import bind_acquisition_sources, iter_source_windows, parse_observation_stream
     from .contracts.common import Evidence
     from .contracts.measurements import AcquisitionSource, MeasurementTiming
 
@@ -481,7 +481,7 @@ def bind_retrieved_acquisition_sources(*, value: ValidatorInput,
         commands=value.commands, receiver_command_evidence=receiver_command_evidence,
         build_evidence=build_evidence, source_artifact_records=records,
         clock_mappings=clock_mappings)
-    selected: list[tuple[Any, str, Any]] = []
+    selected: list[tuple[Any, str, Any, list[Any]]] = []
     unavailable: dict[str, str] = {}
     for source in sources:
         log = next((record for record in records if record.artifact_id == source.log_artifact_id
@@ -523,13 +523,99 @@ def bind_retrieved_acquisition_sources(*, value: ValidatorInput,
         if unit_id is None:
             unavailable[source.log_artifact_id] = "source has no exact measurement unit identity"
             continue
-        selected.append((source, unit_id, candidates[0]))
+        try:
+            replay_commands: dict[tuple[Any, ...], Any] = {}
+            for command in (*value.commands, *receiver_command_evidence):
+                action_id = command.request.get("action_id")
+                key = (action_id, command.deployment_id, command.unit_id)
+                previous = replay_commands.get(key)
+                if previous is not None and previous.model_dump(mode="json") != command.model_dump(mode="json"):
+                    raise ValueError("duplicate acquisition command identity has contradictory evidence")
+                replay_commands[key] = command
+            windows = list(iter_source_windows(child_root, source, records,
+                tuple(replay_commands.values()), build_evidence, clock_mappings=clock_mappings))
+        except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+            unavailable[source.log_artifact_id] = f"verified acquisition replay failed: {exc}"
+            continue
+        selected.append((source, unit_id, candidates[0], windows))
+
+    units_by_id = {unit.unit_id: unit for unit in value.measurement_units}
+    timing_windows: dict[str, list[tuple[Any, Any, Any, list[Any]]]] = {}
+    for source, unit_id, mapping, windows in selected:
+        timing_windows.setdefault(unit_id, []).append((source, mapping, windows, []))
+
+    def central_utc(mapping: Any, nanoseconds: int) -> datetime:
+        return mapping.utc_timestamp + timedelta(
+            seconds=nanoseconds / 1_000_000_000 - mapping.monotonic_seconds)
+
+    def sockperf_record(source: Any, window: Any) -> Mapping[str, Any]:
+        log = next(record for record in records if record.artifact_id == source.log_artifact_id
+                   and record.path == source.log_path and record.retrieval_state == "verified")
+        log.verify_materialized_file(child_root)
+        with resolve_artifact_path(child_root, log.path).open("rb") as stream:
+            for parsed in parse_observation_stream(stream):
+                if parsed.byte_offset == window.source_byte_offset:
+                    row = parsed.value
+                    if (row.get("record_kind") != "probe_window"
+                            or row.get("invocation_id") != source.invocation_id
+                            or row.get("tool") != source.tool or row.get("boot_id") != source.boot_id
+                            or row.get("clock") != source.clock_domain):
+                        raise ValueError("verified Sockperf source window identity changed during replay")
+                    return row
+        raise ValueError("verified Sockperf probe window offset is missing from its source log")
+
+    projected_bounds: dict[str, tuple[datetime, datetime]] = {}
+    for unit_id, rows in timing_windows.items():
+        unit = units_by_id.get(unit_id)
+        if unit is None:
+            unavailable[unit_id] = "verified source has no declared measurement unit"
+            continue
+        eligible = []
+        for source, mapping, windows, _unused in rows:
+            if source.tool == "iperf3" and unit.kind != "probe_chunk":
+                actual = [item for item in windows if item.omitted is False and item.has_positive_inner_support]
+                if actual:
+                    start_ns = min(item.start_earliest_ns for item in actual)
+                    end_ns = max(item.end_latest_ns for item in actual)
+                    eligible.append((central_utc(mapping, start_ns), central_utc(mapping, end_ns)))
+                else:
+                    unavailable[source.log_artifact_id] = "verified receiver source has no positive non-omitted interval"
+            elif source.tool == "sockperf" and unit.kind == "probe_chunk":
+                actual = [item for item in windows if item.has_positive_inner_support]
+                if actual:
+                    eligible.append((central_utc(mapping, min(item.start_earliest_ns for item in actual)),
+                                     central_utc(mapping, max(item.end_latest_ns for item in actual))))
+                else:
+                    unavailable[source.log_artifact_id] = "verified probe chunk has no positive native support"
+            elif (source.tool == "sockperf" and unit.kind == "phase"
+                    and str(getattr(unit.phase, "value", unit.phase)) == "idle_latency"):
+                if len(windows) != 1:
+                    unavailable[source.log_artifact_id] = "idle Sockperf source must have one verified probe window"
+                    continue
+                try:
+                    row = sockperf_record(source, windows[0])
+                    enabled = max(int(row["sender_enabled_ns"]), int(row["receiver_enabled_ns"]))
+                    # This is the requested lifecycle selection, not the
+                    # narrower native CSV filter support used by coverage.
+                    start_ns = enabled + 5_000_000_000
+                    requested_end_ns = start_ns + int(unit.measured_seconds) * 1_000_000_000
+                    end_ns = min(int(row["termination_ns"]), requested_end_ns)
+                    if end_ns <= start_ns:
+                        unavailable[source.log_artifact_id] = "idle warm-up selection has no positive verified native support"
+                        continue
+                    eligible.append((central_utc(mapping, start_ns), central_utc(mapping, end_ns)))
+                except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+                    unavailable[source.log_artifact_id] = f"idle warm-up source replay failed: {exc}"
+        if len(eligible) == 1:
+            projected_bounds[unit_id] = eligible[0]
+        elif len(eligible) > 1:
+            unavailable[unit_id] = "multiple verified source envelopes conflict for one measurement unit"
 
     timings: list[MeasurementTiming] = []
     for timing in value.timings:
         local_sources: list[AcquisitionSource] = []
         local_mappings: list[Any] = []
-        for source, unit_id, mapping in selected:
+        for source, unit_id, mapping, _windows in selected:
             if unit_id != timing.unit_id:
                 continue
             try:
@@ -543,6 +629,10 @@ def bind_retrieved_acquisition_sources(*, value: ValidatorInput,
         if local_sources:
             payload["clock_mappings"] = [item.model_dump(mode="python") for item in local_mappings]
             payload["acquisition_sources"] = Evidence[list[AcquisitionSource]](value=local_sources).model_dump(mode="python")
+        bounds = projected_bounds.get(timing.unit_id)
+        if bounds is not None:
+            payload["measured_started_at"] = Evidence[datetime](value=bounds[0]).model_dump(mode="python")
+            payload["measured_finished_at"] = Evidence[datetime](value=bounds[1]).model_dump(mode="python")
         timings.append(MeasurementTiming.model_validate(payload))
     merged_records: dict[tuple[str, str, str | None], ArtifactRecord] = {
         (record.artifact_id, record.path, record.unit_id): record for record in value.artifact_records}

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,10 +166,20 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 stdout = (f"LoadState=loaded\nActiveState=active\nMainPID={pid}\n"
                     f"ExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\n"
                     "StandardOutput=append\nStandardError=append\nRestart=no\n")
+                if self.full_native and tool == "iperf3":
+                    stdout += "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n"
             elif name.startswith("unit-config-"):
                 stdout = f"[Service]\nStandardOutput=append:/var/lib/cnb/work/server-logs/{'sockperf.log' if tool == 'sockperf' else 'iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/server-logs/{'sockperf.err' if tool == 'sockperf' else 'iperf3-server.err'}\n"
+                if self.full_native and tool == "iperf3":
+                    stdout += "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n"
             elif name.startswith("process-"):
-                stdout = f"/var/lib/cnb/install/bin/{tool}\n{'c' * 64} /proc/{20 if tool == 'sockperf' else 21}/exe"
+                if self.full_native:
+                    from tests.integration.test_acquisition_producer import _build
+                    from cloud_network_benchmark.contracts.common import VmRole
+                    binary_hash = _build(tool, VmRole.VM_B, f"f02r-vm_b-{tool}-build").binary_sha256
+                else:
+                    binary_hash = "c" * 64
+                stdout = f"/var/lib/cnb/install/bin/{tool}\n{binary_hash} /proc/{20 if tool == 'sockperf' else 21}/exe"
             elif name == "socket-sockperf":
                 stdout = 'UNCONN 0 0 10.60.1.11:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))'
             elif name == "socket-iperf3":
@@ -183,6 +195,74 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
         if action.startswith("f02r-") and not action.startswith(("f02r-retrieve-observe-", "f02r-retrieve-")):
             self.actions.append(action)
+            if self.full_native and action == "f02r-vm_b-listener-config-iperf3":
+                value = self.bootstrap_runner.run(request)
+                stdout = value.stdout + "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n"
+                return value.model_copy(update={"stdout": stdout})
+            if self.full_native and action == "f02r-vm_b-listener-verify-iperf3":
+                stdout = ("LoadState=loaded\nActiveState=active\nMainPID=21\n"
+                    "ExecStart={ path=/var/lib/cnb/install/bin/iperf3; argv[]=/var/lib/cnb/install/bin/iperf3 -s -B 10.60.1.11 -p 5201 --json-stream --forceflush; }\n"
+                    "StandardOutput=append\nStandardError=append\nRestart=no\n"
+                    "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
+                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            if self.full_native and action in {"f02r-vm_b-listener-process-sockperf",
+                    "f02r-vm_b-listener-process-iperf3"}:
+                tool = action.rsplit("-", 1)[-1]
+                from tests.integration.test_acquisition_producer import _build
+                from cloud_network_benchmark.contracts.common import VmRole
+                observed = _build(tool, VmRole.VM_B, f"f02r-vm_b-{tool}-build")
+                stdout = f"/var/lib/cnb/install/bin/{tool}\n{observed.binary_sha256} /proc/{20 if tool == 'sockperf' else 21}/exe"
+                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            match = re.fullmatch(r"f02r-(vm_[ab])-(sockperf|iperf3)-(\d+)", action)
+            if self.full_native and match:
+                role, tool, index_text = match.groups()
+                index = int(index_text)
+                from tests.integration.test_acquisition_producer import _build
+                from cloud_network_benchmark.contracts.common import VmRole
+                observed = _build(tool, VmRole(role), f"f02r-{role}-{tool}-build")
+                binary_version = ("sockperf, version 3.10\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.2.0"
+                    if tool == "sockperf" else observed.binary_version)
+                archive_path = f"/var/lib/cnb/work/{tool}.tar.gz"
+                binary_path = f"/var/lib/cnb/install/bin/{tool}"
+                build_configuration = (f"CC=${{CC:-cc}}; compiler={observed.compiler_version}; "
+                    "./configure --prefix=/var/lib/cnb/install; make -j2")
+                identity = "\n".join(("CNB_BUILD_V1", f"tool={tool}",
+                    f"source_reference={observed.source_reference}", f"source_sha256={observed.source_sha256}",
+                    f"upstream_commit={observed.upstream_commit}", f"patch_path={observed.patch_path}",
+                    f"patch_sha256={observed.patch_sha256}",
+                    "compiler_version_b64=" + base64.b64encode(observed.compiler_version.encode()).decode(),
+                    "build_configuration_b64=" + base64.b64encode(build_configuration.encode()).decode(),
+                    f"binary_path={binary_path}",
+                    "binary_version_b64=" + base64.b64encode(binary_version.encode()).decode(),
+                    f"binary_sha256={observed.binary_sha256}", "observation_capability=CNB_ACQ_V1",
+                    f"observation_semantics={observed.observation_semantics}",
+                    f"capabilities={','.join(observed.capabilities)}", ""))
+                if index == 2:
+                    stdout = f"{observed.source_sha256} {archive_path}"
+                elif index == 5:
+                    stdout = observed.compiler_version
+                elif index == 6:
+                    stdout = binary_version
+                elif index == 7:
+                    stdout = f"{observed.binary_sha256} {binary_path}"
+                elif any("CNB_BUILD_V1" in token for token in request.argv):
+                    stdout = identity
+                elif any("printf CNB_ACQ_V1" in token for token in request.argv):
+                    stdout = "CNB_ACQ_V1"
+                elif index >= 8:
+                    if tool == "sockperf":
+                        stdout = ("Usage: sockperf [options]\nserver under-load -i -p -m --mps "
+                            "--reply-every --full-rtt --no-rdtsc --full-log -t" if index == 8 else
+                            "Usage: sockperf server -i -p" if index == 9 else
+                            "Usage: sockperf under-load -i -p -m --mps --reply-every --full-rtt --no-rdtsc --full-log -t")
+                    else:
+                        stdout = "Usage: iperf3 [options]\n-s -c -B -p -P -t -O -i -l -C cubic -Z -J --get-server-output --json-stream --forceflush"
+                else:
+                    stdout = "ok"
+                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
             value = self.bootstrap_runner.run(request)
             stdout = value.stdout.replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
             if action.endswith("acl-inspect"):
@@ -240,31 +320,44 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                         if executable == "sockperf":
                             duration = int(native_request.argv[native_request.argv.index("-t") + 1])
                             base_ns = int(handle.started_monotonic * 1_000_000_000)
+                            timer_start_ns = base_ns + 1_100_000_000
+                            late_tail = .1 if getattr(self, "late_tail", False) else 0.0
+                            termination_ns = timer_start_ns + int((duration + late_tail) * 1_000_000_000)
+                            # The pinned client starts its -t timer after
+                            # Starting test / receiver readiness, not at process spawn.
+                            # The positive case models observed delayed signal delivery;
+                            # the punctual case preserves the honest short-tail failure.
+                            handle.finishes += 1.1 + late_tail
                             rows = []
                             for line in stderr_path.read_text(encoding="utf-8").splitlines():
                                 if not line.startswith("CNB_ACQ_V1 "):
                                     continue
                                 record = json.loads(line[len("CNB_ACQ_V1 "):])
                                 if record.get("record_kind") == "clock_anchor":
-                                    record.update(mono_before_ns=base_ns, realtime_ns=int(NOW.timestamp() * 1_000_000_000), mono_after_ns=base_ns + 1000)
+                                    realtime_ns = int((NOW.timestamp() + base_ns / 1_000_000_000 - 1000)
+                                        * 1_000_000_000)
+                                    record.update(mono_before_ns=base_ns, realtime_ns=realtime_ns,
+                                        mono_after_ns=base_ns + 1000)
                                 elif record.get("record_kind") == "probe_window":
                                     record.update(sender_enabled_ns=base_ns + 1_000_000_000,
-                                        receiver_enabled_ns=base_ns + 1_100_000_000,
-                                        termination_ns=base_ns + duration * 1_000_000_000,
-                                        native_filter_start_ns=base_ns + 5_000_000_000,
-                                        native_filter_end_ns=base_ns + duration * 1_000_000_000)
+                                        receiver_enabled_ns=timer_start_ns,
+                                        termination_ns=termination_ns,
+                                        native_filter_start_ns=timer_start_ns + 400_000_000,
+                                        native_filter_end_ns=termination_ns - 50_000_000)
+                                if record["record_kind"] == "receiver_interval" and record["omitted"]:
+                                    record["interval_end_us"] = base_ns // 1000 + 4_000_000
                                 rows.append("CNB_ACQ_V1 " + json.dumps(record, separators=(",", ":")))
                             stderr_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
                             csv_path = Path(native_request.argv[native_request.argv.index("--full-log") + 1])
-                            sample_start = handle.started_monotonic + 5.1
-                            sample_end = handle.started_monotonic + duration - .1
+                            sample_start = handle.started_monotonic + 1.5
+                            sample_end = handle.started_monotonic + 1.1 + duration + late_tail - .05 - .00001
                             csv_path.write_text("sockperf: test output\n------------------------------\n"
                                 "packet, txTime(sec), rxTime(sec), rtt(usec)\n"
                                 f"0, {sample_start:.6f}, {sample_start + .000001:.6f}, 1.000\n"
                                 f"1, {sample_end:.6f}, {sample_end + .000001:.6f}, 1.000\n"
                                 "------------------------------\n"
-                                f"[Total Run] RunTime={duration:.3f} sec; Warm up time=5000 msec; SentMessages={duration * 1000}; ReceivedMessages=2\n"
-                                f"[Valid Duration] RunTime={duration - 5:.3f} sec; SentMessages={(duration - 5) * 1000}; ReceivedMessages=2\n",
+                                f"[Total Run] RunTime={duration + late_tail:.3f} sec; Warm up time=5000 msec; SentMessages={int((duration + late_tail) * 1000)}; ReceivedMessages=2\n"
+                                f"[Valid Duration] RunTime={duration + late_tail - .45:.3f} sec; SentMessages={int((duration + late_tail - .45) * 1000)}; ReceivedMessages=2\n",
                                 encoding="utf-8")
                         elif executable == "iperf3":
                             duration = int(native_request.argv[native_request.argv.index("-t") + 1])
@@ -277,9 +370,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                                 for i in range(streams)]
                             rows = []
                             for i in range(streams):
-                                rows.extend([{"socket": 17 + i, "start": 0, "end": 5, "seconds": 5,
+                                rows.extend([{"socket": 17 + i, "start": 0, "end": 4, "seconds": 4,
                                     "bytes": 250, "omitted": True, "sender": False},
-                                    {"socket": 17 + i, "start": 5, "end": duration, "seconds": duration - 5,
+                                    {"socket": 17 + i, "start": 0, "end": duration, "seconds": duration,
                                     "bytes": 125000000 // streams, "omitted": False, "sender": False}])
                             receiver = {"start": {"cookie": cookie, "test_start": settings, "connected": connected},
                                 "intervals": [{"streams": [row for row in rows if row["omitted"]]},
@@ -392,7 +485,6 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"files":rows},sort_keys=True,separators=(",",":")),stderr="")
         if action.startswith("f02r-retrieve-observe-"):
             self.actions.append(action)
-            import re
             match = re.search(r"\[ -f (.+?) \] &&", request.argv[-1])
             assert match is not None, request.argv[-1]
             source = __import__("shlex").split(match.group(1))[0]
@@ -435,7 +527,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             cookie = command["result"]["action_id"]
             settings = {"protocol": "TCP", "num_streams": streams, "omit": 5,
                 "duration": duration, "interval": 1, "blksize": 131072, "reverse": False}
-            start_mono = command["monotonic_started"]["value"]
+            command_started_at = datetime.fromisoformat(command["started_at"]["value"].replace("Z", "+00:00"))
+            start_mono = 1000 + (command_started_at - NOW).total_seconds()
             start_us = int(start_mono * 1_000_000)
             connected = [{"socket": 17 + i, "local_host": "10.60.1.11", "local_port": 5201,
                 "remote_host": "10.60.1.10", "remote_port": 50100 + i} for i in range(streams)]
@@ -444,9 +537,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 native_intervals.extend([
                     {"socket": 17 + i, "start": 0, "end": 5, "seconds": 5, "bytes": 250,
                         "omitted": True, "sender": False},
-                    {"socket": 17 + i, "start": 5, "end": duration, "seconds": duration - 5,
+                    {"socket": 17 + i, "start": 0, "end": duration, "seconds": duration,
                         "bytes": 125000000 // streams, "omitted": False, "sender": False}])
-            session_start = NOW + timedelta(seconds=start_mono - 1000)
+            session_start = command_started_at
             events = [{"event": "start", "data": {"cookie": cookie, "test_start": settings,
                 "connected": connected, "timestamp": {"timesecs": session_start.timestamp()}}},
                 {"event": "interval", "data": {"streams": [row for row in native_intervals if row["omitted"]]}},
@@ -462,17 +555,24 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "session_settings",
                 "protocol": "TCP", "num_streams": streams, "omit": 5, "duration": duration,
                 "interval_us": 1_000_000, "block_size": 131072, "reverse": False}, separators=(",", ":")))
+            origins = []
             for i in range(streams):
                 stream = str(17 + i)
                 initial, post = start_us, start_us + 5_000_000
+                origins.append((i, stream, initial, post))
                 source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "stats_origin",
                     "stream_id": stream, "phase": "initial", "origin_us": initial,
                     "start_time_fixed_us": initial}, separators=(",", ":")))
                 source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "stats_origin",
                     "stream_id": stream, "phase": "post_omit", "origin_us": post,
                     "start_time_fixed_us": initial}, separators=(",", ":")))
-                for start, end, origin, omitted, count in ((initial, post, initial, True, 250),
-                        (post, post + duration * 1_000_000, post, False, 125000000 // streams)):
+            # iperf emits each interval event with all streams, so the source
+            # records must preserve that native order rather than interleave phases.
+            for omitted in (True, False):
+                for i, stream, initial, post in origins:
+                    start, end = ((initial, initial + 4_000_000) if omitted else
+                        (post, post + duration * 1_000_000))
+                    count = 250 if omitted else 125000000 // streams
                     source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "receiver_interval",
                         "stream_id": stream, "role": "receiver", "protocol": "TCP",
                         "local_host": "10.60.1.11", "local_port": "5201",
@@ -502,7 +602,7 @@ def _cost_source(path: Path, run_id: str, cost_input_id: str) -> None:
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
-def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_digest):
+def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_digest, *, full_native=False):
     aws_fixture = repository_root / "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
     fixture_hash = hashlib.sha256(aws_fixture.read_bytes()).hexdigest()
     refs = {}
@@ -522,12 +622,23 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
     from cloud_network_benchmark.admission import WorkflowAllowance
     from cloud_network_benchmark.access import TimeoutPolicy
     from cloud_network_benchmark.bootstrap import BootstrapConfig, SourceBuild
+    from cloud_network_benchmark.contracts.common import VmRole
     from cloud_network_benchmark.readiness import ReadinessConfig
-    bootstrap = BootstrapConfig(sources=[
-        SourceBuild(tool="sockperf", source_url="https://example.invalid/sockperf.tar.gz",
-            source_reference="sockperf-src", archive_name="sockperf.tar.gz", source_sha256="a"*64),
-        SourceBuild(tool="iperf3", source_url="https://example.invalid/iperf3.tar.gz",
-            source_reference="iperf3-src", archive_name="iperf3.tar.gz", source_sha256="b"*64)],
+    from tests.integration.test_acquisition_producer import _build
+    sockperf_build = _build("sockperf", VmRole.VM_A, "f02r-vm_a-sockperf-build")
+    iperf3_build = _build("iperf3", VmRole.VM_A, "f02r-vm_a-iperf3-build")
+    if full_native:
+        source_builds = [SourceBuild(tool=build.tool, source_url=f"https://example.invalid/{build.tool}.tar.gz",
+            source_reference=build.source_reference, archive_name=f"{build.tool}.tar.gz",
+            source_sha256=build.source_sha256, upstream_commit=build.upstream_commit,
+            observation_patch_path=build.patch_path, observation_patch_sha256=build.patch_sha256)
+            for build in (sockperf_build, iperf3_build)]
+    else:
+        source_builds = [SourceBuild(tool="sockperf", source_url="https://example.invalid/sockperf.tar.gz",
+            source_reference="sockperf-src", archive_name="sockperf.tar.gz", source_sha256="a" * 64),
+            SourceBuild(tool="iperf3", source_url="https://example.invalid/iperf3.tar.gz",
+            source_reference="iperf3-src", archive_name="iperf3.tar.gz", source_sha256="b" * 64)]
+    bootstrap = BootstrapConfig(sources=source_builds,
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work",
         install_prefix="/var/lib/cnb/install")
     access = {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
@@ -550,12 +661,13 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "expected_validity"), [
-    ("failure_check", False, "partial"),
-    ("failure_check", True, "partial"),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity"), [
+    ("failure_check", False, False, "partial"),
+    ("failure_check", True, False, "partial"),
+    ("failure_check", True, True, "valid"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, context_name, full_native, expected_validity):
+        tmp_path, repository_root, request, context_name, full_native, late_tail, expected_validity):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -573,6 +685,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     child = children["aws"]
     runner = FakePreparedAwsRunner()
     runner.full_native = full_native
+    runner.late_tail = late_tail
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
     runner.native_root = runner.workspace_roots["vm_a"]
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
@@ -580,7 +693,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     campaign, _ = resolve_campaign(config, repository_root)
     _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id)
     costs = load_cost_inputs(cost_path)
-    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256)
+    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256, full_native=full_native)
     clock = FakeClock()
     runtime["sleep"] = clock.sleep
     built = build_runtime(campaign=campaign, parent=parent,
@@ -601,7 +714,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.creation_may_have_started is True
     assert provider_result.values["cleanup"] is not None
     assert provider_result.values["prepare"].stage == "prepare"
-    assert provider_result.values["prepare"].succeeded is True
+    assert provider_result.values["prepare"].succeeded is True, provider_result.values["prepare"].evidence
     assert provider_result.values["measure"].succeeded is True, (runner.guest_exception, provider_result.values["measure"].evidence,
         clock.elapsed, built["ledger"].inspect()["reservations"])
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
@@ -614,7 +727,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert command.binary_version.value == build.binary_version
         assert command.source_identity.value == build.source_reference
     receiver_commands = provider_result.values["measure"].evidence.receiver_command_evidence
-    assert {Path(command.request["argv"][0]).name for command in receiver_commands} == {"sockperf", "iperf3"}
+    assert {Path(token).name for command in receiver_commands
+        for token in command.request["argv"] if token in {"/var/lib/cnb/install/bin/sockperf", "/var/lib/cnb/install/bin/iperf3"}} == {"sockperf", "iperf3"}
     assert provider_result.values["close"].stage == "close"
     assert provider_result.values["close"].succeeded is True, provider_result.values["close"].evidence
     assert provider_result.values["retrieve"].stage == "retrieve"
@@ -638,10 +752,17 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert replay.validation_status.data_validity == expected_validity, [
         (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
     assert not [item for item in replay.findings if item.severity == "error"], replay.findings
-    assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings
+    if full_native:
+        assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings
+    else:
+        assert any(item.code == "command.listener_evidence_missing" for item in replay.findings), replay.findings
     if full_native:
         assert not [item for item in replay.findings if item.code.startswith("native.iperf3.interval_")], replay.findings
-        assert any(item.code == "timing.coverage_unavailable" for item in replay.findings), replay.findings
+        if expected_validity == "valid":
+            assert not [item for item in replay.findings if item.code == "timing.coverage_unavailable"], replay.findings
+        else:
+            assert any(item.unit_id == "idle_latency" and item.code == "timing.coverage_unavailable"
+                for item in replay.findings), replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
 
 
