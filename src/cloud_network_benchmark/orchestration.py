@@ -497,6 +497,27 @@ def _stage_budget_name(stage: str) -> str:
         "close":"retrieval", "retrieve":"retrieval", "cleanup":"cleanup"}[stage]
 
 
+def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
+    """Represent the reserved allowance after completed lifecycle phases."""
+    from dataclasses import replace
+    completed = {
+        "registration": (),
+        "preparation": ("registration",),
+        "measurement": ("registration", "preparation"),
+        "retrieval": ("registration", "preparation", "measurement"),
+    }
+    if stage not in completed:
+        raise ValueError(f"unsupported F11 stage allowance {stage}")
+    fields = {
+        "registration": (),
+        "preparation": ("registration_seconds",),
+        "measurement": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"),
+        "retrieval": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
+                      "measurement_seconds", "measurement_shutdown_seconds"),
+    }[stage]
+    return replace(allowance, **{name: 0.0 for name in fields}, completed_stages=completed[stage])
+
+
 def _before_stage(context: LifecycleContext, clock: Any, provider: str, stage: str,
                   hooks: ProviderHooks) -> None:
     if stage == "cleanup":
@@ -706,7 +727,8 @@ def execute_provider_workflows(
 
 def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                   allowance: Any, workflow_factory: Callable[[Any], Mapping[str, ProviderHooks]],
-                  context: LifecycleContext, clock: Any, max_workers: int = 3,
+                  context: LifecycleContext | None = None, clock: Any, max_workers: int = 3,
+                  context_factory: Callable[[Mapping[str, Any]], LifecycleContext] | None = None,
                   recovery_path: Path | None = None,
                   recovery_factory: Callable[[Any, Mapping[str, ProviderHooks]], SavedLifecycleRecovery] | None = None) -> LifecycleResult:
     """Reserve the complete F11 workflow before constructing external stages.
@@ -724,7 +746,7 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                                admission_reasons=tuple(decision.reasons))
     reservation_id = decision.evidence.reservation_id.value
     ledger_session = getattr(ledger, "controller_session_id", None)
-    if ledger_session is not None:
+    if ledger_session is not None and context is not None:
         context.assert_session(ledger_session)
     # The caller's monotonic window is only accepted when it is the exact
     # window that F11 reserved. Never let an unrelated caller context extend it.
@@ -738,6 +760,24 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
         cap_start = float(reservation["cap_start_monotonic"])
         cap_seconds = float(reservation["cap_seconds"])
         provider_trigger = float(reservation.get("provider_trigger_monotonic", cap_start + cap_seconds))
+        if context_factory is not None:
+            if context is not None:
+                raise ValueError("supply either lifecycle context or context_factory")
+            context = context_factory(reservation)
+        elif context is None:
+            context = LifecycleContext(
+                controller_session_id=ledger.controller_session_id,
+                cap_started_monotonic=cap_start,
+                cap_deadline_monotonic=cap_start+cap_seconds,
+                lifetime_cap_seconds=cap_seconds,
+                stage_remainders={
+                    "registration": allowance.registration_seconds,
+                    "preparation": allowance.preparation_seconds,
+                    "measurement": allowance.measurement_seconds+allowance.measurement_shutdown_seconds,
+                    "retrieval": allowance.retrieval_seconds,
+                    "cleanup": allowance.cleanup_seconds,
+                },
+                provider_trigger_monotonic=provider_trigger)
         if (context.controller_session_id != ledger.controller_session_id
                 or abs(context.cap_started_monotonic-cap_start) > 1e-6
                 or abs(context.cap_deadline_monotonic-(cap_start+cap_seconds)) > 1e-6
@@ -779,7 +819,8 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
     def f11_stage_fit(stage: str):
         if stage == "cleanup":
             return None
-        return ledger.check_stage_fit(reservation_id, stage=stage, remaining=allowance)
+        return ledger.check_stage_fit(reservation_id, stage=stage,
+            remaining=_remaining_f11_allowance(allowance, stage))
     workflows = {provider: replace(hooks, stage_admission=f11_stage_fit)
                  for provider, hooks in workflows.items()}
     result = execute_provider_workflows(workflows, context=context, clock=clock, max_workers=max_workers,

@@ -14,7 +14,9 @@ from cloud_network_benchmark.orchestration import (
     run_lifecycle,
     consume_retry_attempt,
     write_recovery_journal,
+    _remaining_f11_allowance,
 )
+from cloud_network_benchmark.admission import WorkflowAllowance
 from tests.fixtures.f09.helpers import FakeClock, Trace
 
 
@@ -163,6 +165,25 @@ def test_controller_session_and_cap_are_immutable_for_stage_checks():
         context.require_fit("measurement", 901.0, now_monotonic=100.0)
     with pytest.raises(ValueError, match="session"):
         context.assert_session("session-2")
+
+
+def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
+    full = WorkflowAllowance(10, 20, 30, 40, 60, 5, 12, 8, "sourced", {"aws": 50})
+    registration = _remaining_f11_allowance(full, "registration")
+    preparation = _remaining_f11_allowance(full, "preparation")
+    measurement = _remaining_f11_allowance(full, "measurement")
+    retrieval = _remaining_f11_allowance(full, "retrieval")
+    assert registration == full
+    assert preparation.completed_stages == ("registration",)
+    assert (preparation.registration_seconds, preparation.provision_seconds,
+            preparation.readiness_seconds, preparation.stabilization_seconds) == (0, 20, 30, 40)
+    assert measurement.completed_stages == ("registration", "preparation")
+    assert (measurement.registration_seconds, measurement.provision_seconds,
+            measurement.readiness_seconds, measurement.stabilization_seconds) == (0, 0, 0, 0)
+    assert measurement.measurement_seconds == 60 and measurement.measurement_shutdown_seconds == 5
+    assert retrieval.completed_stages == ("registration", "preparation", "measurement")
+    assert retrieval.measurement_seconds == 0 and retrieval.measurement_shutdown_seconds == 0
+    assert retrieval.retrieval_seconds == 12 and retrieval.cleanup_seconds == 8
 
 
 def test_recovery_journal_durably_consumes_each_retry_once(tmp_path):

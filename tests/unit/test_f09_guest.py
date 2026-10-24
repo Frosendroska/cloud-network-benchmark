@@ -149,6 +149,52 @@ def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity
     assert _typed_outcome("aws", "measure", report)[0] is True
 
 
+def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruption(repository_root, tmp_path):
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    base, _clock = _request(repository_root, tmp_path)
+    runtime_root = f"/var/lib/cnb/runtime/{connected.deployment_id}/runtime"
+    digest = package_tree_sha256(repository_root / "src/cloud_network_benchmark")
+    request = type(base).model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": {**base.observation.model_dump(mode="python"), "provider": "aws"},
+        "output_root": f"{runtime_root}/results",
+        "package_root": f"{runtime_root}/source/cloud_network_benchmark",
+        "source_revision": "a"*40, "expected_source_revision": "a"*40,
+        "package_sha256": digest})
+    runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
+        "3.12.3", "2.14.0", "6.0.2", ())
+
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, command):
+            self.requests.append(command)
+            if command.action_id.startswith("f09-guest-run-"):
+                assert "setsid sh -c" in command.argv[-1]
+                now = datetime.now(timezone.utc)
+                return CommandResult(action_id=command.action_id, outcome="interrupted",
+                    started_at=now, finished_at=now, duration_seconds=0, exit_code=None,
+                    stdout="", stderr="interrupted")
+            if command.action_id.startswith("f09-guest-cancel-"):
+                assert "kill -TERM" in command.argv[-1]
+                assert "process_group_stopped" in command.argv[-1]
+                return result(command.action_id, "process_group_stopped")
+            return result(command.action_id)
+
+    runner = Runner()
+    report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+        deadline=deadline(), clock=lambda:100)
+    assert report.outcome is None and "F03 remote handoff failed" in report.failure
+    assert [item.action_id.split("-")[2] for item in report.actions if item.action_id.startswith("f09-guest-")] == [
+        "control", "request", "run", "cancel"]
+    cancel = next(item for item in report.actions if item.action_id.startswith("f09-guest-cancel-"))
+    assert cancel.result["stdout"] == "process_group_stopped"
+
+
 def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(
         repository_root, tmp_path):
     import json

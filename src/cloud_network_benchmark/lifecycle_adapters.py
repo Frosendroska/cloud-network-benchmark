@@ -215,6 +215,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     request_path, outcome_path = root / f"{invocation}.request.json", root / f"{invocation}.outcome.json"
     local_outcome = None
     actions = []
+    cancellation_status = "not_needed"
     vm = connection.vm_a
     try:
         import tempfile
@@ -247,15 +248,44 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 raise TimeoutError("F03 execution is outside the active cap")
             python = str(PurePosixPath(runtime.remote_root) / "venv" / "bin" / "python")
             module_root = str(PurePosixPath(runtime.remote_root) / "source")
-            command = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
-                       f"cloud_network_benchmark.lifecycle_guest --request {shlex.quote(str(request_path))} "
-                       f"--outcome {shlex.quote(str(outcome_path))}")
+            pid_path = root / f"{invocation}.pid"
+            # Isolate the guest process group and publish its PID before it can
+            # outlive an interrupted SSH transport. A reachable controller can
+            # then cancel the exact invocation and verify the group exited.
+            guest_argv = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
+                          f"cloud_network_benchmark.lifecycle_guest --request {shlex.quote(str(request_path))} "
+                          f"--outcome {shlex.quote(str(outcome_path))}")
+            command = ("set -u; pidfile=" + shlex.quote(str(pid_path)) + "; "
+                       "setsid sh -c " + shlex.quote(guest_argv) + " & child=$!; "
+                       "printf '%s\\n' \"$child\" > \"$pidfile\"; "
+                       "wait \"$child\"; status=$?; rm -f -- \"$pidfile\"; exit \"$status\"")
             execute = _request(f"f09-guest-run-{invocation}", vm,
                 ["sh", "-c", command], remaining)
             execute_result = _execute(runner, execute)
             actions.append(_action(execute.action_id, execute.action_type, vm, execute, execute_result))
             if execute_result.outcome != CommandOutcome.SUCCEEDED:
-                raise RuntimeError("VM-A F03 lifecycle guest failed")
+                if execute_result.outcome in {CommandOutcome.INTERRUPTED, CommandOutcome.TIMED_OUT}:
+                    cancel_remaining = deadline.remaining(clock, cleanup=True)
+                    if cancel_remaining > 0:
+                        cancel_command = (
+                            "set -u; pidfile=" + shlex.quote(str(pid_path)) + "; "
+                            "test -s \"$pidfile\" || { echo invocation_pid_unavailable; exit 2; }; "
+                            "pid=$(cat \"$pidfile\"); case \"$pid\" in ''|*[!0-9]*) exit 2;; esac; "
+                            "kill -TERM -- -\"$pid\" 2>/dev/null || true; i=0; "
+                            "while kill -0 -- -\"$pid\" 2>/dev/null; do "
+                            "i=$((i+1)); if [ \"$i\" -ge 10 ]; then echo process_group_still_running; exit 1; fi; "
+                            "sleep 1; done; rm -f -- \"$pidfile\"; echo process_group_stopped")
+                        cancel = _request(f"f09-guest-cancel-{invocation}", vm,
+                            ["sh", "-c", cancel_command],
+                            min(connection.timeouts.command_seconds, cancel_remaining))
+                        cancel_result = _execute(runner, cancel)
+                        actions.append(_action(cancel.action_id, cancel.action_type, vm, cancel, cancel_result))
+                        cancellation_status = ("verified_stopped" if cancel_result.outcome == CommandOutcome.SUCCEEDED
+                                               and "process_group_stopped" in cancel_result.stdout
+                                               else "unverified")
+                    else:
+                        cancellation_status = "not_attempted_cleanup_allowance_exhausted"
+                raise RuntimeError(f"VM-A F03 lifecycle guest failed; cancellation={cancellation_status}")
             remaining = deadline.remaining(clock)
             if remaining <= 0:
                 raise TimeoutError("F03 outcome retrieval is outside the active cap")
@@ -272,7 +302,8 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 raise ValueError("VM-A F03 outcome identity or source digest changed")
             return RemoteGuestExecution(outcome, tuple(actions))
     except BaseException as exc:
-        return RemoteGuestExecution(None, tuple(actions), f"{type(exc).__name__}: F03 remote handoff failed")
+        return RemoteGuestExecution(None, tuple(actions),
+            f"{type(exc).__name__}: F03 remote handoff failed; cancellation={cancellation_status}")
 
 
 def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
