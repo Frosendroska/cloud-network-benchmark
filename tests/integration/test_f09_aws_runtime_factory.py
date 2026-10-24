@@ -48,6 +48,55 @@ class FakeAwsRunner:
                 "document_hash": "a" * 64,
                 "role_arn": f"arn:aws:iam::123456789012:role/expiry-{region}",
             }.items()})
+        elif action == "aws-pair-output":
+            stdout = json.dumps({"deployment": {"value": {"vms": {
+                "vm_a": {"instance_id": "i-vm-a", "private_ipv4": "10.60.1.10", "public_ipv4": "8.8.8.8",
+                    "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
+                    "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
+                    "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-a",
+                    "placement_group": None, "placement_group_strategy": None},
+                "vm_b": {"instance_id": "i-vm-b", "private_ipv4": "10.60.1.11", "public_ipv4": "1.1.1.1",
+                    "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
+                    "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
+                    "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-b",
+                    "placement_group": None, "placement_group_strategy": None}},
+                "network": {}, "placement": {}}}})
+        elif action == "aws-sts-get-caller-identity":
+            stdout = json.dumps({"Account": "123456789012"})
+        elif action == "aws-ec2-describe-instances":
+            instance_id = request.argv[request.argv.index("--instance-ids") + 1]
+            role = "vm_a" if instance_id == "i-vm-a" else "vm_b"
+            private_ip = "10.60.1.10" if role == "vm_a" else "10.60.1.11"
+            public_ip = "8.8.8.8" if role == "vm_a" else "1.1.1.1"
+            stdout = json.dumps({"Reservations": [{"Instances": [{"InstanceId": instance_id,
+                "State": {"Name": "running"}, "Tags": [{"Key": "cnb_run_id", "Value": self.run_id},
+                    {"Key": "cnb_deployment_id", "Value": self.deployment_id}, {"Key": "cnb_role", "Value": role}],
+                "InstanceType": "m7i.xlarge", "ImageId": "ami-0123456789abcdef0",
+                "PrivateIpAddress": private_ip, "PublicIpAddress": public_ip,
+                "Placement": {"AvailabilityZone": "eu-central-1a", "GroupName": None},
+                "NetworkInterfaces": [{"InterfaceType": "interface"}],
+                "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-a" if role == "vm_a" else "vol-b",
+                    "DeleteOnTermination": True}}], "LaunchTime": "2026-10-22T11:50:00Z"}]}]})
+        elif action == "aws-ec2-describe-instance-topology":
+            stdout = json.dumps({"Instances": [{"ZoneId": "use1-az2"}]})
+        elif action == "aws-ec2-describe-images":
+            stdout = json.dumps({"Images": [{"ImageId": "ami-0123456789abcdef0", "OwnerId": "099720109477",
+                "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
+                "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]})
+        elif action == "aws-ec2-describe-volumes":
+            stdout = json.dumps({"Volumes": [{"VolumeId": "vol-a", "Size": 32, "VolumeType": "gp3"}]})
+        elif action == "aws-ec2-describe-instance-types":
+            stdout = json.dumps({"InstanceTypes": [{"InstanceType": "m7i.xlarge",
+                "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                "VCpuInfo": {"DefaultVCpus": 4}, "MemoryInfo": {"SizeInMiB": 16384}}]})
+        elif action.startswith("aws-get-console-output-"):
+            instance_id = action.removeprefix("aws-get-console-output-")
+            stdout = json.dumps({"InstanceId": instance_id, "Timestamp": "2026-10-22T11:51:00Z",
+                "Output": "CNB_HOSTKEY_BOOT_ID=12345678-1234-4234-8234-123456789abc\nCNB_ED25519_HOST_FINGERPRINT=SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAA\n"})
+        elif action.startswith("aws-host-keyscan-"):
+            stdout = "fake-host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+        elif action.startswith("aws-host-key-fingerprint-"):
+            stdout = "256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAA fake-host (ED25519)\n"
         elif action.startswith("aws-expiry-start-"):
             region = action.removeprefix("aws-expiry-start-")
             stdout = json.dumps({"AutomationExecutionId": f"exec-{region}"})
@@ -161,4 +210,5 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["cleanup"] is not None
     assert "aws-expiry-start-eu-central-1" in runner.actions
     assert "aws-pair-apply" in runner.actions
+    assert "aws-pair-output" in runner.actions
     assert "aws-pair-destroy" in runner.actions
