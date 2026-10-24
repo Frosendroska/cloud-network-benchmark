@@ -677,12 +677,13 @@ def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, ru
 
 def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
               expiry_request: ExpiryRequest, *, stages: RemoteStages,
-              reservation: Any = None, claim_data: Any = None):
+              reservation: Any = None, claim_data: Any = None, on_protected=None):
     from .orchestration import ProviderHooks
     state: dict[str, Any] = {"deployment": _deployment_with(deployment, reservation=reservation)}
     def protect():
         evidence = driver.register_expiry(state["deployment"], expiry_request)
         state["deployment"] = _deployment_with(state["deployment"], expiry=evidence)
+        if on_protected is not None: on_protected("aws", evidence)
         return evidence
     def create():
         state["result"] = driver.provision(state["deployment"])
@@ -702,12 +703,13 @@ def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
 
 def gcp_hooks(driver: GcpProviderDriver, deployment: ProviderDeploymentInput,
               expiry_request: ExpiryRequest, *, stages: RemoteStages,
-              reservation: Any = None, claim_data: Any = None):
+              reservation: Any = None, claim_data: Any = None, on_protected=None):
     from .orchestration import ProviderHooks
     state: dict[str, Any] = {"deployment": _deployment_with(deployment, reservation=reservation)}
     def protect():
         evidence = driver.register_expiry(state["deployment"], expiry_request)
         state["deployment"] = _deployment_with(state["deployment"], expiry=evidence)
+        if on_protected is not None: on_protected("gcp", evidence)
         return evidence
     def create():
         state["result"] = driver.provision(state["deployment"])
@@ -726,7 +728,7 @@ def gcp_hooks(driver: GcpProviderDriver, deployment: ProviderDeploymentInput,
 def azure_hooks(deployment: ProviderDeploymentInput, expiry_request: ExpiryRequest, *,
                 options: Any, runner: Any, stages: RemoteStages, reservation: Any = None,
                 claim_data: Any = None, clock: Callable[[], float],
-                utc_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                utc_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc), on_protected=None):
     from . import azure_provider
     from .orchestration import ProviderHooks
     state: dict[str, Any] = {"deployment": _deployment_with(deployment, reservation=reservation)}
@@ -734,6 +736,7 @@ def azure_hooks(deployment: ProviderDeploymentInput, expiry_request: ExpiryReque
         evidence = azure_provider.register_expiry(state["deployment"], expiry_request, options, runner,
                                                   clock=clock, utc_now=utc_now)
         state["deployment"] = _deployment_with(state["deployment"], expiry=evidence)
+        if on_protected is not None: on_protected("azure", evidence)
         return evidence
     def create():
         state["result"] = azure_provider.provision(state["deployment"], options, runner,

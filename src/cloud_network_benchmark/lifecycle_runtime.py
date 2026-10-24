@@ -42,6 +42,19 @@ def _source_path(root: Path, value: Any, label: str, *, must_exist: bool = True)
     return path
 
 
+def _read_review_decision(path: Path) -> dict[str, Any]:
+    """Read the provider review and verify its exact referenced source bytes."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(value.get("source_path"), str):
+        raise ValueError("primary review must identify its source path and digest")
+    declared = Path(value["source_path"])
+    source = declared if declared.is_absolute() else path.parent / declared
+    source = source.resolve(strict=True)
+    if source.is_symlink() or not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != value.get("source_sha256"):
+        raise ValueError("primary review source hash does not match its bytes")
+    return value
+
+
 def load_runtime_config(path: Path, *, selected_providers: set[str] | None = None) -> dict[str, Any]:
     """Load only the bounded F09 runtime vocabulary and resolve local references.
 
@@ -224,6 +237,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
     from .admission import AdmissionPlan, WorkflowAllowance
     from .contracts.admission import ReservationRequest
     from .contracts.common import Evidence, Provider
+    from .contracts.deployment import ProviderDeploymentInput
 
     providers = {Provider(item.provider).value: item for item in campaign.observations}
     child_ids = {provider: child.run_id for provider, child in children.items()}
@@ -280,8 +294,27 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         incurred_cost_usd=Evidence[float](unavailable_reason="F11 ledger derives current incurred charges"),
         active_reserved_usd=Evidence[float](unavailable_reason="F11 ledger derives active reservations"),
         outstanding_cleanup=outstanding_cleanup)
-    namespaces = {provider: f"cnb-{child.run_id}-{child.deployment_id}"
-                  for provider, child in children.items()}
+    namespaces = {}
+    for provider, child in children.items():
+        if provider == "aws":
+            namespaces[provider] = f"cnb-{child.run_id}-{child.deployment_id}"
+        elif provider == "gcp":
+            namespaces[provider] = child.run_id
+        else:
+            from .azure_provider import _slug
+            observation = providers[provider]
+            deployment = ProviderDeploymentInput.from_observation(
+                    observation, campaign_id=parent.campaign_id, run_id=child.run_id,
+                    observation_id=child.observation_id, deployment_id=child.deployment_id,
+                    bootstrap_template=str(runtime["providers"][provider]["bootstrap_template"]),
+                    terraform_directory=str(runtime["providers"][provider]["terraform_directory"]),
+                    child_result_path=str(next(ref.result_path for ref in parent.child_runs
+                        if str(ref.provider) == provider)),
+                    config_sha256=child.config_provenance.sha256,
+                    resolved_sha256=child.config_provenance.resolved_snapshot_sha256,
+                    implementation_git_commit=child.config_provenance.implementation_git_commit,
+                    design_git_commit=child.config_provenance.design_git_commit)
+            namespaces[provider] = _slug(deployment)
     prerequisites = runtime.get("approval_evidence", {})
     support = costs.payload.get("provider_support", {})
     if "aws" in child_ids:
@@ -293,6 +326,13 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         regions = sorted({observation.vm_a.region, observation.vm_b.region})
         support = {**support, "aws": aws_expiry_cost_handoff(
             costs, aws_source, regions, reservation_sha256=costs.payload_sha256)}
+    for provider in child_ids:
+        if provider == "aws":
+            continue
+        envelope = envelopes[provider]
+        included = envelope["components"]["expiry_cleanup_support"]["amount_usd"]
+        support[provider] = {"source_path": costs.source_path,
+            "source_sha256": costs.payload_sha256, "included_usd": included}
     plan = AdmissionPlan(campaign, child_ids, namespaces, costs, allowance,
         execution_scope="paid_request", prerequisites=prerequisites,
         funding=funding, provider_support=support,
@@ -413,7 +453,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs: Any, runtime: dict[str, Any], controller_session_id: str,
         runner: Any, clock: Any, private_root: Path, stages: Any = None,
         repository_root: Path | None = None):
-    """Build the source-bound AWS acceptance runtime around the real F11 ledger.
+    """Build the selected-provider runtime around one source-bound F11 ledger.
 
     The returned workflow factory is intentionally lazy. ``run_lifecycle``
     calls it with the ReservationEvidence returned by ``BudgetLedger.reserve``.
@@ -421,11 +461,12 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     from .admission import BudgetLedger
     from .orchestration import SavedLifecycleRecovery, SavedProviderRecovery
 
-    if set(children) != {"aws"} or {str(getattr(p, "value", p)) for p in campaign.selected_providers} != {"aws"}:
-        raise ValueError("the production AWS runtime currently requires exactly one selected AWS child")
+    selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
+    if set(children) != selected or set(runtime["providers"]) != selected:
+        raise ValueError("the production runtime requires exactly the initialized selected-provider set")
     if (str(getattr(campaign.mode, "value", campaign.mode)) != "acceptance"
-            or children["aws"].execution_state != "initialized"):
-        raise ValueError("the production AWS runtime currently requires an unlaunched acceptance child")
+            or any(child.execution_state != "initialized" for child in children.values())):
+        raise ValueError("the production runtime currently requires unlaunched acceptance children")
     ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=controller_session_id)
@@ -440,29 +481,39 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     def workflow_factory(reservation: Any):
         actual_stages = stages
         if actual_stages is None:
-            from .lifecycle_remote import build_aws_remote_stages
-            actual_stages = build_aws_remote_stages(campaign=campaign, parent=parent,
-                children=children, runtime=runtime, ledger=ledger, reservation=reservation,
-                runner=runner, clock=clock, repository_root=repository_root or Path.cwd(),
-                recovery_path=Path(private_root) / "lifecycle-recovery.json",
-                sleep=runtime.get("sleep", __import__("time").sleep))
-        return build_aws_provider_workflows(campaign=campaign, parent=parent,
+            from .lifecycle_remote import build_provider_remote_stages
+            actual_stages = {}
+            for provider, child in children.items():
+                actual_stages[provider] = build_provider_remote_stages(provider=provider,
+                    campaign=campaign, parent=parent, children={provider: child}, runtime=runtime,
+                    ledger=ledger, reservation=reservation, runner=runner, clock=clock,
+                    repository_root=repository_root or Path.cwd(),
+                    recovery_path=Path(private_root) / f"{provider}-lifecycle-recovery.json",
+                    sleep=runtime.get("sleep", __import__("time").sleep))
+        return build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
             ledger=ledger, runner=runner, clock=clock, stages=actual_stages,
             private_root=private_root)
 
-    child = children["aws"]
-    private_provider_root = (Path(private_root) / "aws").absolute()
-    namespace = f"cnb-{child.run_id}-{child.deployment_id}"
-    journal = private_provider_root / namespace / child.run_id / child.deployment_id / "attempt.json"
-
     def recovery_factory(reservation: Any, _workflows: Any):
+        providers = []
+        for provider, child in children.items():
+            if provider == "aws":
+                private_provider_root = (Path(private_root) / "aws").absolute()
+                namespace = f"cnb-{child.run_id}-{child.deployment_id}"
+                journal = private_provider_root / namespace / child.run_id / child.deployment_id / "attempt.json"
+            elif provider == "gcp":
+                prefix = hashlib.sha256(child.run_id.encode()).hexdigest()[:12]
+                journal = Path(private_root) / "gcp" / prefix / child.run_id / child.deployment_id / "attempt.json"
+            else:
+                journal = Path(private_root) / "azure" / child.run_id / child.deployment_id / "recovery.json"
+            providers.append(SavedProviderRecovery(provider=provider, deployment_id=child.deployment_id,
+                journal_reference=str(journal), expiry_registered=False,
+                creation_may_have_started=False, cleanup_open=False))
         return SavedLifecycleRecovery(schema_version=1, attempt_id=parent.campaign_id,
             controller_session_id=controller_session_id,
             reservation_id=reservation.reservation_id.value,
-            providers=[SavedProviderRecovery(provider="aws", deployment_id=child.deployment_id,
-                journal_reference=str(journal), expiry_registered=False,
-                creation_may_have_started=False, cleanup_open=False)], retry_consumed_ids=[])
+            providers=providers, retry_consumed_ids=[])
 
     return {"ledger": ledger, "request": request, "plan": plan,
         "allowance": runtime["allowance"], "workflow_factory": workflow_factory,
@@ -470,6 +521,182 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         "recovery_path": Path(private_root) / "lifecycle-recovery.json"}
 
 
-def build_provider_workflows(**kwargs: Any) -> dict[str, Any]:
-    """Named runtime seam for the currently authorized one-provider slice."""
-    return build_aws_provider_workflows(**kwargs)
+def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
+        costs: Any, runtime: dict[str, Any], reservation: Any, ledger: Any,
+        runner: Any, clock: Any, stages: dict[str, Any], private_root: Path) -> dict[str, Any]:
+    """Bind every selected provider to one accepted F11 reservation and claim barrier."""
+    from datetime import timedelta
+    from math import ceil
+    from .contracts.admission import ExpiryRequest
+    from .contracts.common import Evidence, Provider, StringEvidence, StructuredEvidence
+    from .contracts.deployment import ProviderDeploymentInput
+    from .lifecycle_adapters import RemoteStages, aws_hooks, azure_hooks, gcp_hooks
+    from .orchestration import _remaining_f11_allowance
+    from .providers import aws as aws_provider
+    from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
+    from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
+    from .admission import aws_expiry_cost_handoff
+    from . import azure_provider
+
+    selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
+    if set(children) != selected or set(stages) != selected:
+        raise ValueError("runtime workflows, stages and initialized provider set must match")
+    if (reservation.state != "reserved" or reservation.source_path != costs.source_path
+            or reservation.source_sha256 != costs.payload_sha256):
+        raise ValueError("accepted reservation differs from exact refreshed cost bytes")
+    record = ledger.inspect().get("reservations", {}).get(reservation.reservation_id.value)
+    if not isinstance(record, dict) or record.get("session") != ledger.controller_session_id:
+        raise ValueError("accepted reservation or controller session is unavailable")
+    refs = {str(ref.provider): ref for ref in parent.child_runs}
+    observations = {str(getattr(item.provider, "value", item.provider)): item
+        for item in campaign.observations}
+    deployments = {}
+    requests = {}
+    options_by_provider = {}
+    for provider, child in children.items():
+        if child.mode != "acceptance" or child.execution_state != "initialized":
+            raise ValueError("default provider factory currently requires unlaunched acceptance children")
+        row = runtime["providers"][provider]
+        observation = observations[provider]
+        child_root = Path(refs[provider].result_path)
+        if not child_root.is_absolute():
+            child_root = Path.cwd() / child_root
+        deployment = ProviderDeploymentInput.from_observation(observation,
+            campaign_id=parent.campaign_id, run_id=child.run_id,
+            observation_id=child.observation_id, deployment_id=child.deployment_id,
+            bootstrap_template=str(row["bootstrap_template"]),
+            terraform_directory=str(row["terraform_directory"]),
+            child_result_path=str(child_root),
+            config_sha256=child.config_provenance.sha256,
+            resolved_sha256=child.config_provenance.resolved_snapshot_sha256,
+            implementation_git_commit=child.config_provenance.implementation_git_commit,
+            design_git_commit=child.config_provenance.design_git_commit,
+            reservation=Evidence(value=reservation))
+        if provider in {"aws", "gcp"}:
+            data = deployment.model_dump(mode="python")
+            admission = dict(data["admission"])
+            admission["cost_input_sha256"] = StringEvidence(value=reservation.source_sha256)
+            data["admission"] = admission
+            deployment = ProviderDeploymentInput.model_validate(data)
+        deployments[provider] = deployment
+        config = row["options"]
+        if provider == "aws":
+            namespace = aws_provider._namespace(deployment)
+            trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
+            expiry_fixture = row["sources"]["expiry_cost_path"]
+            support = aws_expiry_cost_handoff(costs, expiry_fixture,
+                sorted(set((observation.vm_a.region, observation.vm_b.region))),
+                reservation_sha256=reservation.source_sha256)
+            settings_args = {"account_id": config["account_id"], "controller_cidr": config["controller_cidr"],
+                "ami_ids": config["ami_ids"], "public_key": config["public_key_path"].read_text().strip(),
+                "authentication_reference": config["authentication_reference"],
+                "private_state_root": (Path(private_root) / "aws").absolute(),
+                "cost_input_id": costs.cost_input_id, "cost_input_sha256": reservation.source_sha256,
+                "cost_source_path": reservation.source_path,
+                "complete_workflow_cost_handoff": StructuredEvidence(value=support),
+                "complete_workflow_remaining_seconds": ceil(_remaining_f11_allowance(
+                    runtime["allowance"], "registration").total_seconds)}
+            if observation.admission.requires_primary_review:
+                review = row["sources"].get("primary_review_path")
+                if review is None: raise ValueError("AWS scenario requires source-bound primary review")
+                settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
+            settings = AwsRuntimeSettings(**settings_args)
+            driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
+            requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
+                deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
+                expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
+                resource_namespace=namespace,
+                target_selector=driver._target_selector(deployment, driver._regions(deployment)))
+            options_by_provider[provider] = (driver, None)
+        elif provider == "gcp":
+            from .providers.gcp import SAFETY_LEAD_SECONDS
+            sources = row["sources"]
+            handoff = json.loads(sources["workflow_cost_handoff_path"].read_text())
+            support_evidence = json.loads(sources["support_cost_path"].read_text())
+            settings_args = {"project_id": config["project_id"], "controller_cidr": config["controller_cidr"],
+                "images": config["images"], "public_key": config["public_key_path"].read_text().strip(),
+                "authentication_reference": config["authentication_reference"],
+                "private_state_root": (Path(private_root) / "gcp").absolute(),
+                "cost_input_id": costs.cost_input_id, "cost_input_sha256": reservation.source_sha256,
+                "cost_source_path": reservation.source_path,
+                "complete_workflow_cost_handoff": StructuredEvidence(value=handoff),
+                "support_cost_evidence": StructuredEvidence(value=support_evidence),
+                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds)}
+            if observation.admission.requires_primary_review:
+                review = sources.get("primary_review_path")
+                if review is None: raise ValueError("GCP scenario requires source-bound primary review")
+                settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
+            settings = GcpRuntimeSettings(**settings_args)
+            driver = GcpProviderDriver(runner, settings, clock=clock.utc_now)
+            trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+            requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
+                deployment_id=child.deployment_id, provider=Provider.GCP, action="stop",
+                expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
+                resource_namespace=child.run_id,
+                target_selector=f"project={settings.project_id};run_id={child.run_id};deployment_id={child.deployment_id};roles=vm_a,vm_b")
+            options_by_provider[provider] = (driver, None)
+        else:
+            lead = float(runtime["allowance"].provider_leads_seconds[provider])
+            trigger = reservation.expires_at.value - timedelta(seconds=lead)
+            cap_end = float(record["cap_start_monotonic"]) + float(record["cap_seconds"])
+            attempt_root = (Path(private_root) / "azure" / child.run_id / child.deployment_id).absolute()
+            price = json.loads(row["sources"]["expiry_cost_path"].read_text())
+            admission_evidence = {"reservation_id": reservation.reservation_id.value,
+                "source_sha256": reservation.source_sha256, "priority": deployment.admission.priority,
+                "outstanding_cleanup": False}
+            if observation.admission.requires_primary_review:
+                review = row["sources"].get("primary_review_path")
+                if review is None: raise ValueError("Azure scenario requires source-bound primary review")
+                _read_review_decision(review)
+                admission_evidence["priority_review_reference"] = str(review)
+            options = azure_provider.AzureRuntimeOptions(subscription_id=config["subscription_id"],
+                tenant_id=config["tenant_id"], controller_cidr=config["controller_cidr"],
+                attempt_root=attempt_root, authentication_reference=config["authentication_reference"],
+                ssh_public_key=config["ssh_public_key_path"].read_text().strip(),
+                selected_image=config["selected_image"],
+                complete_workflow_seconds=float(runtime["allowance"].total_seconds),
+                post_registration_workflow_seconds=float(_remaining_f11_allowance(
+                    runtime["allowance"], "preparation").total_seconds),
+                cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
+                retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
+                command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price)
+            name, ids = azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
+            requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
+                deployment_id=child.deployment_id, provider=Provider.AZURE, action="deallocate",
+                expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
+                resource_namespace=name, target_selector=";".join(ids))
+            options_by_provider[provider] = (options, None)
+
+    protected: dict[str, Any] = {}
+    def on_protected(provider: str, evidence: Any) -> None:
+        if provider not in requests or provider in protected:
+            raise ValueError("provider protection evidence is duplicate or outside the selected set")
+        protected[provider] = evidence
+    def claim(deployment: Any, _data: Any):
+        provider = str(getattr(deployment.provider, "value", deployment.provider))
+        if set(protected) != selected:
+            return ledger.claim_creation(reservation.reservation_id.value, provider=Provider(provider),
+                expiry_requests=[], expiry_evidence=[])
+        return ledger.claim_creation(reservation.reservation_id.value, provider=Provider(provider),
+            expiry_requests=[requests[key] for key in sorted(requests)],
+            expiry_evidence=[protected[key] for key in sorted(protected)])
+
+    workflows = {}
+    for provider in children:
+        source_stage = stages[provider]
+        stage = RemoteStages(prepare=source_stage.prepare, stabilize=source_stage.stabilize,
+            measure=source_stage.measure, close=source_stage.close,
+            retrieve=source_stage.retrieve, claim=claim)
+        deployment, request = deployments[provider], requests[provider]
+        driver_or_options, _ = options_by_provider[provider]
+        if provider == "aws":
+            workflows[provider] = aws_hooks(driver_or_options, deployment, request,
+                stages=stage, reservation=reservation, on_protected=on_protected)
+        elif provider == "gcp":
+            workflows[provider] = gcp_hooks(driver_or_options, deployment, request,
+                stages=stage, reservation=reservation, on_protected=on_protected)
+        else:
+            workflows[provider] = azure_hooks(deployment, request,
+                options=driver_or_options, runner=runner, stages=stage, reservation=reservation,
+                clock=clock.monotonic, utc_now=clock.utc_now, on_protected=on_protected)
+    return workflows

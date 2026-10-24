@@ -1,4 +1,4 @@
-"""Source-bound AWS remote-stage composition for F09."""
+"""Source-bound provider remote-stage composition for F09."""
 from __future__ import annotations
 
 import shlex
@@ -31,11 +31,11 @@ class _Attempt:
     retrieval: Any = None
 
 
-def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, Any],
+def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, children: dict[str, Any],
         runtime: dict[str, Any], ledger: Any, reservation: Any, runner: Any,
         clock: Any, repository_root: Path, recovery_path: Path,
         sleep: Callable[[float], None] = time.sleep):
-    """Bind real F02/F03/F04/retrieval adapters to one accepted AWS reservation.
+    """Bind real F02/F03/F04/retrieval adapters to one accepted reservation.
 
     The callbacks hold only evidence observed during this attempt. Missing
     observations produce typed failed outcomes, while orchestration still
@@ -56,14 +56,14 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
 
-    if set(children) != {"aws"} or str(getattr(campaign.mode, "value", campaign.mode)) != "acceptance":
-        raise ValueError("AWS production remote stages currently require one acceptance child")
-    child = children["aws"]
+    if set(children) != {provider} or str(getattr(campaign.mode, "value", campaign.mode)) != "acceptance":
+        raise ValueError("production remote stages currently require one acceptance child")
+    child = children[provider]
     observation = child.resolved_observation
-    if (str(getattr(observation.provider, "value", observation.provider)) != "aws"
+    if (str(getattr(observation.provider, "value", observation.provider)) != provider
             or observation.mode != campaign.mode or observation.config_id != child.config_id
             or observation.experiment_id != child.experiment_id):
-        raise ValueError("initialized AWS observation identity does not match the child")
+        raise ValueError("initialized provider observation identity does not match the child")
     revision = child.config_provenance.implementation_git_commit.value
     if not revision:
         raise ValueError("initialized implementation revision is unavailable")
@@ -71,9 +71,9 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
         check=True, capture_output=True, text=True).stdout.strip()
     if current != revision:
         raise ValueError("initialized implementation revision differs from the executing source")
-    ref = next((item for item in parent.child_runs if str(item.provider) == "aws"), None)
+    ref = next((item for item in parent.child_runs if str(item.provider) == provider), None)
     if ref is None:
-        raise ValueError("initialized parent has no AWS child result path")
+        raise ValueError("initialized parent has no provider child result path")
     result_root = Path(ref.result_path)
     if not result_root.is_absolute():
         result_root = Path(repository_root) / result_root
@@ -83,7 +83,7 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
     def pair_of(value: Any):
         pair = value if hasattr(value, "vm_a") else getattr(value, "deployment", None)
         if pair is None or pair.deployment_id != child.deployment_id:
-            raise ValueError("provider output does not match the initialized AWS deployment")
+            raise ValueError("provider output does not match the initialized deployment")
         return pair
 
     def deadline_for(deployment: Any, *, preparation_start: float | None = None):
@@ -175,7 +175,7 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
             total_seconds = float(runtime["allowance"].measurement_seconds)
             for role in ("vm_a", "vm_b"):
                 context = build_collection_context(pair, role=role,
-                    interface=runtime["access"]["diagnostic_interfaces"]["aws"][role],
+                    interface=runtime["access"]["diagnostic_interfaces"][provider][role],
                     output_root=runtime["access"]["bootstrap"].workspace,
                     duration_seconds=total_seconds, prepared=bootstrap)
                 item.diagnostics[role] = start_remote_diagnostics(connection, context,
@@ -344,3 +344,8 @@ def build_aws_remote_stages(*, campaign: Any, parent: Any, children: dict[str, A
 
     return RemoteStages(prepare=prepare, stabilize=stabilize, measure=measure,
         close=close, retrieve=retrieve, claim=lambda *_: None)
+
+
+def build_aws_remote_stages(**kwargs: Any):
+    """Backward-compatible AWS constructor for the provider-bound stages."""
+    return build_provider_remote_stages(provider="aws", **kwargs)

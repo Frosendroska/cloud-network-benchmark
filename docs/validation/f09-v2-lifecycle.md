@@ -24,6 +24,8 @@ The four-mode replay test sends synthetic source-realistic bytes through closed 
 
 The selected package source is transferred with the existing trusted SCP options, checked by SHA-256 and source-revision marker, unpacked under a deployment-specific directory on A, and used through a newly created venv. The offline-safe venv uses system site packages and records the guest interpreter/Pydantic/PyYAML versions; missing dependencies fail before F03. This is a deliberate no-download implementation assumption, not evidence that a real image satisfies it.
 
+The default runtime factory now constructs all selected AWS, Azure and GCP drivers behind one actual F11 reservation, with per-provider expiry requests and recovery references. Provider claims include the complete selected request set and all observed protection evidence. A three-provider synthetic paid-source envelope test injects failure at every external command boundary, confirms all three real protection adapters return typed failure evidence, and asserts no provider pair-creation action runs. This validates the failure barrier and sourced constructor handoff; it does not establish successful cross-provider protection/provision/cleanup or a native measurement.
+
 ## Remaining acceptance limits
 
 Offline mocks do not prove real cloud expiry, paid admission, guest package installation on Ubuntu, Linux guest behavior, native traffic or cloud cleanup. Those are separate gates; F10 is the end of this implementation stage.
