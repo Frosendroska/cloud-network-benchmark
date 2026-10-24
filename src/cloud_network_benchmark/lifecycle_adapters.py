@@ -31,6 +31,13 @@ class GuestRuntimeEvidence:
     actions: tuple[Any, ...]
 
 
+@dataclass(frozen=True)
+class RemoteGuestExecution:
+    outcome: Any | None
+    actions: tuple[Any, ...]
+    failure: str | None = None
+
+
 def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: str,
                         remote_root: str, runner: Any, deadline: Any,
                         clock: Callable[[], float] = __import__("time").monotonic) -> GuestRuntimeEvidence:
@@ -179,6 +186,93 @@ def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_con
         deadline=deadline, clock=clock)
     return ProviderStageOutcome("prepare", True,
         {"bootstrap": prepared, "readiness": readiness, "guest_runtime": guest})
+
+
+def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: GuestRuntimeEvidence,
+                   deadline: Any, clock: Callable[[], float] = __import__("time").monotonic) -> RemoteGuestExecution:
+    """Run the existing F03 entry on VM A and strictly retrieve its outcome.
+
+    Request and response files use unique per-invocation names under the
+    staged deployment runtime. Every SSH/SCP operation uses the existing
+    trusted access command builder; transport success is not measurement
+    success until the returned ``GuestOutcome`` validates and matches identity.
+    """
+    import uuid
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+    from .lifecycle_guest import GuestOutcome, GuestRequest
+
+    request = GuestRequest.model_validate(request.model_dump(mode="python"))
+    if (request.identity.deployment_id != connection.deployment_id
+            or request.identity.run_id != connection.run_id
+            or request.identity.provider != connection.provider
+            or request.package_sha256 != runtime.package_sha256
+            or request.source_revision != runtime.source_revision
+            or request.package_root != Path(runtime.remote_root) / "source" / "cloud_network_benchmark"):
+        raise ValueError("remote F03 request does not match the staged deployment package")
+    invocation = uuid.uuid4().hex
+    root = PurePosixPath(runtime.remote_root) / "control"
+    request_path, outcome_path = root / f"{invocation}.request.json", root / f"{invocation}.outcome.json"
+    local_outcome = None
+    actions = []
+    vm = connection.vm_a
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="cnb-f09-guest-") as temp_dir:
+            local_request = Path(temp_dir) / "request.json"
+            local_outcome = Path(temp_dir) / "outcome.json"
+            local_request.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("F03 request staging is outside the active cap")
+            mkdir = _request(f"f09-guest-control-mkdir-{invocation}", vm,
+                ["sh", "-c", f"mkdir -p {shlex.quote(str(root))}"],
+                min(connection.timeouts.command_seconds, remaining))
+            mkdir_result = _execute(runner, mkdir)
+            actions.append(_action(mkdir.action_id, mkdir.action_type, vm, mkdir, mkdir_result))
+            if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
+                raise RuntimeError("F03 control directory creation failed")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("F03 request transfer is outside the active cap")
+            upload = _request(f"f09-guest-request-{invocation}", vm,
+                [str(local_request), f"{vm.user}@{vm.host}:{request_path}"],
+                min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
+            upload_result = _execute(runner, upload)
+            actions.append(_action(upload.action_id, upload.action_type, vm, upload, upload_result))
+            if upload_result.outcome != CommandOutcome.SUCCEEDED:
+                raise RuntimeError("F03 request transfer failed")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("F03 execution is outside the active cap")
+            python = str(PurePosixPath(runtime.remote_root) / "venv" / "bin" / "python")
+            module_root = str(PurePosixPath(runtime.remote_root) / "source")
+            command = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
+                       f"cloud_network_benchmark.lifecycle_guest --request {shlex.quote(str(request_path))} "
+                       f"--outcome {shlex.quote(str(outcome_path))}")
+            execute = _request(f"f09-guest-run-{invocation}", vm,
+                ["sh", "-c", command], remaining)
+            execute_result = _execute(runner, execute)
+            actions.append(_action(execute.action_id, execute.action_type, vm, execute, execute_result))
+            if execute_result.outcome != CommandOutcome.SUCCEEDED:
+                raise RuntimeError("VM-A F03 lifecycle guest failed")
+            remaining = deadline.remaining(clock)
+            if remaining <= 0:
+                raise TimeoutError("F03 outcome retrieval is outside the active cap")
+            download = _request(f"f09-guest-outcome-{invocation}", vm,
+                [f"{vm.user}@{vm.host}:{outcome_path}", str(local_outcome)],
+                min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
+            download_result = _execute(runner, download)
+            actions.append(_action(download.action_id, download.action_type, vm, download, download_result))
+            if download_result.outcome != CommandOutcome.SUCCEEDED or not local_outcome.is_file():
+                raise RuntimeError("VM-A F03 outcome retrieval failed")
+            outcome = GuestOutcome.model_validate_json(local_outcome.read_text(encoding="utf-8"))
+            if (outcome.identity != request.identity or outcome.source_revision != runtime.source_revision
+                    or outcome.package_sha256 != runtime.package_sha256):
+                raise ValueError("VM-A F03 outcome identity or source digest changed")
+            return RemoteGuestExecution(outcome, tuple(actions))
+    except BaseException as exc:
+        return RemoteGuestExecution(None, tuple(actions), f"{type(exc).__name__}: F03 remote handoff failed")
 
 
 def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,

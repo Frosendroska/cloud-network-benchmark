@@ -426,8 +426,14 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
         return (getattr(value, "ready", None) is True and getattr(value, "failure", None) is None,
                 "readiness evidence is not ready")
     if stage == "measure":
-        return (getattr(value, "outcome", None) == "succeeded"
-                and not getattr(value, "failures", ()), "guest measurement did not complete successfully")
+        outcome = getattr(value, "outcome", None)
+        if not isinstance(outcome, str):
+            outcome = getattr(outcome, "outcome", None)
+        failures = getattr(value, "failures", None)
+        if failures is None:
+            failures = getattr(getattr(value, "outcome", None), "failures", ())
+        return (outcome == "succeeded" and not failures and getattr(value, "failure", None) is None,
+                "guest measurement did not complete successfully")
     if stage == "close":
         return (getattr(value, "closed", None) is True and getattr(value, "failures", None) == (),
                 "producer closure evidence is incomplete")

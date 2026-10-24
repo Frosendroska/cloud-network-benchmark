@@ -35,16 +35,26 @@ def test_closed_inventory_fake_transport_retrieves_and_replays_source_fixture(mo
     sock_log = (Path(__file__).parents[1] / "fixtures/acquisition/sockperf-window.log").read_bytes()
     sock_log = sock_log.replace(b'"realtime_ns":20', f'"realtime_ns":{anchor_ns}'.encode())
     sock_csv = b"Synthetic native Sockperf CSV bytes; no traffic was run.\n"
+    iperf_native = (Path(__file__).parents[1] / "fixtures/acquisition/iperf-receiver.log").read_bytes()
+    vm_b_diagnostics = b"Synthetic VM B diagnostics bytes; no guest process was run.\n"
     remote_roots = {"vm_a":tmp_path / "remote-a", "vm_b":tmp_path / "remote-b"}
     for root in remote_roots.values(): root.mkdir()
     (remote_roots["vm_a"] / "measurements").mkdir()
     (remote_roots["vm_a"] / "measurements/sockperf.stderr").write_bytes(sock_log)
     (remote_roots["vm_a"] / "measurements/sockperf.csv").write_bytes(sock_csv)
+    (remote_roots["vm_b"] / "measurements").mkdir()
+    (remote_roots["vm_b"] / "measurements/iperf3-server.jsonl").write_bytes(iperf_native)
+    (remote_roots["vm_b"] / "diagnostics").mkdir()
+    (remote_roots["vm_b"] / "diagnostics/vm_b.jsonl").write_bytes(vm_b_diagnostics)
     declarations = [
         ArtifactInput(artifact_id="sock-log", path="measurements/sockperf.stderr", kind="sockperf-observation-stderr",
                 producer="vm_a", unit_id=unit_id, expectation="required"),
         ArtifactInput(artifact_id="sock-native", path="measurements/sockperf.csv", kind="sockperf-csv",
                 producer="vm_a", unit_id=unit_id, expectation="required"),
+        ArtifactInput(artifact_id="iperf-server-native", path="measurements/iperf3-server.jsonl",
+                kind="iperf3-server-jsonl", producer="vm_b", unit_id=unit_id, expectation="required"),
+        ArtifactInput(artifact_id="vm-b-diagnostics", path="diagnostics/vm_b.jsonl", kind="diagnostics",
+                producer="vm_b", unit_id=None, expectation="required"),
     ]
     ended = datetime.now(timezone.utc)
     inventory = build_closed_inventory(identity=c.identity.model_dump(), deployment_id=c.deployment_id,
@@ -66,13 +76,14 @@ def test_closed_inventory_fake_transport_retrieves_and_replays_source_fixture(mo
         deadline=deadline(), retry_admission=lambda _item:False, reservation_id="reservation-f09",
         provider_trigger=ended+timedelta(minutes=5), retry_seconds=1,
         now_utc=lambda:ended, clock=lambda:100)
-    assert report.complete and len(report.records) == 2, (report.failures, report.attempts,
+    assert report.complete and len(report.records) == 4, (report.failures, report.attempts,
         [action.result for action in report.actions],
         [(record.artifact_id, record.retrieval_state, record.failure) for record in report.records])
     for record in report.records: record.verify_materialized_file(bundle)
 
-    build = _build("sockperf", VmRole.VM_A, "sock-build")
-    build_records = _build_records(bundle, c.deployment_id, [build])
+    builds = [_build(tool, role, f"{role.value}-{tool}-build")
+              for role in (VmRole.VM_A, VmRole.VM_B) for tool in ("sockperf", "iperf3")]
+    build_records = _build_records(bundle, c.deployment_id, builds)
     command = _command("sockperf-short-multiflow", VmRole.VM_A, unit_id, c.deployment_id)
     mapping = ClockMapping(vm_role=VmRole.VM_A, monotonic_seconds=1, utc_timestamp=anchor,
         estimated_error_ms=Evidence[float](value=1), synchronization_source={"value":"fixture"})
@@ -85,8 +96,9 @@ def test_closed_inventory_fake_transport_retrieves_and_replays_source_fixture(mo
         "identity": c.identity.model_dump(mode="python"),
         "commands": [command_evidence.model_dump(mode="python")],
         "artifacts": {**value.artifacts, **{item.artifact_id: item for item in declarations},
-            build.artifact_id: ArtifactInput(artifact_id=build.artifact_id, path=build_records[0].path,
-                kind="build-identity", producer=VmRole.VM_A, unit_id=None, expectation="required")},
+            **{build.artifact_id: ArtifactInput(artifact_id=build.artifact_id, path=record.path,
+                kind="build-identity", producer=build.role, unit_id=None, expectation="required")
+                for build, record in zip(builds, build_records)}},
         "timings": [{**timing.model_dump(mode="python"), "deployment_id": c.deployment_id}
                     for timing in value.timings]}
     if mode == "diagnostic_day":
@@ -105,7 +117,7 @@ def test_closed_inventory_fake_transport_retrieves_and_replays_source_fixture(mo
         assert (record.path, record.kind, record.producer, record.unit_id) == (
             declaration.path, declaration.kind, declaration.producer, declaration.unit_id), record
     bound, sources, unavailable = bind_retrieved_acquisition_sources(value=value,
-        child_root=bundle, source_artifact_records=[*report.records, *build_records], build_evidence=[build],
+        child_root=bundle, source_artifact_records=[*report.records, *build_records], build_evidence=builds,
         receiver_command_evidence=[], clock_mappings=[mapping])
     assert len(sources) == 1 and sources[0].tool == "sockperf"
     assert not unavailable
@@ -113,15 +125,17 @@ def test_closed_inventory_fake_transport_retrieves_and_replays_source_fixture(mo
     assert timing.acquisition_sources.value[0].mapping_indexes == [0]
     source_hashes = {record.path: hashlib.sha256((bundle / record.path).read_bytes()).hexdigest()
                      for record in [*report.records, *build_records]}
+    evaluated_at = datetime.now(timezone.utc)
     result, summary, seal, sealed_files = finalize_validation(root=bundle,
         validator_input_path=bundle / "validation/input.json", value=bound,
-        evaluated_at=datetime.now(timezone.utc))
+        evaluated_at=evaluated_at)
     saved = type(bound).model_validate_json((bundle / "validation/input.json").read_text())
     assert saved.model_dump(mode="json") == bound.model_dump(mode="json")
     windows = list(iter_source_windows(bundle, sources[0], [*report.records, *build_records],
-        [command_evidence], [build], timing.clock_mappings))
+        [command_evidence], builds, timing.clock_mappings))
     assert windows and windows[0].has_positive_inner_support
-    replay = validate_bundle(saved, evaluated_at=datetime.now(timezone.utc))
+    replay = validate_bundle(saved, evaluated_at=evaluated_at)
+    assert replay.model_dump(mode="json") == result.model_dump(mode="json")
     assert replay.run_id == saved.identity.run_id == result.run_id
     assert summary and len(seal) == 64 and "checksums.sha256" not in sealed_files
     assert source_hashes == {record.path: hashlib.sha256((bundle / record.path).read_bytes()).hexdigest()

@@ -100,6 +100,55 @@ def test_remote_pair_preparation_composes_bootstrap_readiness_and_guest_staging(
     assert outcome.succeeded is False and called == ["bootstrap", "readiness"]
 
 
+def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity(repository_root, tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
+    from cloud_network_benchmark.lifecycle_guest import GuestOutcome
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    base, _clock = _request(repository_root, tmp_path)
+    runtime_root = f"/var/lib/cnb/runtime/{connected.deployment_id}/runtime"
+    source = repository_root / "src/cloud_network_benchmark"
+    digest = package_tree_sha256(source)
+    package_root = Path(runtime_root) / "source/cloud_network_benchmark"
+    request = type(base).model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": {**base.observation.model_dump(mode="python"), "provider": "aws"},
+        "output_root": f"{runtime_root}/results", "package_root": str(package_root),
+        "source_revision": "a"*40, "expected_source_revision": "a"*40,
+        "package_sha256": digest})
+    runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
+        "3.12.3", "2.14.0", "6.0.2", ())
+    class Runner:
+        def __init__(self): self.actions=[]; self.request_payload=None; self.outcome_payload=None
+        def run(self, command):
+            self.actions.append(command)
+            if command.action_id.startswith("f09-guest-request-"):
+                self.request_payload = json.loads(Path(command.argv[-2]).read_text())
+            elif command.action_id.startswith("f09-guest-run-"):
+                assert "cloud_network_benchmark.lifecycle_guest --request" in command.argv[-1]
+                assert command.timeout_seconds == deadline().overall_deadline_monotonic - 100
+                row = self.request_payload
+                self.outcome_payload = GuestOutcome(identity=row["identity"], outcome="succeeded",
+                    executed_unit_ids=[item["unit_id"] for item in row["observation"]["measurement_units"]],
+                    unexecuted_unit_ids=[], commands=[], timings=[], artifact_paths=[],
+                    source_revision=row["source_revision"], package_sha256=row["package_sha256"],
+                    guest_started_at=datetime.now(timezone.utc), guest_finished_at=datetime.now(timezone.utc)).model_dump_json()
+            elif command.action_id.startswith("f09-guest-outcome-"):
+                Path(command.argv[-1]).write_text(self.outcome_payload)
+            return result(command.action_id)
+    runner=Runner()
+    report=run_remote_f03(connected, request, runner=runner, runtime=runtime,
+        deadline=deadline(), clock=lambda:100)
+    assert report.failure is None and report.outcome.outcome == "succeeded"
+    assert [item.action_type for item in report.actions] == ["ssh", "scp", "ssh", "scp"]
+    assert report.outcome.identity == request.identity
+    from cloud_network_benchmark.orchestration import _typed_outcome
+    assert _typed_outcome("aws", "measure", report)[0] is True
+
+
 def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(
         repository_root, tmp_path):
     import json

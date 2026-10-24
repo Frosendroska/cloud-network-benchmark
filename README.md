@@ -20,7 +20,7 @@ Lifecycle run and recovery commands require the complete paid-run admission evid
 
 The root CLI exposes lifecycle commands through `cloud-network-benchmark lifecycle`. It delegates to the isolated lifecycle parser and preserves the existing config and F12 `analyze` commands. `run` accepts an explicit `paid_request` scope plus config, cost inputs, runtime references, result/private roots and controller session; this offline implementation returns a rejection with no provider calls. `cleanup` accepts a private recovery journal and never resumes measurement; it reports that cleanup is unavailable when provider callbacks are not supplied. `recommend-common-n` reads a JSON array of saved F08 calibration results and reports the existing evidence-based recommendation without changing configuration.
 
-Before measurement, the lifecycle adapter stages the selected package revision to VM A through the existing SSH/SCP trust boundary, checks the archive and source revision, creates a deployment-local Python virtual environment, and records the guest Python, Pydantic and PyYAML versions. The offline stage does not download dependencies; a guest without the declared dependencies fails before measurement.
+Before measurement, the lifecycle adapter stages the selected package revision to VM A through the existing SSH/SCP trust boundary, checks the archive and source revision, creates a deployment-local Python virtual environment, installs the dependency ranges already declared in `pyproject.toml`, and records the guest Python, Pydantic and PyYAML versions. Offline tests fake the guest installation command; they do not contact clouds or install anything on a guest.
 
 ## Research context
 
