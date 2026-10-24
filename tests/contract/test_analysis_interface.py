@@ -58,6 +58,24 @@ def test_changed_native_source_cannot_keep_recorded_validity(repository_root, tm
     assert report.payload["runs"][0]["current_data_validity"] == "invalid"
 
 
+def test_saved_validation_identity_cannot_be_attached_to_another_input(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request):
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+
+    _value, _result, selection = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request)
+    payload = json.loads(selection.read_text(encoding="utf-8"))
+    result_ref = Path(payload["runs"][0]["validation_result"])
+    result_path = result_ref if result_ref.is_absolute() else selection.parent / result_ref
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    saved["metrics"]["value"]["identity"]["config_id"] = "different-config"
+    result_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="identity/configuration"):
+        analyze_selection(selection, analysis_git=_git())
+
+
 def test_utc_window_requires_aware_increasing_times(tmp_path):
     from cloud_network_benchmark.analysis import analyze_selection
 
@@ -118,10 +136,16 @@ def test_publish_writes_fixed_tables_escaped_offline_html_and_rejects_existing(t
         "diagnostics": [], "reliability": [], "costs": [], "sources": [], "figures": []}, protected_paths=())
     output = tmp_path / "report"
     files = write_analysis(report, output)
-    assert len(files) == 17
+    assert len(files) == 23
     assert {path.name for path in output.iterdir()} == {
         "report.json", "runs.csv", "bins.csv", "deployments.csv", "comparisons.csv",
         "diagnostics.csv", "reliability.csv", "costs.csv", "index.html", "figures"}
+    assert {path.name for path in (output / "figures").iterdir()} == {
+        "deployment-points.png", "deployment-points.svg", "placement-comparison.png",
+        "placement-comparison.svg", "receiver-time-series.png", "receiver-time-series.svg",
+        "rtt-distribution.png", "rtt-distribution.svg", "throughput-deployment-points.png",
+        "throughput-deployment-points.svg", "throughput-placement-comparison.png",
+        "throughput-placement-comparison.svg", "time-series.png", "time-series.svg"}
     page = (output / "index.html").read_text()
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
     assert "<script>alert(1)</script>" not in page

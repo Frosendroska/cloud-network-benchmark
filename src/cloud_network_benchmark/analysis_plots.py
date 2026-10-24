@@ -53,17 +53,39 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
     runs = payload.get("runs", [])
     bins = payload.get("bins", [])
     def timeline(axis):
+        groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for row in bins:
+            key = (row.get("run_id", ""), row.get("unit_id", ""), row.get("phase", ""),
+                   row.get("schedule_window_label") or "unresolved")
+            groups.setdefault(key, []).append(row)
         eligible = [row for row in bins if row.get("rtt", {}).get("valid_replies", 0)]
         if not eligible:
             axis.text(.5, .5, "No eligible RTT bins", ha="center", va="center", transform=axis.transAxes)
         else:
-            for run_id in sorted({row["run_id"] for row in eligible}):
-                points = sorted((row["start_seconds"], row["rtt"]["median_us"].get("value"))
-                                for row in eligible if row["run_id"] == run_id
-                                and row["rtt"]["median_us"].get("value") is not None)
-                if points:
-                    axis.plot([point[0] for point in points], [point[1] for point in points], marker=".", label=run_id)
-            if eligible:
+            for key, rows in sorted(groups.items()):
+                rows.sort(key=lambda row: (row["start_seconds"], row["end_seconds"]))
+                segments: list[list[tuple[float, float]]] = []
+                segment: list[tuple[float, float]] = []
+                previous_end = None
+                for row in rows:
+                    value = row.get("rtt", {}).get("median_us", {}).get("value")
+                    if value is None or not row.get("rtt", {}).get("valid_replies", 0):
+                        if segment:
+                            segments.append(segment); segment = []
+                        previous_end = None
+                        continue
+                    if previous_end is not None and row["start_seconds"] > previous_end:
+                        if segment:
+                            segments.append(segment); segment = []
+                    segment.append((row["start_seconds"], value))
+                    previous_end = row["end_seconds"]
+                if segment:
+                    segments.append(segment)
+                label = "/".join(part for part in key if part)
+                for index, points in enumerate(segments):
+                    axis.plot([point[0] for point in points], [point[1] for point in points], marker=".",
+                              label=label if index == 0 else None)
+            if len(groups) <= 8:
                 axis.legend(loc="best")
         axis.set_xlabel("Source-supported elapsed seconds")
         axis.set_ylabel("RTT (µs)")
@@ -90,8 +112,8 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
          distribution, [row.get("unit_id", "") for row in runs],
          [source for row in runs for source in row.get("source_refs", [])])
 
-    def deployment(axis):
-        points = payload.get("deployments", [])
+    def deployment(axis, metric):
+        points = [row for row in payload.get("deployments", []) if row.get("metric") == metric]
         if not points:
             axis.text(.5, .5, "No eligible deployment points", ha="center", va="center", transform=axis.transAxes)
         else:
@@ -104,28 +126,78 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
                 lows.append(row["median"] - row["q1"]); highs.append(row["q3"] - row["median"])
             axis.errorbar(labels, medians, yerr=[lows, highs], fmt="_", capsize=5, color="#e45756", label="median and IQR")
             axis.tick_params(axis="x", labelrotation=0, labelsize=8)
-        metrics = sorted({row.get("metric", "") for row in points}) if points else []
-        units = {"throughput_gbps": "Throughput (Gb/s)", "median_rtt_us": "Median RTT (µs)"}
-        metric = metrics[0] if metrics else ""
-        axis.set_ylabel(units.get(metric, metric or "Metric value (see report)"))
-    save("deployment-points", "Independent deployment points", "Every deployment point is shown; bars span Q1 to Q3.",
-         deployment, sorted({run for row in payload.get("deployments", []) for run in row.get("run_ids", [])}),
-         [source for row in payload.get("deployments", []) for source in row.get("source_refs", [])])
+        axis.set_ylabel("Median RTT (µs)" if metric == "median_rtt_us" else "Throughput (Gb/s)")
+    all_deployment_runs = sorted({run for row in payload.get("deployments", []) for run in row.get("run_ids", [])})
+    deployment_sources = [source for row in payload.get("deployments", []) for source in row.get("source_refs", [])]
+    save("deployment-points", "Independent deployment RTT points", "Every independent deployment RTT point; bars span Q1 to Q3.",
+         lambda axis: deployment(axis, "median_rtt_us"), all_deployment_runs, deployment_sources)
+    save("throughput-deployment-points", "Independent deployment throughput points", "Every independent receiver-throughput point; bars span Q1 to Q3.",
+         lambda axis: deployment(axis, "throughput_gbps"), all_deployment_runs, deployment_sources)
 
-    placement_rows = [row for row in payload.get("placement_comparisons", []) if row.get("metric") == "median_rtt_us"]
-    def placement(axis):
-        rows = placement_rows
+    def receiver_timeline(axis):
+        groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for row in bins:
+            receiver = row.get("receiver", {})
+            if receiver.get("throughput_gbps", {}).get("value") is None:
+                continue
+            key = (row.get("run_id", ""), row.get("unit_id", ""), row.get("phase", ""),
+                   row.get("schedule_window_label") or "unresolved")
+            groups.setdefault(key, []).append(row)
+        if not groups:
+            axis.text(.5, .5, "No source-supported receiver intervals", ha="center", va="center", transform=axis.transAxes)
+        for key, rows in sorted(groups.items()):
+            rows.sort(key=lambda row: (row["start_seconds"], row["end_seconds"]))
+            segments: list[list[tuple[float, float]]] = []
+            segment: list[tuple[float, float]] = []
+            previous_end = None
+            for row in rows:
+                value = row.get("receiver", {}).get("throughput_gbps", {}).get("value")
+                if value is None:
+                    if segment:
+                        segments.append(segment); segment = []
+                    previous_end = None
+                    continue
+                if previous_end is not None and row["start_seconds"] > previous_end:
+                    if segment:
+                        segments.append(segment); segment = []
+                segment.append((row["start_seconds"], value))
+                previous_end = row["end_seconds"]
+            if segment:
+                segments.append(segment)
+            label = "/".join(part for part in key if part)
+            for index, points in enumerate(segments):
+                axis.plot([point[0] for point in points], [point[1] for point in points], marker=".",
+                          label=label if index == 0 else None)
+        if groups and len(groups) <= 8 and any(axis.lines):
+            axis.legend(loc="best")
+        axis.set_xlabel("Source-supported elapsed seconds")
+        axis.set_ylabel("Receiver throughput (Gb/s)")
+    save("receiver-time-series", "Supported receiver throughput over time",
+         "Whole receiver intervals only; unsupported gaps are not connected.", receiver_timeline,
+         [row.get("unit_id", "") for row in bins], [source for row in bins for source in row.get("source_refs", [])])
+
+    placement_rows = payload.get("placement_comparisons", [])
+    rtt_placement_rows = [row for row in placement_rows if row.get("metric") == "median_rtt_us"]
+    def placement(axis, rows, metric):
         values = [(row.get("provider", ""), row.get("rtt_difference_us", {}).get("value"))
-                  for row in rows if row.get("rtt_difference_us", {}).get("value") is not None]
+                  for row in rows if metric == "median_rtt_us" and row.get("rtt_difference_us", {}).get("value") is not None]
+        if metric == "throughput_gbps":
+            values = [(row.get("provider", ""), row.get("throughput_change_percent", {}).get("value"))
+                      for row in rows if row.get("throughput_change_percent", {}).get("value") is not None]
         if not values:
             axis.text(.5, .5, "No eligible S1/S3 comparison", ha="center", va="center", transform=axis.transAxes)
         else:
             axis.axhline(0, color="#777", linewidth=.8)
             axis.scatter([item[0] for item in values], [item[1] for item in values], color="#f58518")
-        axis.set_ylabel("S3 − S1 median RTT (µs)")
+        axis.set_ylabel("S3 − S1 median RTT (µs)" if metric == "median_rtt_us" else "100 × (S3/S1 − 1) (%)")
         axis.set_xlabel("Provider")
     save("placement-comparison", "Within-provider placement effect", "S3 − S1 direction; only eligible, recorded groups are plotted.",
-         placement, sorted({run for row in placement_rows for run in (*row.get("s1_run_ids", []), *row.get("s3_run_ids", []))}),
+         lambda axis: placement(axis, rtt_placement_rows, "median_rtt_us"), sorted({run for row in placement_rows for run in (*row.get("s1_run_ids", []), *row.get("s3_run_ids", []))}),
+         [source for row in placement_rows for source in row.get("source_refs", [])])
+    save("throughput-placement-comparison", "Within-provider placement throughput change",
+         "Relative receiver throughput change with S1 as the denominator; zero baselines are unavailable.",
+         lambda axis: placement(axis, [row for row in placement_rows if row.get("metric") == "throughput_gbps"], "throughput_gbps"),
+         sorted({run for row in placement_rows for run in (*row.get("s1_run_ids", []), *row.get("s3_run_ids", []))}),
          [source for row in placement_rows for source in row.get("source_refs", [])])
     return specs
 

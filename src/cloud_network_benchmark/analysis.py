@@ -5,16 +5,18 @@ import hashlib
 import json
 import importlib.metadata
 import math
+from bisect import bisect_right
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .contracts.common import GitSnapshot
+from .contracts.common import Evidence, GitSnapshot
 from .contracts.validation import ValidationResult, ValidatorInput
 from .native import receiver_statistics, rtt_statistics
-from .validation import (_acquisition_windows, _artifact_path, _measured_samples,
+from .validation import (_acquisition_windows, _artifact_path, _measured_samples, _union_intervals,
                          _parse_unit, _source_supported_windows, _validate_artifacts, evaluate_comparison,
                          validate_bundle)
 
@@ -73,20 +75,36 @@ def _cost_ledger(path: Path) -> dict[str, Any]:
 
 
 def _verified_provider_bill(ledger: dict[str, Any], ledger_path: Path,
-                            reservation_id: str, provider: str) -> dict[str, Any] | None:
+                            reservation_id: str, provider: str,
+                            expected_campaign_id: str | None = None) -> dict[str, Any] | None:
     record = ledger.get("reservations", {}).get(reservation_id)
     if not isinstance(record, dict) or provider not in record.get("plan", {}).get("providers", []):
         return None
+    reservation = record.get("evidence", {})
+    if expected_campaign_id is not None and reservation.get("campaign_id") != expected_campaign_id:
+        return {"reserved": None, "estimated": None, "actual": None, "final": False,
+                "reservation_id": reservation_id, "source_verified": False, "source_refs": [],
+                "unavailable_reason": "ledger reservation campaign does not match selected run"}
     bill = record.get("provider_billing", {}).get(provider)
     if not isinstance(bill, dict):
         return None
-    verified_event_ids = set()
+    history_items = bill.get("history", [])
+    if not isinstance(history_items, list) or not history_items:
+        return {"reserved": record.get("reserved_cost_usd"), "estimated": None, "actual": None,
+                "final": False, "reservation_id": reservation_id, "source_verified": False,
+                "source_refs": [], "unavailable_reason": "billing history is missing"}
     source_refs = []
-    for history in bill.get("history", []):
+    calculated = {"actual": Decimal("0"), "estimate": Decimal("0")}
+    seen_amount = {"actual": False, "estimate": False}
+    calculated_final = False
+    final_event_id = None
+    verified = True
+    for history in history_items:
         event_id = history.get("event_id") if isinstance(history, dict) else None
         event = ledger.get("events", {}).get(event_id)
         if not event:
-            continue
+            verified = False
+            break
         payload = event["payload"]
         source = Path(payload.get("source_path", ""))
         if not source.is_absolute():
@@ -94,20 +112,65 @@ def _verified_provider_bill(ledger: dict[str, Any], ledger_path: Path,
         try:
             source_hash = _sha(source.resolve(strict=True))
         except (OSError, ValueError):
-            continue
-        if (payload.get("reservation_id") == reservation_id and payload.get("provider") == provider
-                and payload.get("source_sha256") == history.get("source_sha256") == source_hash):
-            verified_event_ids.add(event_id)
-            source_refs.append({"event_id": event_id, "path": str(source.resolve()), "sha256": source_hash})
-    verified = bool(bill.get("history")) and all(
-        isinstance(item, dict) and item.get("event_id") in verified_event_ids for item in bill.get("history", []))
+            verified = False
+            break
+        if not (payload.get("reservation_id") == reservation_id and payload.get("provider") == provider
+                and payload.get("source_sha256") == history.get("source_sha256") == source_hash
+                and payload.get("incurred_usd") == history.get("amount_usd")
+                and payload.get("actual") == history.get("actual")
+                and payload.get("billing_final") == history.get("billing_final")
+                and payload.get("billing_amount_kind") == history.get("amount_kind")
+                and payload.get("occurred_at") == history.get("occurred_at")):
+            verified = False
+            break
+        try:
+            amount = Decimal(str(payload["incurred_usd"]))
+        except (KeyError, InvalidOperation, ValueError):
+            verified = False
+            break
+        if not amount.is_finite() or amount < 0 or payload.get("billing_amount_kind") not in {"cumulative", "delta"}:
+            verified = False
+            break
+        actual = payload.get("actual") is True
+        is_final = payload.get("billing_final") is True
+        if not isinstance(payload.get("actual"), bool) or not isinstance(payload.get("billing_final"), bool):
+            verified = False
+            break
+        if calculated_final:
+            # F11 freezes billing after a final event; later history cannot alter it.
+            verified = False
+            break
+        bucket = "actual" if actual else "estimate"
+        seen_amount[bucket] = True
+        kind = payload["billing_amount_kind"]
+        if is_final:
+            if not actual:
+                verified = False
+                break
+            calculated["actual"] = (amount if kind == "cumulative" else calculated["actual"] + amount)
+            calculated_final = True
+            final_event_id = event_id
+        elif kind == "delta":
+            calculated[bucket] += amount
+        else:
+            calculated[bucket] = max(calculated[bucket], amount)
+        source_refs.append({"event_id": event_id, "path": str(source.resolve()), "sha256": source_hash})
+    if bill.get("final") is not calculated_final or (calculated_final and bill.get("event_id") != final_event_id):
+        verified = False
+    if verified:
+        try:
+            aggregate_actual = Decimal(str(bill.get("actual_usd") or "0"))
+            aggregate_estimate = Decimal(str(bill.get("estimate_usd") or "0"))
+            verified = (aggregate_actual == calculated["actual"] and aggregate_estimate == calculated["estimate"])
+        except (InvalidOperation, ValueError):
+            verified = False
     return {"reserved": record.get("reserved_cost_usd"),
-            "estimated": bill.get("estimate_usd") if verified else None,
-            "actual": bill.get("actual_usd") if verified else None,
-            "final": bool(bill.get("final")) and verified,
+            "estimated": float(calculated["estimate"]) if verified and seen_amount["estimate"] else None,
+            "actual": float(calculated["actual"]) if verified and (seen_amount["actual"] or calculated_final) else None,
+            "final": calculated_final and verified,
             "reservation_id": reservation_id, "source_verified": verified,
             "source_refs": sorted(source_refs, key=lambda item: item["event_id"]),
-            "unavailable_reason": None if verified else "billing event source bytes were unavailable or did not match recorded hashes"}
+            "unavailable_reason": None if verified else "billing aggregate, event history, campaign, or source bytes disagree"}
 
 
 def _utc_window(raw: Any) -> dict[str, str] | None:
@@ -156,6 +219,14 @@ def _read_pair(item: Any, base: Path) -> tuple[ValidatorInput, ValidationResult,
     value, recorded = parsed
     if recorded.run_id != value.identity.run_id or recorded.mode != value.mode:
         raise ValueError("saved result run_id/mode must match ValidatorInput")
+    metrics = recorded.metrics.value
+    if metrics is not None:
+        expected_identity = value.identity.model_dump(mode="json") | {
+            "provider": str(value.provider), "scenario": str(value.scenario),
+            "mode": str(value.mode), "context": value.context,
+        }
+        if metrics.get("identity") is not None and metrics.get("identity") != expected_identity:
+            raise ValueError("saved result metrics identity/configuration does not match ValidatorInput")
     return value, recorded, source_rows, paths
 
 
@@ -177,6 +248,43 @@ def _deployment_summary(values: list[float]) -> dict[str, Any]:
     q1, q3 = _quantile(ordered, .25), _quantile(ordered, .75)
     return {"n": len(ordered), "points": ordered, "median": _quantile(ordered, .5),
             "q1": q1, "q3": q3, "iqr": q3 - q1}
+
+
+def _unique_deployment_attempts(rows: list[dict[str, Any]], value_of: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep one canonical value per deployment and reject conflicting attempts."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        value = value_of(row)
+        if value is not None:
+            grouped.setdefault(str(row["deployment_id"]), []).append(row)
+    kept, conflicts = [], []
+    for deployment_id, attempts in sorted(grouped.items()):
+        values = {value_of(item) for item in attempts}
+        if len(values) != 1:
+            conflicts.append(deployment_id)
+            continue
+        first = sorted(attempts, key=lambda item: item.get("run_id", ""))[0]
+        kept.append({**first, "run_ids": sorted({item.get("run_id") for item in attempts if item.get("run_id")}),
+            "source_refs": sorted({path for item in attempts for path in item.get("source_refs", [])}),
+            "study_dates": sorted({item.get("study_date") for item in attempts if item.get("study_date")}),
+            "study_weekdays": sorted({item.get("study_weekday") for item in attempts if item.get("study_weekday")})})
+    return kept, conflicts
+
+
+def _containing_window(windows: list[tuple[float, float]], starts: list[float],
+                       interval_start: float, interval_end: float) -> bool:
+    """Return whether one preserved acquisition window fully contains an interval."""
+    index = bisect_right(starts, interval_start) - 1
+    return index >= 0 and interval_end <= windows[index][1]
+
+
+def _diagnostic_alignment_scope(value: ValidatorInput,
+                                overlapping: list[tuple[Any, bool]]) -> list[tuple[Any, bool]]:
+    """Use the concrete probe chunk for DAY samples, not the enclosing day declaration."""
+    if str(value.mode) != "diagnostic_day":
+        return overlapping
+    chunks = {unit.unit_id for unit in value.measurement_units if unit.kind == "probe_chunk"}
+    return [item for item in overlapping if item[0].unit_id in chunks]
 
 
 def _bin_width(mode: Any) -> int:
@@ -205,6 +313,45 @@ def _histogram_data(values: list[float]) -> dict[str, Any]:
         index = min(49, max(0, int((value - low) / (high - low) * 50)))
         counts[index] += 1
     return {"edges_us": edges, "counts": counts}
+
+
+def _iperf_receiver_origin(tcp: Any) -> tuple[float, float] | None:
+    """Return native session interval UTC origin and the configured omit seconds."""
+    if tcp is None or len(tcp.session_details) != 1:
+        return None
+    detail = tcp.session_details[0]
+    start = detail.get("start") if isinstance(detail, dict) else None
+    if not isinstance(start, dict):
+        return None
+    test = start.get("test_start", start)
+    stamp = start.get("timestamp")
+    if isinstance(stamp, dict):
+        stamp = stamp.get("timesecs", stamp.get("time"))
+    try:
+        origin = float(stamp)
+        omit = float(test.get("omit", 0)) if isinstance(test, dict) else 0.0
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(origin) or not math.isfinite(omit) or omit < 0:
+        return None
+    return origin + omit, omit
+
+
+def _timing_clock_error(timing: Any, tool: str) -> float | None:
+    sources = timing.acquisition_sources.value or []
+    roles = {str(getattr(source.producer, "value", source.producer)) for source in sources
+             if source.tool == tool}
+    if not roles:
+        return None
+    errors = []
+    for role in roles:
+        matching = [mapping for mapping in timing.clock_mappings
+                    if str(getattr(mapping.vm_role, "value", mapping.vm_role)) == role
+                    and mapping.estimated_error_ms.value is not None]
+        if len(matching) != 1:
+            return None
+        errors.append(matching[0].estimated_error_ms.value / 1000)
+    return max(errors) if errors else None
 
 
 def _nonplacement_fingerprint(value: ValidatorInput) -> str | None:
@@ -306,13 +453,15 @@ def _placement_rows(inputs: list[ValidatorInput], run_rows: list[dict[str, Any]]
                 raw = row["rtt"].get("median_us", {}) if metric == "median_rtt_us" else row["receiver"].get("throughput_gbps", {})
                 value = raw.value if hasattr(raw, "value") else raw.get("value") if isinstance(raw, dict) else None
                 return float(value) if value is not None else None
-            left = [metric_value(row) for row in s1]; right = [metric_value(row) for row in s3]
-            left = [value for value in left if value is not None]; right = [value for value in right if value is not None]
+            s1_unique, s1_conflicts = _unique_deployment_attempts(s1, metric_value)
+            s3_unique, s3_conflicts = _unique_deployment_attempts(s3, metric_value)
+            left = [metric_value(row) for row in s1_unique]
+            right = [metric_value(row) for row in s3_unique]
             left_med = _quantile(left, .5) if left else None; right_med = _quantile(right, .5) if right else None
             difference = (right_med-left_med) if left_med is not None and right_med is not None and metric == "median_rtt_us" else None
             relative = (100*(right_med/left_med-1)) if left_med and right_med is not None and metric == "throughput_gbps" else None
-            dates = {"S1": sorted({row.get("study_date", "unavailable") for row in s1}),
-                     "S3": sorted({row.get("study_date", "unavailable") for row in s3})}
+            dates = {"S1": sorted({row.get("study_date", "unavailable") for row in s1_unique}),
+                     "S3": sorted({row.get("study_date", "unavailable") for row in s3_unique})}
             same_week = bool(dates["S1"] and dates["S3"] and dates["S1"][0] != "unavailable"
                 and dates["S3"][0] != "unavailable" and len({datetime.fromisoformat(day).isocalendar()[:2]
                 for day in dates["S1"] + dates["S3"]}) == 1)
@@ -329,11 +478,12 @@ def _placement_rows(inputs: list[ValidatorInput], run_rows: list[dict[str, Any]]
                 "baseline": {"scenario": "same_zone", "value": left_med}, "comparison": {"scenario": "placement_optimization", "value": right_med},
                 "rtt_difference_us": {"value": difference} if difference is not None else {"unavailable_reason": unavailable or "not an RTT metric"},
                 "throughput_change_percent": {"value": relative} if relative is not None else {"unavailable_reason": unavailable or "not a throughput metric"},
-                "n_s1": len({row["deployment_id"] for row in s1}), "n_s3": len({row["deployment_id"] for row in s3}),
+                "n_s1": len(s1_unique), "n_s3": len(s3_unique),
                 "s1_run_ids": s1_runs, "s3_run_ids": s3_runs, "study_dates": dates,
                 "source_refs": sorted({path for row in (*s1, *s3) for path in row["source_refs"]}),
                 "same_utc_week": same_week, "same_week_deviation": None if same_week else "selected scenario dates are not all in the same UTC week",
                 "eligible": bool(left and right and not (metric == "throughput_gbps" and left_med == 0)),
+                "excluded_conflicting_deployment_ids": {"S1": s1_conflicts, "S3": s3_conflicts},
                 "unavailable_reason": unavailable})
     return output
 
@@ -348,8 +498,34 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
     run_rows: list[dict[str, Any]] = []
     bins: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
+    for record in value.artifact_records:
+        try:
+            resolved = _artifact_path(value, record).resolve(strict=True)
+        except (OSError, ValueError):
+            resolved = None
+        sources.append({"run_id": value.identity.run_id, "artifact_id": record.artifact_id,
+            "kind": str(record.kind), "path": record.path,
+            "resolved_path": str(resolved) if resolved else None,
+            "sha256": record.sha256.value, "unit_id": record.unit_id,
+            "producer": str(record.producer)})
+    for artifact_id, path, digest in (
+        ("config_snapshot", value.config_snapshot_path, value.config_sha256),
+        ("resolved_snapshot", value.resolved_snapshot_path, value.resolved_sha256.value),
+        ("schedule_snapshot", value.schedule_snapshot_path.value, value.schedule_sha256.value),
+    ):
+        if path and digest:
+            resolved = Path(path)
+            if not resolved.is_absolute():
+                resolved = Path(value.child_result_root) / resolved
+            sources.append({"run_id": value.identity.run_id, "artifact_id": artifact_id,
+                "kind": "provenance_snapshot", "path": str(path),
+                "resolved_path": str(resolved.resolve()), "sha256": digest, "unit_id": None})
     units_metrics = result.metrics.value.get("units", []) if result.metrics.value is not None else []
     metrics_by_unit = {item.get("unit_id"): item for item in units_metrics if isinstance(item, dict)}
+    window_start = datetime.fromisoformat(utc_window["start"].replace("Z", "+00:00")).timestamp() if utc_window else None
+    window_end = datetime.fromisoformat(utc_window["end"].replace("Z", "+00:00")).timestamp() if utc_window else None
+    day_origin_timing = next((item for item in value.timings
+        if item.unit_id in {unit.unit_id for unit in value.measurement_units if unit.kind == "continuous_day"}), None)
     for unit in value.measurement_units:
         sock, tcp = _parse_unit(value, unit, records)
         samples = _measured_samples(value, unit, sock, acquisition)
@@ -357,24 +533,71 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         mapping = next((item for item in timing.clock_mappings if str(getattr(item.vm_role, "value", item.vm_role)) == "vm_a"
                         and item.estimated_error_ms.value is not None), None) if timing else None
         measured_start = timing.measured_started_at.value.timestamp() if timing and timing.measured_started_at.value else None
-        window_start = datetime.fromisoformat(utc_window["start"].replace("Z", "+00:00")).timestamp() if utc_window else None
-        window_end = datetime.fromisoformat(utc_window["end"].replace("Z", "+00:00")).timestamp() if utc_window else None
+        origin_timing = day_origin_timing if str(value.mode) == "diagnostic_day" else timing
+        axis_origin = origin_timing.measured_started_at.value.timestamp() if origin_timing and origin_timing.measured_started_at.value else None
         timed_samples = []
         for sample in samples:
-            if mapping is None or measured_start is None:
+            if mapping is None or axis_origin is None:
                 continue
             sample_utc = mapping.utc_timestamp.timestamp() + sample.tx_seconds - mapping.monotonic_seconds
             if (window_start is None or sample_utc >= window_start) and (window_end is None or sample_utc < window_end):
-                timed_samples.append((sample_utc - measured_start, sample))
-        selected_samples = tuple(sample for _, sample in timed_samples)
-        tcp_intervals = tuple(tcp.receiver_intervals) if tcp else ()
-        tcp_summary = receiver_statistics(tcp_intervals)
+                timed_samples.append((sample_utc - axis_origin, sample, sample_utc))
+        selected_samples = tuple(sample for _, sample, _ in timed_samples)
         unit_id = unit.unit_id
+        windows = acquisition.get(unit_id, ([], []))[0]
+        receiver_windows = _union_intervals((left, right) for tool, left, right in windows if tool == "iperf3")
+        receiver_window_starts = [left for left, _right in receiver_windows]
+        receiver_origin = _iperf_receiver_origin(tcp)
+        receiver_error = _timing_clock_error(timing, "iperf3") if timing else None
+        receiver_intervals = tuple(tcp.receiver_intervals) if tcp else ()
+        selected_receiver = [] if utc_window is not None else list(receiver_intervals)
+        mapped_receiver: list[tuple[float, float, Any]] = []
+        receiver_reason = "native receiver session timestamp or bounded acquisition clock mapping is unavailable"
+        if receiver_origin is not None and receiver_error is not None and receiver_windows:
+            session_origin, _omit = receiver_origin
+            uncertainty = receiver_error
+            selected_receiver = []
+            for interval in receiver_intervals:
+                absolute_start = session_origin + interval.start_seconds
+                absolute_end = session_origin + interval.end_seconds
+                supported = _containing_window(receiver_windows, receiver_window_starts,
+                    absolute_start - uncertainty, absolute_end + uncertainty)
+                selected = ((window_start is None or absolute_start - uncertainty >= window_start)
+                            and (window_end is None or absolute_end + uncertainty <= window_end))
+                if supported and selected:
+                    selected_receiver.append(interval)
+                    if axis_origin is not None:
+                        mapped_receiver.append((absolute_start, absolute_end, interval))
+            receiver_reason = "no whole receiver intervals are supported inside the selected UTC acquisition window"
+        if utc_window is not None and receiver_origin is None:
+            tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=receiver_reason),
+                "measured_seconds": Evidence[float](unavailable_reason=receiver_reason),
+                "throughput_gbps": Evidence[float](unavailable_reason=receiver_reason)}
+        elif utc_window is not None and (receiver_error is None or not receiver_windows):
+            tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=receiver_reason),
+                "measured_seconds": Evidence[float](unavailable_reason=receiver_reason),
+                "throughput_gbps": Evidence[float](unavailable_reason=receiver_reason)}
+        elif utc_window is not None:
+            tcp_summary = receiver_statistics(selected_receiver)
+        else:
+            tcp_summary = receiver_statistics(receiver_intervals)
+        schedule = value.schedule_entry.value
+        study_start = timing.measured_started_at.value if timing else None
+        study_date = study_start.date().isoformat() if study_start else None
         run_rows.append({
-            "run_id": value.identity.run_id, "deployment_id": value.identity.deployment_id,
+            "run_id": value.identity.run_id, "attempt_id": value.identity.run_id,
+            "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
+            "config_id": value.identity.config_id, "deployment_id": value.identity.deployment_id,
             "provider": str(value.provider), "scenario": str(value.scenario), "mode": str(value.mode),
             "context": value.context, "unit_id": unit_id, "kind": str(unit.kind),
-            "phase": str(unit.phase), "streams": unit.streams,
+            "phase": str(unit.phase), "streams": unit.streams, "study_start_utc": study_start.isoformat() if study_start else None,
+            "study_date": study_date, "study_weekday": study_start.strftime("%A") if study_start else None,
+            "schedule_entry_id": schedule.entry_id if schedule else None,
+            "schedule_window_label": schedule.window_label if schedule else None,
+            "schedule_source_path": schedule.source_path if schedule else None,
+            "schedule_source_sha256": schedule.source_sha256 if schedule else None,
+            "acquisition_chunk_start_utc": timing.measured_started_at.value.isoformat() if timing and timing.measured_started_at.value else None,
+            "acquisition_chunk_end_utc": timing.measured_finished_at.value.isoformat() if timing and timing.measured_finished_at.value else None,
             "data_validity": str(result.validation_status.data_validity),
             "current_data_validity": str(result.validation_status.data_validity),
             "recorded_data_validity": str(recorded.validation_status.data_validity),
@@ -386,35 +609,67 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             "metadata": [item.model_dump(mode="json") for item in value.vm_metadata_records],
             "original_unit": metrics_by_unit.get(unit_id, {}),
             "source_refs": sorted({sample.source.path for sample in selected_samples} |
-                                   {interval.source.path for interval in tcp_intervals}),
+                                   {interval.source.path for interval in (selected_receiver if utc_window else receiver_intervals)}),
         })
         width = _bin_width(value.mode)
         support = _source_supported_windows(unit, acquisition)
-        if mapping and measured_start is not None:
-            support = [(max(left, measured_start, window_start or left),
-                        min(right, window_end or right)) for left, right in support
-                       if min(right, window_end or right) > max(left, measured_start, window_start or left)]
+        if axis_origin is not None:
+            support = [(max(left, axis_origin, window_start if window_start is not None else left),
+                        min(right, window_end if window_end is not None else right)) for left, right in support
+                       if min(right, window_end if window_end is not None else right) >
+                       max(left, axis_origin, window_start if window_start is not None else left)]
+        else:
+            support = []
         indices: set[int] = set()
         for left, right in support:
-            first = max(0, math.floor((left - measured_start) / width)) if measured_start is not None else 0
-            last = math.ceil((right - measured_start) / width) if measured_start is not None else first
+            first = max(0, math.floor((left - axis_origin) / width))
+            last = math.ceil((right - axis_origin) / width)
             indices.update(range(first, max(first, last)))
-        sample_bins = dict(_sample_bins(timed_samples, width))
+        sample_bins = dict(_sample_bins([(elapsed, sample) for elapsed, sample, _ in timed_samples], width))
+        receiver_bins: dict[int, list[Any]] = {}
+        receiver_bin_reasons: dict[int, set[str]] = {}
+        if receiver_origin is not None and receiver_error is not None and receiver_windows and axis_origin is not None:
+            for interval_start, interval_end, interval in mapped_receiver:
+                start_elapsed, end_elapsed = interval_start - axis_origin, interval_end - axis_origin
+                index = math.floor(start_elapsed / width)
+                bin_start, bin_end = index * width + axis_origin, (index + 1) * width + axis_origin
+                if interval_start - receiver_error >= bin_start and interval_end + receiver_error <= bin_end:
+                    receiver_bins.setdefault(index, []).append(interval)
+                    indices.add(index)
+                else:
+                    receiver_bin_reasons.setdefault(index, set()).add("receiver interval straddles a bin boundary")
         for index in sorted(indices):
             start, end = index * width, (index + 1) * width
             bucket_samples = sample_bins.get(index, [])
             rtt = rtt_statistics([sample.rtt_us for _, sample in bucket_samples])
-            overlaps = [(max(left, measured_start + start), min(right, measured_start + end))
-                        for left, right in support if measured_start is not None
-                        and min(right, measured_start + end) > max(left, measured_start + start)]
+            overlaps = [(max(left, axis_origin + start), min(right, axis_origin + end))
+                        for left, right in support
+                        if min(right, axis_origin + end) > max(left, axis_origin + start)]
             supported_seconds = sum(right - left for left, right in overlaps)
-            source_paths = {sample.source.path for _, sample in bucket_samples}
+            bucket_receiver = receiver_bins.get(index, [])
+            receiver_metrics = receiver_statistics(bucket_receiver)
+            if not bucket_receiver:
+                reason = "; ".join(sorted(receiver_bin_reasons.get(index, set()))) or receiver_reason
+                receiver_metrics = {"received_bytes": Evidence[int](unavailable_reason=reason),
+                    "measured_seconds": Evidence[float](unavailable_reason=reason),
+                    "throughput_gbps": Evidence[float](unavailable_reason=reason)}
+            source_paths = {sample.source.path for _, sample in bucket_samples} | {item.source.path for item in bucket_receiver}
             bins.append({"run_id": value.identity.run_id, "deployment_id": value.identity.deployment_id,
-                "unit_id": unit_id, "mode": str(value.mode), "kind": str(unit.kind),
-                "axis": "utc-mapped elapsed seconds from measured start", "start_seconds": start,
-                "end_seconds": end, "nominal_seconds": width, "supported_seconds": supported_seconds,
+                "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
+                "config_id": value.identity.config_id, "attempt_id": value.identity.run_id,
+                "unit_id": unit_id, "chunk_id": unit_id if unit.kind == "probe_chunk" else None,
+                "mode": str(value.mode), "kind": str(unit.kind), "phase": str(unit.phase),
+                "study_date": study_date, "study_weekday": study_start.strftime("%A") if study_start else None,
+                "schedule_entry_id": schedule.entry_id if schedule else None,
+                "schedule_window_label": schedule.window_label if schedule else None,
+                "acquisition_chunk_start_utc": timing.measured_started_at.value.isoformat() if timing and timing.measured_started_at.value else None,
+                "acquisition_chunk_end_utc": timing.measured_finished_at.value.isoformat() if timing and timing.measured_finished_at.value else None,
+                "axis": "UTC-mapped seconds from continuous-day origin" if str(value.mode) == "diagnostic_day" else "UTC-mapped elapsed seconds from measured start",
+                "start_seconds": start, "end_seconds": end, "nominal_seconds": width,
+                "supported_seconds": supported_seconds,
                 "coverage": "supported" if supported_seconds >= width else "partial or acquisition gap",
-                "rtt": rtt, "receiver_bytes": {"unavailable_reason": "receiver intervals are not mapped to per-bin UTC bounds"},
+                "rtt": rtt, "receiver_bytes": receiver_metrics, "receiver": receiver_metrics,
+                "receiver_supported_seconds": receiver_metrics["measured_seconds"].value or 0,
                 "source_refs": sorted(source_paths)})
         for parsed in (sock, tcp):
             if parsed:
@@ -424,6 +679,37 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                         sources.append({"run_id": value.identity.run_id, "artifact_id": ref.artifact_id,
                             "path": ref.path, "resolved_path": str((Path(value.child_result_root) / ref.path).resolve()),
                             "sha256": ref.sha256, "unit_id": ref.unit_id})
+    if str(value.mode) == "diagnostic_day" and day_origin_timing is not None:
+        day_start = day_origin_timing.measured_started_at.value
+        day_finish = day_origin_timing.measured_finished_at.value
+        if day_start is not None and day_finish is not None:
+            duration = max(0.0, (day_finish - day_start).total_seconds())
+            width = 60
+            present = {int(row["start_seconds"] // width) for row in bins if row.get("mode") == "diagnostic_day"}
+            parent_unit = next((unit for unit in value.measurement_units if unit.kind == "continuous_day"), None)
+            schedule = value.schedule_entry.value
+            missing = {"received_bytes": Evidence[int](unavailable_reason="no whole source-supported receiver interval in this minute"),
+                "measured_seconds": Evidence[float](unavailable_reason="no whole source-supported receiver interval in this minute"),
+                "throughput_gbps": Evidence[float](unavailable_reason="no whole source-supported receiver interval in this minute")}
+            for index in range(math.ceil(duration / width)):
+                if index in present:
+                    continue
+                start = index * width
+                bins.append({"run_id": value.identity.run_id, "attempt_id": value.identity.run_id,
+                    "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
+                    "config_id": value.identity.config_id, "deployment_id": value.identity.deployment_id,
+                    "unit_id": parent_unit.unit_id if parent_unit else "continuous-day", "chunk_id": None,
+                    "mode": "diagnostic_day", "kind": "acquisition_gap",
+                    "phase": str(parent_unit.phase) if parent_unit else "multi_flow",
+                    "study_date": day_start.date().isoformat(), "study_weekday": day_start.strftime("%A"),
+                    "schedule_entry_id": schedule.entry_id if schedule else None,
+                    "schedule_window_label": schedule.window_label if schedule else None,
+                    "acquisition_chunk_start_utc": None, "acquisition_chunk_end_utc": None,
+                    "axis": "UTC-mapped seconds from continuous-day origin", "start_seconds": start,
+                    "end_seconds": min(start + width, duration), "nominal_seconds": width,
+                    "supported_seconds": 0.0, "coverage": "unsupported whole-minute acquisition gap",
+                    "rtt": rtt_statistics([]), "receiver_bytes": missing, "receiver": missing,
+                    "receiver_supported_seconds": 0.0, "source_refs": []})
     return run_rows, bins, sources
 
 
@@ -482,20 +768,33 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
     all_runs: list[dict[str, Any]] = []
     all_bins: list[dict[str, Any]] = []
     all_sources: list[dict[str, Any]] = []
-    deployments: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
-    deployment_points_seen: set[tuple[str, str, str, str, str, str]] = set()
-    deployment_point_values: dict[tuple[str, str, str, str, str, str], float] = {}
+    deployment_candidates: dict[tuple[str, str, str, str, str], dict[str, list[dict[str, Any]]]] = {}
     deployment_conflicts: list[dict[str, str]] = []
     costs = []
     reliability = []
     diagnostics = []
     current_results = []
     current_inputs = []
+    saved_metric_checks: dict[str, dict[str, Any]] = {}
+    if cost_path is not None:
+        all_sources.append({"run_id": "", "artifact_id": "cost_snapshot", "kind": "cost_snapshot",
+            "path": str(cost_path), "resolved_path": str(cost_path), "sha256": cost["sha256"], "unit_id": None})
     for value, recorded, descriptor_sources, _key in loaded:
         current = validate_bundle(value, evaluated_at=recorded.evaluated_at)
+        recorded_metrics = recorded.metrics.value or {}
+        current_metrics = current.metrics.value or {}
+        differing_metric_fields = sorted(key for key in set(recorded_metrics) | set(current_metrics)
+            if recorded_metrics.get(key) != current_metrics.get(key))
+        saved_metric_checks[value.identity.run_id] = {"consistent": not differing_metric_fields,
+            "differing_fields": differing_metric_fields,
+            "unavailable_reason": None if not differing_metric_fields else
+                "saved result metric projection differs from F08 replay at its recorded evaluation time"}
         current_inputs.append(value)
         current_results.append(current)
         run_rows, bins, native_sources = _unit_rows(value, current, recorded, window)
+        for row in run_rows:
+            row["saved_result_metrics_consistent"] = saved_metric_checks[value.identity.run_id]["consistent"]
+            row["saved_result_differing_fields"] = saved_metric_checks[value.identity.run_id]["differing_fields"]
         all_runs.extend(run_rows)
         all_bins.extend(bins)
         all_sources.extend(descriptor_sources + native_sources)
@@ -523,21 +822,19 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
                 metrics.append(("throughput_gbps", float(throughput_value)))
             for metric_name, metric_value in metrics:
                 group = (row["provider"], row["scenario"], row["phase"], window_label, metric_name)
-                point_key = (*group, row["deployment_id"])
-                if point_key not in deployment_points_seen:
-                    deployment_points_seen.add(point_key)
-                    deployment_point_values[point_key] = metric_value
-                    deployments.setdefault(group, []).append({"run_id": row["run_id"],
-                        "deployment_id": row["deployment_id"], "value": metric_value,
-                        "study_date": date_label, "window_label": window_label,
-                        "source_refs": row["source_refs"]})
-                elif deployment_point_values[point_key] != metric_value:
-                    deployment_conflicts.append({"deployment_id": row["deployment_id"], "metric": metric_name,
-                        "reason": "selected attempts for one deployment disagree; counted once as an independent deployment"})
-        reliability.append({"run_id": value.identity.run_id, "provider": str(value.provider),
+                deployment_candidates.setdefault(group, {}).setdefault(row["deployment_id"], []).append({
+                    "run_id": row["run_id"], "deployment_id": row["deployment_id"], "value": metric_value,
+                    "study_date": date_label, "study_weekday": row.get("study_weekday"),
+                    "window_label": window_label, "source_refs": row["source_refs"]})
+        reliability.append({"run_id": value.identity.run_id, "attempt_id": value.identity.run_id,
+            "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
+            "config_id": value.identity.config_id, "deployment_id": value.identity.deployment_id,
+            "provider": str(value.provider),
             "scenario": str(value.scenario), "mode": str(value.mode), "attempts": 1,
             "recorded_data_validity": str(recorded.validation_status.data_validity),
             "current_data_validity": str(current.validation_status.data_validity),
+            "saved_result_metrics_consistent": saved_metric_checks[value.identity.run_id]["consistent"],
+            "saved_result_differing_fields": saved_metric_checks[value.identity.run_id]["differing_fields"],
             "failure_reason": list(current.validation_status.data_reasons),
             "missing_phases": sorted({str(phase) for phase in value.enabled_phases} -
                 {str(row.get("phase")) for row in (current.metrics.value or {}).get("units", [])}),
@@ -554,65 +851,126 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
             roles = {str(getattr(mapping.vm_role, "value", mapping.vm_role)) for mapping in timing.clock_mappings
                      if mapping.estimated_error_ms.value is not None}
             timing_alignments.append(len(roles) == 2 and len(errors) == 2 and max(errors) <= 100)
-        alignment_eligible = any(timing_alignments)
         metric_fields = ("cpu_total_percent", "cpu_max_core_percent", "cpu_steal_percent",
             "tcp_retransmissions", "interface_rx_drops", "interface_tx_drops",
             "interface_rx_errors", "interface_tx_errors", "rx_bytes", "tx_bytes")
         for sample in value.diagnostics:
             role = str(getattr(sample.vm_role, "value", sample.vm_role))
             source_key = "vm_a_diagnostics" if role == "vm_a" else "vm_b_diagnostics"
+            sample_start = sample.sampled_at.timestamp() - sample.interval_seconds
+            sample_end = sample.sampled_at.timestamp()
+            overlapping = []
+            for timing, aligned in zip(value.timings, timing_alignments):
+                left, right = timing.measured_started_at.value, timing.measured_finished_at.value
+                if left is not None and right is not None and sample_start < right.timestamp() and sample_end > left.timestamp():
+                    overlapping.append((timing, aligned))
+            scoped = _diagnostic_alignment_scope(value, overlapping)
+            alignment_eligible = bool(scoped) and all(item[1] for item in scoped)
+            alignment_reason = (None if alignment_eligible else
+                "no overlapping measurement unit has both VM clock mappings within 100 ms")
             diagnostics.append({"run_id": value.identity.run_id, "vm_role": role,
                 "sampled_at": sample.sampled_at.isoformat().replace("+00:00", "Z"),
                 "monotonic_seconds": sample.monotonic_seconds, "interval_seconds": sample.interval_seconds,
                 "metrics": {name: getattr(sample, name).model_dump(mode="json") for name in metric_fields},
                 "reset_fields": list(sample.reset_fields), "gap_reason": sample.gap_reason,
+                "measurement_unit_ids": sorted({timing.unit_id for timing, _ in scoped}),
                 "clock_mappings_within_100ms": alignment_eligible,
+                "alignment_unavailable_reason": alignment_reason,
                 "source": diagnostic_source.get(source_key, {"unavailable_reason": "diagnostic source artifact is not recorded"})})
         provider_name = str(getattr(value.provider, "value", value.provider))
         reservation = value.reservation.value
         reservation_id = reservation.reservation_id.value if reservation else None
-        bill = (_verified_provider_bill(ledger, cost_path, reservation_id, provider_name)
+        bill = (_verified_provider_bill(ledger, cost_path, reservation_id, provider_name,
+                reservation.campaign_id if reservation else value.identity.campaign_id)
                 if ledger is not None and reservation_id else None)
         if bill:
             costs.append({"run_id": value.identity.run_id, "provider": provider_name,
+                "run_ids": [value.identity.run_id], "campaign_id": reservation.campaign_id if reservation else value.identity.campaign_id,
                 "reservation_id": reservation_id, "reservation": {"value": bill["reserved"], "scope": "shared reservation; not allocated"},
                 "actual": {"value": bill["actual"], "unavailable_reason": bill["unavailable_reason"]} if bill["actual"] is not None else {"unavailable_reason": bill["unavailable_reason"]},
                 "estimated": {"value": bill["estimated"]} if bill["estimated"] is not None else {"unavailable_reason": bill["unavailable_reason"]},
                 "final": bill["final"], "source_verified": bill["source_verified"],
-                "source_refs": bill["source_refs"],
+                "source_refs": bill["source_refs"] + ([{"event_id": "cost_snapshot", "path": str(cost_path), "sha256": cost["sha256"]}] if cost_path else []),
                 "runtime": {"unavailable_reason": "runtime not sourced"}, "transfer": {"unavailable_reason": "transfer not sourced"}})
         else:
             costs.append({"run_id": value.identity.run_id, "provider": provider_name,
+                "run_ids": [value.identity.run_id], "campaign_id": reservation.campaign_id if reservation else value.identity.campaign_id,
+                "reservation_id": reservation_id,
                 "reservation": {"unavailable_reason": "no matching verified reservation evidence"},
                 "actual": {"unavailable_reason": "no verified cost snapshot supplied"},
                 "estimated": {"unavailable_reason": "no verified cost snapshot supplied"},
                 "final": False, "runtime": {"unavailable_reason": "runtime not sourced"},
                 "transfer": {"unavailable_reason": "transfer not sourced"},
                 "source_refs": []})
+    deduplicated_costs: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in costs:
+        key = (item.get("reservation_id") or f"run:{item.get('run_id', '')}", item.get("provider", ""))
+        if key not in deduplicated_costs:
+            deduplicated_costs[key] = {**item, "run_ids": [item["run_id"]] if item.get("run_id") else []}
+        else:
+            existing = deduplicated_costs[key]
+            existing["run_ids"] = sorted(set(existing["run_ids"]) | ({item["run_id"]} if item.get("run_id") else set()))
+            existing["source_refs"] = sorted({json.dumps(ref, sort_keys=True) for ref in existing["source_refs"] + item.get("source_refs", [])})
+            existing["source_refs"] = [json.loads(ref) for ref in existing["source_refs"]]
+    costs = sorted(deduplicated_costs.values(), key=lambda row: (row.get("reservation_id") or "", row.get("provider", ""), row.get("run_id", "")))
     comparison_rows, comparison_results = _comparison_rows(current_inputs, current_results) if current_inputs else ([], {})
     for row in all_runs:
         current = comparison_results.get(row["run_id"])
         if current:
             row["comparison_eligibility"] = str(current.validation_status.comparison_eligibility)
+    deployments: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    for group, by_deployment in sorted(deployment_candidates.items()):
+        metric_name = group[-1]
+        flat = [item for attempts in by_deployment.values() for item in attempts]
+        selected, conflicts = _unique_deployment_attempts(flat, lambda row: row["value"])
+        for deployment_id in conflicts:
+            attempts = by_deployment[deployment_id]
+            deployment_conflicts.append({"deployment_id": deployment_id, "metric": metric_name,
+                "run_ids": json.dumps(sorted({item["run_id"] for item in attempts})),
+                "reason": "conflicting accepted attempt values; deployment excluded from this metric summary"})
+        for item in selected:
+            deployments.setdefault(group, []).append({**item,
+                "study_date": item.get("study_dates", [None])[0] if item.get("study_dates") else None,
+                "study_weekday": item.get("study_weekdays", [None])[0] if item.get("study_weekdays") else None})
     summary_rows = []
     for (provider, scenario, phase, window_label, metric), values in sorted(deployments.items()):
+        values = sorted(values, key=lambda item: (item["deployment_id"], item["value"]))
         points = [item["value"] for item in values]
         summary_rows.append({"provider": provider, "scenario": scenario, "phase": phase,
             "window_label": window_label, "metric": metric,
             "deployment_ids": sorted({item["deployment_id"] for item in values}),
-            "run_ids": sorted({item["run_id"] for item in values}),
+            "run_ids": sorted({run_id for item in values for run_id in item["run_ids"]}),
             "source_refs": sorted({path for item in values for path in item["source_refs"]}),
-            "study_dates": sorted({item["study_date"] for item in values}),
+            "study_dates": sorted({day for item in values for day in item["study_dates"]}),
+            "study_weekdays": sorted({item["study_weekday"] for item in values if item["study_weekday"]}),
             "points": points, **_deployment_summary(points)})
+    deployment_time_groups = []
+    for (provider, scenario, phase, window_label, metric), values in sorted(deployments.items()):
+        for basis, key_name in (("date", "study_date"), ("weekday", "study_weekday")):
+            groups_by_time: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for item in values:
+                time_key = item.get(key_name)
+                if time_key:
+                    groups_by_time.setdefault(time_key, {}).setdefault(item["deployment_id"], []).append(item)
+            for time_key, deployments_on_date in sorted(groups_by_time.items()):
+                points = []
+                for deployment_id, attempts in sorted(deployments_on_date.items()):
+                    vals = {attempt["value"] for attempt in attempts}
+                    if len(vals) == 1:
+                        points.append(next(iter(vals)))
+                if points:
+                    deployment_time_groups.append({"provider": provider, "scenario": scenario,
+                        "phase": phase, "window_label": window_label, "metric": metric,
+                        "date_basis": basis, "date_or_weekday": time_key, **_deployment_summary(points)})
     placement_rows = _placement_rows(current_inputs, all_runs)
     day_context = []
     for run_id in sorted({row["run_id"] for row in all_runs if row["mode"] == "diagnostic_day"}):
         run_bins = [row for row in all_bins if row["run_id"] == run_id and row.get("mode") == "diagnostic_day"
-            and row.get("kind") == "continuous_day"]
-        initial = [row["rtt"]["median_us"]["value"] for row in run_bins if row["start_seconds"] < 300
-            and row["rtt"].get("median_us", {}).get("value") is not None]
-        later = [row["rtt"]["median_us"]["value"] for row in run_bins if row["start_seconds"] >= 300
-            and row["rtt"].get("median_us", {}).get("value") is not None]
+            and row.get("rtt", {}).get("valid_replies", 0)]
+        initial = [row["rtt"]["median_us"].value for row in run_bins if row["start_seconds"] < 300
+            and row["rtt"]["median_us"].value is not None]
+        later = [row["rtt"]["median_us"].value for row in run_bins if row["start_seconds"] >= 300
+            and row["rtt"]["median_us"].value is not None]
         day_context.append({"run_id": run_id, "scope": "descriptive RTT medians during sustained TCP load",
             "initial_300_seconds": _deployment_summary(initial) if initial else {"unavailable_reason": "no supported RTT bins in initial 300 seconds"},
             "subsequent_supported_bins": _deployment_summary(later) if later else {"unavailable_reason": "no later supported RTT bins"},
@@ -648,11 +1006,14 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
             "partial": sum(row["attempt_status"] == "partial" for row in reliability),
             "failed_or_unavailable": sum(row["attempt_status"] == "failed_or_unavailable" for row in reliability),
             "replacement_links": sum(row.get("replacement_of") is not None for row in reliability)},
-        "reliability": sorted(reliability, key=lambda row: row["run_id"]), "costs": sorted(costs, key=lambda row: row["run_id"]),
+        "reliability": sorted(reliability, key=lambda row: row["run_id"]), "costs": sorted(costs, key=lambda row: row.get("reservation_id") or row.get("run_id", "")),
+        "deployment_time_groups": deployment_time_groups,
         "findings": sorted([{"run_id": result.run_id, "data_validity": str(result.validation_status.data_validity),
             "data_reasons": list(result.validation_status.data_reasons),
             "comparison_eligibility": str(result.validation_status.comparison_eligibility),
             "comparison_reasons": list(result.validation_status.comparison_reasons),
+            "saved_result_metrics_consistent": saved_metric_checks[result.run_id]["consistent"],
+            "saved_result_differing_fields": saved_metric_checks[result.run_id]["differing_fields"],
             "finding_codes": sorted({finding.code for finding in result.findings})} for result in current_results], key=lambda row: row["run_id"]),
         "cohort_findings": sorted(deployment_conflicts, key=lambda row: (row["deployment_id"], row["metric"]))}
     return AnalysisReport(payload=_jsonable(payload), protected_paths=tuple(dict.fromkeys(protected)))

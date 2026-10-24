@@ -24,6 +24,17 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
         assert all(row["nominal_seconds"] == expected_width for row in report["bins"])
         assert (output / "index.html").is_file()
         assert (output / "figures" / "time-series.png").is_file()
+        assert (output / "figures" / "receiver-time-series.svg").is_file()
+        assert all("receiver" in row and "source_refs" in row for row in report["bins"])
+        if mode == "diagnostic_day":
+            context = report["day_load_context"][0]
+            assert context["initial_300_seconds"].get("n", 0) > 0
+            assert context["subsequent_supported_bins"].get("n", 0) > 0
+            assert context["idle_baseline"]["unavailable_reason"]
+            assert {row["axis"] for row in report["bins"]} == {
+                "UTC-mapped seconds from continuous-day origin"}
+            assert all(row["chunk_id"] for row in report["bins"]
+                if row["kind"] == "probe_chunk")
 
 
 def test_analyze_cli_structural_error_returns_two_and_keeps_legacy_cli(repository_root, tmp_path, capsys):
@@ -108,6 +119,9 @@ def test_s1_s3_scenario_distributions_are_kept_distinct_and_directional(reposito
     assert paired[0]["direction"] == "S3 minus S1"
     assert paired[0]["rtt_difference_us"]["value"] == 0
     assert paired[0]["config_ids"]["S1"] != paired[0]["config_ids"]["S3"]
+    assert paired[0]["study_dates"]["S1"] and paired[0]["study_dates"]["S3"]
+    assert paired[0]["same_utc_week"] is True
+    assert any(row["date_basis"] in {"date", "weekday"} for row in report["deployment_time_groups"])
     generated = write_analysis(analyzed, tmp_path / "s1-s3-report")
     assert any(path.name == "placement-comparison.png" for path in generated)
 
