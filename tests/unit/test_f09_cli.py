@@ -5,6 +5,7 @@ from pathlib import Path
 
 from cloud_network_benchmark.lifecycle_cli import main, preview_lifecycle
 from cloud_network_benchmark.orchestration import SavedLifecycleRecovery, write_recovery_journal
+from cloud_network_benchmark.cli import main as root_main
 
 
 def test_lifecycle_module_help_is_available(capsys):
@@ -46,6 +47,32 @@ def test_cli_requires_explicit_paid_scope_for_run():
         assert exc.code == 0
     else:
         raise AssertionError("argparse help must exit successfully")
+
+
+def test_root_cli_keeps_existing_commands_and_delegates_lifecycle_help(capsys):
+    for args, expected in ((["--help"], ("validate", "resolve", "dry-run", "init", "analyze", "lifecycle")),
+                           (["lifecycle", "--help"], ("preview", "run", "cleanup", "recommend-common-n"))):
+        try:
+            root_main(args)
+        except SystemExit as exc:
+            assert exc.code == 0
+        output = capsys.readouterr().out
+        assert all(command in output for command in expected)
+
+
+def test_root_lifecycle_run_uses_isolated_safe_refusal_without_side_effects(repository_root, tmp_path, capsys):
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"scope": "references-only"}))
+    results = tmp_path / "results"
+    private = tmp_path / "private"
+    code = root_main(["lifecycle", "run", "--config",
+        str(repository_root / "configs/tests/exp-900-single-provider.yaml"),
+        "--cost-inputs", str(repository_root / "tests/fixtures/f11/cost-inputs.json"),
+        "--runtime-config", str(runtime), "--results-root", str(results), "--private-root", str(private),
+        "--controller-session", "session-root-f09", "--execution-scope", "paid_request", "--format", "json"])
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1 and report["status"] == "rejected" and report["external_calls"] == 0
+    assert not results.exists() and not private.exists()
 
 
 def test_recovery_journal_is_private_exclusive_and_cli_cleanup_never_resumes(tmp_path, capsys):

@@ -31,6 +31,10 @@ def _parser() -> argparse.ArgumentParser:
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("--selection", type=Path, required=True)
     analyze.add_argument("--output", type=Path, required=True)
+    # The lifecycle command owns its nested parser. This placeholder keeps it
+    # visible in root help while allowing lifecycle_cli to parse subcommands.
+    subparsers.add_parser("lifecycle", add_help=False,
+                         help="inspect or request a lifecycle operation")
     return parser
 
 
@@ -41,9 +45,14 @@ def _json(value: object) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    command_line = list(sys.argv[1:] if argv is None else argv)
+    if command_line[:1] == ["lifecycle"]:
+        from .lifecycle_cli import main as lifecycle_main
+
+        return lifecycle_main(command_line[1:])
     parser = _parser()
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(command_line)
         root = _repository_root()
         if args.command == "analyze":
             from .analysis import analyze_selection

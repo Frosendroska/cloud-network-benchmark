@@ -1,6 +1,6 @@
 # F09 offline implementation acceptance
 
-This guide records the credential-free implementation checks. Never run lifecycle paid commands as part of this gate. Module-level preview is inspect-only; root CLI dispatch and final integrated checks wait for coordinator confirmation of F12 CLI integration.
+This guide records the credential-free implementation checks. Never run lifecycle paid commands as part of this gate. Preview is inspect-only; the root CLI delegates lifecycle subcommands to the isolated lifecycle parser after F12 CLI integration.
 
 ## Environment
 
