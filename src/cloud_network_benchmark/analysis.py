@@ -416,6 +416,29 @@ def _combine_day_minute_parts(parts: list[dict[str, Any]]) -> dict[str, Any]:
         "chunk_windows": chunk_windows}
 
 
+def _flush_completed_day_bins(accumulators: dict[int, list[dict[str, Any]]],
+                              completed_before_seconds: float) -> None:
+    """Reduce and release raw samples for minutes no later chunk can reach."""
+    completed_count = max(0, math.floor(completed_before_seconds / 60))
+    for index in sorted(key for key in accumulators if key < completed_count):
+        parts = accumulators[index]
+        if len(parts) == 1 and parts[0].get("_day_finalized"):
+            continue
+        aggregate = _combine_day_minute_parts(parts)
+        aggregate["_day_rtt"] = rtt_statistics([sample.rtt_us for sample in aggregate["samples"]])
+        aggregate["samples"] = []
+        aggregate["_day_finalized"] = True
+        accumulators[index] = [aggregate]
+
+
+def _chronological_day_units(units: list[Any], timings: list[Any]) -> list[Any]:
+    """Order DAY units by their recorded acquisition start before streaming reduction."""
+    starts = {timing.unit_id: (timing.measured_started_at.value.timestamp()
+        if timing.measured_started_at.value is not None else math.inf) for timing in timings}
+    return sorted(units, key=lambda unit: (starts.get(unit.unit_id, math.inf),
+        0 if unit.kind == "continuous_day" else 1, unit.unit_id))
+
+
 def _timing_clock_error(timing: Any, tool: str) -> float | None:
     sources = timing.acquisition_sources.value or []
     roles = {str(getattr(source.producer, "value", source.producer)) for source in sources
@@ -607,7 +630,22 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
     window_end = datetime.fromisoformat(utc_window["end"].replace("Z", "+00:00")).timestamp() if utc_window else None
     day_origin_timing = next((item for item in value.timings
         if item.unit_id in {unit.unit_id for unit in value.measurement_units if unit.kind == "continuous_day"}), None)
-    for unit in value.measurement_units:
+    units_to_parse = ( _chronological_day_units(value.measurement_units, value.timings)
+        if str(value.mode) == "diagnostic_day" else value.measurement_units)
+    day_chunk_units = [unit for unit in units_to_parse if unit.kind == "probe_chunk"]
+    day_chunk_watermarks: dict[str, float] = {}
+    if day_origin_timing and day_origin_timing.measured_started_at.value is not None:
+        origin_timestamp = day_origin_timing.measured_started_at.value.timestamp()
+        day_end = day_origin_timing.measured_finished_at.value.timestamp() if day_origin_timing.measured_finished_at.value else origin_timestamp
+        timing_by_unit = {timing.unit_id: timing for timing in value.timings}
+        for position, chunk in enumerate(day_chunk_units):
+            future_start = next((timing_by_unit[next_chunk.unit_id].measured_started_at.value.timestamp()
+                for next_chunk in day_chunk_units[position + 1:]
+                if next_chunk.unit_id in timing_by_unit
+                and timing_by_unit[next_chunk.unit_id].measured_started_at.value is not None), None)
+            safe_before = future_start if future_start is not None else day_end
+            day_chunk_watermarks[chunk.unit_id] = safe_before - origin_timestamp
+    for unit in units_to_parse:
         sock, tcp = _parse_unit(value, unit, records)
         samples = _measured_samples(value, unit, sock, acquisition)
         timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
@@ -794,6 +832,12 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                         sources.append({"run_id": value.identity.run_id, "artifact_id": ref.artifact_id,
                             "path": ref.path, "resolved_path": str((Path(value.child_result_root) / ref.path).resolve()),
                             "sha256": ref.sha256, "unit_id": ref.unit_id})
+        if unit.kind == "probe_chunk":
+            _flush_completed_day_bins(day_bin_accumulators,
+                day_chunk_watermarks.get(unit.unit_id, -math.inf))
+        # Native parse objects and per-chunk bins otherwise keep completed raw
+        # samples alive while the next chunk is being parsed.
+        sock = tcp = samples = timed_samples = selected_samples = sample_bins = bucket_samples = sample = part = parsed = None
     if str(value.mode) == "diagnostic_day" and day_origin_timing is not None:
         day_start = day_origin_timing.measured_started_at.value
         day_finish = day_origin_timing.measured_finished_at.value
@@ -817,7 +861,8 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                 selected_end_seconds = min(end, selected_end - day_start_timestamp)
                 selected_seconds = max(0.0, selected_end_seconds - selected_start_seconds)
                 parts = day_bin_accumulators.get(index, [])
-                aggregate = _combine_day_minute_parts(parts)
+                finalized = bool(parts and parts[0].get("_day_finalized"))
+                aggregate = parts[0] if finalized else _combine_day_minute_parts(parts)
                 support = _union_intervals([(max(left, day_start_timestamp + start),
                     min(right, day_start_timestamp + end)) for left, right in aggregate["support"]
                     if min(right, day_start_timestamp + end) > max(left, day_start_timestamp + start)])
@@ -838,7 +883,8 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                     supported_seconds = 0.0
                 else:
                     kind = "continuous_day_minute"
-                    rtt = rtt_statistics([sample.rtt_us for sample in aggregate["samples"]])
+                    rtt = aggregate["_day_rtt"] if finalized else rtt_statistics(
+                        [sample.rtt_us for sample in aggregate["samples"]])
                     if selected_seconds < width:
                         coverage = "partial UTC selection or measured-day tail"
                     else:

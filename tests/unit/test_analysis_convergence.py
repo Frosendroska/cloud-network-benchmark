@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from cloud_network_benchmark.analysis import (
     _containing_window,
     _combine_day_minute_parts,
+    _chronological_day_units,
     _deduplicate_cost_rows,
     _diagnostic_alignment_scope,
     _iperf_receiver_origin,
     _receiver_interval_bin,
     _receiver_bin_metrics,
+    _flush_completed_day_bins,
     _unique_deployment_attempts,
     _verified_provider_bill,
 )
@@ -92,6 +94,72 @@ def test_day_minute_combines_raw_samples_and_unions_chunk_support():
     assert sum(end - start for start, end in combined["support"]) == 60.0
     assert combined["chunk_ids"] == ["chunk-a", "chunk-b"]
     assert combined["source_refs"] == ["a.csv", "b.csv"]
+
+
+def test_day_chunk_flush_releases_completed_samples_and_keeps_cross_chunk_quantiles():
+    import gc
+    import weakref
+    from datetime import datetime, timedelta, timezone
+
+    class Sample:
+        def __init__(self, value):
+            self.rtt_us = value
+
+    def part(sample, chunk):
+        return {"samples": [sample], "support": [(0.0, 30.0)],
+            "chunk_ids": [chunk], "chunk_windows": {chunk: {"start_utc": chunk}},
+            "source_refs": [f"{chunk}.csv"]}
+
+    first, active_a, active_b = Sample(1.0), Sample(10.0), Sample(100.0)
+    first_ref, active_a_ref, active_b_ref = map(weakref.ref, (first, active_a, active_b))
+    accumulators = {0: [part(first, "chunk-a")], 1: [part(active_a, "chunk-a")],
+        2: [part(active_b, "chunk-a")]}
+    del first, active_a, active_b
+
+    # A non-minute-aligned next chunk start at 90s closes minute 0 only.
+    _flush_completed_day_bins(accumulators, 90.0)
+    gc.collect()
+    assert first_ref() is None
+    assert active_a_ref() is not None and active_b_ref() is not None
+    assert accumulators[0][0]["_day_rtt"]["median_us"].value == 1.0
+
+    cross_a, cross_b, active_c = Sample(20.0), Sample(200.0), Sample(1000.0)
+    cross_a_ref, cross_b_ref, active_c_ref = map(weakref.ref, (cross_a, cross_b, active_c))
+    accumulators[1].append(part(cross_a, "chunk-b"))
+    accumulators[2].append(part(cross_b, "chunk-b"))
+    accumulators[3] = [part(active_c, "chunk-b")]
+    del cross_a, cross_b, active_c
+
+    # A later start at 150s closes minute 1 after both chunks contribute;
+    # minute 2 remains raw because a future chunk can still reach it.
+    _flush_completed_day_bins(accumulators, 150.0)
+    gc.collect()
+    assert active_a_ref() is None and cross_a_ref() is None
+    assert active_b_ref() is not None and cross_b_ref() is not None
+    assert active_c_ref() is not None
+    merged = accumulators[1][0]
+    assert merged["_day_rtt"]["valid_replies"] == 2
+    assert merged["_day_rtt"]["median_us"].value == 15.0
+    assert merged["chunk_ids"] == ["chunk-a", "chunk-b"]
+    assert merged["source_refs"] == ["chunk-a.csv", "chunk-b.csv"]
+
+    _flush_completed_day_bins(accumulators, 180.0)
+    gc.collect()
+    assert active_b_ref() is None and cross_b_ref() is None
+    assert active_c_ref() is not None
+    _flush_completed_day_bins(accumulators, 240.0)
+    gc.collect()
+    assert active_c_ref() is None
+
+    units = [SimpleNamespace(unit_id=f"chunk-{name}", kind="probe_chunk")
+        for name in ("c", "a", "b")]
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    timings = [SimpleNamespace(unit_id=f"chunk-{name}", measured_started_at=SimpleNamespace(
+        value=base + timedelta(seconds=offset)))
+        for name, offset in (("a", 0), ("b", 90), ("c", 150))]
+    expected = ["chunk-a", "chunk-b", "chunk-c"]
+    assert [unit.unit_id for unit in _chronological_day_units(units, timings)] == expected
+    assert [unit.unit_id for unit in _chronological_day_units(list(reversed(units)), timings)] == expected
 
 
 def test_diagnostic_alignment_requires_every_concrete_overlapping_unit():

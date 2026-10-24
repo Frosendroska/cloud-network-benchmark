@@ -6,7 +6,7 @@ from cloud_network_benchmark.cli import main
 
 
 def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_root, tmp_path,
-        frozen_clock, deterministic_token, fake_git_commits, request):
+        frozen_clock, deterministic_token, fake_git_commits, request, monkeypatch):
     from tests.f12_support import materialize_f08_pair
     from cloud_network_benchmark.analysis import _iperf_receiver_origin
     from cloud_network_benchmark.validation import _parse_unit, _validate_artifacts
@@ -35,6 +35,24 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
         assert measured_intervals
         assert measured_start - .002 <= origin[0] + min(item.start_seconds for item in measured_intervals)
         assert origin[0] + max(item.end_seconds for item in measured_intervals) <= measured_end + .002
+        if mode == "diagnostic_day":
+            import weakref
+            import cloud_network_benchmark.analysis as analysis_module
+            prior_refs = []
+            prior_chunk = None
+            released_before_next_parse = []
+            original_parse = analysis_module._parse_unit
+            def track_native_lifetimes(current_value, current_unit, current_records):
+                nonlocal prior_refs, prior_chunk
+                if current_unit.kind == "probe_chunk" and prior_chunk is not None:
+                    released_before_next_parse.append((prior_chunk,
+                        sum(reference() is not None for reference in prior_refs)))
+                parsed_sock, parsed_tcp = original_parse(current_value, current_unit, current_records)
+                if current_unit.kind == "probe_chunk":
+                    prior_chunk = current_unit.unit_id
+                    prior_refs = [weakref.ref(sample) for sample in parsed_sock.samples] if parsed_sock else []
+                return parsed_sock, parsed_tcp
+            monkeypatch.setattr(analysis_module, "_parse_unit", track_native_lifetimes)
         output = case / "report"
         assert main(["analyze", "--selection", str(selection), "--output", str(output)]) == 0
         report = json.loads((output / "report.json").read_text(encoding="utf-8"))
@@ -47,6 +65,8 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
         assert (output / "figures" / "receiver-time-series.svg").is_file()
         assert all("receiver" in row and "source_refs" in row for row in report["bins"])
         if mode == "diagnostic_day":
+            assert len(released_before_next_parse) > 1
+            assert all(live == 0 for _chunk, live in released_before_next_parse), released_before_next_parse[:5]
             context = report["day_load_context"][0]
             assert context["initial_300_seconds"].get("n", 0) > 0
             assert context["subsequent_supported_bins"].get("n", 0) > 0
