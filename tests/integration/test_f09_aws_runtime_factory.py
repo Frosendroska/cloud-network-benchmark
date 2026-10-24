@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+import yaml
+
 from cloud_network_benchmark.admission import load_cost_inputs
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.common import Provider
@@ -140,6 +143,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.diagnostics_contexts = {}
         self.diagnostics_outcomes = {}
         self.inventory_roles = {}
+        self.full_native = False
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -207,6 +211,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             self.actions.append(action)
             from cloud_network_benchmark.lifecycle_guest import GuestRequest, execute_request
             from tests.f03_support import FakeClock as GuestClock, FakeProcesses
+            from tests.integration.test_acquisition_producer import _fixture_processes
             class NativeFixtureProcesses(FakeProcesses):
                 """Run the actual F03 driver while returning captured F08 grammar bytes."""
                 def start(self, request, *, stdout_path, stderr_path):
@@ -226,11 +231,75 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 "package_root": ROOT / "src/cloud_network_benchmark"})
             self.native_root.mkdir(parents=True, exist_ok=True)
             try:
-                outcome = execute_request(guest_request, processes=NativeFixtureProcesses(guest_clock), clock=guest_clock)
+                if self.full_native:
+                    processes = _fixture_processes(guest_clock)
+                    original_start = processes.start
+                    def source_observed_start(native_request, *, stdout_path, stderr_path):
+                        handle = original_start(native_request, stdout_path=stdout_path, stderr_path=stderr_path)
+                        executable = Path(native_request.argv[0]).name
+                        if executable == "sockperf":
+                            duration = int(native_request.argv[native_request.argv.index("-t") + 1])
+                            base_ns = int(handle.started_monotonic * 1_000_000_000)
+                            rows = []
+                            for line in stderr_path.read_text(encoding="utf-8").splitlines():
+                                if not line.startswith("CNB_ACQ_V1 "):
+                                    continue
+                                record = json.loads(line[len("CNB_ACQ_V1 "):])
+                                if record.get("record_kind") == "clock_anchor":
+                                    record.update(mono_before_ns=base_ns, realtime_ns=int(NOW.timestamp() * 1_000_000_000), mono_after_ns=base_ns + 1000)
+                                elif record.get("record_kind") == "probe_window":
+                                    record.update(sender_enabled_ns=base_ns + 1_000_000_000,
+                                        receiver_enabled_ns=base_ns + 1_100_000_000,
+                                        termination_ns=base_ns + duration * 1_000_000_000,
+                                        native_filter_start_ns=base_ns + 5_000_000_000,
+                                        native_filter_end_ns=base_ns + duration * 1_000_000_000)
+                                rows.append("CNB_ACQ_V1 " + json.dumps(record, separators=(",", ":")))
+                            stderr_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                            csv_path = Path(native_request.argv[native_request.argv.index("--full-log") + 1])
+                            sample_start = handle.started_monotonic + 5.1
+                            sample_end = handle.started_monotonic + duration - .1
+                            csv_path.write_text("sockperf: test output\n------------------------------\n"
+                                "packet, txTime(sec), rxTime(sec), rtt(usec)\n"
+                                f"0, {sample_start:.6f}, {sample_start + .000001:.6f}, 1.000\n"
+                                f"1, {sample_end:.6f}, {sample_end + .000001:.6f}, 1.000\n"
+                                "------------------------------\n"
+                                f"[Total Run] RunTime={duration:.3f} sec; Warm up time=5000 msec; SentMessages={duration * 1000}; ReceivedMessages=2\n"
+                                f"[Valid Duration] RunTime={duration - 5:.3f} sec; SentMessages={(duration - 5) * 1000}; ReceivedMessages=2\n",
+                                encoding="utf-8")
+                        elif executable == "iperf3":
+                            duration = int(native_request.argv[native_request.argv.index("-t") + 1])
+                            streams = int(native_request.argv[native_request.argv.index("-P") + 1])
+                            cookie = native_request.action_id
+                            settings = {"protocol": "TCP", "num_streams": streams, "omit": 5,
+                                "duration": duration, "interval": 1, "blksize": 131072, "reverse": False}
+                            connected = [{"socket": 17 + i, "local_host": guest_request.b_private_ipv4,
+                                "local_port": 5201, "remote_host": "10.60.1.10", "remote_port": 50100 + i}
+                                for i in range(streams)]
+                            rows = []
+                            for i in range(streams):
+                                rows.extend([{"socket": 17 + i, "start": 0, "end": 5, "seconds": 5,
+                                    "bytes": 250, "omitted": True, "sender": False},
+                                    {"socket": 17 + i, "start": 5, "end": duration, "seconds": duration - 5,
+                                    "bytes": 125000000 // streams, "omitted": False, "sender": False}])
+                            receiver = {"start": {"cookie": cookie, "test_start": settings, "connected": connected},
+                                "intervals": [{"streams": [row for row in rows if row["omitted"]]},
+                                    {"streams": [row for row in rows if not row["omitted"]]}],
+                                "end": {"sum_received": {"bytes": 125000000, "seconds": duration}}}
+                            client = {"start": {"cookie": cookie, "test_start": settings},
+                                "server_output_json": receiver,
+                                "end": {"sum_received": {"bytes": 125000000, "seconds": duration}}}
+                            stdout_path.write_text(json.dumps(client), encoding="utf-8")
+                        return handle
+                    processes.start = source_observed_start
+                else:
+                    processes = NativeFixtureProcesses(guest_clock)
+                outcome = execute_request(guest_request, processes=processes, clock=guest_clock)
             except Exception as exc:
                 self.guest_exception = f"{type(exc).__name__}: {exc}"
                 raise
             self.guest_outcome = outcome.model_dump_json()
+            if self.full_native:
+                self._write_source_observed_receiver_logs(outcome)
             return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-guest-outcome-"):
@@ -282,7 +351,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 tcp_retransmissions={"value":0}, interface_rx_drops={"value":0}, interface_tx_drops={"value":0},
                 interface_rx_errors={"value":0}, interface_tx_errors={"value":0}, rx_bytes={"value":1000}, tx_bytes={"value":1000})
             diag_path.write_text(sample.model_dump_json()+"\n", encoding="utf-8")
-            mapping = ClockMapping(vm_role=role, monotonic_seconds=1, utc_timestamp=NOW,
+            mapping = ClockMapping(vm_role=role, monotonic_seconds=1000 if self.full_native else 1, utc_timestamp=NOW,
                 estimated_error_ms={"value":1}, synchronization_source={"value":"synthetic chrony fixture"})
             (root / "diagnostics" / f"{role}-clock.jsonl").write_text(mapping.model_dump_json()+"\n", encoding="utf-8")
             output_root = context["output_root"]
@@ -352,6 +421,67 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
         return super().run(request)
 
+    def _write_source_observed_receiver_logs(self, outcome):
+        root = self.workspace_roots["vm_b"] / "server-logs"
+        root.mkdir(parents=True, exist_ok=True)
+        event_lines, source_lines = [], []
+        for command in outcome.commands:
+            request = command.get("request", {})
+            argv = request.get("argv", [])
+            if not argv or Path(argv[0]).name != "iperf3":
+                continue
+            duration = int(argv[argv.index("-t") + 1])
+            streams = int(argv[argv.index("-P") + 1])
+            cookie = command["result"]["action_id"]
+            settings = {"protocol": "TCP", "num_streams": streams, "omit": 5,
+                "duration": duration, "interval": 1, "blksize": 131072, "reverse": False}
+            start_mono = command["monotonic_started"]["value"]
+            start_us = int(start_mono * 1_000_000)
+            connected = [{"socket": 17 + i, "local_host": "10.60.1.11", "local_port": 5201,
+                "remote_host": "10.60.1.10", "remote_port": 50100 + i} for i in range(streams)]
+            native_intervals = []
+            for i in range(streams):
+                native_intervals.extend([
+                    {"socket": 17 + i, "start": 0, "end": 5, "seconds": 5, "bytes": 250,
+                        "omitted": True, "sender": False},
+                    {"socket": 17 + i, "start": 5, "end": duration, "seconds": duration - 5,
+                        "bytes": 125000000 // streams, "omitted": False, "sender": False}])
+            session_start = NOW + timedelta(seconds=start_mono - 1000)
+            events = [{"event": "start", "data": {"cookie": cookie, "test_start": settings,
+                "connected": connected, "timestamp": {"timesecs": session_start.timestamp()}}},
+                {"event": "interval", "data": {"streams": [row for row in native_intervals if row["omitted"]]}},
+                {"event": "interval", "data": {"streams": [row for row in native_intervals if not row["omitted"]]}},
+                {"event": "end", "data": {"sum_received": {"bytes": 125000000, "seconds": duration}}}]
+            event_lines.extend(json.dumps(event, separators=(",", ":")) for event in events)
+            common = {"format": 1, "tool": "iperf3", "semantics_id": "iperf-3.17.1-stats-v1",
+                "invocation_id": "f02r-vm_b-listener-iperf3", "pid": 51,
+                "boot_id": "12345678-1234-4234-8234-123456789def", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
+            anchor = {**common, "record_kind": "clock_anchor", "mono_before_ns": 1_000_000_000_000,
+                "realtime_ns": int(NOW.timestamp() * 1_000_000_000), "mono_after_ns": 1_000_000_001_000}
+            source_lines.append("CNB_ACQ_V1 " + json.dumps(anchor, separators=(",", ":")))
+            source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "session_settings",
+                "protocol": "TCP", "num_streams": streams, "omit": 5, "duration": duration,
+                "interval_us": 1_000_000, "block_size": 131072, "reverse": False}, separators=(",", ":")))
+            for i in range(streams):
+                stream = str(17 + i)
+                initial, post = start_us, start_us + 5_000_000
+                source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "stats_origin",
+                    "stream_id": stream, "phase": "initial", "origin_us": initial,
+                    "start_time_fixed_us": initial}, separators=(",", ":")))
+                source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "stats_origin",
+                    "stream_id": stream, "phase": "post_omit", "origin_us": post,
+                    "start_time_fixed_us": initial}, separators=(",", ":")))
+                for start, end, origin, omitted, count in ((initial, post, initial, True, 250),
+                        (post, post + duration * 1_000_000, post, False, 125000000 // streams)):
+                    source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "receiver_interval",
+                        "stream_id": stream, "role": "receiver", "protocol": "TCP",
+                        "local_host": "10.60.1.11", "local_port": "5201",
+                        "remote_host": "10.60.1.10", "remote_port": str(50100 + i),
+                        "interval_start_us": start, "interval_end_us": end, "bytes": count,
+                        "omitted": omitted}, separators=(",", ":")))
+        (root / "iperf3-server.jsonl").write_text("\n".join(event_lines) + "\n", encoding="utf-8")
+        (root / "iperf3-server.err").write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+
 
 def _cost_source(path: Path, run_id: str, cost_input_id: str) -> None:
     payload = json.loads((ROOT / "tests/fixtures/f11/cost-inputs.json").read_text())
@@ -420,11 +550,21 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(tmp_path, repository_root):
+@pytest.mark.parametrize(("context_name", "full_native", "expected_validity"), [
+    ("failure_check", False, "partial"),
+    ("failure_check", True, "partial"),
+])
+def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
+        tmp_path, repository_root, request, context_name, full_native, expected_validity):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
-    config = repository_root / "configs/tests/exp-900-single-provider.yaml"
+    source_config = repository_root / "configs/tests/exp-900-single-provider.yaml"
+    config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
+    config_data["context"] = context_name
+    config = repository_root / "configs/tests" / f"f09-{tmp_path.name}-{context_name}.yaml"
+    request.addfinalizer(lambda: config.unlink(missing_ok=True))
+    config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
     initialized = initialize_campaign(config, repository_root, tmp_path / "results",
         clock=lambda: NOW, token_source=lambda: "campaign")
     parent_path = Path(initialized.parent_manifest_path)
@@ -432,6 +572,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         config_path=config)
     child = children["aws"]
     runner = FakePreparedAwsRunner()
+    runner.full_native = full_native
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
     runner.native_root = runner.workspace_roots["vm_a"]
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
@@ -494,9 +635,13 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     saved = ValidatorInput.model_validate_json(result_file.read_text(encoding="utf-8"))
     replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
     assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
-    assert replay.validation_status.data_validity == "partial", replay.findings
+    assert replay.validation_status.data_validity == expected_validity, [
+        (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
     assert not [item for item in replay.findings if item.severity == "error"], replay.findings
     assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings
+    if full_native:
+        assert not [item for item in replay.findings if item.code.startswith("native.iperf3.interval_")], replay.findings
+        assert any(item.code == "timing.coverage_unavailable" for item in replay.findings), replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
 
 
