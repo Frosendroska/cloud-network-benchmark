@@ -76,8 +76,10 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--execution-scope", choices=("paid_request",), required=True)
     cleanup = commands.add_parser("cleanup")
     cleanup.add_argument("--recovery", required=True, type=Path)
-    cleanup.add_argument("--runtime-config", required=True, type=Path)
-    cleanup.add_argument("--private-root", required=True, type=Path)
+    cleanup.add_argument("--runtime-config", type=Path,
+        help="deprecated for cleanup; original source-bound settings come from the private recovery journal")
+    cleanup.add_argument("--private-root", type=Path,
+        help="deprecated for cleanup; original private paths come from the private recovery journal")
     cleanup.add_argument("--controller-session", required=True)
     cleanup.add_argument("--format", choices=("human", "json"), default="human")
     recommendation = commands.add_parser("recommend-common-n")
@@ -87,7 +89,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=None) -> int:
+def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=None,
+         cleanup_runner=None, cleanup_utc_now=None, cleanup_monotonic_now=None) -> int:
     parser = _parser()
     try:
         args = parser.parse_args(argv)
@@ -211,16 +214,27 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                   (f"Recommended common N: {recommendation.common_n.value}" if recommendation.common_n.value is not None
                    else f"Common N pending: {recommendation.unavailable_reason}"))
             return 0 if recommendation.common_n.value is not None else 1
-        # A cleanup command must never guess runtime adapters from a public file.
-        # The direct Python API uses provider journals/settings and is supplied by
-        # the owning orchestration stage; absent those, fail closed without calls.
+        # Cleanup is rebuilt only from the private recovery journal, its saved
+        # source-bound provider settings and the original F11 ledger reference.
         if not args.recovery.is_file() or args.recovery.is_symlink():
             raise ValueError("recovery reference must be a regular non-symlink file")
         if cleanup_actions is not None and reconcile is not None:
             from .orchestration import cleanup_lifecycle
             result = cleanup_lifecycle(args.recovery, current_session_id=args.controller_session,
                 cleanup_actions=cleanup_actions, reconcile=reconcile)
-            report = {"status": "complete" if result.complete else "blocked",
+        else:
+            from .orchestration import SavedLifecycleRecovery
+            from .lifecycle_cleanup import CleanupClock, build_cleanup_runtime
+            from .contracts.execution import SubprocessCommandRunner
+            recovery = SavedLifecycleRecovery.validate_unique(
+                json.loads(args.recovery.read_text(encoding="utf-8")))
+            clock = CleanupClock()
+            result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
+                current_session_id=args.controller_session,
+                runner=cleanup_runner or SubprocessCommandRunner(),
+                utc_now=cleanup_utc_now or clock.utc_now,
+                monotonic_now=cleanup_monotonic_now or clock.monotonic)
+        report = {"status": "complete" if result.complete else "blocked",
                 "execution": "not_resumed", "cleanup": "complete" if result.complete else "incomplete",
                 "attempt_id": result.attempt_id,
                 "original_session_id": result.original_session_id,
@@ -231,15 +245,10 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     for provider, item in result.providers.items()},
                 "external_calls": sum(item.get("cleanup") in {"attempted", "succeeded", "failed"}
                                        for item in result.providers.values())}
-            print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+        print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Cleanup {report['status']}: execution was not resumed.",
                   file=sys.stdout if result.complete else sys.stderr)
-            return 0 if result.complete else 1
-        report = {"status": "incomplete", "execution": "not_resumed", "cleanup": "not_attempted",
-                  "reason_codes": ["provider_cleanup_runtime_adapter_required"], "external_calls": 0}
-        print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
-              "Cleanup not attempted: provider runtime adapters are unavailable.", file=sys.stderr)
-        return 1
+        return 0 if result.complete else 1
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "invalid", "reason_codes": ["invalid_lifecycle_request"],
                           "error": str(exc), "external_calls": 0}, sort_keys=True), file=sys.stderr)

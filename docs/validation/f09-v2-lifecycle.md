@@ -26,6 +26,12 @@ The selected package source is transferred with the existing trusted SCP options
 
 The default runtime factory now constructs all selected AWS, Azure and GCP drivers behind one actual F11 reservation, with per-provider expiry requests and recovery references. Provider claims include the complete selected request set and all observed protection evidence. A three-provider synthetic paid-source envelope test injects failure at every external command boundary, confirms all three real protection adapters return typed failure evidence, and asserts no provider pair-creation action runs. This validates the failure barrier and sourced constructor handoff; it does not establish successful cross-provider protection/provision/cleanup or a native measurement.
 
+### Cleanup-only runtime reconstruction (2026-10-24)
+
+The recovery journal now stores the original F11 ledger path/scope and exact private per-provider cleanup-settings references before provider side effects. These settings retain original deployment/reservation/expiry identities, native provider options, and a content digest; cleanup validates the selected driver’s exact namespace, target selector, expiry lead, and journal path before calling AWS cleanup, GCP cleanup, or Azure destroy. The `cleanup` CLI no longer requires or reads current runtime configuration, cost inputs, or approvals. It never reserves again or resumes provision/measurement. Reconciliation writes a private receipt bound by SHA-256 and records unknown billing without releasing funding; F11 liability remains open unless typed provider inventory plus persisted absence IDs prove cleanup.
+
+Offline integration uses the default cleanup CLI over a three-provider attempt that failed during the all-provider protection barrier. It invokes all three provider cleanup paths with a fake command runner, verifies the original F11 reservation remains in both cleanup-open and cleanup-blocked sets when complete absence cannot be proven, and verifies a tampered AWS cleanup-settings file is rejected before its provider command. Only GCP's read-only inventory boundary is reached for this no-create fixture. No clouds, current paid approvals, or current prices are used. This does not prove successful resource deletion for a populated cloud attempt.
+
 ## Remaining acceptance limits
 
 Offline mocks do not prove real cloud expiry, paid admission, guest package installation on Ubuntu, Linux guest behavior, native traffic or cloud cleanup. Those are separate gates; F10 is the end of this implementation stage.

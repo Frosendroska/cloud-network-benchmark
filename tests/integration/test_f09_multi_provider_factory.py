@@ -13,6 +13,7 @@ from cloud_network_benchmark.lifecycle_runtime import build_runtime
 from cloud_network_benchmark.manifests import initialize_campaign
 from cloud_network_benchmark.orchestration import run_lifecycle
 from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+from cloud_network_benchmark.lifecycle_cli import main as lifecycle_main
 from cloud_network_benchmark.access import TimeoutPolicy
 from cloud_network_benchmark.bootstrap import BootstrapConfig, SourceBuild
 from cloud_network_benchmark.readiness import ReadinessConfig
@@ -129,9 +130,32 @@ def test_default_three_provider_factory_reserves_then_blocks_every_claim_after_p
         admission_plan=built["plan"], allowance=built["allowance"],
         workflow_factory=built["workflow_factory"], clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
-    assert result.admission_status == "reserved", result.admission_reasons
+    assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
     assert all(item.primary_failure is not None for item in result.provider_results.values())
     assert all(item.values["protect"].state == "failed" for item in result.provider_results.values())
     assert all(item.values["protect"] is not None for item in result.provider_results.values())
     assert not any(action in {"aws-pair-apply", "gcp-pair-apply", "pair_apply"} for action in runner.actions)
+
+    cleanup_runner = FailedExternalCommands()
+    cleanup_code = lifecycle_main(["cleanup", "--recovery", str(built["recovery_path"]),
+        "--controller-session", "cleanup-session", "--format", "json"],
+        cleanup_runner=cleanup_runner, cleanup_utc_now=clock.utc_now,
+        cleanup_monotonic_now=clock.monotonic)
+    assert cleanup_code == 1
+    assert set(cleanup_runner.actions) <= {"gcp-inventory-all-zones"}
+    assert not any("apply" in action or "measure" in action for action in cleanup_runner.actions)
+    state = built["ledger"].inspect()
+    assert result.reservation_evidence.reservation_id.value in state["cleanup_open"]
+    assert result.reservation_evidence.reservation_id.value in state["cleanup_blocked"]
+
+    recovery = json.loads(built["recovery_path"].read_text())
+    settings_path = Path(recovery["providers"][0]["cleanup_settings_reference"])
+    settings_path.write_text(settings_path.read_text() + " ")
+    tamper_runner = FailedExternalCommands()
+    tamper_code = lifecycle_main(["cleanup", "--recovery", str(built["recovery_path"]),
+        "--controller-session", "cleanup-session-2", "--format", "json"],
+        cleanup_runner=tamper_runner, cleanup_utc_now=clock.utc_now,
+        cleanup_monotonic_now=clock.monotonic)
+    assert tamper_code == 1
+    assert set(tamper_runner.actions) <= {"gcp-inventory-all-zones"}

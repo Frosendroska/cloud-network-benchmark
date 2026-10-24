@@ -478,6 +478,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs=costs, runtime=runtime, ledger_state=ledger.inspect(),
         controller_session_id=controller_session_id)
 
+    cleanup_references: dict[str, str] = {}
     def workflow_factory(reservation: Any):
         actual_stages = stages
         if actual_stages is None:
@@ -493,7 +494,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         return build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
             ledger=ledger, runner=runner, clock=clock, stages=actual_stages,
-            private_root=private_root)
+            private_root=private_root, cleanup_references=cleanup_references)
 
     def recovery_factory(reservation: Any, _workflows: Any):
         providers = []
@@ -509,10 +510,12 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                 journal = Path(private_root) / "azure" / child.run_id / child.deployment_id / "recovery.json"
             providers.append(SavedProviderRecovery(provider=provider, deployment_id=child.deployment_id,
                 journal_reference=str(journal), expiry_registered=False,
-                creation_may_have_started=False, cleanup_open=False))
+                creation_may_have_started=False, cleanup_open=False,
+                cleanup_settings_reference=cleanup_references.get(provider)))
         return SavedLifecycleRecovery(schema_version=1, attempt_id=parent.campaign_id,
             controller_session_id=controller_session_id,
             reservation_id=reservation.reservation_id.value,
+            ledger_path=str(ledger.path), ledger_scope_id=ledger.scope_id,
             providers=providers, retry_consumed_ids=[])
 
     return {"ledger": ledger, "request": request, "plan": plan,
@@ -523,7 +526,8 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
 
 def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs: Any, runtime: dict[str, Any], reservation: Any, ledger: Any,
-        runner: Any, clock: Any, stages: dict[str, Any], private_root: Path) -> dict[str, Any]:
+        runner: Any, clock: Any, stages: dict[str, Any], private_root: Path,
+        cleanup_references: dict[str, str] | None = None) -> dict[str, Any]:
     """Bind every selected provider to one accepted F11 reservation and claim barrier."""
     from datetime import timedelta
     from math import ceil
@@ -536,6 +540,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
     from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
     from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
     from .admission import aws_expiry_cost_handoff
+    from .lifecycle_cleanup import save_cleanup_settings
     from . import azure_provider
 
     selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
@@ -607,6 +612,11 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
                 resource_namespace=namespace,
                 target_selector=driver._target_selector(deployment, driver._regions(deployment)))
+            if cleanup_references is not None:
+                cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
+                    deployment=deployment, request=requests[provider], reservation=reservation,
+                    provider_lead_seconds=(reservation.expires_at.value - requests[provider].expires_at.value).total_seconds(),
+                    settings=settings, private_root=Path(private_root)))
             options_by_provider[provider] = (driver, None)
         elif provider == "gcp":
             from .providers.gcp import SAFETY_LEAD_SECONDS
@@ -634,6 +644,11 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
                 resource_namespace=child.run_id,
                 target_selector=f"project={settings.project_id};run_id={child.run_id};deployment_id={child.deployment_id};roles=vm_a,vm_b")
+            if cleanup_references is not None:
+                cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
+                    deployment=deployment, request=requests[provider], reservation=reservation,
+                    provider_lead_seconds=(reservation.expires_at.value - requests[provider].expires_at.value).total_seconds(),
+                    settings=settings, private_root=Path(private_root)))
             options_by_provider[provider] = (driver, None)
         else:
             lead = float(runtime["allowance"].provider_leads_seconds[provider])
@@ -665,6 +680,10 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 deployment_id=child.deployment_id, provider=Provider.AZURE, action="deallocate",
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
                 resource_namespace=name, target_selector=";".join(ids))
+            if cleanup_references is not None:
+                cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
+                    deployment=deployment, request=requests[provider], reservation=reservation,
+                    provider_lead_seconds=lead, settings=options, private_root=Path(private_root)))
             options_by_provider[provider] = (options, None)
 
     protected: dict[str, Any] = {}

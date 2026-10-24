@@ -119,6 +119,7 @@ class SavedProviderRecovery(StrictModel):
     expiry_registered: bool
     creation_may_have_started: bool
     cleanup_open: bool
+    cleanup_settings_reference: str | None = None
 
 
 class SavedLifecycleRecovery(StrictModel):
@@ -126,6 +127,8 @@ class SavedLifecycleRecovery(StrictModel):
     attempt_id: str = Field(min_length=1)
     controller_session_id: str = Field(min_length=1)
     reservation_id: str | None = None
+    ledger_path: str | None = None
+    ledger_scope_id: str | None = None
     providers: list[SavedProviderRecovery] = Field(min_length=1, max_length=3)
     retry_consumed_ids: list[str] = Field(default_factory=list)
 
