@@ -38,7 +38,6 @@ All commands ran from `/private/tmp/cnb-f12` with the assigned offline runtime a
 | Check | Result |
 | --- | --- |
 | Focused F12: `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config /private/tmp/cnb-offline-venv/bin/python -m pytest -q tests/unit/test_analysis.py tests/unit/test_analysis_convergence.py tests/unit/test_analysis_plots.py tests/contract/test_analysis_interface.py tests/integration/test_analysis_replay.py` | Exit 0; 35 passed in 102.37s. |
-| Focused receiver/report and materialized four-mode replay | Exit 0; 2 passed in 93.33s. |
 | Full credential-free suite at `feacf19f987d5869e85615b0b6f5c639a2e59a2e`: `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config /private/tmp/cnb-offline-venv/bin/python -m pytest -q` | Exit 0; 1289 passed in 281.55s; no skips reported. |
 | Canonical contracts: `python -m cloud_network_benchmark.contracts.schema --output specs/003-v2-shared-contracts/contracts --check` | Exit 0; no schema drift. |
 | CLI: `python -m cloud_network_benchmark analyze --help` | Exit 0; exposes only `--selection` and `--output`. |
