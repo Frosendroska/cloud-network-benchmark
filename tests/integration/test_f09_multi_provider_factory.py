@@ -90,6 +90,7 @@ class GcpSourceRunner:
             return result(value)
         if action.startswith(("gcp-instance-read", "gcp-hostkey-instance")):
             value = _instance_response(driver, d, role)
+            value["networkInterfaces"][0]["accessConfigs"][0]["natIP"] = "8.8.8.8" if role == "vm_a" else "1.1.1.1"
             value.update({"scheduling": {"provisioningModel": "STANDARD", "instanceTerminationAction": "STOP",
                 "terminationTime": trigger.isoformat().replace("+00:00", "Z"), "automaticRestart": False},
                 "resourcePolicies": []})
@@ -370,7 +371,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
-        "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10, "synthetic-test-policy",
+        "allowance": WorkflowAllowance(10, 60, 180, 60, 80, 5, 10, 10, "synthetic-test-policy",
             {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
@@ -403,15 +404,35 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
     clock = Clock()
     if successful_protection:
         import cloud_network_benchmark.lifecycle_adapters as adapters
+        from cloud_network_benchmark.bootstrap import BootstrapConfig as NativeBootstrapConfig, SourceBuild as NativeSourceBuild
+        from cloud_network_benchmark.contracts.common import VmRole
+        from tests.integration.test_acquisition_producer import _build
         from tests.integration.test_f09_aws_runtime_factory import FakePreparedAwsRunner
         from tests.integration.test_azure_provider_flow import CleanupRunner
+        native_builds = [_build(tool, VmRole.VM_A, f"f02r-vm_a-{tool}-build")
+            for tool in ("sockperf", "iperf3")]
+        runtime["access"]["bootstrap"] = NativeBootstrapConfig(sources=[NativeSourceBuild(tool=build.tool,
+            source_url=f"https://example.invalid/{build.tool}.tar.gz", source_reference=build.source_reference,
+            archive_name=f"{build.tool}.tar.gz", source_sha256=build.source_sha256,
+            upstream_commit=build.upstream_commit, observation_patch_path=build.patch_path,
+            observation_patch_sha256=build.patch_sha256) for build in native_builds],
+            remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
         class ThreeProviderDispatch:
-            def __init__(self):
+            def __init__(self, root):
                 self.clock = clock
                 self.aws = FakePreparedAwsRunner()
                 self.gcp = GcpSourceRunner()
                 self.gcp.clock = clock
                 self.azure = None
+                self.remote = {"aws": self.aws, "gcp": FakePreparedAwsRunner(),
+                    "azure": FakePreparedAwsRunner()}
+                self.identity_provider = {str(value): name for name, value in identities.items()}
+                for name, responder in self.remote.items():
+                    responder.full_native = True
+                    responder.clock = clock
+                    responder.late_tail = True
+                    responder.workspace_roots = {role: root / name / role for role in ("vm_a", "vm_b")}
+                    responder.native_root = responder.workspace_roots["vm_a"]
                 self.requests = []
                 self.actions = []
                 self.ledger = None
@@ -484,21 +505,34 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                         now = clock.utc_now()
                         return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
                             finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
-                    return self.azure.run(request)
-                # Keep actual remote stages active, but fail closed until the
-                # separately assigned native-remote matrix is wired here.
+                    outcome = self.azure.run(request)
+                    if request.action_type == "pair_destroy" and outcome.outcome == "succeeded":
+                        self.azure.account_present = False
+                        self.azure.present_children.clear()
+                    return outcome
+                identity = request.argv[request.argv.index("-i") + 1] if "-i" in request.argv else None
+                provider = self.identity_provider.get(identity)
+                if provider is None:
+                    raise AssertionError(f"remote action lacks a known provider identity: {request.action_id} {request.argv}")
+                responder = self.remote[provider]
+                if request.action_type == "scp":
+                    return responder.run(request)
+                if request.action_id.startswith(("f02r-", "f09-")):
+                    return responder.run(request)
                 now = clock.utc_now()
-                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
-                    finished_at=now, duration_seconds=0, exit_code=1, stdout="", stderr="offline remote fixture not bound")
-        runner = ThreeProviderDispatch()
+                raise AssertionError(f"unexpected remote action {request.action_id} {request.argv}")
+        runner = ThreeProviderDispatch(tmp_path / "remote")
     else:
         runner = FailedExternalCommands()
     built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
         runtime=runtime, controller_session_id="synthetic-session", runner=runner,
         clock=clock, private_root=tmp_path / "private", repository_root=ROOT)
     if successful_protection:
+        runtime["sleep"] = clock.sleep
         runner.ledger = built["ledger"]
         original_aws_hooks, original_gcp_hooks, original_azure_hooks = adapters.aws_hooks, adapters.gcp_hooks, adapters.azure_hooks
+        original_prepare_remote_pair = adapters.prepare_remote_pair
+        prepare_errors = []
         observed = {}
         def observe_aws(driver, deployment, expiry_request, **kwargs):
             runner.aws.run_id = deployment.run_id
@@ -513,9 +547,24 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             runner.azure = CleanupRunner(deployment, kwargs["options"], clock.utc_now())
             observed["azure"] = (deployment, expiry_request, kwargs["options"])
             return original_azure_hooks(deployment, expiry_request, **kwargs)
+        def observe_prepare_remote_pair(connection, **kwargs):
+            provider = runner.identity_provider.get(connection.vm_a.authentication_reference)
+            assert provider is not None, connection.vm_a.authentication_reference
+            responder = runner.remote[provider]
+            responder.private_a, responder.private_b = connection.private_ipv4_a, connection.private_ipv4_b
+            responder.public_a, responder.public_b = connection.vm_a.host, connection.vm_b.host
+            responder.native_base_time = clock.utc_now()
+            responder.run_id, responder.deployment_id = connection.run_id, connection.deployment_id
+            responder.connection = connection
+            try:
+                return original_prepare_remote_pair(connection, **kwargs)
+            except Exception as exc:
+                prepare_errors.append((type(exc).__name__, str(exc)))
+                raise
         monkeypatch.setattr(adapters, "aws_hooks", observe_aws)
         monkeypatch.setattr(adapters, "gcp_hooks", observe_gcp)
         monkeypatch.setattr(adapters, "azure_hooks", observe_azure)
+        monkeypatch.setattr(adapters, "prepare_remote_pair", observe_prepare_remote_pair)
     result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
         admission_plan=built["plan"], allowance=built["allowance"],
         workflow_factory=built["workflow_factory"], clock=clock,
@@ -538,8 +587,34 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert {str(created.vm_a.role), str(created.vm_b.role)} == {"vm_a", "vm_b"}
             assert provider_result.values["cleanup"] is not None, (provider_name, provider_result.values)
             assert provider_result.values["cleanup"].cleanup_state == "succeeded", (provider_name, provider_result.values["cleanup"].cleanup_failure, provider_result.values["cleanup"].secondary_failures, provider_result.values["cleanup"].inventory.value, [(r.action_id, r.argv) for r in runner.requests if any("describe-" in str(token) for token in r.argv)])
+            assert provider_result.values["prepare"].succeeded is True, (provider_name, provider_result.values["prepare"], prepare_errors)
+            for stage in ("stabilize", "measure", "close", "retrieve"):
+                assert provider_result.values[stage].succeeded is True, (provider_name, stage, getattr(provider_result.values[stage].evidence, "failure", None), getattr(getattr(provider_result.values[stage].evidence, "outcome", None), "failures", None), provider_result.values[stage].evidence)
         assert all(observed[p][1].run_id == children[p].run_id for p in children)
-        assert result.completed is False
+        from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
+        from cloud_network_benchmark.contracts.validation import ValidatorInput
+        from cloud_network_benchmark.validation import evaluate_comparison, validate_bundle
+        evaluated_at = max(clock.utc_now(), datetime.now(timezone.utc)) + timedelta(minutes=1)
+        finalized = finalize_production_batch(parent_path=parent_path, children=children,
+            parent=parent, lifecycle=result, repository_root=ROOT, evaluated_at=evaluated_at)
+        assert set(finalized) == {"aws", "azure", "gcp"}
+        saved_inputs, roots = {}, {}
+        for provider in children:
+            ref = next(row for row in parent.child_runs if str(row.provider) == provider)
+            roots[provider] = (ROOT / ref.result_path).resolve()
+            saved_inputs[provider] = ValidatorInput.model_validate_json(
+                (roots[provider] / "validation" / "input.json").read_text(encoding="utf-8"))
+        preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
+            for provider, value in saved_inputs.items()}
+        replays = evaluate_comparison(list(saved_inputs.values()), list(preliminary.values()))
+        for provider, saved in saved_inputs.items():
+            replay = replays[saved.identity.run_id]
+            assert replay.model_dump(mode="json") == finalized[provider][0].model_dump(mode="json")
+            assert replay.validation_status.data_validity == "valid", [
+                (finding.code, finding.severity, finding.message) for finding in replay.findings]
+            assert not [finding for finding in replay.findings if finding.severity == "error"
+                and finding.code != "comparison.ineligible"], replay.findings
+            assert (roots[provider] / "checksums.sha256").is_file()
         return
     assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
@@ -570,3 +645,32 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cleanup_monotonic_now=clock.monotonic)
     assert tamper_code == 1
     assert set(tamper_runner.actions) <= {"gcp-inventory-all-zones"}
+
+
+def test_parent_aggregate_keeps_high_water_for_overlapping_peer_events(tmp_path):
+    from cloud_network_benchmark.contracts.common import ExecutionState
+    from cloud_network_benchmark.manifests import initialize_campaign, update_child_execution
+    from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+
+    config = ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"
+    snapshots = []
+    for name, order in (("late-first", ("aws", "azure")), ("early-first", ("azure", "aws"))):
+        initialized = initialize_campaign(config, ROOT, tmp_path / name,
+            clock=lambda: NOW, token_source=lambda: name)
+        parent_path = Path(initialized.parent_manifest_path)
+        parent, children = load_initialized_campaign(parent_path, repository_root=ROOT,
+            config_path=config)
+        event_times = {"aws": NOW + timedelta(seconds=2), "azure": NOW + timedelta(seconds=1)}
+        references = {str(ref.provider): ref for ref in parent.child_runs}
+        for provider in order:
+            update_child_execution((ROOT / references[provider].manifest_path).resolve(),
+                ExecutionState.PROVISION_READY, event_times[provider], parent_manifest_path=parent_path)
+        current_parent = type(parent).model_validate_json(parent_path.read_text(encoding="utf-8"))
+        assert current_parent.updated_at == NOW + timedelta(seconds=2)
+        assert [event.occurred_at for event in current_parent.lifecycle_events] == sorted(
+            event.occurred_at for event in current_parent.lifecycle_events)
+        snapshots.append((current_parent.aggregate_state, current_parent.updated_at))
+        with pytest.raises(ValueError, match="earlier"):
+            update_child_execution((ROOT / references["aws"].manifest_path).resolve(),
+                ExecutionState.RUNNING, NOW + timedelta(seconds=1), parent_manifest_path=parent_path)
+    assert snapshots[0] == snapshots[1]

@@ -43,6 +43,8 @@ class FakeAwsRunner:
         self.actions = []
         self.run_id = ""
         self.deployment_id = ""
+        self.private_a, self.private_b = "10.60.1.10", "10.60.1.11"
+        self.public_a, self.public_b = "8.8.8.8", "1.1.1.1"
 
     def run(self, request):
         action = request.action_id
@@ -60,12 +62,12 @@ class FakeAwsRunner:
             }.items()})
         elif action == "aws-pair-output":
             stdout = json.dumps({"deployment": {"value": {"vms": {
-                "vm_a": {"instance_id": "i-vm-a", "private_ipv4": "10.60.1.10", "public_ipv4": "8.8.8.8",
+                "vm_a": {"instance_id": "i-vm-a", "private_ipv4": self.private_a, "public_ipv4": self.public_a,
                     "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
                     "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
                     "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-a",
                     "placement_group": None, "placement_group_strategy": None},
-                "vm_b": {"instance_id": "i-vm-b", "private_ipv4": "10.60.1.11", "public_ipv4": "1.1.1.1",
+                "vm_b": {"instance_id": "i-vm-b", "private_ipv4": self.private_b, "public_ipv4": self.public_b,
                     "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
                     "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
                     "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-b",
@@ -76,8 +78,8 @@ class FakeAwsRunner:
         elif action.startswith("aws-describe-instances"):
             instance_id = request.argv[request.argv.index("--instance-ids") + 1]
             role = "vm_a" if instance_id == "i-vm-a" else "vm_b"
-            private_ip = "10.60.1.10" if role == "vm_a" else "10.60.1.11"
-            public_ip = "8.8.8.8" if role == "vm_a" else "1.1.1.1"
+            private_ip = self.private_a if role == "vm_a" else self.private_b
+            public_ip = self.public_a if role == "vm_a" else self.public_b
             stdout = json.dumps({"Reservations": [{"Instances": [{"InstanceId": instance_id,
                 "State": {"Name": "running"}, "Tags": [{"Key": "cnb_run_id", "Value": self.run_id},
                     {"Key": "cnb_deployment_id", "Value": self.deployment_id}, {"Key": "cnb_role", "Value": role}],
@@ -147,9 +149,15 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.inventory_roles = {}
         self.full_native = False
 
+    def _now(self):
+        clock = getattr(self, "clock", None)
+        return clock.utc_now() if clock is not None else NOW
+
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
         action = request.action_id
+        if self.full_native and not hasattr(self, "native_base_time"):
+            self.native_base_time = self._now()
         if action.startswith("f02r-ready-"):
             self.actions.append(action)
             name = action.removeprefix("f02r-ready-").rsplit("-", 1)[0]
@@ -157,12 +165,12 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             if name.startswith("cloud-init"):
                 stdout = "status: done"
             elif name == "private-icmp":
-                stdout = "64 bytes from 10.60.1.11"
+                stdout = f"64 bytes from {self.private_b}"
             elif name in {"private-tcp", "ssh-vm-a", "ssh-vm-b"}:
                 stdout = ""
             elif name.startswith("service-"):
                 port, pid = (11111, 20) if tool == "sockperf" else (5201, 21)
-                args = f"server -i 10.60.1.11 -p {port}" if tool == "sockperf" else "-s -B 10.60.1.11 -p 5201 --json-stream --forceflush"
+                args = f"server -i {self.private_b} -p {port}" if tool == "sockperf" else f"-s -B {self.private_b} -p 5201 --json-stream --forceflush"
                 stdout = (f"LoadState=loaded\nActiveState=active\nMainPID={pid}\n"
                     f"ExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\n"
                     "StandardOutput=append\nStandardError=append\nRestart=no\n")
@@ -181,18 +189,18 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     binary_hash = "c" * 64
                 stdout = f"/var/lib/cnb/install/bin/{tool}\n{binary_hash} /proc/{20 if tool == 'sockperf' else 21}/exe"
             elif name == "socket-sockperf":
-                stdout = 'UNCONN 0 0 10.60.1.11:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))'
+                stdout = f'UNCONN 0 0 {self.private_b}:11111 0.0.0.0:* users:(("sockperf",pid=20,fd=3))'
             elif name == "socket-iperf3":
-                stdout = 'LISTEN 0 4096 10.60.1.11:5201 0.0.0.0:* users:(("iperf3",pid=21,fd=3))'
+                stdout = f'LISTEN 0 4096 {self.private_b}:5201 0.0.0.0:* users:(("iperf3",pid=21,fd=3))'
             elif name == "guest-acl":
-                stdout = nft_listing(self.deployment_id).replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
+                stdout = nft_listing(self.deployment_id).replace("10.0.0.1", self.private_a).replace("10.0.0.2", self.private_b)
             else:
                 stdout = "authenticated"
             if name.startswith("service-"):
                 requested = request.argv[-1].split("--property=",1)[1].split(",") if "--property=" in request.argv[-1] else []
                 stdout = "\n".join(line for line in stdout.splitlines() if line.split("=",1)[0] in requested or line == "[Service]")
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
         if action.startswith("f02r-") and not action.startswith(("f02r-retrieve-observe-", "f02r-retrieve-")):
             self.actions.append(action)
             if self.full_native and action == "f02r-vm_b-listener-config-iperf3":
@@ -201,11 +209,11 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 return value.model_copy(update={"stdout": stdout})
             if self.full_native and action == "f02r-vm_b-listener-verify-iperf3":
                 stdout = ("LoadState=loaded\nActiveState=active\nMainPID=21\n"
-                    "ExecStart={ path=/var/lib/cnb/install/bin/iperf3; argv[]=/var/lib/cnb/install/bin/iperf3 -s -B 10.60.1.11 -p 5201 --json-stream --forceflush; }\n"
+                    f"ExecStart={{ path=/var/lib/cnb/install/bin/iperf3; argv[]=/var/lib/cnb/install/bin/iperf3 -s -B {self.private_b} -p 5201 --json-stream --forceflush; }}\n"
                     "StandardOutput=append\nStandardError=append\nRestart=no\n"
                     "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
-                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+                return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
             if self.full_native and action in {"f02r-vm_b-listener-process-sockperf",
                     "f02r-vm_b-listener-process-iperf3"}:
                 tool = action.rsplit("-", 1)[-1]
@@ -213,8 +221,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 from cloud_network_benchmark.contracts.common import VmRole
                 observed = _build(tool, VmRole.VM_B, f"f02r-vm_b-{tool}-build")
                 stdout = f"/var/lib/cnb/install/bin/{tool}\n{observed.binary_sha256} /proc/{20 if tool == 'sockperf' else 21}/exe"
-                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+                return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
             match = re.fullmatch(r"f02r-(vm_[ab])-(sockperf|iperf3)-(\d+)", action)
             if self.full_native and match:
                 role, tool, index_text = match.groups()
@@ -261,10 +269,10 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                         stdout = "Usage: iperf3 [options]\n-s -c -B -p -P -t -O -i -l -C cubic -Z -J --get-server-output --json-stream --forceflush"
                 else:
                     stdout = "ok"
-                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+                return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
             value = self.bootstrap_runner.run(request)
-            stdout = value.stdout.replace("10.0.0.1", "10.60.1.10").replace("10.0.0.2", "10.60.1.11")
+            stdout = value.stdout.replace("10.0.0.1", self.private_a).replace("10.0.0.2", self.private_b)
             if action.endswith("acl-inspect"):
                 stdout = stdout.replace("chain cnb_campaign_aws_deployment", f"chain {request.argv[-1].split()[-1]}")
             value = value.model_copy(update={"stdout": stdout})
@@ -272,21 +280,21 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         if action.startswith("f09-runtime-"):
             self.actions.append(action)
             if request.action_type == "scp":
-                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+                return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
             if "runtime-verify" in action:
-                return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                    finished_at=NOW, duration_seconds=0, exit_code=0,
+                return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=0,
                     stdout=json.dumps({"python":"3.11.0","pydantic":"2.10.0","yaml":"6.0.2"}), stderr="")
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-guest-request-"):
             self.actions.append(action)
             local_source = next(Path(value) for value in request.argv
                 if value.endswith("request.json") and Path(value).is_file())
             self.guest_request = local_source.read_text(encoding="utf-8")
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-guest-run-"):
             self.actions.append(action)
             from cloud_network_benchmark.lifecycle_guest import GuestRequest, execute_request
@@ -305,7 +313,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                         stdout_path.write_bytes((fixture_root / "iperf3.json").read_bytes())
                     return handle
             guest_clock = GuestClock()
-            guest_clock.utc_adjustment = NOW - guest_clock.origin
+            native_base_time = getattr(self, "native_base_time", self._now())
+            self.native_base_time = native_base_time
+            guest_clock.utc_adjustment = native_base_time - guest_clock.origin
             guest_request = GuestRequest.model_validate_json(self.guest_request).model_copy(update={
                 "output_root": self.native_root,
                 "package_root": ROOT / "src/cloud_network_benchmark"})
@@ -334,7 +344,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                                     continue
                                 record = json.loads(line[len("CNB_ACQ_V1 "):])
                                 if record.get("record_kind") == "clock_anchor":
-                                    realtime_ns = int((NOW.timestamp() + base_ns / 1_000_000_000 - 1000)
+                                    realtime_ns = int((native_base_time.timestamp() + base_ns / 1_000_000_000 - 1000)
                                         * 1_000_000_000)
                                     record.update(mono_before_ns=base_ns, realtime_ns=realtime_ns,
                                         mono_after_ns=base_ns + 1000)
@@ -366,7 +376,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                             settings = {"protocol": "TCP", "num_streams": streams, "omit": 5,
                                 "duration": duration, "interval": 1, "blksize": 131072, "reverse": False}
                             connected = [{"socket": 17 + i, "local_host": guest_request.b_private_ipv4,
-                                "local_port": 5201, "remote_host": "10.60.1.10", "remote_port": 50100 + i}
+                                "local_port": 5201, "remote_host": self.private_a, "remote_port": 50100 + i}
                                 for i in range(streams)]
                             rows = []
                             for i in range(streams):
@@ -393,22 +403,22 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             self.guest_outcome = outcome.model_dump_json()
             if self.full_native:
                 self._write_source_observed_receiver_logs(outcome)
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-guest-outcome-"):
             self.actions.append(action)
             if self.guest_outcome is not None:
                 Path(request.argv[-1]).write_text(self.guest_outcome, encoding="utf-8")
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-diagnostics-context-"):
             self.actions.append(action)
             source = next(Path(value) for value in request.argv
                 if value.endswith("context.json") and Path(value).is_file())
             invocation = action.removeprefix("f09-diagnostics-context-")
             self.diagnostics_contexts[invocation] = json.loads(source.read_text(encoding="utf-8"))
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
         if action.startswith("f09-diagnostics-start-"):
             self.actions.append(action)
             invocation = action.removeprefix("f09-diagnostics-start-")
@@ -439,12 +449,12 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             diag_path = root / "diagnostics" / f"{role}.jsonl"
             diag_path.parent.mkdir(parents=True, exist_ok=True)
             sample = DiagnosticSample(schema_version=2, deployment_id=context["deployment_id"], vm_role=role,
-                sampled_at=NOW, monotonic_seconds=1, interval_seconds=1,
+                sampled_at=self._now(), monotonic_seconds=1, interval_seconds=1,
                 cpu_total_percent={"value":5}, cpu_max_core_percent={"value":10}, cpu_steal_percent={"value":0},
                 tcp_retransmissions={"value":0}, interface_rx_drops={"value":0}, interface_tx_drops={"value":0},
                 interface_rx_errors={"value":0}, interface_tx_errors={"value":0}, rx_bytes={"value":1000}, tx_bytes={"value":1000})
             diag_path.write_text(sample.model_dump_json()+"\n", encoding="utf-8")
-            mapping = ClockMapping(vm_role=role, monotonic_seconds=1000 if self.full_native else 1, utc_timestamp=NOW,
+            mapping = ClockMapping(vm_role=role, monotonic_seconds=(1000 + (self._now() - self.native_base_time).total_seconds()) if self.full_native else 1, utc_timestamp=self._now(),
                 estimated_error_ms={"value":1}, synchronization_source={"value":"synthetic chrony fixture"})
             (root / "diagnostics" / f"{role}-clock.jsonl").write_text(mapping.model_dump_json()+"\n", encoding="utf-8")
             output_root = context["output_root"]
@@ -453,23 +463,23 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     f"{output_root}/diagnostics/{role}.jsonl",f"{output_root}/diagnostics/{role}-clock.jsonl"]}
             stdout = json.dumps({"pid":501,"process_group":501,
                 "boot_id":"12345678-1234-4234-8234-123456789abc","start_ticks":1234})
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
         if action.startswith("f09-diagnostics-stop-"):
             self.actions.append(action)
-            closed_at = NOW + timedelta(minutes=5)
+            closed_at = self._now() + timedelta(minutes=5)
             return CommandResult(action_id=action,outcome="succeeded",started_at=closed_at,finished_at=closed_at,
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"state":"stopped","closed_at_utc":closed_at.isoformat()}),stderr="")
         if action.startswith("f09-diagnostics-outcome-"):
             self.actions.append(action)
             invocation = action.removeprefix("f09-diagnostics-outcome-")
-            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps(self.diagnostics_outcomes[invocation]),stderr="")
         if action.startswith("f09-listener-exit-"):
             self.actions.append(action)
-            stamp = (NOW + timedelta(minutes=5)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+            stamp = (self._now() + timedelta(minutes=5)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
             stdout = f"LoadState=loaded\nActiveState=inactive\nMainPID=0\nInactiveEnterTimestamp={stamp}\n"
-            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
         if action.startswith("f09-inventory-"):
             self.actions.append(action)
@@ -481,7 +491,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     data=path.read_bytes(); rows.append({"path":path.relative_to(root).as_posix(),
                         "size_bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()})
                     self.inventory_roles[path.relative_to(root).as_posix()] = role
-            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"files":rows},sort_keys=True,separators=(",",":")),stderr="")
         if action.startswith("f02r-retrieve-observe-"):
             self.actions.append(action)
@@ -495,22 +505,22 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 "sockperf_server_log", "iperf3_server_log", "iperf3_server_error"} else "vm_a"
             local = self.workspace_roots[role] / relative
             data = local.read_bytes()
-            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=f"{len(data)} {hashlib.sha256(data).hexdigest()}",stderr="")
         if action.startswith("f02r-retrieve-") and request.action_type == "scp":
             self.actions.append(action)
             remote = next(value for value in request.argv if ":/var/lib/cnb/work/" in value)
             from pathlib import PurePosixPath
-            role = "vm_a" if "8.8.8.8" in remote else "vm_b"
+            role = "vm_a" if f"{self.public_a}:" in remote else "vm_b"
             local = self.workspace_roots[role] / PurePosixPath(remote.split(":",1)[1]).relative_to("/var/lib/cnb/work")
             Path(request.argv[-1]).write_bytes(local.read_bytes())
-            return CommandResult(action_id=action,outcome="succeeded",started_at=NOW,finished_at=NOW,
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout="",stderr="")
         if action.startswith("f09-control-clock-"):
             self.actions.append(action)
-            timestamp = (NOW + timedelta(seconds=self.current_elapsed)).isoformat(timespec="microseconds").replace("+00:00", "Z")
-            return CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
+            timestamp = (self._now() + timedelta(seconds=self.current_elapsed)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
         return super().run(request)
 
     def _write_source_observed_receiver_logs(self, outcome):
@@ -528,10 +538,10 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             settings = {"protocol": "TCP", "num_streams": streams, "omit": 5,
                 "duration": duration, "interval": 1, "blksize": 131072, "reverse": False}
             command_started_at = datetime.fromisoformat(command["started_at"]["value"].replace("Z", "+00:00"))
-            start_mono = 1000 + (command_started_at - NOW).total_seconds()
+            start_mono = 1000 + (command_started_at - self.native_base_time).total_seconds()
             start_us = int(start_mono * 1_000_000)
-            connected = [{"socket": 17 + i, "local_host": "10.60.1.11", "local_port": 5201,
-                "remote_host": "10.60.1.10", "remote_port": 50100 + i} for i in range(streams)]
+            connected = [{"socket": 17 + i, "local_host": self.private_b, "local_port": 5201,
+                "remote_host": self.private_a, "remote_port": 50100 + i} for i in range(streams)]
             native_intervals = []
             for i in range(streams):
                 native_intervals.extend([
@@ -550,7 +560,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 "invocation_id": "f02r-vm_b-listener-iperf3", "pid": 51,
                 "boot_id": "12345678-1234-4234-8234-123456789def", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
             anchor = {**common, "record_kind": "clock_anchor", "mono_before_ns": 1_000_000_000_000,
-                "realtime_ns": int(NOW.timestamp() * 1_000_000_000), "mono_after_ns": 1_000_000_001_000}
+                "realtime_ns": int(self.native_base_time.timestamp() * 1_000_000_000), "mono_after_ns": 1_000_000_001_000}
             source_lines.append("CNB_ACQ_V1 " + json.dumps(anchor, separators=(",", ":")))
             source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "session_settings",
                 "protocol": "TCP", "num_streams": streams, "omit": 5, "duration": duration,
@@ -575,8 +585,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     count = 250 if omitted else 125000000 // streams
                     source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "receiver_interval",
                         "stream_id": stream, "role": "receiver", "protocol": "TCP",
-                        "local_host": "10.60.1.11", "local_port": "5201",
-                        "remote_host": "10.60.1.10", "remote_port": str(50100 + i),
+                        "local_host": self.private_b, "local_port": "5201",
+                        "remote_host": self.private_a, "remote_port": str(50100 + i),
                         "interval_start_us": start, "interval_end_us": end, "bytes": count,
                         "omitted": omitted}, separators=(",", ":")))
         (root / "iperf3-server.jsonl").write_text("\n".join(event_lines) + "\n", encoding="utf-8")

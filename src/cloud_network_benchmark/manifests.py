@@ -555,11 +555,36 @@ def recompute_parent_manifest(
     detail: str,
     fault: FaultInjector = no_fault,
 ) -> CampaignManifest:
+    return _recompute_parent_manifest(parent_manifest_path, occurred_at, detail, fault)
+
+
+def recompute_parent_manifest_for_child_update(
+    parent_manifest_path: Path,
+    occurred_at: datetime,
+    detail: str,
+    child_manifest_path: Path,
+    fault: FaultInjector = no_fault,
+) -> CampaignManifest:
+    """Project one real child event while preserving the parent high-water mark."""
+    child = ChildRunManifest.model_validate_json(child_manifest_path.read_text(encoding="utf-8"))
+    if child.updated_at != occurred_at:
+        raise ValueError("parent peer projection must match the updated child event time")
+    return _recompute_parent_manifest(parent_manifest_path, occurred_at, detail, fault,
+        child_observation=(child.run_id, child.provider))
+
+
+def _recompute_parent_manifest(
+    parent_manifest_path: Path,
+    occurred_at: datetime,
+    detail: str,
+    fault: FaultInjector = no_fault,
+    child_observation: tuple[str, Provider] | None = None,
+) -> CampaignManifest:
     try:
         parent = CampaignManifest.model_validate_json(parent_manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise PersistenceError("parent manifest is unavailable or invalid") from exc
-    if occurred_at < parent.updated_at:
+    if occurred_at < parent.updated_at and child_observation is None:
         raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
     references = {Provider(reference.provider): reference for reference in parent.child_runs}
     selected = {Provider(provider) for provider in parent.selected_providers}
@@ -614,19 +639,30 @@ def recompute_parent_manifest(
         if not matches_result:
             raise PersistenceError("referenced child result path does not match its run_id", {"run_id": reference.run_id})
         children.append((child.execution_state, child.cleanup_state))
+    if child_observation is not None:
+        run_id, provider = child_observation
+        reference = references.get(Provider(provider))
+        if reference is None or reference.run_id != run_id:
+            raise PersistenceError("parent peer projection does not match a selected child")
     aggregate = aggregate_campaign(children)
+    updated_at = max(parent.updated_at, occurred_at)
+    event_detail = detail
+    if child_observation is not None and occurred_at < parent.updated_at:
+        event_detail = (f"{detail}; earlier peer event {occurred_at.isoformat()} "
+            f"reconciled at aggregate high-water time {updated_at.isoformat()}")
     event = LifecycleEvent(
         state_domain="campaign",
         state=aggregate.value,
-        occurred_at=occurred_at,
-        detail=detail,
+        occurred_at=updated_at,
+        detail=event_detail,
     )
+    events = [*parent.lifecycle_events, event]
     updated = _validated_copy(
         parent,
         {
             "aggregate_state": aggregate,
-            "updated_at": occurred_at,
-            "lifecycle_events": [*parent.lifecycle_events, event],
+            "updated_at": updated_at,
+            "lifecycle_events": events,
         },
     )
     atomic_write_json(parent_manifest_path, _manifest_payload(updated), fault)
@@ -763,7 +799,8 @@ def update_child_runtime_evidence(
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
-        recompute_parent_manifest(parent_path, occurred_at, "child runtime evidence updated", fault)
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            "child runtime evidence updated", manifest_path, fault)
     return updated
 
 
@@ -795,7 +832,8 @@ def update_child_execution(
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
-        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} execution -> {target.value}", fault)
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            f"child {manifest.run_id} execution -> {target.value}", manifest_path, fault)
     return updated
 
 
@@ -825,7 +863,8 @@ def update_child_cleanup(
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
-        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} cleanup -> {target.value}", fault)
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            f"child {manifest.run_id} cleanup -> {target.value}", manifest_path, fault)
     return updated
 
 
