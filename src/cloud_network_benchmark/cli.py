@@ -10,6 +10,7 @@ from .config import resolve_campaign
 from .dry_run import build_dry_run, render_human, render_json
 from .errors import BenchmarkError
 from .manifests import initialize_campaign
+from .manifests import RepositoryGitProvenance
 
 
 def _repository_root() -> Path:
@@ -27,6 +28,9 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--config", type=Path, required=True)
     init.add_argument("--results-root", type=Path, default=Path("results"))
     init.add_argument("--format", choices=("human", "json"), default="human")
+    analyze = subparsers.add_parser("analyze")
+    analyze.add_argument("--selection", type=Path, required=True)
+    analyze.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -41,6 +45,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         args = parser.parse_args(argv)
         root = _repository_root()
+        if args.command == "analyze":
+            from .analysis import analyze_selection
+            from .analysis_report import write_analysis
+            try:
+                report = analyze_selection(args.selection, analysis_git=RepositoryGitProvenance().snapshot(root))
+                files = write_analysis(report, args.output)
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"Error [analysis_error]: {exc}", file=sys.stderr)
+                return 2
+            print(f"Analysis report written to {args.output} ({len(files)} files)")
+            return 0
         config_path = args.config if args.config.is_absolute() else root / args.config
         if args.command in {"validate", "resolve"}:
             resolved, _ = resolve_campaign(config_path, root)

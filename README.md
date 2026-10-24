@@ -21,3 +21,13 @@ Choose or prepare an experiment configuration for the providers and scenarios yo
 ## Research context
 
 This framework supports the Master's thesis *Benchmarking Network Performance across Clouds*. The thesis describes the research questions, measurement design, and interpretation of results.
+
+## Analyze saved results
+
+Install the optional local renderer with `python -m pip install -e '.[analysis]'`, then point `analyze` at a selection of saved validator inputs and validation results. The command revalidates selected evidence and writes a new, source-disjoint report directory. A successful exit means publication succeeded; it does not mean every selected observation is valid or comparable.
+
+```bash
+cloud-network-benchmark analyze --selection selection.json --output results/processed/report-001
+```
+
+See [native analysis](docs/native-analysis.md) for the selection format, output files, and evidence limits.
