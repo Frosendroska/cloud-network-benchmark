@@ -24,4 +24,14 @@ Before measurement, the lifecycle adapter stages the selected package revision t
 
 ## Research context
 
-This framework supports the Master's thesis *Benchmarking Network Performance across Clouds*. The thesis repository owns research questions, methodology, experiment design and interpretation; this repository owns executable configuration, provider code, orchestration, raw result bundles, validation and implementation documentation.
+This framework supports the Master's thesis *Benchmarking Network Performance across Clouds*. The thesis repository owns research questions, methodology, experiment design and interpretation; this repository owns executable configuration, provider code, orchestration, raw result bundles, validation and implementation documentation. The thesis describes the research questions, measurement design, and interpretation of results.
+
+## Analyze saved results
+
+Install the optional local renderer with `python -m pip install -e '.[analysis]'`, then point `analyze` at a selection of saved validator inputs and validation results. The command revalidates selected evidence and writes a new, source-disjoint report directory. A successful exit means publication succeeded; it does not mean every selected observation is valid or comparable.
+
+```bash
+cloud-network-benchmark analyze --selection selection.json --output results/processed/report-001
+```
+
+See [native analysis](docs/native-analysis.md) for the selection format, output files, and evidence limits.
