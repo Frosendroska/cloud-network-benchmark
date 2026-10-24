@@ -16,7 +16,7 @@ from .analysis_plots import render_figures
 
 _TABLES = {
     "runs.csv": ("run_id", "attempt_id", "campaign_id", "experiment_id", "config_id", "deployment_id", "provider", "scenario", "mode", "context", "unit_id", "kind", "phase", "streams", "study_start_utc", "study_date", "study_weekday", "schedule_entry_id", "schedule_window_label", "schedule_source_path", "schedule_source_sha256", "data_validity", "recorded_data_validity", "current_data_validity", "comparison_eligibility", "saved_result_metrics_consistent", "saved_result_differing_fields", "rtt", "receiver", "metadata", "source_refs"),
-    "bins.csv": ("run_id", "attempt_id", "campaign_id", "experiment_id", "config_id", "deployment_id", "unit_id", "chunk_id", "axis", "start_seconds", "end_seconds", "nominal_seconds", "supported_seconds", "coverage", "receiver_supported_seconds", "rtt", "receiver_bytes", "receiver", "study_date", "study_weekday", "schedule_entry_id", "schedule_window_label", "source_refs"),
+    "bins.csv": ("run_id", "attempt_id", "campaign_id", "experiment_id", "config_id", "deployment_id", "unit_id", "chunk_id", "chunk_ids", "chunk_windows", "axis", "start_seconds", "end_seconds", "nominal_seconds", "selected_seconds", "selection_start_seconds", "selection_end_seconds", "supported_seconds", "coverage", "receiver_supported_seconds", "receiver_whole_interval_seconds", "rtt", "receiver_bytes", "receiver", "receiver_whole_intervals", "receiver_exclusions", "study_date", "study_weekday", "schedule_entry_id", "schedule_window_label", "source_refs"),
     "deployments.csv": ("provider", "scenario", "phase", "window_label", "metric", "date_basis", "date_or_weekday", "n", "points", "deployment_ids", "run_ids", "source_refs", "study_dates", "study_weekdays", "median", "q1", "q3", "iqr"),
     "comparisons.csv": ("comparison_type", "comparison_id", "provider", "scenario", "slot_id", "window_label", "phase", "metric", "direction", "expected_providers", "present_providers", "missing_providers", "eligibility", "phase_ids", "run_ids", "config_ids", "placement_settings", "baseline", "comparison", "rtt_difference_us", "throughput_change_percent", "n_s1", "n_s3", "study_dates", "same_utc_week", "reasons", "unavailable_reason"),
     "diagnostics.csv": ("run_id", "vm_role", "sampled_at", "monotonic_seconds", "interval_seconds", "measurement_unit_ids", "metrics", "reset_fields", "gap_reason", "clock_mappings_within_100ms", "alignment_unavailable_reason", "source"),
@@ -71,8 +71,23 @@ def _html(payload: dict[str, Any]) -> str:
     figures = payload.get("figures", [])
     images = "\n".join(f'<figure><a href="{html.escape(item["svg"], quote=True)}"><img src="{html.escape(item["png"], quote=True)}" alt="{html.escape(item["caption"], quote=True)}"></a><figcaption>{html.escape(item["caption"])}</figcaption></figure>' for item in figures)
     body_rows = "\n".join("<tr>" + "".join(f"<td>{html.escape(_stable(row.get(key)))}</td>" for key in ("run_id", "provider", "scenario", "mode", "unit_id", "phase", "data_validity", "comparison_eligibility")) + "</tr>" for row in rows)
-    source_rows = "\n".join(f'<tr><td>{html.escape(item.get("run_id", ""))}</td><td>{html.escape(item.get("artifact_id", item.get("kind", "")))}</td><td><a href="{html.escape(item.get("resolved_path", item.get("path", "")), quote=True)}"><code>{html.escape(item.get("path", ""))}</code></a></td><td>{html.escape(item.get("sha256", ""))}</td></tr>' for item in payload.get("sources", []))
-    table_families = (("Bins", "bins", ("run_id", "unit_id", "start_seconds", "end_seconds", "nominal_seconds", "supported_seconds", "coverage", "rtt", "receiver_bytes")),
+    def source_row(item: dict[str, Any]) -> str:
+        path = str(item.get("path") or "")
+        resolved = item.get("resolved_path")
+        if isinstance(resolved, str) and resolved:
+            path_cell = f'<a href="{html.escape(resolved, quote=True)}"><code>{html.escape(path)}</code></a>'
+        else:
+            reason = str(item.get("unavailable_reason") or "source path cannot be resolved")
+            path_cell = f'<span>Unavailable: {html.escape(reason)}</span>'
+            if path:
+                path_cell += f' <code>{html.escape(path)}</code>'
+        return "<tr>" + "".join((
+            f"<td>{html.escape(str(item.get('run_id') or ''))}</td>",
+            f"<td>{html.escape(str(item.get('artifact_id') or item.get('kind') or ''))}</td>",
+            f"<td>{path_cell}</td>",
+            f"<td>{html.escape(str(item.get('sha256') or ''))}</td>")) + "</tr>"
+    source_rows = "\n".join(source_row(item) for item in payload.get("sources", []))
+    table_families = (("Bins", "bins", ("run_id", "unit_id", "chunk_ids", "chunk_windows", "start_seconds", "end_seconds", "selected_seconds", "nominal_seconds", "supported_seconds", "coverage", "rtt", "receiver_bytes", "receiver_whole_intervals", "receiver_exclusions")),
         ("Deployment distributions", "deployments", ("provider", "scenario", "phase", "window_label", "metric", "n", "points", "median", "q1", "q3", "iqr", "study_dates", "study_weekdays")),
         ("Deployment date and weekday groups", "deployment_time_groups", ("provider", "scenario", "phase", "window_label", "metric", "date_basis", "date_or_weekday", "n", "points", "median", "q1", "q3", "iqr")),
         ("Matched provider comparisons", "comparisons", ("scenario", "slot_id", "window_label", "expected_providers", "present_providers", "missing_providers", "eligibility", "phase_ids", "run_ids", "reasons")),

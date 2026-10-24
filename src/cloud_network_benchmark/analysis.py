@@ -271,6 +271,36 @@ def _unique_deployment_attempts(rows: list[dict[str, Any]], value_of: Any) -> tu
     return kept, conflicts
 
 
+def _deduplicate_cost_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Represent a shared provider reservation once, independent of selection order."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (str(row.get("reservation_id") or f"run:{row.get('run_id', '')}"),
+               str(row.get("provider", "")))
+        groups.setdefault(key, []).append(row)
+    output = []
+    compared = ("campaign_id", "reservation", "actual", "estimated", "final", "source_verified")
+    for _key, members in sorted(groups.items()):
+        members = sorted(members, key=lambda item: (str(item.get("run_id", "")),
+            json.dumps(item, sort_keys=True, separators=(",", ":"))))
+        first = members[0]
+        run_ids = sorted({str(item["run_id"]) for item in members if item.get("run_id")})
+        signatures = {tuple(json.dumps(item.get(field), sort_keys=True, separators=(",", ":"))
+                            for field in compared) for item in members}
+        refs = sorted({json.dumps(ref, sort_keys=True, separators=(",", ":"))
+                       for item in members for ref in item.get("source_refs", [])})
+        row = {**first, "run_id": run_ids[0] if run_ids else "", "run_ids": run_ids,
+               "source_refs": [json.loads(ref) for ref in refs]}
+        if len(signatures) > 1 and len(members) > 1:
+            reason = "shared reservation evidence conflicts across selected runs"
+            row.update({"reservation": {"unavailable_reason": reason},
+                "actual": {"unavailable_reason": reason}, "estimated": {"unavailable_reason": reason},
+                "final": False, "source_verified": False, "unavailable_reason": reason})
+        output.append(row)
+    return sorted(output, key=lambda row: (row.get("reservation_id") or "",
+        row.get("provider", ""), row.get("run_id", "")))
+
+
 def _containing_window(windows: list[tuple[float, float]], starts: list[float],
                        interval_start: float, interval_end: float) -> bool:
     """Return whether one preserved acquisition window fully contains an interval."""
@@ -315,8 +345,8 @@ def _histogram_data(values: list[float]) -> dict[str, Any]:
     return {"edges_us": edges, "counts": counts}
 
 
-def _iperf_receiver_origin(tcp: Any) -> tuple[float, float] | None:
-    """Return native session interval UTC origin and the configured omit seconds."""
+def _iperf_receiver_origin(tcp: Any, *, post_omit_origin: bool) -> tuple[float, float] | None:
+    """Return the session interval UTC origin using F08's unit-specific reset rule."""
     if tcp is None or len(tcp.session_details) != 1:
         return None
     detail = tcp.session_details[0]
@@ -334,7 +364,56 @@ def _iperf_receiver_origin(tcp: Any) -> tuple[float, float] | None:
         return None
     if not math.isfinite(origin) or not math.isfinite(omit) or omit < 0:
         return None
-    return origin + omit, omit
+    return origin + (omit if post_omit_origin else 0.0), omit
+
+
+def _receiver_interval_bin(start: float, end: float, origin: float,
+                           width: float, uncertainty: float) -> tuple[int | None, list[int]]:
+    """Map a whole receiver interval to one bin, or identify every touched bin."""
+    if end + uncertainty <= origin:
+        return None, []
+    first = max(0, math.floor((start - uncertainty - origin) / width))
+    last = max(0, math.ceil((end + uncertainty - origin) / width) - 1)
+    touched = list(range(first, last + 1))
+    if len(touched) == 1:
+        bin_start = origin + touched[0] * width
+        bin_end = bin_start + width
+        if start - uncertainty >= bin_start and end + uncertainty <= bin_end:
+            return touched[0], touched
+    return None, touched
+
+
+def _receiver_bin_metrics(intervals: list[Any], *, straddled: bool,
+                          unavailable_reason: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return primary metrics and independently visible whole-interval evidence."""
+    whole = receiver_statistics(intervals)
+    if straddled:
+        reason = "receiver interval straddles a bin boundary"
+        primary = {"received_bytes": Evidence[int](unavailable_reason=reason),
+            "measured_seconds": Evidence[float](unavailable_reason=reason),
+            "throughput_gbps": Evidence[float](unavailable_reason=reason)}
+    elif not intervals:
+        primary = {"received_bytes": Evidence[int](unavailable_reason=unavailable_reason),
+            "measured_seconds": Evidence[float](unavailable_reason=unavailable_reason),
+            "throughput_gbps": Evidence[float](unavailable_reason=unavailable_reason)}
+    else:
+        primary = whole
+    return primary, whole
+
+
+def _combine_day_minute_parts(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine chunk-native observations before calculating a canonical DAY minute."""
+    chunk_windows = {}
+    for part in parts:
+        chunk_windows.update(part.get("chunk_windows", {}))
+    return {"samples": [sample for part in parts for sample in part.get("samples", [])],
+        "support": _union_intervals([interval for part in parts for interval in part.get("support", [])]),
+        "receiver_intervals": [interval for part in parts for interval in part.get("receiver_intervals", [])],
+        "receiver_straddles": any(part.get("receiver_straddles", False) for part in parts),
+        "exclusions": [item for part in parts for item in part.get("exclusions", [])],
+        "source_refs": sorted({path for part in parts for path in part.get("source_refs", [])}),
+        "chunk_ids": sorted({chunk_id for part in parts for chunk_id in part.get("chunk_ids", [])}),
+        "chunk_windows": chunk_windows}
 
 
 def _timing_clock_error(timing: Any, tool: str) -> float | None:
@@ -498,6 +577,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
     run_rows: list[dict[str, Any]] = []
     bins: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
+    day_bin_accumulators: dict[int, list[dict[str, Any]]] = {}
     for record in value.artifact_records:
         try:
             resolved = _artifact_path(value, record).resolve(strict=True)
@@ -506,6 +586,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         sources.append({"run_id": value.identity.run_id, "artifact_id": record.artifact_id,
             "kind": str(record.kind), "path": record.path,
             "resolved_path": str(resolved) if resolved else None,
+            "unavailable_reason": None if resolved else "recorded artifact cannot be resolved to a local file",
             "sha256": record.sha256.value, "unit_id": record.unit_id,
             "producer": str(record.producer)})
     for artifact_id, path, digest in (
@@ -547,7 +628,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         windows = acquisition.get(unit_id, ([], []))[0]
         receiver_windows = _union_intervals((left, right) for tool, left, right in windows if tool == "iperf3")
         receiver_window_starts = [left for left, _right in receiver_windows]
-        receiver_origin = _iperf_receiver_origin(tcp)
+        receiver_origin = _iperf_receiver_origin(tcp, post_omit_origin=unit.kind == "continuous_day")
         receiver_error = _timing_clock_error(timing, "iperf3") if timing else None
         receiver_intervals = tuple(tcp.receiver_intervals) if tcp else ()
         selected_receiver = [] if utc_window is not None else list(receiver_intervals)
@@ -628,16 +709,32 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         sample_bins = dict(_sample_bins([(elapsed, sample) for elapsed, sample, _ in timed_samples], width))
         receiver_bins: dict[int, list[Any]] = {}
         receiver_bin_reasons: dict[int, set[str]] = {}
+        receiver_bin_exclusions: dict[int, list[dict[str, Any]]] = {}
+        receiver_bin_straddles: set[int] = set()
         if receiver_origin is not None and receiver_error is not None and receiver_windows and axis_origin is not None:
             for interval_start, interval_end, interval in mapped_receiver:
-                start_elapsed, end_elapsed = interval_start - axis_origin, interval_end - axis_origin
-                index = math.floor(start_elapsed / width)
-                bin_start, bin_end = index * width + axis_origin, (index + 1) * width + axis_origin
-                if interval_start - receiver_error >= bin_start and interval_end + receiver_error <= bin_end:
+                index, touched = _receiver_interval_bin(interval_start, interval_end, axis_origin,
+                    width, receiver_error)
+                exclusion = {"artifact_id": interval.source.artifact_id, "path": interval.source.path,
+                    "sha256": interval.source.sha256, "start_seconds": interval.start_seconds,
+                    "end_seconds": interval.end_seconds, "bytes": interval.bytes,
+                    "reason": "omitted warm-up interval" if interval.omitted else
+                        "sender interval excluded" if interval.sender else
+                        "receiver interval straddles a bin boundary"}
+                if interval.omitted or interval.sender:
+                    for affected in touched:
+                        indices.add(affected)
+                        receiver_bin_reasons.setdefault(affected, set()).add(exclusion["reason"])
+                        receiver_bin_exclusions.setdefault(affected, []).append(exclusion)
+                elif index is not None:
                     receiver_bins.setdefault(index, []).append(interval)
                     indices.add(index)
                 else:
-                    receiver_bin_reasons.setdefault(index, set()).add("receiver interval straddles a bin boundary")
+                    for affected in touched:
+                        indices.add(affected)
+                        receiver_bin_straddles.add(affected)
+                        receiver_bin_reasons.setdefault(affected, set()).add(exclusion["reason"])
+                        receiver_bin_exclusions.setdefault(affected, []).append(exclusion)
         for index in sorted(indices):
             start, end = index * width, (index + 1) * width
             bucket_samples = sample_bins.get(index, [])
@@ -647,17 +744,19 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                         if min(right, axis_origin + end) > max(left, axis_origin + start)]
             supported_seconds = sum(right - left for left, right in overlaps)
             bucket_receiver = receiver_bins.get(index, [])
-            receiver_metrics = receiver_statistics(bucket_receiver)
-            if not bucket_receiver:
-                reason = "; ".join(sorted(receiver_bin_reasons.get(index, set()))) or receiver_reason
-                receiver_metrics = {"received_bytes": Evidence[int](unavailable_reason=reason),
-                    "measured_seconds": Evidence[float](unavailable_reason=reason),
-                    "throughput_gbps": Evidence[float](unavailable_reason=reason)}
-            source_paths = {sample.source.path for _, sample in bucket_samples} | {item.source.path for item in bucket_receiver}
-            bins.append({"run_id": value.identity.run_id, "deployment_id": value.identity.deployment_id,
+            receiver_metrics, whole_interval_metrics = _receiver_bin_metrics(bucket_receiver,
+                straddled=index in receiver_bin_straddles,
+                unavailable_reason="; ".join(sorted(receiver_bin_reasons.get(index, set()))) or receiver_reason)
+            exclusions = sorted(receiver_bin_exclusions.get(index, []),
+                key=lambda item: (item["path"], item["start_seconds"], item["end_seconds"], item["reason"]))
+            source_paths = ({sample.source.path for _, sample in bucket_samples}
+                | {item.source.path for item in bucket_receiver}
+                | {item["path"] for item in exclusions})
+            bin_row = {"run_id": value.identity.run_id, "deployment_id": value.identity.deployment_id,
                 "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
                 "config_id": value.identity.config_id, "attempt_id": value.identity.run_id,
                 "unit_id": unit_id, "chunk_id": unit_id if unit.kind == "probe_chunk" else None,
+                "chunk_ids": [unit_id] if unit.kind == "probe_chunk" else [],
                 "mode": str(value.mode), "kind": str(unit.kind), "phase": str(unit.phase),
                 "study_date": study_date, "study_weekday": study_start.strftime("%A") if study_start else None,
                 "schedule_entry_id": schedule.entry_id if schedule else None,
@@ -669,8 +768,24 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                 "supported_seconds": supported_seconds,
                 "coverage": "supported" if supported_seconds >= width else "partial or acquisition gap",
                 "rtt": rtt, "receiver_bytes": receiver_metrics, "receiver": receiver_metrics,
+                "receiver_whole_intervals": whole_interval_metrics, "receiver_exclusions": exclusions,
                 "receiver_supported_seconds": receiver_metrics["measured_seconds"].value or 0,
-                "source_refs": sorted(source_paths)})
+                "receiver_whole_interval_seconds": whole_interval_metrics["measured_seconds"].value or 0,
+                "source_refs": sorted(source_paths)}
+            if str(value.mode) == "diagnostic_day":
+                part = {"samples": [sample for _, sample in bucket_samples], "support": overlaps,
+                    "receiver_intervals": bucket_receiver, "receiver_straddles": index in receiver_bin_straddles,
+                    "exclusions": exclusions, "source_refs": sorted(source_paths),
+                    "chunk_ids": [], "chunk_windows": {}}
+                if unit.kind == "probe_chunk":
+                    part["chunk_ids"].append(unit_id)
+                    if timing and timing.measured_started_at.value and timing.measured_finished_at.value:
+                        part["chunk_windows"][unit_id] = {
+                            "start_utc": timing.measured_started_at.value.isoformat(),
+                            "end_utc": timing.measured_finished_at.value.isoformat()}
+                day_bin_accumulators.setdefault(index, []).append(part)
+            else:
+                bins.append(bin_row)
         for parsed in (sock, tcp):
             if parsed:
                 for ref in (parsed.source, *(sample.source for sample in parsed.samples),
@@ -685,31 +800,71 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         if day_start is not None and day_finish is not None:
             duration = max(0.0, (day_finish - day_start).total_seconds())
             width = 60
-            present = {int(row["start_seconds"] // width) for row in bins if row.get("mode") == "diagnostic_day"}
+            day_start_timestamp = day_start.timestamp()
+            selected_start = max(day_start_timestamp, window_start if window_start is not None else day_start_timestamp)
+            selected_end = min(day_start_timestamp + duration, window_end if window_end is not None else day_start_timestamp + duration)
+            if selected_end > selected_start:
+                first_index = max(0, math.floor((selected_start - day_start_timestamp) / width))
+                end_index = min(math.ceil(duration / width), math.ceil((selected_end - day_start_timestamp) / width))
+            else:
+                first_index = end_index = 0
             parent_unit = next((unit for unit in value.measurement_units if unit.kind == "continuous_day"), None)
             schedule = value.schedule_entry.value
-            missing = {"received_bytes": Evidence[int](unavailable_reason="no whole source-supported receiver interval in this minute"),
-                "measured_seconds": Evidence[float](unavailable_reason="no whole source-supported receiver interval in this minute"),
-                "throughput_gbps": Evidence[float](unavailable_reason="no whole source-supported receiver interval in this minute")}
-            for index in range(math.ceil(duration / width)):
-                if index in present:
-                    continue
+            for index in range(first_index, end_index):
                 start = index * width
+                end = min(start + width, duration)
+                selected_start_seconds = max(start, selected_start - day_start_timestamp)
+                selected_end_seconds = min(end, selected_end - day_start_timestamp)
+                selected_seconds = max(0.0, selected_end_seconds - selected_start_seconds)
+                parts = day_bin_accumulators.get(index, [])
+                aggregate = _combine_day_minute_parts(parts)
+                support = _union_intervals([(max(left, day_start_timestamp + start),
+                    min(right, day_start_timestamp + end)) for left, right in aggregate["support"]
+                    if min(right, day_start_timestamp + end) > max(left, day_start_timestamp + start)])
+                supported_seconds = sum(right - left for left, right in support)
+                receiver_intervals = aggregate["receiver_intervals"]
+                receiver_metrics, whole_interval_metrics = _receiver_bin_metrics(receiver_intervals,
+                    straddled=bool(parts and aggregate["receiver_straddles"]),
+                    unavailable_reason="no whole source-supported receiver interval in this selected minute")
+                exclusions = sorted({json.dumps(item, sort_keys=True, separators=(",", ":"))
+                    for item in aggregate["exclusions"]})
+                exclusions = [json.loads(item) for item in exclusions]
+                source_paths = aggregate["source_refs"]
+                chunk_ids = aggregate["chunk_ids"]
+                if not parts:
+                    kind = "acquisition_gap"
+                    rtt = rtt_statistics([])
+                    coverage = "unsupported selected acquisition interval"
+                    supported_seconds = 0.0
+                else:
+                    kind = "continuous_day_minute"
+                    rtt = rtt_statistics([sample.rtt_us for sample in aggregate["samples"]])
+                    if selected_seconds < width:
+                        coverage = "partial UTC selection or measured-day tail"
+                    else:
+                        coverage = "supported" if supported_seconds >= selected_seconds else "partial or acquisition gap"
+                chunk_windows = [(chunk_id, aggregate["chunk_windows"].get(chunk_id))
+                    for chunk_id in chunk_ids]
                 bins.append({"run_id": value.identity.run_id, "attempt_id": value.identity.run_id,
                     "campaign_id": value.identity.campaign_id, "experiment_id": value.identity.experiment_id,
                     "config_id": value.identity.config_id, "deployment_id": value.identity.deployment_id,
-                    "unit_id": parent_unit.unit_id if parent_unit else "continuous-day", "chunk_id": None,
-                    "mode": "diagnostic_day", "kind": "acquisition_gap",
+                    "unit_id": parent_unit.unit_id if parent_unit else "continuous-day",
+                    "chunk_id": chunk_ids[0] if len(chunk_ids) == 1 else None, "chunk_ids": chunk_ids,
+                    "chunk_windows": chunk_windows, "mode": "diagnostic_day", "kind": kind,
                     "phase": str(parent_unit.phase) if parent_unit else "multi_flow",
                     "study_date": day_start.date().isoformat(), "study_weekday": day_start.strftime("%A"),
                     "schedule_entry_id": schedule.entry_id if schedule else None,
                     "schedule_window_label": schedule.window_label if schedule else None,
                     "acquisition_chunk_start_utc": None, "acquisition_chunk_end_utc": None,
                     "axis": "UTC-mapped seconds from continuous-day origin", "start_seconds": start,
-                    "end_seconds": min(start + width, duration), "nominal_seconds": width,
-                    "supported_seconds": 0.0, "coverage": "unsupported whole-minute acquisition gap",
-                    "rtt": rtt_statistics([]), "receiver_bytes": missing, "receiver": missing,
-                    "receiver_supported_seconds": 0.0, "source_refs": []})
+                    "end_seconds": end, "nominal_seconds": width, "selected_seconds": selected_seconds,
+                    "selection_start_seconds": selected_start_seconds, "selection_end_seconds": selected_end_seconds,
+                    "supported_seconds": supported_seconds, "coverage": coverage,
+                    "rtt": rtt, "receiver_bytes": receiver_metrics, "receiver": receiver_metrics,
+                    "receiver_whole_intervals": whole_interval_metrics, "receiver_exclusions": exclusions,
+                    "receiver_supported_seconds": receiver_metrics["measured_seconds"].value or 0,
+                    "receiver_whole_interval_seconds": whole_interval_metrics["measured_seconds"].value or 0,
+                    "source_refs": source_paths})
     return run_rows, bins, sources
 
 
@@ -902,17 +1057,7 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
                 "final": False, "runtime": {"unavailable_reason": "runtime not sourced"},
                 "transfer": {"unavailable_reason": "transfer not sourced"},
                 "source_refs": []})
-    deduplicated_costs: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in costs:
-        key = (item.get("reservation_id") or f"run:{item.get('run_id', '')}", item.get("provider", ""))
-        if key not in deduplicated_costs:
-            deduplicated_costs[key] = {**item, "run_ids": [item["run_id"]] if item.get("run_id") else []}
-        else:
-            existing = deduplicated_costs[key]
-            existing["run_ids"] = sorted(set(existing["run_ids"]) | ({item["run_id"]} if item.get("run_id") else set()))
-            existing["source_refs"] = sorted({json.dumps(ref, sort_keys=True) for ref in existing["source_refs"] + item.get("source_refs", [])})
-            existing["source_refs"] = [json.loads(ref) for ref in existing["source_refs"]]
-    costs = sorted(deduplicated_costs.values(), key=lambda row: (row.get("reservation_id") or "", row.get("provider", ""), row.get("run_id", "")))
+    costs = _deduplicate_cost_rows(costs)
     comparison_rows, comparison_results = _comparison_rows(current_inputs, current_results) if current_inputs else ([], {})
     for row in all_runs:
         current = comparison_results.get(row["run_id"])
