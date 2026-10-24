@@ -1,4 +1,4 @@
-"""Exercise the real all-provider factory through a failed protection barrier."""
+"""Exercise default provider factories through source-shaped offline commands."""
 from __future__ import annotations
 
 import hashlib
@@ -203,6 +203,104 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
         cleanup_runner=runner, cleanup_utc_now=clock.utc_now, cleanup_monotonic_now=clock.monotonic)
     assert cleanup_code == 0
     assert not any("apply" in action or "measure" in action for action in runner.actions[before:])
+
+
+def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cleanup(
+        tmp_path, repository_root, monkeypatch):
+    """Keep Azure's real hook and provider functions while faking only CLI replies."""
+    import cloud_network_benchmark.lifecycle_adapters as adapters
+    from tests.integration.test_azure_provider_flow import CleanupRunner
+    from cloud_network_benchmark.contracts.common import CommandOutcome
+
+    config = repository_root / "configs/tests/exp-901-azure-single-provider.yaml"
+    campaign, _ = resolve_campaign(config, repository_root)
+    initialized = initialize_campaign(config, repository_root, tmp_path / "results",
+        clock=lambda: NOW, token_source=lambda: "azure-source-shaped")
+    parent_path = Path(initialized.parent_manifest_path)
+    parent, children = load_initialized_campaign(parent_path, repository_root=repository_root, config_path=config)
+    costs = _costs(tmp_path / "costs.json", campaign, children)
+    gates = {}
+    for name in ("f10_offline", "paid_authorization", "quota_review"):
+        source = tmp_path / f"{name}.txt"; source.write_text(f"synthetic {name}\n")
+        gates[name] = {"evidence_id": f"synthetic-{name}", "source_path": str(source),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    pub = tmp_path / "test.pub"
+    pub.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc test\n")
+    identity = tmp_path / "azure-id"
+    identity.write_text("synthetic private identity for offline runtime only\n")
+    identity.chmod(0o600)
+    expiry_cost = tmp_path / "azure-expiry-cost.json"
+    expiry_cost.write_text(json.dumps({"source_id": "synthetic-azure-prices", "date": "2026-10-22",
+        "sha256": "a" * 64, "automation_rate_per_job_minute": 0.002, "job_minutes_bound": 20}))
+    runtime = {"initialized_campaign_manifest": parent_path,
+        "ledger": {"path": tmp_path / "ledger.json", "scope_id": "azure-source-shaped", "initialize_if_missing": True},
+        "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10,
+            "synthetic-test-policy", {"azure": 360}), "copy_retry_seconds": 1,
+        "approval_evidence": gates,
+        "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
+                cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
+            "readiness": ReadinessConfig(poll_interval_seconds=.01, attempt_ceiling=1),
+            "guest_remote_root": "/var/lib/cnb/runtime",
+            "diagnostic_interfaces": {"azure": {"vm_a": "eth0", "vm_b": "eth0"}}},
+        "providers": {"azure": {"options": {"subscription_id": "00000000-0000-0000-0000-000000000001",
+                "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
+                "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
+                "ssh_public_key_path": pub, "authentication_reference": str(identity),
+                "poll_seconds": 15, "command_timeout_seconds": 60},
+            "bootstrap_template": repository_root / "terraform/azure/pair/main.tf",
+            "terraform_directory": repository_root / "terraform/azure",
+            "sources": {"expiry_cost_path": expiry_cost, "primary_review_path": None}}}}
+    clock = Clock()
+    class AzureCommandRunner:
+        def __init__(self):
+            self.delegate = None
+            self.requests = []
+        def run(self, request):
+            assert self.delegate is not None, "actual Azure hook must bind the cleanup runner before protection"
+            self.requests.append(request)
+            self.delegate.now = clock.utc_now()
+            if request.action_type == "vm_image_observation":
+                self.delegate.requests.append(request)
+                publisher, offer, sku, version = self.delegate.o.selected_image.split(":")
+                payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                    "offer": offer, "sku": sku, "exactVersion": version}}}
+                return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
+                    started_at=clock.utc_now(), finished_at=clock.utc_now(), duration_seconds=0,
+                    exit_code=0, stdout=json.dumps(payload), stderr="")
+            return self.delegate.run(request)
+    runner = AzureCommandRunner()
+    original_azure_hooks = adapters.azure_hooks
+    observed = {}
+    def observe_azure_hooks(deployment, expiry_request, **kwargs):
+        observed.update(deployment=deployment, expiry_request=expiry_request, options=kwargs["options"])
+        runner.delegate = CleanupRunner(deployment, kwargs["options"], clock.utc_now())
+        return original_azure_hooks(deployment, expiry_request, **kwargs)
+    monkeypatch.setattr(adapters, "azure_hooks", observe_azure_hooks)
+    built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
+        runtime=runtime, controller_session_id="synthetic-session", runner=runner,
+        clock=clock, private_root=tmp_path / "private", repository_root=repository_root)
+    assert load_cost_inputs(Path(costs.source_path)).payload_sha256 == costs.payload_sha256
+    result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
+        admission_plan=built["plan"], allowance=built["allowance"],
+        workflow_factory=built["workflow_factory"], clock=clock,
+        recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    assert result.admission_status == "reserved", result.admission_reasons
+    assert set(result.provider_results) == {"azure"}
+    provider = result.provider_results["azure"]
+    assert provider.values["protect"].state == "registered", provider.values["protect"].failure
+    assert provider.values["claim"].eligible is True
+    assert provider.values["claim"].creation_granted is True
+    assert provider.values["create"] is not None, (provider.primary_failure, provider.values)
+    assert provider.values["create"].deployment is not None, provider.values["create"].failures[0].message
+    assert provider.values["create"].deployment.run_id == children["azure"].run_id
+    assert provider.values["cleanup"].cleanup_state == "succeeded"
+    assert provider.values["cleanup"].failures == []
+    assert all(resource["type"] == "Microsoft.Automation/automationAccounts"
+        for resource in provider.values["cleanup"].resources)
+    assert observed["deployment"].run_id == children["azure"].run_id
+    assert observed["expiry_request"].target_selector
+    assert {request.action_type for request in runner.requests} >= {
+        "expiry_outputs", "pair_apply", "pair_output", "pair_inventory", "pair_destroy"}
 
 
 def _costs(path: Path, campaign, children):
