@@ -5,6 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import pytest
 
 from cloud_network_benchmark.admission import WorkflowAllowance, load_cost_inputs
 from cloud_network_benchmark.config import resolve_campaign
@@ -327,7 +328,9 @@ def _costs(path: Path, campaign, children):
     return load_cost_inputs(path)
 
 
-def test_default_three_provider_factory_reserves_then_blocks_every_claim_after_protection_failure(tmp_path):
+@pytest.mark.parametrize("successful_protection", [False, True], ids=["protection-failure", "all-provider-claim-barrier"])
+def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
+        tmp_path, monkeypatch, successful_protection):
     config = ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"
     campaign, _ = resolve_campaign(config, ROOT)
     initialized = initialize_campaign(config, ROOT, tmp_path / "results",
@@ -343,14 +346,22 @@ def test_default_three_provider_factory_reserves_then_blocks_every_claim_after_p
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
     aws_cost = ROOT / "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
     gcp_handoff = tmp_path / "gcp-handoff.json"
+    gcp_total = sum(float(value["amount_usd"])
+        for value in costs.payload["provider_run_envelopes"]["gcp"]["components"].values())
     gcp_handoff.write_text(json.dumps({"source_path": costs.source_path, "source_sha256": cost_hash,
-        "prices_checked_on": "2026-10-22", "estimated_total_usd": 1.0,
+        "prices_checked_on": "2026-10-22", "estimated_total_usd": gcp_total,
         "units": {"two-vm-run": 1}}))
     azure_cost = tmp_path / "azure-expiry-cost.json"
     azure_cost.write_text(json.dumps({"source_id": "synthetic-azure-prices", "date": "2026-10-22",
         "sha256": "a" * 64, "automation_rate_per_job_minute": 0.002, "job_minutes_bound": 20}))
     pub = tmp_path / "test.pub"
     pub.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc test\n")
+    identities = {}
+    for provider in ("aws", "azure", "gcp"):
+        identity = tmp_path / f"{provider}-id"
+        identity.write_text(f"synthetic {provider} identity for offline runtime only\n")
+        identity.chmod(0o600)
+        identities[provider] = identity
     bootstrap = BootstrapConfig(sources=[
         SourceBuild(tool="sockperf", source_url="https://example.invalid/sockperf.tar.gz",
             source_reference="sockperf-src", archive_name="sockperf.tar.gz", source_sha256="a"*64),
@@ -360,7 +371,7 @@ def test_default_three_provider_factory_reserves_then_blocks_every_claim_after_p
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
         "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10, "synthetic-test-policy",
-            {"aws": 360, "azure": 360, "gcp": 360}),
+            {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
                 cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
@@ -371,32 +382,165 @@ def test_default_three_provider_factory_reserves_then_blocks_every_claim_after_p
         "providers": {
             "aws": {"options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
                 "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}, "public_key_path": pub,
-                "authentication_reference": "fake-aws-auth"}, "bootstrap_template": ROOT / "terraform/aws/pair/main.tf",
+                "authentication_reference": str(identities["aws"])}, "bootstrap_template": ROOT / "terraform/aws/pair/main.tf",
                 "terraform_directory": ROOT / "terraform/aws", "sources": {"expiry_cost_path": aws_cost,
                     "primary_review_path": None}},
             "azure": {"options": {"subscription_id": "00000000-0000-0000-0000-000000000001",
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
                 "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
-                "ssh_public_key_path": pub, "authentication_reference": "fake-azure-auth",
+                "ssh_public_key_path": pub, "authentication_reference": str(identities["azure"]),
                 "poll_seconds": 15, "command_timeout_seconds": 60},
                 "bootstrap_template": ROOT / "terraform/azure/pair/main.tf", "terraform_directory": ROOT / "terraform/azure",
                 "sources": {"expiry_cost_path": azure_cost, "primary_review_path": None}},
             "gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
                 "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
                     "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"},
-                "public_key_path": pub, "authentication_reference": "fake-gcp-auth"},
+                "public_key_path": pub, "authentication_reference": str(identities["gcp"])},
                 "bootstrap_template": ROOT / "terraform/gcp/pair/main.tf", "terraform_directory": ROOT / "terraform/gcp",
                 "sources": {"workflow_cost_handoff_path": gcp_handoff,
                     "support_cost_path": ROOT / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                     "primary_review_path": None}}}}
-    clock, runner = Clock(), FailedExternalCommands()
+    clock = Clock()
+    if successful_protection:
+        import cloud_network_benchmark.lifecycle_adapters as adapters
+        from tests.integration.test_f09_aws_runtime_factory import FakePreparedAwsRunner
+        from tests.integration.test_azure_provider_flow import CleanupRunner
+        class ThreeProviderDispatch:
+            def __init__(self):
+                self.clock = clock
+                self.aws = FakePreparedAwsRunner()
+                self.gcp = GcpSourceRunner()
+                self.gcp.clock = clock
+                self.azure = None
+                self.requests = []
+                self.actions = []
+                self.ledger = None
+                self.reservation_id = None
+                self.claim_snapshot_at_first_apply = None
+                self.aws_pair_destroyed = False
+            def _assert_claim_barrier(self):
+                if self.claim_snapshot_at_first_apply is not None:
+                    return
+                state = self.ledger.inspect()
+                if self.reservation_id is None:
+                    assert len(state["reservations"]) == 1, state["reservations"].keys()
+                    self.reservation_id = next(iter(state["reservations"]))
+                claims = state["reservations"][self.reservation_id]["creation_claims"]
+                assert set(claims) == {"aws", "azure", "gcp"}, claims
+                self.claim_snapshot_at_first_apply = tuple(sorted(claims))
+            def run(self, request):
+                self.requests.append(request)
+                self.actions.append(request.action_id)
+                if request.action_id.startswith("aws-"):
+                    if request.action_id == "aws-pair-apply": self._assert_claim_barrier()
+                    if request.action_id == "aws-pair-destroy": self.aws_pair_destroyed = True
+                    if request.action_id.startswith(("aws-expiry-read-terminal-", "aws-expiry-confirm-cancel-")):
+                        region = request.argv[request.argv.index("--region") + 1]
+                        execution_id = request.argv[request.argv.index("--automation-execution-id") + 1]
+                        parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
+                            "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": [self.aws.run_id],
+                            "DeploymentId": [self.aws.deployment_id], "Region": [region]}
+                        now = clock.utc_now()
+                        response = {"AutomationExecution": {"AutomationExecutionId": execution_id,
+                            "DocumentName": f"expiry-{region}", "DocumentVersion": "1",
+                            "AutomationExecutionStatus": "Cancelled", "Parameters": parameters,
+                            "StepExecutionsTruncated": False, "StepExecutions": []}}
+                        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                            finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(response), stderr="")
+                    if request.action_id.startswith(("aws-expiry-document-absence-", "aws-expiry-role-absence-")):
+                        code = "InvalidDocument" if "document-absence" in request.action_id else "NoSuchEntity"
+                        now = clock.utc_now()
+                        return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
+                            finished_at=now, duration_seconds=0, exit_code=254, stdout="",
+                            stderr=f"An error occurred ({code}) when calling the offline absence check")
+                    if self.aws_pair_destroyed and any(token.startswith("describe-") for token in request.argv):
+                        operation = next((token for token in request.argv if token.startswith("describe-")), None)
+                        collections = {"describe-instances": "Reservations", "describe-volumes": "Volumes",
+                            "describe-network-interfaces": "NetworkInterfaces", "describe-security-groups": "SecurityGroups",
+                            "describe-subnets": "Subnets", "describe-route-tables": "RouteTables",
+                            "describe-internet-gateways": "InternetGateways", "describe-vpcs": "Vpcs",
+                            "describe-vpc-peering-connections": "VpcPeeringConnections",
+                            "describe-placement-groups": "PlacementGroups", "describe-key-pairs": "KeyPairs",
+                            "describe-addresses": "Addresses"}
+                        if operation in collections:
+                            now = clock.utc_now()
+                            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                                finished_at=now, duration_seconds=0, exit_code=0,
+                                stdout=json.dumps({collections[operation]: []}), stderr="")
+                    return self.aws.run(request)
+                if request.action_id.startswith("gcp-"):
+                    if request.action_id == "gcp-pair-apply": self._assert_claim_barrier()
+                    return self.gcp.run(request)
+                if request.action_type == "pair_apply":
+                    self._assert_claim_barrier()
+                if request.action_id.startswith("azure-"):
+                    assert self.azure is not None
+                    self.azure.now = clock.utc_now()
+                    if request.action_type == "vm_image_observation":
+                        self.azure.requests.append(request)
+                        publisher, offer, sku, version = self.azure.o.selected_image.split(":")
+                        payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                            "offer": offer, "sku": sku, "exactVersion": version}}}
+                        now = clock.utc_now()
+                        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                            finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
+                    return self.azure.run(request)
+                # Keep actual remote stages active, but fail closed until the
+                # separately assigned native-remote matrix is wired here.
+                now = clock.utc_now()
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
+                    finished_at=now, duration_seconds=0, exit_code=1, stdout="", stderr="offline remote fixture not bound")
+        runner = ThreeProviderDispatch()
+    else:
+        runner = FailedExternalCommands()
     built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
         runtime=runtime, controller_session_id="synthetic-session", runner=runner,
         clock=clock, private_root=tmp_path / "private", repository_root=ROOT)
+    if successful_protection:
+        runner.ledger = built["ledger"]
+        original_aws_hooks, original_gcp_hooks, original_azure_hooks = adapters.aws_hooks, adapters.gcp_hooks, adapters.azure_hooks
+        observed = {}
+        def observe_aws(driver, deployment, expiry_request, **kwargs):
+            runner.aws.run_id = deployment.run_id
+            runner.aws.deployment_id = deployment.deployment_id
+            observed["aws"] = (driver, deployment, expiry_request)
+            return original_aws_hooks(driver, deployment, expiry_request, **kwargs)
+        def observe_gcp(driver, deployment, expiry_request, **kwargs):
+            runner.gcp.driver, runner.gcp.deployment, runner.gcp.expiry_request = driver, deployment, expiry_request
+            observed["gcp"] = (driver, deployment, expiry_request)
+            return original_gcp_hooks(driver, deployment, expiry_request, **kwargs)
+        def observe_azure(deployment, expiry_request, **kwargs):
+            runner.azure = CleanupRunner(deployment, kwargs["options"], clock.utc_now())
+            observed["azure"] = (deployment, expiry_request, kwargs["options"])
+            return original_azure_hooks(deployment, expiry_request, **kwargs)
+        monkeypatch.setattr(adapters, "aws_hooks", observe_aws)
+        monkeypatch.setattr(adapters, "gcp_hooks", observe_gcp)
+        monkeypatch.setattr(adapters, "azure_hooks", observe_azure)
     result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
         admission_plan=built["plan"], allowance=built["allowance"],
         workflow_factory=built["workflow_factory"], clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    if successful_protection:
+        assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
+        assert set(result.provider_results) == {"aws", "azure", "gcp"}
+        assert set(observed) == {"aws", "azure", "gcp"}
+        assert set(runner.claim_snapshot_at_first_apply or ()) == {"aws", "azure", "gcp"}
+        for provider_name, provider_result in result.provider_results.items():
+            assert provider_result.values["protect"].state == "registered", (provider_name, provider_result.values)
+            assert provider_result.values["claim"].eligible is True, (provider_name, provider_result.values["claim"])
+            assert provider_result.values["claim"].creation_granted is True, (provider_name, provider_result.values["claim"])
+            assert provider_result.values["create"] is not None, (provider_name, provider_result.primary_failure, provider_result.values)
+            created = provider_result.values["create"]
+            if provider_name == "azure":
+                created = created.deployment
+            assert created is not None, (provider_name, provider_result.values["create"])
+            assert created.run_id == children[provider_name].run_id
+            assert {str(created.vm_a.role), str(created.vm_b.role)} == {"vm_a", "vm_b"}
+            assert provider_result.values["cleanup"] is not None, (provider_name, provider_result.values)
+            assert provider_result.values["cleanup"].cleanup_state == "succeeded", (provider_name, provider_result.values["cleanup"].cleanup_failure, provider_result.values["cleanup"].secondary_failures, provider_result.values["cleanup"].inventory.value, [(r.action_id, r.argv) for r in runner.requests if any("describe-" in str(token) for token in r.argv)])
+        assert all(observed[p][1].run_id == children[p].run_id for p in children)
+        assert result.completed is False
+        return
     assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
     assert all(item.primary_failure is not None for item in result.provider_results.values())
