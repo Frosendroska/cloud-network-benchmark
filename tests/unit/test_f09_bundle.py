@@ -100,8 +100,15 @@ from pathlib import Path
 def test_f09_retrieval_rechecks_admission_and_records_one_campaign_retry(tmp_path):
     from tests.fixtures.f02r.support import connection, deadline, result as command_result
     from tests.unit.test_retrieval import manifest as retrieval_manifest
+    from cloud_network_benchmark.orchestration import (SavedLifecycleRecovery,
+        consume_retry_attempt, write_recovery_journal)
     now = datetime.now(timezone.utc)
     c = connection(tmp_path); payload = b"native"; calls = []
+    journal = tmp_path / "private" / "recovery.json"
+    write_recovery_journal(journal, SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-retrieval",
+        controller_session_id="session", providers=[{"provider":"aws", "deployment_id":"run-aws-deployment",
+        "journal_reference":"private/aws.json", "expiry_registered":True,
+        "creation_may_have_started":True, "cleanup_open":True}]))
     class Runner:
         def run(self, request):
             if request.action_type == "ssh":
@@ -110,12 +117,17 @@ def test_f09_retrieval_rechecks_admission_and_records_one_campaign_retry(tmp_pat
             Path(request.argv[-1]).write_bytes(b"partial" if len(calls) == 1 else payload)
             return command_result(request.action_id)
     admissions = []
+    consumed = []
     outcome = retrieve_closed_bundle(connection=c, manifest=retrieval_manifest(c, payload), runner=Runner(),
         filesystem=tmp_path, deadline=deadline(), retry_admission=lambda item: admissions.append(item.artifact_id) or True,
+        consume_retry=lambda artifact_id: consumed.append(artifact_id) or consume_retry_attempt(journal, artifact_id),
         reservation_id="res-1", provider_trigger=now + timedelta(minutes=5), retry_seconds=1,
         now_utc=lambda: now, clock=lambda: 100)
     assert outcome.complete and outcome.retrieved == ["sockperf-a"]
     assert admissions == ["sockperf-a"]
+    assert consumed == ["sockperf-a"]
+    recovery = SavedLifecycleRecovery.validate_unique(__import__("json").loads(journal.read_text()))
+    assert recovery.retry_consumed_ids == ["sockperf-a"]
     assert [attempt.attempt for attempt in outcome.attempts] == [1, 2]
     assert outcome.attempts[0].reason == "size_mismatch" and outcome.attempts[1].outcome == "verified"
 

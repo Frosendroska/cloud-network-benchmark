@@ -98,6 +98,10 @@ def test_recovery_journal_is_private_exclusive_and_cli_cleanup_never_resumes(tmp
     report = json.loads(capsys.readouterr().out)
     assert code == 0 and report["status"] == "complete" and report["execution"] == "not_resumed"
     assert actions == ["aws"] and report["external_calls"] == 1
+    saved = SavedLifecycleRecovery.validate_unique(json.loads(recovery_path.read_text()))
+    assert saved.providers[0].cleanup_open is False
+    assert saved.providers[0].creation_may_have_started is False
+    assert saved.providers[0].expiry_registered is False
 
 
 def test_common_n_command_exposes_existing_recommendation_without_freezing_config(tmp_path, capsys):

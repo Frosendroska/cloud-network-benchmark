@@ -74,9 +74,14 @@ def package_tree_sha256(root: Path) -> str:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("package root must be a real directory")
     digest = hashlib.sha256()
-    files = sorted(path for path in root.rglob("*") if path.is_file())
-    if any(path.is_symlink() for path in root.rglob("*")):
+    paths = list(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
         raise ValueError("package tree cannot contain symlinks")
+    # Importing the staged package creates bytecode caches. They are runtime
+    # products, not source identity, and must not change the selected digest.
+    files = sorted(path for path in paths if path.is_file()
+                   and "__pycache__" not in path.relative_to(root).parts
+                   and path.suffix != ".pyc")
     for path in files:
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(4, "big")); digest.update(relative)

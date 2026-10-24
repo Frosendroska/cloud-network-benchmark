@@ -36,10 +36,10 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
                         clock: Callable[[], float] = __import__("time").monotonic) -> GuestRuntimeEvidence:
     """Stage the exact package source on A and verify its private venv.
 
-    The guest venv isolates the staged application and records the existing
-    Ubuntu Python dependency versions. It uses system site packages so this
-    offline-safe step never downloads or resolves new dependencies; a guest
-    missing pydantic or PyYAML fails before measurement.
+    The guest venv isolates the staged application and records the prepared
+    Ubuntu Python dependency versions. Bootstrap installs the venv tooling and
+    the existing distro Pydantic/PyYAML packages; this step never downloads or
+    resolves dependencies and fails before measurement if they are absent.
     """
     from .access import _action, _execute, _request
     from .contracts.common import CommandOutcome
@@ -63,7 +63,7 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
             for path in sorted(package_root.rglob("*")):
                 if path.is_symlink():
                     raise ValueError("controller package source cannot contain symlinks")
-                if path.is_file():
+                if path.is_file() and "__pycache__" not in path.relative_to(package_root).parts and path.suffix != ".pyc":
                     tar.add(path, arcname=(PurePosixPath("source/cloud_network_benchmark")
                                            / path.relative_to(package_root)).as_posix(), recursive=False)
             marker = source_revision.encode("utf-8") + b"\n"
@@ -76,6 +76,13 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
         transfer_timeout = min(connection.timeouts.transfer_seconds, deadline.remaining(clock, readiness=True))
         if transfer_timeout <= 0:
             raise TimeoutError("runtime staging does not fit inside the readiness remainder")
+        mkdir_request = _request(f"f09-runtime-mkdir-{connection.deployment_id}", vm,
+            ["sh", "-c", f"mkdir -p {shlex.quote(str(root))}"],
+            min(connection.timeouts.command_seconds, transfer_timeout))
+        mkdir_result = _execute(runner, mkdir_request)
+        actions.append(_action(mkdir_request.action_id, mkdir_request.action_type, vm, mkdir_request, mkdir_result))
+        if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
+            raise RuntimeError("guest runtime destination creation failed")
         transfer = _request(f"f09-runtime-stage-{connection.deployment_id}", vm,
             [str(archive), f"{vm.user}@{vm.host}:{destination}"], transfer_timeout, action_type="scp")
         transfer_result = _execute(runner, transfer)
@@ -96,6 +103,7 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
             f"tar -xzf {shlex.quote(destination)} -C {shlex.quote(runtime)}",
             f"test \"$(cat {shlex.quote(runtime + '/runtime-source-revision.txt')})\" = {shlex.quote(source_revision)}",
             f"python3 -m venv --system-site-packages {shlex.quote(runtime + '/venv')}",
+            f"{shlex.quote(runtime + '/venv/bin/python')} -m pip install 'pydantic>=2.0,<3' 'PyYAML>=6.0,<7'",
             f"PYTHONPATH={shlex.quote(runtime + '/source')} {shlex.quote(runtime + '/venv/bin/python')} -c {shlex.quote(python_probe)}",
         ))
         verify = _request(f"f09-runtime-verify-{connection.deployment_id}", vm,
@@ -114,6 +122,12 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
             raise ValueError("guest runtime version evidence is incomplete")
         if tuple(int(part) for part in python_version.split(".")) < (3, 9, 0):
             raise ValueError("guest Python must satisfy the package's Python >=3.9 requirement")
+        try:
+            pydantic_major = int(pydantic_version.split(".", 1)[0])
+        except ValueError as exc:
+            raise ValueError("guest Pydantic version is malformed") from exc
+        if pydantic_major < 2:
+            raise ValueError("guest Pydantic must satisfy the package's Pydantic >=2 requirement")
         return GuestRuntimeEvidence(source_revision, package_digest, archive_digest, runtime,
             python_version, pydantic_version, yaml_version, tuple(actions))
 
@@ -137,6 +151,34 @@ class RemoteStages:
     close: Callable[[ProviderDeploymentInput, Any], Any]
     retrieve: Callable[[ProviderDeploymentInput, Any], Any]
     claim: Callable[[ProviderDeploymentInput, Any], Any]
+
+
+def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_config: Any,
+                         runner: Any, deadline: Any, source_root: Path,
+                         source_revision: str, remote_root: str,
+                         clock: Callable[[], float] = __import__("time").monotonic):
+    """Run the existing paired bootstrap/readiness and A-local source preparation.
+
+    This is a production composition helper, not a replacement for F03/F04.
+    It returns failure evidence at the first incomplete boundary and never
+    treats a successful transport command as a ready pair.
+    """
+    from . import access
+    from .orchestration import ProviderStageOutcome
+
+    prepared = access.prepare(connection, bootstrap_config, runner, deadline=deadline, clock=clock)
+    if prepared.succeeded is not True:
+        return ProviderStageOutcome("prepare", False, {"bootstrap": prepared})
+    readiness = access.check_readiness(connection, readiness_config, runner,
+        prepared=prepared, deadline=deadline, clock=clock)
+    if readiness.ready is not True:
+        return ProviderStageOutcome("prepare", False,
+            {"bootstrap": prepared, "readiness": readiness})
+    guest = stage_guest_runtime(connection, source_root=source_root,
+        source_revision=source_revision, remote_root=remote_root, runner=runner,
+        deadline=deadline, clock=clock)
+    return ProviderStageOutcome("prepare", True,
+        {"bootstrap": prepared, "readiness": readiness, "guest_runtime": guest})
 
 
 def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,

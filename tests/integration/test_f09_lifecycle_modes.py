@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cloud_network_benchmark.contracts.campaign import PhaseConfiguration
-from cloud_network_benchmark.orchestration import LifecycleContext, ProviderHooks, execute_provider_workflows, validate_mode_units
+from cloud_network_benchmark.orchestration import LifecycleContext, ProviderHooks, ProviderStageOutcome, execute_provider_workflows, validate_mode_units
 from tests.fixtures.f09.helpers import FakeClock
 
 
@@ -35,7 +35,7 @@ def test_one_retained_pair_per_provider_and_mode_uses_exact_resolved_units(provi
     def hook(stage):
         def action():
             trace.append(stage)
-            return {"mode": mode, "units": [unit.unit_id for unit in units], "synthetic": True}
+            return ProviderStageOutcome(stage, True, {"mode": mode, "units": [unit.unit_id for unit in units], "synthetic": True})
         return action
     workflow = ProviderHooks(provider, *(hook(stage) for stage in
         ("protect", "claim", "create", "prepare", "stabilize", "measure", "close", "retrieve", "cleanup")))
@@ -43,7 +43,7 @@ def test_one_retained_pair_per_provider_and_mode_uses_exact_resolved_units(provi
         context=LifecycleContext("session", 1, 100000, 100000), clock=FakeClock())
     assert result.completed
     assert trace.count("create") == trace.count("measure") == trace.count("cleanup") == 1
-    assert result.provider_results[provider].values["measure"]["units"] == [unit.unit_id for unit in units]
+    assert result.provider_results[provider].values["measure"].evidence["units"] == [unit.unit_id for unit in units]
     if mode in {"calibration", "diagnostic_day"}:
         assert trace.count("create") == 1  # no pair or TCP process per trial/chunk
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cloud_network_benchmark.orchestration import LifecycleContext, ProviderHooks, execute_provider_workflows
+from cloud_network_benchmark.orchestration import LifecycleContext, ProviderHooks, ProviderStageOutcome, execute_provider_workflows
 from tests.fixtures.f09.helpers import FakeClock
 
 
@@ -14,7 +14,7 @@ def make_hooks(provider, fail_at=None, *, failures=()):
         def run():
             if stage == fail_at or stage in failures:
                 raise RuntimeError(f"synthetic {provider} {stage}")
-            return {"synthetic": True, "stage": stage}
+            return ProviderStageOutcome(stage, True, {"synthetic": True, "stage": stage})
         return run
     return ProviderHooks(provider, *(action(stage) for stage in STAGES))
 

@@ -172,6 +172,7 @@ def retry_manifest(manifest: RetrievalManifest, artifact_ids: Sequence[str]) -> 
 def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runner: Any,
                            filesystem: Path, deadline: Any,
                            retry_admission: Callable[[RetrievalItem], bool],
+                           consume_retry: Callable[[str], bool] | None = None,
                            reservation_id: str, provider_trigger: datetime,
                            retry_seconds: float, now_utc: Callable[[], datetime],
                            clock: Callable[[], float],
@@ -186,7 +187,10 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
     first = run_retrieval(connection, manifest, runner, filesystem, deadline=deadline,
                           clock=clock, max_attempts=1)
     merged = first
-    retry_ids = retry_failed_items(first, already_retried=already_retried)
+    consumed = set(already_retried)
+    # Without a durable consumer, refuse retries rather than allow repeated
+    # finalization to obtain another transfer attempt.
+    retry_ids = retry_failed_items(first, already_retried=tuple(consumed)) if consume_retry is not None else ()
     if any(action.result.get("outcome") == "interrupted" for action in first.actions):
         retry_ids = ()
     for artifact_id in retry_ids:
@@ -197,7 +201,7 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
             cap_end=deadline.cap_expires_at, provider_trigger=provider_trigger,
             now=now_utc(), cleanup_seconds=deadline.cleanup_reserve_seconds,
             retry_seconds=retry_seconds, failed_artifact_ids=(artifact_id,),
-            already_retried=already_retried)
+            already_retried=tuple(consumed))
         if artifact_id not in handoff.retry_artifact_ids:
             continue
         try:
@@ -206,6 +210,13 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
             admitted = False
         if not admitted:
             continue
+        try:
+            consumed_now = consume_retry(artifact_id) if consume_retry is not None else False
+        except Exception:
+            consumed_now = False
+        if not consumed_now:
+            continue
+        consumed.add(artifact_id)
         one_item = retry_manifest(manifest, (artifact_id,))
         second = run_retrieval(connection, one_item, runner, filesystem, deadline=deadline,
                                clock=clock, max_attempts=1, attempt_offset=1)
@@ -235,6 +246,24 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
         for declaration in required)
     return RetrievalResult.model_validate({**merged.model_dump(mode="python"),
         "complete": complete and deadline.remaining(clock, cleanup=True) > 0})
+
+
+def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
+        recovery_path: Path, allowance: Any, **kwargs: Any) -> RetrievalResult:
+    """Use the reserved F11 fit and durable attempt journal for final-copy retry.
+
+    The ledger check runs immediately before each concrete artifact retry. The
+    journal consumer fsyncs the attempt identity before the second transfer;
+    repeated finalization therefore cannot obtain a third attempt.
+    """
+    from .orchestration import consume_retry_attempt
+
+    def admitted(_item: RetrievalItem) -> bool:
+        decision = ledger.check_stage_fit(reservation_id, stage="retrieval", remaining=allowance)
+        return getattr(decision, "eligible", None) is True
+
+    return retrieve_closed_bundle(**kwargs, retry_admission=admitted,
+        consume_retry=lambda artifact_id: consume_retry_attempt(recovery_path, artifact_id))
 
 
 def save_validator_input(path: Path, value: ValidatorInput) -> ValidatorInput:

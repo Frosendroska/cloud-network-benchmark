@@ -8,8 +8,12 @@ import pytest
 from cloud_network_benchmark.orchestration import (
     LifecycleContext,
     ProviderHooks,
+    ProviderStageOutcome,
+    SavedLifecycleRecovery,
     execute_provider_workflows,
     run_lifecycle,
+    consume_retry_attempt,
+    write_recovery_journal,
 )
 from tests.fixtures.f09.helpers import FakeClock, Trace
 
@@ -21,7 +25,7 @@ def hooks(provider, trace, *, protect=None, fail=None, start_barrier=None):
             start_barrier.wait(timeout=1)
         if stage == fail:
             raise RuntimeError(f"{provider} {stage}")
-        return {"provider": provider, "stage": stage, "synthetic": True}
+        return ProviderStageOutcome(stage, True, {"provider": provider, "stage": stage, "synthetic": True})
 
     return ProviderHooks(
         provider=provider,
@@ -105,12 +109,73 @@ def test_worker_interrupt_requests_scoped_cancel_then_closes_and_cleans_created_
     assert not result.completed and result.provider_results["aws"].primary_failure
 
 
+def test_protection_interrupt_is_caught_and_attempts_cleanup_for_uncertain_registration():
+    trace = Trace()
+    base = hooks("aws", trace)
+    interrupted = ProviderHooks(**{**base.__dict__,
+        "protect":lambda:(_ for _ in ()).throw(KeyboardInterrupt()),
+        "cancel":lambda:trace.add("aws", "cancel")})
+    result = execute_provider_workflows({"aws":interrupted},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for _, stage in trace.events]
+    assert "cleanup" in stages and "cancel" in stages
+    assert not any(stage in {"claim", "create"} for stage in stages)
+    assert not result.completed and result.provider_results["aws"].interrupted
+
+
+def test_returned_provider_failure_and_unregistered_expiry_are_not_success():
+    trace = Trace()
+    base = hooks("aws", trace)
+    bad_expiry = ProviderHooks(**{**base.__dict__, "protect":lambda:{"state":"failed"}})
+    outcome = execute_provider_workflows({"aws":bad_expiry},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    assert not outcome.completed
+    assert "registered expiry" in outcome.provider_results["aws"].primary_failure
+    assert "claim" not in [stage for _, stage in trace.events]
+
+    trace = Trace()
+    base = hooks("aws", trace)
+    bad_cleanup = ProviderHooks(**{**base.__dict__,
+        "cleanup":lambda:{"cleanup_state":"failed", "launch_blocked":True}})
+    outcome = execute_provider_workflows({"aws":bad_cleanup},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    assert not outcome.completed
+    assert outcome.provider_results["aws"].cleanup_state == "failed"
+    assert "cleanup is failed" in outcome.provider_results["aws"].primary_failure
+
+
+@pytest.mark.parametrize("now,deadline,trigger", [(999.0, 1000.0, 200.0), (201.0, 200.0, None)])
+def test_original_cap_or_earlier_provider_trigger_blocks_stages_but_still_cleans(now, deadline, trigger):
+    trace = Trace()
+    context = LifecycleContext("session", 1, deadline, 1200,
+        provider_trigger_monotonic=trigger)
+    clock = FakeClock(monotonic=now)
+    result = execute_provider_workflows({"aws":hooks("aws", trace)}, context=context, clock=clock)
+    stages = [stage for _, stage in trace.events]
+    assert not result.completed
+    assert "protect" not in stages and "claim" not in stages and "create" not in stages
+    assert "cleanup" in stages
+
+
 def test_controller_session_and_cap_are_immutable_for_stage_checks():
     context = LifecycleContext("session-1", 100.0, 1000.0, 1200, {"measurement": 900.0})
     with pytest.raises(ValueError, match="cap"):
         context.require_fit("measurement", 901.0, now_monotonic=100.0)
     with pytest.raises(ValueError, match="session"):
         context.assert_session("session-2")
+
+
+def test_recovery_journal_durably_consumes_each_retry_once(tmp_path):
+    path = tmp_path / "private" / "recovery.json"
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-retry", controller_session_id="session",
+        providers=[{"provider":"aws", "deployment_id":"run-aws-deployment",
+            "journal_reference":"private/aws.json", "expiry_registered":True,
+            "creation_may_have_started":True, "cleanup_open":True}])
+    write_recovery_journal(path, recovery)
+    assert consume_retry_attempt(path, "native-artifact") is True
+    assert consume_retry_attempt(path, "native-artifact") is False
+    saved = SavedLifecycleRecovery.validate_unique(__import__("json").loads(path.read_text()))
+    assert saved.retry_consumed_ids == ["native-artifact"]
 
 
 def test_admission_is_reserved_before_provider_factory_and_offline_scope_never_dispatches():

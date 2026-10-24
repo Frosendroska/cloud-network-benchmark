@@ -102,7 +102,7 @@ class BootstrapConfig(StrictModel):
     remote_root: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
     install_prefix: str = Field(min_length=1)
-    bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables"])
+    bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables", "python3-venv"])
 
     @model_validator(mode="after")
     def validate_paths_and_tools(self):

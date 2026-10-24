@@ -59,3 +59,49 @@ def test_missing_cleanup_adapter_still_reconciles_and_keeps_launch_blocked(tmp_p
     assert not outcome.complete
     assert outcome.providers["gcp"]["errors"] == ["provider cleanup adapter unavailable"]
     assert outcome.providers["gcp"]["launch_blocked"]
+
+
+def test_cleanup_reconciliation_is_bound_to_saved_reservation_and_updates_f11(tmp_path):
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.admission import Reconciliation
+
+    recovery = tmp_path / "recovery-ledger.json"
+    row = _provider("aws")
+    recovery.write_text(json.dumps({"schema_version":1,"attempt_id":"attempt-1",
+        "controller_session_id":"old-session","reservation_id":"reservation-1","providers":[row]}))
+    recovery.chmod(0o600)
+    class Ledger:
+        def __init__(self): self.events=[]
+        def reconcile(self, event): self.events.append(event)
+    ledger = Ledger()
+    event = Reconciliation(event_id="event-1", reservation_id="reservation-1", provider="aws",
+        source_sha256="a"*64, cleanup_verified_absent=True,
+        billable_resources_present=False, occurred_at=datetime.now(timezone.utc),
+        cleanup_status_reported=True)
+    outcome = cleanup_lifecycle(recovery, current_session_id="new-session",
+        cleanup_actions={"aws":lambda record:{"deleted":True}},
+        reconcile=lambda record, result:{"ledger_event":event,"absence_proved":True,
+            "billable_resources_present":False,"cleanup_open":False}, ledger=ledger)
+    assert outcome.complete and ledger.events == [event]
+
+
+def test_cleanup_f11_reconciliation_identity_mismatch_remains_blocked(tmp_path):
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.admission import Reconciliation
+    recovery = tmp_path / "recovery-ledger.json"
+    row = _provider("aws")
+    recovery.write_text(json.dumps({"schema_version":1,"attempt_id":"attempt-1",
+        "controller_session_id":"old-session","reservation_id":"reservation-1","providers":[row]}))
+    recovery.chmod(0o600)
+    class Ledger:
+        def reconcile(self, event): raise AssertionError("wrong identity must not reach F11")
+    event = Reconciliation(event_id="event-1", reservation_id="other", provider="aws",
+        source_sha256="a"*64, cleanup_verified_absent=True,
+        billable_resources_present=False, occurred_at=datetime.now(timezone.utc),
+        cleanup_status_reported=True)
+    outcome = cleanup_lifecycle(recovery, current_session_id="new-session",
+        cleanup_actions={"aws":lambda record:{"deleted":True}},
+        reconcile=lambda record, result:{"ledger_event":event,"absence_proved":True,
+            "billable_resources_present":False,"cleanup_open":False}, ledger=Ledger())
+    assert not outcome.complete
+    assert outcome.providers["aws"]["launch_blocked"] is True
