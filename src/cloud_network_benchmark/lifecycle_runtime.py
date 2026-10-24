@@ -30,6 +30,8 @@ def _source_path(root: Path, value: Any, label: str, *, must_exist: bool = True)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a nonempty source path")
     candidate = Path(value)
+    if ".." in candidate.parts:
+        raise ValueError(f"{label} cannot contain parent traversal")
     path = candidate if candidate.is_absolute() else root / candidate
     path = path.absolute()
     if any(part.is_symlink() for part in (path, *path.parents)):
@@ -67,8 +69,10 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("ledger.initialize_if_missing must be boolean")
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
-    if not isinstance(root["allowance"], dict):
-        raise ValueError("allowance must be a strict object")
+    allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
+        "readiness_seconds", "stabilization_seconds", "measurement_seconds",
+        "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds",
+        "source_id", "provider_leads_seconds", "completed_stages"}, "allowance")
     access = _keys(root["access"], {"timeouts", "readiness", "bootstrap", "guest_remote_root",
         "diagnostic_interfaces"}, "access")
     if not isinstance(access["guest_remote_root"], str) or not access["guest_remote_root"].startswith("/"):
@@ -78,6 +82,21 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("providers must select one or more supported providers")
     if selected_providers is not None and set(providers) != selected_providers:
         raise ValueError("runtime providers must exactly match the selected campaign providers")
+    if not isinstance(allowance["provider_leads_seconds"], dict) or set(allowance["provider_leads_seconds"]) != set(providers):
+        raise ValueError("allowance provider leads must exactly match selected providers")
+    if allowance["completed_stages"] != []:
+        raise ValueError("initial allowance completed_stages must be empty")
+    try:
+        from .admission import WorkflowAllowance
+        root["allowance"] = WorkflowAllowance(**allowance)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("allowance does not match the strict F11 workflow contract") from exc
+    from .access import TimeoutPolicy
+    from .bootstrap import BootstrapConfig
+    from .readiness import ReadinessConfig
+    access["timeouts"] = TimeoutPolicy.model_validate(access["timeouts"])
+    access["readiness"] = ReadinessConfig.model_validate(access["readiness"])
+    access["bootstrap"] = BootstrapConfig.model_validate(access["bootstrap"])
     option_keys = {
         "aws": {"account_id", "controller_cidr", "ami_ids", "public_key_path", "authentication_reference"},
         "gcp": {"project_id", "controller_cidr", "images", "public_key_path", "authentication_reference"},
