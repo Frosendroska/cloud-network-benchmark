@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from pathlib import Path
 from typing import Any
@@ -133,3 +134,55 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")
                               for key, value in root["approval_refs"].items()}
     return root
+
+
+def load_initialized_campaign(parent_path: Path, *, repository_root: Path,
+                              config_path: Path, schedule_path: Path | None = None):
+    """Read existing CLI-init identities without allocating or rewriting them."""
+    from .manifests import CampaignManifest, ChildRunManifest
+
+    parent_path = Path(parent_path)
+    repository_root = Path(repository_root).resolve(strict=True)
+    if parent_path.is_symlink() or not parent_path.is_file():
+        raise ValueError("initialized campaign manifest must be a regular source file")
+    parent = CampaignManifest.model_validate_json(parent_path.read_text(encoding="utf-8"))
+    children = {}
+    for reference in parent.child_runs:
+        manifest_path = (repository_root / reference.manifest_path).resolve(strict=True)
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("initialized child manifest is unavailable")
+        child = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+        if (child.campaign_id != parent.campaign_id or child.provider != reference.provider
+                or child.run_id != reference.run_id or child.execution_state != "initialized"
+                or child.actual_started_at is not None or child.actual_finished_at is not None
+                or child.commands or child.timings or child.artifact_records):
+            raise ValueError("initialized child identity has already launched or differs from parent")
+        children[str(child.provider)] = child
+    selected = {str(provider) for provider in parent.selected_providers}
+    if set(children) != selected:
+        raise ValueError("initialized parent does not contain exactly the selected provider children")
+
+    def verified_snapshot(relative: str, expected_hash: str, label: str) -> Path:
+        target = (repository_root / relative).resolve(strict=True)
+        if target.is_symlink() or not target.is_file():
+            raise ValueError(f"initialized {label} snapshot is unavailable")
+        if hashlib.sha256(target.read_bytes()).hexdigest() != expected_hash:
+            raise ValueError(f"initialized {label} snapshot hash does not match its manifest")
+        return target
+
+    source = Path(config_path).resolve(strict=True)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    if source_hash != parent.config_provenance.sha256:
+        raise ValueError("CLI config bytes differ from the initialized source identity")
+    for child in children.values():
+        verified_snapshot(child.config_provenance.snapshot_path, child.config_provenance.sha256, "config")
+        if child.config_provenance.resolved_snapshot_sha256.value is None:
+            raise ValueError("initialized resolved config snapshot hash is unavailable")
+        verified_snapshot(child.config_provenance.resolved_snapshot_path,
+            child.config_provenance.resolved_snapshot_sha256.value, "resolved config")
+        if schedule_path is not None:
+            if child.config_provenance.schedule_sha256.value is None or child.config_provenance.schedule_snapshot_path.value is None:
+                raise ValueError("initialized schedule snapshot identity is unavailable")
+            verified_snapshot(child.config_provenance.schedule_snapshot_path.value,
+                child.config_provenance.schedule_sha256.value, "schedule")
+    return parent, children
