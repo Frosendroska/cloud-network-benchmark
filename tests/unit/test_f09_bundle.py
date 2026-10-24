@@ -212,3 +212,16 @@ def test_saved_validator_input_replays_real_f08_validation_and_seals_after_outpu
     assert (root / "validation/summary.txt").read_text() == summary
     assert "checksums.sha256" not in records and "private" not in " ".join(records)
     assert digest == hashlib.sha256((root / "checksums.sha256").read_bytes()).hexdigest()
+
+
+def test_persist_validation_defers_bundle_seal_for_batch_projection(tmp_path, repository_root):
+    from tests.unit.test_validation import NOW, make_input
+    from cloud_network_benchmark.lifecycle_bundle import persist_validation
+    value = make_input(repository_root)
+    root = tmp_path / "bundle"; root.mkdir()
+    result, _ = persist_validation(root=root,
+        validator_input_path=root / "validation" / "validator-input.json",
+        value=value, evaluated_at=NOW)
+    assert result.run_id == value.identity.run_id
+    assert (root / "validation/result.json").is_file()
+    assert not (root / "checksums.sha256").exists()

@@ -65,3 +65,10 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
     assert request.campaign_id == parent.campaign_id
     assert request.estimated_cost_usd.value == pytest.approx(0.07)
     assert plan.funding == {"primary": Decimal("0.07")}
+
+    blocked, _ = build_admission_request(campaign=campaign, parent=parent, children={provider: child},
+        costs=costs, runtime=runtime,
+        ledger_state={"cleanup_blocked": [], "reservations": {"old": {
+            "cleanup_open": True, "session": "prior-session"}}},
+        controller_session_id="current-session")
+    assert blocked.outstanding_cleanup is True

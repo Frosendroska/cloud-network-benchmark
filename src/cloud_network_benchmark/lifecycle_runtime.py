@@ -216,7 +216,9 @@ def load_initialized_campaign(parent_path: Path, *, repository_root: Path,
 
 
 def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, Any],
-                            costs: Any, runtime: dict[str, Any]):
+                            costs: Any, runtime: dict[str, Any],
+                            ledger_state: dict[str, Any] | None = None,
+                            controller_session_id: str | None = None):
     """Build F11 inputs from the initialized identities and exact sourced cost rows."""
     from decimal import Decimal
     from .admission import AdmissionPlan, WorkflowAllowance
@@ -257,6 +259,16 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
     if set(allowance.provider_leads_seconds) != set(child_ids):
         raise ValueError("allowance provider set differs from initialized campaign")
     schedule = campaign.schedule_entry.value
+    outstanding_cleanup = False
+    if ledger_state is not None:
+        reservations = ledger_state.get("reservations")
+        cleanup_blocked = ledger_state.get("cleanup_blocked")
+        if not isinstance(reservations, dict) or not isinstance(cleanup_blocked, list):
+            raise ValueError("ledger cleanup state is malformed")
+        outstanding_cleanup = bool(cleanup_blocked) or any(
+            isinstance(record, dict) and record.get("cleanup_open")
+            and record.get("session") != controller_session_id
+            for record in reservations.values())
     request = ReservationRequest(schema_version=2, campaign_id=parent.campaign_id,
         config_id=campaign.config_id,
         schedule_entry_id=(Evidence[str](value=schedule.entry_id) if schedule else
@@ -267,7 +279,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](unavailable_reason="F11 ledger derives current incurred charges"),
         active_reserved_usd=Evidence[float](unavailable_reason="F11 ledger derives active reservations"),
-        outstanding_cleanup=False)
+        outstanding_cleanup=outstanding_cleanup)
     namespaces = {provider: f"cnb-{child.run_id}-{child.deployment_id}"
                   for provider, child in children.items()}
     prerequisites = runtime.get("approval_evidence", {})

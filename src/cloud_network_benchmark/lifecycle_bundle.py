@@ -395,6 +395,21 @@ def finalize_validation(*, root: Path, validator_input_path: Path, value: Valida
                         evaluated_at: datetime, peers: Sequence[ValidatorInput] = (),
                         peer_results: Sequence[Any] = ()) -> tuple[Any, str, str, dict[str, str]]:
     """Validate the persisted strict input, persist result/summary, then seal."""
+    result, summary = persist_validation(root=root, validator_input_path=validator_input_path,
+        value=value, evaluated_at=evaluated_at, peers=peers, peer_results=peer_results)
+    digest, hashes = seal_bundle(root)
+    return result, summary, digest, hashes
+
+
+def persist_validation(*, root: Path, validator_input_path: Path, value: ValidatorInput,
+                       evaluated_at: datetime, peers: Sequence[ValidatorInput] = (),
+                       peer_results: Sequence[Any] = ()) -> tuple[Any, str]:
+    """Persist and validate one input without sealing its public bundle.
+
+    Multi-provider lifecycle finalization must write every result and manifest
+    projection before any immutable bundle is sealed. The caller owns the final
+    all-provider seal barrier.
+    """
     from .summaries import summarize_validation
     from .validation import evaluate_comparison, validate_bundle
     saved = save_validator_input(validator_input_path, value)
@@ -413,8 +428,7 @@ def finalize_validation(*, root: Path, validator_input_path: Path, value: Valida
     _write_exclusive(result_path, result.model_dump_json(indent=2).encode("utf-8") + b"\n")
     summary = summarize_validation(result)
     _write_exclusive(summary_path, summary.encode("utf-8"))
-    digest, hashes = seal_bundle(root)
-    return result, summary, digest, hashes
+    return result, summary
 
 
 def recommend_calibration_common_n(results: Sequence[Any]):
