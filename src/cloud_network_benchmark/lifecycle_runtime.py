@@ -316,7 +316,10 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
                     design_git_commit=child.config_provenance.design_git_commit)
             namespaces[provider] = _slug(deployment)
     prerequisites = runtime.get("approval_evidence", {})
-    support = costs.payload.get("provider_support", {})
+    # Keep the validated cost payload immutable while deriving runtime support
+    # evidence. Mutating this nested mapping makes its in-memory value diverge
+    # from the source bytes F11 re-reads before reserve.
+    support = dict(costs.payload.get("provider_support", {}))
     if "aws" in child_ids:
         from .admission import aws_expiry_cost_handoff
         aws_source = runtime["providers"]["aws"]["sources"]["expiry_cost_path"]
