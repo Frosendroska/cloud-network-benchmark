@@ -971,6 +971,65 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert recommendation.unavailable_reason is None, recommendation.unavailable_reason
             assert recommendation.common_n.value in {2, 4, 8}
             assert recommendation.source_sha256.value and recommendation.plateau_found.value in {True, False}
+        # Feed the finalized, on-disk F09 inputs/results directly into F12.
+        # This bridge deliberately reuses the factory's native trees and never
+        # materializes replacement benchmark evidence.
+        from cloud_network_benchmark.analysis import analyze_selection
+        from cloud_network_benchmark.analysis_report import write_analysis
+        from cloud_network_benchmark.contracts.common import Evidence, GitSnapshot, StringEvidence
+        selection_root = tmp_path / "f10-analysis"
+        selection_root.mkdir()
+        entries, source_hashes = [], {}
+        for provider in sorted(children):
+            input_path = roots[provider] / "validation" / "input.json"
+            result_path = roots[provider] / "validation" / "result.json"
+            assert input_path.is_file() and result_path.is_file()
+            entries.append({"validator_input": str(input_path.resolve()),
+                "validation_result": str(result_path.resolve())})
+            for source in (input_path, result_path):
+                source_hashes[source] = hashlib.sha256(source.read_bytes()).hexdigest()
+            for source in roots[provider].rglob("*"):
+                if source.is_file():
+                    source_hashes[source] = hashlib.sha256(source.read_bytes()).hexdigest()
+        selection_a, selection_b = selection_root / "selection-a.json", selection_root / "selection-b.json"
+        selection_a.write_text(json.dumps({"format_version": 1, "runs": entries}, sort_keys=True))
+        selection_b.write_text(json.dumps({"format_version": 1, "runs": list(reversed(entries))}, sort_keys=True))
+        snapshot = GitSnapshot(commit=StringEvidence(value="a" * 40), dirty=Evidence(value=False),
+            diff_sha256=StringEvidence(value="b" * 64))
+        report_a = analyze_selection(selection_a, analysis_git=snapshot)
+        report_b = analyze_selection(selection_b, analysis_git=snapshot)
+        assert report_a.payload["runs"] == report_b.payload["runs"]
+        assert {row["provider"] for row in report_a.payload["runs"]} == {"aws", "azure", "gcp"}
+        assert {row["mode"] for row in report_a.payload["runs"]} == {str(campaign.mode)}
+        for provider in children:
+            saved = saved_inputs[provider]
+            rows = [row for row in report_a.payload["runs"] if row["provider"] == provider]
+            assert rows and all(row["run_id"] == saved.identity.run_id for row in rows)
+            assert all(row["experiment_id"] == saved.identity.experiment_id for row in rows)
+            # This contract models each attempt as its distinct run identity.
+            assert all(row["attempt_id"] == saved.identity.run_id for row in rows)
+            assert all(row["deployment_id"] == saved.identity.deployment_id for row in rows)
+            assert all(row["config_id"] == saved.identity.config_id for row in rows)
+            schedule = saved.schedule_entry.value
+            assert all(row["schedule_entry_id"] == (schedule.entry_id if schedule else None) for row in rows)
+        if is_calibration:
+            assert all(row["comparison_eligibility"] == "ineligible" for row in report_a.payload["runs"])
+        if is_diagnostic_day:
+            assert report_a.payload["day_load_context"]
+            assert all(item["idle_baseline"].get("unavailable_reason")
+                == "diagnostic-day mode has no idle baseline" for item in report_a.payload["day_load_context"])
+        assert {row["provider"] for row in report_a.payload["costs"]} == {"aws", "azure", "gcp"}
+        assert all(row.get("source_verified", False) is False and row["final"] is False
+            and row["actual"].get("unavailable_reason")
+            and row["estimated"].get("unavailable_reason")
+            and not row.get("source_refs") for row in report_a.payload["costs"]), report_a.payload["costs"]
+        out_a, out_b = selection_root / "report-a", selection_root / "report-b"
+        write_analysis(report_a, out_a)
+        write_analysis(report_b, out_b)
+        files_a = {p.relative_to(out_a): p.read_bytes() for p in out_a.rglob("*") if p.is_file()}
+        files_b = {p.relative_to(out_b): p.read_bytes() for p in out_b.rglob("*") if p.is_file()}
+        assert files_a and files_a == files_b
+        assert source_hashes == {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in source_hashes}
         return
     assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure, built["plan"].child_identities.keys(), built["plan"].namespaces.keys(), built["plan"].allowance.provider_leads_seconds.keys(), campaign.selected_providers)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
