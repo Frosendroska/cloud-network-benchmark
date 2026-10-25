@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
@@ -25,10 +26,22 @@ NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 
 
 class Clock:
-    def __init__(self): self.elapsed = 0.0
-    def utc_now(self): return NOW + timedelta(seconds=self.elapsed)
-    def monotonic(self): return 100.0 + self.elapsed
-    def sleep(self, seconds): self.elapsed += seconds
+    def __init__(self):
+        self._owner = threading.get_ident()
+        self._offsets = {self._owner: 0.0}
+        self._lock = threading.Lock()
+    def _offset(self):
+        ident = threading.get_ident()
+        with self._lock:
+            if ident == self._owner:
+                return max(self._offsets.values())
+            return self._offsets.setdefault(ident, self._offsets[self._owner])
+    def utc_now(self): return NOW + timedelta(seconds=self._offset())
+    def monotonic(self): return 100.0 + self._offset()
+    def sleep(self, seconds):
+        ident = threading.get_ident()
+        with self._lock:
+            self._offsets[ident] = self._offsets.get(ident, max(self._offsets.values())) + seconds
 
 
 class FailedExternalCommands:
@@ -68,7 +81,7 @@ class GcpSourceRunner:
         if action.endswith("-apply") or action.endswith("-destroy"):
             return result({})
         if action == "gcp-protection-outputs":
-            self.clock.elapsed += 2
+            self.clock.sleep(2)
             now = self.clock.utc_now()
             templates = {role: {"id": str(111+i), "name": f"{namespace}-{'a' if i == 0 else 'b'}",
                 "self_link_unique": f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/instanceTemplates/{namespace}-{'a' if i == 0 else 'b'}?uniqueId={111+i}"}
@@ -329,13 +342,46 @@ def _costs(path: Path, campaign, children):
     return load_cost_inputs(path)
 
 
-@pytest.mark.parametrize("successful_protection", [False, True], ids=["protection-failure", "all-provider-claim-barrier"])
+@pytest.mark.parametrize(("successful_protection", "config_name"), [
+    (False, "configs/tests/exp-903-three-provider-smoke.yaml"),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml"),
+    (True, "configs/experiments/exp-001-calibration.yaml"),
+], ids=["protection-failure", "all-provider-acceptance", "all-provider-calibration"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
-        tmp_path, monkeypatch, successful_protection):
-    config = ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"
-    campaign, _ = resolve_campaign(config, ROOT)
+        tmp_path, monkeypatch, request, successful_protection, config_name):
+    config = ROOT / config_name
+    schedule_entry = None
+    if "calibration" in config_name:
+        import yaml
+        from cloud_network_benchmark.contracts.admission import ScheduleEntry
+        source_config = config
+        config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
+        base_campaign, _ = resolve_campaign(source_config, ROOT)
+        scenario_source = json.loads((ROOT / "tests/fixtures/f11/scenarios.json").read_text(encoding="utf-8"))
+        window = scenario_source["synthetic_windows"]["night"]
+        scheduled_start = NOW.replace(hour=int(window[:2]), minute=int(window[3:5]), second=int(window[6:8]), microsecond=0)
+        config_data["scheduled_start"] = scheduled_start.isoformat().replace("+00:00", "Z")
+        config = ROOT / "configs/tests" / f"f09-{tmp_path.name}-synthetic-calibration.yaml"
+        request.addfinalizer(lambda: config.unlink(missing_ok=True))
+        config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+        header = "entry_id,config_id,experiment_id,scheduled_start,window_label,priority"
+        row = f"F09-SYNTHETIC-CAL,{base_campaign.config_id},{base_campaign.experiment_id},{scheduled_start.isoformat()},night,{base_campaign.admission.priority}"
+        schedule_bytes = (header + "\n" + row + "\n").encode("utf-8")
+        schedule_path = tmp_path / "synthetic-calibration-schedule.csv"
+        schedule_path.write_bytes(schedule_bytes)
+        schedule_entry = ScheduleEntry(schema_version=2, entry_id="F09-SYNTHETIC-CAL",
+            config_id=base_campaign.config_id, experiment_id=base_campaign.experiment_id,
+            scheduled_start=scheduled_start, window_label="night", source_path=str(schedule_path),
+            source_sha256=hashlib.sha256(schedule_bytes).hexdigest(),
+            row_sha256=hashlib.sha256(row.encode()).hexdigest(), original_header=header,
+            original_row=row, columns=header.split(","), priority=base_campaign.admission.priority)
+        synthetic_now = scheduled_start - timedelta(minutes=5)
+        monkeypatch.setattr(__import__(__name__, fromlist=["NOW"]), "NOW", synthetic_now)
+        import tests.integration.test_f09_aws_runtime_factory as aws_runtime_test
+        monkeypatch.setattr(aws_runtime_test, "NOW", synthetic_now)
+    campaign, _ = resolve_campaign(config, ROOT, schedule_entry=schedule_entry)
     initialized = initialize_campaign(config, ROOT, tmp_path / "results",
-        clock=lambda: NOW, token_source=lambda: "campaign")
+        clock=lambda: NOW, token_source=lambda: "campaign", schedule_entry=schedule_entry)
     parent_path = Path(initialized.parent_manifest_path)
     parent, children = load_initialized_campaign(parent_path, repository_root=ROOT, config_path=config)
     costs = _costs(tmp_path / "costs.json", campaign, children)
@@ -345,6 +391,15 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         source = tmp_path / f"{name}.txt"; source.write_text(f"synthetic {name}\n")
         gates[name] = {"evidence_id": f"synthetic-{name}", "source_path": str(source),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    if getattr(campaign.mode, "value", campaign.mode) == "calibration":
+        source = tmp_path / "synthetic-calibration-authorization.txt"
+        source.write_text("offline synthetic calibration authorization fixture\n")
+        evidence = {"evidence_id": "synthetic-calibration-authorization",
+            "source_path": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+        gates["calibration_authorized"] = evidence
+        gates["paid_acceptance"] = {**evidence, "status": "completed",
+            "config_id": campaign.config_id, "mode": "acceptance",
+            "providers": list(campaign.selected_providers)}
     aws_cost = ROOT / "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
     gcp_handoff = tmp_path / "gcp-handoff.json"
     gcp_total = sum(float(value["amount_usd"])
@@ -371,8 +426,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
-        "allowance": WorkflowAllowance(10, 60, 180, 60, 80, 5, 10, 10, "synthetic-test-policy",
-            {"aws": 360, "azure": 360, "gcp": 30}),
+        "allowance": WorkflowAllowance(5, 5, 300, 60,
+            960 if getattr(campaign.mode, "value", campaign.mode) == "calibration" else 80, 5, 10, 10,
+            "synthetic-test-policy", {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
                 cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
@@ -431,6 +487,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     responder.full_native = True
                     responder.clock = clock
                     responder.late_tail = True
+                    responder.protocol_elapsed = 12 * 60 if getattr(campaign.mode, "value", campaign.mode) == "calibration" else 60
                     responder.workspace_roots = {role: root / name / role for role in ("vm_a", "vm_b")}
                     responder.native_root = responder.workspace_roots["vm_a"]
                 self.requests = []
@@ -458,8 +515,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     if request.action_id.startswith(("aws-expiry-read-terminal-", "aws-expiry-confirm-cancel-")):
                         region = request.argv[request.argv.index("--region") + 1]
                         execution_id = request.argv[request.argv.index("--automation-execution-id") + 1]
+                        trigger = self.aws.expiry_request.expires_at.value.strftime("%Y-%m-%dT%H:%M:%SZ")
                         parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
-                            "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": [self.aws.run_id],
+                            "ExpiryTriggerUtc": [trigger], "RunId": [self.aws.run_id],
                             "DeploymentId": [self.aws.deployment_id], "Region": [region]}
                         now = clock.utc_now()
                         response = {"AutomationExecution": {"AutomationExecutionId": execution_id,
@@ -527,6 +585,11 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
     built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
         runtime=runtime, controller_session_id="synthetic-session", runner=runner,
         clock=clock, private_root=tmp_path / "private", repository_root=ROOT)
+    if getattr(campaign.mode, "value", campaign.mode) == "calibration":
+        from cloud_network_benchmark.admission import BudgetLedger, _validate_paid_acceptance_evidence
+        for gate in ("calibration_authorized", "paid_acceptance"):
+            BudgetLedger._validate_gate_evidence(built["plan"].prerequisites[gate])
+        _validate_paid_acceptance_evidence(built["plan"].prerequisites["paid_acceptance"], campaign)
     if successful_protection:
         runtime["sleep"] = clock.sleep
         runner.ledger = built["ledger"]
@@ -537,6 +600,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         def observe_aws(driver, deployment, expiry_request, **kwargs):
             runner.aws.run_id = deployment.run_id
             runner.aws.deployment_id = deployment.deployment_id
+            runner.aws.expiry_request = expiry_request
             observed["aws"] = (driver, deployment, expiry_request)
             return original_aws_hooks(driver, deployment, expiry_request, **kwargs)
         def observe_gcp(driver, deployment, expiry_request, **kwargs):
@@ -570,10 +634,10 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         workflow_factory=built["workflow_factory"], clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
     if successful_protection:
-        assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
+        assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure, built["plan"].child_identities.keys(), built["plan"].namespaces.keys(), built["plan"].allowance.provider_leads_seconds.keys(), campaign.selected_providers)
         assert set(result.provider_results) == {"aws", "azure", "gcp"}
         assert set(observed) == {"aws", "azure", "gcp"}
-        assert set(runner.claim_snapshot_at_first_apply or ()) == {"aws", "azure", "gcp"}
+        assert set(runner.claim_snapshot_at_first_apply or ()) == {"aws", "azure", "gcp"}, (result.primary_failure, {p: (r.primary_failure, r.values.keys()) for p, r in result.provider_results.items()}, runner.actions)
         for provider_name, provider_result in result.provider_results.items():
             assert provider_result.values["protect"].state == "registered", (provider_name, provider_result.values)
             assert provider_result.values["claim"].eligible is True, (provider_name, provider_result.values["claim"])
@@ -589,7 +653,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert provider_result.values["cleanup"].cleanup_state == "succeeded", (provider_name, provider_result.values["cleanup"].cleanup_failure, provider_result.values["cleanup"].secondary_failures, provider_result.values["cleanup"].inventory.value, [(r.action_id, r.argv) for r in runner.requests if any("describe-" in str(token) for token in r.argv)])
             assert provider_result.values["prepare"].succeeded is True, (provider_name, provider_result.values["prepare"], prepare_errors)
             for stage in ("stabilize", "measure", "close", "retrieve"):
-                assert provider_result.values[stage].succeeded is True, (provider_name, stage, getattr(provider_result.values[stage].evidence, "failure", None), getattr(getattr(provider_result.values[stage].evidence, "outcome", None), "failures", None), provider_result.values[stage].evidence)
+                outcome = provider_result.values.get(stage)
+                assert outcome is not None and outcome.succeeded is True, (provider_name, stage, list(provider_result.values), provider_result.primary_failure, provider_result.secondary_failures, outcome)
         assert all(observed[p][1].run_id == children[p].run_id for p in children)
         from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
         from cloud_network_benchmark.contracts.validation import ValidatorInput
@@ -616,7 +681,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 and finding.code != "comparison.ineligible"], replay.findings
             assert (roots[provider] / "checksums.sha256").is_file()
         return
-    assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure)
+    assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure, built["plan"].child_identities.keys(), built["plan"].namespaces.keys(), built["plan"].allowance.provider_leads_seconds.keys(), campaign.selected_providers)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
     assert all(item.primary_failure is not None for item in result.provider_results.values())
     assert all(item.values["protect"].state == "failed" for item in result.provider_results.values())

@@ -43,6 +43,7 @@ class FakeAwsRunner:
         self.actions = []
         self.run_id = ""
         self.deployment_id = ""
+        self.expiry_request = None
         self.private_a, self.private_b = "10.60.1.10", "10.60.1.11"
         self.public_a, self.public_b = "8.8.8.8", "1.1.1.1"
 
@@ -114,8 +115,10 @@ class FakeAwsRunner:
             stdout = json.dumps({"AutomationExecutionId": f"exec-{region}"})
         elif action.startswith("aws-expiry-confirm-"):
             region = action.removeprefix("aws-expiry-confirm-")
+            trigger = (self.expiry_request.expires_at.value.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if self.expiry_request is not None else "2026-10-22T12:14:00Z")
             parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
-                "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": [self.run_id],
+                "ExpiryTriggerUtc": [trigger], "RunId": [self.run_id],
                 "DeploymentId": [self.deployment_id], "Region": [region]}
             stdout = json.dumps({"AutomationExecution": {"AutomationExecutionId": f"exec-{region}",
                 "DocumentName": f"expiry-{region}", "DocumentVersion": "1",
@@ -123,7 +126,7 @@ class FakeAwsRunner:
                 "CurrentStepName": "waitUntilExpiry", "Parameters": parameters,
                 "StepExecutionsTruncated": False, "StepExecutions": [{"StepName": "waitUntilExpiry",
                     "Action": "aws:sleep", "StepStatus": "InProgress",
-                    "Inputs": {"Timestamp": "2026-10-22T12:14:00Z"}}]}})
+                    "Inputs": {"Timestamp": trigger}}]}})
         result = CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
             finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
         return result
@@ -467,7 +470,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
         if action.startswith("f09-diagnostics-stop-"):
             self.actions.append(action)
-            closed_at = self._now() + timedelta(minutes=5)
+            closed_at = self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)
             return CommandResult(action_id=action,outcome="succeeded",started_at=closed_at,finished_at=closed_at,
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"state":"stopped","closed_at_utc":closed_at.isoformat()}),stderr="")
         if action.startswith("f09-diagnostics-outcome-"):
@@ -477,7 +480,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 duration_seconds=0,exit_code=0,stdout=json.dumps(self.diagnostics_outcomes[invocation]),stderr="")
         if action.startswith("f09-listener-exit-"):
             self.actions.append(action)
-            stamp = (self._now() + timedelta(minutes=5)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
+            stamp = (self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
             stdout = f"LoadState=loaded\nActiveState=inactive\nMainPID=0\nInactiveEnterTimestamp={stamp}\n"
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
