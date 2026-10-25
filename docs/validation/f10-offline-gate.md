@@ -1,49 +1,44 @@
 # F10 offline readiness gate
 
-## Scope and prerequisites
+## Outcome
 
-This gate is the credential-free, local proof at one clean committed revision. It does not prove Linux guest process behavior, provider permissions, cloud networking, expiry, deletion or billing. It performs no install, Terraform init, registry access, live plan/apply/destroy, cloud CLI, SSH/SCP or benchmark traffic. Prepared tools and locked local providers are prerequisites, never installed by the gate.
+The credential-free offline gate **passed** at executable commit `3cfb059cfa716875dca1e422c6690491922a4ce8` (Git tree `3271b04230b9b4333792c7282e79f10526cd9075`). It began and ended clean at that revision. The run did not verify cloud behavior or native Linux process identity and did not launch any cloud, paid or benchmark activity.
 
-The assigned clone is `/private/tmp/cnb-f10`, branch `codex/f10-v2-offline-gate`, based on merged F09/F12 `eb0be0b40d2b38607212cad3761f454295122f9b`. The coordinator prepared Python `/private/tmp/cnb-offline-venv-20261025/bin/python`, Terraform `/private/tmp/cnb-tools/terraform`, PowerShell `/private/tmp/cnb-tools/powershell-7.5.11/pwsh`, and the local mirror `/private/tmp/cnb-f10-provider-mirror`. Six Terraform roots were initialized beforehand with backend disabled and lockfiles read only. Preparation is not F10 validation evidence. The gate checks these prerequisites and uses only a filesystem provider mirror.
+The full pytest suite reported **1,450 passed, 2 skipped, 0 failed**, with one existing Python `extractall` deprecation warning. The two skips are the exact unavailable-Linux-`/proc` tests below. The full gate evaluated 29 named identities, including all four all-provider lifecycle modes and both controller-interruption variants; no required identity was missing and there were no unexpected skips. The schema check, diff check, all six Terraform fmt and validate commands, and all four existing mocked Azure/GCP plan suites passed (19 total checks, each exit 0). AWS has no checked-in Terraform mock-plan suite; the gate does not invent one.
 
-The script verifies clean HEAD/tree before and after execution, refuses reused or source-overlapping evidence paths, removes inherited cloud/SSH credential variables from subprocesses, and records only allowlisted versions and command evidence. Outputs live in a new local evidence directory outside the source checkout. JUnit must contain every named identity and all four factory mode IDs. Only the two exact unavailable-`/proc` tests on Darwin may be recorded as not run; any other required skip or missing case fails the gate.
+The default AWS/Azure/GCP factories saved actual F09 `validation/input.json` and validation results then fed those files and native result roots into F12. Reports from reversed selections had identical complete file sets and bytes, and input/native source hashes were unchanged. The report kept calibration comparison-ineligible, represented diagnostic-day idle baseline as unavailable, and left costs unavailable without a verified cost snapshot. These are fake/offline evidence, not research results.
 
-## Required coverage inventory
+## Exact full command and evidence
 
-The exact named test identities and evidence boundaries are maintained in [coverage.md](../../specs/014-v2-offline-gate/contracts/coverage.md). The complete suite is run once, and the gate checks its JUnit report for those identities, four all-provider modes, and controller interruption cases. This reuses existing server/controller failure, deadline, actual-overlap, chunk-gap, receiver-streaming, retrieval, budget/expiry, residual-resource, provenance, source-patch and F12 replay suites. AWS has no Terraform mock-plan suite; the gate runs only the existing four Azure/GCP mock-provider plan suites. No mock suite or coverage count is invented.
-
-The integrated default-factory test saves the F09 validator inputs and results for AWS/Azure/GCP, then feeds those exact files and native result roots through F12. It compares full output sets/bytes across reordered selections and verifies saved source hashes remain unchanged. The fixtures are synthetic offline evidence, not research results. Missing cost snapshots remain unknown; calibration remains comparison-ineligible; diagnostic-day context is separate from idle baselines.
-
-## Source and command review
-
-Read-only source review checked the current Thesis `advisor/docs/design_document.md`, `DECISIONS.md`, `experiments/FRAMEWORK_IMPLEMENTATION_NOTES.md`, `experiments/EXPERIMENTS.md`, `tracking/IMPLEMENTATION_PROMPTS.md`, `tracking/M04_implementation.md`, `tracking/framework_implementation_roadmap.html` and `tracking/M05_experiments.md`. The runbook keeps acceptance at ten measured seconds per phase and N=4 before calibration; uses the approved CAL-S1 1/4/2/8, 8/2/4/1, 2/8/1/4 trial orders and ≥95% common-N rule; checks measured log growth against 32-GiB disks and 20-GiB/cloud export; requires a separate 86,400-second continuous TCP DAY with ≤300-second local chunks and ≥99% RTT coverage; and leaves study windows, refreshed prices, quotas and real N pending. This follows M05's execution order and does not treat its provisional dates or dated cost forecast as current approval.
-
-Commands used for this read-only check were `sed -n '1,240p' /Users/katya/Desktop/University/Masters/Thesis/tracking/M05_experiments.md`, `rg -n 'acceptance|calibration|diagnostic day|86,400|95%|20 GiB|expiry|cleanup' /Users/katya/Desktop/University/Masters/Thesis/{advisor/docs/design_document.md,DECISIONS.md,experiments/FRAMEWORK_IMPLEMENTATION_NOTES.md,experiments/EXPERIMENTS.md,tracking/M05_experiments.md}`, and `PYTHONPATH=src /private/tmp/cnb-offline-venv-20261025/bin/python -m cloud_network_benchmark --help` (exit 0). CLI help exposes `validate`, `resolve`, `dry-run`, `init`, `analyze` and `lifecycle`; it contains no paid-acceptance command. No such command is presented as executable below.
-
-## Command and result
-
-The executable interface is:
+The definitive command used a new evidence directory and the corrected prepared tool paths:
 
 ```sh
 THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
 MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config \
 /private/tmp/cnb-offline-venv-20261025/bin/python scripts/validate_offline.py \
-  --evidence-dir /private/tmp/cnb-f10-final-evidence-4 \
+  --evidence-dir /private/tmp/cnb-f10-final-evidence-5 \
   --terraform /private/tmp/cnb-tools/terraform \
   --pwsh /private/tmp/cnb-tools/powershell-7.5.11/pwsh \
   --provider-mirror /private/tmp/cnb-f10-provider-mirror
 ```
 
-A zero exit requires every full-suite, schema, diff, six-root format/validate and four mocked-plan check to pass, complete named JUnit coverage, and unchanged clean source state. The evidence directory contains each argv/exit/duration/log/checksum, JUnit, safe tool/environment metadata, coverage/skips and a `summary.json`; failed or omitted checks are never counted passed. Full command results, tested SHA, log hashes and any two Darwin platform gaps will be added here only after the clean committed run completes. Until then, the full gate status is **not run**.
+Exit: **0**. The same committed command was first attempted in the default sandbox and reached Terraform provider startup, where the sandbox denied its local Unix-socket bind. The definitive run used the normal reviewed local execution permission for those provider sockets; it did not access a cloud or network service. Earlier path/lock preflight failures and the sandbox-denied run remain preserved in `/private/tmp/cnb-f10-final-evidence-{1,2,3,4}`; they are failed/incomplete attempts, not the successful gate evidence.
 
-Focused implementation validation has run separately from the full gate:
+The definitive raw evidence is under `/private/tmp/cnb-f10-final-evidence-5/`. `summary.json` SHA-256 is `01730b8da0a711d87d4fa3f1e4b8ae4fa0e4ce032a084f0951844b8304fe57ba`; `pytest.xml` SHA-256 is `a070fac39bc6c84452c00836105713e6de9320fab57e5a7707e83866d19c77dc`; the full pytest log `01-full-pytest.log` SHA-256 is `95746ae028ea2ca6f4a8136f1a2b967382648f43026fec197ee6c9106ee04e7f`. `summary.json` records exact argv, status, exit, duration and log hash for every check. All 19 checks passed. The isolated Terraform CLI config SHA-256 is `1260c0a338af19a6900aace387e66b50a8e9900610cd13f8dcc322fcb5ff6a28`.
 
-- `PYTHONPATH=src /private/tmp/cnb-offline-venv-20261025/bin/python -m pytest tests/unit/test_offline_gate.py -q` → **5 passed**.
-- `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config PYTHONPATH=src PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH /private/tmp/cnb-offline-venv-20261025/bin/python -m pytest tests/integration/test_f09_multi_provider_factory.py -q -k 'all-provider-acceptance or all-provider-calibration or all-provider-short-study or all-provider-diagnostic-day'` → **4 passed, 7 deselected** in 137.75 seconds; output `/private/tmp/cnb-f10-factory.log`.
-- `/private/tmp/cnb-offline-venv-20261025/bin/python scripts/validate_offline.py --help` → **exit 0**; syntax/import compilation with `-m py_compile scripts/validate_offline.py tests/unit/test_offline_gate.py` → **exit 0**.
+The checked environment was Darwin arm64, Python 3.12.14, pytest 8.4.2, Pydantic 2.14.1, PyYAML 6.0.3, Matplotlib 3.11.2, NumPy 2.5.4, Terraform 1.16.6 and PowerShell 7.5.11. The read-only Thesis source revision was `ce89a8549bafe95b7fe989784f3b37e8f65b9bbf`.
 
-These focused checks do not substitute for the committed-code full gate below. The full gate remains **not run** until the implementation commit is clean.
+## Named native-platform gaps
 
-## Paid stage boundary
+Only these two tests were not run because Darwin does not expose Linux `/proc` process identity:
 
-See [paid acceptance handoff](../paid-acceptance.md) for the separate source-backed sequence. Acceptance, calibration, the diagnostic day, window selection and research execution require refreshed registered inputs and separate authorization. No launch or paid action is performed by F10.
+- `tests/unit/test_f09_guest.py::test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited`
+- `tests/unit/test_f09_guest.py::test_f03_scoped_stop_refuses_reused_pid_start_ticks`
+
+Their actual skip reason is “the local test host has no Linux /proc process identity interface.” Both must run on the separately authorized native Linux acceptance host. Native Linux guest `/proc`, instrumented source-built Sockperf/iperf3 execution, real SSH trust, provider permissions/networking, expiry behavior and full billable-resource removal remain unproved.
+
+## Source review and paid boundary
+
+The read-only Thesis review covered `advisor/docs/design_document.md`, `DECISIONS.md`, `experiments/FRAMEWORK_IMPLEMENTATION_NOTES.md`, `experiments/EXPERIMENTS.md`, `tracking/IMPLEMENTATION_PROMPTS.md`, `tracking/M04_implementation.md`, `tracking/framework_implementation_roadmap.html` and `tracking/M05_experiments.md`. The separate [paid acceptance handoff](../paid-acceptance.md) follows the registered ten-second/N=4 acceptance, CAL-S1 orders and ≥95% common-N rule, measured disk/export gate, separate 86,400-second DAY, ≤300-second probe chunks and ≥99% RTT coverage. Exact research N, UTC windows, refreshed prices, quotas and realized costs remain pending. M05 dates and dated cost forecasts remain provisional inputs, not current approval.
+
+Commands used for the source and CLI review were `sed -n '1,240p' /Users/katya/Desktop/University/Masters/Thesis/tracking/M05_experiments.md`, `rg -n 'acceptance|calibration|diagnostic day|86,400|95%|20 GiB|expiry|cleanup' /Users/katya/Desktop/University/Masters/Thesis/{advisor/docs/design_document.md,DECISIONS.md,experiments/FRAMEWORK_IMPLEMENTATION_NOTES.md,experiments/EXPERIMENTS.md,tracking/M05_experiments.md}`, and `PYTHONPATH=src /private/tmp/cnb-offline-venv-20261025/bin/python -m cloud_network_benchmark --help` (exit 0). CLI help contains no paid-acceptance command, so the runbook does not claim one exists.
