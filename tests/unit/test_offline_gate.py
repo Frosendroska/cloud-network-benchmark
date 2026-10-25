@@ -16,7 +16,7 @@ def test_junit_requires_named_cases_and_only_exact_darwin_proc_gaps(tmp_path):
     report = tmp_path / "junit.xml"
     factory = "tests.integration.test_f09_multi_provider_factory"
     cases = "".join(f'<testcase classname="{factory}" name="test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[{case}]"/>' for case in ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study", "all-provider-diagnostic-day", "controller-interrupt-during-native-f03", "controller-interrupt-unverified-stop", "protection-failure"))
-    report.write_text(f'<testsuites><testsuite tests="9" skipped="1"><testcase classname="tests.unit.test_ok" name="test_kept"/><testcase classname="tests.unit.test_f09_guest" name="test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited"><skipped message="the local test host has no Linux /proc process identity interface"/></testcase>{cases}</testsuite></testsuites>')
+    report.write_text(f'<testsuites><testsuite tests="9" skipped="1"><testcase classname="tests.unit.test_ok" name="test_kept"/><testcase classname="tests.unit.test_f09_guest" name="test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited"><skipped message="the local test host has no Linux /proc process identity interface /private/tmp/cnb-f10/tests/unit/test_f09_guest.py:299: the local test host has no Linux /proc process identity interface"/></testcase>{cases}</testsuite></testsuites>')
     result = gate.junit_coverage(report, coverage, "Darwin")
     assert result["tests"] == 9
     assert result["platform_gaps"][0]["state"] == "not_run"

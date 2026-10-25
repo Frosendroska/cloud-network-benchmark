@@ -153,7 +153,10 @@ def junit_coverage(path: Path, coverage_file: Path, platform_name: str):
     for identity, reason in skipped:
         proc_reason = "the local test host has no Linux /proc process identity interface"
         allowed = (platform_name == "Darwin" and identity in PROC_CASES
-                   and reason == proc_reason)
+                   and (reason == proc_reason or re.fullmatch(
+                       re.escape(proc_reason)
+                       + r" /[^ ]*/tests/unit/test_f09_guest\.py:\d+: "
+                       + re.escape(proc_reason), reason) is not None))
         if allowed:
             gaps.append({"identity": identity, "state": "not_run", "reason": reason})
         else:
