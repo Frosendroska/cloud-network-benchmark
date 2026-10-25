@@ -308,7 +308,8 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
     observed = {}
     def observe_azure_hooks(deployment, expiry_request, **kwargs):
         observed.update(deployment=deployment, expiry_request=expiry_request, options=kwargs["options"])
-        runner.delegate = CleanupRunner(deployment, kwargs["options"], clock.utc_now())
+        runner.delegate = CleanupRunner(deployment, kwargs["options"], clock.utc_now(),
+            fail_delete_once="expiry_schedules_delete")
         return original_azure_hooks(deployment, expiry_request, **kwargs)
     monkeypatch.setattr(adapters, "azure_hooks", observe_azure_hooks)
     built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
@@ -328,14 +329,29 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
     assert provider.values["create"] is not None, (provider.primary_failure, provider.values)
     assert provider.values["create"].deployment is not None, provider.values["create"].failures[0].message
     assert provider.values["create"].deployment.run_id == children["azure"].run_id
-    assert provider.values["cleanup"].cleanup_state == "succeeded"
-    assert provider.values["cleanup"].failures == []
-    assert all(resource["type"] == "Microsoft.Automation/automationAccounts"
-        for resource in provider.values["cleanup"].resources)
+    assert provider.values["cleanup"].cleanup_state == "failed"
+    assert provider.values["cleanup"].launch_blocked is True
     assert observed["deployment"].run_id == children["azure"].run_id
     assert observed["expiry_request"].target_selector
     assert {request.action_type for request in runner.requests} >= {
         "expiry_outputs", "pair_apply", "pair_output", "pair_inventory", "pair_destroy"}
+    recovery = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+    saved_settings = Path(recovery["providers"][0]["cleanup_settings_reference"])
+    assert saved_settings.is_file()
+    saved_settings_bytes = saved_settings.read_bytes()
+    assert Path(recovery["providers"][0]["journal_reference"]).is_file()
+    before_recovery = len(runner.requests)
+    cleanup_code = lifecycle_main(["cleanup", "--recovery", str(built["recovery_path"]),
+        "--controller-session", "azure-recovery-session", "--format", "json"],
+        cleanup_runner=runner, cleanup_utc_now=clock.utc_now,
+        cleanup_monotonic_now=clock.monotonic)
+    assert cleanup_code == 0
+    recovered = runner.requests[before_recovery:]
+    assert any(request.action_type == "expiry_schedules_delete" for request in recovered)
+    assert any(request.action_type == "pair_inventory" for request in recovered)
+    assert not any(request.action_type in {"pair_apply", "expiry_create", "measurement"}
+        for request in recovered)
+    assert saved_settings.read_bytes() == saved_settings_bytes
 
 
 def _costs(path: Path, campaign, children):
@@ -732,8 +748,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         for provider, saved in saved_inputs.items():
             replay = replays[saved.identity.run_id]
             assert replay.model_dump(mode="json") == finalized[provider][0].model_dump(mode="json")
-            expected_validity = "partial" if is_diagnostic_day else "valid"
-            assert replay.validation_status.data_validity == expected_validity, [
+            assert replay.validation_status.data_validity == "valid", [
                 (finding.code, finding.severity, finding.message) for finding in replay.findings]
             if is_diagnostic_day:
                 metrics = replay.metrics.value
@@ -743,12 +758,11 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 assert day["coverage"]["complete"] is True
                 assert day["coverage"]["active_probe_ratio"]["value"] >= .99
                 assert len(chunks) + 1 == len(saved.measurement_units)
-                assert sum(unit["coverage"]["complete"] is True for unit in chunks) == len(chunks) - 1
-                assert chunks[-1]["coverage"]["complete"] is False
+                assert all(unit["coverage"]["complete"] is True for unit in chunks)
                 last_chunk_id = chunks[-1]["unit_id"]
                 last_chunk_command = next(command for command in saved.commands
                     if command.unit_id == last_chunk_id and command.producer == "vm_a")
-                assert last_chunk_command.result["outcome"] == "interrupted"
+                assert last_chunk_command.result["outcome"] == "succeeded"
             if is_calibration:
                 assert replay.validation_status.comparison_eligibility == "ineligible"
             assert not [finding for finding in replay.findings if finding.severity == "error"
@@ -774,7 +788,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cleanup_runner=cleanup_runner, cleanup_utc_now=clock.utc_now,
         cleanup_monotonic_now=clock.monotonic)
     assert cleanup_code == 1
-    assert set(cleanup_runner.actions) <= {"gcp-inventory-all-zones"}
+    assert all(action == "gcp-inventory-all-zones" or action.startswith("azure-")
+        for action in cleanup_runner.actions), cleanup_runner.actions
     assert not any("apply" in action or "measure" in action for action in cleanup_runner.actions)
     state = built["ledger"].inspect()
     assert result.reservation_evidence.reservation_id.value in state["cleanup_open"]
@@ -789,7 +804,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cleanup_runner=tamper_runner, cleanup_utc_now=clock.utc_now,
         cleanup_monotonic_now=clock.monotonic)
     assert tamper_code == 1
-    assert set(tamper_runner.actions) <= {"gcp-inventory-all-zones"}
+    assert all(action == "gcp-inventory-all-zones" or action.startswith("azure-")
+        for action in tamper_runner.actions), tamper_runner.actions
 
 
 def test_parent_aggregate_keeps_high_water_for_overlapping_peer_events(tmp_path):

@@ -274,6 +274,59 @@ def test_day_finalizes_probe_that_exits_with_tcp(repository_root, tmp_path):
     assert all(f"{unit_id}" in " ".join(result.artifact_paths) for unit_id in probe_ids)
 
 
+@pytest.mark.parametrize(("tail_seconds", "grace_seconds", "expected_outcome"), [
+    (1.2, 2.0, "succeeded"),
+    (10.0, 2.0, "interrupted"),
+])
+def test_day_terminal_probe_gets_only_bounded_natural_close_after_tcp(
+        repository_root, tmp_path, tail_seconds, grace_seconds, expected_outcome):
+    item = observation(repository_root, "diagnostic_day")
+    clock = FakeClock()
+
+    class TerminalTailProbe(FakeProcesses):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.terminal_tail_adjusted = False
+
+        def start(self, request, **kwargs):
+            handle = super().start(request, **kwargs)
+            if request.argv[0] == "sockperf":
+                handle.finishes += 0.01
+            return handle
+
+        def poll(self, handle):
+            if (not self.terminal_tail_adjusted and handle.request.argv[0] == "iperf3"
+                    and self.clock.monotonic() >= handle.finishes):
+                active = [probe for probe in self.handles
+                    if probe.request.argv[0] == "sockperf" and probe.result is None]
+                if active:
+                    active[-1].finishes = handle.finishes + tail_seconds
+                    self.terminal_tail_adjusted = True
+            return super().poll(handle)
+
+    processes = TerminalTailProbe(clock)
+    measurement_context = replace(context(item, tmp_path,
+        deadline=1000 + 86407 + grace_seconds + 10),
+        shutdown_grace_seconds=grace_seconds)
+    result = run_measurement(item, measurement_context, processes=processes, clock=clock)
+    tcp = next(handle for handle in processes.handles if handle.request.argv[0] == "iperf3")
+    probes = [handle for handle in processes.handles if handle.request.argv[0] == "sockperf"]
+    last_probe = probes[-1]
+    last_command = next(row for row in result.command_evidence if row.unit_id == last_probe.request.action_id.removeprefix("sockperf-"))
+
+    assert result.outcome == "succeeded"
+    assert len([handle for handle in processes.handles if handle.request.argv[0] == "iperf3"]) == 1
+    assert last_probe.result is not None
+    assert last_probe.result.outcome == expected_outcome
+    assert (last_probe not in processes.stop_calls) is (expected_outcome == "succeeded")
+    assert last_command.result["outcome"] == expected_outcome
+    if expected_outcome == "succeeded":
+        assert last_probe.finished_monotonic - tcp.finished_monotonic == pytest.approx(tail_seconds)
+    else:
+        assert last_probe.finished_monotonic <= measurement_context.deadline_monotonic
+    assert all(handle.started_monotonic <= tcp.finished_monotonic for handle in probes)
+
+
 def test_day_finalization_error_is_secondary_to_interruption(repository_root, tmp_path):
     item = observation(repository_root, "diagnostic_day")
     clock = FakeClock()

@@ -838,6 +838,18 @@ class _Runner:
             self.timings.append(_timing(parent.unit_id, self.context,
                 notification=initial_notification_utc, tcp_started=tcp_utc,
                 omitted=5, clocks=self.context.clock_mappings))
+            # TCP fixes the measured DAY end. If its final already-running
+            # probe is still closing, observe that same process briefly inside
+            # the existing usable budget. The separate shutdown reserve stays
+            # available for the ordinary bounded stop below.
+            if probe_handle is not None and self.processes.poll(probe_handle) is None:
+                usable = min(deadline, self.context.deadline_monotonic - self.context.shutdown_grace_seconds)
+                terminal_cutoff = min(usable,
+                    self.clock.monotonic() + self.context.shutdown_grace_seconds)
+                while self.clock.monotonic() < terminal_cutoff:
+                    if self.processes.poll(probe_handle) is not None:
+                        break
+                    self._event_until([probe_handle], terminal_cutoff)
             receiver_seconds, omitted_seconds = _receiver_timing_file(tcp_path, json_stream=True)
             bounds = None
             if tcp_mono is not None and tcp_finish_mono is not None:

@@ -139,7 +139,7 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
             raise ValueError("saved Azure request target differs from the original deployment")
 
 
-def cleanup_saved_provider(record: Any, *, runner: Any) -> tuple[Any, SavedProviderCleanupSettings, list[str]]:
+def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_now=None) -> tuple[Any, SavedProviderCleanupSettings, list[str]]:
     if not record.cleanup_settings_reference:
         raise ValueError("saved recovery record has no original provider settings reference")
     saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
@@ -149,10 +149,12 @@ def cleanup_saved_provider(record: Any, *, runner: Any) -> tuple[Any, SavedProvi
     _validate_request(saved)
     d = saved.deployment
     clock = CleanupClock()
+    utc_now = utc_now or clock.utc_now
+    monotonic_now = monotonic_now or clock.monotonic
     if saved.provider == Provider.AWS:
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
         result = AwsProviderDriver(runner, AwsRuntimeSettings.model_validate(saved.settings),
-            clock=clock.utc_now).cleanup(d)
+            clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _journal_ids(journal, "known_resource_ids")
         try:
@@ -162,7 +164,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any) -> tuple[Any, SavedProvi
     elif saved.provider == Provider.GCP:
         from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
         result = GcpProviderDriver(runner, GcpRuntimeSettings.model_validate(saved.settings),
-            clock=clock.utc_now).cleanup(d)
+            clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
         try:
@@ -184,7 +186,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any) -> tuple[Any, SavedProvi
         prereq = state.get("expiry", {})
         absent_ids.extend(value for key, value in prereq.items()
             if key.endswith("_id") and isinstance(value, str) and value.startswith("/subscriptions/"))
-        result = azure_provider.destroy(d, options, runner, clock=clock.monotonic, utc_now=clock.utc_now)
+        result = azure_provider.destroy(d, options, runner, clock=monotonic_now, utc_now=utc_now)
     return result, saved, list(dict.fromkeys(item for item in absent_ids if isinstance(item, str) and item.strip()))
 
 
@@ -250,7 +252,15 @@ def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) ->
         return (isinstance(inventory, dict) and inventory.get("pages_complete") is True
             and not inventory.get("resources")
             and all(not inventory.get(name) for name in ("instances", "disks", "addresses", "support_resources")))
-    return result.cleanup_state == CleanupState.SUCCEEDED and result.launch_blocked is False and not result.resources
+    # Azure's typed cleanup retains the pre-expiry Terraform inventory in
+    # `resources`; the owned Automation account is expected there before the
+    # expiry resources are destroyed and its exact absence is checked. Treat
+    # that trace as compatible with absence only when its ID was recorded in
+    # the saved recovery journal. Unexpected resource identities remain a
+    # cleanup blocker.
+    return (result.cleanup_state == CleanupState.SUCCEEDED and result.launch_blocked is False
+        and all(item.get("type") == "Microsoft.Automation/automationAccounts"
+            and item.get("id") in absent_ids for item in result.resources))
 
 
 def build_cleanup_runtime(*, recovery_path: Path, recovery: Any, current_session_id: str, runner: Any,
@@ -276,7 +286,8 @@ def build_cleanup_runtime(*, recovery_path: Path, recovery: Any, current_session
 
     def cleanup(record: Any):
         try:
-            result, saved, absent_ids = cleanup_saved_provider(record, runner=runner)
+            result, saved, absent_ids = cleanup_saved_provider(record, runner=runner,
+                utc_now=utc_now, monotonic_now=monotonic_now)
             if saved.reservation.reservation_id.value != recovery.reservation_id:
                 raise ValueError("provider cleanup settings reference a different F11 reservation")
             if saved.reservation.model_dump(mode="json") != saved_reservation.model_dump(mode="json"):
