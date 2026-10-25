@@ -189,13 +189,15 @@ def test_static_binary_identity_materializes_supplied_comparison_and_deadline_un
     from pathlib import Path
     binary=tmp_path/"synthetic-tool"; binary.write_bytes(b"synthetic executable bytes")
     context={"interface":"eth0","metadata_seed":{"source_builds":{"value":{
-        "sockperf":{"binary_sha256":{"value":"incorrect","unavailable_reason":None},"binary_version":"v1"},
-        "iperf3":{"binary_sha256":{"value":hashlib.sha256(binary.read_bytes()).hexdigest(),"unavailable_reason":None},"binary_version":"v1"}},"unavailable_reason":None}}}
+        "sockperf":{"binary_sha256":"incorrect","binary_version":"v1\nBuild details"},
+        "iperf3":{"binary_sha256":hashlib.sha256(binary.read_bytes()).hexdigest(),"binary_version":"v1\nBuild details"}},"unavailable_reason":None}}}
     monkeypatch.setattr(guest,"shutil_which",lambda _tool:str(binary))
-    metadata=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":0,"stdout":"v1\n","stderr":""},remaining=lambda:5)
+    metadata=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":0,"stdout":"v1\nBuild details\n","stderr":""},remaining=lambda:5)
     assert metadata["tool_versions"]["value"]["sockperf"]["binary_sha256"]["value"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert metadata["tool_versions"]["value"]["sockperf"]["version"]["value"] == "v1\nBuild details"
     assert metadata["source_builds"]["value"]["sockperf"]["matches_bootstrap_binary"]["value"] is False
     assert metadata["source_builds"]["value"]["iperf3"]["matches_bootstrap_binary"]["value"] is True
+    assert metadata["source_builds"]["value"]["iperf3"]["matches_bootstrap_version"]["value"] is True
     exhausted=guest.read_static_metadata(context,root=Path(__file__).parents[1]/"fixtures/f04",run_command=lambda *_:{"returncode":0,"stdout":"v1\n","stderr":""},remaining=lambda:0)
     for tool in ("sockperf","iperf3"):
         assert exhausted["tool_versions"]["value"][tool]["binary_sha256"]["value"] is None

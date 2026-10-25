@@ -106,10 +106,13 @@ class AutomationRunner:
 
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
-                 account_present=True, present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
+                 account_present=True, account_resource_id=None, account_absence="absent",
+                 present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
+        self.account_resource_id=account_resource_id
+        self.account_absence=account_absence
         self.role_definition_inventory=role_definition_inventory
         self.role_assignment_inventory=role_assignment_inventory
         self.present_children=set(present_children if present_children is not None else {"jobSchedules","schedules","runbooks"})
@@ -127,13 +130,21 @@ class CleanupRunner(AutomationRunner):
         elif request.action_type=="pair_inventory":
             self.requests.append(request)
             url=request.argv[request.argv.index("--url")+1].split("?",1)[0]
-            resources=[{"id":self.account,"type":"Microsoft.Automation/automationAccounts"}] if self.account_present else []
+            resources=[{"id":self.account_resource_id or self.account,"type":"Microsoft.Automation/automationAccounts"}] if self.account_present else []
             out="" if self.blank_inventory else json.dumps({"value":resources,"nextLink":url+"?api-version=2021-04-01&$skiptoken=two"})
         elif request.action_type=="expiry_inventory": self.requests.append(request); out="false"
         elif request.action_type=="role_cleanup_inventory": self.requests.append(request); out=self.role_assignment_inventory
         elif request.action_type=="role_definition_cleanup_inventory": self.requests.append(request); out=self.role_definition_inventory
         elif request.action_type=="automation_account_absence":
             self.requests.append(request)
+            if self.account_absence == "present":
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=0,
+                    stdout=json.dumps({"id":request.argv[request.argv.index("--ids")+1]}),stderr="")
+            if self.account_absence == "unknown":
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,
+                    stdout="",stderr="injected inconclusive readback")
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr='{"error":{"code":"ResourceNotFound"}}')
         elif request.action_type.endswith("_before_delete"):
             self.requests.append(request)
@@ -478,6 +489,36 @@ def test_cleanup_proves_vm_absence_and_blocks_expiry_teardown_for_residual_pair_
             assert not any(kind.endswith("_delete") for kind in cleanup_actions)
     else:
             assert all(kind in cleanup_actions for kind in ("expiry_jobSchedules_delete","expiry_schedules_delete","expiry_runbooks_delete"))
+
+
+@pytest.mark.parametrize("case", ["foreign_predelete_account", "account_still_present", "unknown_account_readback"])
+def test_cleanup_never_proves_absence_without_exact_account_removal(
+        repository_root: Path, tmp_path: Path, case):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration_runner=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,
+        registration_runner,clock=lambda:1.0,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    kwargs={}
+    if case == "foreign_predelete_account":
+        kwargs["account_resource_id"] = _slug(d) + "/providers/Microsoft.Automation/automationAccounts/foreign"
+    elif case == "account_still_present":
+        kwargs["account_absence"] = "present"
+    else:
+        kwargs["account_absence"] = "unknown"
+    runner=CleanupRunner(d,o,now,**kwargs)
+    result=destroy(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.cleanup_state == "failed"
+    assert result.launch_blocked is True
+    if case == "foreign_predelete_account":
+        assert not any(request.action_type == "automation_account_absence" for request in runner.requests)
+        assert any("pair resources remain" in failure.message for failure in result.failures)
+    else:
+        assert any(request.action_type == "automation_account_absence" for request in runner.requests)
+        expected_detail = ("Automation account absence is not proven" if case == "account_still_present"
+            else "automation_account_absence failed")
+        assert any(expected_detail in failure.message for failure in result.failures)
 
 
 @pytest.mark.parametrize("fail_at,account_present,children", [

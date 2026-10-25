@@ -1,26 +1,30 @@
 # Cloud Network Benchmark
 
-Cloud Network Benchmark is a small framework for measuring private VM-to-VM network performance across AWS, Microsoft Azure, and Google Cloud. It provisions a comparable pair of Ubuntu VMs, runs a consistent sequence of FLENT measurements, and saves the raw results and run metadata for later analysis.
+Cloud Network Benchmark is a small framework for reproducible VM-to-VM network measurements across AWS, Microsoft Azure and Google Cloud. The V2 protocol measures Sockperf UDP full RTT and receiver-side iperf3 A-to-B TCP throughput, with one-second host diagnostics saved locally during a run. The framework keeps provider-specific provisioning and cleanup behavior explicit and validates copied result bundles against their saved configuration and evidence.
 
-The framework supports same-zone, cross-zone, provider-specific placement optimization, and inter-region experiments. Each observation measures idle latency, single-flow TCP performance, and aggregate TCP performance with concurrent latency measurements. Results describe the selected VMs, regions, placement, and observation period; they are not universal rankings of cloud providers or claims of maximum bandwidth.
+Supported experiment modes retain their own protocols: short studies use idle, single-flow and calibrated aggregate phases; calibration uses one retained VM pair for the ordered stream-count trials; diagnostic days retain one continuous TCP run and use bounded local probe chunks. The framework does not infer study dates or a common stream count. Results describe the selected VMs, regions, placement and observation period, not universal provider rankings or maximum bandwidth.
 
-## Run an experiment
+## Inspect a saved experiment
 
-You need Python 3.9 or later, Terraform, and credentials for the cloud provider selected in your experiment configuration. Configure the provider's standard credentials and confirm that the account can create and destroy the required VMs and networking resources.
+The lifecycle preview reads the selected configuration, optional schedule row and cost inputs without reserving budget or contacting a provider:
 
 ```bash
-git clone https://github.com/Frosendroska/cloud-network-benchmark.git
-cd cloud-network-benchmark
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-cloud-network-benchmark run --config configs/experiments/exp-001-multi-provider.yaml
+PYTHONPATH=src python -m cloud_network_benchmark.lifecycle_cli preview \
+  --config configs/experiments/exp-001-multi-provider.yaml \
+  --cost-inputs /path/to/saved-cost-inputs.json \
+  --runtime-config /path/to/sourced-runtime-references.json \
+  --format json
 ```
 
-Choose or prepare an experiment configuration for the providers and scenarios you want to run. A run creates temporary infrastructure and incurs cloud charges. The framework saves its manifest and raw measurements locally under `results/`; retain these files with the configuration used to produce them.
+Lifecycle run and recovery commands require the complete paid-run admission evidence and provider runtime adapters. The credential-free implementation stage deliberately rejects a paid run and does not claim cloud readiness; run the offline checks in `docs/validation/f09-v2-lifecycle.md` instead. No paid experiment is launched by this repository workflow.
+
+The root CLI exposes lifecycle commands through `cloud-network-benchmark lifecycle`. It delegates to the isolated lifecycle parser and preserves the existing config and F12 `analyze` commands. `run` accepts an explicit `paid_request` scope plus config, cost inputs, runtime references, result/private roots and controller session; this offline implementation returns a rejection with no provider calls. `cleanup` accepts a private recovery journal and never resumes measurement; it reports that cleanup is unavailable when provider callbacks are not supplied. `recommend-common-n` reads a JSON array of saved F08 calibration results and reports the existing evidence-based recommendation without changing configuration.
+
+Before measurement, the lifecycle adapter stages the selected package revision to VM A through the existing SSH/SCP trust boundary, checks the archive and source revision, creates a deployment-local Python virtual environment, installs the dependency ranges already declared in `pyproject.toml`, and records the guest Python, Pydantic and PyYAML versions. Offline tests fake the guest installation command; they do not contact clouds or install anything on a guest.
 
 ## Research context
 
-This framework supports the Master's thesis *Benchmarking Network Performance across Clouds*. The thesis describes the research questions, measurement design, and interpretation of results.
+This framework supports the Master's thesis *Benchmarking Network Performance across Clouds*. The thesis repository owns research questions, methodology, experiment design and interpretation; this repository owns executable configuration, provider code, orchestration, raw result bundles, validation and implementation documentation. The thesis describes the research questions, measurement design, and interpretation of results.
 
 ## Analyze saved results
 

@@ -1,0 +1,259 @@
+"""Isolated F09 lifecycle command parser and read-only admission preview."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+from .admission import load_cost_inputs
+from .config import resolve_campaign
+from .scheduling import load_schedule
+from .lifecycle_bundle import recommend_calibration_common_n
+from .lifecycle_runtime import load_runtime_config, load_initialized_campaign
+
+
+def preview_lifecycle(*, config_path: Path, repository_root: Path,
+                       schedule_path: Path | None, row_id: str | None,
+                       cost_inputs_path: Path, now: datetime | None = None) -> dict[str, Any]:
+    """Inspect one selected row without reserving, registering or invoking a provider."""
+    root = repository_root.resolve()
+    config_path = config_path.resolve()
+    resolved, _ = resolve_campaign(config_path, root)
+    selected_entry = None
+    reasons = list(resolved.launch_blockers)
+    if schedule_path is not None:
+        entries = load_schedule(schedule_path, config_paths={resolved.config_id: config_path}, repository_root=root)
+        matches = [entry for entry in entries if entry.entry_id == row_id]
+        if len(matches) != 1:
+            reasons.append("selected_schedule_row_missing_or_ambiguous")
+        else:
+            selected_entry = matches[0]
+            resolved, _ = resolve_campaign(config_path, root, schedule_entry=selected_entry)
+    elif row_id is not None:
+        reasons.append("schedule_row_requires_schedule_file")
+    elif resolved.admission.requires_schedule:
+        reasons.append("schedule_pending")
+    costs = load_cost_inputs(cost_inputs_path)
+    if costs.refresh_required:
+        reasons.append("price_refresh_required")
+    reasons.extend(("f11_reservation_not_evaluated", "paid_acceptance_prerequisites_not_evaluated",
+                    "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"))
+    return {
+        "status": "inspectable" if selected_entry is not None or not resolved.admission.requires_schedule else "pending",
+        "paid_eligible": False,
+        "config_id": resolved.config_id,
+        "experiment_id": resolved.experiment_id,
+        "mode": str(resolved.mode),
+        "selected_providers": [str(provider) for provider in resolved.selected_providers],
+        "schedule_entry_id": selected_entry.entry_id if selected_entry else None,
+        "cost_input": {"id": costs.cost_input_id, "sha256": costs.payload_sha256,
+                       "prices_checked_on": str(costs.prices_checked_on),
+                       "refresh_required": costs.refresh_required},
+        "reason_codes": sorted(set(reasons)),
+        "external_calls": 0,
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cloud-network-benchmark lifecycle")
+    commands = parser.add_subparsers(dest="action", required=True)
+    for name in ("preview", "run"):
+        command = commands.add_parser(name)
+        command.add_argument("--config", required=True, type=Path)
+        command.add_argument("--schedule", type=Path)
+        command.add_argument("--row-id")
+        command.add_argument("--cost-inputs", required=True, type=Path)
+        command.add_argument("--runtime-config", required=True, type=Path)
+        command.add_argument("--format", choices=("human", "json"), default="human")
+        if name == "run":
+            command.add_argument("--results-root", required=True, type=Path)
+            command.add_argument("--private-root", required=True, type=Path)
+            command.add_argument("--controller-session", required=True)
+            command.add_argument("--execution-scope", choices=("paid_request",), required=True)
+    cleanup = commands.add_parser("cleanup")
+    cleanup.add_argument("--recovery", required=True, type=Path)
+    cleanup.add_argument("--runtime-config", type=Path,
+        help="deprecated for cleanup; original source-bound settings come from the private recovery journal")
+    cleanup.add_argument("--private-root", type=Path,
+        help="deprecated for cleanup; original private paths come from the private recovery journal")
+    cleanup.add_argument("--controller-session", required=True)
+    cleanup.add_argument("--format", choices=("human", "json"), default="human")
+    recommendation = commands.add_parser("recommend-common-n")
+    recommendation.add_argument("--validation-results", required=True, type=Path,
+        help="JSON array of saved F08 calibration ValidationResult objects")
+    recommendation.add_argument("--format", choices=("human", "json"), default="human")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=None,
+         cleanup_runner=None, cleanup_utc_now=None, cleanup_monotonic_now=None) -> int:
+    parser = _parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.action in {"preview", "run"}:
+            for path in (args.config, args.cost_inputs, args.runtime_config):
+                if not path.is_file() or path.is_symlink():
+                    raise ValueError(f"required local input is unavailable: {path.name}")
+            resolved, _ = resolve_campaign(args.config, Path.cwd())
+            runtime = load_runtime_config(args.runtime_config,
+                selected_providers={str(provider) for provider in resolved.selected_providers})
+            report = preview_lifecycle(config_path=args.config, repository_root=Path.cwd(),
+                schedule_path=args.schedule, row_id=args.row_id, cost_inputs_path=args.cost_inputs,
+                now=datetime.now(timezone.utc))
+            if args.action == "run":
+                try:
+                    initialized, children = load_initialized_campaign(
+                        runtime["initialized_campaign_manifest"], repository_root=Path.cwd(),
+                        config_path=args.config, schedule_path=args.schedule)
+                    if initialized.config_id != resolved.config_id or initialized.mode != resolved.mode:
+                        raise ValueError("initialized campaign identity differs from the selected config")
+                    if set(children) != {str(provider) for provider in resolved.selected_providers}:
+                        raise ValueError("initialized provider set differs from the selected campaign")
+                except (OSError, ValueError) as exc:
+                    report.update(status="rejected", reason_codes=sorted(set(report["reason_codes"] +
+                        ["initialized_campaign_unavailable_or_mismatched"])), detail=str(exc),
+                        execution_scope=args.execution_scope, external_calls=0)
+                    print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                          "Lifecycle run rejected: initialized campaign identity is unavailable or mismatched.")
+                    return 1
+                from .contracts.execution import SubprocessCommandRunner
+                from .lifecycle_runtime import build_runtime
+                from .orchestration import run_lifecycle
+                from .lifecycle_projection import finalize_production_batch
+
+                class Clock:
+                    @staticmethod
+                    def monotonic():
+                        return time.monotonic()
+
+                    @staticmethod
+                    def utc_now():
+                        return datetime.now(timezone.utc)
+
+                class CountingRunner:
+                    def __init__(self):
+                        self.delegate = SubprocessCommandRunner()
+                        self.actions = []
+
+                    def run(self, request):
+                        self.actions.append(request.action_id)
+                        return self.delegate.run(request)
+
+                costs = load_cost_inputs(args.cost_inputs)
+                selected_campaign, _ = resolve_campaign(args.config, Path.cwd(),
+                    schedule_entry=(None if args.schedule is None else
+                        next((entry for entry in load_schedule(args.schedule,
+                            config_paths={resolved.config_id: args.config}, repository_root=Path.cwd())
+                            if entry.entry_id == args.row_id), None)))
+                runner, clock = CountingRunner(), Clock()
+                built = build_runtime(campaign=selected_campaign, parent=initialized,
+                    children=children, costs=costs, runtime=runtime,
+                    controller_session_id=args.controller_session, runner=runner, clock=clock,
+                    private_root=args.private_root, repository_root=Path.cwd())
+                lifecycle = run_lifecycle(ledger=built["ledger"],
+                    reservation_request=built["request"], admission_plan=built["plan"],
+                    allowance=built["allowance"], workflow_factory=built["workflow_factory"],
+                    clock=clock, recovery_path=built["recovery_path"],
+                    recovery_factory=built["recovery_factory"])
+                validations = {}
+                if lifecycle.provider_results and lifecycle.reservation_evidence is not None:
+                    validations = finalize_production_batch(
+                        parent_path=runtime["initialized_campaign_manifest"], children=children,
+                        parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
+                data_valid = bool(validations) and all(
+                    value[0].validation_status.data_validity == "valid"
+                    for value in validations.values())
+                unevaluated = {"f11_reservation_not_evaluated", "paid_acceptance_prerequisites_not_evaluated",
+                    "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"}
+                report.update(status=("complete" if lifecycle.completed and data_valid else
+                    "rejected" if lifecycle.admission_status != "reserved" else "failed"),
+                    reason_codes=sorted((set(lifecycle.admission_reasons)
+                        | ({lifecycle.primary_failure} if lifecycle.primary_failure else set()))
+                        | (set(report["reason_codes"]) - unevaluated)),
+                    execution_scope=args.execution_scope, campaign_id=initialized.campaign_id,
+                    run_ids={k: v.run_id for k, v in children.items()},
+                    admission_status=lifecycle.admission_status,
+                    reservation_id=(lifecycle.reservation_evidence.reservation_id.value
+                        if lifecycle.reservation_evidence is not None else None),
+                    providers={provider: {"execution_state": item.execution_state,
+                        "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
+                        "secondary_failures": item.secondary_failures,
+                        "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
+                            if provider in validations else None)}
+                        for provider, item in lifecycle.provider_results.items()},
+                    external_calls=len(runner.actions))
+                print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                      f"Lifecycle run {report['status']}; admission: {report['admission_status']}; external calls: {report['external_calls']}",
+                      file=sys.stdout if lifecycle.completed else sys.stderr)
+                return 0 if report["status"] == "complete" else 1
+            print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                  f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
+            return 0 if report["status"] != "invalid" else 2
+        if args.action == "recommend-common-n":
+            if not args.validation_results.is_file() or args.validation_results.is_symlink():
+                raise ValueError("validation results must be a regular non-symlink file")
+            payload = json.loads(args.validation_results.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                raise ValueError("validation results must be a JSON array")
+            recommendation = recommend_calibration_common_n(payload)
+            report = {"status": "recommended" if recommendation.common_n.value is not None else "pending",
+                "common_n": recommendation.common_n.model_dump(mode="json"),
+                "plateau_found": recommendation.plateau_found.model_dump(mode="json"),
+                "provider_medians_gbps": recommendation.provider_medians_gbps,
+                "qualifying_ratios": recommendation.qualifying_ratios,
+                "source_campaign_id": recommendation.source_campaign_id.model_dump(mode="json"),
+                "source_run_ids": list(recommendation.source_run_ids),
+                "source_sha256": recommendation.source_sha256.model_dump(mode="json"),
+                "reason": recommendation.unavailable_reason,
+                "config_mutated": False}
+            print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                  (f"Recommended common N: {recommendation.common_n.value}" if recommendation.common_n.value is not None
+                   else f"Common N pending: {recommendation.unavailable_reason}"))
+            return 0 if recommendation.common_n.value is not None else 1
+        # Cleanup is rebuilt only from the private recovery journal, its saved
+        # source-bound provider settings and the original F11 ledger reference.
+        if not args.recovery.is_file() or args.recovery.is_symlink():
+            raise ValueError("recovery reference must be a regular non-symlink file")
+        if cleanup_actions is not None and reconcile is not None:
+            from .orchestration import cleanup_lifecycle
+            result = cleanup_lifecycle(args.recovery, current_session_id=args.controller_session,
+                cleanup_actions=cleanup_actions, reconcile=reconcile)
+        else:
+            from .orchestration import SavedLifecycleRecovery
+            from .lifecycle_cleanup import CleanupClock, build_cleanup_runtime
+            from .contracts.execution import SubprocessCommandRunner
+            recovery = SavedLifecycleRecovery.validate_unique(
+                json.loads(args.recovery.read_text(encoding="utf-8")))
+            clock = CleanupClock()
+            result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
+                current_session_id=args.controller_session,
+                runner=cleanup_runner or SubprocessCommandRunner(),
+                utc_now=cleanup_utc_now or clock.utc_now,
+                monotonic_now=cleanup_monotonic_now or clock.monotonic)
+        report = {"status": "complete" if result.complete else "blocked",
+                "execution": "not_resumed", "cleanup": "complete" if result.complete else "incomplete",
+                "attempt_id": result.attempt_id,
+                "original_session_id": result.original_session_id,
+                "current_session_id": result.current_session_id,
+                "providers": {provider: {key: value for key, value in item.items()
+                    if key in {"cleanup", "reconciled", "absence_proved", "billable_resources_present",
+                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason"}}
+                    for provider, item in result.providers.items()},
+                "external_calls": sum(item.get("cleanup") in {"attempted", "succeeded", "failed"}
+                                       for item in result.providers.values())}
+        print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
+                  f"Cleanup {report['status']}: execution was not resumed.",
+                  file=sys.stdout if result.complete else sys.stderr)
+        return 0 if result.complete else 1
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(json.dumps({"status": "invalid", "reason_codes": ["invalid_lifecycle_request"],
+                          "error": str(exc), "external_calls": 0}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

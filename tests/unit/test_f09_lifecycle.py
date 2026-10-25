@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+import pytest
+
+from cloud_network_benchmark.orchestration import (
+    LifecycleContext,
+    ProviderHooks,
+    ProviderStageOutcome,
+    SavedLifecycleRecovery,
+    execute_provider_workflows,
+    run_lifecycle,
+    consume_retry_attempt,
+    write_recovery_journal,
+    _remaining_f11_allowance,
+    _typed_outcome,
+)
+from cloud_network_benchmark.admission import WorkflowAllowance
+from tests.fixtures.f09.helpers import FakeClock, Trace
+
+
+def hooks(provider, trace, *, protect=None, fail=None, start_barrier=None):
+    def run(stage):
+        trace.add(provider, stage)
+        if stage == "create" and start_barrier is not None:
+            start_barrier.wait(timeout=1)
+        if stage == fail:
+            raise RuntimeError(f"{provider} {stage}")
+        return ProviderStageOutcome(stage, True, {"provider": provider, "stage": stage, "synthetic": True})
+
+    return ProviderHooks(
+        provider=provider,
+        protect=lambda: protect() if protect else run("protect"),
+        claim=lambda: run("claim"),
+        create=lambda: run("create"),
+        prepare=lambda: run("prepare"),
+        stabilize=lambda: run("stabilize"),
+        measure=lambda: run("measure"),
+        close=lambda: run("close"),
+        retrieve=lambda: run("retrieve"),
+        cleanup=lambda: run("cleanup"),
+    )
+
+
+def test_all_protection_is_verified_before_any_claim_or_create():
+    trace = Trace()
+    result = execute_provider_workflows(
+        {name: hooks(name, trace) for name in ("aws", "azure", "gcp")},
+        context=LifecycleContext("session-1", 100, 1000, 1200),
+        clock=FakeClock(),
+    )
+    first_claim = min(i for i, (_, stage) in enumerate(trace.events) if stage == "claim")
+    assert all(stage == "protect" for _, stage in trace.events[:first_claim])
+    assert len([1 for _, stage in trace.events if stage == "create"]) == 3
+    assert result.completed
+
+
+def test_failed_protection_blocks_all_creation_and_cleans_safety_liabilities():
+    trace = Trace()
+    def bad_protection():
+        trace.add("azure", "protect")
+        raise RuntimeError("synthetic registration uncertainty")
+    result = execute_provider_workflows(
+        {"aws": hooks("aws", trace), "azure": hooks("azure", trace, protect=bad_protection)},
+        context=LifecycleContext("session-1", 100, 1000, 1200),
+        clock=FakeClock(),
+    )
+    assert not any(stage in {"claim", "create"} for _, stage in trace.events)
+    assert {p for p, stage in trace.events if stage == "cleanup"} == {"aws", "azure"}
+    assert result.primary_failure is not None
+
+
+def test_healthy_providers_overlap_and_failed_peer_does_not_skip_cleanup():
+    trace = Trace()
+    barrier = Barrier(2)
+    result = execute_provider_workflows(
+        {"aws": hooks("aws", trace, fail="prepare", start_barrier=barrier),
+         "gcp": hooks("gcp", trace, start_barrier=barrier)},
+        context=LifecycleContext("session-1", 100, 1000, 1200),
+        clock=FakeClock(),
+        max_workers=2,
+    )
+    assert result.provider_results["gcp"].execution_state == "succeeded"
+    assert result.provider_results["aws"].execution_state == "failed"
+    assert {p for p, stage in trace.events if stage == "cleanup"} == {"aws", "gcp"}
+
+
+def test_claim_failure_is_provider_local_after_complete_protection():
+    trace = Trace()
+    rows = {name: hooks(name, trace, fail="claim" if name == "aws" else None)
+            for name in ("aws", "gcp")}
+    result = execute_provider_workflows(rows,
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    assert not any(provider == "aws" and stage == "create" for provider, stage in trace.events)
+    assert any(provider == "gcp" and stage == "create" for provider, stage in trace.events)
+    assert {provider for provider, stage in trace.events if stage == "cleanup"} == {"aws", "gcp"}
+    assert not result.completed
+
+
+def test_worker_interrupt_requests_scoped_cancel_then_closes_and_cleans_created_pair():
+    trace = Trace()
+    base = hooks("aws", trace)
+    interrupted = ProviderHooks(**{**base.__dict__,
+        "measure":lambda:(_ for _ in ()).throw(KeyboardInterrupt()),
+        "cancel":lambda:trace.add("aws", "cancel")})
+    result = execute_provider_workflows({"aws":interrupted},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for _, stage in trace.events]
+    assert "cancel" in stages and "close" in stages and "retrieve" in stages and "cleanup" in stages
+    assert not result.completed and result.provider_results["aws"].primary_failure
+
+
+def test_protection_interrupt_is_caught_and_attempts_cleanup_for_uncertain_registration():
+    trace = Trace()
+    base = hooks("aws", trace)
+    interrupted = ProviderHooks(**{**base.__dict__,
+        "protect":lambda:(_ for _ in ()).throw(KeyboardInterrupt()),
+        "cancel":lambda:trace.add("aws", "cancel")})
+    result = execute_provider_workflows({"aws":interrupted},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for _, stage in trace.events]
+    assert "cleanup" in stages and "cancel" in stages
+    assert not any(stage in {"claim", "create"} for stage in stages)
+    assert not result.completed and result.provider_results["aws"].interrupted
+
+
+def test_returned_provider_failure_and_unregistered_expiry_are_not_success():
+    trace = Trace()
+    base = hooks("aws", trace)
+    bad_expiry = ProviderHooks(**{**base.__dict__, "protect":lambda:{"state":"failed"}})
+    outcome = execute_provider_workflows({"aws":bad_expiry},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    assert not outcome.completed
+    assert "registered expiry" in outcome.provider_results["aws"].primary_failure
+    assert "claim" not in [stage for _, stage in trace.events]
+
+    trace = Trace()
+    base = hooks("aws", trace)
+    bad_cleanup = ProviderHooks(**{**base.__dict__,
+        "cleanup":lambda:{"cleanup_state":"failed", "launch_blocked":True}})
+    outcome = execute_provider_workflows({"aws":bad_cleanup},
+        context=LifecycleContext("session-1", 100, 1000, 1200), clock=FakeClock())
+    assert not outcome.completed
+    assert outcome.provider_results["aws"].cleanup_state == "failed"
+    assert "cleanup is failed" in outcome.provider_results["aws"].primary_failure
+
+
+@pytest.mark.parametrize("provider,inventory", [
+    ("aws", {"complete": True, "safety_absent": {"eu-central-1": True},
+        "regions": {"eu-central-1": {"complete": True, "resources": {"instances": [], "known_ids": {}}}}}),
+    ("gcp", {"pages_complete": True, "zone_scope": "all_project_zones",
+        "completed_scopes": ["all_project_zones", "global"], "resources": []}),
+    ("azure", []),
+])
+def test_cleanup_requires_provider_inventory_proving_absence(provider, inventory):
+    from types import SimpleNamespace
+    valid = SimpleNamespace(cleanup_state="succeeded", launch_blocked=False,
+        failures=[], inventory=SimpleNamespace(value=inventory), resources=inventory if provider == "azure" else None)
+    assert _typed_outcome(provider, "cleanup", valid)[0]
+    if provider == "azure":
+        valid.resources = [{"id": "still-present"}]
+    else:
+        valid.inventory = SimpleNamespace(value={**inventory,
+            ("safety_absent" if provider == "aws" else "resources"): {"zone": False} if provider == "aws" else [{"id": "still-present"}]})
+    assert not _typed_outcome(provider, "cleanup", valid)[0]
+
+
+@pytest.mark.parametrize("now,deadline,trigger", [(999.0, 1000.0, 200.0), (201.0, 200.0, None)])
+def test_original_cap_or_earlier_provider_trigger_blocks_stages_but_still_cleans(now, deadline, trigger):
+    trace = Trace()
+    context = LifecycleContext("session", 1, deadline, 1200,
+        provider_trigger_monotonic=trigger)
+    clock = FakeClock(monotonic=now)
+    result = execute_provider_workflows({"aws":hooks("aws", trace)}, context=context, clock=clock)
+    stages = [stage for _, stage in trace.events]
+    assert not result.completed
+    assert "protect" not in stages and "claim" not in stages and "create" not in stages
+    assert "cleanup" in stages
+
+
+def test_controller_session_and_cap_are_immutable_for_stage_checks():
+    context = LifecycleContext("session-1", 100.0, 1000.0, 1200, {"measurement": 900.0})
+    with pytest.raises(ValueError, match="cap"):
+        context.require_fit("measurement", 901.0, now_monotonic=100.0)
+    with pytest.raises(ValueError, match="session"):
+        context.assert_session("session-2")
+
+
+def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
+    full = WorkflowAllowance(10, 20, 30, 40, 60, 5, 12, 8, "sourced", {"aws": 50})
+    registration = _remaining_f11_allowance(full, "registration")
+    preparation = _remaining_f11_allowance(full, "preparation")
+    measurement = _remaining_f11_allowance(full, "measurement")
+    retrieval = _remaining_f11_allowance(full, "retrieval")
+    assert registration == full
+    assert preparation.completed_stages == ("registration",)
+    assert (preparation.registration_seconds, preparation.provision_seconds,
+            preparation.readiness_seconds, preparation.stabilization_seconds) == (0, 20, 30, 40)
+    assert measurement.completed_stages == ("registration", "preparation")
+    assert (measurement.registration_seconds, measurement.provision_seconds,
+            measurement.readiness_seconds, measurement.stabilization_seconds) == (0, 0, 0, 0)
+    assert measurement.measurement_seconds == 60 and measurement.measurement_shutdown_seconds == 5
+    assert retrieval.completed_stages == ("registration", "preparation", "measurement")
+    assert retrieval.measurement_seconds == 0 and retrieval.measurement_shutdown_seconds == 0
+    assert retrieval.retrieval_seconds == 12 and retrieval.cleanup_seconds == 8
+
+
+def test_recovery_journal_durably_consumes_each_retry_once(tmp_path):
+    path = tmp_path / "private" / "recovery.json"
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-retry", controller_session_id="session",
+        providers=[{"provider":"aws", "deployment_id":"run-aws-deployment",
+            "journal_reference":"private/aws.json", "expiry_registered":True,
+            "creation_may_have_started":True, "cleanup_open":True}])
+    write_recovery_journal(path, recovery)
+    assert consume_retry_attempt(path, "native-artifact") is True
+    assert consume_retry_attempt(path, "native-artifact") is False
+    saved = SavedLifecycleRecovery.validate_unique(__import__("json").loads(path.read_text()))
+    assert saved.retry_consumed_ids == ["native-artifact"]
+
+
+def test_admission_is_reserved_before_provider_factory_and_offline_scope_never_dispatches():
+    class Ledger:
+        def __init__(self, status): self.status, self.calls = status, []
+        def reserve(self, request, *, plan):
+            self.calls.append("reserve")
+            from types import SimpleNamespace
+            return SimpleNamespace(status=self.status, evidence=None, reasons=("prerequisite_pending",))
+    class Plan:
+        execution_scope = "paid_request"
+    ledger = Ledger("rejected")
+    factory_called = False
+    def factory(_evidence):
+        nonlocal factory_called
+        factory_called = True
+        return {}
+    result = run_lifecycle(ledger=ledger, reservation_request=object(), admission_plan=Plan(),
+        allowance=object(), workflow_factory=factory,
+        context=LifecycleContext("s", 1, 100, 100), clock=FakeClock())
+    assert result.admission_status == "rejected"
+    assert ledger.calls == ["reserve"] and not factory_called
+    class OfflinePlan: execution_scope = "offline_simulation"
+    with pytest.raises(ValueError, match="offline_simulation"):
+        run_lifecycle(ledger=ledger, reservation_request=object(), admission_plan=OfflinePlan(),
+            allowance=object(), workflow_factory=factory,
+            context=LifecycleContext("s", 1, 100, 100), clock=FakeClock())
+    assert ledger.calls == ["reserve"]

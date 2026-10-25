@@ -720,6 +720,47 @@ def test_clock_alignment_boundary_is_separate_from_a_local_rtt(repository_root):
     assert failed.metrics.value["units"][0]["alignment"]["one_second_eligible"]["value"] is False
 
 
+def test_coverage_applies_clock_uncertainty_once_to_source_support(repository_root):
+    from cloud_network_benchmark.contracts.measurements import ClockMapping
+
+    value = make_input(repository_root, mode_override="short_study")
+    unit = next(item for item in value.measurement_units if item.phase == "idle_latency")
+    timing = next(item for item in value.timings if item.unit_id == unit.unit_id)
+    mapping = ClockMapping(vm_role="vm_a", monotonic_seconds=0, utc_timestamp=NOW,
+        estimated_error_ms={"value": 1}, synchronization_source={"value": "materialized fixture"})
+    timing = timing.model_copy(update={"clock_mappings": [mapping]})
+    value = value.model_copy(update={"timings": [timing if item.unit_id == unit.unit_id else item
+        for item in value.timings]})
+    start = timing.measured_started_at.value.timestamp()
+    finish = timing.measured_finished_at.value.timestamp()
+
+    def coverage_for(window):
+        return _coverage(value, unit, NativeParse(), None,
+            {unit.unit_id: ([ ("sockperf", *window) ], [])})
+
+    # Acquisition replay has already removed the actual 1 ms uncertainty from
+    # these supports. Extra source margin therefore proves the whole selected
+    # interval without a second erosion at the selection step.
+    enclosed = coverage_for((start - 2, finish + 2))
+    assert enclosed["active_probe_seconds"]["value"] == pytest.approx(unit.measured_seconds)
+    assert enclosed["complete"] is True
+    assert enclosed["tcp_start_bracket"]["coverage_bound"] == \
+        "source-inner support within declared measured window"
+
+    # When already-inner support reaches only to the selected endpoints, its
+    # genuine 1 ms losses remain visible and do not satisfy idle full support.
+    edge_clipped = coverage_for((start + .001, finish - .001))
+    assert edge_clipped["active_probe_seconds"]["value"] == pytest.approx(unit.measured_seconds - .002)
+    assert edge_clipped["complete"] is False
+
+    unbounded = timing.model_copy(update={"clock_mappings": []})
+    value = value.model_copy(update={"timings": [unbounded if item.unit_id == unit.unit_id else item
+        for item in value.timings]})
+    unknown = _coverage(value, unit, NativeParse(), None,
+        {unit.unit_id: ([ ("sockperf", start - 2, finish + 2) ], [])})
+    assert unknown["active_probe_seconds"]["value"] is None
+
+
 def test_materialized_artifact_integrity_and_symlink_escape_are_reported(repository_root, tmp_path):
     value = make_input(repository_root)
     unit = value.measurement_units[0]
@@ -800,6 +841,31 @@ def test_tcp_window_must_intersect_native_sample_support(repository_root):
     assert "source-bound active-probe acquisition intervals" in result["tcp_start_bracket"]["unavailable_reason"]
 
 
+@pytest.mark.parametrize("tool", ["sockperf", "iperf3"])
+def test_f02r_persistent_listener_without_process_times_is_retained(repository_root, tool):
+    value = make_input(repository_root)
+    unit = next(item for item in value.measurement_units if item.phase == "multi_flow")
+    action = f"f02r-vm_b-listener-{tool}"
+    root = "/var/lib/cnb/work/server-logs"
+    argv = ["sudo", "systemd-run", "--unit", f"cnb-{value.identity.deployment_id}-{tool}",
+        "--property=Restart=no", "--property=UMask=0022",
+        f"--property=StandardOutput=append:{root}/{tool}{'.log' if tool == 'sockperf' else '-server.jsonl'}",
+        f"--property=StandardError=append:{root}/{tool}{'.err' if tool == 'sockperf' else '-server.err'}"]
+    if tool == "iperf3":
+        argv.append("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
+    argv.extend([f"/var/lib/cnb/install/bin/{tool}"])
+    argv.extend(["server", "-i", "10.60.1.11", "-p", "11111"] if tool == "sockperf" else
+        ["-s", "-B", "10.60.1.11", "-p", "5201", "--json-stream", "--forceflush"])
+    listener = CommandEvidence(schema_version=2, request={"action_id": action, "argv": argv},
+        result={"outcome": "succeeded", "action_id": action}, producer="vm_b",
+        deployment_id=value.identity.deployment_id, unit_id=unit.unit_id,
+        binary_version={"value": "3.17.1"}, source_identity={"value": "fixture"},
+        monotonic_started={"unavailable_reason": "persistent listener start is not measured"},
+        monotonic_finished={"unavailable_reason": "persistent listener has no finite finish"})
+    findings = _command_findings(value.model_copy(update={"commands": [listener]}))
+    assert not [item for item in findings if item.code == "command.timing_unavailable"]
+
+
 def test_receiver_session_settings_endpoint_and_window_are_corroborated(repository_root):
     value = make_input(repository_root)
     unit = value.measurement_units[1]
@@ -823,15 +889,34 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
     source = SourceRef("iperf3_server_log","receiver.jsonl","a"*64)
     details = ({"session_id":"1","start":{"test_start":{"protocol":"TCP","num_streams":1,
         "omit":5,"duration":60,"blksize":131072},"timestamp":{"timesecs":(NOW+timedelta(seconds=7)).timestamp()},
-        "connected":[{"socket":17,"local_host":"10.0.0.2","local_port":5201,
+        "cookie":"captured-session", "connected":[{"socket":17,"local_host":"10.0.0.2","local_port":5201,
             "remote_host":"10.0.0.1","remote_port":50100}]}},)
-    good = ReceiverInterval("1",3,63,60,1000,False,False,source,1)
-    straddling = ReceiverInterval("1",1,4,3,100,False,False,source,2)
+    good = ReceiverInterval("1",0,60,60,1000,False,False,source,1)
+    omitted_warmup = ReceiverInterval("1",0,4,4,250,True,False,source,2)
+    outside = ReceiverInterval("1",61,64,3,100,False,False,source,3)
     parsed = NativeParse(source=source,sessions=("1",),session_details=details,
-        receiver_intervals=(good,straddling))
+        receiver_intervals=(good,omitted_warmup,outside))
     selected = _receiver_session_for_unit(value,unit,parsed)
-    assert selected.receiver_intervals == (good,)
+    assert selected.receiver_intervals == (good, omitted_warmup, outside)
+    assert any(item.code == "native.iperf3.window_unavailable" for item in selected.findings)
+    assert not any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
+    verified = {"captured-session": {"origin_utc": (NOW+timedelta(seconds=10)).timestamp(),
+        "uncertainty_seconds": .000001, "crossing_reset": False, "stream_count": 1}}
+    selected = _receiver_session_for_unit(value,unit,parsed,verified)
+    assert selected.receiver_intervals == (good, omitted_warmup)
     assert any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
+    partial = ReceiverInterval("1",3,60,57,900,False,False,source,4)
+    partial_result = _receiver_session_for_unit(value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(partial,)),verified)
+    assert partial_result.receiver_intervals == (partial,)
+    assert not any(item.code == "native.iperf3.interval_outside_window" for item in partial_result.findings)
+    shifted_timing = timing.model_copy(update={
+        "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=20)),
+        "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=80))})
+    shifted_value = value.model_copy(update={"timings":[value.timings[0],shifted_timing,*value.timings[2:]]})
+    shifted_result = _receiver_session_for_unit(shifted_value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(good,)),verified)
+    assert any(item.code == "native.iperf3.interval_outside_window" for item in shifted_result.findings)
     wrong_start = {**details[0]["start"],"connected":[{**details[0]["start"]["connected"][0],
         "local_host":"10.0.0.9"}]}
     mismatch = _receiver_session_for_unit(value,unit,NativeParse(**{**parsed.__dict__,
@@ -988,6 +1073,34 @@ def test_commands_require_private_targets_and_persistent_private_bound_listeners
     bad = commands[1].model_copy(update={"request":{"argv":["iperf3", "-s", "-B", "8.8.8.8", "-p", "5201"]}})
     findings = _command_findings(value.model_copy(update={"commands":[commands[0], bad]}))
     assert {item.code for item in findings} >= {"command.listener_bind", "command.streaming"}
+
+
+
+def test_f02r_iperf_listener_accepts_exact_sudo_systemd_run_and_rejects_mutations(repository_root):
+    from cloud_network_benchmark.validation import _f02r_iperf_listener
+
+    value = make_input(repository_root)
+    action = "f02r-vm_b-listener-iperf3"
+    argv = ["sudo", "systemd-run", "--unit=cnb-listener-iperf3",
+        "--property=Restart=no", "--property=Environment=CNB_ACQUISITION_ID=" + action,
+        "/var/lib/cnb/install/bin/iperf3", "-s", "-B", "10.0.0.2", "-p", "5201",
+        "--json-stream", "--forceflush"]
+    command = CommandEvidence(schema_version=2,
+        request={"argv": argv, "action_id": action, "acquisition_invocation_id": action},
+        result={"outcome": "succeeded", "action_id": action}, producer="vm_b",
+        deployment_id=value.identity.deployment_id, unit_id=value.measurement_units[0].unit_id,
+        binary_version={"value": "3.17.1"}, source_identity={"value": "fixture"},
+        monotonic_started={"value": 0}, monotonic_finished={"value": 1})
+    assert _f02r_iperf_listener(command, argv)
+    wrong_env = list(argv)
+    wrong_env[4] = "--property=Environment=CNB_ACQUISITION_ID=wrong"
+    wrong_bind = list(argv)
+    wrong_bind[8] = "8.8.8.8"
+    wrong_action = command.model_copy(deep=True)
+    wrong_action.request["action_id"] = "other-action"
+    assert not _f02r_iperf_listener(command, wrong_env)
+    assert not _f02r_iperf_listener(wrong_action, argv)
+    assert not _f02r_iperf_listener(command, wrong_bind)
 
 
 def test_sequence_requires_actual_sockperf_runtime_and_ten_second_pause(repository_root):

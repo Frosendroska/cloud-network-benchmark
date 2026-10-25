@@ -10,6 +10,7 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
     from tests.f12_support import materialize_f08_pair
     from cloud_network_benchmark.analysis import _iperf_receiver_origin
     from cloud_network_benchmark.validation import _parse_unit, _validate_artifacts
+    from cloud_network_benchmark.validation import _acquisition_windows
 
     for mode, expected_width in (("short_study", 1), ("acceptance", 1),
             ("calibration", 1), ("diagnostic_day", 60)):
@@ -18,23 +19,29 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
         value, expected, selection = materialize_f08_pair(repository_root, case, frozen_clock,
             deterministic_token, fake_git_commits, request, mode=mode)
         _findings, records, _provenance = _validate_artifacts(value)
-        parsed_sessions = [(_parse_unit(value, unit, records)[1], unit) for unit in value.measurement_units]
+        origins_by_unit = {}
+        for timing_record in value.timings:
+            origins = {}
+            _windows, errors = _acquisition_windows(value, timing_record,
+                verified_iperf_origins=origins)
+            assert not errors, errors
+            origins_by_unit[timing_record.unit_id] = origins
+        parsed_sessions = [(_parse_unit(value, unit, records,
+            origins_by_unit.get(unit.unit_id, {}))[1], unit) for unit in value.measurement_units]
         tcp, tcp_unit = next((parsed, unit) for parsed, unit in parsed_sessions if parsed and parsed.session_details)
-        origin = _iperf_receiver_origin(tcp, post_omit_origin=tcp_unit.kind == "continuous_day")
+        verified_origins = origins_by_unit[tcp_unit.unit_id]
+        origin = _iperf_receiver_origin(tcp, verified_origins=verified_origins)
         assert origin is not None
-        native_start = tcp.session_details[0]["start"]["timestamp"]
-        if isinstance(native_start, dict):
-            native_start = native_start.get("timesecs", native_start.get("time"))
-        omit = tcp.session_details[0]["start"].get("test_start", {}).get("omit", 0)
-        expected_origin = native_start + (omit if tcp_unit.kind == "continuous_day" else 0)
-        assert origin[0] == expected_origin
+        cookie = tcp.session_details[0]["start"]["cookie"]
+        assert origin == (verified_origins[cookie]["origin_utc"],
+            verified_origins[cookie]["uncertainty_seconds"])
         timing = next(item for item in value.timings if item.unit_id == tcp_unit.unit_id)
         measured_start = timing.measured_started_at.value.timestamp()
         measured_end = timing.measured_finished_at.value.timestamp()
         measured_intervals = [item for item in tcp.receiver_intervals if not item.omitted]
         assert measured_intervals
-        assert measured_start - .002 <= origin[0] + min(item.start_seconds for item in measured_intervals)
-        assert origin[0] + max(item.end_seconds for item in measured_intervals) <= measured_end + .002
+        assert measured_start - origin[1] <= origin[0] + min(item.start_seconds for item in measured_intervals)
+        assert origin[0] + max(item.end_seconds for item in measured_intervals) <= measured_end + origin[1]
         if mode == "diagnostic_day":
             import weakref
             import cloud_network_benchmark.analysis as analysis_module
@@ -42,12 +49,14 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
             prior_chunk = None
             released_before_next_parse = []
             original_parse = analysis_module._parse_unit
-            def track_native_lifetimes(current_value, current_unit, current_records):
+            def track_native_lifetimes(current_value, current_unit, current_records,
+                    verified_iperf_origins=None):
                 nonlocal prior_refs, prior_chunk
                 if current_unit.kind == "probe_chunk" and prior_chunk is not None:
                     released_before_next_parse.append((prior_chunk,
                         sum(reference() is not None for reference in prior_refs)))
-                parsed_sock, parsed_tcp = original_parse(current_value, current_unit, current_records)
+                parsed_sock, parsed_tcp = original_parse(current_value, current_unit, current_records,
+                    verified_iperf_origins)
                 if current_unit.kind == "probe_chunk":
                     prior_chunk = current_unit.unit_id
                     prior_refs = [weakref.ref(sample) for sample in parsed_sock.samples] if parsed_sock else []

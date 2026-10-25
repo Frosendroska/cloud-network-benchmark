@@ -555,11 +555,36 @@ def recompute_parent_manifest(
     detail: str,
     fault: FaultInjector = no_fault,
 ) -> CampaignManifest:
+    return _recompute_parent_manifest(parent_manifest_path, occurred_at, detail, fault)
+
+
+def recompute_parent_manifest_for_child_update(
+    parent_manifest_path: Path,
+    occurred_at: datetime,
+    detail: str,
+    child_manifest_path: Path,
+    fault: FaultInjector = no_fault,
+) -> CampaignManifest:
+    """Project one real child event while preserving the parent high-water mark."""
+    child = ChildRunManifest.model_validate_json(child_manifest_path.read_text(encoding="utf-8"))
+    if child.updated_at != occurred_at:
+        raise ValueError("parent peer projection must match the updated child event time")
+    return _recompute_parent_manifest(parent_manifest_path, occurred_at, detail, fault,
+        child_observation=(child.run_id, child.provider))
+
+
+def _recompute_parent_manifest(
+    parent_manifest_path: Path,
+    occurred_at: datetime,
+    detail: str,
+    fault: FaultInjector = no_fault,
+    child_observation: tuple[str, Provider] | None = None,
+) -> CampaignManifest:
     try:
         parent = CampaignManifest.model_validate_json(parent_manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise PersistenceError("parent manifest is unavailable or invalid") from exc
-    if occurred_at < parent.updated_at:
+    if occurred_at < parent.updated_at and child_observation is None:
         raise ValueError("occurred_at cannot be earlier than the manifest updated_at")
     references = {Provider(reference.provider): reference for reference in parent.child_runs}
     selected = {Provider(provider) for provider in parent.selected_providers}
@@ -614,19 +639,30 @@ def recompute_parent_manifest(
         if not matches_result:
             raise PersistenceError("referenced child result path does not match its run_id", {"run_id": reference.run_id})
         children.append((child.execution_state, child.cleanup_state))
+    if child_observation is not None:
+        run_id, provider = child_observation
+        reference = references.get(Provider(provider))
+        if reference is None or reference.run_id != run_id:
+            raise PersistenceError("parent peer projection does not match a selected child")
     aggregate = aggregate_campaign(children)
+    updated_at = max(parent.updated_at, occurred_at)
+    event_detail = detail
+    if child_observation is not None and occurred_at < parent.updated_at:
+        event_detail = (f"{detail}; earlier peer event {occurred_at.isoformat()} "
+            f"reconciled at aggregate high-water time {updated_at.isoformat()}")
     event = LifecycleEvent(
         state_domain="campaign",
         state=aggregate.value,
-        occurred_at=occurred_at,
-        detail=detail,
+        occurred_at=updated_at,
+        detail=event_detail,
     )
+    events = [*parent.lifecycle_events, event]
     updated = _validated_copy(
         parent,
         {
             "aggregate_state": aggregate,
-            "updated_at": occurred_at,
-            "lifecycle_events": [*parent.lifecycle_events, event],
+            "updated_at": updated_at,
+            "lifecycle_events": events,
         },
     )
     atomic_write_json(parent_manifest_path, _manifest_payload(updated), fault)
@@ -660,6 +696,114 @@ def update_child_evidence(
     return updated
 
 
+def update_child_runtime_evidence(
+    manifest_path: Path,
+    occurred_at: datetime,
+    *,
+    reservation: Optional[ReservationEvidence] = None,
+    expiry: Optional[ExpiryEvidence] = None,
+    commands: Optional[List[CommandEvidence]] = None,
+    timings: Optional[List[MeasurementTiming]] = None,
+    artifact_records: Optional[List[ArtifactRecord]] = None,
+    retrieval_failure: Optional[FailureEvidence] = None,
+    validation_status: Optional[ValidationStatus] = None,
+    parent_manifest_path: Optional[Path] = None,
+    fault: FaultInjector = no_fault,
+) -> ChildRunManifest:
+    """Atomically append/update existing lifecycle evidence without widening its schema.
+
+    The function validates the complete resulting ChildRunManifest before writing.
+    Retrieval failure is first-cause evidence and is never replaced by a later error.
+    """
+    supplied = (reservation, expiry, commands, timings, artifact_records,
+                retrieval_failure, validation_status)
+    if all(value is None for value in supplied):
+        raise ValueError("at least one runtime evidence field must be supplied")
+    manifest = ChildRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None or occurred_at < manifest.updated_at:
+        raise ValueError("occurred_at must be timezone-aware and not earlier than manifest updated_at")
+    updates: Dict[str, Any] = {"updated_at": occurred_at}
+    if reservation is not None:
+        reservation = type(manifest.reservation.value).model_validate(reservation) if manifest.reservation.value else ReservationEvidence.model_validate(reservation)
+        if reservation.campaign_id != manifest.campaign_id:
+            raise ValueError("reservation must match child campaign identity")
+        updates["reservation"] = Evidence[ReservationEvidence](value=reservation)
+    if expiry is not None:
+        expiry = ExpiryEvidence.model_validate(expiry)
+        if (expiry.run_id, expiry.deployment_id, expiry.provider) != (manifest.run_id, manifest.deployment_id, manifest.provider):
+            raise ValueError("expiry must match child run, deployment and provider")
+        updates["expiry"] = Evidence[ExpiryEvidence](value=expiry)
+    for name, supplied_value in (("commands", commands), ("timings", timings), ("artifact_records", artifact_records)):
+        if supplied_value is None:
+            continue
+        model = {"commands": CommandEvidence, "timings": MeasurementTiming,
+                 "artifact_records": ArtifactRecord}[name]
+        observed = [model.model_validate(item) for item in supplied_value]
+        prior = getattr(manifest, name)
+        if name == "commands":
+            key = lambda item: (item.request.get("action_id"), item.deployment_id, item.unit_id)
+        elif name == "timings":
+            key = lambda item: item.unit_id
+        else:
+            key = lambda item: (item.artifact_id, item.path, item.unit_id)
+        combined = list(prior)
+        existing = {key(item): index for index, item in enumerate(prior)}
+        for item in observed:
+            item_key = key(item)
+            if item_key in existing:
+                index = existing[item_key]
+                previous = combined[index]
+                if item == previous:
+                    continue
+                if name == "timings":
+                    prior_payload = previous.model_dump(mode="python")
+                    item_payload = item.model_dump(mode="python")
+                    refinable = {"measured_started_at", "measured_finished_at",
+                                 "clock_mappings", "acquisition_sources"}
+                    prior_core = {field: value for field, value in prior_payload.items() if field not in refinable}
+                    item_core = {field: value for field, value in item_payload.items() if field not in refinable}
+                    old_sources = previous.acquisition_sources.value or []
+                    new_sources = item.acquisition_sources.value or []
+                    old_bounds_missing = (previous.measured_started_at.value is None
+                        and previous.measured_finished_at.value is None)
+                    new_bounds_complete = (item.measured_started_at.value is not None
+                        and item.measured_finished_at.value is not None)
+                    new_bounds_missing = (item.measured_started_at.value is None
+                        and item.measured_finished_at.value is None)
+                    if (prior_core == item_core and not old_sources and new_sources
+                            and old_bounds_missing and (new_bounds_complete or new_bounds_missing)):
+                        combined[index] = item
+                        continue
+                elif name == "artifact_records":
+                    prior_payload = previous.model_dump(mode="python")
+                    item_payload = item.model_dump(mode="python")
+                    mutable = {"size_bytes", "sha256"}
+                    prior_core = {field: value for field, value in prior_payload.items() if field not in mutable}
+                    item_core = {field: value for field, value in item_payload.items() if field not in mutable}
+                    if (previous.kind == "measurement_timing" and prior_core == item_core
+                            and previous.retrieval_state == item.retrieval_state == "verified"):
+                        combined[index] = item
+                        continue
+                raise ValueError(f"{name} update cannot overwrite existing evidence")
+            existing[item_key] = len(combined)
+            combined.append(item)
+        updates[name] = combined
+    if retrieval_failure is not None and manifest.retrieval_failure is None:
+        failure = FailureEvidence.model_validate(retrieval_failure)
+        if not manifest.created_at <= failure.occurred_at <= occurred_at:
+            raise ValueError("retrieval failure time must be within the manifest timeline")
+        updates["retrieval_failure"] = failure
+    if validation_status is not None:
+        updates["validation_status"] = ValidationStatus.model_validate(validation_status)
+    updated = _validated_copy(manifest, updates)
+    atomic_write_json(manifest_path, _manifest_payload(updated), fault)
+    parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
+    if parent_path.exists():
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            "child runtime evidence updated", manifest_path, fault)
+    return updated
+
+
 def update_child_execution(
     manifest_path: Path,
     target: ExecutionState,
@@ -688,7 +832,8 @@ def update_child_execution(
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
-        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} execution -> {target.value}", fault)
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            f"child {manifest.run_id} execution -> {target.value}", manifest_path, fault)
     return updated
 
 
@@ -718,7 +863,8 @@ def update_child_cleanup(
     atomic_write_json(manifest_path, _manifest_payload(updated), fault)
     parent_path = parent_manifest_path or _parent_manifest_path(manifest_path, manifest.campaign_id)
     if parent_path.exists():
-        recompute_parent_manifest(parent_path, occurred_at, f"child {manifest.run_id} cleanup -> {target.value}", fault)
+        recompute_parent_manifest_for_child_update(parent_path, occurred_at,
+            f"child {manifest.run_id} cleanup -> {target.value}", manifest_path, fault)
     return updated
 
 

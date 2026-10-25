@@ -357,8 +357,8 @@ def read_static_metadata(context, *, root=Path("/"), run_command=_command, remai
         timeout = min(0.2, remaining())
         result = run_command(argv, timeout) if remaining() > 0 else {"returncode": None, "stdout": "", "stderr": "deadline reached"}
         binary_name = shutil_which(tool)
-        version = (result.get("stdout") or result.get("stderr", "")).strip().splitlines()
-        data = {"version": _e(version[0][:240]) if result.get("returncode") == 0 and version else unavailable("version unavailable"),
+        version = (result.get("stdout") or result.get("stderr", "")).strip()
+        data = {"version": _e(version) if result.get("returncode") == 0 and version else unavailable("version unavailable"),
                 "binary_sha256": unavailable("binary unavailable")}
         if binary_name:
             try:
@@ -373,12 +373,17 @@ def read_static_metadata(context, *, root=Path("/"), run_command=_command, remai
                         "matches_bootstrap_binary": _e(None, "bootstrap binary hash unavailable"),
                         "matches_bootstrap_version": _e(None, "bootstrap binary version unavailable")}
         if isinstance(supplied, dict) and data["binary_sha256"]["value"]:
-            expected = supplied.get("binary_sha256", {}).get("value") if isinstance(supplied.get("binary_sha256"), dict) else None
+            expected_raw = supplied.get("binary_sha256")
+            expected = (expected_raw.get("value") if isinstance(expected_raw, dict)
+                else expected_raw if isinstance(expected_raw, str) else None)
             builds[tool]["matches_bootstrap_binary"] = _e(data["binary_sha256"]["value"] == expected) if expected else _e(None, "bootstrap binary hash unavailable")
         if isinstance(supplied, dict):
             expected_version = supplied.get("binary_version")
             actual_version = data["version"].get("value")
-            builds[tool]["matches_bootstrap_version"] = _e(actual_version == expected_version) if actual_version and expected_version else _e(None, "bootstrap binary version unavailable")
+            builds[tool]["matches_bootstrap_version"] = (
+                _e(actual_version.strip() == expected_version.strip())
+                if actual_version and isinstance(expected_version, str)
+                else _e(None, "bootstrap binary version unavailable"))
     seed["tool_versions"] = _e(versions)
     seed["source_builds"] = _e(builds)
     return seed

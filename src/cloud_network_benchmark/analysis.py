@@ -345,26 +345,32 @@ def _histogram_data(values: list[float]) -> dict[str, Any]:
     return {"edges_us": edges, "counts": counts}
 
 
-def _iperf_receiver_origin(tcp: Any, *, post_omit_origin: bool) -> tuple[float, float] | None:
-    """Return the session interval UTC origin using F08's unit-specific reset rule."""
+def _iperf_receiver_origin(tcp: Any, *, verified_origins: dict[str, dict[str, Any]]) -> tuple[float, float] | None:
+    """Return only the same-cookie, source-replayed post-omit UTC origin."""
     if tcp is None or len(tcp.session_details) != 1:
         return None
     detail = tcp.session_details[0]
     start = detail.get("start") if isinstance(detail, dict) else None
     if not isinstance(start, dict):
         return None
-    test = start.get("test_start", start)
-    stamp = start.get("timestamp")
-    if isinstance(stamp, dict):
-        stamp = stamp.get("timesecs", stamp.get("time"))
+    cookie = start.get("cookie")
+    if not isinstance(cookie, str) or not cookie.strip():
+        return None
+    observed = verified_origins.get(cookie)
+    if not isinstance(observed, dict) or observed.get("crossing_reset") is not False:
+        return None
+    origin = observed.get("origin_utc")
+    uncertainty = observed.get("uncertainty_seconds")
+    stream_count = observed.get("stream_count")
     try:
-        origin = float(stamp)
-        omit = float(test.get("omit", 0)) if isinstance(test, dict) else 0.0
+        origin = float(origin)
+        uncertainty = float(uncertainty)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(origin) or not math.isfinite(omit) or omit < 0:
+    if (not math.isfinite(origin) or not math.isfinite(uncertainty) or uncertainty < 0
+            or isinstance(stream_count, bool) or not isinstance(stream_count, int) or stream_count < 1):
         return None
-    return origin + (omit if post_omit_origin else 0.0), omit
+    return origin, uncertainty
 
 
 def _receiver_interval_bin(start: float, end: float, origin: float,
@@ -594,9 +600,13 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                utc_window: dict[str, str] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     artifact_findings, records, _provenance = _validate_artifacts(value)
     acquisition = {}
+    origins_by_unit: dict[str, dict[str, dict[str, Any]]] = {}
     for timing in value.timings:
-        windows, errors = _acquisition_windows(value, timing)
+        unit_origins: dict[str, dict[str, Any]] = {}
+        windows, errors = _acquisition_windows(value, timing,
+            verified_iperf_origins=unit_origins)
         acquisition[timing.unit_id] = (windows, errors)
+        origins_by_unit[timing.unit_id] = unit_origins if not errors else {}
     run_rows: list[dict[str, Any]] = []
     bins: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
@@ -646,7 +656,8 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             safe_before = future_start if future_start is not None else day_end
             day_chunk_watermarks[chunk.unit_id] = safe_before - origin_timestamp
     for unit in units_to_parse:
-        sock, tcp = _parse_unit(value, unit, records)
+        verified_origins = origins_by_unit.get(unit.unit_id, {})
+        sock, tcp = _parse_unit(value, unit, records, verified_origins)
         samples = _measured_samples(value, unit, sock, acquisition)
         timing = next((item for item in value.timings if item.unit_id == unit.unit_id), None)
         mapping = next((item for item in timing.clock_mappings if str(getattr(item.vm_role, "value", item.vm_role)) == "vm_a"
@@ -666,17 +677,25 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         windows = acquisition.get(unit_id, ([], []))[0]
         receiver_windows = _union_intervals((left, right) for tool, left, right in windows if tool == "iperf3")
         receiver_window_starts = [left for left, _right in receiver_windows]
-        receiver_origin = _iperf_receiver_origin(tcp, post_omit_origin=unit.kind == "continuous_day")
-        receiver_error = _timing_clock_error(timing, "iperf3") if timing else None
+        receiver_origin = _iperf_receiver_origin(tcp, verified_origins=verified_origins)
+        receiver_uncertainty = receiver_origin[1] if receiver_origin is not None else None
         receiver_intervals = tuple(tcp.receiver_intervals) if tcp else ()
         selected_receiver = [] if utc_window is not None else list(receiver_intervals)
         mapped_receiver: list[tuple[float, float, Any]] = []
-        receiver_reason = "native receiver session timestamp or bounded acquisition clock mapping is unavailable"
-        if receiver_origin is not None and receiver_error is not None and receiver_windows:
-            session_origin, _omit = receiver_origin
-            uncertainty = receiver_error
+        receiver_reason = "verified same-cookie post-omit receiver origin is unavailable"
+        if tcp is not None:
+            detail = tcp.session_details[0] if len(tcp.session_details) == 1 else {}
+            start_data = detail.get("start", {}) if isinstance(detail, dict) else {}
+            cookie = start_data.get("cookie") if isinstance(start_data, dict) else None
+            observed_origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
+            if isinstance(observed_origin, dict) and observed_origin.get("crossing_reset") is True:
+                receiver_reason = "verified receiver interval crosses its post-omit reset; mapped intervals are unavailable"
+        if receiver_origin is not None and receiver_windows:
+            session_origin, uncertainty = receiver_origin
             selected_receiver = []
             for interval in receiver_intervals:
+                if interval.omitted or interval.sender:
+                    continue
                 absolute_start = session_origin + interval.start_seconds
                 absolute_end = session_origin + interval.end_seconds
                 supported = _containing_window(receiver_windows, receiver_window_starts,
@@ -692,7 +711,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=receiver_reason),
                 "measured_seconds": Evidence[float](unavailable_reason=receiver_reason),
                 "throughput_gbps": Evidence[float](unavailable_reason=receiver_reason)}
-        elif utc_window is not None and (receiver_error is None or not receiver_windows):
+        elif utc_window is not None and (receiver_uncertainty is None or not receiver_windows):
             tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=receiver_reason),
                 "measured_seconds": Evidence[float](unavailable_reason=receiver_reason),
                 "throughput_gbps": Evidence[float](unavailable_reason=receiver_reason)}
@@ -749,10 +768,10 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         receiver_bin_reasons: dict[int, set[str]] = {}
         receiver_bin_exclusions: dict[int, list[dict[str, Any]]] = {}
         receiver_bin_straddles: set[int] = set()
-        if receiver_origin is not None and receiver_error is not None and receiver_windows and axis_origin is not None:
+        if receiver_origin is not None and receiver_uncertainty is not None and receiver_windows and axis_origin is not None:
             for interval_start, interval_end, interval in mapped_receiver:
                 index, touched = _receiver_interval_bin(interval_start, interval_end, axis_origin,
-                    width, receiver_error)
+                    width, receiver_uncertainty)
                 exclusion = {"artifact_id": interval.source.artifact_id, "path": interval.source.path,
                     "sha256": interval.source.sha256, "start_seconds": interval.start_seconds,
                     "end_seconds": interval.end_seconds, "bytes": interval.bytes,

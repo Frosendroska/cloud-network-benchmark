@@ -183,6 +183,47 @@ def test_retry_materializes_only_verified_bytes_and_preserves_attempts(tmp_path)
     assert not outcome.attempts[0].staging_path==outcome.attempts[1].staging_path
 
 
+@pytest.mark.parametrize("value", [0, 3, True, 1.0, "1"])
+def test_attempt_bound_is_strict_and_rejected_before_side_effects(tmp_path, value):
+    c=connection(tmp_path)
+    called=[]
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_retrieval(c, manifest(c), lambda request: called.append(request), tmp_path,
+                      deadline=deadline(), clock=lambda:100, max_attempts=value)
+    assert called == []
+
+
+def test_one_attempt_bound_never_hides_second_transfer(tmp_path):
+    c=connection(tmp_path); payload=b"native"
+    class Loss:
+        def __init__(self): self.scp=[]
+        def run(self, request):
+            if request.action_type == "ssh":
+                return result(request.action_id, f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            self.scp.append(request)
+            Path(request.argv[-1]).write_bytes(b"partial")
+            return result(request.action_id, success=False, stderr="synthetic loss")
+    runner=Loss()
+    outcome=run_retrieval(c, manifest(c,payload), runner, tmp_path, deadline=deadline(),
+                          clock=lambda:100, max_attempts=1)
+    assert len(runner.scp) == len(outcome.attempts) == 1
+    assert outcome.attempts[0].attempt == 1 and not outcome.complete
+
+
+def test_attempt_offset_produces_unique_campaign_attempt_identity(tmp_path):
+    c=connection(tmp_path); payload=b"native"
+    class Runner:
+        def run(self, request):
+            if request.action_type == "ssh":
+                return result(request.action_id, f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+            Path(request.argv[-1]).write_bytes(payload)
+            return result(request.action_id)
+    outcome=run_retrieval(c, manifest(c,payload), Runner(), tmp_path, deadline=deadline(),
+                          clock=lambda:100, max_attempts=1, attempt_offset=1)
+    assert outcome.complete and [attempt.attempt for attempt in outcome.attempts] == [2]
+    assert outcome.actions[-1].action_id.endswith("-2")
+
+
 def test_optional_remote_absence_is_explicit_without_fabricated_closed_record(tmp_path):
     c=connection(tmp_path); m=manifest(c)
     declaration=m.declarations[0].model_copy(update={"expectation":"optional"})

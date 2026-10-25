@@ -210,11 +210,11 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         idle_phase=unit.phase=="idle_latency"
         day_unit=unit.kind=="continuous_day"
         chunk_unit=unit.kind=="probe_chunk"
-        measured_offset = 5 if idle_phase else (7 if day_unit else 0 if chunk_unit else 10)
+        measured_offset = 5 if idle_phase else (7 if day_unit else 0 if chunk_unit else 7)
         measured_start = probe_start + timedelta(seconds=measured_offset)
         duration=unit.measured_seconds
         measured_finish = measured_start + timedelta(seconds=duration)
-        tcp_start = Evidence[datetime](unavailable_reason="idle phase has no TCP client") if idle_phase or chunk_unit else Evidence[datetime](value=probe_start+timedelta(seconds=2 if day_unit else 7))
+        tcp_start = Evidence[datetime](unavailable_reason="idle phase has no TCP client") if idle_phase or chunk_unit else Evidence[datetime](value=probe_start+timedelta(seconds=2))
         mapping_a = ClockMapping(vm_role="vm_a", monotonic_seconds=0, utc_timestamp=NOW,
             estimated_error_ms={"value":0}, synchronization_source={"value":"synthetic clock fixture"})
         mapping_b = ClockMapping(vm_role="vm_b", monotonic_seconds=0, utc_timestamp=NOW,
@@ -322,7 +322,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             iperf_build=next((b for b in builds if b.tool=="iperf3"),None)
             cookie=f"f08-{unit.unit_id}-session"
             action=f"iperf3-{unit.unit_id}"
-            commands.append(command(unit.unit_id,"vm_a",client_argv,start_offset+7))
+            commands.append(command(unit.unit_id,"vm_a",client_argv,start_offset+2))
             if iperf_build:
                 commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
                     "action_id":action,"argv":[iperf_build.binary_path,*client_argv[1:]]},
@@ -344,7 +344,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 "client acquisition stderr captured separately from receiver observations\n")
             if iperf_build:
                 boot="12345678-1234-1234-1234-123456789def"
-                left=int((start_offset+10)*1_000_000_000)
+                left=int((start_offset+7)*1_000_000_000)
                 right=left+duration*1_000_000_000
                 rows=[{"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"clock_anchor","cookie":cookie,"mono_before_ns":left,"realtime_ns":int(NOW.timestamp()*1_000_000_000)+left,"mono_after_ns":left+1000},
                     {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"session_settings","cookie":cookie,"protocol":"TCP","num_streams":n,"omit":5,"duration":duration,"interval_us":1000000,"block_size":131072,"reverse":False}]
@@ -398,10 +398,14 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             "binary_version":Evidence[str](value=sockperf_server_build.binary_version),
             "source_identity":Evidence[str](value=sockperf_server_build.source_reference)})
         iperf_build=next(b for b in builds if b.tool=="iperf3" and b.role==VmRole.VM_B)
+        listener_unit=f"cnb-{deployment_id}-iperf3"
         commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
             "action_id":"f02r-vm_b-listener-iperf3","acquisition_invocation_id":"f02r-vm_b-listener-iperf3",
-            "launcher_argv":["systemd-run","--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,"-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"],
-            "argv":["systemd-run","--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,"-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"]},
+            "argv":["sudo","systemd-run","--unit",listener_unit,"--property=Restart=no","--property=UMask=0022",
+                "--property=StandardOutput=append:/var/lib/cnb/work/server-logs/iperf3-server.jsonl",
+                "--property=StandardError=append:/var/lib/cnb/work/server-logs/iperf3-server.err",
+                "--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,
+                "-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"]},
             "result":{**commands[-1].result,"action_id":"f02r-vm_b-listener-iperf3"},
             "binary_version":Evidence[str](value=iperf_build.binary_version),
             "source_identity":Evidence[str](value=iperf_build.source_reference)})
@@ -424,10 +428,16 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         else (100 if unit.phase=="single_flow" else 500)) for unit in loaded_units}
     for unit in loaded_units:
         offset=offset_by_unit[unit.unit_id]
-        stamp=(NOW+timedelta(seconds=offset+(2 if value.mode=="diagnostic_day" else 7))).timestamp()
+        # The JSONL start event is the listener's observed session start, which
+        # follows the F03 client's recorded launch by the measured two-second
+        # choreography. The independent post-omit origin remains at +7s in the
+        # CNB acquisition rows above; it is not the session-start timestamp.
+        stamp=(NOW+timedelta(seconds=offset+2)).timestamp()
         received_bytes=10800000000000 if value.mode=="diagnostic_day" else 125000000
         receiver_seconds=86400 if value.mode=="diagnostic_day" else unit.measured_seconds
-        interval_start=0 if value.mode=="diagnostic_day" else 3
+        # Receiver interval offsets are relative to the independently captured
+        # post-omit stats origin, so the first measured interval begins at 0.
+        interval_start=0
         day_cookie=f"f08-{unit.unit_id}-session"
         day_settings={"protocol":"TCP","num_streams":1,"omit":5,"duration":86400,
             "interval":1,"blksize":131072,"reverse":False}
