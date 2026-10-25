@@ -92,14 +92,18 @@ def prerequisites(evidence: Path, terraform: Path, pwsh: Path, mirror: Path):
         version = locks[provider][1]
         require(f'provider "registry.terraform.io/hashicorp/{provider}"' in lock_text,
                 f"expected {provider} provider lock missing in {rel}")
-        require(f'version = "{version}"' in lock_text, f"unexpected {provider} lock in {rel}")
+        require(re.search(rf'\bversion\s*=\s*"{re.escape(version)}"', lock_text) is not None,
+                f"unexpected {provider} lock in {rel}")
         cached = path / ".terraform/providers"
         platform_rel = Path("registry.terraform.io/hashicorp") / provider / version / "darwin_arm64"
         require(cached.is_dir() and has_provider_binary(cached / platform_rel), f"initialized local providers missing: {rel}")
         require(has_provider_binary(mirror / platform_rel), f"locked darwin_arm64 package missing from mirror: {provider} {version}")
     for rel, testfile in MOCKS.items():
         content = (ROOT / "terraform" / rel / testfile).read_text()
-        require("mock_provider" in content and re.search(r"command\s*=\s*plan", content), f"mock-plan contract missing in {rel}")
+        run_count = len(re.findall(r'(?m)^\s*run\s+"', content))
+        plan_count = len(re.findall(r"\bcommand\s*=\s*plan\b", content))
+        require("mock_provider" in content and run_count > 0 and plan_count == run_count,
+                f"every existing Terraform test must be an explicit mock plan in {rel}")
         require(not re.search(r"command\s*=\s*(apply|destroy)", content), f"non-plan Terraform test in {rel}")
     return state
 

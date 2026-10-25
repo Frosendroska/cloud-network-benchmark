@@ -4,7 +4,7 @@
 
 This gate is the credential-free, local proof at one clean committed revision. It does not prove Linux guest process behavior, provider permissions, cloud networking, expiry, deletion or billing. It performs no install, Terraform init, registry access, live plan/apply/destroy, cloud CLI, SSH/SCP or benchmark traffic. Prepared tools and locked local providers are prerequisites, never installed by the gate.
 
-The assigned clone is `/private/tmp/cnb-f10`, branch `codex/f10-v2-offline-gate`, based on merged F09/F12 `eb0be0b40d2b38607212cad3761f454295122f9b`. The coordinator prepared Python `/private/tmp/cnb-offline-venv-20261025/bin/python`, Terraform `/private/tmp/cnb-tools/terraform1.16.6`, PowerShell `/private/tmp/cnb-tools/powershell-7.5.11/pwsh7.5.11`, and the local mirror `/private/tmp/cnb-f10-provider-mirror`. Six Terraform roots were initialized beforehand with backend disabled and lockfiles read only. Preparation is not F10 validation evidence. The gate checks these prerequisites and uses only a filesystem provider mirror.
+The assigned clone is `/private/tmp/cnb-f10`, branch `codex/f10-v2-offline-gate`, based on merged F09/F12 `eb0be0b40d2b38607212cad3761f454295122f9b`. The coordinator prepared Python `/private/tmp/cnb-offline-venv-20261025/bin/python`, Terraform `/private/tmp/cnb-tools/terraform`, PowerShell `/private/tmp/cnb-tools/powershell-7.5.11/pwsh`, and the local mirror `/private/tmp/cnb-f10-provider-mirror`. Six Terraform roots were initialized beforehand with backend disabled and lockfiles read only. Preparation is not F10 validation evidence. The gate checks these prerequisites and uses only a filesystem provider mirror.
 
 The script verifies clean HEAD/tree before and after execution, refuses reused or source-overlapping evidence paths, removes inherited cloud/SSH credential variables from subprocesses, and records only allowlisted versions and command evidence. Outputs live in a new local evidence directory outside the source checkout. JUnit must contain every named identity and all four factory mode IDs. Only the two exact unavailable-`/proc` tests on Darwin may be recorded as not run; any other required skip or missing case fails the gate.
 
@@ -28,9 +28,9 @@ The executable interface is:
 THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis \
 MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config \
 /private/tmp/cnb-offline-venv-20261025/bin/python scripts/validate_offline.py \
-  --evidence-dir /private/tmp/cnb-f10-final-evidence \
-  --terraform /private/tmp/cnb-tools/terraform1.16.6 \
-  --pwsh /private/tmp/cnb-tools/powershell-7.5.11/pwsh7.5.11 \
+  --evidence-dir /private/tmp/cnb-f10-final-evidence-4 \
+  --terraform /private/tmp/cnb-tools/terraform \
+  --pwsh /private/tmp/cnb-tools/powershell-7.5.11/pwsh \
   --provider-mirror /private/tmp/cnb-f10-provider-mirror
 ```
 
