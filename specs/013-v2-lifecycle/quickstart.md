@@ -16,7 +16,7 @@ export PYTHONPATH=src
 export PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH
 ```
 
-Coordinator integrates latest main before implementation; use `/private/tmp/cnb-offline-venv/bin/python` (prepared Python3.11.13). No dependency download is required for F09. Terraform/provider/SSH/SCP/native commands are fake in these tests. Runtime staging fakes are not actual guest installation proof.
+Coordinator integrates latest main before implementation; use `/private/tmp/cnb-offline-venv-20261025/bin/python` (Python 3.12.14). Terraform/provider/SSH/SCP/native commands are fake in these tests. Runtime staging fakes are not actual guest installation proof.
 
 ## Focused gates after implementation
 
@@ -56,3 +56,23 @@ PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src THESIS_ROOT='
 Result: **1,436 passed**, one warning, exit 0, 344.99 seconds. The sole warning is a `DeprecationWarning` in `tests/unit/test_f09_guest.py::test_staged_runtime_import_execution_does_not_mutate_immutable_package_digest`: `archive.extractall(runtime_root)` will use a changed extraction-filter default in Python 3.14. It did not fail the test. Full output is retained at `/private/tmp/cnb-f09-full-pytest-709fe24.log`.
 
 The focused F12 analysis/replay checks passed: 43 passed, exit 0. The shared-contract schema check and root/lifecycle CLI help commands also exited 0. These checks were run offline; no cloud, credentials, paid experiment, or F10 readiness claim is implied.
+
+## Latest F09 convergence checks — 2026-10-25
+
+Checked code head: `f72bd492d321d2b13054da17d56fb2cd6f3acc06`.
+
+T040 now binds controller cancellation in all three default provider workflows to an event observed by the active F03 polling owner. The exact default-factory regression `[controller-interrupt-during-native-f03]` passed for AWS, Azure and GCP: cancellation arrives while their actual F03 status polls are blocked, then scoped stop, diagnostic/listener closure, retrieval and provider cleanup run. Controller interruption remains primary; cleanup reconciles in F11, billing remains nonfinal, and no funding is released. Guest SIGTERM is converted to a catchable interruption and the prior signal handler is restored. Two process identity consequence tests requiring Linux `/proc` were skipped on macOS and are not claimed as passed.
+
+T041 normal cleanup writes source-bound absence receipts and reconciles the original F11 reservation before clearing private recovery flags. Recovery replays a durable receipt after injected F11 persistence interruption without provider commands. Unknown absence keeps cleanup open; unknown billing retains funding. Azure cleanup-only reconstruction retains observed absent resource IDs for reconciliation.
+
+Focused command:
+
+```sh
+PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH /private/tmp/cnb-offline-venv-20261025/bin/python -m pytest -q tests/unit/test_f09_guest.py tests/integration/test_f09_aws_runtime_factory.py tests/integration/test_f09_lifecycle_recovery.py tests/integration/test_f09_multi_provider_factory.py
+```
+
+Result: 37 passed, 2 skipped because the local macOS host has no Linux `/proc` process identity interface, one Python tarfile deprecation warning, exit 0, 101.61 seconds. The exact controller parameter passed separately: 1 passed, exit 0, 1.27 seconds.
+
+The full repository command was `PYTHONPATH=src THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH /private/tmp/cnb-offline-venv-20261025/bin/python -m pytest -q`. It passed on the code head above: 1,439 passed, 2 skipped (the same Linux `/proc` cases), one Python tarfile deprecation warning, exit 0, 345.16 seconds. The warning is `DeprecationWarning` for `archive.extractall(runtime_root)` at `tests/unit/test_f09_guest.py:558`, whose extraction-filter default changes in Python 3.14. The test command output was returned directly; a separate raw full-suite log was not retained.
+
+The schema `--check`, root CLI help, lifecycle help, lifecycle module help, preview help and `git diff --check` each exited 0. The full suite uses offline fakes and synthetic source-bound fixtures. Native Linux behavior, provider API behavior, cloud cleanup/expiry and paid acceptance remain unproved; no cloud, credentials, paid experiment or F10 readiness claim is implied.

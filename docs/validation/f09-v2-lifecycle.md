@@ -1,6 +1,27 @@
 # F09 V2 lifecycle implementation evidence
 
-This record covers F09 code commit `9a66147277f188a1473d58f2346bbff4b20f99bb` after normal integration of verified F12 `origin/main` at `5028ab97c3a906e51a42ad11dade746251847e71` (merge commit `57fec394ecd57f58f03e5c4b1989120022a07df5`). Validation ran in the credential-free implementation worktree only. The root CLI lifecycle command delegates to the isolated parser, while F12 `analyze` and existing config commands remain available. Paid lifecycle execution and provider-specific recovery adapters remain blocked pending complete paid prerequisites and a separately authorized stage. No provider APIs, credentials, Terraform plans, SSH, or native benchmark traffic were used; guest staging was exercised only through fake SCP/SSH runners.
+## Current offline implementation gate (2026-10-25)
+
+The latest checked code head is `f72bd492d321d2b13054da17d56fb2cd6f3acc06`. It includes actual default AWS/Azure/GCP factory composition, source-bound cleanup receipt reconciliation, and bounded guest cancellation after controller interruption. All validation was credential-free and used fake external commands, synthetic source-bound inputs, and fake time. No cloud, credentials, Terraform apply, real SSH/SCP, or native benchmark traffic ran. The two Linux `/proc` process identity integration checks were skipped on this macOS host; native Linux guest behavior and cloud acceptance remain unproved.
+
+| Check | Result |
+| --- | --- |
+| Focused T040/T041 suites: guest, AWS factory, recovery, and multi-provider factory | Passed, 37; skipped 2 Linux `/proc` cases; one tarfile deprecation warning (101.61s) |
+| Default three-provider controller interruption parameter `[controller-interrupt-during-native-f03]` | Passed, 1 (1.27s); all three actual provider hooks received cancellation while native F03 polls were blocked, then stopped listeners/diagnostics and finalized cleanup |
+| Full repository `pytest -q` on the code head above | Passed, 1,439; skipped 2 Linux `/proc` cases; one tarfile deprecation warning (345.16s) |
+| Shared-contract schema `--check` | Passed, exit 0; no schema changes |
+| Root CLI help, lifecycle help, lifecycle module help and preview help | Passed, all four exit 0 |
+| `git diff --check` | Passed, exit 0 |
+
+The sole warning is `DeprecationWarning` at `tests/unit/test_f09_guest.py:558`: Python 3.14 will change `tarfile.extractall` filtering defaults. It did not fail validation. The full-suite output was returned by the test command; no separate full raw log file was retained. The full suite and focused tests used `/private/tmp/cnb-offline-venv-20261025/bin/python` (Python 3.12.14), `PYTHONPATH=src`, `THESIS_ROOT=/Users/katya/Desktop/University/Masters/Thesis`, `MPLBACKEND=Agg`, `MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config`, and `PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH`, from `/private/tmp/cnb-f09` with `login=false`.
+
+The controller interruption regression blocks all selected providers in their real production F03 status-poll stages until the actual default-hook cancellation callbacks run. Each provider then issues its scoped stop, closes two diagnostic processes and its listener, retrieves available closed evidence, and completes cleanup. The controller interruption remains the primary lifecycle failure; the F11 reservation remains nonfinal and releases no funds. Guest tests also verify the SIGTERM-to-`KeyboardInterrupt` bridge restores the previous signal handler, while process identity consequences that require Linux `/proc` are explicitly not claimed from the skipped cases.
+
+Normal provider cleanup persists an absence receipt, reconciles the original F11 reservation, then clears recovery flags. If F11 persistence fails after the receipt, explicit cleanup replays the receipt without provider commands and completes reconciliation. Unknown absence keeps cleanup liability open; unknown billing keeps funding retained. These results establish offline implementation behavior only.
+
+The following checkpoint narratives are historical and superseded where their completion statements conflict with this current gate. They are retained to preserve the progression of implementation evidence.
+
+Historical checkpoint: F09 code commit `9a66147277f188a1473d58f2346bbff4b20f99bb` after normal integration of verified F12 `origin/main` at `5028ab97c3a906e51a42ad11dade746251847e71` (merge commit `57fec394ecd57f58f03e5c4b1989120022a07df5`).
 
 ## Commands run
 
