@@ -128,20 +128,32 @@ def junit_coverage(path: Path, coverage_file: Path, platform_name: str):
         skip = case.find("skipped")
         if skip is not None:
             skipped.append((identity, (skip.get("message", "") + " " + (skip.text or "")).strip()))
-    expected = set(re.findall(r"`(tests/[^`]+::[^`]+)`", coverage_file.read_text()))
+    inventory = coverage_file.read_text()
+    expected = set(re.findall(r"`(tests/[^`]+::[^`]+)`", inventory))
     factory = "tests/integration/test_f09_multi_provider_factory.py::test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier"
-    expected.update(f"{factory}[all-provider-{mode}]" for mode in
-                    ("acceptance", "calibration", "short-study", "diagnostic-day"))
+    # Resolve abbreviated test names and parameter cases using their table row context.
+    for line in inventory.splitlines():
+        full = re.findall(r"`(tests/[^`]+::[^`]+)`", line)
+        module = full[0].split("::", 1)[0] if full else None
+        if module:
+            shorthand = re.sub(r"`tests/[^`]+::[^`]+`", "", line)
+            for name in re.findall(r"\b(test_[A-Za-z0-9_]+)\b", shorthand):
+                expected.add(f"{module}::{name}")
+        for case in re.findall(r"Same function\s+\[([^\]]+)\]", line):
+            expected.add(f"{factory}[{case}]")
     expected.update(f"{factory}[{case}]" for case in
-                    ("controller-interrupt-during-native-f03", "controller-interrupt-unverified-stop"))
+                    ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study",
+                     "all-provider-diagnostic-day", "controller-interrupt-during-native-f03",
+                     "controller-interrupt-unverified-stop", "protection-failure"))
+    # Bare function requirements are satisfied by a plain case or any collected variants;
+    # explicit parameter IDs above must match exactly.
     missing = sorted(req for req in expected if req not in identities and not
                      ("[" not in req and any(x.startswith(req + "[") for x in identities)))
-    # Parameterized mode entries require their exact ids; the table's full bracket suffix is retained above.
     gaps, unexpected = [], []
     for identity, reason in skipped:
-        test_id = identity.removeprefix("tests/")
-        short = identity.split("::")[-1].split("[")[0]
-        allowed = platform_name == "Darwin" and identity in {f"tests/unit/test_f09_guest.py::{x.split('::')[-1]}" for x in PROC_CASES} and "proc" in reason.lower()
+        proc_reason = "the local test host has no Linux /proc process identity interface"
+        allowed = (platform_name == "Darwin" and identity in PROC_CASES
+                   and reason == proc_reason)
         if allowed:
             gaps.append({"identity": identity, "state": "not_run", "reason": reason})
         else:
@@ -189,8 +201,6 @@ def main(argv=None):
     try:
         started_state = prerequisites(evidence, args.terraform, args.pwsh, args.provider_mirror)
     except Exception as exc:
-        # A safe new evidence location can still retain a concise incomplete result
-        # for missing tools or a dirty checkout. Never create output on collision.
         if (evidence.is_absolute() and not evidence.exists() and not evidence.is_symlink()
                 and evidence.parent.is_dir() and not evidence.parent.is_symlink()):
             resolved = evidence.parent.resolve() / evidence.name
@@ -205,46 +215,46 @@ def main(argv=None):
                     failure["end_state_error"] = str(state_exc)
                 (evidence / "summary.json").write_text(json.dumps(failure, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         return 1
-    thesis_root = Path(os.environ.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis")).resolve(strict=True)
-    thesis_revision = subprocess.run(["git", "-C", str(thesis_root), "rev-parse", "HEAD"],
-        text=True, capture_output=True, check=True).stdout.strip()
     evidence.mkdir(parents=True)
-    tf_config = evidence / "terraform.rc"
-    tf_config.write_text('disable_checkpoint = true\nprovider_installation {\n  filesystem_mirror {\n    path = "' + str(args.provider_mirror.resolve()) + '"\n    include = ["registry.terraform.io/hashicorp/*"]\n  }\n}\n', encoding="utf-8")
-    env = os.environ.copy()
-    for key in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
-        env.pop(key, None)
-    for key in list(env):
-        upper = key.upper()
-        if (upper.startswith(("AWS_", "AZURE_", "ARM_", "GOOGLE_", "GCP_", "CLOUDSDK_", "TF_VAR_"))
-                or upper in {"SSH_AUTH_SOCK", "SSH_AGENT_PID", "GH_TOKEN", "GITHUB_TOKEN"}):
-            env.pop(key, None)
-    env.update({"PYTHONPATH": "src", "THESIS_ROOT": env.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis"),
-        "MPLBACKEND": "Agg", "MPLCONFIGDIR": str(evidence / "matplotlib"), "PATH": str(args.pwsh.parent) + os.pathsep + env.get("PATH", ""),
-        "TF_CLI_CONFIG_FILE": str(tf_config), "CHECKPOINT_DISABLE": "1", "TF_IN_AUTOMATION": "1"})
-    Path(env["MPLCONFIGDIR"]).mkdir()
-    terraform_version = json.loads(subprocess.run([str(args.terraform), "version", "-json"],
-        capture_output=True, text=True, check=True).stdout).get("terraform_version")
     summary = {"format_version": 1, "revision": started_state["head"], "tree": started_state["tree"],
         "clean_at_start": True, "started_at_unix": time.time(), "status": "failed", "checks": [],
-        "environment": {"host_os": platform.system(), "host_architecture": platform.machine(),
+        "native_linux_verified": False, "cloud_verified": False}
+    pytest_xml = evidence / "pytest.xml"
+    checks = [
+        ("full-pytest", [sys.executable, "-m", "pytest", "-q", f"--junitxml={pytest_xml}"]),
+        ("schema-check", [sys.executable, "-m", "cloud_network_benchmark.contracts.schema", "--output", "specs/003-v2-shared-contracts/contracts", "--check"]),
+        ("diff-check", ["git", "diff", "--check"]),
+    ]
+    for rel in ROOTS:
+        checks += [(f"fmt-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "fmt", "-check", "-recursive"]),
+                   (f"validate-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "validate", "-no-color"])]
+        if rel in MOCKS:
+            checks.append((f"mock-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "test", "-no-color"]))
+    try:
+        thesis_root = Path(os.environ.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis")).resolve(strict=True)
+        thesis_revision = subprocess.run(["git", "-C", str(thesis_root), "rev-parse", "HEAD"],
+            text=True, capture_output=True, check=True).stdout.strip()
+        tf_config = evidence / "terraform.rc"
+        tf_config.write_text('disable_checkpoint = true\nprovider_installation {\n  filesystem_mirror {\n    path = "' + str(args.provider_mirror.resolve()) + '"\n    include = ["registry.terraform.io/hashicorp/*"]\n  }\n}\n', encoding="utf-8")
+        env = os.environ.copy()
+        for key in ("PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+            env.pop(key, None)
+        for key in list(env):
+            upper = key.upper()
+            if (upper.startswith(("AWS_", "AZURE_", "ARM_", "GOOGLE_", "GCP_", "CLOUDSDK_", "TF_VAR_"))
+                    or upper in {"SSH_AUTH_SOCK", "SSH_AGENT_PID", "GH_TOKEN", "GITHUB_TOKEN"}):
+                env.pop(key, None)
+        env.update({"PYTHONPATH": "src", "THESIS_ROOT": env.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis"),
+            "MPLBACKEND": "Agg", "MPLCONFIGDIR": str(evidence / "matplotlib"), "PATH": str(args.pwsh.parent) + os.pathsep + env.get("PATH", ""),
+            "TF_CLI_CONFIG_FILE": str(tf_config), "CHECKPOINT_DISABLE": "1", "TF_IN_AUTOMATION": "1"})
+        Path(env["MPLCONFIGDIR"]).mkdir()
+        terraform_version = json.loads(subprocess.run([str(args.terraform), "version", "-json"],
+            capture_output=True, text=True, check=True).stdout).get("terraform_version")
+        summary["environment"] = {"host_os": platform.system(), "host_architecture": platform.machine(),
             "python": platform.python_version(), "terraform": terraform_version,
             "pwsh": subprocess.run([str(args.pwsh), "--version"], capture_output=True, text=True, check=True).stdout.strip(),
             "packages": {p: importlib.metadata.version(p) for p in ("pytest", "pydantic", "PyYAML", "matplotlib", "numpy")},
-            "terraform_cli_config_sha256": sha(tf_config),
-            "thesis_revision": thesis_revision}, "native_linux_verified": False, "cloud_verified": False}
-    try:
-        pytest_xml = evidence / "pytest.xml"
-        checks = [
-            ("full-pytest", [sys.executable, "-m", "pytest", "-q", f"--junitxml={pytest_xml}"]),
-            ("schema-check", [sys.executable, "-m", "cloud_network_benchmark.contracts.schema", "--output", "specs/003-v2-shared-contracts/contracts", "--check"]),
-            ("diff-check", ["git", "diff", "--check"]),
-        ]
-        for rel in ROOTS:
-            checks += [(f"fmt-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "fmt", "-check", "-recursive"]),
-                       (f"validate-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "validate", "-no-color"])]
-            if rel in MOCKS:
-                checks.append((f"mock-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "test", "-no-color"]))
+            "terraform_cli_config_sha256": sha(tf_config), "thesis_revision": thesis_revision}
         for index, (name, command) in enumerate(checks):
             code = run_check(summary, evidence, name, command, env, timeout=2400 if name == "full-pytest" else 300)
             if code:
@@ -262,14 +272,23 @@ def main(argv=None):
         passed = len(summary["checks"]) == len(checks) and all(x["status"] == "passed" for x in summary["checks"]) and bool(summary.get("coverage")) and unchanged
         summary["status"] = "passed" if passed else "failed"
         return 0 if passed else 1
-    except Exception as exc:
-        summary["error"] = f"{type(exc).__name__}: {exc}"
+    except BaseException as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc or 'interrupted'}"
+        if isinstance(exc, KeyboardInterrupt):
+            summary["interrupted"] = True
+        recorded = {row["name"] for row in summary["checks"]}
+        for name, command in checks:
+            if name not in recorded:
+                summary["checks"].append({"name": name, "argv": list(map(str, command)),
+                    "status": "not_run", "exit_code": None, "duration_seconds": None,
+                    "log": None, "log_sha256": None})
         try:
             summary["end_state"] = source_state()
         except Exception as state_exc:
             summary["end_state_error"] = str(state_exc)
+        summary["source_unchanged"] = same_source_state(started_state, summary["end_state"]) if "end_state" in summary else False
         summary["status"] = "failed"
-        return 1
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
     finally:
         summary["finished_at_unix"] = time.time()
         (evidence / "summary.json").write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
