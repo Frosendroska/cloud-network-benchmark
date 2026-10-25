@@ -69,6 +69,21 @@ def test_remote_inventory_manifest_uses_observed_remote_hashes_and_controller_si
     assert "missing" in manifest.unavailable_items
 
 
+def test_remote_inventory_rejects_missing_required_artifacts():
+    import pytest
+
+    ended = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="required closed remote artifacts are unavailable"):
+        build_remote_closed_inventory(identity={"provider":"aws"},
+            deployment_id="run-aws-deployment", remote_workspace="/var/lib/cnb/work",
+            declarations=[ArtifactInput(artifact_id="required", path="required.json",
+                kind="vm_metadata", producer="vm_a", expectation="required")],
+            remote_files={"vm_a":[], "vm_b":[]},
+            source_vm_ids={"vm_a":"10.1.0.1", "vm_b":"10.1.0.2"},
+            measurement_ended_at=ended,
+            closure={"vm_a":ended+timedelta(seconds=1), "vm_b":ended+timedelta(seconds=2)})
+
+
 def test_retry_selects_only_failed_concrete_ids_and_drops_siblings():
     ended = datetime(2026, 10, 23, tzinfo=timezone.utc)
     declarations = [ArtifactInput(artifact_id="a", path="a.csv", kind="sockperf-csv", producer="vm_a", expectation="required"),
