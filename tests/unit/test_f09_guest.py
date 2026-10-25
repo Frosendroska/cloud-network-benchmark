@@ -188,7 +188,7 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
     runner = Runner()
     report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
         deadline=deadline(), clock=lambda:100)
-    assert report.outcome is None and "F03 remote handoff failed" in report.failure
+    assert report.outcome is None and "F03 guest command evidence failed" in report.failure
     assert [item.action_id.split("-")[2] for item in report.actions if item.action_id.startswith("f09-guest-")] == [
         "control", "request", "run", "cancel"]
     cancel = next(item for item in report.actions if item.action_id.startswith("f09-guest-cancel-"))

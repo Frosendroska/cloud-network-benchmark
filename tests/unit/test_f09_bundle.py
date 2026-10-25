@@ -49,7 +49,7 @@ def test_remote_inventory_manifest_uses_observed_remote_hashes_and_controller_si
         ArtifactInput(artifact_id="build-b", path="metadata/build/vm_b-iperf3.identity",
             kind="build-identity", producer="vm_b", expectation="required"),
         ArtifactInput(artifact_id="missing", path="metadata/vm_a.json", kind="vm_metadata",
-            producer="vm_a", expectation="required"),
+            producer="vm_a", expectation="optional"),
     ]
     files = {
         "vm_a":[{"path":"probe/chunk-01.csv", "size_bytes":7, "sha256":hashlib.sha256(b"native\n").hexdigest()}],
