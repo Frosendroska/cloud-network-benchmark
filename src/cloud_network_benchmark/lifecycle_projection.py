@@ -136,11 +136,12 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
         (getattr(remote, "receiver_command_evidence", ()) or ()))
     timings = [MeasurementTiming.model_validate(item) for item in
         (getattr(guest, "timings", ()) or ())]
-    if _value(child.mode) == "diagnostic_day":
-        parent_units = {unit.unit_id for unit in child.measurement_units}
-        commands = [item for item in commands if item.unit_id in parent_units]
-        timings = [item for item in timings if item.unit_id in parent_units]
-    for unit in child.measurement_units:
+    # DAY chunk identities are recovered from the actual guest command list.
+    # Materialize their controller-owned command/timing records for strict
+    # ValidatorInput replay; `_sync_manifest` separately keeps the child
+    # manifest's parent-only projection.
+    units = _day_units(child, guest)
+    for unit in units:
         unit_commands = [item for item in commands if item.unit_id == unit.unit_id]
         unit_timings = [item for item in timings if item.unit_id == unit.unit_id]
         groups = {
@@ -235,7 +236,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
     from .lifecycle_bundle import lifecycle_declarations
     builds = _builds_from(result)
     declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
-        measurement_units=child.measurement_units,
+        measurement_units=_day_units(child, guest),
         schedule_supplied=child.schedule_entry.value is not None,
         build_observations=builds)
     for role in ("vm_a", "vm_b"):
@@ -338,7 +339,11 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     allowed_units = {unit.unit_id for unit in units}
     commands = [item for item in commands if item.unit_id in allowed_units]
     timings = [item for item in timings if item.unit_id in allowed_units]
-    records = list(child.artifact_records) + _records_from(result)
+    # The child manifest intentionally omits concrete DAY probe chunks. Their
+    # controller-owned command/timing sidecars still belong in the complete
+    # ValidatorInput and are rematerialized from the captured guest outcome.
+    records = (list(child.artifact_records) + _records_from(result)
+        + _materialize_controller_evidence(root, child, result, declarations))
     record_map = {}
     for record in records:
         key = (record.artifact_id, record.path, record.unit_id)
@@ -472,10 +477,15 @@ def finalize_production_batch(*, parent_path: Path, children: Mapping[str, Any],
             projected_records[(record.artifact_id, record.path, record.unit_id)] = updated_record
         bound = ValidatorInput.model_validate({**bound.model_dump(mode="python"),
             "artifact_records": [item.model_dump(mode="python") for item in projected_records.values()]})
-        child = update_child_runtime_evidence(child_path, fixed_at, timings=bound.timings,
-            artifact_records=changed_timing_records or None, parent_manifest_path=parent_path)
-        if child.timings != bound.timings:
-            raise ValueError("child manifest timings differ from strict retrieved-source projection")
+        manifest_unit_ids = {unit.unit_id for unit in child.measurement_units}
+        manifest_timings = [timing for timing in bound.timings
+            if timing.unit_id in manifest_unit_ids]
+        manifest_timing_records = [record for record in changed_timing_records
+            if record.unit_id is None or record.unit_id in manifest_unit_ids]
+        child = update_child_runtime_evidence(child_path, fixed_at, timings=manifest_timings,
+            artifact_records=manifest_timing_records or None, parent_manifest_path=parent_path)
+        if child.timings != manifest_timings:
+            raise ValueError("child manifest timings differ from strict manifest-unit source projection")
         inputs[provider], roots[provider], paths[provider] = bound, root, child_path
     preliminary = {provider: validate_bundle(value, evaluated_at=fixed_at)
         for provider, value in inputs.items()}

@@ -25,6 +25,26 @@ ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 
 
+def _source_bound_test_common_n(tmp_path, request, frozen_clock, deterministic_token, fake_git_commits):
+    """Select N from saved F08 source bundles for an explicitly synthetic F09 fixture."""
+    from cloud_network_benchmark.calibration import select_common_n
+    from tests.integration.test_native_validation_replay import _materialize_complete_bundle
+
+    results = []
+    for provider in ("aws", "azure", "gcp"):
+        bundle, result = _materialize_complete_bundle(ROOT, tmp_path / "f08-source" / provider,
+            frozen_clock, deterministic_token, fake_git_commits, request,
+            config_name="exp-001-calibration.yaml", provider=provider)
+        assert all(record.sha256.value == hashlib.sha256(
+            (Path(bundle.child_result_root) / record.path).read_bytes()).hexdigest()
+            for record in bundle.artifact_records)
+        results.append(result)
+    recommendation = select_common_n(results)
+    assert recommendation.common_n.value == 2 and recommendation.plateau_found.value is True
+    assert recommendation.source_campaign_id.value and recommendation.source_sha256.value
+    return recommendation.common_n_state_fields()
+
+
 class Clock:
     def __init__(self):
         self._owner = threading.get_ident()
@@ -346,32 +366,45 @@ def _costs(path: Path, campaign, children):
     (False, "configs/tests/exp-903-three-provider-smoke.yaml"),
     (True, "configs/tests/exp-903-three-provider-smoke.yaml"),
     (True, "configs/experiments/exp-001-calibration.yaml"),
-], ids=["protection-failure", "all-provider-acceptance", "all-provider-calibration"])
+    (True, "configs/experiments/exp-001-multi-provider.yaml"),
+    (True, "configs/experiments/exp-001-diagnostic-day.yaml"),
+], ids=["protection-failure", "all-provider-acceptance", "all-provider-calibration",
+    "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
-        tmp_path, monkeypatch, request, successful_protection, config_name):
+        tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
+        successful_protection, config_name):
     config = ROOT / config_name
     schedule_entry = None
-    if "calibration" in config_name:
+    is_calibration = "calibration" in config_name
+    is_short_study = "multi-provider" in config_name
+    is_diagnostic_day = "diagnostic-day" in config_name
+    if is_calibration or is_short_study or is_diagnostic_day:
         import yaml
         from cloud_network_benchmark.contracts.admission import ScheduleEntry
         source_config = config
         config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
         base_campaign, _ = resolve_campaign(source_config, ROOT)
+        if is_short_study or is_diagnostic_day:
+            config_data["benchmark"]["common_n"] = _source_bound_test_common_n(
+                tmp_path, request, frozen_clock, deterministic_token, fake_git_commits)
         scenario_source = json.loads((ROOT / "tests/fixtures/f11/scenarios.json").read_text(encoding="utf-8"))
-        window = scenario_source["synthetic_windows"]["night"]
+        window_label = "evening" if is_short_study else "night"
+        window = scenario_source["synthetic_windows"][window_label]
         scheduled_start = NOW.replace(hour=int(window[:2]), minute=int(window[3:5]), second=int(window[6:8]), microsecond=0)
         config_data["scheduled_start"] = scheduled_start.isoformat().replace("+00:00", "Z")
         config = ROOT / "configs/tests" / f"f09-{tmp_path.name}-synthetic-calibration.yaml"
         request.addfinalizer(lambda: config.unlink(missing_ok=True))
         config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
         header = "entry_id,config_id,experiment_id,scheduled_start,window_label,priority"
-        row = f"F09-SYNTHETIC-CAL,{base_campaign.config_id},{base_campaign.experiment_id},{scheduled_start.isoformat()},night,{base_campaign.admission.priority}"
+        mode_suffix = "CAL" if is_calibration else "SHORT" if is_short_study else "DAY"
+        entry_id = f"F09-SYNTHETIC-{mode_suffix}"
+        row = f"{entry_id},{base_campaign.config_id},{base_campaign.experiment_id},{scheduled_start.isoformat()},{window_label},{base_campaign.admission.priority}"
         schedule_bytes = (header + "\n" + row + "\n").encode("utf-8")
         schedule_path = tmp_path / "synthetic-calibration-schedule.csv"
         schedule_path.write_bytes(schedule_bytes)
-        schedule_entry = ScheduleEntry(schema_version=2, entry_id="F09-SYNTHETIC-CAL",
+        schedule_entry = ScheduleEntry(schema_version=2, entry_id=entry_id,
             config_id=base_campaign.config_id, experiment_id=base_campaign.experiment_id,
-            scheduled_start=scheduled_start, window_label="night", source_path=str(schedule_path),
+            scheduled_start=scheduled_start, window_label=window_label, source_path=str(schedule_path),
             source_sha256=hashlib.sha256(schedule_bytes).hexdigest(),
             row_sha256=hashlib.sha256(row.encode()).hexdigest(), original_header=header,
             original_row=row, columns=header.split(","), priority=base_campaign.admission.priority)
@@ -391,12 +424,19 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         source = tmp_path / f"{name}.txt"; source.write_text(f"synthetic {name}\n")
         gates[name] = {"evidence_id": f"synthetic-{name}", "source_path": str(source),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
-    if getattr(campaign.mode, "value", campaign.mode) == "calibration":
-        source = tmp_path / "synthetic-calibration-authorization.txt"
-        source.write_text("offline synthetic calibration authorization fixture\n")
-        evidence = {"evidence_id": "synthetic-calibration-authorization",
+    if is_calibration or is_short_study or is_diagnostic_day:
+        source = tmp_path / "synthetic-mode-authorization.txt"
+        source.write_text("offline synthetic mode authorization fixture; test-only evidence\n")
+        evidence = {"evidence_id": "synthetic-mode-authorization",
             "source_path": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
-        gates["calibration_authorized"] = evidence
+        if is_calibration:
+            gates["calibration_authorized"] = evidence
+        if is_short_study or is_diagnostic_day:
+            gates["common_n"] = {**evidence, **config_data["benchmark"]["common_n"]}
+            gates["study_window"] = evidence
+        if is_diagnostic_day:
+            gates["diagnostic_day_authorized"] = evidence
+            gates["size_export_review"] = evidence
         gates["paid_acceptance"] = {**evidence, "status": "completed",
             "config_id": campaign.config_id, "mode": "acceptance",
             "providers": list(campaign.selected_providers)}
@@ -427,7 +467,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
         "allowance": WorkflowAllowance(5, 5, 300, 60,
-            960 if getattr(campaign.mode, "value", campaign.mode) == "calibration" else 80, 5, 10, 10,
+            960 if is_calibration else 230 if is_short_study else 86412 if is_diagnostic_day else 80, 5, 10, 10,
             "synthetic-test-policy", {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
@@ -487,7 +527,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     responder.full_native = True
                     responder.clock = clock
                     responder.late_tail = True
-                    responder.protocol_elapsed = 12 * 60 if getattr(campaign.mode, "value", campaign.mode) == "calibration" else 60
+                    mode_value = getattr(campaign.mode, "value", campaign.mode)
+                    responder.protocol_elapsed = (12 * 60 if mode_value == "calibration" else
+                        86_407 if mode_value == "diagnostic_day" else 60)
                     responder.workspace_roots = {role: root / name / role for role in ("vm_a", "vm_b")}
                     responder.native_root = responder.workspace_roots["vm_a"]
                 self.requests = []
@@ -587,8 +629,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         clock=clock, private_root=tmp_path / "private", repository_root=ROOT)
     if getattr(campaign.mode, "value", campaign.mode) == "calibration":
         from cloud_network_benchmark.admission import BudgetLedger, _validate_paid_acceptance_evidence
-        for gate in ("calibration_authorized", "paid_acceptance"):
-            BudgetLedger._validate_gate_evidence(built["plan"].prerequisites[gate])
+        for gate in ("calibration_authorized", "common_n", "study_window", "diagnostic_day_authorized", "size_export_review", "paid_acceptance"):
+            if gate in built["plan"].prerequisites:
+                BudgetLedger._validate_gate_evidence(built["plan"].prerequisites[gate])
         _validate_paid_acceptance_evidence(built["plan"].prerequisites["paid_acceptance"], campaign)
     if successful_protection:
         runtime["sleep"] = clock.sleep
@@ -654,7 +697,20 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert provider_result.values["prepare"].succeeded is True, (provider_name, provider_result.values["prepare"], prepare_errors)
             for stage in ("stabilize", "measure", "close", "retrieve"):
                 outcome = provider_result.values.get(stage)
-                assert outcome is not None and outcome.succeeded is True, (provider_name, stage, list(provider_result.values), provider_result.primary_failure, provider_result.secondary_failures, outcome)
+                if stage == "retrieve" and outcome is not None and not outcome.succeeded:
+                    retrieval = outcome.evidence
+                    details = {
+                        "complete": getattr(retrieval, "complete", None),
+                        "failure": getattr(retrieval, "failure", None),
+                        "failures": getattr(retrieval, "failures", [])[:8],
+                        "failure_count": len(getattr(retrieval, "failures", [])),
+                        "attempt_count": len(getattr(retrieval, "attempts", [])),
+                        "action_count": len(getattr(retrieval, "actions", [])),
+                    }
+                    assert outcome.succeeded is True, (provider_name, stage, details,
+                        provider_result.primary_failure, provider_result.secondary_failures)
+                assert outcome is not None and outcome.succeeded is True, (provider_name, stage,
+                    provider_result.primary_failure, provider_result.secondary_failures)
         assert all(observed[p][1].run_id == children[p].run_id for p in children)
         from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
         from cloud_network_benchmark.contracts.validation import ValidatorInput
@@ -663,10 +719,11 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         finalized = finalize_production_batch(parent_path=parent_path, children=children,
             parent=parent, lifecycle=result, repository_root=ROOT, evaluated_at=evaluated_at)
         assert set(finalized) == {"aws", "azure", "gcp"}
+        projected_parent = json.loads(parent_path.read_text(encoding="utf-8"))
         saved_inputs, roots = {}, {}
         for provider in children:
-            ref = next(row for row in parent.child_runs if str(row.provider) == provider)
-            roots[provider] = (ROOT / ref.result_path).resolve()
+            ref = next(row for row in projected_parent["child_runs"] if row["provider"] == provider)
+            roots[provider] = Path(ref["result_path"]).resolve()
             saved_inputs[provider] = ValidatorInput.model_validate_json(
                 (roots[provider] / "validation" / "input.json").read_text(encoding="utf-8"))
         preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
@@ -675,11 +732,34 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         for provider, saved in saved_inputs.items():
             replay = replays[saved.identity.run_id]
             assert replay.model_dump(mode="json") == finalized[provider][0].model_dump(mode="json")
-            assert replay.validation_status.data_validity == "valid", [
+            expected_validity = "partial" if is_diagnostic_day else "valid"
+            assert replay.validation_status.data_validity == expected_validity, [
                 (finding.code, finding.severity, finding.message) for finding in replay.findings]
+            if is_diagnostic_day:
+                metrics = replay.metrics.value
+                day = next(unit for unit in metrics["units"] if unit["kind"] == "continuous_day")
+                chunks = [unit for unit in metrics["units"] if unit["kind"] == "probe_chunk"]
+                assert day["tcp"]["measured_seconds"]["value"] == 86_400
+                assert day["coverage"]["complete"] is True
+                assert day["coverage"]["active_probe_ratio"]["value"] >= .99
+                assert len(chunks) + 1 == len(saved.measurement_units)
+                assert sum(unit["coverage"]["complete"] is True for unit in chunks) == len(chunks) - 1
+                assert chunks[-1]["coverage"]["complete"] is False
+                last_chunk_id = chunks[-1]["unit_id"]
+                last_chunk_command = next(command for command in saved.commands
+                    if command.unit_id == last_chunk_id and command.producer == "vm_a")
+                assert last_chunk_command.result["outcome"] == "interrupted"
+            if is_calibration:
+                assert replay.validation_status.comparison_eligibility == "ineligible"
             assert not [finding for finding in replay.findings if finding.severity == "error"
                 and finding.code != "comparison.ineligible"], replay.findings
             assert (roots[provider] / "checksums.sha256").is_file()
+        if is_calibration:
+            from cloud_network_benchmark.calibration import select_common_n
+            recommendation = select_common_n(list(preliminary.values()))
+            assert recommendation.unavailable_reason is None, recommendation.unavailable_reason
+            assert recommendation.common_n.value in {2, 4, 8}
+            assert recommendation.source_sha256.value and recommendation.plateau_found.value in {True, False}
         return
     assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure, built["plan"].child_identities.keys(), built["plan"].namespaces.keys(), built["plan"].allowance.provider_leads_seconds.keys(), campaign.selected_providers)
     assert set(result.provider_results) == {"aws", "azure", "gcp"}
