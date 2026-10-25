@@ -38,6 +38,7 @@ class RemoteGuestExecution:
     actions: tuple[Any, ...]
     failure: str | None = None
     receiver_command_evidence: tuple[Any, ...] = ()
+    outcome_source_bytes: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +272,39 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     cancellation_status = "not_needed"
     stage = "request staging"
     vm = connection.vm_a
+
+    def retrieve_outcome(*, preserve_cleanup: bool):
+        """Retrieve the closed guest outcome under the original F03 deadline."""
+        remaining = deadline.remaining(clock, cleanup=preserve_cleanup)
+        if remaining <= 0:
+            return None, None, "outcome transfer has no remaining original-cap allowance"
+        download = _request(f"f09-guest-outcome-{invocation}", vm,
+            [f"{vm.user}@{vm.host}:{outcome_path}", str(local_outcome)],
+            min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
+        download_result = _execute(runner, download)
+        actions.append(_action(download.action_id, download.action_type, vm, download, download_result))
+        if download_result.outcome != CommandOutcome.SUCCEEDED or not local_outcome.is_file():
+            return None, None, "closed guest outcome transfer was unavailable"
+        source_bytes = local_outcome.read_bytes()
+        try:
+            outcome = GuestOutcome.model_validate_json(source_bytes)
+        except Exception as exc:
+            return None, source_bytes, f"closed guest outcome is malformed ({type(exc).__name__})"
+        if (outcome.identity != request.identity or outcome.source_revision != runtime.source_revision
+                or outcome.package_sha256 != runtime.package_sha256):
+            return None, source_bytes, "closed guest outcome identity, revision, or package digest changed"
+        return outcome, source_bytes, None
+
+    def interrupted_execution(message: str, *, retrieve: bool, preserve_cleanup: bool):
+        outcome = source_bytes = None
+        unavailable = "partial guest outcome unavailable: verified closure was not established"
+        if retrieve:
+            outcome, source_bytes, retrieve_error = retrieve_outcome(preserve_cleanup=preserve_cleanup)
+            unavailable = (f"partial guest outcome unavailable: {retrieve_error}"
+                if retrieve_error else "partial guest outcome retained")
+        return RemoteGuestExecution(outcome, tuple(actions), f"{message}; {unavailable}",
+            outcome_source_bytes=source_bytes)
+
     try:
         import tempfile
         with tempfile.TemporaryDirectory(prefix="cnb-f09-guest-") as temp_dir:
@@ -358,7 +392,8 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 if remaining <= 0:
                     cancellation_status = _stop_remote_f03(connection, process_record, invocation,
                         process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
-                    raise TimeoutError(f"F03 active cap expired; {cancellation_status}")
+                    return interrupted_execution(f"F03 active cap expired; {cancellation_status}",
+                        retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                 poll = _request(f"f09-guest-status-{invocation}", vm,
                     ["sh", "-c", "if test -s " + shlex.quote(str(status_path))
                      + "; then printf 'exited '; cat " + shlex.quote(str(status_path))
@@ -379,27 +414,28 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                     if cancel_event is not None and cancel_event.is_set():
                         cancellation_status = _stop_remote_f03(connection, process_record, invocation,
                             process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
-                        raise InterruptedError(f"controller cancellation; {cancellation_status}")
+                        return interrupted_execution(f"controller cancellation; {cancellation_status}",
+                            retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                     sleep(min(0.25, remaining))
                 else:
                     raise RuntimeError("VM-A F03 process disappeared without an authenticated terminal status")
             if status != 0:
-                raise RuntimeError(f"VM-A F03 lifecycle guest exited with status {status}")
-            remaining = deadline.remaining(clock)
-            if remaining <= 0:
-                raise TimeoutError("F03 outcome retrieval is outside the active cap")
-            download = _request(f"f09-guest-outcome-{invocation}", vm,
-                [f"{vm.user}@{vm.host}:{outcome_path}", str(local_outcome)],
-                min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
-            download_result = _execute(runner, download)
-            actions.append(_action(download.action_id, download.action_type, vm, download, download_result))
-            if download_result.outcome != CommandOutcome.SUCCEEDED or not local_outcome.is_file():
-                raise RuntimeError("VM-A F03 outcome retrieval failed")
-            outcome = GuestOutcome.model_validate_json(local_outcome.read_text(encoding="utf-8"))
-            if (outcome.identity != request.identity or outcome.source_revision != runtime.source_revision
-                    or outcome.package_sha256 != runtime.package_sha256):
-                raise ValueError("VM-A F03 outcome identity or source digest changed")
-            return RemoteGuestExecution(outcome, tuple(actions))
+                cancellation_status = _stop_remote_f03(connection, process_record, invocation,
+                    process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                return interrupted_execution(f"VM-A F03 lifecycle guest exited with status {status}; {cancellation_status}",
+                    retrieve=cancellation_status == "process_group_stopped",
+                    preserve_cleanup=True)
+            outcome, source_bytes, outcome_error = retrieve_outcome(preserve_cleanup=False)
+            cancelled_race = cancel_event is not None and cancel_event.is_set()
+            if outcome_error:
+                return RemoteGuestExecution(None, tuple(actions),
+                    f"F03 outcome retrieval/validation failed: {outcome_error}",
+                    outcome_source_bytes=source_bytes)
+            if cancelled_race:
+                return RemoteGuestExecution(outcome, tuple(actions),
+                    "controller cancellation raced with natural guest exit; closed outcome retained as failure evidence",
+                    outcome_source_bytes=source_bytes)
+            return RemoteGuestExecution(outcome, tuple(actions), outcome_source_bytes=source_bytes)
     except BaseException as exc:
         return RemoteGuestExecution(None, tuple(actions),
             f"{type(exc).__name__}: F03 {stage} failed ({exc}); cancellation={cancellation_status}")

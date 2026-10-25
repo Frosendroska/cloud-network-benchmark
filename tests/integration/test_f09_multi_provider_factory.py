@@ -382,20 +382,23 @@ def _costs(path: Path, campaign, children):
     return load_cost_inputs(path)
 
 
-@pytest.mark.parametrize(("successful_protection", "config_name", "interrupt_f11_cleanup", "interrupt_controller"), [
-    (False, "configs/tests/exp-903-three-provider-smoke.yaml", False, False),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False, False),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml", True, False),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False, True),
-    (True, "configs/experiments/exp-001-calibration.yaml", False, False),
-    (True, "configs/experiments/exp-001-multi-provider.yaml", False, False),
-    (True, "configs/experiments/exp-001-diagnostic-day.yaml", False, False),
+@pytest.mark.parametrize(("successful_protection", "config_name", "interrupt_f11_cleanup", "interrupt_controller", "interrupt_stop_verified"), [
+    (False, "configs/tests/exp-903-three-provider-smoke.yaml", False, False, True),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False, False, True),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", True, False, True),
+    (True, "configs/experiments/exp-001-multi-provider.yaml", False, True, True),
+    (True, "configs/experiments/exp-001-multi-provider.yaml", False, True, False),
+    (True, "configs/experiments/exp-001-calibration.yaml", False, False, True),
+    (True, "configs/experiments/exp-001-multi-provider.yaml", False, False, True),
+    (True, "configs/experiments/exp-001-diagnostic-day.yaml", False, False, True),
 ], ids=["protection-failure", "all-provider-acceptance", "receipt-before-f11-recovery",
-    "controller-interrupt-during-native-f03", "all-provider-calibration",
+    "controller-interrupt-during-native-f03", "controller-interrupt-unverified-stop",
+    "all-provider-calibration",
     "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
         tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
-        successful_protection, config_name, interrupt_f11_cleanup, interrupt_controller):
+        successful_protection, config_name, interrupt_f11_cleanup, interrupt_controller,
+        interrupt_stop_verified):
     config = ROOT / config_name
     schedule_entry = None
     is_calibration = "calibration" in config_name
@@ -551,6 +554,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 self.identity_provider = {str(value): name for name, value in identities.items()}
                 for name, responder in self.remote.items():
                     responder.full_native = True
+                    responder.partial_after_first_unit = interrupt_controller
+                    responder.cancel_verified = interrupt_stop_verified
                     responder.clock = clock
                     responder.late_tail = True
                     mode_value = getattr(campaign.mode, "value", campaign.mode)
@@ -765,14 +770,56 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert provider_result.cleanup_state == "succeeded", (provider_name, provider_result.values.get("cleanup"))
             actions = runner.remote[provider_name].actions
             assert any(action.startswith("f09-guest-cancel-") for action in actions), (provider_name, actions)
-            assert len([action for action in actions if action.startswith("f09-diagnostics-stop-")]) == 2
+            assert len([action for action in actions if action.startswith("f09-diagnostics-stop-")]) >= 2
             assert len([action for action in actions if action.startswith("f09-listener-stop-")]) >= 1
+            guest_execution = provider_result.values["measure"].evidence
+            if not interrupt_stop_verified:
+                assert guest_execution.outcome is None and guest_execution.outcome_source_bytes is None
+                assert "verified closure was not established" in guest_execution.failure
+                assert not any(action.startswith("f09-guest-outcome-") for action in actions)
+                assert provider_result.cleanup_state == "succeeded"
+                continue
+            partial = guest_execution.outcome
+            assert provider_result.values["measure"].succeeded is False
+            assert guest_execution.failure and "controller cancellation" in guest_execution.failure
+            assert len(partial.executed_unit_ids) == 1 and partial.unexecuted_unit_ids
+            assert partial.commands and partial.timings
+            source = guest_execution.outcome_source_bytes
+            assert source and json.loads(source)["executed_unit_ids"] == partial.executed_unit_ids
+            assert hashlib.sha256(source).hexdigest()
         reservation_id = result.reservation_evidence.reservation_id.value
         ledger_state = built["ledger"].inspect()
         reservation_record = ledger_state["reservations"][reservation_id]
         assert reservation_record["provider_cleanup"] == {p: True for p in children}
         assert all(item["final"] is False for item in reservation_record["provider_billing"].values())
         assert reservation_record.get("released_usd", "0") == "0"
+        from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
+        finalized = finalize_production_batch(parent_path=parent_path, children=children,
+            parent=parent, lifecycle=result, repository_root=ROOT,
+            evaluated_at=max(clock.utc_now(), datetime.now(timezone.utc)) + timedelta(minutes=1))
+        assert set(finalized) == {"aws", "azure", "gcp"}
+        projected_parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        for provider_name, provider_result in result.provider_results.items():
+            ref = next(row for row in projected_parent["child_runs"] if row["provider"] == provider_name)
+            root = Path(ref["result_path"]).resolve()
+            child_manifest = json.loads(Path(ref["manifest_path"]).read_text(encoding="utf-8"))
+            guest_execution = provider_result.values["measure"].evidence
+            source_bytes = guest_execution.outcome_source_bytes
+            source_record = next((row for row in child_manifest["artifact_records"]
+                if row["artifact_id"] == "guest_outcome_source"), None)
+            if source_bytes is None:
+                assert source_record is None
+                assert child_manifest["execution_state"] == "interrupted"
+                continue
+            assert source_record is not None, (provider_name, bool(source_bytes), child_manifest["artifact_records"])
+            assert source_record["sha256"]["value"] == hashlib.sha256(source_bytes).hexdigest()
+            assert (root / source_record["path"]).read_bytes() == source_bytes
+            from cloud_network_benchmark.contracts.validation import ValidatorInput
+            saved = ValidatorInput.model_validate_json(
+                (root / "validation/input.json").read_text(encoding="utf-8"))
+            assert [row.unit_id for row in saved.commands if row.unit_id == guest_execution.outcome.executed_unit_ids[0]]
+            assert any(row.unit_id == guest_execution.outcome.executed_unit_ids[0] for row in saved.timings)
+            assert child_manifest["execution_state"] == "interrupted"
         return
     if interrupt_f11_cleanup:
         assert interrupted["done"] is True

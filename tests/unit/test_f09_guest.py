@@ -154,19 +154,28 @@ def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity
     runner=Runner(cancel_event)
     report=run_remote_f03(connected, request, runner=runner, runtime=runtime,
         deadline=deadline(), clock=lambda:100, cancel_event=cancel_event)
-    assert report.failure is None and report.outcome.outcome == "succeeded"
+    assert report.failure and "raced with natural guest exit" in report.failure
+    assert report.outcome.outcome == "succeeded" and report.outcome_source_bytes
     assert [item.action_type for item in report.actions] == ["ssh", "scp", "ssh", "ssh", "scp"]
     assert not any(item.action_id.startswith("f09-guest-cancel-") for item in report.actions)
     assert report.outcome.identity == request.identity
     from cloud_network_benchmark.orchestration import _typed_outcome
-    assert _typed_outcome("aws", "measure", report)[0] is True
+    assert _typed_outcome("aws", "measure", report)[0] is False
 
 
-def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruption(repository_root, tmp_path):
+@pytest.mark.parametrize(("source_case", "verified_stop"), [
+    ("partial", True), ("missing", True), ("malformed", True),
+    ("wrong_identity", True), ("partial", False), ("nonzero_exit", True),
+], ids=["partial-source", "missing-source", "malformed-source", "wrong-identity",
+    "unverified-stop", "nonzero-terminal-status"])
+def test_remote_f03_preserves_partial_outcome_only_after_verified_stop(
+        repository_root, tmp_path, source_case, verified_stop):
     import json
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.contracts.measurements import CommandEvidence, MeasurementTiming
     from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
+    from cloud_network_benchmark.lifecycle_guest import GuestOutcome, package_tree_sha256
     from tests.fixtures.f02r.support import connection, deadline, result
 
     connected = connection(tmp_path)
@@ -182,6 +191,33 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
         "package_sha256": digest})
     runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
         "3.12.3", "2.14.0", "6.0.2", ())
+    unit = request.observation.measurement_units[0]
+    started = datetime.now(timezone.utc)
+    action_id = f"sockperf-{unit.unit_id}"
+    command = CommandEvidence(schema_version=2,
+        request={"action_id": action_id, "argv": ["sockperf", "ping-pong", "-t", "10"]},
+        result={"outcome": "succeeded"}, producer="vm_a", deployment_id=connected.deployment_id,
+        unit_id=unit.unit_id, binary_version={"value": "sockperf-1"},
+        source_identity={"value": "synthetic partial guest source"},
+        monotonic_started={"value": 10.0}, monotonic_finished={"value": 11.0},
+        started_at={"value": started}, finished_at={"value": started + timedelta(seconds=1)})
+    timing = MeasurementTiming(unit_id=unit.unit_id, deployment_id=connected.deployment_id,
+        probe_test_started_at={"value": started}, tcp_started_at={"unavailable_reason": "idle unit"},
+        measured_started_at={"value": started}, measured_finished_at={"value": started + timedelta(seconds=1)},
+        monotonic_started={"value": 10.0}, monotonic_finished={"value": 11.0}, omitted_seconds=0,
+        overlap_seconds={"unavailable_reason": "partial interruption fixture"})
+    partial = GuestOutcome(identity=request.identity, outcome="failed",
+        executed_unit_ids=[unit.unit_id],
+        unexecuted_unit_ids=[item.unit_id for item in request.observation.measurement_units[1:]],
+        commands=[command.model_dump(mode="json")], timings=[timing.model_dump(mode="json")],
+        artifact_paths=[], failures=[{"category": "controller_interruption",
+            "message": "interrupted after first completed unit", "occurred_at": started}],
+        source_revision=runtime.source_revision, package_sha256=runtime.package_sha256,
+        guest_started_at=started, guest_finished_at=started + timedelta(seconds=1))
+    raw_partial = partial.model_dump_json().encode("utf-8")
+    if source_case == "wrong_identity":
+        changed = request.identity.model_copy(update={"run_id": "different-run"})
+        raw_partial = partial.model_copy(update={"identity": changed}).model_dump_json().encode("utf-8")
 
     class Runner:
         def __init__(self, cancellation): self.requests = []; self.cancellation = cancellation
@@ -194,11 +230,21 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
                     "invocation_id": invocation, "pid": 25001, "process_group": 25001,
                     "session_id": 25001, "boot_id": "synthetic-boot", "start_ticks": 12345}))
             if command.action_id.startswith("f09-guest-status-"):
+                if source_case == "nonzero_exit":
+                    return result(command.action_id, "exited 1")
                 self.cancellation.set()
                 return result(command.action_id, "running")
             if command.action_id.startswith("f09-guest-cancel-"):
                 assert "b64decode" in command.argv[-1]
-                return result(command.action_id, "process_group_stopped")
+                return result(command.action_id,
+                    "process_group_stopped" if verified_stop else "cancellation_unverified")
+            if command.action_id.startswith("f09-guest-outcome-"):
+                if source_case == "missing":
+                    now = datetime.now(timezone.utc)
+                    return CommandResult(action_id=command.action_id, outcome="failed",
+                        started_at=now, finished_at=now, duration_seconds=0, exit_code=1,
+                        stdout="", stderr="outcome absent")
+                Path(command.argv[-1]).write_bytes(b"not-json\n" if source_case == "malformed" else raw_partial)
             return result(command.action_id)
 
     import threading
@@ -206,11 +252,35 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
     runner = Runner(cancellation)
     report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
         deadline=deadline(), clock=lambda:100, cancel_event=cancellation, sleep=lambda _seconds: None)
-    assert report.outcome is None and "process_group_stopped" in report.failure
-    assert [item.action_id.split("-")[2] for item in report.actions if item.action_id.startswith("f09-guest-")] == [
-        "control", "request", "run", "status", "cancel"]
+    if source_case == "nonzero_exit":
+        assert "guest exited with status 1" in report.failure
+    else:
+        assert "controller cancellation" in report.failure
+    if verified_stop:
+        assert any(item.action_id.startswith("f09-guest-outcome-") for item in report.actions)
+        if source_case in {"partial", "nonzero_exit"}:
+            assert report.outcome is not None and report.outcome.outcome == "failed"
+            assert report.outcome.executed_unit_ids == [unit.unit_id]
+            assert report.outcome.commands and report.outcome.timings
+            assert report.outcome_source_bytes == raw_partial
+            assert "partial guest outcome retained" in report.failure
+        else:
+            assert report.outcome is None
+            assert "partial guest outcome unavailable" in report.failure
+            if source_case == "malformed":
+                assert report.outcome_source_bytes == b"not-json\n"
+            if source_case == "wrong_identity":
+                assert report.outcome_source_bytes == raw_partial
+    else:
+        assert report.outcome is None and report.outcome_source_bytes is None
+        assert "verified closure was not established" in report.failure
+        assert not any(item.action_id.startswith("f09-guest-outcome-") for item in report.actions)
+    action_names = [item.action_id.split("-")[2] for item in report.actions if item.action_id.startswith("f09-guest-")]
+    assert action_names[:5] == ["control", "request", "run", "status", "cancel"]
+    if verified_stop:
+        assert action_names[-1] == "outcome"
     cancel = next(item for item in report.actions if item.action_id.startswith("f09-guest-cancel-"))
-    assert cancel.result["stdout"] == "process_group_stopped"
+    assert cancel.result["stdout"] == ("process_group_stopped" if verified_stop else "cancellation_unverified")
 
 
 def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp_path):

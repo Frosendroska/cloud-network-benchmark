@@ -145,6 +145,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.guest_request = None
         self.guest_outcome = None
         self.guest_exception = None
+        self.partial_after_first_unit = False
         self.native_root = None
         self.workspace_roots = {}
         self.diagnostics_contexts = {}
@@ -306,6 +307,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             class NativeFixtureProcesses(FakeProcesses):
                 """Run the actual F03 driver while returning captured F08 grammar bytes."""
                 def start(self, request, *, stdout_path, stderr_path):
+                    if interrupt_unit and interrupt_unit in request.action_id:
+                        raise KeyboardInterrupt("synthetic controller cancellation after a completed unit")
                     handle = super().start(request, stdout_path=stdout_path, stderr_path=stderr_path)
                     executable = Path(request.argv[0]).name
                     fixture_root = ROOT / "tests/fixtures/f08/native"
@@ -322,12 +325,17 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             guest_request = GuestRequest.model_validate_json(self.guest_request).model_copy(update={
                 "output_root": self.native_root,
                 "package_root": ROOT / "src/cloud_network_benchmark"})
+            original_units = list(guest_request.observation.measurement_units)
+            interrupt_unit = (original_units[1].unit_id
+                if self.partial_after_first_unit and len(original_units) > 1 else None)
             self.native_root.mkdir(parents=True, exist_ok=True)
             try:
                 if self.full_native:
                     processes = _fixture_processes(guest_clock)
                     original_start = processes.start
                     def source_observed_start(native_request, *, stdout_path, stderr_path):
+                        if interrupt_unit and interrupt_unit in native_request.action_id:
+                            raise KeyboardInterrupt("synthetic controller cancellation after a completed unit")
                         handle = original_start(native_request, stdout_path=stdout_path, stderr_path=stderr_path)
                         executable = Path(native_request.argv[0]).name
                         if executable == "sockperf":
@@ -423,7 +431,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             assert "b64decode" in request.argv[-1]
             return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
                 finished_at=self._now(), duration_seconds=0, exit_code=0,
-                stdout="process_group_stopped\n", stderr="")
+                stdout=("process_group_stopped\n" if getattr(self, "cancel_verified", True)
+                    else "cancellation_unverified\n"), stderr="")
         if action.startswith("f09-guest-outcome-"):
             self.actions.append(action)
             if self.guest_outcome is not None:

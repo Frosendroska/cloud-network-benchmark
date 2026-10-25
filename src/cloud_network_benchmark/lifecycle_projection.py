@@ -130,6 +130,12 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
 
     guest = _guest_from(result)
     remote = _guest_execution_from(result)
+    source_bytes = getattr(remote, "outcome_source_bytes", None)
+    source_declaration = by_id.get("guest_outcome_source")
+    if source_bytes is not None and source_declaration is not None:
+        record = _controller_record(root, child.deployment_id, source_declaration, source_bytes)
+        if record is not None:
+            records.append(record)
     commands = [CommandEvidence.model_validate(item) for item in
         (getattr(guest, "commands", ()) or ())]
     commands.extend(CommandEvidence.model_validate(item) for item in
@@ -164,6 +170,22 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
                         if sidecar:
                             records.append(sidecar)
     return records
+
+
+def _include_guest_outcome_source(declarations: list[Any], remote: Any) -> list[Any]:
+    """Declare exact transferred GuestOutcome bytes for strict bundle projection."""
+    if getattr(remote, "outcome_source_bytes", None) is None:
+        return declarations
+    from .contracts.artifacts import ArtifactInput
+    declaration = ArtifactInput(artifact_id="guest_outcome_source",
+        path="metadata/guest-outcome-source.json", kind="guest_outcome_source",
+        producer="controller", unit_id=None, expectation="required")
+    existing = next((item for item in declarations if item.artifact_id == declaration.artifact_id), None)
+    if existing is not None and existing != declaration:
+        raise ValueError("guest outcome source declaration conflicts with the fixed F09 projection path")
+    if existing is None:
+        declarations.append(declaration)
+    return declarations
 
 
 def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: Any,
@@ -239,6 +261,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         measurement_units=_day_units(child, guest),
         schedule_supplied=child.schedule_entry.value is not None,
         build_observations=builds)
+    _include_guest_outcome_source(declarations, remote)
     for role in ("vm_a", "vm_b"):
         from .diagnostics import _declarations
         declarations.extend(_declarations(role))
@@ -307,6 +330,8 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
         measurement_units=units, schedule_supplied=child.schedule_entry.value is not None,
         build_observations=builds)
+    remote = _guest_execution_from(result)
+    _include_guest_outcome_source(declarations, remote)
     for role in ("vm_a", "vm_b"):
         declarations.extend(_declarations(role))
     artifacts = {}
@@ -320,7 +345,6 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     if guest is not None:
         commands.extend(CommandEvidence.model_validate(value) for value in guest.commands)
         timings.extend(MeasurementTiming.model_validate(value) for value in guest.timings)
-    remote = _guest_execution_from(result)
     commands.extend(CommandEvidence.model_validate(value) for value in
         (getattr(remote, "receiver_command_evidence", ()) or ()))
     commands_by_key = {}
@@ -371,7 +395,6 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
                 diagnostics.extend(DiagnosticSample.model_validate(item) for item in parsed)
             else:
                 clock_mappings.extend(parsed)
-    remote = _guest_execution_from(result)
     receiver_commands = list(getattr(remote, "receiver_command_evidence", ()) or ())
     resolved_path = root / child.config_provenance.resolved_snapshot_path
     config_path = root / child.config_provenance.snapshot_path
