@@ -51,13 +51,28 @@ def test_receiver_interval_lookup_preserves_gaps_and_requires_full_containment()
     assert not _containing_window(windows, starts, 4.9, 5.1)
 
 
-def test_native_receiver_origin_matches_f08_mode_specific_omit_reset():
+def test_native_receiver_origin_requires_verified_same_cookie_post_omit_reset():
     from cloud_network_benchmark.native import NativeParse
 
-    tcp = NativeParse(session_details=({"start": {"timestamp": {"timesecs": 1792540907},
-        "test_start": {"omit": 2}}},))
-    assert _iperf_receiver_origin(tcp, post_omit_origin=False) == (1792540907.0, 2.0)
-    assert _iperf_receiver_origin(tcp, post_omit_origin=True) == (1792540909.0, 2.0)
+    detail = {"start": {"cookie": "verified-cookie", "timestamp": {"timesecs": 1792540907},
+        "test_start": {"omit": 2}}}
+    tcp = NativeParse(session_details=(detail,))
+    observed = {"origin_utc": 1792540911.125, "uncertainty_seconds": 0.003001,
+        "crossing_reset": False, "stream_count": 2}
+    verified = {"verified-cookie": observed}
+    assert _iperf_receiver_origin(tcp, verified_origins=verified) == (1792540911.125, 0.003001)
+    assert _iperf_receiver_origin(tcp, verified_origins={}) is None
+    assert _iperf_receiver_origin(tcp, verified_origins={"another-cookie": observed}) is None
+    assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
+        **observed, "crossing_reset": True}}) is None
+    assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
+        **observed, "uncertainty_seconds": float("nan")}}) is None
+    assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
+        **observed, "stream_count": True}}) is None
+    assert _iperf_receiver_origin(NativeParse(session_details=(detail, detail)),
+        verified_origins=verified) is None
+    missing_cookie = NativeParse(session_details=({"start": {"timestamp": 1792540907}},))
+    assert _iperf_receiver_origin(missing_cookie, verified_origins=verified) is None
 
 
 def test_receiver_interval_straddle_invalidates_every_touched_bin():

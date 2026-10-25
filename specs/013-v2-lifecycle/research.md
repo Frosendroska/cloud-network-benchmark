@@ -63,8 +63,10 @@ Build identity records may already be materialized on the controller by bootstra
 
 ## D7 — Serialize CLI integration and keep paid evidence honest
 
-**Decision**: F09 owns isolated lifecycle_cli plus final narrow cli dispatch only after coordinator release/latest-main F12 integration. Keep F12 analysis commands/modules untouched. Offline preview/fakes are usable now; real execution paths remain blocked by existing missing paid-acceptance/support/dates/refresh prerequisites until separately authorized evidence exists. User-facing docs describe actual command selection and outcomes, not internal workflow artifacts.
+**Decision**: F09 owns isolated lifecycle_cli plus final narrow cli dispatch only after coordinator release/latest-main F12 integration. Keep F12 analysis commands/modules untouched except the bounded consumer integration below, authorized after F12 landed. Offline preview/fakes are usable now; real execution paths remain blocked by existing missing paid-acceptance/support/dates/refresh prerequisites until separately authorized evidence exists. User-facing docs describe actual command selection and outcomes, not internal workflow artifacts.
 **Alternative rejected**: Concurrent replacement of cli.py, a second executable platform, weakening paid gates for a demo. No new research decision or human approval is needed for these engineering choices.
+
+**Implementation clarification**: F12's analysis selection receives only the exact post-omit origin and uncertainty already verified from the same native cookie by F08 acquisition replay. This consumer handoff applies in all measured TCP modes, retains unavailable results for missing/conflicting/crossing-reset evidence, and does not modify F08 inputs, acquisition, protocol settings, or native bytes.
 
 ## F09 source-origin integration clarification
 
