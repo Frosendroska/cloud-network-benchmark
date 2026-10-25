@@ -44,3 +44,15 @@ F12 analysis CLI help/dispatch is checked through its actual integrated parser t
 ## Reporting
 
 Record exact integrated head, commands/exit results/test counts in `docs/validation/f09-v2-lifecycle.md`; distinguish not run, unavailable and passed. Finish Spec Kit implementation/convergence with zero actionable findings. Offline fakes establish instrument readiness only; F10 integrated gate and separate paid Linux/cloud/expiry acceptance remain unproved.
+
+## Recorded offline gate — 2026-10-25
+
+The complete repository suite passed on code head `709fe24be285dc5fef5feb5b6ec2c51f40aec598`:
+
+```sh
+PATH=/private/tmp/cnb-tools/powershell-7.5.11:$PATH PYTHONPATH=src THESIS_ROOT='/Users/katya/Desktop/University/Masters/Thesis' MPLBACKEND=Agg MPLCONFIGDIR=/private/tmp/cnb-matplotlib-config /private/tmp/cnb-offline-venv-20261025/bin/python -m pytest -q
+```
+
+Result: **1,436 passed**, one warning, exit 0, 344.99 seconds. The sole warning is a `DeprecationWarning` in `tests/unit/test_f09_guest.py::test_staged_runtime_import_execution_does_not_mutate_immutable_package_digest`: `archive.extractall(runtime_root)` will use a changed extraction-filter default in Python 3.14. It did not fail the test. Full output is retained at `/private/tmp/cnb-f09-full-pytest-709fe24.log`.
+
+The focused F12 analysis/replay checks passed: 43 passed, exit 0. The shared-contract schema check and root/lifecycle CLI help commands also exited 0. These checks were run offline; no cloud, credentials, paid experiment, or F10 readiness claim is implied.
