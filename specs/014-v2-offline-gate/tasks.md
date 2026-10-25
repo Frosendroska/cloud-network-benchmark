@@ -74,6 +74,13 @@ MVP is US1's safe reproducible command; completion additionally requires the act
 - Limitations: native Linux `/proc`, instrumented guest tools, real provider/cloud behavior, paid acceptance, refreshed prices/quotas, real calibration N and study windows remain not run or pending. No cloud or paid action occurred.
 - Next stage: coordinator runs Spec Kit convergence and final integration/delivery. Preserve this branch history and rerun the full command if any executable, test, config, Terraform or tool-patch content changes.
 
+### Convergence completion evidence
+
+- The Phase 7 implementation supersedes the earlier Phase 6 tested-head/count note above. Executable/tested HEAD is `0ed0ad50da69f6313ee6b04da34bf4e37a4becae` (tree `912804c4a9ef240a93831059ecf02fe9cbf77b4f`), clean before and after the definitive gate.
+- Focused gate tests: 19 passed. The committed full gate at `/private/tmp/cnb-f10-final-evidence-7/` exited 0: 1,464 passed, exactly two allowed Darwin `/proc` cases not run, no failures/unexpected skips, all 36 required identities and variants present, and all 19 schema/diff/Terraform checks passed. Exact command, environment, hashes and limitations are in `docs/validation/f10-offline-gate.md`.
+- Coverage parser was separately exercised against the retained complete evidence-6 JUnit before the final run: 1,466 collected test cases, 36 required identities/variants, `missing=[]`, both exact platform gaps accepted, and three unrelated proc/process explanations rejected. Evidence-6 remains a failed parser attempt; evidence-7 is the definitive passing run.
+- The full-suite result contains synthetic/offline evidence only. The exact two native Darwin `/proc` tests, native Linux process behavior, instrumented guest execution, real cloud behavior, paid acceptance, refreshed prices/quotas, research N and study windows remain unproved or pending. No cloud or paid action occurred.
+
 
 ## Phase 7: Convergence
 

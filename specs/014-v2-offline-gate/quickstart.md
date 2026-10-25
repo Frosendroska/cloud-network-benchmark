@@ -2,7 +2,7 @@
 
 ## Verified implementation
 
-The committed F10 gate passed at `3cfb059cfa716875dca1e422c6690491922a4ce8` with a clean source tree. The complete run produced 1,450 passed, two exact Darwin `/proc` skips, no failed tests, schema/diff checks, six Terraform format/validate pairs and four mocked Azure/GCP plan suites. The full gate summary and raw logs are preserved in `/private/tmp/cnb-f10-final-evidence-5/`; see [validation evidence](../../docs/validation/f10-offline-gate.md) for hashes and limitations.
+The committed F10 gate passed at `0ed0ad50da69f6313ee6b04da34bf4e37a4becae` with a clean source tree. The complete run produced 1,464 passed, two exact Darwin `/proc` skips, no failed tests, schema/diff checks, six Terraform format/validate pairs and four mocked Azure/GCP plan suites. The full gate summary and raw logs are preserved in `/private/tmp/cnb-f10-final-evidence-7/`; see [validation evidence](../../docs/validation/f10-offline-gate.md) for hashes and limitations.
 
 ## Run the local offline gate
 
