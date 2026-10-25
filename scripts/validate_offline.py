@@ -23,6 +23,25 @@ PROC_CASES = {
     "tests/unit/test_f09_guest.py::test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited",
     "tests/unit/test_f09_guest.py::test_f03_scoped_stop_refuses_reused_pid_start_ticks",
 }
+REQUIRED_COLLECTION_TARGETS = (
+    "tests/integration/test_acquisition_producer.py",
+    "tests/integration/test_analysis_replay.py",
+    "tests/integration/test_f09_lifecycle_recovery.py",
+    "tests/integration/test_f09_multi_provider_factory.py",
+    "tests/integration/test_measurement_runner.py",
+    "tests/integration/test_offline_boundaries.py",
+    "tests/integration/test_azure_provider_flow.py",
+    "tests/unit/test_bootstrap.py",
+    "tests/unit/test_f09_guest.py",
+    "tests/unit/test_f09_lifecycle.py",
+    "tests/unit/test_f11_budget.py",
+    "tests/unit/test_git_provenance.py",
+    "tests/unit/test_measurement_timing.py",
+    "tests/unit/test_readiness.py",
+    "tests/unit/test_retrieval.py",
+    "tests/unit/test_v2_admission_artifacts.py",
+)
+REQUIRED_FULL_MODULES = ("tests/integration/test_azure_provider_flow.py",)
 
 
 def sha(path: Path) -> str:
@@ -108,7 +127,17 @@ def prerequisites(evidence: Path, terraform: Path, pwsh: Path, mirror: Path):
     return state
 
 
-def junit_coverage(path: Path, coverage_file: Path, platform_name: str):
+def parse_collection(path: Path):
+    identities = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        candidate = line.strip()
+        if candidate.startswith("tests/") and "::" in candidate:
+            identities.add(candidate)
+    require(bool(identities), "required pytest collection is empty or malformed")
+    return identities
+
+
+def junit_coverage(path: Path, coverage_file: Path, platform_name: str, collected_identities):
     try:
         root = ET.parse(path).getroot()
         cases = root.findall(".//testcase")
@@ -145,10 +174,28 @@ def junit_coverage(path: Path, coverage_file: Path, platform_name: str):
                     ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study",
                      "all-provider-diagnostic-day", "controller-interrupt-during-native-f03",
                      "controller-interrupt-unverified-stop", "protection-failure"))
-    # Bare function requirements are satisfied by a plain case or any collected variants;
-    # explicit parameter IDs above must match exactly.
-    missing = sorted(req for req in expected if req not in identities and not
-                     ("[" not in req and any(x.startswith(req + "[") for x in identities)))
+    # For bare function rows, require every variant independently collected from pytest.
+    required = set()
+    missing = set()
+    for req in expected:
+        if "[" in req:
+            required.add(req)
+            if req not in collected_identities:
+                missing.add(req)
+            continue
+        variants = {item for item in collected_identities
+                    if item == req or item.startswith(req + "[")}
+        if not variants:
+            missing.add(req)
+        required.update(variants)
+    for module in REQUIRED_FULL_MODULES:
+        module_cases = {item for item in collected_identities
+                        if item.startswith(module + "::")}
+        if not module_cases:
+            missing.add(module + "::<no collected tests>")
+        required.update(module_cases)
+    missing.update(required - identities)
+    missing = sorted(missing)
     gaps, unexpected = [], []
     for identity, reason in skipped:
         proc_reason = "the local test host has no Linux /proc process identity interface"
@@ -164,7 +211,7 @@ def junit_coverage(path: Path, coverage_file: Path, platform_name: str):
     require(not missing, "required named coverage missing: " + ", ".join(missing))
     require(not failed, "pytest JUnit reports failed cases: " + ", ".join(failed[:10]))
     require(not unexpected, "unexpected required skips: " + json.dumps(unexpected))
-    return {"tests": len(cases), "failures": len(failed), "skips": len(skipped), "required_identities": len(expected), "missing": missing, "unexpected_skips": unexpected, "platform_gaps": gaps}
+    return {"tests": len(cases), "failures": len(failed), "skips": len(skipped), "required_identities": len(required), "missing": missing, "unexpected_skips": unexpected, "platform_gaps": gaps}
 
 
 def run_check(summary, evidence, name, argv, env, timeout=900):
@@ -225,6 +272,7 @@ def main(argv=None):
     pytest_xml = evidence / "pytest.xml"
     checks = [
         ("full-pytest", [sys.executable, "-m", "pytest", "-q", f"--junitxml={pytest_xml}"]),
+        ("required-collection", [sys.executable, "-m", "pytest", "--collect-only", "-q", *REQUIRED_COLLECTION_TARGETS]),
         ("schema-check", [sys.executable, "-m", "cloud_network_benchmark.contracts.schema", "--output", "specs/003-v2-shared-contracts/contracts", "--check"]),
         ("diff-check", ["git", "diff", "--check"]),
     ]
@@ -267,7 +315,10 @@ def main(argv=None):
                         "log": None, "log_sha256": None})
                 break
         if summary["checks"] and summary["checks"][0]["name"] == "full-pytest" and summary["checks"][0]["exit_code"] == 0:
-            summary["coverage"] = junit_coverage(pytest_xml, ROOT / "specs/014-v2-offline-gate/contracts/coverage.md", platform.system())
+            collection_check = next((item for item in summary["checks"] if item["name"] == "required-collection"), None)
+            if collection_check is not None and collection_check["status"] == "passed":
+                collected = parse_collection(evidence / collection_check["log"])
+                summary["coverage"] = junit_coverage(pytest_xml, ROOT / "specs/014-v2-offline-gate/contracts/coverage.md", platform.system(), collected)
             summary["junit_report"] = {"path": pytest_xml.name, "sha256": sha(pytest_xml)}
         summary["end_state"] = source_state()
         unchanged = same_source_state(started_state, summary["end_state"])

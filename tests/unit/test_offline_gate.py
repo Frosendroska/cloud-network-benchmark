@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -10,18 +12,58 @@ import pytest
 from scripts import validate_offline as gate
 
 
+FACTORY_MODULE = "tests/integration/test_f09_multi_provider_factory"
+FACTORY_FUNCTION = "test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier"
+FACTORY_CASES = ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study",
+                 "all-provider-diagnostic-day", "controller-interrupt-during-native-f03",
+                 "controller-interrupt-unverified-stop", "protection-failure")
+AZURE_MODULE = "tests/integration/test_azure_provider_flow.py"
+AZURE_CASE = f"{AZURE_MODULE}::test_registration_requires_lead_and_exact_target_ids"
+
+
+def factory_identities():
+    return {f"tests/integration/test_f09_multi_provider_factory.py::{FACTORY_FUNCTION}[{case}]"
+            for case in FACTORY_CASES}
+
+
+def baseline_collection(*identities):
+    return factory_identities() | {AZURE_CASE, *identities}
+
+
+def azure_xml_case():
+    return '<testcase classname="tests.integration.test_azure_provider_flow" name="test_registration_requires_lead_and_exact_target_ids"/>'
+
+
+REQUIRED_VARIANTS = {
+    "tests/integration/test_acquisition_producer.py::test_iperf_replay_requires_native_receiver_corroboration": (
+        "[client_action_collision]", "[cookie_only]", "[native_endpoint]", "[native_settings]",
+        "[native_stream]", "[observation_bytes]", "[observation_endpoint]"),
+    "tests/unit/test_f09_lifecycle.py::test_original_cap_or_earlier_provider_trigger_blocks_stages_but_still_cleans": (
+        "[201.0-200.0-None]", "[999.0-1000.0-200.0]"),
+    "tests/unit/test_f11_budget.py::test_full_remaining_and_reserved_liabilities_obey_working_and_total_caps": (
+        "[250-True]", "[250.0001-False]", "[300-False]"),
+}
+
+
+def xml_testcase(identity):
+    module, name = identity.split("::", 1)
+    classname = ".".join(Path(module).with_suffix("").parts)
+    return f'<testcase classname="{classname}" name="{name}"/>'
+
+
 def test_junit_requires_named_cases_and_only_exact_darwin_proc_gaps(tmp_path):
     coverage = tmp_path / "coverage.md"
     coverage.write_text("`tests/unit/test_ok.py::test_kept`\n`tests/unit/test_f09_guest.py::test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited`\n")
     report = tmp_path / "junit.xml"
-    factory = "tests.integration.test_f09_multi_provider_factory"
-    cases = "".join(f'<testcase classname="{factory}" name="test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[{case}]"/>' for case in ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study", "all-provider-diagnostic-day", "controller-interrupt-during-native-f03", "controller-interrupt-unverified-stop", "protection-failure"))
-    report.write_text(f'<testsuites><testsuite tests="9" skipped="1"><testcase classname="tests.unit.test_ok" name="test_kept"/><testcase classname="tests.unit.test_f09_guest" name="test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited"><skipped message="the local test host has no Linux /proc process identity interface /private/tmp/cnb-f10/tests/unit/test_f09_guest.py:299: the local test host has no Linux /proc process identity interface"/></testcase>{cases}</testsuite></testsuites>')
-    result = gate.junit_coverage(report, coverage, "Darwin")
-    assert result["tests"] == 9
+    factory = FACTORY_MODULE.replace("/", ".")
+    cases = "".join(f'<testcase classname="{factory}" name="{FACTORY_FUNCTION}[{case}]"/>' for case in FACTORY_CASES)
+    report.write_text(f'<testsuites><testsuite tests="10" skipped="1"><testcase classname="tests.unit.test_ok" name="test_kept"/><testcase classname="tests.unit.test_f09_guest" name="test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited"><skipped message="the local test host has no Linux /proc process identity interface /private/tmp/cnb-f10/tests/unit/test_f09_guest.py:299: the local test host has no Linux /proc process identity interface"/></testcase>{cases}{azure_xml_case()}</testsuite></testsuites>')
+    collected = baseline_collection("tests/unit/test_ok.py::test_kept", "tests/unit/test_f09_guest.py::test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited")
+    result = gate.junit_coverage(report, coverage, "Darwin", collected)
+    assert result["tests"] == 10
     assert result["platform_gaps"][0]["state"] == "not_run"
     with pytest.raises(ValueError, match="unexpected required skips"):
-        gate.junit_coverage(report, coverage, "Linux")
+        gate.junit_coverage(report, coverage, "Linux", collected)
 
 
 def test_junit_missing_malformed_and_empty_reports_fail(tmp_path):
@@ -31,12 +73,48 @@ def test_junit_missing_malformed_and_empty_reports_fail(tmp_path):
     for raw, message in (("<broken", "malformed"), ("<testsuites/>", "empty")):
         report.write_text(raw)
         with pytest.raises(ValueError, match=message):
-            gate.junit_coverage(report, coverage, "Darwin")
+            gate.junit_coverage(report, coverage, "Darwin", set())
     with pytest.raises(ValueError, match="missing or malformed"):
-        gate.junit_coverage(tmp_path / "missing.xml", coverage, "Darwin")
-    report.write_text('<testsuites><testsuite><testcase classname="tests.unit.test_other" name="test_other"/></testsuite></testsuites>')
+        gate.junit_coverage(tmp_path / "missing.xml", coverage, "Darwin", set())
+    report.write_text('<testsuites><testsuite><testcase classname="tests.unit.test_other" name="test_other"/>' + azure_xml_case() + "</testsuite></testsuites>")
     with pytest.raises(ValueError, match="coverage missing"):
-        gate.junit_coverage(report, coverage, "Darwin")
+        gate.junit_coverage(report, coverage, "Darwin", baseline_collection("tests/unit/test_other.py::test_other"))
+
+
+def test_collection_parser_requires_canonical_nonempty_node_ids(tmp_path):
+    output = tmp_path / "collection.log"
+    output.write_text("tests/unit/test_ok.py::test_plain\ntests/unit/test_ok.py::test_param[value]\n2 tests collected\n")
+    assert gate.parse_collection(output) == {"tests/unit/test_ok.py::test_plain", "tests/unit/test_ok.py::test_param[value]"}
+    output.write_text("no test identifiers\n")
+    with pytest.raises(ValueError, match="collection is empty or malformed"):
+        gate.parse_collection(output)
+
+
+@pytest.mark.parametrize("base,variant", [
+    (base, variant) for base, variants in REQUIRED_VARIANTS.items() for variant in variants
+])
+def test_junit_rejects_each_missing_collected_variant_with_sibling_retained(tmp_path, base, variant):
+    coverage = tmp_path / "coverage.md"
+    coverage.write_text("\n".join(f"`{name}`" for name in REQUIRED_VARIANTS) + "\n")
+    collected_variants = {f"{name}{value}" for name, values in REQUIRED_VARIANTS.items() for value in values}
+    module_cases = {AZURE_CASE, f"{AZURE_MODULE}::test_missing_expiry_is_rejected_before_workspace_mutation"}
+    collected = baseline_collection(*collected_variants, *module_cases)
+    identities = (collected_variants - {f"{base}{variant}"}) | module_cases | factory_identities()
+    report = tmp_path / "junit.xml"
+    report.write_text("<testsuites><testsuite>" + "".join(xml_testcase(item) for item in identities) + "</testsuite></testsuites>")
+    with pytest.raises(ValueError, match=re.escape(f"{base}{variant}")):
+        gate.junit_coverage(report, coverage, "Darwin", collected)
+
+
+def test_junit_rejects_omitted_whole_required_module(tmp_path):
+    coverage = tmp_path / "coverage.md"
+    coverage.write_text("`tests/unit/test_ok.py::test_kept`\n")
+    module_cases = {AZURE_CASE, f"{AZURE_MODULE}::test_missing_expiry_is_rejected_before_workspace_mutation"}
+    collected = baseline_collection("tests/unit/test_ok.py::test_kept", *module_cases)
+    report = tmp_path / "junit.xml"
+    report.write_text("<testsuites><testsuite>" + "".join(xml_testcase(item) for item in factory_identities() | {"tests/unit/test_ok.py::test_kept"}) + "</testsuite></testsuites>")
+    with pytest.raises(ValueError, match="test_registration_requires_lead_and_exact_target_ids"):
+        gate.junit_coverage(report, coverage, "Darwin", collected)
 
 
 @pytest.mark.parametrize("omitted", [
@@ -58,22 +136,24 @@ def test_junit_resolves_abbreviated_names_and_rejects_each_omission(tmp_path, om
         ("tests.integration.test_measurement_runner", "test_failed_day_probe_rotates_without_restarting_tcp"),
     ]
     cases = "".join(f'<testcase classname="{module}" name="{name}"/>' for module, name in required if name != omitted)
+    cases += "".join(f'<testcase classname="{FACTORY_MODULE.replace("/", ".")}" name="{FACTORY_FUNCTION}[{case}]"/>' for case in FACTORY_CASES)
+    cases += azure_xml_case()
     report = tmp_path / "junit.xml"
     report.write_text(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
     with pytest.raises(ValueError, match="coverage missing"):
-        gate.junit_coverage(report, coverage, "Darwin")
+        gate.junit_coverage(report, coverage, "Darwin", baseline_collection(*(f"{module.replace('.', '/')}.py::{name}" for module, name in required)))
 
 
 def test_junit_requires_exact_parameter_variants_and_protection_failure(tmp_path):
     coverage = tmp_path / "coverage.md"
     coverage.write_text("`tests/integration/test_f09_multi_provider_factory.py::test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[all-provider-acceptance]`\nSame function [protection-failure]\n")
     report = tmp_path / "junit.xml"
-    report.write_text('<testsuites><testsuite><testcase classname="tests.integration.test_f09_multi_provider_factory" name="test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[all-provider-acceptance]"/></testsuite></testsuites>')
+    report.write_text("<testsuites><testsuite>" + "".join(f'<testcase classname="{FACTORY_MODULE.replace("/", ".")}" name="{FACTORY_FUNCTION}[{case}]"/>' for case in FACTORY_CASES if case != "protection-failure") + azure_xml_case() + "</testsuite></testsuites>")
     with pytest.raises(ValueError, match="protection-failure"):
-        gate.junit_coverage(report, coverage, "Darwin")
-    report.write_text('<testsuites><testsuite><testcase classname="tests.integration.test_f09_multi_provider_factory" name="test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[protection-failure]"/></testsuite></testsuites>')
+        gate.junit_coverage(report, coverage, "Darwin", baseline_collection())
+    report.write_text("<testsuites><testsuite>" + "".join(f'<testcase classname="{FACTORY_MODULE.replace("/", ".")}" name="{FACTORY_FUNCTION}[{case}]"/>' for case in FACTORY_CASES if case != "all-provider-acceptance") + azure_xml_case() + "</testsuite></testsuites>")
     with pytest.raises(ValueError, match="all-provider-acceptance"):
-        gate.junit_coverage(report, coverage, "Darwin")
+        gate.junit_coverage(report, coverage, "Darwin", baseline_collection())
 
 
 def test_only_exact_proc_gap_reason_is_allowed(tmp_path):
@@ -81,11 +161,11 @@ def test_only_exact_proc_gap_reason_is_allowed(tmp_path):
     identity = "tests/unit/test_f09_guest.py::test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited"
     coverage.write_text(f"`{identity}`\n")
     report = tmp_path / "junit.xml"
-    factory = "tests.integration.test_f09_multi_provider_factory"
-    cases = "".join(f'<testcase classname="{factory}" name="test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier[{case}]"/>' for case in ("all-provider-acceptance", "all-provider-calibration", "all-provider-short-study", "all-provider-diagnostic-day", "controller-interrupt-during-native-f03", "controller-interrupt-unverified-stop", "protection-failure"))
-    report.write_text(f'<testsuites><testsuite><testcase classname="tests.unit.test_f09_guest" name="{identity.split("::")[1]}"><skipped message="unexpected process regression"/></testcase>{cases}</testsuite></testsuites>')
+    factory = FACTORY_MODULE.replace("/", ".")
+    cases = "".join(f'<testcase classname="{factory}" name="{FACTORY_FUNCTION}[{case}]"/>' for case in FACTORY_CASES)
+    report.write_text(f'<testsuites><testsuite><testcase classname="tests.unit.test_f09_guest" name="{identity.split("::")[1]}"><skipped message="unexpected process regression"/></testcase>{cases}{azure_xml_case()}</testsuite></testsuites>')
     with pytest.raises(ValueError, match="unexpected required skips"):
-        gate.junit_coverage(report, coverage, "Darwin")
+        gate.junit_coverage(report, coverage, "Darwin", baseline_collection(identity))
 
 
 def test_run_check_records_exit_timeout_interruption_and_log_hash(tmp_path, monkeypatch):
@@ -176,7 +256,7 @@ def test_main_metadata_failure_records_all_omitted_checks_and_end_state(tmp_path
     result = json.loads((evidence / "summary.json").read_text())
     assert result["status"] == "failed" and result["source_unchanged"]
     assert "CalledProcessError" in result["error"] and result["end_state"] == clean
-    expected_checks = 3 + sum(2 + (rel in gate.MOCKS) for rel in gate.ROOTS)
+    expected_checks = 4 + sum(2 + (rel in gate.MOCKS) for rel in gate.ROOTS)
     assert len(result["checks"]) == expected_checks
     assert all(row["status"] == "not_run" for row in result["checks"])
 
