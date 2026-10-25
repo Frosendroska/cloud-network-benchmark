@@ -494,10 +494,41 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",
                     sleep=runtime.get("sleep", __import__("time").sleep))
-        return build_provider_workflows(campaign=campaign, parent=parent,
+        workflows = build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
             ledger=ledger, runner=runner, clock=clock, stages=actual_stages,
             private_root=private_root, cleanup_references=cleanup_references)
+
+        # A normal provider cleanup must close the same F11 liability that a
+        # cleanup-only restart would reconcile. Keep this in the production
+        # factory so default hooks cannot clear their journal flags on native
+        # deletion alone.
+        from dataclasses import replace
+        from .lifecycle_cleanup import reconcile_saved_cleanup_result
+        from .orchestration import SavedLifecycleRecovery
+
+        def bind_cleanup_reconcile(provider: str, resource_ids):
+            def reconcile(native_result):
+                saved_recovery = SavedLifecycleRecovery.validate_unique(
+                    json.loads((Path(private_root) / "lifecycle-recovery.json").read_text(encoding="utf-8")))
+                rows = [row for row in saved_recovery.providers if row.provider == provider]
+                if len(rows) != 1:
+                    raise ValueError("normal cleanup cannot identify its saved provider recovery record")
+                reconciliation = reconcile_saved_cleanup_result(rows[0], native_result,
+                    recovery=saved_recovery, ledger=ledger, utc_now=clock.utc_now,
+                    provider_resource_ids=(resource_ids() if resource_ids is not None else None))
+                ledger.reconcile(reconciliation["ledger_event"])
+                reconciled_reservation = ledger.inspect().get("reservations", {}).get(
+                    saved_recovery.reservation_id, {})
+                if reconciled_reservation.get("provider_cleanup", {}).get(provider) is not True:
+                    raise RuntimeError("F11 ledger did not durably acknowledge provider cleanup")
+                if reconciliation["absence_proved"] is not True:
+                    raise RuntimeError("normal cleanup did not prove source-bound resource absence")
+            return reconcile
+
+        return {provider: replace(hooks, cleanup_reconcile=bind_cleanup_reconcile(
+            provider, hooks.cleanup_resource_ids))
+            for provider, hooks in workflows.items()}
 
     def recovery_factory(reservation: Any, _workflows: Any):
         providers = []

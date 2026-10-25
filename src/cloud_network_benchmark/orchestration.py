@@ -73,6 +73,8 @@ class ProviderHooks:
     cleanup: Callable[[], Any]
     cancel: Callable[[], Any] = lambda: None
     stage_admission: Callable[[str], Any] | None = None
+    cleanup_reconcile: Callable[[Any], Any] | None = None
+    cleanup_resource_ids: Callable[[], list[str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +318,33 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
     outcomes: dict[str, dict[str, Any]] = {}
     for record in recovery.providers:
         liability = record.cleanup_open or record.expiry_registered or record.creation_may_have_started
+        ledger_reservation = None
+        if ledger is not None and callable(getattr(ledger, "inspect", None)) and recovery.reservation_id is not None:
+            ledger_reservation = ledger.inspect().get("reservations", {}).get(recovery.reservation_id)
+            from .lifecycle_cleanup import replay_saved_cleanup_receipt
+            try:
+                receipt_reconciled = replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
+            except RuntimeError as exc:
+                outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
+                    "errors": [str(exc)], "launch_blocked": True}
+                continue
+            if receipt_reconciled:
+                try:
+                    update_provider_recovery(recovery_path, record.provider, "cleanup", "succeeded")
+                    outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
+                        "absence_proved": True, "billable_resources_present": False,
+                        "reason": "saved source receipt acknowledged by the original F11 ledger",
+                        "launch_blocked": False}
+                    continue
+                except BaseException as exc:
+                    outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
+                        "errors": [f"recovery journal update failed ({type(exc).__name__})"],
+                        "launch_blocked": True}
+                    continue
+            if isinstance(ledger_reservation, Mapping):
+                # A local journal flag or stale receipt cannot override an open
+                # original F11 provider cleanup liability.
+                liability = True
         if not liability:
             outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
                                          "reason": "journal proves no safety or compute allocation began"}
@@ -346,6 +375,11 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                         or event.provider != record.provider):
                     raise ValueError("F11 reconciliation identity does not match the saved attempt")
                 ledger.reconcile(event)
+                if callable(getattr(ledger, "inspect", None)):
+                    acknowledged = ledger.inspect().get("reservations", {}).get(
+                        recovery.reservation_id, {}).get("provider_cleanup", {}).get(record.provider)
+                    if event.cleanup_verified_absent and acknowledged is not True:
+                        raise ValueError("F11 ledger did not durably acknowledge provider absence")
         except BaseException as exc:
             reconciliation = None
             errors.append(f"reconciliation failed ({type(exc).__name__})")
@@ -488,7 +522,8 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
 
 def _call(provider: str, stage: str, action: Callable[[], Any], result: ProviderLifecycleResult,
           *, before: Callable[[], None] | None = None,
-          after: Callable[[Any, bool], None] | None = None) -> bool:
+          after: Callable[[Any, bool], None] | None = None,
+          verify: Callable[[Any], None] | None = None) -> bool:
     try:
         if before is not None:
             try:
@@ -501,6 +536,8 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
         value = action()
         result.values[stage] = value
         succeeded, reason = _typed_outcome(provider, stage, value)
+        if succeeded and verify is not None:
+            verify(value)
         if succeeded and stage == "create" and not isinstance(value, ProviderStageOutcome):
             protected = result.values.get("protect")
             from .contracts.deployment import ProviderDeploymentOutput
@@ -637,7 +674,7 @@ def execute_provider_workflows(
             item.secondary_failures.append(message)
         item.execution_state = "failed"
 
-    def call(provider: str, stage: str, action: Callable[[], Any]) -> bool:
+    def call(provider: str, stage: str, action: Callable[[], Any], *, verify=None) -> bool:
         nonlocal interrupted
         started_at = utc_now()
         try:
@@ -653,7 +690,8 @@ def execute_provider_workflows(
                                              "succeeded" if success else "failed")
             else:
                 after = None
-            succeeded = _call(provider, stage, action, results[provider], before=before, after=after)
+            succeeded = _call(provider, stage, action, results[provider], before=before,
+                              after=after, verify=verify)
         except BaseException as exc:
             results[provider].stage_times[stage] = {
                 "started_at": started_at, "finished_at": utc_now()}
@@ -749,7 +787,11 @@ def execute_provider_workflows(
         def cleanup_one(provider: str) -> bool:
             # Route through call() so a successful terminal provider response is
             # durably reconciled before the attempt can report completion.
-            return call(provider, "cleanup", workflows[provider].cleanup)
+            hooks = workflows[provider]
+            if hooks.cleanup_reconcile is None:
+                return call(provider, "cleanup", hooks.cleanup)
+            return call(provider, "cleanup", hooks.cleanup,
+                verify=lambda result: hooks.cleanup_reconcile(result))
         with ThreadPoolExecutor(max_workers=min(max_workers, len(workflows))) as pool:
             futures = {pool.submit(cleanup_one, provider): provider
                        for provider in protection_attempted}

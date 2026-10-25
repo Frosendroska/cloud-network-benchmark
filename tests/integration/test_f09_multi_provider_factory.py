@@ -378,17 +378,19 @@ def _costs(path: Path, campaign, children):
     return load_cost_inputs(path)
 
 
-@pytest.mark.parametrize(("successful_protection", "config_name"), [
-    (False, "configs/tests/exp-903-three-provider-smoke.yaml"),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml"),
-    (True, "configs/experiments/exp-001-calibration.yaml"),
-    (True, "configs/experiments/exp-001-multi-provider.yaml"),
-    (True, "configs/experiments/exp-001-diagnostic-day.yaml"),
-], ids=["protection-failure", "all-provider-acceptance", "all-provider-calibration",
+@pytest.mark.parametrize(("successful_protection", "config_name", "interrupt_f11_cleanup"), [
+    (False, "configs/tests/exp-903-three-provider-smoke.yaml", False),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", True),
+    (True, "configs/experiments/exp-001-calibration.yaml", False),
+    (True, "configs/experiments/exp-001-multi-provider.yaml", False),
+    (True, "configs/experiments/exp-001-diagnostic-day.yaml", False),
+], ids=["protection-failure", "all-provider-acceptance", "receipt-before-f11-recovery",
+    "all-provider-calibration",
     "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
         tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
-        successful_protection, config_name):
+        successful_protection, config_name, interrupt_f11_cleanup):
     config = ROOT / config_name
     schedule_entry = None
     is_calibration = "calibration" in config_name
@@ -652,6 +654,16 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
     if successful_protection:
         runtime["sleep"] = clock.sleep
         runner.ledger = built["ledger"]
+        if interrupt_f11_cleanup:
+            original_reconcile = built["ledger"].reconcile
+            interrupted = {"done": False}
+            def fail_gcp_cleanup_once(event):
+                if (event.provider == "gcp" and event.cleanup_verified_absent
+                        and not interrupted["done"]):
+                    interrupted["done"] = True
+                    raise OSError("injected F11 persistence interruption after receipt")
+                return original_reconcile(event)
+            monkeypatch.setattr(built["ledger"], "reconcile", fail_gcp_cleanup_once)
         original_aws_hooks, original_gcp_hooks, original_azure_hooks = adapters.aws_hooks, adapters.gcp_hooks, adapters.azure_hooks
         original_prepare_remote_pair = adapters.prepare_remote_pair
         prepare_errors = []
@@ -692,6 +704,42 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         admission_plan=built["plan"], allowance=built["allowance"],
         workflow_factory=built["workflow_factory"], clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    if interrupt_f11_cleanup:
+        assert interrupted["done"] is True
+        assert result.admission_status == "reserved"
+        assert set(result.provider_results) == {"aws", "azure", "gcp"}
+        for provider_name, provider_result in result.provider_results.items():
+            assert provider_result.values["cleanup"] is not None, (provider_name, provider_result.values)
+            assert provider_result.values["cleanup"].cleanup_state == "succeeded", provider_result.values["cleanup"]
+        reservation_id = result.reservation_evidence.reservation_id.value
+        reservation_record = built["ledger"].inspect()["reservations"][reservation_id]
+        assert reservation_record["provider_cleanup"] == {"aws": True, "azure": True, "gcp": False}
+        assert reservation_record["provider_billing"]["gcp"]["final"] is False
+        assert reservation_record.get("released_usd", "0") == "0"
+        recovery = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+        gcp_row = next(row for row in recovery["providers"] if row["provider"] == "gcp")
+        assert gcp_row["cleanup_open"] is True
+        receipt_candidates = list(Path(gcp_row["cleanup_settings_reference"]).parent.glob(
+            f"{reservation_id}-gcp-cleanup-*.json"))
+        assert len(receipt_candidates) == 1
+        receipt = json.loads(receipt_candidates[0].read_text(encoding="utf-8"))
+        assert receipt["absence_proved"] is True and receipt["absent_resource_ids"]
+        class NoUnexpectedCleanupCommand:
+            def run(self, request):
+                raise AssertionError(f"receipt recovery must reconcile without provider commands: {request.action_id}")
+        cleanup_status = lifecycle_main(["cleanup", "--recovery", str(built["recovery_path"]),
+            "--controller-session", "receipt-recovery-session", "--format", "json"],
+            cleanup_runner=NoUnexpectedCleanupCommand(), cleanup_utc_now=clock.utc_now,
+            cleanup_monotonic_now=clock.monotonic)
+        assert cleanup_status == 0
+        recovered = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+        assert all(not row["cleanup_open"] and not row["expiry_registered"]
+            and not row["creation_may_have_started"] for row in recovered["providers"])
+        recovered_record = built["ledger"].inspect()["reservations"][reservation_id]
+        assert recovered_record["provider_cleanup"] == {p: True for p in children}
+        assert all(item["final"] is False for item in recovered_record["provider_billing"].values())
+        assert recovered_record.get("released_usd", "0") == "0"
+        return
     if successful_protection:
         assert result.admission_status == "reserved", (result.admission_reasons, result.primary_failure, built["plan"].child_identities.keys(), built["plan"].namespaces.keys(), built["plan"].allowance.provider_leads_seconds.keys(), campaign.selected_providers)
         assert set(result.provider_results) == {"aws", "azure", "gcp"}
@@ -728,6 +776,38 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 assert outcome is not None and outcome.succeeded is True, (provider_name, stage,
                     provider_result.primary_failure, provider_result.secondary_failures)
         assert all(observed[p][1].run_id == children[p].run_id for p in children)
+        reservation_id = result.reservation_evidence.reservation_id.value
+        ledger_state = built["ledger"].inspect()
+        reservation_record = ledger_state["reservations"][reservation_id]
+        assert reservation_record["provider_cleanup"] == {p: True for p in children}, {
+            provider: (item.cleanup_state, item.primary_failure, item.secondary_failures)
+            for provider, item in result.provider_results.items()}
+        assert reservation_id not in ledger_state["cleanup_open"]
+        assert reservation_id not in ledger_state["cleanup_blocked"]
+        assert all(item["final"] is False for item in reservation_record["provider_billing"].values())
+        assert reservation_record.get("released_usd", "0") == "0"
+        recovery = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+        assert all(not row["cleanup_open"] and not row["expiry_registered"]
+            and not row["creation_may_have_started"] for row in recovery["providers"])
+        for row in recovery["providers"]:
+            receipt_candidates = list(Path(row["cleanup_settings_reference"]).parent.glob(
+                f"{reservation_id}-{row['provider']}-cleanup-*.json"))
+            assert len(receipt_candidates) == 1, (row["provider"], receipt_candidates)
+            receipt = json.loads(receipt_candidates[0].read_text(encoding="utf-8"))
+            assert receipt["absence_proved"] is True and receipt["absent_resource_ids"]
+            from cloud_network_benchmark.orchestration import update_provider_recovery
+            update_provider_recovery(built["recovery_path"], row["provider"], "create", "started")
+        class NoUnexpectedCleanupCommand:
+            def run(self, request):
+                raise AssertionError(f"already-reconciled cleanup must not invoke provider commands: {request.action_id}")
+        cleanup_status = lifecycle_main(["cleanup", "--recovery", str(built["recovery_path"]),
+            "--controller-session", "cleanup-restart-session", "--format", "json"],
+            cleanup_runner=NoUnexpectedCleanupCommand(), cleanup_utc_now=clock.utc_now,
+            cleanup_monotonic_now=clock.monotonic)
+        assert cleanup_status == 0
+        recovered = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+        assert all(not row["cleanup_open"] and not row["expiry_registered"]
+            and not row["creation_may_have_started"] for row in recovered["providers"])
         from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
         from cloud_network_benchmark.contracts.validation import ValidatorInput
         from cloud_network_benchmark.validation import evaluate_comparison, validate_bundle

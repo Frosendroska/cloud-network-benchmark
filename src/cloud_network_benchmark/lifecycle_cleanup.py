@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import time
 from typing import Any
@@ -156,7 +157,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
         result = AwsProviderDriver(runner, AwsRuntimeSettings.model_validate(saved.settings),
             clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
-        absent_ids = _journal_ids(journal, "known_resource_ids")
+        absent_ids = _known_resource_ids(journal)
         try:
             absent_ids.extend(_nested_resource_ids(json.loads(journal.read_text()).get("safety", {})))
         except (OSError, json.JSONDecodeError):
@@ -211,6 +212,22 @@ def _journal_ids(path: Path, key: str) -> list[str]:
     return _nested_resource_ids(value)
 
 
+def _known_resource_ids(path: Path) -> list[str]:
+    """Read only the provider journal's explicit category/region ID arrays."""
+    try:
+        categories = json.loads(path.read_text(encoding="utf-8")).get("known_resource_ids", {})
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    values = []
+    if isinstance(categories, dict):
+        for regions in categories.values():
+            if isinstance(regions, dict):
+                for ids in regions.values():
+                    if isinstance(ids, list):
+                        values.extend(item for item in ids if isinstance(item, str) and item.strip())
+    return list(dict.fromkeys(values))
+
+
 def _private_receipt(path: Path, value: dict[str, Any]) -> tuple[Path, bytes]:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink():
@@ -231,15 +248,22 @@ def _private_receipt(path: Path, value: dict[str, Any]) -> tuple[Path, bytes]:
             raise
     finally:
         temporary.unlink(missing_ok=True)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     return path, raw
 
 
 def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) -> bool:
     from .contracts.common import CleanupState
     state = getattr(result, "cleanup_state", None)
-    if state not in {CleanupState.SUCCEEDED, CleanupState.NOT_REQUIRED} or not absent_ids:
+    if state not in {CleanupState.SUCCEEDED, CleanupState.NOT_REQUIRED}:
         return False
     if provider == Provider.AWS:
+        if not absent_ids:
+            return False
         inventory = result.inventory.value if result.inventory else None
         if not isinstance(inventory, dict) or inventory.get("complete") is not True:
             return False
@@ -248,6 +272,8 @@ def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) ->
             and all(row.get("complete") is True and not row.get("remaining") for row in regions.values())
             and isinstance(safety, dict) and bool(safety) and all(value is True for value in safety.values()))
     if provider == Provider.GCP:
+        if not absent_ids:
+            return False
         inventory = result.inventory.value if result.inventory else None
         return (isinstance(inventory, dict) and inventory.get("pages_complete") is True
             and not inventory.get("resources")
@@ -259,14 +285,199 @@ def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) ->
     # the saved recovery journal. Unexpected resource identities remain a
     # cleanup blocker.
     return (result.cleanup_state == CleanupState.SUCCEEDED and result.launch_blocked is False
+        and isinstance(result.resources, list)
         and all(item.get("type") == "Microsoft.Automation/automationAccounts"
             and item.get("id") in absent_ids for item in result.resources))
+
+
+def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
+                                   ledger: Any, utc_now,
+                                   provider_resource_ids: list[str] | None = None) -> dict[str, Any]:
+    """Persist and construct the same source-bound F11 receipt for either cleanup path.
+
+    This helper does not mutate the F11 ledger or clear recovery flags. Callers
+    must durably reconcile its event first, then clear the corresponding
+    recovery liability.
+    """
+    from .admission import Reconciliation
+
+    if not record.cleanup_settings_reference:
+        raise ValueError("cleanup receipt cannot be associated with saved settings")
+    saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
+    if (record.provider != str(saved.provider) or record.deployment_id != saved.deployment.deployment_id
+            or saved.reservation.reservation_id.value != recovery.reservation_id):
+        raise ValueError("cleanup receipt identity differs from the saved attempt")
+    if not recovery.ledger_path or not recovery.ledger_scope_id or not recovery.reservation_id:
+        raise ValueError("saved attempt lacks its original F11 ledger reference")
+    if (Path(ledger.path).resolve() != Path(recovery.ledger_path).resolve()
+            or ledger.scope_id != recovery.ledger_scope_id):
+        raise ValueError("cleanup reconciliation did not use the original F11 ledger")
+    try:
+        reservation = ledger.inspect()["reservations"][recovery.reservation_id]
+        expected = ReservationEvidence.model_validate(reservation["evidence"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("original F11 reservation evidence is unavailable") from exc
+    if saved.reservation.model_dump(mode="json") != expected.model_dump(mode="json"):
+        raise ValueError("saved provider cleanup reservation differs from original F11 evidence")
+
+    journal = Path(record.journal_reference)
+    try:
+        state = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        state = {}
+    if provider_resource_ids is not None:
+        if (not isinstance(provider_resource_ids, list)
+                or any(not isinstance(item, str) or not item.strip() for item in provider_resource_ids)):
+            raise ValueError("provider cleanup resource identities are malformed")
+        absent_ids = list(dict.fromkeys(provider_resource_ids))
+    elif saved.provider == Provider.AWS:
+        absent_ids = _known_resource_ids(journal) + _nested_resource_ids(state.get("safety", {}))
+    elif saved.provider == Provider.GCP:
+        absent_ids = (_journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
+            + _nested_resource_ids(state.get("templates", {}))
+            + _nested_resource_ids(state.get("observed_resources", {}))
+            + _nested_resource_ids(state.get("observed_disks", [])))
+    else:
+        absent_ids = [value for value in state.get("vm_ids", ()) if isinstance(value, str)]
+        prereq = state.get("expiry", {})
+        absent_ids.extend(value for key, value in prereq.items()
+            if key.endswith("_id") and isinstance(value, str) and value.startswith("/subscriptions/"))
+        if not absent_ids:
+            # Azure removes its private provider journal only after every direct
+            # VM/Automation absence check, resource inventory, and RBAC inventory
+            # succeeds. `_validate_request` above binds these IDs to that attempt.
+            absent_ids = [item for item in saved.expiry_request.target_selector.split(";") if item]
+    if saved.provider == Provider.AZURE:
+        identity = getattr(result, "identity", None)
+        if (identity is None or identity.run_id != saved.deployment.run_id
+                or identity.deployment_id != saved.deployment.deployment_id
+                or getattr(identity.provider, "value", identity.provider) != str(saved.provider)):
+            raise ValueError("Azure cleanup result identity differs from the saved deployment")
+    absent_ids = list(dict.fromkeys(item for item in absent_ids if isinstance(item, str) and item.strip()))
+    verified_absent = result is not None and _result_is_absent(saved.provider, result, absent_ids)
+    at = utc_now()
+    typed = result.model_dump(mode="json") if result is not None and hasattr(result, "model_dump") else None
+    receipt = {"schema_version": 1, "provider": str(saved.provider),
+        "reservation_id": recovery.reservation_id, "deployment_id": saved.deployment.deployment_id,
+        "occurred_at": at.isoformat(), "cleanup_result": typed,
+        "absence_proved": verified_absent,
+        "absent_resource_ids": sorted(set(absent_ids)) if verified_absent else []}
+    raw = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    receipt_path = Path(record.cleanup_settings_reference).with_name(
+        f"{recovery.reservation_id}-{record.provider}-cleanup-{digest[:16]}.json")
+    receipt_path, _ = _private_receipt(receipt_path, receipt)
+    failure = None
+    if not verified_absent:
+        cleanup_fail = getattr(result, "cleanup_failure", None) if result is not None else None
+        if cleanup_fail is not None:
+            failure = {"category": cleanup_fail.category, "message": cleanup_fail.message[:500]}
+        else:
+            failure = {"category": "cleanup_incomplete", "message": "provider absence is not proved"}
+    event = Reconciliation(event_id=f"cleanup-{recovery.reservation_id}-{record.provider}-{digest[:16]}",
+        reservation_id=recovery.reservation_id, provider=record.provider,
+        source_sha256=digest, source_path=str(receipt_path), incurred_usd=None,
+        actual=False, cleanup_verified_absent=verified_absent,
+        billable_resources_present=False if verified_absent else None,
+        cleanup_status_reported=True, failure=failure, occurred_at=at,
+        billing_final=False, billing_amount_kind="cumulative",
+        absence_evidence_id=(f"{record.provider}-cleanup-{digest[:16]}" if verified_absent else None),
+        absent_resource_ids=tuple(sorted(set(absent_ids))) if verified_absent else ())
+    return {"ledger_event": event, "absence_proved": verified_absent,
+        "billable_resources_present": False if verified_absent else None,
+        "cleanup_open": not verified_absent, "billing_final": False, "incurred_usd": None}
+
+
+def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> bool:
+    """Verify a durable cleanup receipt and idempotently reconcile its exact event."""
+    from .admission import Reconciliation
+
+    if not record.cleanup_settings_reference or not recovery.reservation_id:
+        return False
+    directory = Path(record.cleanup_settings_reference).parent
+    saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
+    if (str(saved.provider) != record.provider or saved.deployment.deployment_id != record.deployment_id
+            or saved.reservation.reservation_id.value != recovery.reservation_id):
+        return False
+    if (Path(ledger.path).resolve() != Path(recovery.ledger_path).resolve()
+            or ledger.scope_id != recovery.ledger_scope_id):
+        return False
+    for receipt_path in sorted(directory.glob(f"{recovery.reservation_id}-{record.provider}-cleanup-*.json")):
+        if receipt_path.is_symlink():
+            continue
+        try:
+            raw = receipt_path.read_bytes()
+            receipt = json.loads(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            if (receipt_path.name != f"{recovery.reservation_id}-{record.provider}-cleanup-{digest[:16]}.json"
+                    or receipt.get("provider") != record.provider
+                    or receipt.get("reservation_id") != recovery.reservation_id
+                    or receipt.get("deployment_id") != record.deployment_id
+                    or receipt.get("absence_proved") is not True
+                    or not receipt.get("absent_resource_ids")):
+                continue
+            from .contracts.common import Provider
+            if saved.provider == Provider.AWS:
+                from .providers.aws import AwsCleanupResult
+                result = AwsCleanupResult.model_validate(receipt["cleanup_result"])
+                expected_ids = _known_resource_ids(_expected_journal(saved))
+                state = json.loads(_expected_journal(saved).read_text(encoding="utf-8"))
+                expected_ids.extend(_nested_resource_ids(state.get("safety", {})))
+                if set(expected_ids) != set(receipt["absent_resource_ids"]):
+                    continue
+            elif saved.provider == Provider.GCP:
+                from .providers.gcp import GcpCleanupResult
+                result = GcpCleanupResult.model_validate(receipt["cleanup_result"])
+                journal = _expected_journal(saved)
+                state = json.loads(journal.read_text(encoding="utf-8"))
+                expected_ids = (_journal_ids(journal, "observed_resources")
+                    + _journal_ids(journal, "observed_disks")
+                    + _nested_resource_ids(state.get("templates", {}))
+                    + _nested_resource_ids(state.get("observed_resources", {}))
+                    + _nested_resource_ids(state.get("observed_disks", [])))
+                if set(expected_ids) != set(receipt["absent_resource_ids"]):
+                    continue
+            else:
+                from .azure_provider import AzureCleanupResult
+                result = AzureCleanupResult.model_validate(receipt["cleanup_result"])
+                if (result.identity.run_id != saved.deployment.run_id
+                        or result.identity.deployment_id != saved.deployment.deployment_id
+                        or result.identity.provider != str(saved.provider)):
+                    continue
+                if not set(saved.expiry_request.target_selector.split(";")) <= set(receipt["absent_resource_ids"]):
+                    continue
+            if not _result_is_absent(saved.provider, result, receipt["absent_resource_ids"]):
+                continue
+            if (receipt_path.parent.resolve() != directory.resolve()
+                    or stat.S_IMODE(receipt_path.stat().st_mode) & 0o077):
+                continue
+            event_id = f"cleanup-{recovery.reservation_id}-{record.provider}-{digest[:16]}"
+            event = Reconciliation(event_id=event_id, reservation_id=recovery.reservation_id,
+                provider=record.provider, source_sha256=digest,
+                incurred_usd=None, actual=False, cleanup_verified_absent=True,
+                billable_resources_present=False, cleanup_status_reported=True, failure=None,
+                occurred_at=datetime.fromisoformat(receipt["occurred_at"]), billing_final=False,
+                billing_amount_kind="cumulative", released_funding_by_bucket={},
+                source_path=str(receipt_path), absence_evidence_id=f"{record.provider}-cleanup-{digest[:16]}",
+                absent_resource_ids=tuple(sorted(set(receipt["absent_resource_ids"]))))
+            try:
+                ledger.reconcile(event)
+            except BaseException as exc:
+                # A validated durable receipt is now the recovery source of
+                # truth. Never fall through to another provider command when
+                # the original F11 acknowledgement could not be persisted.
+                raise RuntimeError("original F11 cleanup receipt reconciliation failed") from exc
+            return ledger.inspect().get("reservations", {}).get(recovery.reservation_id, {}).get(
+                "provider_cleanup", {}).get(record.provider) is True
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    return False
 
 
 def build_cleanup_runtime(*, recovery_path: Path, recovery: Any, current_session_id: str, runner: Any,
                           utc_now, monotonic_now):
     """Rebuild only the saved cleanup and reconciliation path; no admission or launch path."""
-    from .admission import BudgetLedger, Reconciliation
+    from .admission import BudgetLedger
     from .orchestration import cleanup_lifecycle
 
     if not recovery.ledger_path or not recovery.ledger_scope_id or not recovery.reservation_id:
@@ -281,70 +492,23 @@ def build_cleanup_runtime(*, recovery_path: Path, recovery: Any, current_session
         reservation_record = ledger.inspect()["reservations"][recovery.reservation_id]
     except (KeyError, TypeError) as exc:
         raise ValueError("saved reservation is missing from its original F11 ledger") from exc
-    saved_reservation = ReservationEvidence.model_validate(reservation_record["evidence"])
-    outputs: dict[str, tuple[Any, SavedProviderCleanupSettings, list[str], str | None]] = {}
+    outputs: dict[str, Any] = {}
 
     def cleanup(record: Any):
         try:
-            result, saved, absent_ids = cleanup_saved_provider(record, runner=runner,
+            result, saved, _absent_ids = cleanup_saved_provider(record, runner=runner,
                 utc_now=utc_now, monotonic_now=monotonic_now)
-            if saved.reservation.reservation_id.value != recovery.reservation_id:
-                raise ValueError("provider cleanup settings reference a different F11 reservation")
-            if saved.reservation.model_dump(mode="json") != saved_reservation.model_dump(mode="json"):
-                raise ValueError("provider cleanup reservation differs from the original ledger evidence")
-            outputs[record.provider] = (result, saved, absent_ids, None)
+            outputs[record.provider] = result
             return result
         except BaseException as exc:
-            saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
-            outputs[record.provider] = (None, saved, [], f"{type(exc).__name__}: {str(exc)[:300]}")
+            outputs[record.provider] = None
             raise
 
     def reconcile(record: Any, result: Any):
-        prior = outputs.get(record.provider)
-        if prior is None:
-            if not record.cleanup_settings_reference:
-                raise ValueError("cleanup receipt cannot be associated with saved settings")
-            saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
-            absent_ids, failure = [], "cleanup adapter did not return typed evidence"
-        else:
-            result, saved, absent_ids, failure = prior
-        if result is not None and result is not prior[0]:
+        if record.provider in outputs and result is not outputs[record.provider]:
             raise ValueError("cleanup callback result changed before reconciliation")
-        typed = result.model_dump(mode="json") if result is not None and hasattr(result, "model_dump") else None
-        verified_absent = result is not None and _result_is_absent(saved.provider, result, absent_ids)
-        at = utc_now()
-        receipt = {"schema_version": 1, "provider": str(saved.provider),
-            "reservation_id": recovery.reservation_id, "deployment_id": saved.deployment.deployment_id,
-            "occurred_at": at.isoformat(), "cleanup_result": typed,
-            "failure": failure, "absence_proved": verified_absent,
-            "absent_resource_ids": sorted(set(absent_ids)) if verified_absent else []}
-        raw = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
-        digest = hashlib.sha256(raw).hexdigest()
-        receipt_path = Path(record.cleanup_settings_reference).with_name(
-            f"{recovery.reservation_id}-{record.provider}-cleanup-{digest[:16]}.json")
-        receipt_path, raw = _private_receipt(receipt_path, receipt)
-        result_failure = None
-        if not verified_absent:
-            cleanup_fail = getattr(result, "cleanup_failure", None) if result is not None else None
-            if cleanup_fail is not None:
-                result_failure = {"category": cleanup_fail.category, "message": cleanup_fail.message[:500]}
-            elif failure:
-                result_failure = {"category": "cleanup_incomplete", "message": failure}
-        event = Reconciliation(event_id=f"cleanup-{recovery.reservation_id}-{record.provider}-{digest[:16]}",
-            reservation_id=recovery.reservation_id, provider=record.provider,
-            source_sha256=digest, source_path=str(receipt_path), incurred_usd=None,
-            actual=False, cleanup_verified_absent=verified_absent,
-            billable_resources_present=False if verified_absent else None,
-            cleanup_status_reported=True, failure=result_failure, occurred_at=at,
-            billing_final=False, billing_amount_kind="cumulative",
-            absence_evidence_id=(f"{record.provider}-cleanup-{digest[:16]}" if verified_absent else None),
-            absent_resource_ids=tuple(sorted(set(absent_ids))) if verified_absent else ())
-        return {"ledger_event": event, "absence_proved": verified_absent,
-            "billable_resources_present": False if verified_absent else None,
-            # Provider-local clearance is independent of whether peer providers
-            # have completed their own cleanup event in this sequential loop.
-            "cleanup_open": not verified_absent, "billing_final": False,
-            "incurred_usd": None}
+        return reconcile_saved_cleanup_result(record, result, recovery=recovery,
+            ledger=ledger, utc_now=utc_now)
 
     return cleanup_lifecycle(Path(recovery_path), current_session_id=current_session_id,
         cleanup_actions={row.provider: cleanup for row in recovery.providers},

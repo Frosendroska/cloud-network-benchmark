@@ -750,13 +750,36 @@ def azure_hooks(deployment: ProviderDeploymentInput, expiry_request: ExpiryReque
         return state["result"]
     def stage(name: str):
         return getattr(stages, name)(state["deployment"], _last_result(state))
+    def cleanup():
+        # Azure's native destroy removes its provider journal only after every
+        # absence check succeeds, so snapshot the exact source-bound identities
+        # before invoking it for the F11 cleanup receipt.
+        journal = Path(options.attempt_root) / "recovery.json"
+        saved = json.loads(journal.read_text(encoding="utf-8")) if journal.is_file() and not journal.is_symlink() else {}
+        ids = [item for item in saved.get("vm_ids", ()) if isinstance(item, str) and item.strip()]
+        expiry = saved.get("expiry", {})
+        if isinstance(expiry, Mapping):
+            ids.extend(value for key, value in expiry.items()
+                if key.endswith("_id") and isinstance(value, str) and value.strip())
+            metadata = expiry.get("metadata", {})
+            if isinstance(metadata, Mapping):
+                account = metadata.get("automation_account_id")
+                if isinstance(account, str) and account.strip():
+                    ids.append(account)
+                    for collection, key in (("runbooks", "runbook"), ("schedules", "schedule"),
+                            ("jobSchedules", "job_schedule_id")):
+                        child = metadata.get(key)
+                        if isinstance(child, str) and child.strip():
+                            ids.append(f"{account}/{collection}/{child}")
+        state["cleanup_resource_ids"] = list(dict.fromkeys(ids))
+        return azure_provider.destroy(state["deployment"], options, runner, clock=clock, utc_now=utc_now)
     return ProviderHooks(
         provider="azure", protect=protect,
         claim=lambda: stages.claim(state["deployment"], claim_data),
         create=create, prepare=lambda: stage("prepare"), stabilize=lambda: stage("stabilize"),
         measure=lambda: stage("measure"), close=lambda: stage("close"),
-        retrieve=lambda: stage("retrieve"),
-        cleanup=lambda: azure_provider.destroy(state["deployment"], options, runner, clock=clock, utc_now=utc_now),
+        retrieve=lambda: stage("retrieve"), cleanup=cleanup,
+        cleanup_resource_ids=lambda: list(state.get("cleanup_resource_ids", ())),
     )
 
 
