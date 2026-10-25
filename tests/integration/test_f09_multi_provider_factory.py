@@ -302,7 +302,11 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
                 return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
                     started_at=clock.utc_now(), finished_at=clock.utc_now(), duration_seconds=0,
                     exit_code=0, stdout=json.dumps(payload), stderr="")
-            return self.delegate.run(request)
+            outcome = self.delegate.run(request)
+            if request.action_type == "expiry_destroy" and outcome.outcome == CommandOutcome.SUCCEEDED:
+                self.delegate.account_present = False
+                self.delegate.present_children.clear()
+            return outcome
     runner = AzureCommandRunner()
     original_azure_hooks = adapters.azure_hooks
     observed = {}
@@ -378,19 +382,20 @@ def _costs(path: Path, campaign, children):
     return load_cost_inputs(path)
 
 
-@pytest.mark.parametrize(("successful_protection", "config_name", "interrupt_f11_cleanup"), [
-    (False, "configs/tests/exp-903-three-provider-smoke.yaml", False),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False),
-    (True, "configs/tests/exp-903-three-provider-smoke.yaml", True),
-    (True, "configs/experiments/exp-001-calibration.yaml", False),
-    (True, "configs/experiments/exp-001-multi-provider.yaml", False),
-    (True, "configs/experiments/exp-001-diagnostic-day.yaml", False),
+@pytest.mark.parametrize(("successful_protection", "config_name", "interrupt_f11_cleanup", "interrupt_controller"), [
+    (False, "configs/tests/exp-903-three-provider-smoke.yaml", False, False),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False, False),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", True, False),
+    (True, "configs/tests/exp-903-three-provider-smoke.yaml", False, True),
+    (True, "configs/experiments/exp-001-calibration.yaml", False, False),
+    (True, "configs/experiments/exp-001-multi-provider.yaml", False, False),
+    (True, "configs/experiments/exp-001-diagnostic-day.yaml", False, False),
 ], ids=["protection-failure", "all-provider-acceptance", "receipt-before-f11-recovery",
-    "all-provider-calibration",
+    "controller-interrupt-during-native-f03", "all-provider-calibration",
     "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
         tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
-        successful_protection, config_name, interrupt_f11_cleanup):
+        successful_protection, config_name, interrupt_f11_cleanup, interrupt_controller):
     config = ROOT / config_name
     schedule_entry = None
     is_calibration = "calibration" in config_name
@@ -516,6 +521,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     "support_cost_path": ROOT / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                     "primary_review_path": None}}}}
     clock = Clock()
+    f03_status_started = threading.Event()
+    provider_status_started = {provider: threading.Event() for provider in children}
+    provider_cancel_called = {provider: threading.Event() for provider in children}
     if successful_protection:
         import cloud_network_benchmark.lifecycle_adapters as adapters
         from cloud_network_benchmark.bootstrap import BootstrapConfig as NativeBootstrapConfig, SourceBuild as NativeSourceBuild
@@ -635,6 +643,15 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 responder = self.remote[provider]
                 if request.action_type == "scp":
                     return responder.run(request)
+                if request.action_id.startswith("f09-guest-status-") and interrupt_controller:
+                    f03_status_started.set()
+                    provider_status_started[provider].set()
+                    assert provider_cancel_called[provider].wait(10), (
+                        "production cancel callback did not reach the active F03 status poll", provider)
+                    now = clock.utc_now()
+                    return CommandResult(action_id=request.action_id, outcome="succeeded",
+                        started_at=now, finished_at=now, duration_seconds=0, exit_code=0,
+                        stdout="running\n", stderr="")
                 if request.action_id.startswith(("f02r-", "f09-")):
                     return responder.run(request)
                 now = clock.utc_now()
@@ -645,12 +662,42 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
     built = build_runtime(campaign=campaign, parent=parent, children=children, costs=costs,
         runtime=runtime, controller_session_id="synthetic-session", runner=runner,
         clock=clock, private_root=tmp_path / "private", repository_root=ROOT)
+    original_workflow_factory = built["workflow_factory"]
+    workflow_factory = original_workflow_factory
+    captured_workflows = {}
+    if interrupt_controller:
+        def capture_workflows(reservation):
+            hooks = original_workflow_factory(reservation)
+            from dataclasses import replace
+            observed_hooks = {}
+            for provider_name, hooks_for_provider in hooks.items():
+                original_cancel = hooks_for_provider.cancel
+                def observed_cancel(provider_name=provider_name, callback=original_cancel):
+                    value = callback()
+                    provider_cancel_called[provider_name].set()
+                    return value
+                observed_hooks[provider_name] = replace(hooks_for_provider, cancel=observed_cancel)
+            captured_workflows.update(observed_hooks)
+            return observed_hooks
+        workflow_factory = capture_workflows
     if getattr(campaign.mode, "value", campaign.mode) == "calibration":
         from cloud_network_benchmark.admission import BudgetLedger, _validate_paid_acceptance_evidence
         for gate in ("calibration_authorized", "common_n", "study_window", "diagnostic_day_authorized", "size_export_review", "paid_acceptance"):
             if gate in built["plan"].prerequisites:
                 BudgetLedger._validate_gate_evidence(built["plan"].prerequisites[gate])
         _validate_paid_acceptance_evidence(built["plan"].prerequisites["paid_acceptance"], campaign)
+    if interrupt_controller:
+        import cloud_network_benchmark.orchestration as orchestration_module
+        original_as_completed = orchestration_module.as_completed
+        interrupted_once = {"done": False}
+        def inject_controller_interrupt(futures):
+            if not interrupted_once["done"]:
+                interrupted_once["done"] = True
+                assert all(event.wait(15) for event in provider_status_started.values()), (
+                    "all actual provider F03 stages did not enter their bounded status polls")
+                raise KeyboardInterrupt("injected controller interrupt while actual F03 was active")
+            return original_as_completed(futures)
+        monkeypatch.setattr(orchestration_module, "as_completed", inject_controller_interrupt)
     if successful_protection:
         runtime["sleep"] = clock.sleep
         runner.ledger = built["ledger"]
@@ -702,8 +749,31 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         monkeypatch.setattr(adapters, "prepare_remote_pair", observe_prepare_remote_pair)
     result = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
         admission_plan=built["plan"], allowance=built["allowance"],
-        workflow_factory=built["workflow_factory"], clock=clock,
+        workflow_factory=workflow_factory, clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    if interrupt_controller:
+        assert interrupted_once["done"] and f03_status_started.is_set()
+        assert result.admission_status == "reserved" and result.completed is False
+        assert set(captured_workflows) == {"aws", "azure", "gcp"}
+        assert all(provider_cancel_called[provider].is_set() for provider in children)
+        assert set(result.provider_results) == {"aws", "azure", "gcp"}
+        for provider_name, provider_result in result.provider_results.items():
+            assert provider_result.interrupted is True, (provider_name, provider_result)
+            assert provider_result.values.get("cancel", {}).get("requested") is True
+            assert provider_result.values.get("cancel", {}).get("verified_stopped") is False
+            assert provider_result.values.get("cleanup") is not None
+            assert provider_result.cleanup_state == "succeeded", (provider_name, provider_result.values.get("cleanup"))
+            actions = runner.remote[provider_name].actions
+            assert any(action.startswith("f09-guest-cancel-") for action in actions), (provider_name, actions)
+            assert len([action for action in actions if action.startswith("f09-diagnostics-stop-")]) == 2
+            assert len([action for action in actions if action.startswith("f09-listener-stop-")]) >= 1
+        reservation_id = result.reservation_evidence.reservation_id.value
+        ledger_state = built["ledger"].inspect()
+        reservation_record = ledger_state["reservations"][reservation_id]
+        assert reservation_record["provider_cleanup"] == {p: True for p in children}
+        assert all(item["final"] is False for item in reservation_record["provider_billing"].values())
+        assert reservation_record.get("released_usd", "0") == "0"
+        return
     if interrupt_f11_cleanup:
         assert interrupted["done"] is True
         assert result.admission_status == "reserved"

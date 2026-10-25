@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import sys
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -172,6 +173,10 @@ def main(argv=None) -> int:
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--outcome", required=True, type=Path)
     args = parser.parse_args(argv)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    def interrupt_measurement(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupt_measurement)
     try:
         if not args.request.is_absolute() or not args.outcome.is_absolute() or args.request == args.outcome:
             raise ValueError("request and outcome must be distinct absolute paths")
@@ -188,6 +193,8 @@ def main(argv=None) -> int:
     except Exception as exc:
         print(json.dumps({"outcome": "failed", "error_type": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

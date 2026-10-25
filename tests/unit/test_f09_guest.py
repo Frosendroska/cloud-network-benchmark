@@ -122,34 +122,48 @@ def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity
     runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
         "3.12.3", "2.14.0", "6.0.2", ())
     class Runner:
-        def __init__(self): self.actions=[]; self.request_payload=None; self.outcome_payload=None
+        def __init__(self, cancel_event): self.actions=[]; self.request_payload=None; self.outcome_payload=None; self.cancel_event=cancel_event
         def run(self, command):
             self.actions.append(command)
             if command.action_id.startswith("f09-guest-request-"):
                 self.request_payload = json.loads(Path(command.argv[-2]).read_text())
             elif command.action_id.startswith("f09-guest-run-"):
                 assert "cloud_network_benchmark.lifecycle_guest --request" in command.argv[-1]
-                assert command.timeout_seconds == deadline().overall_deadline_monotonic - 100
+                assert command.timeout_seconds == min(command.timeout_seconds,
+                    deadline().overall_deadline_monotonic - 100)
                 row = self.request_payload
+                invocation = command.action_id.removeprefix("f09-guest-run-")
                 self.outcome_payload = GuestOutcome(identity=row["identity"], outcome="succeeded",
                     executed_unit_ids=[item["unit_id"] for item in row["observation"]["measurement_units"]],
                     unexecuted_unit_ids=[], commands=[], timings=[], artifact_paths=[],
                     source_revision=row["source_revision"], package_sha256=row["package_sha256"],
                     guest_started_at=datetime.now(timezone.utc), guest_finished_at=datetime.now(timezone.utc)).model_dump_json()
+                return result(command.action_id, json.dumps({"deployment_id": connected.deployment_id,
+                    "invocation_id": invocation, "pid": 25001, "process_group": 25001,
+                    "session_id": 25001, "boot_id": "synthetic-boot", "start_ticks": 12345}))
+            elif command.action_id.startswith("f09-guest-status-"):
+                # Cancellation racing with actual guest completion preserves
+                # the authenticated terminal status and retrieves its output.
+                self.cancel_event.set()
+                return result(command.action_id, "exited 0")
             elif command.action_id.startswith("f09-guest-outcome-"):
                 Path(command.argv[-1]).write_text(self.outcome_payload)
             return result(command.action_id)
-    runner=Runner()
+    import threading
+    cancel_event = threading.Event()
+    runner=Runner(cancel_event)
     report=run_remote_f03(connected, request, runner=runner, runtime=runtime,
-        deadline=deadline(), clock=lambda:100)
+        deadline=deadline(), clock=lambda:100, cancel_event=cancel_event)
     assert report.failure is None and report.outcome.outcome == "succeeded"
-    assert [item.action_type for item in report.actions] == ["ssh", "scp", "ssh", "scp"]
+    assert [item.action_type for item in report.actions] == ["ssh", "scp", "ssh", "ssh", "scp"]
+    assert not any(item.action_id.startswith("f09-guest-cancel-") for item in report.actions)
     assert report.outcome.identity == request.identity
     from cloud_network_benchmark.orchestration import _typed_outcome
     assert _typed_outcome("aws", "measure", report)[0] is True
 
 
 def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruption(repository_root, tmp_path):
+    import json
     from datetime import datetime, timezone
     from cloud_network_benchmark.contracts.execution import CommandResult
     from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
@@ -170,29 +184,154 @@ def test_remote_f03_cancels_and_verifies_exact_guest_group_after_ssh_interruptio
         "3.12.3", "2.14.0", "6.0.2", ())
 
     class Runner:
-        def __init__(self): self.requests = []
+        def __init__(self, cancellation): self.requests = []; self.cancellation = cancellation
         def run(self, command):
             self.requests.append(command)
             if command.action_id.startswith("f09-guest-run-"):
                 assert "setsid sh -c" in command.argv[-1]
-                now = datetime.now(timezone.utc)
-                return CommandResult(action_id=command.action_id, outcome="interrupted",
-                    started_at=now, finished_at=now, duration_seconds=0, exit_code=None,
-                    stdout="", stderr="interrupted")
+                invocation = command.action_id.removeprefix("f09-guest-run-")
+                return result(command.action_id, json.dumps({"deployment_id": connected.deployment_id,
+                    "invocation_id": invocation, "pid": 25001, "process_group": 25001,
+                    "session_id": 25001, "boot_id": "synthetic-boot", "start_ticks": 12345}))
+            if command.action_id.startswith("f09-guest-status-"):
+                self.cancellation.set()
+                return result(command.action_id, "running")
             if command.action_id.startswith("f09-guest-cancel-"):
-                assert "kill -TERM" in command.argv[-1]
-                assert "process_group_stopped" in command.argv[-1]
+                assert "b64decode" in command.argv[-1]
                 return result(command.action_id, "process_group_stopped")
             return result(command.action_id)
 
-    runner = Runner()
+    import threading
+    cancellation = threading.Event()
+    runner = Runner(cancellation)
     report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
-        deadline=deadline(), clock=lambda:100)
-    assert report.outcome is None and "F03 guest command evidence failed" in report.failure
+        deadline=deadline(), clock=lambda:100, cancel_event=cancellation, sleep=lambda _seconds: None)
+    assert report.outcome is None and "process_group_stopped" in report.failure
     assert [item.action_id.split("-")[2] for item in report.actions if item.action_id.startswith("f09-guest-")] == [
-        "control", "request", "run", "cancel"]
+        "control", "request", "run", "status", "cancel"]
     cancel = next(item for item in report.actions if item.action_id.startswith("f09-guest-cancel-"))
     assert cancel.result["stdout"] == "process_group_stopped"
+
+
+def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp_path):
+    """Exercise the production stop script against a real local session, offline."""
+    import json
+    import os
+    import shlex
+    import subprocess
+    import sys
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.lifecycle_adapters import _stop_remote_f03
+    from tests.fixtures.f02r.support import connection, deadline
+
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("the local test host has no Linux /proc process identity interface")
+    connected = connection(tmp_path)
+    leader = subprocess.Popen([sys.executable, "-c",
+        "import os,time; child=os.fork(); os._exit(0) if child else time.sleep(30)"],
+        start_new_session=True)
+    pid = leader.pid
+    stat_path = Path(f"/proc/{pid}/stat")
+    import time
+    for _ in range(100):
+        try:
+            stat_raw = stat_path.read_text()
+            break
+        except FileNotFoundError:
+            time.sleep(.01)
+    tail = stat_raw[stat_raw.rfind(")") + 2:].split()
+    record = {"deployment_id": connected.deployment_id, "invocation_id": "owned-child-session",
+        "pid": pid, "process_group": os.getpgid(pid), "session_id": os.getsid(pid),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "start_ticks": int(tail[19])}
+    process_path = tmp_path / "owned-child-session.process.json"
+    process_path.write_text(json.dumps(record, sort_keys=True))
+    leader.wait(timeout=2)
+    assert not stat_path.exists(), "test precondition: session leader has exited"
+    class LocalScopedRunner:
+        def run(self, command):
+            tokens = shlex.split(command.argv[-1])
+            assert tokens[:2] == ["python3", "-c"]
+            completed = subprocess.run([sys.executable, "-c", tokens[2], *tokens[3:]],
+                capture_output=True, text=True, timeout=8)
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=command.action_id,
+                outcome="succeeded" if completed.returncode == 0 else "failed",
+                started_at=now, finished_at=now, duration_seconds=0,
+                exit_code=completed.returncode, stdout=completed.stdout,
+                stderr=completed.stderr)
+    actions = []
+    status = _stop_remote_f03(connected, record, record["invocation_id"],
+        process_path=str(process_path), runner=LocalScopedRunner(), deadline=deadline(),
+        clock=lambda:100, actions=actions)
+    assert status == "process_group_stopped"
+    assert actions and "process_group_stopped" in actions[-1].result["stdout"]
+
+
+def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
+    import json
+    import os
+    import shlex
+    import subprocess
+    import sys
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.lifecycle_adapters import _stop_remote_f03
+    from tests.fixtures.f02r.support import connection, deadline
+
+    if not Path("/proc/self/stat").is_file():
+        pytest.skip("the local test host has no Linux /proc process identity interface")
+    connected = connection(tmp_path)
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
+    raw = Path(f"/proc/{process.pid}/stat").read_text()
+    tail = raw[raw.rfind(")") + 2:].split()
+    record = {"deployment_id": connected.deployment_id, "invocation_id": "wrong-start-ticks",
+        "pid": process.pid, "process_group": os.getpgid(process.pid), "session_id": os.getsid(process.pid),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "start_ticks": int(tail[19]) + 1}
+    process_path = tmp_path / "wrong-start-ticks.process.json"
+    process_path.write_text(json.dumps(record, sort_keys=True))
+    class LocalScopedRunner:
+        def run(self, command):
+            tokens = shlex.split(command.argv[-1])
+            completed = subprocess.run([sys.executable, "-c", tokens[2], *tokens[3:]],
+                capture_output=True, text=True, timeout=3)
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=command.action_id,
+                outcome="succeeded" if completed.returncode == 0 else "failed",
+                started_at=now, finished_at=now, duration_seconds=0,
+                exit_code=completed.returncode, stdout=completed.stdout,
+                stderr=completed.stderr)
+    actions = []
+    try:
+        status = _stop_remote_f03(connected, record, record["invocation_id"],
+            process_path=str(process_path), runner=LocalScopedRunner(), deadline=deadline(),
+            clock=lambda:100, actions=actions)
+        assert status == "cancellation_unverified"
+        assert process.poll() is None, "mismatched start ticks must not signal a reused PID"
+    finally:
+        os.killpg(process.pid, 9)
+        process.wait(timeout=3)
+
+
+def test_guest_sigterm_bridge_raises_interrupt_and_restores_original_handler(
+        repository_root, tmp_path, monkeypatch, capsys):
+    import signal
+    from cloud_network_benchmark import lifecycle_guest
+
+    request, _clock = _request(repository_root, tmp_path)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(request.model_dump_json())
+    prior = signal.getsignal(signal.SIGTERM)
+    def send_sigterm(_request):
+        signal.raise_signal(signal.SIGTERM)
+    monkeypatch.setattr(lifecycle_guest, "execute_request", send_sigterm)
+    status = lifecycle_guest.main(["--request", str(request_path),
+        "--outcome", str(tmp_path / "outcome.json")])
+    assert status == 1
+    assert "measurement interrupted" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) == prior
 
 
 def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(tmp_path):

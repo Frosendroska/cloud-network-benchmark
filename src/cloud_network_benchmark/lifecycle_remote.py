@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import shlex
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ class _Attempt:
     inventories: dict[str, Any] | None = None
     manifest: Any = None
     retrieval: Any = None
+    f03_process_record: dict[str, Any] | None = None
+    f03_process_absent_at: datetime | None = None
 
 
 def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, children: dict[str, Any],
@@ -79,6 +82,18 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         result_root = Path(repository_root) / result_root
     result_root = result_root.resolve(strict=True)
     attempts: dict[str, _Attempt] = {}
+    cancel_event = threading.Event()
+    control_lock = threading.Lock()
+    control: dict[str, Any] = {"process_record": None, "verified_absent_at": None}
+
+    def cancel():
+        # This callback is deliberately nonblocking: the active F03 poll loop
+        # owns the SSH stop operation and records whether process absence was
+        # actually verified. Setting an Event alone is never reported as stop.
+        cancel_event.set()
+        with control_lock:
+            return {"requested": True, "verified_stopped": False,
+                    "invocation_id": (control["process_record"] or {}).get("invocation_id")}
 
     def pair_of(value: Any):
         pair = value if hasattr(value, "vm_a") else getattr(value, "deployment", None)
@@ -116,6 +131,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
 
     def prepare(deployment: Any, provision: Any):
         try:
+            if cancel_event.is_set():
+                return ProviderStageOutcome("prepare", False, {"failure": "controller cancellation was requested"})
             item = attempt(deployment, provision)
             started = clock.monotonic()
             item.deadline = deadline_for(deployment, preparation_start=started)
@@ -132,6 +149,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
 
     def stabilize(deployment: Any, provision: Any):
         try:
+            if cancel_event.is_set():
+                return ProviderStageOutcome("stabilize", False, {"failure": "controller cancellation was requested"})
             item = attempt(deployment, provision)
             prepared = item.prepared
             if prepared is None or not prepared.succeeded:
@@ -151,6 +170,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "stabilization and remaining stages do not fit the original cap"})
             while clock.monotonic() < wait_until:
+                if cancel_event.is_set():
+                    raise InterruptedError("controller cancellation was requested during stabilization")
                 remaining = wait_until - clock.monotonic()
                 if item.deadline.remaining(clock.monotonic) <= 0:
                     raise TimeoutError("original provider cap expired during stabilization/slot wait")
@@ -165,6 +186,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
 
     def measure(deployment: Any, provision: Any):
         try:
+            if cancel_event.is_set():
+                return ProviderStageOutcome("measure", False, {"failure": "controller cancellation was requested"})
             item = attempt(deployment, provision)
             if item.stable is None or item.prepared is None or not item.prepared.succeeded:
                 return ProviderStageOutcome("measure", False,
@@ -274,7 +297,12 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 receiver_command_evidence=[command.model_dump(mode="json") for command in receiver_commands],
                 source_artifact_records=[])
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
-                runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic)
+                runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
+                cancel_event=cancel_event, sleep=sleep,
+                on_process_record=lambda record: _record_f03_process(record, control, control_lock, item))
+            if item.guest.failure and "process_group_stopped" in item.guest.failure:
+                item.f03_process_absent_at = clock.utc_now()
+                control["verified_absent_at"] = item.f03_process_absent_at
             item.guest = __import__("dataclasses").replace(item.guest,
                 receiver_command_evidence=tuple(receiver_commands))
             item.measurement_ended_at = (item.guest.outcome.guest_finished_at
@@ -288,23 +316,39 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     def close(deployment: Any, provision: Any):
         try:
             item = attempt(deployment, provision)
+            if (item.listener_closure is not None and item.closures is not None
+                    and {"vm_a", "vm_b", "vm_a_measurement_closed_at"} <= set(item.closures)
+                    and all(item.closures[role].state == "closed" and item.closures[role].closed_at is not None
+                            and not item.closures[role].failures for role in ("vm_a", "vm_b"))
+                    and item.listener_closure.closed and item.listener_closure.closed_at is not None
+                    and not item.listener_closure.failures):
+                return ProviderStageOutcome("close", True,
+                    {"diagnostics": item.closures, "listeners": item.listener_closure,
+                     "measurement_ended_at": item.measurement_ended_at})
             if item.measurement_ended_at is None:
                 item.measurement_ended_at = clock.utc_now()
             for role in ("vm_a", "vm_b"):
+                prior = (item.closures or {}).get(role)
+                if (prior is not None and prior.state == "closed" and prior.closed_at is not None
+                        and not prior.failures):
+                    continue
                 process = (item.diagnostics or {}).get(role)
                 if process is not None:
                     item.closures[role] = stop_remote_diagnostics(item.connection, process,
                         runner=runner, deadline=item.deadline, clock=clock.monotonic)
-            item.listener_closure = stop_vm_b_listeners(item.connection, runner=runner,
-                deadline=item.deadline, clock=clock.monotonic)
+            if item.listener_closure is None or not item.listener_closure.closed or item.listener_closure.failures:
+                item.listener_closure = stop_vm_b_listeners(item.connection, runner=runner,
+                    deadline=item.deadline, clock=clock.monotonic)
             closures = item.closures or {}
+            measurement_closed_at = (item.guest.outcome.guest_finished_at if item.guest and item.guest.outcome
+                else item.f03_process_absent_at)
             valid = (set(closures) == {"vm_a", "vm_b"}
                 and all(value.state == "closed" and value.closed_at is not None and not value.failures
                         for value in closures.values())
                 and item.listener_closure.closed and item.listener_closure.closed_at is not None
                 and not item.listener_closure.failures
-                and item.guest is not None and item.guest.outcome is not None)
-            item.closures["vm_a_measurement_closed_at"] = item.guest.outcome.guest_finished_at if item.guest and item.guest.outcome else None
+                and item.guest is not None and measurement_closed_at is not None)
+            item.closures["vm_a_measurement_closed_at"] = measurement_closed_at
             return ProviderStageOutcome("close", valid,
                 {"diagnostics": closures, "listeners": item.listener_closure,
                  "measurement_ended_at": item.measurement_ended_at})
@@ -374,7 +418,13 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     if hasattr(exc, "errors") else str(exc)})
 
     return RemoteStages(prepare=prepare, stabilize=stabilize, measure=measure,
-        close=close, retrieve=retrieve, claim=lambda *_: None)
+        close=close, retrieve=retrieve, claim=lambda *_: None, cancel=cancel)
+
+
+def _record_f03_process(record: dict[str, Any], control: dict[str, Any], lock: Any, attempt: _Attempt) -> None:
+    with lock:
+        control["process_record"] = dict(record)
+        attempt.f03_process_record = dict(record)
 
 
 def build_aws_remote_stages(**kwargs: Any):

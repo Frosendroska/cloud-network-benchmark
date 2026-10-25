@@ -492,23 +492,25 @@ def build_cleanup_runtime(*, recovery_path: Path, recovery: Any, current_session
         reservation_record = ledger.inspect()["reservations"][recovery.reservation_id]
     except (KeyError, TypeError) as exc:
         raise ValueError("saved reservation is missing from its original F11 ledger") from exc
-    outputs: dict[str, Any] = {}
+    outputs: dict[str, tuple[Any, list[str]]] = {}
 
     def cleanup(record: Any):
         try:
-            result, saved, _absent_ids = cleanup_saved_provider(record, runner=runner,
+            result, saved, absent_ids = cleanup_saved_provider(record, runner=runner,
                 utc_now=utc_now, monotonic_now=monotonic_now)
-            outputs[record.provider] = result
+            outputs[record.provider] = (result, absent_ids)
             return result
         except BaseException as exc:
-            outputs[record.provider] = None
+            outputs[record.provider] = (None, [])
             raise
 
     def reconcile(record: Any, result: Any):
-        if record.provider in outputs and result is not outputs[record.provider]:
+        output = outputs.get(record.provider)
+        if output is not None and result is not output[0]:
             raise ValueError("cleanup callback result changed before reconciliation")
         return reconcile_saved_cleanup_result(record, result, recovery=recovery,
-            ledger=ledger, utc_now=utc_now)
+            ledger=ledger, utc_now=utc_now,
+            provider_resource_ids=(output[1] if output is not None else None))
 
     return cleanup_lifecycle(Path(recovery_path), current_session_id=current_session_id,
         cleanup_actions={row.provider: cleanup for row in recovery.providers},

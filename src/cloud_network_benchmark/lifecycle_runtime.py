@@ -447,7 +447,8 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
 
     from .lifecycle_adapters import RemoteStages
     bound_stages = RemoteStages(prepare=stages.prepare, stabilize=stages.stabilize,
-        measure=stages.measure, close=stages.close, retrieve=stages.retrieve, claim=claim)
+        measure=stages.measure, close=stages.close, retrieve=stages.retrieve, claim=claim,
+        cancel=stages.cancel)
     return {"aws": aws_hooks(driver, deployment, request, stages=bound_stages,
         reservation=reservation, claim_data=None)}
 
@@ -739,7 +740,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
         source_stage = stages[provider]
         stage = RemoteStages(prepare=source_stage.prepare, stabilize=source_stage.stabilize,
             measure=source_stage.measure, close=source_stage.close,
-            retrieve=source_stage.retrieve, claim=claim)
+            retrieve=source_stage.retrieve, claim=claim, cancel=source_stage.cancel)
         deployment, request = deployments[provider], requests[provider]
         driver_or_options, _ = options_by_provider[provider]
         if provider == "aws":

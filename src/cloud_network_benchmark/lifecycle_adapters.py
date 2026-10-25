@@ -208,6 +208,7 @@ class RemoteStages:
     close: Callable[[ProviderDeploymentInput, Any], Any]
     retrieve: Callable[[ProviderDeploymentInput, Any], Any]
     claim: Callable[[ProviderDeploymentInput, Any], Any]
+    cancel: Callable[[], Any] = lambda: None
 
 
 def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_config: Any,
@@ -239,7 +240,9 @@ def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_con
 
 
 def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: GuestRuntimeEvidence,
-                   deadline: Any, clock: Callable[[], float] = __import__("time").monotonic) -> RemoteGuestExecution:
+                   deadline: Any, clock: Callable[[], float] = __import__("time").monotonic,
+                   cancel_event: Any = None, sleep: Callable[[float], None] = __import__("time").sleep,
+                   on_process_record: Callable[[dict[str, Any]], None] | None = None) -> RemoteGuestExecution:
     """Run the existing F03 entry on VM A and strictly retrieve its outcome.
 
     Request and response files use unique per-invocation names under the
@@ -301,46 +304,87 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             stage = "guest command construction"
             python = str(PurePosixPath(runtime.remote_root) / "venv" / "bin" / "python")
             module_root = str(PurePosixPath(runtime.remote_root) / "source")
-            pid_path = root / f"{invocation}.pid"
-            # Isolate the guest process group and publish its PID before it can
-            # outlive an interrupted SSH transport. A reachable controller can
-            # then cancel the exact invocation and verify the group exited.
+            status_path = root / f"{invocation}.status"
+            process_path = root / f"{invocation}.process.json"
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("controller cancellation arrived before F03 launch")
             guest_argv = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
                           f"cloud_network_benchmark.lifecycle_guest --request {shlex.quote(str(request_path))} "
                           f"--outcome {shlex.quote(str(outcome_path))}")
-            command = ("set -u; pidfile=" + shlex.quote(str(pid_path)) + "; "
-                       "setsid sh -c " + shlex.quote(guest_argv) + " & child=$!; "
-                       "printf '%s\\n' \"$child\" > \"$pidfile\"; "
-                       "wait \"$child\"; status=$?; rm -f -- \"$pidfile\"; exit \"$status\"")
+            guest_wrapper = (guest_argv + "; status=$?; printf '%s\\n' \"$status\" > "
+                + shlex.quote(str(status_path) + ".tmp") + "; mv -f -- "
+                + shlex.quote(str(status_path) + ".tmp") + " " + shlex.quote(str(status_path))
+                + "; exit \"$status\"")
+            record_python = ("import json,os,sys,time; pid=int(sys.argv[3]); "
+                "deadline=time.monotonic()+2; "
+                "exec('while True:\\n try:\\n  pg=os.getpgid(pid); sid=os.getsid(pid); break\\n except ProcessLookupError:\\n  if time.monotonic()>=deadline: raise\\n  time.sleep(.02)'); "
+                "stat=open('/proc/%d/stat'%pid).read(); tail=stat[stat.rfind(')')+2:].split(); "
+                "row={'deployment_id':sys.argv[1],'invocation_id':sys.argv[2],'pid':pid,'process_group':pg,'session_id':sid,'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip(),'start_ticks':int(tail[19])}; "
+                "assert pid==pg==sid and row['start_ticks']>0; "
+                "tmp=sys.argv[4]+'.tmp'; open(tmp,'x').write(json.dumps(row,sort_keys=True)); os.replace(tmp,sys.argv[4]); print(json.dumps(row,sort_keys=True))")
+            command = ("set -eu; test ! -e " + shlex.quote(str(process_path)) + "; "
+                       "setsid sh -c " + shlex.quote(guest_wrapper)
+                       + " </dev/null >/dev/null 2>&1 & child=$!; "
+                       "python3 -c " + shlex.quote(record_python) + " "
+                       + shlex.quote(connection.deployment_id) + " " + shlex.quote(invocation) + " \"$child\" "
+                       + shlex.quote(str(process_path)))
             execute = _request(f"f09-guest-run-{invocation}", vm,
-                ["sh", "-c", command], remaining)
+                ["sh", "-c", command], min(connection.timeouts.command_seconds, remaining))
             stage = "guest command execution"
             execute_result = _execute(runner, execute)
             stage = "guest command evidence"
             actions.append(_action(execute.action_id, execute.action_type, vm, execute, execute_result))
             if execute_result.outcome != CommandOutcome.SUCCEEDED:
-                if execute_result.outcome in {CommandOutcome.INTERRUPTED, CommandOutcome.TIMED_OUT}:
-                    cancel_remaining = deadline.remaining(clock, cleanup=True)
-                    if cancel_remaining > 0:
-                        cancel_command = (
-                            "set -u; pidfile=" + shlex.quote(str(pid_path)) + "; "
-                            "test -s \"$pidfile\" || { echo invocation_pid_unavailable; exit 2; }; "
-                            "pid=$(cat \"$pidfile\"); case \"$pid\" in ''|*[!0-9]*) exit 2;; esac; "
-                            "kill -TERM -- -\"$pid\" 2>/dev/null || true; i=0; "
-                            "while kill -0 -- -\"$pid\" 2>/dev/null; do "
-                            "i=$((i+1)); if [ \"$i\" -ge 10 ]; then echo process_group_still_running; exit 1; fi; "
-                            "sleep 1; done; rm -f -- \"$pidfile\"; echo process_group_stopped")
-                        cancel = _request(f"f09-guest-cancel-{invocation}", vm,
-                            ["sh", "-c", cancel_command],
-                            min(connection.timeouts.command_seconds, cancel_remaining))
-                        cancel_result = _execute(runner, cancel)
-                        actions.append(_action(cancel.action_id, cancel.action_type, vm, cancel, cancel_result))
-                        cancellation_status = ("verified_stopped" if cancel_result.outcome == CommandOutcome.SUCCEEDED
-                                               and "process_group_stopped" in cancel_result.stdout
-                                               else "unverified")
-                    else:
-                        cancellation_status = "not_attempted_cleanup_allowance_exhausted"
-                raise RuntimeError(f"VM-A F03 lifecycle guest failed; cancellation={cancellation_status}")
+                raise RuntimeError(f"VM-A F03 scoped launch failed or its process identity was not published ({execute_result.outcome}: {execute_result.stderr[:200]})")
+            try:
+                process_record = json.loads(execute_result.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise ValueError("VM-A F03 process identity record is malformed") from exc
+            expected_fields = {"deployment_id", "invocation_id", "pid", "process_group", "session_id", "boot_id", "start_ticks"}
+            if (set(process_record) != expected_fields or process_record["deployment_id"] != connection.deployment_id
+                    or process_record["invocation_id"] != invocation
+                    or any(isinstance(process_record[key], bool) or not isinstance(process_record[key], int)
+                        or process_record[key] <= 0 for key in ("pid", "process_group", "session_id", "start_ticks"))
+                    or process_record["pid"] != process_record["process_group"]
+                    or process_record["pid"] != process_record["session_id"]
+                    or not isinstance(process_record["boot_id"], str) or not process_record["boot_id"]):
+                raise ValueError("VM-A F03 process identity record does not describe the scoped setsid leader")
+            if on_process_record is not None:
+                on_process_record(process_record)
+            status = None
+            stage = "guest status polling"
+            while status is None:
+                remaining = deadline.remaining(clock)
+                if remaining <= 0:
+                    cancellation_status = _stop_remote_f03(connection, process_record, invocation,
+                        process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                    raise TimeoutError(f"F03 active cap expired; {cancellation_status}")
+                poll = _request(f"f09-guest-status-{invocation}", vm,
+                    ["sh", "-c", "if test -s " + shlex.quote(str(status_path))
+                     + "; then printf 'exited '; cat " + shlex.quote(str(status_path))
+                     + "; elif kill -0 -- -" + str(process_record["process_group"])
+                     + " 2>/dev/null; then printf 'running\\n'; else printf 'absent\\n'; fi"],
+                    min(connection.timeouts.command_seconds, remaining))
+                poll_result = _execute(runner, poll)
+                actions.append(_action(poll.action_id, poll.action_type, vm, poll, poll_result))
+                if poll_result.outcome != CommandOutcome.SUCCEEDED:
+                    raise RuntimeError("VM-A F03 authenticated status poll failed")
+                line = poll_result.stdout.strip()
+                if line.startswith("exited "):
+                    code = line.removeprefix("exited ").strip()
+                    if not code.isdigit():
+                        raise ValueError("VM-A F03 guest exit status is malformed")
+                    status = int(code)
+                elif line == "running":
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancellation_status = _stop_remote_f03(connection, process_record, invocation,
+                            process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                        raise InterruptedError(f"controller cancellation; {cancellation_status}")
+                    sleep(min(0.25, remaining))
+                else:
+                    raise RuntimeError("VM-A F03 process disappeared without an authenticated terminal status")
+            if status != 0:
+                raise RuntimeError(f"VM-A F03 lifecycle guest exited with status {status}")
             remaining = deadline.remaining(clock)
             if remaining <= 0:
                 raise TimeoutError("F03 outcome retrieval is outside the active cap")
@@ -359,6 +403,80 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     except BaseException as exc:
         return RemoteGuestExecution(None, tuple(actions),
             f"{type(exc).__name__}: F03 {stage} failed ({exc}); cancellation={cancellation_status}")
+
+
+def _stop_remote_f03(connection: Any, process_record: Mapping[str, Any], invocation: str, *,
+                     process_path: str, runner: Any, deadline: Any,
+                     clock: Callable[[], float], actions: list[Any]) -> str:
+    """Stop only the observed F03 session after checking its complete identity."""
+    import json
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+
+    remaining = deadline.remaining(clock, cleanup=True)
+    if remaining <= 0:
+        return "cancellation_unverified_cleanup_allowance_exhausted"
+    # The published record is passed as canonical expected values; the guest
+    # checks boot, leader start ticks, PGID/SID and every remaining session
+    # member before signalling the owned group.
+    code = r'''import json,os,signal,sys,time
+path,deployment,invocation,pid,pgid,sid,boot,ticks=sys.argv[1:]
+expected={'deployment_id':deployment,'invocation_id':invocation,'pid':int(pid),'process_group':int(pgid),'session_id':int(sid),'boot_id':boot,'start_ticks':int(ticks)}
+try:
+ record=json.load(open(path))
+ if record != expected: raise SystemExit('process_record_identity_mismatch')
+ if open('/proc/sys/kernel/random/boot_id').read().strip()!=boot: raise SystemExit('boot_identity_mismatch')
+ def rows():
+  out=[]
+  for name in os.listdir('/proc'):
+   if not name.isdigit(): continue
+   try:
+    raw=open('/proc/'+name+'/stat').read(); tail=raw[raw.rfind(')')+2:].split()
+    out.append((int(name),int(tail[2]),int(tail[3]),int(tail[19])))
+   except (OSError,ValueError,IndexError): pass
+  return out
+ all_rows=rows(); leader=next((r for r in all_rows if r[0]==int(pid)),None)
+ if leader and (leader[1]!=int(pgid) or leader[2]!=int(sid) or leader[3]!=int(ticks)):
+  raise SystemExit('leader_identity_mismatch')
+ owned=[r for r in all_rows if r[1]==int(pgid) and r[2]==int(sid)]
+ if not owned:
+  print('process_group_stopped'); raise SystemExit(0)
+ if not leader and not owned: print('process_group_stopped'); raise SystemExit(0)
+ os.killpg(int(pgid),signal.SIGTERM)
+ end=time.monotonic()+min(float(sys.argv[9]),5.0)
+ while time.monotonic()<end:
+  if not [r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]:
+   print('process_group_stopped'); raise SystemExit(0)
+  time.sleep(.1)
+ remaining=[r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]
+ if remaining:
+  os.killpg(int(pgid),signal.SIGKILL)
+ end=time.monotonic()+min(float(sys.argv[9]),2.0)
+ while time.monotonic()<end:
+  if not [r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]:
+   print('process_group_stopped'); raise SystemExit(0)
+  time.sleep(.1)
+ print('process_group_still_running'); raise SystemExit(1)
+except ProcessLookupError:
+ print('process_group_stopped')
+'''
+    # Pass the exact process record through stdin-free argv values and compare
+    # it with the durable guest file before any signal is sent.
+    record = dict(process_record)
+    import base64
+    encoded_code = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    request = _request(f"f09-guest-cancel-{invocation}", connection.vm_a,
+        ["sh", "-c", "python3 -c " + shlex.quote("exec(__import__('base64').b64decode('" + encoded_code + "'))") + " "
+         + " ".join(shlex.quote(str(value)) for value in (
+             process_path, record["deployment_id"], invocation, record["pid"],
+             record["process_group"], record["session_id"], record["boot_id"],
+             record["start_ticks"], min(remaining, 5.0)))],
+        min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, request)
+    actions.append(_action(request.action_id, request.action_type, connection.vm_a, request, result))
+    if result.outcome == CommandOutcome.SUCCEEDED and result.stdout.strip().endswith("process_group_stopped"):
+        return "process_group_stopped"
+    return "cancellation_unverified"
 
 
 def start_remote_diagnostics(connection: Any, context: Mapping[str, Any], *, runner: Any,
@@ -703,6 +821,7 @@ def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
         close=lambda: stages.close(state["deployment"], _last_result(state)),
         retrieve=lambda: stages.retrieve(state["deployment"], _last_result(state)),
         cleanup=lambda: driver.cleanup(state["deployment"]),
+        cancel=stages.cancel,
     )
 
 
@@ -727,6 +846,7 @@ def gcp_hooks(driver: GcpProviderDriver, deployment: ProviderDeploymentInput,
         create=create, prepare=lambda: stage("prepare"), stabilize=lambda: stage("stabilize"),
         measure=lambda: stage("measure"), close=lambda: stage("close"),
         retrieve=lambda: stage("retrieve"), cleanup=lambda: driver.cleanup(state["deployment"]),
+        cancel=stages.cancel,
     )
 
 
@@ -779,6 +899,7 @@ def azure_hooks(deployment: ProviderDeploymentInput, expiry_request: ExpiryReque
         create=create, prepare=lambda: stage("prepare"), stabilize=lambda: stage("stabilize"),
         measure=lambda: stage("measure"), close=lambda: stage("close"),
         retrieve=lambda: stage("retrieve"), cleanup=cleanup,
+        cancel=stages.cancel,
         cleanup_resource_ids=lambda: list(state.get("cleanup_resource_ids", ())),
     )
 

@@ -406,8 +406,24 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             self.guest_outcome = outcome.model_dump_json()
             if self.full_native:
                 self._write_source_observed_receiver_logs(outcome)
+            invocation = action.removeprefix("f09-guest-run-")
+            record = {"deployment_id": self.deployment_id, "invocation_id": invocation,
+                "pid": 25001, "process_group": 25001, "session_id": 25001,
+                "boot_id": "synthetic-boot", "start_ticks": 12345}
             return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
-                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="", stderr="")
+                finished_at=self._now(), duration_seconds=0, exit_code=0,
+                stdout=json.dumps(record), stderr="")
+        if action.startswith("f09-guest-status-"):
+            self.actions.append(action)
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0,
+                stdout="exited 0\n", stderr="")
+        if action.startswith("f09-guest-cancel-"):
+            self.actions.append(action)
+            assert "b64decode" in request.argv[-1]
+            return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0,
+                stdout="process_group_stopped\n", stderr="")
         if action.startswith("f09-guest-outcome-"):
             self.actions.append(action)
             if self.guest_outcome is not None:
