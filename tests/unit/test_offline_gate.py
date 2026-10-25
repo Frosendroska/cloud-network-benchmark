@@ -117,6 +117,20 @@ def test_junit_rejects_omitted_whole_required_module(tmp_path):
         gate.junit_coverage(report, coverage, "Darwin", collected)
 
 
+def test_junit_rejects_missing_azure_powerShell_case_with_sibling_retained(tmp_path):
+    coverage = tmp_path / "coverage.md"
+    coverage.write_text("`tests/unit/test_ok.py::test_kept`\n")
+    azure_cases = {
+        AZURE_CASE,
+        f"{AZURE_MODULE}::test_deallocation_runbook_has_two_target_retries_and_no_start_create_delete",
+    }
+    collected = baseline_collection("tests/unit/test_ok.py::test_kept", *azure_cases)
+    report = tmp_path / "junit.xml"
+    report.write_text("<testsuites><testsuite>" + "".join(xml_testcase(item) for item in factory_identities() | azure_cases - {next(item for item in azure_cases if "deallocation_runbook" in item)} | {"tests/unit/test_ok.py::test_kept"}) + "</testsuite></testsuites>")
+    with pytest.raises(ValueError, match="deallocation_runbook_has_two_target_retries"):
+        gate.junit_coverage(report, coverage, "Darwin", collected)
+
+
 @pytest.mark.parametrize("omitted", [
     "test_failed_day_tcp_preserves_partial_day_and_does_not_restart",
     "test_late_success_at_original_deadline_is_not_ready",
