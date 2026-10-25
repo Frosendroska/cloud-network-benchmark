@@ -83,8 +83,8 @@ MVP is US1's safe reproducible command; completion additionally requires the act
 
 ### Phase 8 final evidence
 
-- Phase 8 supersedes prior convergence tested-head/count notes. Final tested executable HEAD is `48d46ea5f908f89f6ae25c3290f5e534a5b45de8` (tree `f07316e47fe98959ecf60650f0cdc89944cedf9b`), clean before and after the full gate.
-- Focused offline gate tests: 33 passed. The definitive command in `/private/tmp/cnb-f10-final-evidence-8/` exited 0: 1,478 passed, two exact Darwin `/proc` cases not run, no failures or unexpected skips, 112 required identities/variants/module cases present, and all 20 checks passed.
+- Phase 8 supersedes prior convergence tested-head/count notes. Final tested executable HEAD is `92c057a9a724f51a5118aeb654215f75f3bcb25b` (tree `6ffdfc611a86b51cd68d89c0474e33fcfe7c5b43`), clean before and after the full gate.
+- Focused offline gate tests: 34 passed. The definitive command in `/private/tmp/cnb-f10-final-evidence-9/` exited 0: 1,479 passed, two exact Darwin `/proc` cases not run, no failures or unexpected skips, 112 required identities/variants/module cases present, and all 20 checks passed.
 - A separate collection-only check yielded 332 canonical node IDs without executing tests. Targeted deletions against the retained prior complete JUnit rejected each of 12 required parameter variants and all 67 collected Azure provider-flow cases; missing and empty collection inputs fail closed. Exact argv, environment, SHA-256 values and source limitations are recorded in `docs/validation/f10-offline-gate.md`.
 - No paid/cloud activity occurred. Native Linux `/proc`, instrumented guest behavior, actual cloud/provider outcomes, paid acceptance, refreshed prices/quotas, research N and study windows remain not run or pending.
 
