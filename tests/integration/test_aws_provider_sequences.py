@@ -25,7 +25,13 @@ class QueueRunner:
 
     def run(self, request):
         self.actions.append(request.action_id)
-        exit_code, stdout, stderr = self.replies.pop(0)
+        # Local provider-cache initialization has its own successful boundary;
+        # it must not consume a queued cloud/apply failure response.
+        if request.action_id.startswith("terraform-init-"):
+            assert "init" in request.argv and "-backend=false" in request.argv
+            exit_code, stdout, stderr = 0, "", ""
+        else:
+            exit_code, stdout, stderr = self.replies.pop(0)
         return CommandResult(
             action_id=request.action_id,
             outcome="succeeded" if exit_code == 0 else "failed",
@@ -349,7 +355,7 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
         assert "apply failed" in str(exc)
     else:
         raise AssertionError("timed-out apply must preserve its primary failure")
-    assert runner.actions[:2] == ["aws-pair-apply", "aws-pair-destroy"]
+    assert runner.actions[:3] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-destroy"]
     assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == "terraform_apply"
@@ -422,7 +428,7 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
             assert "AWS pair Terraform output failed" in str(exc)
     else:
         raise AssertionError("missing output must fail the attempt")
-    assert runner.actions[:3] == ["aws-pair-apply", "aws-pair-output", "aws-pair-destroy"]
+    assert runner.actions[:4] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output", "aws-pair-destroy"]
     assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == ("output_invalid" if output_outcome == CommandOutcome.SUCCEEDED else "terraform_output")
@@ -503,7 +509,7 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
     driver._verify_observed_instance = lambda expected, *_args: expected
     driver._verify_host_key = lambda detail: {"known_hosts_path": str(attempt / f"{detail['instance_id']}.known_hosts")}
     result = driver.provision(deployment)
-    assert runner.actions == ["aws-pair-apply", "aws-pair-output"]
+    assert runner.actions == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output"]
     assert sequence[:len(regions)] == [f"expiry-confirm-{region}" for region in regions]
     assert sequence.index("aws-pair-apply") > len(regions) - 1
     assert str(result.scenario) == scenario

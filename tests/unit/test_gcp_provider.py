@@ -129,7 +129,7 @@ def test_command_deadline_and_journal_store_redacted_durable_views(tmp_path):
     driver._active_attempt = attempt
     driver._save(attempt, {"run_id": "run-1", "deployment_id": "deploy-1", "commands": []})
     driver._run("test-action", ["tool", "arg"], attempt, timeout=12)
-    assert runner.request.timeout_seconds == 5
+    assert 0 < runner.request.timeout_seconds <= 5
     driver._save(attempt, {"run_id": "run-1", "deployment_id": "deploy-1", "commands": [], "later_state": "saved"})
     journal = json.loads((attempt / "attempt.json").read_text())
     assert journal["later_state"] == "saved"

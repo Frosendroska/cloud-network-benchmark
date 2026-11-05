@@ -582,6 +582,12 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             def run(self, request):
                 self.requests.append(request)
                 self.actions.append(request.action_id)
+                if request.action_id.startswith("terraform-init-"):
+                    assert "init" in request.argv and "-backend=false" in request.argv
+                    assert request.environment["TF_DATA_DIR"]
+                    now = self.clock.utc_now()
+                    return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                        finished_at=now, duration_seconds=0, exit_code=0, stdout="", stderr="")
                 if request.action_id.startswith("aws-"):
                     if request.action_id == "aws-pair-apply": self._assert_claim_barrier()
                     if request.action_id == "aws-pair-destroy": self.aws_pair_destroyed = True

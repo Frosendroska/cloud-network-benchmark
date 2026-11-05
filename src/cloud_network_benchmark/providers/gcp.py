@@ -37,8 +37,8 @@ class GcpRuntimeSettings(StrictModel):
     public_key: str = Field(min_length=1)
     authentication_reference: str = Field(min_length=1)
     private_state_root: Path
-    terraform: str = "/private/tmp/cnb-tools/terraform"
-    gcloud: str = "/opt/homebrew/bin/gcloud"
+    terraform: str = "terraform"
+    gcloud: str = "gcloud"
     cost_input_id: str = Field(min_length=1)
     cost_input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     cost_source_path: str = Field(min_length=1)
@@ -714,7 +714,16 @@ class GcpProviderDriver:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
             limit = min(limit, max(1, int(remaining)))
-        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment_classification="contains_secret_references")
+        from ..terraform_work import private_terraform_environment, initialize_terraform
+        command_deadline = time.monotonic() + limit
+        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
+        if not hasattr(self, "_initialized_terraform"):
+            self._initialized_terraform = set()
+        initialize_terraform(self.runner, request, self._initialized_terraform)
+        remaining_after_init = command_deadline - time.monotonic()
+        if remaining_after_init <= 0:
+            raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
+        request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
         result = self.runner.run(request)
         self._record_command(request, result)
         return result

@@ -264,6 +264,10 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
             started=datetime.now(timezone.utc)
             def result(value="", code=0):
                 return CommandResult(action_id=action,outcome="succeeded",started_at=started,finished_at=started,duration_seconds=0.0,exit_code=code,stdout=value if isinstance(value,str) else json.dumps(value),stderr="")
+            if action.startswith("terraform-init-"):
+                assert "init" in request.argv and "-backend=false" in request.argv
+                assert request.environment["TF_DATA_DIR"]
+                return result()
             if action == "gcp-protection-apply": return result()
             if action == "gcp-protection-outputs":
                 templates={role:{"id":str(111 if role=="vm_a" else 222),"name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","self_link_unique":f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/global/instanceTemplates/{namespace}-{'a' if role=='vm_a' else 'b'}?uniqueId={111 if role=='vm_a' else 222}"} for role in ("vm_a","vm_b")}

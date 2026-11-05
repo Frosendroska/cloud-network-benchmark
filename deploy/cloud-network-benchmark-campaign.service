@@ -1,0 +1,22 @@
+[Unit]
+Description=Explicit cloud network benchmark campaign
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/srv/cnb/private/active-stage.json
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/cnb/repository
+Environment=PATH=/srv/cnb/venv/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+EnvironmentFile=-/etc/cloud-network-benchmark/controller.env
+ExecStart=/srv/cnb/venv/bin/cloud-network-benchmark campaign run --state-root /srv/cnb/private
+Restart=on-failure
+RestartSec=15
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

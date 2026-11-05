@@ -35,6 +35,8 @@ def _parser() -> argparse.ArgumentParser:
     # visible in root help while allowing lifecycle_cli to parse subcommands.
     subparsers.add_parser("lifecycle", add_help=False,
                          help="inspect or request a lifecycle operation")
+    subparsers.add_parser("campaign", add_help=False,
+                         help="check, supervise and resume a prepared remote campaign")
     return parser
 
 
@@ -46,6 +48,9 @@ def _json(value: object) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     command_line = list(sys.argv[1:] if argv is None else argv)
+    if command_line[:1] == ["campaign"]:
+        from .campaign_cli import main as campaign_main
+        return campaign_main(command_line[1:])
     if command_line[:1] == ["lifecycle"]:
         from .lifecycle_cli import main as lifecycle_main
 

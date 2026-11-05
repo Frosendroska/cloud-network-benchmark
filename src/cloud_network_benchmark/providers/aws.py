@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+from decimal import Decimal, ROUND_CEILING
 from math import isfinite
 import os
 import re
@@ -77,8 +78,8 @@ class AwsRuntimeSettings(StrictModel):
     public_key: str = Field(min_length=1)
     authentication_reference: str = Field(min_length=1)
     private_state_root: Path
-    aws_cli: str = "/usr/local/bin/aws"
-    terraform: str = "/private/tmp/cnb-tools/terraform"
+    aws_cli: str = "aws"
+    terraform: str = "terraform"
     cost_input_id: str = Field(min_length=1)
     cost_input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     cost_source_path: str = Field(min_length=1)
@@ -164,6 +165,7 @@ class AwsProviderDriver:
         self._cleanup_deadline: float | None = None
         self._precreate_deadline: float | None = None
         self._active_primary_failure: FailureEvidence | None = None
+        self._initialized_terraform: set[str] = set()
 
     def register_expiry(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ExpiryEvidence:
         """Create and read back protection in all regions before any pair command."""
@@ -171,6 +173,7 @@ class AwsProviderDriver:
         try:
             self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
             regions, reservation, trigger = self._validate_registration(deployment, request)
+            actual_price = _expiry_price(self._root(), self.settings)
             attempt = self._attempt_dir(deployment)
             self._active_attempt = attempt
             self._active_commands = []
@@ -257,11 +260,11 @@ class AwsProviderDriver:
                     "planned_action_seconds": EXPIRY_ACTION_TIMEOUT_SECONDS,
                     "planned_stop_margin_seconds": PLANNED_STOP_MARGIN_SECONDS,
                     "reserved_cap_end_utc": reservation.expires_at.value.isoformat(),
-                    "cost_input_id": EXPIRY_INPUT_ID,
-                    "cost_input_sha256": EXPIRY_INPUT_SHA256,
+                    "cost_input_id": actual_price["id"],
+                    "cost_input_sha256": actual_price["observed_sha256"],
                     "action_timeout_seconds": EXPIRY_ACTION_TIMEOUT_SECONDS,
-                    "planned_expiry_cost_per_region_usd": EXPIRY_COST_PER_REGION,
-                    "planned_expiry_cost_usd": EXPIRY_COST_PER_REGION * len(regions),
+                    "planned_expiry_cost_per_region_usd": actual_price["worst_planned_cost_per_region"],
+                    "planned_expiry_cost_usd": actual_price["worst_planned_cost_per_region"] * len(regions),
                     "expiry_cost_handoff_source_path": self.settings.complete_workflow_cost_handoff.value["source_path"],
                     "expiry_cost_handoff_source_sha256": self.settings.complete_workflow_cost_handoff.value["source_sha256"],
                     "expiry_cost_included_usd": self.settings.complete_workflow_cost_handoff.value["expiry_cost_included_usd"],
@@ -599,7 +602,9 @@ class AwsProviderDriver:
         return regions, reservation, trigger
 
     def _validate_expiry_cost_coverage(self, reservation: ReservationEvidence, regions: list[str]) -> None:
-        required = round(EXPIRY_COST_PER_REGION * len(regions), 4)
+        price = _expiry_price(self._root(), self.settings)
+        per_region = price["worst_planned_cost_per_region"]
+        required = round(per_region * len(regions), 4)
         reserved = reservation.reserved_cost_usd.value
         if reserved is None or reserved + 1e-9 < required:
             raise AwsProviderError(f"reserved cost does not cover the AWS expiry allowance of {required:.4f} USD", category="expiry_cost_underreserved")
@@ -610,9 +615,9 @@ class AwsProviderDriver:
         if (
             handoff.get("source_path") != reservation.source_path
             or handoff.get("source_sha256") != reservation.source_sha256
-            or handoff.get("expiry_input_id") != EXPIRY_INPUT_ID
-            or handoff.get("expiry_input_sha256") != EXPIRY_INPUT_SHA256
-            or handoff.get("expiry_cost_allowance_per_region_usd") != EXPIRY_COST_PER_REGION
+            or handoff.get("expiry_input_id") != price["id"]
+            or handoff.get("expiry_input_sha256") != price["observed_sha256"]
+            or handoff.get("expiry_cost_allowance_per_region_usd") != per_region
             or handoff.get("expiry_cost_regions") != regions
             or isinstance(included, bool)
             or not isinstance(included, (int, float))
@@ -1287,15 +1292,23 @@ class AwsProviderDriver:
             if remaining <= 0:
                 raise AwsProviderError("pair apply admission budget expired immediately before creation", category="cap_insufficient", action_id=action_id)
             timeout = min(timeout, remaining)
+        from ..terraform_work import private_terraform_environment, initialize_terraform
+        command_deadline = time.monotonic() + timeout
         request = CommandRequest(
             action_id=action_id,
             action_type="aws_provider_control",
             argv=[str(value) for value in argv],
             cwd=str(cwd or self._root()),
+            environment=private_terraform_environment(argv, cwd or self._root()),
             timeout_seconds=timeout,
             stdin=stdin,
             environment_classification="contains_secret_references" if self.settings.authentication_reference else "none",
         )
+        initialize_terraform(self.runner, request, self._initialized_terraform)
+        remaining_after_init = command_deadline - time.monotonic()
+        if remaining_after_init <= 0:
+            raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
+        request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
         result = self.runner.run(request)
         # Persist only redacted command identity/outcome/timing, never provider stdout.
         record = {
@@ -1353,21 +1366,34 @@ def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
 
 
 def _validate_expiry_price_fixture(root: Path, settings: AwsRuntimeSettings) -> None:
-    path = root / EXPIRY_INPUT_PATH
+    _expiry_price(root, settings)
+
+
+def _expiry_price(root: Path, settings: AwsRuntimeSettings) -> dict[str, Any]:
+    handoff = settings.complete_workflow_cost_handoff.value or {}
+    path = Path(handoff.get("expiry_input_path", root / EXPIRY_INPUT_PATH))
     if not path.is_file() or path.is_symlink():
         raise AwsProviderError("dated AWS expiry cost input fixture is unavailable", category="cost_fixture_missing")
     raw = path.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != EXPIRY_INPUT_SHA256:
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != handoff.get("expiry_input_sha256", EXPIRY_INPUT_SHA256):
         # The reservation's complete-workflow source is independently validated against its admission hash.
         raise AwsProviderError("dated AWS expiry price fixture ID/hash differs", category="cost_fixture_mismatch")
     payload = json.loads(raw)
     steps = payload.get("planned_steps_per_region")
     action_seconds = payload.get("planned_action_seconds_per_region")
-    per_region = steps * payload.get("automation_step_price", 0) + action_seconds * payload.get("script_second_price", 0) if isinstance(steps, int) and isinstance(action_seconds, int) else None
+    rates = (payload.get("automation_step_price"), payload.get("script_second_price"))
+    if any(isinstance(rate, bool) or not isinstance(rate, (int, float)) or not isfinite(rate) or rate < 0 for rate in rates):
+        raise AwsProviderError("expiry price rates must be finite nonnegative USD", category="cost_fixture_invalid")
+    per_region = float((Decimal(str(rates[0])) * 2 + Decimal(str(rates[1])) * 330).quantize(Decimal("0.0001"), rounding=ROUND_CEILING))
     if (payload.get("free_tier_assumed") is not False or payload.get("discovery_horizon_seconds_per_region") != EXPIRY_SCRIPT_SECONDS
-        or action_seconds != EXPIRY_ACTION_TIMEOUT_SECONDS or round(per_region, 4) != EXPIRY_COST_PER_REGION
-        or payload.get("worst_planned_cost_for_two_regions") != round(EXPIRY_COST_PER_REGION * 2, 4)):
+        or steps != 2 or action_seconds != EXPIRY_ACTION_TIMEOUT_SECONDS
+        or payload.get("currency") != "USD"
+        or payload.get("worst_planned_cost_per_region") != round(per_region, 4)
+        or payload.get("worst_planned_cost_for_two_regions") != round(per_region * 2, 4)
+        or payload.get("id") != handoff.get("expiry_input_id", EXPIRY_INPUT_ID)):
         raise AwsProviderError("expiry price fixture omits the documented two-step/330-second action allowance", category="cost_fixture_invalid")
+    return {**payload, "observed_sha256": digest}
 
 
 def _namespace(deployment: ProviderDeploymentInput) -> str:

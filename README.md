@@ -18,6 +18,10 @@ cloud-network-benchmark dry-run --config configs/experiments/exp-001-multi-provi
 
 The full offline gate requires a clean checkout, prepared local Python/Terraform/PowerShell tools and initialized locked providers. See [F10 validation](docs/validation/f10-offline-gate.md) for the exact tested command, environment, evidence and two Linux `/proc` checks not run on macOS. The gate does not install missing tools or providers.
 
+## Run from a remote controller
+
+The [campaign runner guide](docs/campaign-runner.md) covers the single Linux systemd service, one operator settings file, supervised acceptance and explicit calibration/DAY/WEEK starts. `campaign check` and start without `--execute` launch nothing. Real credentials, prices, approvals, common N and UTC windows remain required inputs. See [offline campaign evidence](docs/validation/campaign-driver.md) for tested behavior and remaining supervised checks.
+
 ## Inspect a saved experiment
 
 The lifecycle preview reads the selected configuration, optional schedule row and cost inputs without reserving budget or contacting a provider:

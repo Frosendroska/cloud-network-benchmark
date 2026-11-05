@@ -1,0 +1,185 @@
+# Copy outside Git to /etc/cloud-network-benchmark/operator.yaml.
+# Nulls are deliberate blockers. Fill from your actual accounts/reviews and
+# conservative initial acceptance bounds; measured bounds for scheduled stages.
+# Do not change confirmed/reviewed until evidence exists.
+schema_version: 1
+state_root: /srv/cnb/private
+results_root: /srv/cnb/results
+minimum_free_bytes: null
+ledger:
+  path: /srv/cnb/private/budget-ledger.json
+  scope_id: thesis-primary
+backup_destination: null # optional mounted filesystem; verify it is off-machine
+notification_hook: null # optional absolute executable path; receives one JSON argument
+common_n_recommendation: null # locally saved recommend-common-n --format json output
+credential_refresh:
+  confirmed: false
+  source: null
+  valid_through_utc: null # tested refresh, through final slot and cleanup
+providers:
+  aws:
+    account_id: null
+    controller_cidr: null
+    ami_ids: {eu-central-1: null}
+    public_key_path: /srv/cnb/credentials/id_ed25519.pub
+    authentication_reference: /srv/cnb/credentials/id_ed25519
+    diagnostic_interfaces: {vm_a: null, vm_b: null}
+  azure:
+    subscription_id: null
+    tenant_id: null
+    controller_cidr: null
+    selected_image: null # concrete Ubuntu24.04 publisher:offer:sku:version, never latest
+    ssh_public_key_path: /srv/cnb/credentials/id_ed25519.pub
+    authentication_reference: /srv/cnb/credentials/id_ed25519
+    poll_seconds: 2
+    command_timeout_seconds: 120
+    diagnostic_interfaces: {vm_a: null, vm_b: null}
+  gcp:
+    project_id: null
+    controller_cidr: null
+    images: {europe-west3: null, europe-west2: null} # provider contract requires both; same pinned global Ubuntu image may be used
+    public_key_path: /srv/cnb/credentials/id_ed25519.pub
+    authentication_reference: /srv/cnb/credentials/id_ed25519
+    diagnostic_interfaces: {vm_a: null, vm_b: null}
+approvals:
+  f10_offline: &pending_approval
+    confirmed: false
+    source: null
+    fields: {}
+  paid_authorization: *pending_approval
+  quota_review: *pending_approval
+  paid_acceptance: *pending_approval
+  calibration_authorized: *pending_approval
+  common_n: *pending_approval
+  diagnostic_day_authorized: *pending_approval
+  size_export_review: *pending_approval
+  study_window: *pending_approval
+pricing:
+  reviewed: false
+  id: null
+  checked_on: null
+  source: null # dated actual quotes/register/support evidence outside Git
+  funding:
+    primary: null
+    replacements: null
+    tax: null
+    uncertainty: null
+    working_limit: 250
+    protected_buffer: 50
+    total_limit: 300
+  expiry:
+    aws: {automation_step_price: null, script_second_price: null}
+    azure: {automation_rate_per_job_minute: null, job_minutes_bound: null}
+    gcp: {zero_support_rationale: null}
+  # Whole-workflow USD component totals for ONE pair in ONE provider. Include
+  # setup/copy/cleanup, not just measured traffic. All stages share these frozen
+  # source bytes and ONE ledger. Anchors only repeat pending values; replace
+  # with independently reviewed per-provider/per-mode amounts before launch.
+  components:
+    acceptance:
+      aws: &pending_components
+        compute: null
+        disks: null
+        addresses: null
+        traffic_export: null
+        tax: null
+        uncertainty: null
+        expiry_cleanup_support: null
+      azure: *pending_components
+      gcp: *pending_components
+    calibration:
+      aws: *pending_components
+      azure: *pending_components
+      gcp: *pending_components
+    day:
+      aws: *pending_components
+      azure: *pending_components
+      gcp: *pending_components
+    s1:
+      aws: *pending_components
+      azure: *pending_components
+      gcp: *pending_components
+    s3:
+      aws: *pending_components
+      azure: *pending_components
+      gcp: *pending_components
+stage_inputs:
+  acceptance:
+    # Fill ONLY after physically supervising each registered attempt.
+    failure_checks:
+      V-A-FAIL:
+        server_failure: {confirmed: false, source: null}
+        controller_loss: {confirmed: false, source: null}
+        expiry: {confirmed: false, source: null}
+        cleanup: {confirmed: false, source: null}
+      V-Z-FAIL:
+        server_failure: {confirmed: false, source: null}
+        controller_loss: {confirmed: false, source: null}
+        expiry: {confirmed: false, source: null}
+        cleanup: {confirmed: false, source: null}
+      V-G-FAIL:
+        server_failure: {confirmed: false, source: null}
+        controller_loss: {confirmed: false, source: null}
+        expiry: {confirmed: false, source: null}
+        cleanup: {confirmed: false, source: null}
+    allowance:
+      source_id: null
+      registration_seconds: null
+      provision_seconds: null
+      readiness_seconds: null
+      stabilization_seconds: 60
+      measurement_seconds: null
+      measurement_shutdown_seconds: null
+      retrieval_seconds: null
+      cleanup_seconds: null
+      provider_leads_seconds: {aws: 360, azure: null, gcp: 30}
+  calibration:
+    start_utc: null
+    allowance:
+      source_id: null
+      registration_seconds: null
+      provision_seconds: null
+      readiness_seconds: null
+      stabilization_seconds: 60
+      measurement_seconds: null
+      measurement_shutdown_seconds: null
+      retrieval_seconds: null
+      cleanup_seconds: null
+      provider_leads_seconds: {aws: 360, azure: null, gcp: 30}
+  day:
+    start_utc: null
+    approvals:
+      size_export_review:
+        confirmed: false
+        source: null
+        fields:
+          measured_log_bytes: null
+          measured_seconds: null
+          expected_raw_bytes: null
+          export_verified_bytes: null
+          export_checksum_verified: false
+    allowance:
+      source_id: null
+      registration_seconds: null
+      provision_seconds: null
+      readiness_seconds: null
+      stabilization_seconds: 60
+      measurement_seconds: null
+      measurement_shutdown_seconds: null
+      retrieval_seconds: null
+      cleanup_seconds: null
+      provider_leads_seconds: {aws: 360, azure: null, gcp: 30}
+  week:
+    first_day_utc: null
+    windows_utc: {night: null, morning: null, afternoon: null, evening: null}
+    allowance:
+      source_id: null
+      registration_seconds: null
+      provision_seconds: null
+      readiness_seconds: null
+      stabilization_seconds: 60
+      measurement_seconds: null
+      measurement_shutdown_seconds: null
+      retrieval_seconds: null
+      cleanup_seconds: null
+      provider_leads_seconds: {aws: 360, azure: null, gcp: 30}

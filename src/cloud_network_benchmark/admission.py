@@ -158,6 +158,13 @@ def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest)
             if plan.execution_scope != "paid_request" or envelope["source_path"] != plan.costs.source_path or envelope["source_sha256"] != plan.costs.payload_sha256:
                 raise ValueError("cost_envelope_invalid: paid envelope must bind the refreshed cost input")
             source_row = plan.costs.payload.get("provider_run_envelopes", {}).get(provider)
+            templates = plan.costs.payload.get("provider_run_envelope_templates", {})
+            if templates:
+                source_row = templates.get(plan.resolved_campaign.config_id, {}).get(provider)
+                if isinstance(source_row, Mapping):
+                    if "run_id" in source_row:
+                        raise ValueError("cost_envelope_invalid: a run template cannot supply a child identity")
+                    source_row = {**source_row, "run_id": plan.child_identities[provider]}
         else:
             raise ValueError("cost_envelope_invalid: unknown source kind")
         if not isinstance(source_row, Mapping):
@@ -207,6 +214,13 @@ def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest)
 def _validate_paid_acceptance_evidence(evidence: Mapping[str, Any], campaign: Any) -> None:
     """Require a source-linked completed acceptance covering this campaign scope."""
     BudgetLedger._validate_gate_evidence(evidence)
+    if "accepted_campaigns" in evidence:
+        from .acceptance_review import validate_acceptance_scope
+        try:
+            validate_acceptance_scope(evidence, campaign)
+        except (OSError, KeyError, TypeError, StopIteration) as exc:
+            raise ValueError("acceptance source evidence is incomplete or unreadable") from exc
+        return
     providers = {Provider(p).value for p in campaign.selected_providers}
     if (evidence.get("status") != "completed" or evidence.get("config_id") != campaign.config_id
         or evidence.get("mode") != ExperimentMode.ACCEPTANCE.value
@@ -221,7 +235,7 @@ def load_cost_inputs(path: Path) -> CostInputs:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid cost input JSON") from exc
     required = {"schema_version", "cost_input_id", "prices_checked_on", "source_scope", "source_sha256", "source_identity_kind", "currency", "funding"}
-    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support", "provider_run_envelopes"}) or not required <= set(data):
+    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support", "provider_run_envelopes", "provider_run_envelope_templates"}) or not required <= set(data):
         raise ValueError("invalid cost input fields")
     if data["schema_version"] != 1 or data["currency"] != "USD":
         raise ValueError("unsupported cost input scope")
@@ -257,7 +271,7 @@ def load_cost_inputs(path: Path) -> CostInputs:
                       bool(data.get("refresh_required_before_paid_execution", False)))
 
 
-def aws_expiry_cost_handoff(cost_inputs: CostInputs, aws_fixture: Path, regions: Sequence[str], *, reservation_sha256: str) -> dict[str, Any]:
+def aws_expiry_cost_handoff(cost_inputs: CostInputs, aws_fixture: Path, regions: Sequence[str], *, reservation_sha256: str, config_id: str | None = None) -> dict[str, Any]:
     """Build the explicit F05 payload; its support amount is included in the reservation."""
     _hash(reservation_sha256, "reservation_sha256")
     if reservation_sha256 != cost_inputs.payload_sha256:
@@ -265,18 +279,28 @@ def aws_expiry_cost_handoff(cost_inputs: CostInputs, aws_fixture: Path, regions:
     raw = aws_fixture.read_bytes()
     fixture = json.loads(raw)
     digest = hashlib.sha256(raw).hexdigest()
-    if (digest != "315d3e49755396597f97cac3512b9843fcf1c95083fadc11fae667c770215a61"
-        or fixture.get("free_tier_assumed") is not False
-        or fixture.get("id") != "aws-ssm-automation-public-2026-10-22"
-        or _decimal(fixture.get("worst_planned_cost_per_region")) != Decimal("0.0139")):
+    per_region = (_decimal(fixture.get("automation_step_price")) * 2
+                  + _decimal(fixture.get("script_second_price")) * 330).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+    if (fixture.get("free_tier_assumed") is not False or not fixture.get("id")
+        or fixture.get("planned_steps_per_region") != 2
+        or fixture.get("discovery_horizon_seconds_per_region") != 300
+        or fixture.get("planned_action_seconds_per_region") != 330
+        or fixture.get("currency") != "USD"
+        or date.fromisoformat(str(fixture.get("checked_on"))) > date.today()
+        or _decimal(fixture.get("worst_planned_cost_per_region")) != per_region):
         raise ValueError("support_cost_missing")
     selected = sorted(set(regions))
     if not selected or len(selected) != len(regions) or any(not item.strip() for item in selected):
         raise ValueError("provider regions must be unique and nonblank")
-    per_region = _decimal(fixture["worst_planned_cost_per_region"])
     included = (per_region * len(selected)).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+    if config_id is not None and cost_inputs.payload.get("provider_run_envelope_templates"):
+        funded = cost_inputs.payload["provider_run_envelope_templates"][config_id]["aws"]["components"]["expiry_cleanup_support"]["amount_usd"]
+        if _decimal(funded) < included:
+            raise ValueError("support_cost_missing: funded AWS expiry allowance is insufficient")
+        included = _decimal(funded)
     return {"source_path": cost_inputs.source_path, "source_sha256": reservation_sha256,
             "expiry_input_id": fixture["id"], "expiry_input_sha256": digest,
+            "expiry_input_path": str(aws_fixture),
             "expiry_cost_allowance_per_region_usd": float(per_region), "expiry_cost_regions": selected,
             "expiry_cost_included_usd": float(included)}
 
@@ -702,7 +726,7 @@ class BudgetLedger:
                     for key in required: self._validate_gate_evidence(plan.prerequisites[key])
                     if "paid_acceptance" in required:
                         _validate_paid_acceptance_evidence(plan.prerequisites["paid_acceptance"], campaign)
-                except ValueError:
+                except (ValueError, OSError, KeyError, StopIteration):
                     reasons.append("prerequisite_pending")
             if plan.optional_reviewed is False and request.priority in {"P2", "P3"}: reasons.append("optional_review_required")
             for provider in request.selected_providers:
@@ -722,7 +746,7 @@ class BudgetLedger:
                             raise ValueError("support inclusion must be sourced and positive")
                         if Provider(provider) == Provider.AWS:
                             support_scope = plan.costs.payload.get("provider_support", {}).get("aws", {})
-                            if (support.get("expiry_input_id") != "aws-ssm-automation-public-2026-10-22"
+                            if (not support.get("expiry_input_id")
                                 or support.get("expiry_input_sha256") != support_scope.get("sha256")
                                 or _hash(support.get("expiry_input_sha256", ""), "provider support hash") != support_scope.get("sha256")
                                 or not support.get("expiry_cost_regions")
