@@ -55,8 +55,8 @@
 ## Phase 6: Polish & Cross-Cutting Concerns
 
 - [x] T022 Complete concise exact VM setup/stage/analysis/physical-controller-loss commands and credential-refresh boundaries in `docs/campaign-runner.md`; document actual pending cloud acceptance and V-S3 membership evidence, one registered failure attempt/provider, capacity/lead measurement and remaining data-loss limits (FR-004, FR-011, FR-015, FR-016).
-- [ ] T023 Run campaign tests and appropriate existing admission/lifecycle/analysis regressions; record command/results, interpreter, resource peaks, skipped native/systemd checks and exact tested revision in `docs/validation/campaign-driver.md`.
-- [ ] T024 Perform actual SpecKit convergence against `specs/017-campaign-driver/{spec,plan,tasks}.md` and implemented paths, return application repairs to owning writer, then rerun affected checks at exact final integrated revision.
+- [x] T023 Run campaign tests and appropriate existing admission/lifecycle/analysis regressions; record command/results, interpreter, resource peaks, skipped native/systemd checks and exact tested revision in `docs/validation/campaign-driver.md`.
+- [x] T024 Perform actual SpecKit convergence against `specs/017-campaign-driver/{spec,plan,tasks}.md` and implemented paths, return application repairs to owning writer, then rerun affected checks at exact final integrated revision.
 
 ## Dependencies and parallel execution
 
