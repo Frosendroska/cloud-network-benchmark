@@ -221,9 +221,10 @@ def load_initialized_campaign(parent_path: Path, *, repository_root: Path,
         verified_snapshot(child.config_provenance.resolved_snapshot_path,
             child.config_provenance.resolved_snapshot_sha256.value, "resolved config")
         if schedule_path is not None:
-            if child.config_provenance.schedule_sha256.value is None or child.config_provenance.schedule_snapshot_path.value is None:
+            if child.config_provenance.schedule_sha256.value is None:
                 raise ValueError("initialized schedule snapshot identity is unavailable")
-            verified_snapshot(child.config_provenance.schedule_snapshot_path.value,
+            snapshot = str(Path(child.config_provenance.snapshot_path).parent / "schedule.csv")
+            verified_snapshot(snapshot,
                 child.config_provenance.schedule_sha256.value, "schedule")
     return parent, children
 
@@ -246,6 +247,13 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
     if any(child.execution_state != "initialized" for child in children.values()):
         raise ValueError("initialized child already contains lifecycle execution")
     rows = costs.payload.get("provider_run_envelopes")
+    templates = costs.payload.get("provider_run_envelope_templates", {})
+    if templates:
+        source_rows = templates.get(campaign.config_id)
+        if not isinstance(source_rows, dict) or any("run_id" in row for row in source_rows.values() if isinstance(row, dict)):
+            raise ValueError("refreshed cost source requires identity-free templates for this config")
+        rows = {provider: {**row, "run_id": child_ids[provider]}
+                for provider, row in source_rows.items() if provider in child_ids and isinstance(row, dict)}
     if not isinstance(rows, dict) or set(rows) != set(child_ids):
         raise ValueError("refreshed cost input must contain exact per-provider run envelopes")
     envelopes = {}
@@ -328,7 +336,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         observation = providers["aws"]
         regions = sorted({observation.vm_a.region, observation.vm_b.region})
         support = {**support, "aws": aws_expiry_cost_handoff(
-            costs, aws_source, regions, reservation_sha256=costs.payload_sha256)}
+            costs, aws_source, regions, reservation_sha256=costs.payload_sha256, config_id=campaign.config_id)}
     for provider in child_ids:
         if provider == "aws":
             continue
@@ -626,7 +634,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             expiry_fixture = row["sources"]["expiry_cost_path"]
             support = aws_expiry_cost_handoff(costs, expiry_fixture,
                 sorted(set((observation.vm_a.region, observation.vm_b.region))),
-                reservation_sha256=reservation.source_sha256)
+                reservation_sha256=reservation.source_sha256, config_id=campaign.config_id)
             settings_args = {"account_id": config["account_id"], "controller_cidr": config["controller_cidr"],
                 "ami_ids": config["ami_ids"], "public_key": config["public_key_path"].read_text().strip(),
                 "authentication_reference": config["authentication_reference"],

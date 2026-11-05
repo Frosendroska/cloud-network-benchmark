@@ -1,0 +1,2 @@
+stage: week
+settings: /etc/cloud-network-benchmark/operator.yaml

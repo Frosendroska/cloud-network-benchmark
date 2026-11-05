@@ -212,6 +212,27 @@ def _read_pair(item: Any, base: Path) -> tuple[ValidatorInput, ValidationResult,
             value = model.model_validate(_json_file(path))
         except Exception as exc:
             raise ValueError(f"invalid {key} at {path}: {exc}") from exc
+        if key == "validator_input":
+            # Export descriptors use locations relative to selection.json so a
+            # verified stage can be copied to the laptop without runner paths.
+            updates = {}
+            for field in ("child_result_root", "campaign_manifest_path", "child_manifest_path"):
+                candidate = Path(getattr(value, field))
+                if not candidate.is_absolute():
+                    updates[field] = str((base / candidate).resolve())
+            child_root = Path(updates.get("child_result_root", value.child_result_root))
+            # Config descriptors are relative to the child bundle, unlike the
+            # selection-level manifest references. Preserve that F08 convention.
+            for field in ("config_snapshot_path", "resolved_snapshot_path"):
+                candidate = Path(getattr(value, field))
+                if not candidate.is_absolute():
+                    updates[field] = str((child_root / candidate).resolve())
+            if value.schedule_snapshot_path.value is not None:
+                candidate = Path(value.schedule_snapshot_path.value)
+                if not candidate.is_absolute():
+                    updates["schedule_snapshot_path"] = value.schedule_snapshot_path.model_copy(
+                        update={"value": str((child_root / candidate).resolve())})
+            value = value.model_copy(update=updates)
         parsed.append(value)
         digest = _sha(path)
         source_rows.append({"kind": key, "path": str(path), "sha256": digest})

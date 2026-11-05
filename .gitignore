@@ -16,6 +16,10 @@ id_ed25519*
 credentials*
 secrets*
 
+# Frozen campaign runtime inputs are preserved with results, not committed.
+configs/tests/campaign-generated/
+configs/experiments/campaign-generated/
+
 # Terraform local state and generated files
 **/.terraform/
 *.tfstate

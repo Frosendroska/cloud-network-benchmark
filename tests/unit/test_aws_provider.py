@@ -439,7 +439,7 @@ def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_prese
     })
     driver._inventory_region = lambda _deployment, _region, failures: failures.append(primary) or {"complete": False, "remaining": {"volumes": ["inventory_unknown"]}}
     result = driver.cleanup(deployment)
-    assert runner.actions == ["aws-pair-destroy"]
+    assert runner.actions == ["terraform-init-aws-pair-destroy", "aws-pair-destroy"]
     assert result.cleanup_state == "failed"
     assert result.primary_failure.category == "terraform_apply"
     assert result.cleanup_failure.category == "inventory_incomplete"
@@ -471,7 +471,7 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     result = driver.cleanup(deployment)
     journal = driver._load_journal(attempt, deployment)
-    assert runner.actions == ["aws-pair-destroy"]
+    assert runner.actions == ["terraform-init-aws-pair-destroy", "aws-pair-destroy"]
     assert result.cleanup_state == "failed"
     assert result.primary_failure.category == "terraform_apply"
     assert journal["launch_blocked"] is True
