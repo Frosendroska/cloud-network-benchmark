@@ -20,7 +20,7 @@ The full offline gate requires a clean checkout, prepared local Python/Terraform
 
 ## Run from a remote controller
 
-The [campaign runner guide](docs/campaign-runner.md) covers account/controller setup, all offline/native test commands, credential storage, supervised acceptance and explicit calibration/DAY/WEEK starts. It also gives log/disk paths and commands to download, checksum-verify and analyse closed observations while WEEK continues. `campaign check` and start without `--execute` launch nothing. Real credentials, prices, approvals, common N and UTC windows remain required inputs. See [offline campaign evidence](docs/validation/campaign-driver.md) for tested behavior and remaining supervised checks.
+The [visual campaign runbook](docs/campaign-runner.html) ([Markdown reference](docs/campaign-runner.md)) covers account/controller setup, all offline/native test commands, credential storage, supervised acceptance and explicit calibration/DAY/WEEK starts. It also gives log/disk paths and commands to download, checksum-verify and analyse closed observations while WEEK continues. `campaign check` and start without `--execute` launch nothing. Real credentials, prices, approvals, common N and UTC windows remain required inputs. See [offline campaign evidence](docs/validation/campaign-driver.md) for tested behavior and remaining supervised checks.
 
 ## Inspect a saved experiment
 

@@ -2,6 +2,8 @@
 
 Updated 6 November 2026. Run collection on one remote Ubuntu VM; analyse on your laptop. Driver PR #25 is merged and [offline-tested](validation/campaign-driver.md). Real Ubuntu/systemd and cloud acceptance remain pending. Commands with `--execute` create billable resources: run them only after the named review/authorization. Replace `ACTUAL_*` and `YOUR_*` with real values. No AI session is needed during measurement.
 
+Open the [visual HTML runbook](campaign-runner.html) for a saved checklist, setup controls, copyable commands and stage navigation. This Markdown file remains the operational source. After editing it, run `python3 scripts/render_campaign_runbook.py`; use `--check` to detect a stale HTML copy.
+
 ## 1. Create the three accounts and obtain the controller
 
 1. Create or select your [AWS account](https://aws.amazon.com/), [Azure account/subscription](https://azure.microsoft.com/en-us/pricing/purchase-options/azure-account) and [GCP project with billing](https://docs.cloud.google.com/resource-manager/docs/creating-managing-projects). Enable MFA on human accounts. Record AWS account ID, Azure subscription/tenant IDs and GCP project ID. Check actual student/trial/university credit eligibility and service restrictions; do not assume credits cover these VMs. Keep the $250 working / $50 protected / $300 total budget; refresh gross workflow quotes, tax, export and expiry-support costs before launch.
