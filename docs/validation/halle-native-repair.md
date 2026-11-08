@@ -64,10 +64,38 @@ substitutes for the halle rerun.
 Local Git reads initially stalled on materialized files/objects; verified object reads and a
 Git stat-cache refresh restored normal operations without changing staged file contents.
 
-Native Linux acceptance is still pending. The macOS checks cannot qualify halle `/proc`,
-real SSH, provider expiry/deletion, source-built tools, logout/reboot persistence or cloud
-behavior. `Linger=no` and maintenance announced for 11 November remain operational gaps.
+The later halle rerun below qualifies the two local Linux `/proc` tests. Real SSH,
+provider expiry/deletion, source-built tools, logout/reboot persistence and cloud behavior
+remain unqualified. `Linger=no` and maintenance announced for 11 November remain operational gaps.
 The original ~949 MiB setup/fixture size is not the volume of a real diagnostic day.
+
+## Halle rerun and filesystem-buffer correction
+
+The user reported revision `d3115f371b45ce16ca343814f266915a53c1eeb8` from
+`/u/halle/brek/home_at/cnb/evidence/native-repair-oKUyLNUZ/`: all **13 scoped-stop
+checks passed**, including both native Linux `/proc` cases. The full suite reported
+**1,589 passed, one failed, four skipped** in 997.30 seconds. Schema and whitespace
+checks passed. The skips were the missing genuine Thesis checkout and three missing
+PowerShell-runtime cases. Keep that evidence directory unchanged.
+
+The remaining failure was the new artifact-integrity memory regression: 2,100,252 bytes
+against its unchanged 1.5 MiB limit. Python 3.12 chooses its default binary I/O buffer
+from the file's block size; this buffer exists in addition to the verifier's reusable
+1 MiB buffer ([CPython 3.12.3 implementation](https://github.com/python/cpython/blob/v3.12.3/Modules/_io/_iomodule.c#L330-L374)).
+Locally forcing a 1 MiB default I/O buffer reproduced the failure at 2,100,454 bytes.
+This is consistent with NFS buffering; the actual halle block size has not been measured.
+
+The verifier now opens the file with `buffering=0`, since it supplies its own read buffer.
+The regression models both 8 KiB and 1 MiB default buffers and still checks the complete
+checksum, budget callbacks and corruption in the partial final chunk. Both the 1.5 MiB
+contract-test limit and 3 MiB large-replay limit remain unchanged. Native confirmation
+of this follow-up is pending; the earlier run is not an all-pass Linux result.
+
+Local follow-up verification: **99 passed** in 52.05 seconds under native macOS arm64
+Python 3.12.14, covering the artifact contract, retrieval, acquisition and integration
+producer suites, including the 100,000-row replay. JUnit: `/tmp/cnb-nfs-repair-focused.xml`.
+This was focused verification; the full local suite was not repeated for this two-line
+production change.
 
 ## Transfer and update on halle (no sudo)
 

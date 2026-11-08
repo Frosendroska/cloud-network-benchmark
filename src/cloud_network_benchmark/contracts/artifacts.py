@@ -89,10 +89,10 @@ class ArtifactRecord(StrictModel):
         path = resolve_artifact_path(child_root, self.path)
         size = 0
         digest = hashlib.sha256()
-        # Reuse one buffer so consecutive reads do not hold two 1 MiB chunks.
+        # Own the only read buffer; default I/O buffering can add 1 MiB on NFS.
         buffer = bytearray(1024 * 1024)
         view = memoryview(buffer)
-        with path.open("rb") as stream:
+        with path.open("rb", buffering=0) as stream:
             while True:
                 if budget_check is not None:
                     budget_check(size, digest.hexdigest())
