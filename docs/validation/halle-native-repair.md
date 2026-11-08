@@ -47,8 +47,20 @@ the four mock-plan suites passed. Provider plugins required local socket permiss
 the sandbox; execution used a filesystem mirror and an environment with cloud credentials
 removed. The initial sandbox plugin-start failures are retained separately.
 
-Schema, Python compilation and whitespace checks passed. Affected provider projections and
-the full suite are recorded in the final evidence report accompanying the repair bundle.
+At tested code `7d7955da34b7baea152f3ab4e2a6c79e29295a42`, the full native macOS arm64
+suite (Python 3.12.14) passed: **1,592 passed, two Linux `/proc` skips**, one existing tar
+extraction deprecation warning, 877.48 seconds, exit 0. JUnit contains 1,594 cases and no
+failures/errors. This includes every reported provider projection case and the large replay.
+Evidence: `/tmp/cnb-halle-repair-full-tlflj8vk/`; Terraform static evidence:
+`/tmp/cnb-halle-repair-static-jao58kli/`. Schema, compilation and whitespace checks passed.
+Existing user runbook edits were preserved; this was not a clean-checkout renewal of the
+strict F10 gate. The follow-up commit only refines this handoff, leaving code/tests equal
+to the tested revision. The final evidence report and checksums accompany the bundle.
+
+A separate native-arm64 allocation check measured 2,102,230 bytes for the previous checksum
+read loop and 1,054,708 bytes for the reusable-buffer implementation. The original replay
+limit failure was reported on Linux; the pre-fix macOS replay passed. Neither measurement
+substitutes for the halle rerun.
 Local Git reads initially stalled on materialized files/objects; verified object reads and a
 Git stat-cache refresh restored normal operations without changing staged file contents.
 
@@ -205,6 +217,23 @@ export TF_CLI_CONFIG_FILE="$CNB_TFRC" CHECKPOINT_DISABLE=1 TF_IN_AUTOMATION=1
 for CNB_REL in aws/pair aws/safety azure/pair azure/expiry gcp/pair gcp/protection; do
   terraform -chdir="terraform/$CNB_REL" init -backend=false -lockfile=readonly -input=false
 done
+# `providers mirror` writes packed ZIPs. The gate also checks the unpacked
+# version/platform layout; materialize it after init has verified the ZIPs.
+export CNB_MIRROR
+python - <<'PY'
+import os, zipfile
+from pathlib import Path
+mirror = Path(os.environ['CNB_MIRROR']) / 'registry.terraform.io/hashicorp'
+for provider, version in [('aws', '6.70.0'), ('azurerm', '4.81.0'), ('google', '7.46.1')]:
+    root = mirror / provider
+    archive_path = root / f'terraform-provider-{provider}_{version}_linux_amd64.zip'
+    destination = root / version / 'linux_amd64'
+    destination.mkdir(parents=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(destination)
+    for binary in destination.glob('terraform-provider-*'):
+        binary.chmod(0o700)
+PY
 # Requires the actual read-only Thesis checkout, not a fixture directory.
 export THESIS_ROOT="$HOME/cnb/Thesis"
 test -d "$THESIS_ROOT/.git"
