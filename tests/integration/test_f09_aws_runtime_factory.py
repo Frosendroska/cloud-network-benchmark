@@ -705,7 +705,7 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
     ("failure_check", True, True, "valid"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, context_name, full_native, late_tail, expected_validity):
+        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail, expected_validity):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -715,8 +715,12 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     config = repository_root / "configs/tests" / f"f09-{tmp_path.name}-{context_name}.yaml"
     request.addfinalizer(lambda: config.unlink(missing_ok=True))
     config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    # Keep real implementation identity for the staged-source guard. Only the
+    # design identity belongs to this explicitly synthetic, cloud-free fixture.
+    from cloud_network_benchmark.manifests import StaticGitProvenance
     initialized = initialize_campaign(config, repository_root, tmp_path / "results",
-        clock=lambda: NOW, token_source=lambda: "campaign")
+        clock=lambda: NOW, token_source=lambda: "campaign",
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
     parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
         config_path=config)

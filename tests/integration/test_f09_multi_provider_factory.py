@@ -439,8 +439,12 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         import tests.integration.test_f09_aws_runtime_factory as aws_runtime_test
         monkeypatch.setattr(aws_runtime_test, "NOW", synthetic_now)
     campaign, _ = resolve_campaign(config, ROOT, schedule_entry=schedule_entry)
+    # Keep real implementation identity for the staged-source guard. Only the
+    # design identity belongs to this explicitly synthetic, cloud-free fixture.
+    from cloud_network_benchmark.manifests import StaticGitProvenance
     initialized = initialize_campaign(config, ROOT, tmp_path / "results",
-        clock=lambda: NOW, token_source=lambda: "campaign", schedule_entry=schedule_entry)
+        clock=lambda: NOW, token_source=lambda: "campaign", schedule_entry=schedule_entry,
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
     parent, children = load_initialized_campaign(parent_path, repository_root=ROOT, config_path=config)
     costs = _costs(tmp_path / "costs.json", campaign, children)

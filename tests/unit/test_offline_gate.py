@@ -260,6 +260,7 @@ def test_main_retains_preflight_failure_without_dispatch(tmp_path, monkeypatch, 
 
 
 def test_main_metadata_failure_records_all_omitted_checks_and_end_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("THESIS_ROOT", str(tmp_path))
     evidence = tmp_path / "evidence"
     clean = {"head": "a", "tree": "b", "clean": True, "status": []}
     monkeypatch.setattr(gate, "prerequisites", lambda *args: clean)
@@ -276,6 +277,7 @@ def test_main_metadata_failure_records_all_omitted_checks_and_end_state(tmp_path
 
 
 def test_main_interrupt_preserves_failed_log_and_marks_remaining_not_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("THESIS_ROOT", str(tmp_path))
     evidence = tmp_path / "evidence"
     clean = {"head": "a", "tree": "b", "clean": True, "status": []}
     monkeypatch.setattr(gate, "prerequisites", lambda *args: clean)
@@ -302,6 +304,7 @@ def test_main_interrupt_preserves_failed_log_and_marks_remaining_not_run(tmp_pat
 
 
 def test_main_sanitizes_environment_and_records_allowlisted_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("THESIS_ROOT", str(tmp_path))
     evidence = tmp_path / "evidence"
     clean = {"head": "a", "tree": "b", "clean": True, "status": []}
     monkeypatch.setattr(gate, "prerequisites", lambda *args: clean)
@@ -362,6 +365,7 @@ def test_main_rejects_evidence_inside_source_without_creating_it(tmp_path, monke
 
 
 def test_main_failure_detects_revised_or_dirty_end_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("THESIS_ROOT", str(tmp_path))
     evidence = tmp_path / "evidence"
     clean = {"head": "a", "tree": "b", "clean": True, "status": []}
     changed = {"head": "a", "tree": "changed", "clean": False, "status": [" M src/file.py"]}
@@ -391,3 +395,70 @@ def test_main_failure_detects_revised_or_dirty_end_state(tmp_path, monkeypatch):
 def os_env():
     import os
     return os.environ.copy()
+
+
+@pytest.mark.parametrize("system,machine,target", [
+    ("Linux", "x86_64", "linux_amd64"), ("Linux", "aarch64", "linux_arm64"),
+    ("Darwin", "arm64", "darwin_arm64"), ("Darwin", "x86_64", "darwin_amd64"),
+])
+def test_terraform_platform_uses_host_package(system, machine, target, monkeypatch):
+    monkeypatch.setattr(gate.platform, "system", lambda: system)
+    monkeypatch.setattr(gate.platform, "machine", lambda: machine)
+    assert gate.terraform_platform() == target
+
+
+def test_terraform_platform_rejects_unknown_host(monkeypatch):
+    monkeypatch.setattr(gate.platform, "system", lambda: "unknown")
+    with pytest.raises(ValueError, match="unsupported Terraform host"):
+        gate.terraform_platform()
+
+
+@pytest.mark.parametrize("cached_target,accepted", [("linux_amd64", True), ("darwin_arm64", False)])
+def test_linux_preflight_requires_linux_provider_packages(tmp_path, monkeypatch, cached_target, accepted):
+    repo, mirror = tmp_path / "repo", tmp_path / "mirror"
+    repo.mkdir(); mirror.mkdir()
+    monkeypatch.setattr(gate, "ROOT", repo)
+    clean = {"head": "a", "tree": "b", "clean": True, "status": []}
+    monkeypatch.setattr(gate, "source_state", lambda: clean)
+    monkeypatch.setattr(gate.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(gate.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(gate.shutil, "which", lambda name: "/test/pytest")
+    monkeypatch.setattr(gate.importlib.metadata, "version", lambda pkg: "1")
+    terraform, pwsh = tmp_path / "terraform", tmp_path / "pwsh"
+    for tool in (terraform, pwsh):
+        tool.write_text("synthetic tool"); tool.chmod(0o755)
+    for rel in gate.ROOTS:
+        provider, version = {"aws": ("aws", "6.70.0"), "azure": ("azurerm", "4.81.0"),
+                             "gcp": ("google", "7.46.1")}[rel.split("/")[0]]
+        root = repo / "terraform" / rel
+        root.mkdir(parents=True)
+        (root / ".terraform.lock.hcl").write_text(
+            f'provider "registry.terraform.io/hashicorp/{provider}" {{\n version = "{version}"\n}}\n')
+        package = Path("registry.terraform.io/hashicorp") / provider / version / cached_target
+        for base in (root / ".terraform/providers", mirror):
+            destination = base / package
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"terraform-provider-{provider}").write_text("synthetic package")
+        if rel in gate.MOCKS:
+            mock = root / gate.MOCKS[rel]
+            mock.parent.mkdir(parents=True, exist_ok=True)
+            mock.write_text('mock_provider "test" {}\nrun "offline" {\n command = plan\n}\n')
+    if accepted:
+        assert gate.prerequisites(tmp_path / "evidence", terraform, pwsh, mirror) == clean
+    else:
+        with pytest.raises(ValueError, match="initialized local providers missing"):
+            gate.prerequisites(tmp_path / "evidence", terraform, pwsh, mirror)
+
+
+def test_main_missing_real_thesis_context_fails_before_checks(tmp_path, monkeypatch):
+    monkeypatch.setenv("THESIS_ROOT", str(tmp_path / "missing-thesis"))
+    clean = {"head": "a", "tree": "b", "clean": True, "status": []}
+    monkeypatch.setattr(gate, "prerequisites", lambda *args: clean)
+    monkeypatch.setattr(gate, "source_state", lambda: clean)
+    monkeypatch.setattr(gate, "run_check", lambda *a, **k: pytest.fail("missing context must not dispatch checks"))
+    evidence = tmp_path / "evidence"
+    assert gate.main(["--evidence-dir", str(evidence), "--terraform", "/tf",
+                      "--pwsh", "/pwsh", "--provider-mirror", "/mirror"]) == 1
+    summary = json.loads((evidence / "summary.json").read_text())
+    assert "FileNotFoundError" in summary["error"]
+    assert all(row["status"] == "not_run" for row in summary["checks"])

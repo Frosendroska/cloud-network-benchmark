@@ -449,52 +449,64 @@ def _stop_remote_f03(connection: Any, process_record: Mapping[str, Any], invocat
     from .access import _action, _execute, _request
     from .contracts.common import CommandOutcome
 
-    remaining = deadline.remaining(clock, cleanup=True)
+    remaining = min(deadline.remaining(clock, cleanup=True), connection.timeouts.command_seconds)
     if remaining <= 0:
         return "cancellation_unverified_cleanup_allowance_exhausted"
     # The published record is passed as canonical expected values; the guest
     # checks boot, leader start ticks, PGID/SID and every remaining session
     # member before signalling the owned group.
     code = r'''import json,os,signal,sys,time
-path,deployment,invocation,pid,pgid,sid,boot,ticks=sys.argv[1:]
-expected={'deployment_id':deployment,'invocation_id':invocation,'pid':int(pid),'process_group':int(pgid),'session_id':int(sid),'boot_id':boot,'start_ticks':int(ticks)}
+path,deployment,invocation,pid,pgid,sid,boot,ticks,timeout=sys.argv[1:]
+pid,pgid,sid,ticks=int(pid),int(pgid),int(sid),int(ticks)
+expected={'deployment_id':deployment,'invocation_id':invocation,'pid':pid,'process_group':pgid,'session_id':sid,'boot_id':boot,'start_ticks':ticks}
 try:
- record=json.load(open(path))
+ with open(path) as stream: record=json.load(stream)
  if record != expected: raise SystemExit('process_record_identity_mismatch')
- if open('/proc/sys/kernel/random/boot_id').read().strip()!=boot: raise SystemExit('boot_identity_mismatch')
+ with open('/proc/sys/kernel/random/boot_id') as stream: observed_boot=stream.read().strip()
+ if observed_boot!=boot: raise SystemExit('boot_identity_mismatch')
+ if pid<=1 or pgid!=pid or sid!=pid: raise SystemExit('session_identity_mismatch')
  def rows():
   out=[]
   for name in os.listdir('/proc'):
    if not name.isdigit(): continue
    try:
-    raw=open('/proc/'+name+'/stat').read(); tail=raw[raw.rfind(')')+2:].split()
-    out.append((int(name),int(tail[2]),int(tail[3]),int(tail[19])))
-   except (OSError,ValueError,IndexError): pass
+    with open('/proc/'+name+'/stat') as stream: raw=stream.read()
+    tail=raw[raw.rfind(')')+2:].split()
+    out.append((int(name),int(tail[2]),int(tail[3]),int(tail[19]),tail[0]))
+   except (FileNotFoundError,ProcessLookupError): pass
+   except PermissionError: continue
   return out
- all_rows=rows(); leader=next((r for r in all_rows if r[0]==int(pid)),None)
- if leader and (leader[1]!=int(pgid) or leader[2]!=int(sid) or leader[3]!=int(ticks)):
-  raise SystemExit('leader_identity_mismatch')
- owned=[r for r in all_rows if r[1]==int(pgid) and r[2]==int(sid)]
- if not owned:
-  print('process_group_stopped'); raise SystemExit(0)
- if not leader and not owned: print('process_group_stopped'); raise SystemExit(0)
- os.killpg(int(pgid),signal.SIGTERM)
- end=time.monotonic()+min(float(sys.argv[9]),5.0)
+ def live_owned():
+  all_rows=rows(); leader=next((r for r in all_rows if r[0]==pid),None)
+  if leader and (leader[1]!=pgid or leader[2]!=sid or leader[3]!=ticks):
+   raise SystemExit('leader_identity_mismatch')
+  group=[r for r in all_rows if r[1]==pgid]
+  if any(r[2]!=sid or r[3]<ticks for r in group):
+   raise SystemExit('member_identity_mismatch')
+  # Zombies have exited; only their parent or the host's reaper can reap them.
+  return [r for r in group if r[4] not in {'Z','X'}]
+ def stopped():
+  if not live_owned():
+   print('process_group_stopped'); return True
+  return False
+ if stopped(): raise SystemExit(0)
+ end=time.monotonic()+max(0.0,float(timeout))
+ os.killpg(pgid,signal.SIGTERM)
+ term_end=time.monotonic()+max(0.0,(end-time.monotonic())*.7)
+ while time.monotonic()<term_end:
+  if stopped(): raise SystemExit(0)
+  time.sleep(min(.1,max(0.0,term_end-time.monotonic())))
+ if stopped(): raise SystemExit(0)
+ os.killpg(pgid,signal.SIGKILL)
  while time.monotonic()<end:
-  if not [r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]:
-   print('process_group_stopped'); raise SystemExit(0)
-  time.sleep(.1)
- remaining=[r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]
- if remaining:
-  os.killpg(int(pgid),signal.SIGKILL)
- end=time.monotonic()+min(float(sys.argv[9]),2.0)
- while time.monotonic()<end:
-  if not [r for r in rows() if r[1]==int(pgid) and r[2]==int(sid)]:
-   print('process_group_stopped'); raise SystemExit(0)
-  time.sleep(.1)
+  if stopped(): raise SystemExit(0)
+  time.sleep(min(.1,max(0.0,end-time.monotonic())))
+ if stopped(): raise SystemExit(0)
  print('process_group_still_running'); raise SystemExit(1)
 except ProcessLookupError:
- print('process_group_stopped')
+ # A disappearing group is successful only after rechecking identity/liveness.
+ if stopped(): raise SystemExit(0)
+ raise SystemExit('process_group_stop_raced')
 '''
     # Pass the exact process record through stdin-free argv values and compare
     # it with the durable guest file before any signal is sent.
