@@ -242,10 +242,9 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
                     uuid.UUID(options["subscription_id"])
                     uuid.UUID(options["tenant_id"])
                     AzureRuntimeOptions.concrete_ubuntu_image(options["selected_image"])
-                elif (set(options["images"]) != {"europe-west3", "europe-west2"} or not all(
-                        isinstance(image, str) and re.fullmatch(r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-[a-z0-9-]+", image)
-                        for image in options["images"].values())):
-                    raise ValueError("set concrete GCP Ubuntu image resource identities for Frankfurt and London")
+                elif provider == "gcp":
+                    from .providers.gcp import validate_ubuntu_image_identities
+                    validate_ubuntu_image_identities(options["images"])
         # Credential refresh is a reviewed operator fact, never inferred from a login.
         refresh = settings.get("credential_refresh", {})
         if not refresh.get("confirmed") or not refresh.get("valid_through_utc"):

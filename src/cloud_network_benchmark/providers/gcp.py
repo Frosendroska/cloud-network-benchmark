@@ -30,6 +30,16 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {"europe-west3": ("europe-west3-a", "europe-west3-b"), "europe-west2": ("europe-west2-a",)}
 
 
+def validate_ubuntu_image_identities(images: dict[str, str]) -> None:
+    """Require dated Ubuntu 24.04 amd64 image resources, never family aliases."""
+    if not isinstance(images, dict) or set(images) != set(REGION_ZONES):
+        raise ValueError("images must pin the selected Frankfurt and London image identities")
+    # Noble is the published image name; retain dated legacy configuration names.
+    pattern = r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-(?:noble-amd64-v|lts-amd64-v?)[0-9]{8}"
+    if any(not isinstance(value, str) or not re.fullmatch(pattern, value) for value in images.values()):
+        raise ValueError("images must be immutable Ubuntu 24.04 amd64 image identities, not aliases or families")
+
+
 class GcpRuntimeSettings(StrictModel):
     project_id: str = Field(pattern=r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
     controller_cidr: str
@@ -75,10 +85,7 @@ class GcpRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
-        if set(self.images) != {"europe-west3", "europe-west2"}:
-            raise ValueError("images must pin the selected Frankfurt and London image identities")
-        if any(not re.fullmatch(r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-[a-z0-9-]+", value) for value in self.images.values()):
-            raise ValueError("images must be immutable Ubuntu 24.04 amd64 image identities, not aliases or families")
+        validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
             if field not in handoff:
