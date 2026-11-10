@@ -38,6 +38,9 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
     provider = Provider(campaign.selected_providers[0]).value
     child = SimpleNamespace(run_id=f"initialized-{provider}", deployment_id=f"initialized-{provider}-deployment",
         observation_id=f"initialized-{provider}-observation", execution_state="initialized")
+    from cloud_network_benchmark.manifests import RepositoryGitProvenance
+    child.config_provenance = SimpleNamespace(
+        implementation_git_commit=RepositoryGitProvenance().commit(repository_root))
     rows = {}
     for name in ("compute", "disks", "addresses", "traffic_export", "tax", "uncertainty", "expiry_cleanup_support"):
         rows.setdefault(provider, {"envelope_id": f"env-{provider}", "provider": provider,
@@ -55,7 +58,15 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
         hashlib.sha256(raw).hexdigest(), payload, ("fixture",), False)
     allowance = WorkflowAllowance(10, 20, 10, 60, 100, 5, 10, 10, "fixture-policy", {provider: 60})
     aws_expiry_source = repository_root / "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
-    runtime = {"providers": {provider: {"sources": {"expiry_cost_path": aws_expiry_source}}},
+    # Request construction now retains executable/template provenance too. This
+    # synthetic descriptor supplies identity only and grants no paid authority.
+    runtime_path = tmp_path / "SYNTHETIC-runtime.json"
+    runtime_path.write_text('{"scope":"SYNTHETIC-request-only"}')
+    runtime = {"providers": {provider: {"sources": {"expiry_cost_path": aws_expiry_source},
+        "bootstrap_template": repository_root / "terraform/aws/bootstrap.yaml",
+        "terraform_directory": repository_root / "terraform/aws/pair"}},
+        "runtime_source": {"path": str(runtime_path),
+            "sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest()},
         "allowance": allowance, "approval_evidence": {}}
     parent = SimpleNamespace(campaign_id="initialized-campaign")
 
@@ -68,6 +79,8 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
     assert request.campaign_id == parent.campaign_id
     assert request.estimated_cost_usd.value == pytest.approx(0.07)
     assert plan.funding == {"primary": Decimal("0.07")}
+    assert runtime["runtime_source"] in plan.financial_binding["sources"]
+    assert plan.financial_binding["initialized_revisions"] == [child.config_provenance.implementation_git_commit.value]
 
     blocked, _ = build_admission_request(campaign=campaign, parent=parent, children={provider: child},
         costs=costs, runtime=runtime,
