@@ -190,3 +190,20 @@ def test_expired_authority_stops_new_stages_but_original_cleanup_reconciles(tmp_
         record_absence(book, f'SYNTHETIC-expired-{provider}', rid, provider, NOW+timedelta(days=2))
     assert book.inspect()['reservations'][rid]['cleanup_open'] is False
     assert book.inspect()['reservations'][rid]['financial']['gross_eur'] == '0.56'
+
+
+def test_higher_reviewed_fx_revalues_prior_unbilled_cash_without_erasing_margin(tmp_path):
+    import json
+    from tests.financial_helpers import save
+    book, plans, card, path = synthetic_finances(tmp_path, count=2)
+    card['caps']['personal_cash_eur'] = '1.80'
+    plans = rewrite_card(plans,path,card)
+    assert book.reserve(plans[0][0],plan=plans[0][1]).status == 'reserved'
+    fxfile = tmp_path/'SYNTHETIC-fx-higher.json'
+    fxdata = json.loads((tmp_path/'SYNTHETIC-fx.json').read_text())
+    fxdata['conservative_eur_per_unit'] = '2.00'
+    card['fx'] = {**fxdata, **save(fxfile,fxdata)}
+    updated = rewrite_card(plans,tmp_path/'SYNTHETIC-reapproved-higher-fx.json',card)
+    result = book.reserve(updated[1][0],plan=updated[1][1])
+    assert result.reasons == ('financial_cash_ceiling_exceeded',)
+    assert len(book.inspect()['reservations']) == 1

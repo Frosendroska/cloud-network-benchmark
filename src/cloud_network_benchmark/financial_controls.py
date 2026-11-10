@@ -324,11 +324,13 @@ def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal
     prior = [r['financial'] for r in records]
     caps = Caps.model_validate(snapshot['caps'])
     # Never release original maxima or allow later FX changes to discount old exposure.
-    gross = [max(amount(f['gross_eur']), liability(amount(r.get('incurred_usd', 0)) * amount(f['rate'])))
+    rate = max([amount(snapshot['rate'])] + [amount(f['rate']) for f in prior])
+    gross = [max(amount(f['gross_eur']),
+        liability(max(amount(r['reserved_cost_usd']), amount(r.get('incurred_usd', 0))) * rate)
+        + max(amount(f['gross_eur']) - liability(amount(r['reserved_cost_usd']) * amount(f['rate'])), Decimal(0)))
              for r, f in zip(records, prior)]
     external = max([amount(snapshot['external_gross_eur'])] + [amount(f['external_gross_eur']) for f in prior])
     cash_external = max([amount(snapshot['external_cash_eur'])] + [amount(f['external_cash_eur']) for f in prior])
-    rate = max([amount(snapshot['rate'])] + [amount(f['rate']) for f in prior])
     future = liability(remaining_usd * rate)
     total = external + sum(gross) + amount(snapshot['gross_eur']) + future
     cash = cash_external + sum(gross) + amount(snapshot['cash_eur']) + future
@@ -343,9 +345,18 @@ def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal
         if used + amount(snapshot['gross_eur']) > ceiling(cap):
             raise FinancialError('financial_' + label + '_ceiling_exceeded')
     for provider, value in snapshot['providers_eur'].items():
-        used = sum((max(amount(f['providers_eur'].get(provider, 0)),
-            liability(amount(r.get('provider_billing', {}).get(provider, {}).get('actual_usd') or 0) * amount(f['rate'])))
-            for r, f in zip(records, prior)), Decimal(0))
+        used = Decimal(0)
+        for r, f in zip(records, prior):
+            if provider not in f['providers_eur']:
+                continue
+            reserved = sum((amount(c['amount_usd']) for c in
+                r['plan']['cost_envelopes'][provider]['components'].values()), Decimal(0))
+            billing = r.get('provider_billing', {}).get(provider, {})
+            dollars = max(reserved, amount(billing.get('actual_usd') or 0), amount(billing.get('estimate_usd') or 0))
+            # Preserve the original fixed-fee/rounding margin while revaluing all
+            # unsettled USD exposure at the highest reviewed conservative rate.
+            margin = max(amount(f['providers_eur'][provider]) - liability(reserved * amount(f['rate'])), Decimal(0))
+            used += max(amount(f['providers_eur'][provider]), liability(dollars * rate) + margin)
         if used + amount(value) > ceiling(caps.providers_eur[provider]):
             raise FinancialError('financial_provider_ceiling_exceeded')
 
