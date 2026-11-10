@@ -29,6 +29,8 @@ from .contracts.admission import (ExpiryEvidence, ExpiryRequest, ReservationEvid
                                   ReservationRequest)
 from .contracts.common import Evidence, ExperimentMode, Provider, StringEvidence
 from .scheduling import assess_provider_skew, inspect_schedule, load_schedule
+from .financial_controls import (FinancialError, validate_paid_financial_plan,
+    check_shared_finances, revalidate_financial_record, validate_stored_commitment)
 
 
 def _decimal(value: Any, name: str = "money") -> Decimal:
@@ -370,6 +372,7 @@ class AdmissionPlan:
     optional_review_evidence: Mapping[str, Any] = field(default_factory=dict)
     observation_id: str | None = None
     cost_envelopes: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    financial_binding: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.execution_scope not in {"offline_simulation", "paid_request"}:
@@ -574,6 +577,8 @@ class BudgetLedger:
                 _decimal(item.get("reserved_cost_usd"), "reserved cost")
                 _decimal(item.get("incurred_usd", "0"), "incurred cost")
                 _decimal(item.get("released_usd", "0"), "released funding")
+                if "financial" in item:
+                    validate_stored_commitment(item, scope_id=self.scope_id)
                 _duration(item.get("cap_start_monotonic"), "monotonic activation")
                 _duration(item.get("allowance"), "workflow allowance")
                 _hash(item.get("plan", {}).get("fingerprint", ""), "plan fingerprint")
@@ -709,6 +714,11 @@ class BudgetLedger:
         except ValueError as exc:
             reason = "source_mismatch" if "source_mismatch" in str(exc) else "cost_envelope_invalid"
             return AdmissionDecision("rejected", False, None, (reason,), 0)
+        try:
+            financial = validate_paid_financial_plan(plan, request, scope_id=self.scope_id,
+                                                    now=self.utc_now())
+        except FinancialError as exc:
+            return AdmissionDecision("rejected", False, None, (exc.reason,), 0)
         reasons = []
         support_components: list[Decimal] = []
         if plan.execution_scope == "paid_request":
@@ -806,7 +816,7 @@ class BudgetLedger:
                 "cleanup":plan.allowance.cleanup_seconds,"source_id":plan.allowance.source_id,
                 "provider_leads":dict(plan.allowance.provider_leads_seconds)},
                 "provider_support":dict(plan.provider_support), "original_failure":plan.original_failure,
-                "cost_envelopes":dict(plan.cost_envelopes),
+                "cost_envelopes":dict(plan.cost_envelopes), "financial": financial,
                 "optional_reviewed":plan.optional_reviewed,"optional_review_evidence":dict(plan.optional_review_evidence),
                 "observation_id":plan.observation_id,"scheduled_start":campaign.scheduled_start.isoformat() if campaign.scheduled_start else None}
             fingerprint = hashlib.sha256(json.dumps({"request": request.model_dump(mode="json"), "source": plan.costs.payload_sha256, "plan":plan_payload}, sort_keys=True, default=str).encode()).hexdigest()
@@ -889,6 +899,12 @@ class BudgetLedger:
             commitment = active + spent + remaining
             if commitment > Decimal("250") or commitment + Decimal("50") > Decimal("300"):
                 return AdmissionDecision("rejected", False, None, ("budget_exhausted",), state["revision"])
+            if financial is not None:
+                try:
+                    check_shared_finances(state, financial, remaining_usd=max(remaining-price, Decimal("0")))
+                except (FinancialError, ValueError, KeyError, TypeError) as exc:
+                    reason = exc.reason if isinstance(exc, FinancialError) else "financial_ledger_invalid"
+                    return AdmissionDecision("rejected", False, None, (reason,), state["revision"])
             now = _utc(self.utc_now())
             deadline = min([now + timedelta(seconds=request.lifetime_cap_seconds)] + [now + timedelta(seconds=request.lifetime_cap_seconds - float(v)) for v in plan.allowance.provider_leads_seconds.values()])
             workflow_seconds = plan.allowance.fit_seconds(now=now, scheduled_start=campaign.scheduled_start)
@@ -920,6 +936,9 @@ class BudgetLedger:
             # Activation precedes provider expiry registration; until sourced cleanup
             # proves absence, a controller restart must conservatively block launches.
             rec["cleanup_open"] = True
+            rec["execution_scope"] = plan.execution_scope
+            if financial is not None:
+                rec["financial"] = financial
             rec["provider_cleanup"] = {name: False for name in selected}
             state["cleanup_open"].append(rid)
             rec["context"] = str(getattr(campaign.context,"value",campaign.context))
@@ -951,6 +970,12 @@ class BudgetLedger:
         state = self.inspect()
         rec = state["reservations"].get(reservation_id)
         if not rec: return StageDecision(False, ("ledger_unavailable",), None)
+        if stage != "cleanup":
+            try:
+                revalidate_financial_record(rec, state=state, now=self.utc_now(),
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+            except FinancialError as exc:
+                return StageDecision(False, (exc.reason,), None)
         originals = rec.get("allowance_fields", {})
         remain_fields = {"registration_seconds":remaining.registration_seconds,"provision_seconds":remaining.provision_seconds,
             "readiness_seconds":remaining.readiness_seconds,"stabilization_seconds":remaining.stabilization_seconds,
@@ -1010,6 +1035,11 @@ class BudgetLedger:
         try:
             state = self._read(); rec = state["reservations"].get(reservation_id)
             if not rec: return StageDecision(False,("ledger_unavailable",),None)
+            try:
+                revalidate_financial_record(rec, state=state, now=self.utc_now(),
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+            except FinancialError as exc:
+                return StageDecision(False, (exc.reason,), None)
             evidence_now = ReservationEvidence.model_validate(rec["evidence"])
             if evidence_now.state != "reserved" or rec.get("terminal_released") or rec.get("lifecycle_terminal"):
                 return StageDecision(False,("reservation_terminal",),evidence_now.expires_at.value)

@@ -108,7 +108,7 @@ def load_entry(stage, entry, root):
     return runtime, parent, children, request, plan
 
 
-def test_actual_acceptance_generation_loads_and_two_shared_reservations_are_admitted(repository_root, tmp_path, monkeypatch, request):
+def test_generated_acceptance_does_not_manufacture_financial_authority(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     clock = Clock()
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
@@ -122,11 +122,12 @@ def test_actual_acceptance_generation_loads_and_two_shared_reservations_are_admi
         runtime, parent, children, request, plan = load_entry(stage, entry, repository_root)
         namespaces.extend(plan.namespaces.values())
         decision = book.reserve(request, plan=plan)
-        assert decision.status == "reserved", decision.reasons
+        assert decision.status == "rejected"
+        assert decision.reasons == ("financial_authorization_invalid",)
         assert len(children) == 3
         assert all(child.mode == "acceptance" for child in children.values())
         assert all(Path(row["bootstrap_template"]).is_file() for row in runtime["providers"].values())
-    assert len(book.inspect()["reservations"]) == 2
+    assert len(book.inspect()["reservations"]) == 0
     assert len(namespaces) == len(set(namespaces)) == 6
 
 
@@ -176,18 +177,18 @@ def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isol
     for entry in entries[:2]:
         _, _, _, request, plan = load_entry(stage, entry, repository_root)
         denied = book.reserve(request, plan=plan)
-        assert denied.status in {"rejected", "pending"} and "prerequisite_pending" in denied.reasons
-        # Keep real paid source-template and accounting validation; only the
-        # empirical acceptance boundary is explicitly fake in this offline case.
+        assert denied.status in {"rejected", "pending"} and "financial_authorization_invalid" in denied.reasons
+        # An empirical acceptance stub cannot override missing financial authority.
         with monkeypatch.context() as approval_boundary:
             approval_boundary.setattr("cloud_network_benchmark.admission._validate_paid_acceptance_evidence", lambda *_: None)
             admitted = book.reserve(request, plan=plan)
-        assert admitted.status == "reserved", admitted.reasons
-    assert len(book.inspect()["reservations"]) == 2
-    assert {row["session"] for row in book.inspect()["reservations"].values()} == {stage["controller_session_id"]}
+        assert admitted.status == "rejected"
+        assert admitted.reasons == ("financial_authorization_invalid",)
+    assert len(book.inspect()["reservations"]) == 0
+    assert {row["session"] for row in book.inspect()["reservations"].values()} == set()
 
 
-def test_complete_static_check_uses_only_readonly_identity_boundary_without_mutation(repository_root, tmp_path, monkeypatch):
+def test_complete_static_check_blocks_before_identity_calls_without_mutation(repository_root, tmp_path, monkeypatch):
     import copy
     import cloud_network_benchmark.campaign_inputs as inputs
 
@@ -196,8 +197,8 @@ def test_complete_static_check_uses_only_readonly_identity_boundary_without_muta
     called = []
     monkeypatch.setattr(inputs, "check_provider_identities", lambda providers: called.append(providers) or [])
     before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
-    assert inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root) == []
-    assert called == [settings["providers"]]
+    assert inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root) == ["cumulative_transfer_guard_not_implemented"]
+    assert called == []
     assert settings == original
     assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
     assert not Path(settings["state_root"]).exists()
@@ -210,7 +211,7 @@ def test_missing_real_identity_is_actionable_and_does_not_prepare_state(reposito
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     monkeypatch.setattr(inputs, "check_provider_identities", lambda _: ["AWS credentials unavailable; refresh reviewed account"])
     blockers = inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root)
-    assert blockers == ["AWS credentials unavailable; refresh reviewed account"]
+    assert blockers == ["cumulative_transfer_guard_not_implemented"]
     assert not Path(settings["state_root"]).exists()
     assert not Path(settings["results_root"]).exists()
 

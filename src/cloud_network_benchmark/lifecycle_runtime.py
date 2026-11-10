@@ -172,7 +172,9 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         source = _source_path(reference.parent, declared_path, f"approval_evidence.{key}.source_path")
         if hashlib.sha256(source.read_bytes()).hexdigest() != declared_hash:
             raise ValueError(f"approval evidence {key} source hash does not match its bytes")
-        root["approval_evidence"][key] = evidence
+        root["approval_evidence"][key] = {**evidence, "source_path": str(source)}
+    root["runtime_source"] = {"path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     return root
 
 
@@ -352,8 +354,43 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         optional_review_evidence=({"priority": prerequisites["optional_review"]}
             if "optional_review" in prerequisites else {}),
         observation_id=next(iter(children.values())).observation_id,
-        cost_envelopes=envelopes)
+        cost_envelopes=envelopes,
+        financial_binding=_financial_runtime_binding(runtime, children))
     return request, plan
+
+
+def _financial_runtime_binding(runtime, children):
+    """Bind actual executable/template bytes, effective settings and initialized revision.
+
+    Does not read credentials or emit their contents. Only source digests are retained.
+    """
+    from .financial_controls import digest
+    from .manifests import RepositoryGitProvenance
+    root = Path(__file__).resolve().parents[2]
+    sources = dict()
+    def add(path):
+        path = Path(path).absolute()
+        if path.is_file() and not path.is_symlink():
+            sources[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in (root / "src/cloud_network_benchmark").rglob("*.py"):
+        add(path)
+    for row in runtime["providers"].values():
+        add(row["bootstrap_template"])
+        for path in Path(row["terraform_directory"]).glob("*.tf"):
+            add(path)
+        for path in row["sources"].values():
+            if path is not None:
+                add(path)
+    source = runtime.get("runtime_source")
+    if source:
+        sources[source["path"]] = source["sha256"]
+    return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
+        "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
+                                         for c in children.values()}),
+        "runtime_source": source,
+        "effective_runtime_sha256": digest({k: v for k, v in runtime.items()
+            if k not in {"approval_evidence", "runtime_source", "sleep"}}),
+        "sources": [{"path": p, "sha256": h} for p, h in sorted(sources.items())]}
 
 
 def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
@@ -482,6 +519,12 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=controller_session_id)
+    # Invalid authority must not even initialize a new accounting file. The
+    # transport blocker currently prevents every real paid request here.
+    from .financial_controls import validate_paid_financial_plan
+    pending_request, pending_plan = build_admission_request(campaign=campaign, parent=parent,
+        children=children, costs=costs, runtime=runtime, controller_session_id=controller_session_id)
+    validate_paid_financial_plan(pending_plan, pending_request, scope_id=ledger.scope_id, now=clock.utc_now())
     if not ledger.path.exists():
         if runtime["ledger"]["initialize_if_missing"] is not True:
             raise ValueError("ledger is missing and runtime configuration forbids initialization")

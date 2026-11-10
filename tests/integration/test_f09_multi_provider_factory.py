@@ -21,6 +21,8 @@ from cloud_network_benchmark.bootstrap import BootstrapConfig, SourceBuild
 from cloud_network_benchmark.readiness import ReadinessConfig
 
 
+pytestmark = pytest.mark.usefixtures('isolated_legacy_provider_financial_boundary')
+
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 

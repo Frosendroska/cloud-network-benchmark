@@ -178,7 +178,7 @@ def _common_n(settings):
     return CommonNState.model_validate(frozen).model_dump(mode="json")
 
 
-def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
+def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_preparation: bool = False) -> list[str]:
     """Read-only preflight; an empty list is local readiness, not cloud acceptance."""
     errors = []
     try:
@@ -283,7 +283,12 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
             disk_path = disk_path.parent
         if shutil.disk_usage(disk_path).free < minimum:
             raise ValueError("insufficient local free disk for the declared stage requirement")
-        errors.extend(check_provider_identities(settings["providers"]))
+        # Until cumulative SCP accounting exists, readiness must fail locally
+        # before even read-only provider identity APIs. Preparation is not approval.
+        if not local_preparation:
+            from .financial_controls import require_transfer_capability
+            require_transfer_capability()
+            errors.extend(check_provider_identities(settings["providers"]))
     except (ValueError, KeyError, OSError, TypeError) as exc:
         errors.append(str(exc) if not isinstance(exc, KeyError) else f"missing operator setting: {exc.args[0]}")
     return errors
@@ -501,7 +506,7 @@ def _frozen_config(data, alias, settings, entry_id):
 def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                   results_root: Path, clock) -> dict[str, Any]:
     """Prepare identities durably; only read-only identity commands may run."""
-    errors = validate_stage_inputs(plan, settings, root)
+    errors = validate_stage_inputs(plan, settings, root, local_preparation=True)
     if errors:
         raise ValueError("; ".join(errors))
     root = Path(root).resolve()
