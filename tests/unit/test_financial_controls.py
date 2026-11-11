@@ -32,3 +32,11 @@ def test_price_age_requires_hours_not_calendar_date(tmp_path):
         quote.check(NOW+timedelta(seconds=1), NOW+timedelta(minutes=20))
     with pytest.raises(FinancialError, match='financial_quote_stale'):
         quote.check(NOW-timedelta(days=2), NOW)
+
+
+def test_eur_conversion_covers_the_usd_amount_f11_actually_reserves():
+    from cloud_network_benchmark.financial_controls import provider_liability
+    # Source dollars round up to0.0100 in F11. At1.01EUR/USD that is0.0101EUR,
+    # so reserving only one EUR cent would understate the stored USD liability.
+    assert provider_liability({'compute':{'amount_usd':'0.00990099'}},
+                              Decimal('1.01'), Decimal('0')) == Decimal('0.02')

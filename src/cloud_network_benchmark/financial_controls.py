@@ -47,6 +47,13 @@ def ceiling(value: Any) -> Decimal:
         raise FinancialError('financial_amount_invalid') from None
 
 
+def provider_liability(components: Mapping[str, Any], rate: Decimal, fixed_fees: Decimal) -> Decimal:
+    """Convert the USD amount actually reserved by F11, including its upward rounding."""
+    dollars = sum((amount(c['amount_usd']) for c in components.values()), Decimal(0))
+    dollars = dollars.quantize(Decimal('.0001'), rounding=ROUND_CEILING)
+    return liability(dollars * rate + fixed_fees)
+
+
 def stamp(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise FinancialError('financial_timestamp_invalid')
@@ -285,8 +292,8 @@ def validate_paid_financial_plan(plan: Any, request: Any, *, scope_id: str, now:
         if any(e['priced_on'] != stamp(card.price.checked_at).date().isoformat()
                for e in plan.cost_envelopes.values()):
             raise FinancialError('financial_price_mismatch')
-        by_provider = {p: str(liability(sum((amount(c['amount_usd']) for c in e['components'].values()),
-            Decimal(0)) * rate + amount(card.fixed_fees_eur))) for p, e in plan.cost_envelopes.items()}
+        by_provider = {p: str(provider_liability(e['components'], rate, amount(card.fixed_fees_eur)))
+                       for p, e in plan.cost_envelopes.items()}
         gross = sum((amount(v) for v in by_provider.values()), Decimal(0))
         if gross > ceiling(card.caps.run_eur):
             raise FinancialError('financial_run_ceiling_exceeded')
@@ -351,6 +358,7 @@ def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal
                 continue
             reserved = sum((amount(c['amount_usd']) for c in
                 r['plan']['cost_envelopes'][provider]['components'].values()), Decimal(0))
+            reserved = reserved.quantize(Decimal('.0001'), rounding=ROUND_CEILING)
             billing = r.get('provider_billing', {}).get(provider, {})
             dollars = max(reserved, amount(billing.get('actual_usd') or 0), amount(billing.get('estimate_usd') or 0))
             # Preserve the original fixed-fee/rounding margin while revaluing all
