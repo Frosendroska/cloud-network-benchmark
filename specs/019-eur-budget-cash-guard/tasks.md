@@ -22,8 +22,8 @@
 - [X] T011 [US3] Correct renderer caption/date only, regenerate HTML and --check; preserve unstaged pre-existing edits (FR-008).
 
 ## Phase 6: Validation and delivery
-- [ ] T012 Run affected/full credential-free and native checks if existing SSH works; record evidence/control matrix/prerequisites in docs/validation/eur-financial-guard.md (SC-001/002/003).
-- [ ] T013 Converge feature against spec/plan/tasks and selectively commit financial changes with no private state or unrelated runbook edits (FR-008).
+- [X] T012 Run affected/full credential-free and native checks if existing SSH works; record evidence/control matrix/prerequisites in docs/validation/eur-financial-guard.md (SC-001/002/003).
+- [X] T013 Converge feature against spec/plan/tasks and selectively commit financial changes with no private state or unrelated runbook edits (FR-008).
 
 ## Dependencies and implementation strategy
 T001/T002 -> T003/T004 -> T005/T006/T007 -> T008/T009 -> T010/T011 -> T012/T013.
