@@ -41,9 +41,11 @@ as unrestricted paid restart.
 | macOS full pytest | `ae8c2a1` code | 1,695 passed, five platform skips, one existing tarfile deprecation warning; 722.41 seconds. Two skips require Linux /proc and three require PowerShell. |
 | Local focused financial/runtime tests | `ae8c2a1` | 53 passed in 1.01 seconds. |
 | Local bounded-transfer and affected admission/retrieval/F11 tests | Bounded-transfer revision after `2804674`, including creation-time quote check | 267 passed in two affected groups (193 in 95.05 seconds; 74 in 0.84 seconds), zero failures/skips, including 18 new boundary cases. Python 3.13.7 on macOS; GNU coreutils `dd` 9.2 was used for exact, truncated and oversized remote-script cases. Contract schema `--check` and `git diff --check` passed. |
+| Halle full strict offline gate after bounded transfer | `572bbe1af1ccc472e0efa2f8964ebbe47b109327` | **Failed:** 1,704 passed, 14 failed, zero skips/errors, one warning. All 14 failures were old F09 fake runners lacking `run_bounded_copy`; the new transfer boundary cases passed. The first failed pytest check stopped the gate, leaving its 19 other checks unrun. Original isolated source and evidence remain unchanged. |
+| Halle affected native F09/transfer rerun | `0378ce9e9d9774aa01658fa8bae42c4dce9fad34` | **Passed:** 34 tests, zero failures/errors/skips, in 854.42 seconds. All 14 test IDs that failed in the original full gate passed. Isolated source was clean before and after the run; log and JUnit hashes verified. This is an affected rerun, not a passing full strict gate. |
 
 The later delta includes F11's upward USD rounding before EUR conversion and retains fees when
-revaluing prior unbilled dollars at a higher reviewed FX rate. The passing full gate was preserved;
+revaluing prior unbilled dollars at a higher reviewed FX rate. The earlier passing full gate was preserved;
 only the affected 53 tests were run for the delta. No unchanged full suite was repeated for it.
 Linux tools: Python 3.12.3, Terraform 1.16.6, PowerShell 7.5.11; genuine Thesis revision
 `64de99536074095acbc75c0f57e24ce0cc5b9e4c`. Both verification checkouts were isolated. The normal
@@ -53,15 +55,20 @@ Evidence: `/u/halle/brek/home_at/cnb/evidence/eur-guard-final-TQg2m1KM`.
 The full gate is under `gate/`; latest delta is `precision-summary.json`, `precision-pytest.xml`
 and `precision-*.log`. Every full-gate log hash and JUnit hash was checked before packing
 `financial-summary.zip` (SHA-256 `31457413665aaae85867564a300fc0a3f64327e4f7c73fc03e89d9a112f9d14d`).
-The runner's `native_linux_verified` and `cloud_verified` flags remain false; these are
-credential-free checks executed on Linux, not live provider acceptance or controller qualification.
+The runner's `native_linux_verified` and `cloud_verified` flags remain false; the current repair
+has an affected native rerun, not a passing strict full gate or live provider acceptance.
 
-For this bounded-transfer revision, the old Halle control socket was absent. A fresh batch SSH
-attempt reached `halle.cli.ito.cit.tum.de` but was denied by authentication, so no new credentials
-were requested or used. The 267-test local result is not new Halle/Linux
-evidence. The earlier full native gate above predates this transfer implementation; run its affected
-checks on Halle when the approved connection is available before treating this revision as native
-Linux verified. No cloud/provider call was made for these tests.
+For this bounded-transfer revision, the old Halle control socket was initially absent and a fresh
+batch SSH attempt was denied by authentication. The authorized connection was later restored.
+The original failed full-gate evidence remains at
+`/u/halle/brek/home_at/cnb/evidence/transfer-native-zuuz72jr/gate`; its `summary.json` records
+the 19 unrun checks, and `pytest.xml` and `01-full-pytest.log` retain the 14 failures. Do not
+describe this gate as passing. The separate repair run is at
+`/u/halle/brek/home_at/cnb/evidence/transfer-native-fix-jcTFi8DX`; its `pytest.log` SHA-256 is
+`e29befbd76bfbd49963cddce4edc0c752f4a34d4d4aa549762283e5f8b6fce30` and `pytest.xml`
+SHA-256 is `7e6739e88dd8206f5f52c5eaf2e2d95aaf1c223db4827544042ddacebc6102ef`.
+The test-only repair supplies bounded fake SSH copies and source-shaped synthetic transfer terms;
+it does not alter the production transfer guard. No cloud/provider call was made for these tests.
 
 An earlier full run at `5b9189b` had 1,697 passes and one incomplete synthetic runtime-provenance
 fixture failure (zero skips); its original evidence is retained at
