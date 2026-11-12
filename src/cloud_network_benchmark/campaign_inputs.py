@@ -283,8 +283,8 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             disk_path = disk_path.parent
         if shutil.disk_usage(disk_path).free < minimum:
             raise ValueError("insufficient local free disk for the declared stage requirement")
-        # Until cumulative SCP accounting exists, readiness must fail locally
-        # before even read-only provider identity APIs. Preparation is not approval.
+        # Check the installed bounded transport before read-only identity APIs.
+        # Source-bound amounts and approval still fail closed at admission.
         if not local_preparation:
             from .financial_controls import require_transfer_capability
             require_transfer_capability()
@@ -335,9 +335,15 @@ def _cost_payload(settings, root):
                     raise ValueError("price components require finite nonnegative amounts and positive quantities")
                 normalized[name] = {**value, "amount_usd": str(amount), "quantity": str(quantity)}
             regions = sorted(set(data["provider_configs"][provider]["regions"].values()))
+            transfer = pricing.get("result_transfer", {}).get(category, {}).get(provider)
+            if not isinstance(transfer, dict):
+                raise ValueError(f"supply priced pricing.result_transfer.{category}.{provider} payload and protocol allowances")
             rows[provider] = {"envelope_id": f"{config_id}-{provider}", "provider": provider,
                 "priced_on": checked, "source_kind": "provider-price-input", "regions": regions,
-                "unit_basis": "one-two-vm-provider-run", "components": normalized}
+                "unit_basis": "one-two-vm-provider-run", "components": normalized,
+                "result_transfer": transfer}
+            from .financial_controls import transfer_terms
+            transfer_terms(rows[provider])
         templates[config_id] = rows
     funding = pricing.get("funding")
     if not isinstance(funding, dict):

@@ -38,8 +38,7 @@ def validate_images(request, repository_root, tmp_path, monkeypatch):
             errors = validate_stage_inputs({"stage": "acceptance"}, operator, repository_root)
             assert not (tmp_path / "private").exists()
             assert not (tmp_path / "results").exists()
-            # A valid image proceeds to the independent financial transport blocker.
-            return [] if errors == ["cumulative_transfer_guard_not_implemented"] else errors
+            return errors
     return validate
 
 

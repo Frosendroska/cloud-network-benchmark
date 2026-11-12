@@ -107,9 +107,9 @@ class CheckedSource(Source):
             raise ValueError('official source URLs require HTTPS')
         return value
 
-    def check(self, now: datetime, end: datetime) -> None:
+    def check(self, now: datetime, end: datetime, *, freshness_at: datetime | None = None) -> None:
         self.read()
-        age = stamp(now) - stamp(self.checked_at)
+        age = stamp(freshness_at if freshness_at is not None else now) - stamp(self.checked_at)
         if age < timedelta(0) or age > timedelta(hours=24) or stamp(self.valid_until) < stamp(end):
             raise FinancialError('financial_quote_stale')
 
@@ -171,9 +171,46 @@ class FinancialAuthorization(StrictModel):
     funding_treatment: Literal['full-personal-cash-no-offsets']
 
 
-def require_transfer_capability() -> None:
-    """No configuration/card can turn opaque SCP into a cumulative byte guard."""
-    raise FinancialError('cumulative_transfer_guard_not_implemented')
+def transfer_terms(envelope: Mapping[str, Any]) -> tuple[int, int]:
+    """Read the source-bound payload cap and separately priced protocol allowance.
+
+    The latter is a conservative *price input*, not a measured bound on SSH or
+    provider-billed wire bytes. Both values belong to one two-VM provider run.
+    """
+    row = envelope.get('result_transfer')
+    if not isinstance(row, Mapping) or set(row) != {
+            'payload_limit_bytes', 'protocol_overhead_allowance_bytes',
+            'protocol_overhead_priced_usd'}:
+        raise FinancialError('financial_transfer_allowance_missing')
+    payload = row['payload_limit_bytes']
+    overhead = row['protocol_overhead_allowance_bytes']
+    if (type(payload) is not int or payload <= 0 or type(overhead) is not int or overhead <= 0):
+        raise FinancialError('financial_transfer_allowance_invalid')
+    component = envelope.get('components', {}).get('traffic_export', {})
+    try:
+        quantity = amount(component['quantity'])
+        price = amount(component['amount_usd'])
+        overhead_price = amount(row['protocol_overhead_priced_usd'])
+    except (KeyError, TypeError):
+        raise FinancialError('financial_transfer_price_invalid') from None
+    # The complete priced egress quantity must include the payload AND the
+    # protocol/control allowance, even where measured traffic shares this row.
+    if (component.get('unit') != 'GB-egress' or quantity * Decimal(1_000_000_000) < payload + overhead
+            or price <= 0 or overhead_price <= 0 or overhead_price > price):
+        raise FinancialError('financial_transfer_price_invalid')
+    return payload, overhead
+
+
+def require_transfer_capability(envelopes: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+    """Fail closed unless the production runner and paid source have a bounded path."""
+    from .contracts.execution import SubprocessCommandRunner
+    if not callable(getattr(SubprocessCommandRunner, 'run_bounded_copy', None)):
+        raise FinancialError('financial_transfer_transport_unavailable')
+    if envelopes is not None:
+        if not envelopes:
+            raise FinancialError('financial_transfer_allowance_missing')
+        for envelope in envelopes.values():
+            transfer_terms(envelope)
 
 
 def _serialize(value: Any) -> Any:
@@ -215,9 +252,12 @@ def _read_authority(reference: Mapping[str, Any]) -> tuple[Source, FinancialAuth
 
 
 def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, Any],
-                       scope_id: str, now: datetime, end: datetime) -> tuple[Source, FinancialAuthorization]:
+                       scope_id: str, now: datetime, end: datetime,
+                       quote_freshness_at: datetime | None = None) -> tuple[Source, FinancialAuthorization]:
     source, card = _read_authority(reference)
     now, end = stamp(now), stamp(end)
+    if quote_freshness_at is not None and not (stamp(card.valid_from) <= stamp(quote_freshness_at) <= now):
+        raise FinancialError('financial_quote_stale')
     if not (stamp(card.approved_at) <= now and stamp(card.valid_from) <= now < stamp(card.valid_until)
             and now <= end <= stamp(card.valid_until)):
         raise FinancialError('financial_authorization_expired')
@@ -250,14 +290,14 @@ def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, An
         raise FinancialError('financial_ceiling_exceeded')
     for value in caps.providers_eur.values():
         ceiling(value)
-    card.price.check(now, end)
+    card.price.check(now, end, freshness_at=quote_freshness_at)
     if card.price.sha256 != binding['cost_sha256']:
         raise FinancialError('financial_price_mismatch')
     prices = card.price.json()
     if (prices.get('currency') != 'USD' or prices.get('refresh_required_before_paid_execution', False)
             or prices.get('prices_checked_on') != stamp(card.price.checked_at).date().isoformat()):
         raise FinancialError('financial_price_mismatch')
-    card.fx.check(now, end)
+    card.fx.check(now, end, freshness_at=quote_freshness_at)
     fx = card.fx.json()
     # Canonical reviewed FX capture must agree with the card, not a free floating factor.
     if (any(fx.get(key) != card.fx.model_dump(mode='json')[key] for key in
@@ -265,7 +305,7 @@ def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, An
             or stamp(datetime.fromisoformat(fx['checked_at'])) != stamp(card.fx.checked_at)
             or stamp(datetime.fromisoformat(fx['valid_until'])) != stamp(card.fx.valid_until)):
         raise FinancialError('financial_fx_mismatch')
-    card.external_liabilities.check(now, end)
+    card.external_liabilities.check(now, end, freshness_at=quote_freshness_at)
     other = card.external_liabilities.json()
     if (other.get('ledger_scope_id') != scope_id or other.get('currency') != 'EUR'
             or amount(other.get('gross_eur')) != amount(card.other_gross_eur)
@@ -313,7 +353,7 @@ def validate_paid_financial_plan(plan: Any, request: Any, *, scope_id: str, now:
             'external_gross_eur': str(liability(card.other_gross_eur)),
             'external_cash_eur': str(liability(card.other_personal_cash_eur)), 'scope_id': scope_id}
         if plan.execution_scope == 'paid_request':
-            require_transfer_capability()
+            require_transfer_capability(plan.cost_envelopes)
         return snapshot
     except FinancialError:
         raise
@@ -382,21 +422,30 @@ def validate_stored_commitment(record: dict, *, scope_id: str) -> None:
         raise FinancialError('financial_ledger_invalid')
 
 
-def revalidate_financial_record(record: dict, *, state: dict, now: datetime, end: datetime) -> None:
+def revalidate_financial_record(record: dict, *, state: dict, now: datetime, end: datetime,
+                                quote_freshness_at: datetime | None = None) -> None:
     if record.get('execution_scope') == 'offline_simulation':
         return
     try:
         financial = record['financial']
         source = financial['authority']
+        # A new provider creation claim checks quote age at that claim. Later
+        # stages reuse its durable proof so a retained DAY pair can retrieve
+        # after 86,400 seconds while source hashes and approval still recheck.
+        proofs = record.get('creation_quote_checked_at', {})
+        launch_at = (stamp(quote_freshness_at) if quote_freshness_at is not None else
+            max((stamp(datetime.fromisoformat(value)) for value in proofs.values()),
+                default=stamp(datetime.fromisoformat(record['evidence']['cap_started_at']['value']))))
         validate_authority({'source_path': source['path'], 'source_sha256': source['sha256']},
-            binding=financial['binding'], scope_id=financial['scope_id'], now=now, end=end)
+            binding=financial['binding'], scope_id=financial['scope_id'], now=now, end=end,
+            quote_freshness_at=launch_at)
         if state.get('cleanup_blocked') or state.get('budget_blocked'):
             raise FinancialError('financial_outstanding_liability')
         # Existing records already include this reservation: add no new exposure.
         check_shared_finances(state, {**financial, 'gross_eur':'0', 'cash_eur':'0',
             'providers_eur':dict.fromkeys(financial['providers_eur'], '0')},
             remaining_usd=sum((amount(v) for v in state['funding_remaining'].values()), Decimal(0)))
-        require_transfer_capability()
+        require_transfer_capability(record['plan']['cost_envelopes'])
     except FinancialError:
         raise
     except (ValueError, KeyError, TypeError, OSError) as exc:

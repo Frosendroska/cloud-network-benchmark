@@ -11,7 +11,7 @@ from cloud_network_benchmark.admission import BudgetLedger
 from tests.financial_helpers import synthetic_finances, rewrite_card, NOW
 
 
-def test_valid_card_still_cannot_manufacture_transfer_capability(tmp_path):
+def test_paid_card_binds_sourced_transfer_allowance(tmp_path):
     book, plans, _, _ = synthetic_finances(tmp_path)
     req, plan = plans[0]
     assert validate_paid_financial_plan(plan, req, scope_id=book.scope_id, now=NOW)['gross_eur'] == '0.56'
@@ -19,7 +19,10 @@ def test_valid_card_still_cannot_manufacture_transfer_capability(tmp_path):
     paid_book, paid_plans, _, _ = synthetic_finances(paid_dir, paid=True)
     req,plan = paid_plans[0]
     result = paid_book.reserve(req, plan=plan)
-    assert result.reasons == ('cumulative_transfer_guard_not_implemented',)
+    assert result.status == 'reserved', result.reasons
+    transfer = paid_book.inspect()['reservations'][result.evidence.reservation_id.value]['result_transfer']
+    assert set(transfer) == {'aws', 'azure', 'gcp'}
+    assert all(row['payload_limit_bytes'] == 1000 and row['debited_bytes'] == 0 for row in transfer.values())
     assert book.inspect()['reservations'] == {}
 
 
@@ -77,8 +80,8 @@ def test_invalid_authority_never_reserves_or_dispatches(tmp_path, case):
     assert result.admission_reasons == (expected[case],)
     assert book.path.read_bytes() == before
     assert not book.inspect()['reservations']
-    # For semantic monetary errors hidden by the intentional live transfer blocker,
-    # exercise the SAME financial ledger path in explicit offline_simulation.
+    # Also exercise semantic monetary errors through the same financial ledger
+    # path in explicit offline_simulation.
 
 
 def test_simultaneous_fixed_batch_reservations_have_atomic_shared_ceiling(tmp_path):
@@ -137,16 +140,18 @@ def test_caps_round_down_before_boundary_comparison(tmp_path):
 def test_invalid_paid_runtime_does_not_initialize_missing_ledger(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import cloud_network_benchmark.lifecycle_runtime as runtime_module
-    book, plans, _, _ = synthetic_finances(tmp_path, paid=True)
-    req, plan = plans[0]
+    book, plans, card, cardpath = synthetic_finances(tmp_path, paid=True)
+    card.pop('fx')
+    req, plan = rewrite_card(plans, cardpath, card)[0]
     missing = tmp_path/'SYNTHETIC-DO-NOT-INITIALIZE.json'
     runtime = {'providers':dict.fromkeys(plan.child_identities, {}),
                'ledger':{'path':missing, 'scope_id':book.scope_id, 'initialize_if_missing':True}}
-    # Constructing exact request inputs is isolated; the real guard stays intact.
+    # Constructing exact request inputs is isolated; invalid authority fails
+    # before ledger creation and before any provider factory can run.
     monkeypatch.setattr(runtime_module, 'build_admission_request', lambda **_: (req,plan))
     children = {p:SimpleNamespace(execution_state='initialized', mode=plan.resolved_campaign.mode)
                 for p in plan.child_identities}
-    with pytest.raises(FinancialError, match='cumulative_transfer_guard_not_implemented'):
+    with pytest.raises(FinancialError, match='financial_authorization_invalid'):
         runtime_module.build_runtime(campaign=plan.resolved_campaign, parent=None, children=children,
             costs=plan.costs, runtime=runtime, controller_session_id='SYNTHETIC', runner=None,
             clock=SimpleNamespace(utc_now=lambda:NOW, monotonic=lambda:1.), private_root=tmp_path/'private')

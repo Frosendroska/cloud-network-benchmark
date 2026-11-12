@@ -519,12 +519,15 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=controller_session_id)
-    # Invalid authority must not even initialize a new accounting file. The
-    # transport blocker currently prevents every real paid request here.
+    # Invalid authority or unsourced transfer terms must not initialize a new
+    # accounting file.
     from .financial_controls import validate_paid_financial_plan
     pending_request, pending_plan = build_admission_request(campaign=campaign, parent=parent,
         children=children, costs=costs, runtime=runtime, controller_session_id=controller_session_id)
     validate_paid_financial_plan(pending_plan, pending_request, scope_id=ledger.scope_id, now=clock.utc_now())
+    if pending_plan.execution_scope == "paid_request" and not callable(getattr(runner, "run_bounded_copy", None)):
+        from .financial_controls import FinancialError
+        raise FinancialError("financial_transfer_transport_unavailable")
     if not ledger.path.exists():
         if runtime["ledger"]["initialize_if_missing"] is not True:
             raise ValueError("ledger is missing and runtime configuration forbids initialization")

@@ -365,6 +365,18 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     or item.listener_closure is None or item.measurement_ended_at is None):
                 return ProviderStageOutcome("retrieve", False,
                     {"failure": "both producer closures and measurement terminal time are required"})
+            # Do not start another workspace inventory after a durable paid
+            # result-transfer exhaustion. Cleanup remains in the outer flow.
+            state = ledger.inspect()
+            rec = state["reservations"].get(reservation.reservation_id.value)
+            if rec is None:
+                return ProviderStageOutcome("retrieve", False, {"failure": "retrieval reservation is unavailable"})
+            if rec.get("execution_scope") == "paid_request":
+                transfer = rec.get("result_transfer", {}).get(provider)
+                if (state.get("budget_blocked")
+                        or transfer is None or transfer["debited_bytes"] >= transfer["payload_limit_bytes"]):
+                    return ProviderStageOutcome("retrieve", False,
+                        {"failure": "result_transfer_allowance_exhausted"})
             for role in ("vm_a", "vm_b"):
                 item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
                     workspace=runtime["access"]["bootstrap"].workspace, runner=runner,

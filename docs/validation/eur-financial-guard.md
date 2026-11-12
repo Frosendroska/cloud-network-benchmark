@@ -27,9 +27,9 @@ as unrestricted paid restart.
 | EUR gross | Confirmed whole-thesis maximum EUR 300; explicit working/protected/provider/stage/run/fixed-batch caps, no recommendation defaults. External thesis liabilities, tax/uncertainty components, FX/card fee rate and fixed fees included; liabilities round up, caps down. Existing stricter USD 250/300/50 checks remain additional controls, not EUR labels. |
 | Personal cash | Separate explicit ceiling and stored cash exposure. Full gross counts as cash; credit and reimbursement offsets are unsupported and rejected. This conservatively forgoes credit benefits and does not assume reimbursement was received. |
 | Shared history | Existing atomic flock/fsync ledger; concurrent P0/P1 reservations share EUR/cash accounting. Original maximum exposures and external high-water marks remain after cleanup/reconciliation. Legacy unconverted history blocks new financial admission; it is not reset/migrated automatically. This can overcount final charges and intentionally block later work. |
-| New stages | Approval/source/freshness and shared headroom revalidation before non-cleanup stage/creation claim. Generic old paid records cannot grant new creation. |
+| New stages | Approval, immutable source hashes, validity through cleanup and shared headroom are revalidated before non-cleanup stages/creation claims. Quote freshness is checked at reservation and again at each new provider creation claim; the claim time is stored in the ledger so a long DAY run retains launch-time proof instead of requiring a new quote mid-run. Generic old paid records cannot grant new creation. |
 | Cleanup | No new quote/approval requirements in constructor/inspect/reconcile or shared provider settings. Existing original-scoped cleanup/recovery remains available after expiry, stale prices, missing card or exhausted launch allowance. |
-| Cumulative transfer | **Unresolved, live blocker:** opaque SCP has no bounded byte stream, durable pre-debit for both VMs/attempts or sourced allowance for protocol/network overhead. `cumulative_transfer_guard_not_implemented` blocks real paid admission and provider identity preflight. No configuration/attestation flag enables it. Inventory/size/hash/time/retry checks are retained, not mislabelled as caps. |
+| Cumulative transfer | Paid source envelopes now require a positive aggregate payload cap per two-VM provider run and a separate positive protocol/control overhead allowance and USD price within the priced GB-egress component. The ledger durably pre-debits each declared maximum before artifact inventory, including partial/cancelled attempts and retries, under its shared lock. A cap-crossing attempt is refused before payload and blocks further paid work; reaching the cap exactly permits no further payload for that provider. The paid copy uses SSH without a PTY, a remote byte-limited stream with one-byte excess probe and EOF proof, and a local byte-limited binary reader; published files still require exact size/hash and materialized verification. Workspace inventory and other control messages are priced by the explicit overhead input, but their billable wire bytes are not measured or hard-bounded. This is payload enforcement, not a wire-byte guarantee. |
 | Preparation/presentation | Local preparation skips provider APIs and grants no authority; exact prepared identities need later review. Hero dated 10 November states EUR 300 all-in and proposed EUR 250/EUR 50 recommendations, with policy link. Existing user Markdown/renderer changes preserved. |
 
 ## Validation
@@ -40,6 +40,7 @@ as unrestricted paid restart.
 | Halle financial/runtime delta | `ae8c2a11b3f3cb97d5dd70187a601c03d93cf747` | 53 affected tests passed, zero failures/skips; schema, renderer and diff checks passed; source unchanged. |
 | macOS full pytest | `ae8c2a1` code | 1,695 passed, five platform skips, one existing tarfile deprecation warning; 722.41 seconds. Two skips require Linux /proc and three require PowerShell. |
 | Local focused financial/runtime tests | `ae8c2a1` | 53 passed in 1.01 seconds. |
+| Local bounded-transfer and affected admission/retrieval/F11 tests | Bounded-transfer revision after `2804674`, including creation-time quote check | 267 passed in two affected groups (193 in 95.05 seconds; 74 in 0.84 seconds), zero failures/skips, including 18 new boundary cases. Python 3.13.7 on macOS; GNU coreutils `dd` 9.2 was used for exact, truncated and oversized remote-script cases. Contract schema `--check` and `git diff --check` passed. |
 
 The later delta includes F11's upward USD rounding before EUR conversion and retains fees when
 revaluing prior unbilled dollars at a higher reviewed FX rate. The passing full gate was preserved;
@@ -54,6 +55,13 @@ and `precision-*.log`. Every full-gate log hash and JUnit hash was checked befor
 `financial-summary.zip` (SHA-256 `31457413665aaae85867564a300fc0a3f64327e4f7c73fc03e89d9a112f9d14d`).
 The runner's `native_linux_verified` and `cloud_verified` flags remain false; these are
 credential-free checks executed on Linux, not live provider acceptance or controller qualification.
+
+For this bounded-transfer revision, the old Halle control socket was absent. A fresh batch SSH
+attempt reached `halle.cli.ito.cit.tum.de` but was denied by authentication, so no new credentials
+were requested or used. The 267-test local result is not new Halle/Linux
+evidence. The earlier full native gate above predates this transfer implementation; run its affected
+checks on Halle when the approved connection is available before treating this revision as native
+Linux verified. No cloud/provider call was made for these tests.
 
 An earlier full run at `5b9189b` had 1,697 passes and one incomplete synthetic runtime-provenance
 fixture failure (zero skips); its original evidence is retained at
@@ -71,10 +79,17 @@ Halle delta. Pre-existing user Markdown, renderer and old validation-report edit
 
 ## Actual launch prerequisites
 
-Do not create a paid approval or new live ledger from these fixtures. Cumulative transfer enforcement
-must first be implemented/reviewed; removing the blocker alone is not a repair. Then supply actual
-human-approved exact prepared entries/counts/resource scope, gross/working/protected/provider/stage/
-run/batch and personal unreimbursed-cash caps, source-backed reconciled external liabilities, current
+Do not create a paid approval or new live ledger from these fixtures. Supply an approved source-bound
+aggregate payload cap per provider run (both VMs and all attempts), a conservative separately priced
+protocol/control allowance, and an egress component quantity/price covering both. Partial attempts
+consume their full declared maximum without refund, so leave room for retries.
+`pricing.result_transfer.<category>.<provider>` must provide `payload_limit_bytes`,
+`protocol_overhead_allowance_bytes` and `protocol_overhead_priced_usd` for each prepared category
+and provider; its `traffic_export` component uses `GB-egress`. The numeric inputs must come from
+reviewed output-growth and price evidence; the synthetic values in tests are not approvals.
+Then supply actual human-approved exact prepared entries/counts/resource scope,
+gross/working/protected/provider/stage/run/batch and personal unreimbursed-cash caps,
+source-backed reconciled external liabilities, current
 prices/FX/tax/fees and original cleanup/lifetime/expiry evidence. No numerical personal cash allowance
 has been authorized. Old liabilities need explicit conversion/reconciliation without lost history.
 Credits/reimbursement cannot lower this implementation's conservative cash total. Provider acceptance,

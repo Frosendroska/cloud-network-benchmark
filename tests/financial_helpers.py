@@ -33,6 +33,11 @@ def synthetic_finances(tmp_path, count=1, *, paid=False):
                    funding={'primary':str(count/2)})
     rows = {p:{**{k:v for k,v in e.items() if k not in {'source_path','source_sha256'}},
                'source_kind':'provider-price-input', 'priced_on':'2026-11-10'} for p,e in specs[0][1].cost_envelopes.items()}
+    if paid:
+        for row in rows.values():
+            row['result_transfer'] = {'payload_limit_bytes': 1000,
+                'protocol_overhead_allowance_bytes': 1000,
+                'protocol_overhead_priced_usd': '0.001'}
     payload['provider_run_envelope_templates'] = {campaign.config_id:{p:{**{k:v for k,v in e.items() if k != 'run_id'},
         } for p,e in rows.items()}}
     payload.pop('provider_run_envelopes', None)
@@ -43,7 +48,8 @@ def synthetic_finances(tmp_path, count=1, *, paid=False):
         'runtime_source':runtimefile, 'effective_runtime_sha256':'d'*64, 'sources':[runtimefile]}
     plans = []
     for req, plan in specs:
-        envs = {p:{**e, 'run_id':plan.child_identities[p], 'source_kind':'provider-price-input', 'priced_on':'2026-11-10',
+        envs = {p:{**e, **({'result_transfer':rows[p]['result_transfer']} if paid else {}),
+            'run_id':plan.child_identities[p], 'source_kind':'provider-price-input', 'priced_on':'2026-11-10',
             'source_path':str(costfile), 'source_sha256':costs.payload_sha256} for p,e in plan.cost_envelopes.items()}
         support = {p:{'source_path':str(costfile), 'source_sha256':costs.payload_sha256,
             'included_usd':e['components']['expiry_cleanup_support']['amount_usd']} for p,e in envs.items()}

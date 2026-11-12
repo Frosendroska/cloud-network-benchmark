@@ -68,12 +68,16 @@ def operator_settings(tmp_path, root, monkeypatch):
             "funding": {"primary": "100", "replacements": "0", "tax": "20", "uncertainty": "25"},
             "expiry": {"aws": {"automation_step_price": ".001", "script_second_price": ".00001"},
                 "azure": {"automation_rate_per_job_minute": ".001", "job_minutes_bound": "5"},
-                "gcp": {"zero_support_rationale": "synthetic fixture no cost"}}, "components": {}},
+                "gcp": {"zero_support_rationale": "synthetic fixture no cost"}}, "components": {},
+            "result_transfer": {}},
         "stage_inputs": {}}
     for category in ("acceptance", "calibration", "day", "s1", "s3"):
         settings["pricing"]["components"][category] = {provider: {name: {
-            "amount_usd": ".01", "quantity": "1", "unit": "test-unit", "inclusion_rule": "synthetic offline fixture",
+            "amount_usd": ".01", "quantity": "1", "unit": "GB-egress" if name == "traffic_export" else "test-unit", "inclusion_rule": "synthetic offline fixture",
             "funding_bucket": "primary"} for name in COST_COMPONENTS} for provider in ("aws", "azure", "gcp")}
+        settings["pricing"]["result_transfer"][category] = {provider: {
+            "payload_limit_bytes": 1000, "protocol_overhead_allowance_bytes": 1000,
+            "protocol_overhead_priced_usd": ".001"} for provider in ("aws", "azure", "gcp")}
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
     for stage, measurement in (("acceptance", 76), ("week", 226), ("calibration", 1180)):
         settings["stage_inputs"][stage] = {"first_day_utc": tomorrow,
@@ -188,7 +192,7 @@ def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isol
     assert {row["session"] for row in book.inspect()["reservations"].values()} == set()
 
 
-def test_complete_static_check_blocks_before_identity_calls_without_mutation(repository_root, tmp_path, monkeypatch):
+def test_complete_static_check_reaches_identity_review_without_mutation(repository_root, tmp_path, monkeypatch):
     import copy
     import cloud_network_benchmark.campaign_inputs as inputs
 
@@ -197,8 +201,8 @@ def test_complete_static_check_blocks_before_identity_calls_without_mutation(rep
     called = []
     monkeypatch.setattr(inputs, "check_provider_identities", lambda providers: called.append(providers) or [])
     before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
-    assert inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root) == ["cumulative_transfer_guard_not_implemented"]
-    assert called == []
+    assert inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root) == []
+    assert called == [settings["providers"]]
     assert settings == original
     assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
     assert not Path(settings["state_root"]).exists()
@@ -211,7 +215,7 @@ def test_missing_real_identity_is_actionable_and_does_not_prepare_state(reposito
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     monkeypatch.setattr(inputs, "check_provider_identities", lambda _: ["AWS credentials unavailable; refresh reviewed account"])
     blockers = inputs.validate_stage_inputs({"stage": "acceptance"}, settings, repository_root)
-    assert blockers == ["cumulative_transfer_guard_not_implemented"]
+    assert blockers == ["AWS credentials unavailable; refresh reviewed account"]
     assert not Path(settings["state_root"]).exists()
     assert not Path(settings["results_root"]).exists()
 

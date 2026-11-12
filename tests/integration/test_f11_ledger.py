@@ -801,7 +801,10 @@ def test_saved_provider_price_envelopes_validate_without_launching_paid_work(tmp
     request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="priced-boundary",
         providers=[Provider.AWS, Provider.AZURE, Provider.GCP], child_prefix="priced-run",
         namespace_prefix="priced-ns", funding={"primary":"0.5"})
-    rows = make_synthetic_envelopes(campaign, plan.child_identities, plan.funding)
+    rows = {name:{**row, "result_transfer": {
+        "payload_limit_bytes": 1000, "protocol_overhead_allowance_bytes": 1000,
+        "protocol_overhead_priced_usd": "0.001"}}
+        for name,row in make_synthetic_envelopes(campaign, plan.child_identities, plan.funding).items()}
     public_rows = {name:{**{k:v for k,v in row.items() if k not in {"source_path","source_sha256"}},
         "source_kind":"provider-price-input"} for name,row in rows.items()}
     payload = dict(costs.payload)
