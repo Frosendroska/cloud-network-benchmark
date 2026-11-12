@@ -73,6 +73,9 @@ class FailedExternalCommands:
         return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
             finished_at=NOW, duration_seconds=0, exit_code=1, stdout="", stderr="injected offline failure")
 
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        raise AssertionError(f"protection failure must not reach result transfer: {request.action_id}")
+
 
 class GcpSourceRunner:
     """Source-shaped gcloud/Terraform replies for an observed real GCP driver."""
@@ -83,6 +86,9 @@ class GcpSourceRunner:
         self.actions = []
         self.error = None
         self.clock = None
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        raise AssertionError(f"GCP provider-only protection fixture must not reach result transfer: {request.action_id}")
 
     def run(self, request):
         import base64, hashlib, struct
@@ -292,6 +298,8 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
         def __init__(self):
             self.delegate = None
             self.requests = []
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            raise AssertionError(f"Azure provider-only protection fixture must not reach result transfer: {request.action_id}")
         def run(self, request):
             assert self.delegate is not None, "actual Azure hook must bind the cleanup runner before protection"
             self.requests.append(request)
@@ -369,12 +377,16 @@ def _costs(path: Path, campaign, children):
         for name in ("compute", "disks", "addresses", "traffic_export", "tax", "uncertainty"):
             parts[name] = {"amount_usd": "0.1", "quantity": "1", "unit": "unit",
                 "inclusion_rule": "synthetic test input", "funding_bucket": "primary"}
+        parts["traffic_export"].update(quantity="1", unit="GB-egress")
         parts["expiry_cleanup_support"] = {"amount_usd": "0.0139", "quantity": "1",
             "unit": "region-session", "inclusion_rule": "synthetic test input", "funding_bucket": "primary"}
         components[provider] = {"envelope_id": f"synthetic-{provider}", "provider": provider,
             "run_id": children[provider].run_id, "priced_on": "2026-10-22",
             "source_kind": "provider-price-input", "regions": regions[provider],
-            "unit_basis": "one-two-vm-provider-run", "components": parts}
+            "unit_basis": "one-two-vm-provider-run", "components": parts,
+            "result_transfer": {"payload_limit_bytes": 900_000_000,
+                "protocol_overhead_allowance_bytes": 100_000_000,
+                "protocol_overhead_priced_usd": "0.001"}}
     payload = json.loads((ROOT / "tests/fixtures/f11/cost-inputs.json").read_text())
     payload.update(cost_input_id=campaign.admission.cost_input_id, prices_checked_on="2026-10-22",
         acquired_on="2026-10-22", refresh_required_before_paid_execution=False,
@@ -585,6 +597,16 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 claims = state["reservations"][self.reservation_id]["creation_claims"]
                 assert set(claims) == {"aws", "azure", "gcp"}, claims
                 self.claim_snapshot_at_first_apply = tuple(sorted(claims))
+            def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+                assert request.action_type == "ssh", request.action_type
+                assert request.action_id.startswith("f02r-retrieve-"), request.action_id
+                assert "-i" in request.argv, request.argv
+                identity = request.argv[request.argv.index("-i") + 1]
+                provider = self.identity_provider.get(identity)
+                assert provider is not None, f"bounded copy lacks a known provider identity: {request.action_id}"
+                self.requests.append(request)
+                self.actions.append(request.action_id)
+                return self.remote[provider].run_bounded_copy(request, destination, maximum_payload_bytes)
             def run(self, request):
                 self.requests.append(request)
                 self.actions.append(request.action_id)
@@ -911,6 +933,15 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         assert reservation_record["provider_cleanup"] == {p: True for p in children}, {
             provider: (item.cleanup_state, item.primary_failure, item.secondary_failures)
             for provider, item in result.provider_results.items()}
+        for provider, identity in identities.items():
+            copy_requests = [request for request in runner.requests
+                if request.action_id.startswith("f02r-retrieve-") and request.action_type == "ssh"
+                and not request.action_id.startswith("f02r-retrieve-observe-")
+                and "-i" in request.argv and request.argv[request.argv.index("-i") + 1] == str(identity)]
+            transfer = reservation_record["result_transfer"][provider]
+            assert copy_requests, (provider, runner.actions)
+            assert 0 < transfer["debited_bytes"] <= transfer["payload_limit_bytes"]
+            assert len(transfer["attempts"]) == len(copy_requests), (provider, transfer, copy_requests)
         assert reservation_id not in ledger_state["cleanup_open"]
         assert reservation_id not in ledger_state["cleanup_blocked"]
         assert all(item["final"] is False for item in reservation_record["provider_billing"].values())

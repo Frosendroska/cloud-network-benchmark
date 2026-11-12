@@ -5,8 +5,9 @@ import hashlib
 import base64
 import json
 import re
+import shlex
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ import yaml
 from cloud_network_benchmark.admission import load_cost_inputs
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.common import Provider
-from cloud_network_benchmark.contracts.execution import CommandResult
+from cloud_network_benchmark.contracts.execution import BOUNDED_COPY_EOF_MARKER, CommandResult
 from cloud_network_benchmark.lifecycle_runtime import build_runtime
 from cloud_network_benchmark.orchestration import run_lifecycle
 
@@ -158,6 +159,41 @@ class FakePreparedAwsRunner(FakeAwsRunner):
     def _now(self):
         clock = getattr(self, "clock", None)
         return clock.utc_now() if clock is not None else NOW
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        """Model a charged SSH copy from one fake VM, including remote excess detection."""
+        assert request.action_type == "ssh"
+        assert request.action_id.startswith("f02r-retrieve-")
+        assert request.argv[0] == "ssh" and request.argv[1] == "-T"
+        assert type(maximum_payload_bytes) is int and maximum_payload_bytes >= 0
+        role_by_host = {self.public_a: "vm_a", self.public_b: "vm_b"}
+        role = role_by_host[request.argv[-2].rsplit("@", 1)[-1]]
+        remote_argv = shlex.split(request.argv[-1])
+        assert remote_argv[:2] == ["sh", "-c"] and len(remote_argv) == 3
+        script = remote_argv[2]
+        match = re.search(
+            r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
+            script,
+        )
+        assert match is not None, script
+        assert int(match.group(2)) == maximum_payload_bytes
+        assert "os.read(3, 1)" in script and BOUNDED_COPY_EOF_MARKER in script
+        source_tokens = shlex.split(match.group(1))
+        assert len(source_tokens) == 1
+        relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/work")
+        root = self.workspace_roots[role]
+        source = root / relative
+        assert source.resolve().is_relative_to(root.resolve())
+        assert source.is_file() and not source.is_symlink()
+        self.actions.append(request.action_id)
+        with source.open("rb") as remote, Path(destination).open("xb") as local:
+            local.write(remote.read(maximum_payload_bytes))
+        within_cap = source.stat().st_size <= maximum_payload_bytes
+        return CommandResult(action_id=request.action_id,
+            outcome="succeeded" if within_cap else "failed", started_at=self._now(),
+            finished_at=self._now(), duration_seconds=0,
+            exit_code=0 if within_cap else 1, stdout="",
+            stderr="" if within_cap else "remote source exceeds charged payload cap")
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -634,11 +670,15 @@ def _cost_source(path: Path, run_id: str, cost_input_id: str) -> None:
     for name in ("compute", "disks", "addresses", "traffic_export", "tax", "uncertainty"):
         components[name] = {"amount_usd": "0.1", "quantity": "1", "unit": "unit",
             "inclusion_rule": "synthetic test source", "funding_bucket": "primary"}
+    components["traffic_export"].update(quantity="1.1", unit="GB-egress")
     components["expiry_cleanup_support"] = {"amount_usd": "0.0139", "quantity": "1",
         "unit": "region-session", "inclusion_rule": "synthetic test source", "funding_bucket": "primary"}
     payload["provider_run_envelopes"] = {"aws": {"envelope_id": "fixture-aws", "provider": "aws",
         "run_id": run_id, "priced_on": "2026-10-22", "source_kind": "provider-price-input",
-        "regions": [region], "unit_basis": "one-two-vm-provider-run", "components": components}}
+        "regions": [region], "unit_basis": "one-two-vm-provider-run", "components": components,
+        "result_transfer": {"payload_limit_bytes": 1_000_000_000,
+            "protocol_overhead_allowance_bytes": 100_000_000,
+            "protocol_overhead_priced_usd": "0.01"}}}
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
@@ -777,6 +817,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["close"].succeeded is True, provider_result.values["close"].evidence
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
+    assert any(action.startswith("f02r-retrieve-") for action in runner.actions)
     assert any(action.startswith("f02r-") for action in runner.actions)
     assert "aws-expiry-start-eu-central-1" in runner.actions
     assert "aws-pair-apply" in runner.actions
@@ -823,7 +864,7 @@ def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, r
     parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
         config_path=config)
     child = children["aws"]
-    runner = FakeAwsRunner()
+    runner = FakePreparedAwsRunner()
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)
