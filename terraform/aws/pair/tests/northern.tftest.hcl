@@ -1,4 +1,7 @@
 mock_provider "aws" {}
+mock_provider "aws" {
+  alias = "london"
+}
 
 override_data {
   target = data.aws_caller_identity.current
