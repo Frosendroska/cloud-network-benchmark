@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 from pydantic import ValidationError
 
 from cloud_network_benchmark.config import resolve_campaign

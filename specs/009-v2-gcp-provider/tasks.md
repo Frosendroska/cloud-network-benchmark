@@ -93,3 +93,10 @@ Complete native protection proof first (US1 MVP), then exact selected pair/trust
 
 - [X] T044 CRITICAL Apply the prior-controller-session uncertainty guard to the current attempt as well as siblings in `src/cloud_network_benchmark/providers/gcp.py`, with owned integration regressions. Same-attempt registered expiry reuse, direct provision, and `_assert_no_open_cleanup` now require the persisted controller session to match the current session. A previous-session attempt remains cleanup-only: registration reuse and provision fail before any apply, preserve its original session/cap, and verified cleanup remains available. The healthy concurrent-sibling path remains allowed for current-session registered work. Per Constitution V; FR-006/007/011; US1/AC2; T011/T021/T033/T041.
 - [X] T045 HIGH Require the exact single expected S3 placement policy in actual instance readback in `src/cloud_network_benchmark/providers/gcp.py`, with owned full-path regressions. Registration validates the selected canonical project/region/policy ID; template and instance responses are normalized by exact canonical path and must contain precisely one selected policy for S3 or none for other scenarios. Full S3 provision traces reject extra, duplicate, missing, foreign-project, and wrong-region policies on VM readback, record primary failure, and attempt pair/protection cleanup; the ordinary one-policy S3 register/provision/trust/cleanup trace still succeeds. Per FR-003/009; US2/AC1/AC2; SC-001/SC-003; contracts: S3 resource_policies holds only its COLLOCATED policy; T014/T017/T036/T042.
+
+## Bounded saved-plan repair — 14 November 2026
+
+The shared AWS/GCP saved-plan repair specification, plan, task review and
+convergence record are in
+[`../007-v2-aws-provider/repairs/saved-plan-review.md`](../007-v2-aws-provider/repairs/saved-plan-review.md).
+This repairs F07 protection/pair apply; it grants no paid execution authority.

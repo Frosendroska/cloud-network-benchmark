@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 import pytest
 
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
+
 from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID, GcpProviderDriver, SAFETY_LEAD_SECONDS
 from cloud_network_benchmark.contracts.admission import ReservationEvidence
 from cloud_network_benchmark.contracts.common import Evidence, StringEvidence

@@ -132,7 +132,13 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         "azure": {"expiry_cost_path", "primary_review_path"}}
     for provider, value in providers.items():
         row = _keys(value, {"options", "bootstrap_template", "terraform_directory", "sources"}, f"providers.{provider}")
-        options = _keys(row["options"], option_keys[provider], f"providers.{provider}.options")
+        optional = {"plan_review_timeout_seconds"} if provider in {"aws", "gcp"} else set()
+        present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
+        options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
+        if "plan_review_timeout_seconds" in present:
+            seconds = options["plan_review_timeout_seconds"]
+            if type(seconds) is not int or not 0 <= seconds <= 600:
+                raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
         for name in ("public_key_path", "ssh_public_key_path"):
             if name in options:
                 options[name] = _source_path(path.parent, options[name], f"providers.{provider}.{name}")
@@ -376,8 +382,9 @@ def _financial_runtime_binding(runtime, children):
         add(path)
     for row in runtime["providers"].values():
         add(row["bootstrap_template"])
-        for path in Path(row["terraform_directory"]).glob("*.tf"):
-            add(path)
+        for path in Path(row["terraform_directory"]).rglob("*"):
+            if ".terraform" not in path.parts and (path.suffix in {".tf", ".py"} or path.name == ".terraform.lock.hcl"):
+                add(path)
         for path in row["sources"].values():
             if path is not None:
                 add(path)
@@ -476,7 +483,7 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
                 or hashlib.sha256(review_source.read_bytes()).hexdigest() != declared_hash):
             raise ValueError("AWS primary review source hash does not match its bytes")
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
-    settings = AwsRuntimeSettings(**settings_values)
+    settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0))
     driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
     trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -694,7 +701,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 review = row["sources"].get("primary_review_path")
                 if review is None: raise ValueError("AWS scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = AwsRuntimeSettings(**settings_args)
+            settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
@@ -725,7 +732,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 review = sources.get("primary_review_path")
                 if review is None: raise ValueError("GCP scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = GcpRuntimeSettings(**settings_args)
+            settings = GcpRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             driver = GcpProviderDriver(runner, settings, clock=clock.utc_now)
             trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,

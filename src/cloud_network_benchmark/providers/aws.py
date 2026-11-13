@@ -89,6 +89,7 @@ class AwsRuntimeSettings(StrictModel):
     complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
+    plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=90, gt=0, le=600)
 
@@ -1312,7 +1313,7 @@ class AwsProviderDriver:
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
         registration_action = action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")) and "-cancel-" not in action_id
-        if self._registration_deadline is not None and registration_action:
+        if self._registration_deadline is not None and (registration_action or action_id.startswith("aws-safety-apply-")):
             remaining = int(self._registration_deadline - time.monotonic())
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
@@ -1344,28 +1345,33 @@ class AwsProviderDriver:
         if remaining_after_init <= 0:
             raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
         request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
-        result = self.runner.run(request)
-        # Persist only redacted command identity/outcome/timing, never provider stdout.
-        record = {
-            "action_id": result.action_id,
-            "argv": request.durable_view()["argv"],
-            "outcome": str(result.outcome),
-            "started_at": result.started_at.isoformat(),
-            "finished_at": result.finished_at.isoformat(),
-            "duration_seconds": result.duration_seconds,
-            "duration_basis": result.duration_basis,
-            "exit_code": result.exit_code,
-            "redactions_applied": bool(result.redactions),
-        }
-        self._active_commands.append(record)
-        if self._active_attempt is not None:
-            command_log = self._active_attempt / "commands.jsonl"
-            with command_log.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(command_log, 0o600)
-        return result
+        def execute(request):
+            result = self.runner.run(request)
+            # Persist only redacted command identity/outcome/timing, never provider stdout.
+            record = {
+                "action_id": result.action_id,
+                "argv": request.durable_view()["argv"],
+                "outcome": str(result.outcome),
+                "started_at": result.started_at.isoformat(),
+                "finished_at": result.finished_at.isoformat(),
+                "duration_seconds": result.duration_seconds,
+                "duration_basis": result.duration_basis,
+                "exit_code": result.exit_code,
+                "redactions_applied": bool(result.redactions),
+            }
+            self._active_commands.append(record)
+            if self._active_attempt is not None:
+                command_log = self._active_attempt / "commands.jsonl"
+                with command_log.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(command_log, 0o600)
+            return result
+        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+            from ..terraform_plan import reviewed_apply
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+        return execute(request)
 
     def _aws_json(self, *argv: str) -> dict[str, Any]:
         action_id = "aws-" + "-".join(argv[1:3]).replace("_", "-")

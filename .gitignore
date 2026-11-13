@@ -34,6 +34,9 @@ override.tf.json
 *_override.tf.json
 terraform.tfplan
 *.tfplan
+# Private saved-plan JSON and operator inspection receipts
+**/aws-*-review-*/
+**/gcp-*-review-*/
 
 # Python and test artifacts
 __pycache__/

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from pathlib import Path
 import pytest
 
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
+
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRequest, ReservationEvidence
 from cloud_network_benchmark.contracts.common import CommandOutcome, Evidence, StringEvidence, StructuredEvidence

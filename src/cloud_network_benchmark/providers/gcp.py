@@ -66,6 +66,7 @@ class GcpRuntimeSettings(StrictModel):
     support_cost_evidence: StructuredEvidence
     complete_workflow_remaining_seconds: float = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
+    plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=180, gt=0, le=600)
 
@@ -742,7 +743,7 @@ class GcpProviderDriver:
         if self._deadline is not None:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
-            limit = min(limit, max(1, int(remaining)))
+            limit = min(limit, remaining)
         from ..terraform_work import private_terraform_environment, initialize_terraform
         command_deadline = time.monotonic() + limit
         request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
@@ -753,9 +754,14 @@ class GcpProviderDriver:
         if remaining_after_init <= 0:
             raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
         request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
-        result = self.runner.run(request)
-        self._record_command(request, result)
-        return result
+        def execute(request):
+            result = self.runner.run(request)
+            self._record_command(request, result)
+            return result
+        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+            from ..terraform_plan import reviewed_apply
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+        return execute(request)
 
     def _record_command(self, request: CommandRequest, result: CommandResult) -> None:
         attempt = self._active_attempt
@@ -818,6 +824,10 @@ class GcpProviderDriver:
             journal["pair_binding"] = {"config_sha256": hashlib.sha256(serialized_vars).hexdigest(), "template_a": template["template_a"], "template_b": template["template_b"], "project_id": self.settings.project_id, "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
             self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
+        if root == "pair" and action == "apply":
+            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+            slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
+            self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
             raise GcpProviderError(f"GCP Terraform {root} {action} failed", category="terraform_failed", action_id=rc.action_id)

@@ -65,3 +65,20 @@ def isolated_legacy_provider_financial_boundary(monkeypatch):
     monkeypatch.setattr(admission, 'validate_paid_financial_plan', lambda *_a, **_k: None)
     monkeypatch.setattr(financial, 'validate_paid_financial_plan', lambda *_a, **_k: None)
     monkeypatch.setattr(admission, 'revalidate_financial_record', lambda *_a, **_k: None)
+
+
+@pytest.fixture
+def isolated_legacy_saved_plan_boundary(monkeypatch):
+    """Old fake stage runners model apply/output, not Terraform plan files.
+
+    Scope of this explicit mock is only their existing stage behavior. Real plan
+    creation/review/hash/cleanup dispatch is covered in test_terraform_plan_review.
+    No production setting or runner can select this test-only isolation.
+    """
+    import cloud_network_benchmark.terraform_plan as plans
+
+    def original_apply(request, run, **_kwargs):
+        assert "apply" in request.argv
+        return run(request)
+
+    monkeypatch.setattr(plans, "reviewed_apply", original_apply)

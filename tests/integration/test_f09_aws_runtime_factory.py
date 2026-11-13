@@ -20,7 +20,7 @@ from cloud_network_benchmark.contracts.execution import BOUNDED_COPY_EOF_MARKER,
 from cloud_network_benchmark.lifecycle_runtime import build_runtime
 from cloud_network_benchmark.orchestration import run_lifecycle
 
-pytestmark = pytest.mark.usefixtures('isolated_legacy_provider_financial_boundary')
+pytestmark = pytest.mark.usefixtures('isolated_legacy_saved_plan_boundary', 'isolated_legacy_provider_financial_boundary')
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
