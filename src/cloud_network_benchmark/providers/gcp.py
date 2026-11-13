@@ -27,13 +27,23 @@ from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
 SAFETY_LEAD_SECONDS = 30
 CONTROLLER_SESSION_ID = str(uuid.uuid4())
 NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": True, "source": "https://cloud.google.com/compute/docs/network-bandwidth", "checked_on": "2026-10-23"}
-REGION_ZONES = {"europe-west3": ("europe-west3-a", "europe-west3-b"), "europe-west2": ("europe-west2-a",)}
+REGION_ZONES = {
+    "europe-west3": ("europe-west3-a", "europe-west3-b"),
+    "europe-west2": ("europe-west2-a",),
+    "europe-north1": ("europe-north1-a",),
+}
+BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
+NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
 
 
-def validate_ubuntu_image_identities(images: dict[str, str]) -> None:
+def validate_ubuntu_image_identities(images: dict[str, str], *, selected_regions: set[str] | None = None) -> None:
     """Require dated Ubuntu 24.04 amd64 image resources, never family aliases."""
-    if not isinstance(images, dict) or set(images) != set(REGION_ZONES):
-        raise ValueError("images must pin the selected Frankfurt and London image identities")
+    allowed_maps = (BASELINE_IMAGE_REGIONS, NORTHERN_IMAGE_REGIONS,
+                    BASELINE_IMAGE_REGIONS | NORTHERN_IMAGE_REGIONS)
+    if not isinstance(images, dict) or frozenset(images) not in allowed_maps:
+        raise ValueError("images must pin the selected Frankfurt/London or Finland image identities")
+    if selected_regions is not None and not selected_regions <= images.keys():
+        raise ValueError("images must pin every selected GCP region")
     # Noble is the published image name; retain dated legacy configuration names.
     pattern = r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-(?:noble-amd64-v|lts-amd64-v?)[0-9]{8}"
     if any(not isinstance(value, str) or not re.fullmatch(pattern, value) for value in images.values()):
@@ -244,6 +254,7 @@ class GcpProviderDriver:
     def provision(self, deployment: ProviderDeploymentInput) -> ProviderDeploymentOutput:
         self._deadline = None
         self._validate_deployment(deployment)
+        self._validate_selected_images(deployment)
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
@@ -375,6 +386,7 @@ class GcpProviderDriver:
 
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
+        self._validate_selected_images(deployment)
         reservation = deployment.reservation.value
         if reservation is None or reservation.state != "reserved":
             raise GcpProviderError("active reservation evidence is required", category="reservation_required")
@@ -419,19 +431,29 @@ class GcpProviderDriver:
     def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
-        if deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}:
-            raise GcpProviderError("F07 supports only Frankfurt roles and London receiver", category="scenario_unsupported")
+        northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
+                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
+        if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
+                            and deployment.experiment_id == "EXP-902"):
+            raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
+        if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
+            raise GcpProviderError("only the selected Frankfurt/London topology or Finland same-zone pair is supported", category="scenario_unsupported")
         if deployment.vm_a.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"} or deployment.vm_b.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"}:
             raise GcpProviderError("GCP roles must use selected n2-standard-4 shape", category="shape_unsupported")
         if deployment.vm_a.role != "vm_a" or deployment.vm_b.role != "vm_b" or deployment.vm_a.function != "client_traffic_generator" or deployment.vm_b.function != "server_receiver":
             raise GcpProviderError("GCP deployment requires exact client A and receiver B identities", category="identity_mismatch")
         expected_zones = {"same_zone": ("europe-west3-a", "europe-west3-a"), "cross_zone": ("europe-west3-a", "europe-west3-b"), "placement_optimization": ("europe-west3-a", "europe-west3-a"), "inter_region": ("europe-west3-a", "europe-west2-a")}
-        if deployment.scenario not in expected_zones or (deployment.vm_a.zone, deployment.vm_b.zone) != expected_zones[deployment.scenario]:
+        if not northern and (deployment.scenario not in expected_zones or (deployment.vm_a.zone, deployment.vm_b.zone) != expected_zones[deployment.scenario]):
             raise GcpProviderError("scenario zones must match the selected V2 topology", category="scenario_unsupported")
         if deployment.scenario == "placement_optimization" and deployment.placement.kind != "compact_placement_policy":
             raise GcpProviderError("S3 requires same-zone compact placement", category="scenario_unsupported")
         if deployment.scenario == "inter_region" and deployment.vm_b.region != "europe-west2":
             raise GcpProviderError("S4 receiver must be in London", category="scenario_unsupported")
+
+    def _validate_selected_images(self, deployment: ProviderDeploymentInput) -> None:
+        selected = {deployment.vm_a.region, deployment.vm_b.region}
+        if not selected <= self.settings.images.keys():
+            raise GcpProviderError("selected GCP region has no pinned Ubuntu image", category="image_mismatch")
 
     def _validate_review(self, deployment: ProviderDeploymentInput) -> None:
         evidence = self.settings.primary_review_decision
@@ -766,6 +788,19 @@ class GcpProviderDriver:
             variables = json.loads(vars_path.read_text(encoding="utf-8"))
             if variables.get("project_id") != self.settings.project_id:
                 raise GcpProviderError("Terraform inputs belong to another project", category="state_identity_mismatch")
+            if (variables.get("zone_a"), variables.get("zone_b")) != (deployment.vm_a.zone, deployment.vm_b.zone):
+                raise GcpProviderError("Terraform inputs changed the original role zones", category="state_identity_mismatch")
+            if root == "protection":
+                expected = {
+                    "namespace": self._namespace(deployment),
+                    "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario,
+                    "image_a": self.settings.images.get(deployment.vm_a.region),
+                    "image_b": self.settings.images.get(deployment.vm_b.region),
+                }
+            else:
+                expected = {"name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b"}
+            if any(variables.get(key) != value for key, value in expected.items()):
+                raise GcpProviderError("Terraform inputs changed the original attempt scope", category="state_identity_mismatch")
         else:
             variables = None
         common = {"project_id": self.settings.project_id}

@@ -1,5 +1,5 @@
 data "aws_caller_identity" "current" {}
-data "aws_availability_zones" "frankfurt" {
+data "aws_availability_zones" "primary" {
   state = "available"
 }
 data "aws_availability_zones" "london" {
@@ -19,8 +19,8 @@ locals {
   placement               = var.scenario == "placement_optimization"
   subnet_b_frankfurt_cidr = "10.60.2.0/24"
   subnet_b_frankfurt_ip   = local.cross_zone ? "10.60.2.10" : "10.60.1.11"
-  zone_a                  = "eu-central-1a"
-  zone_b_frankfurt        = local.cross_zone ? "eu-central-1b" : "eu-central-1a"
+  zone_a                  = var.primary_zone
+  zone_b_frankfurt        = local.cross_zone ? "eu-central-1b" : var.primary_zone
   zone_b_london           = "eu-west-2a"
 }
 
@@ -31,6 +31,11 @@ resource "terraform_data" "account_guard" {
       condition     = data.aws_caller_identity.current.account_id == var.account_id
       error_message = "AWS credentials resolve to a different account than the admitted attempt."
     }
+    precondition {
+      condition = var.primary_region == "eu-central-1" && var.primary_zone == "eu-central-1a" ||
+        var.scenario == "same_zone" && var.primary_region == "eu-north-1" && var.primary_zone == "eu-north-1a"
+      error_message = "Stockholm is admitted only for the reviewed same-zone eu-north-1a pair."
+    }
   }
 }
 
@@ -39,12 +44,12 @@ resource "aws_vpc" "frankfurt" {
   cidr_block           = "10.60.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = merge(local.tags, { Name = "${var.resource_namespace}-frankfurt" })
+  tags                 = merge(local.tags, { Name = "${var.resource_namespace}-primary" })
 }
 
 resource "aws_internet_gateway" "frankfurt" {
   vpc_id = aws_vpc.frankfurt.id
-  tags   = merge(local.tags, { Name = "${var.resource_namespace}-frankfurt-igw" })
+  tags   = merge(local.tags, { Name = "${var.resource_namespace}-primary-igw" })
 }
 
 resource "aws_route_table" "frankfurt" {
@@ -53,7 +58,7 @@ resource "aws_route_table" "frankfurt" {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.frankfurt.id
   }
-  tags = merge(local.tags, { Name = "${var.resource_namespace}-frankfurt-public" })
+  tags = merge(local.tags, { Name = "${var.resource_namespace}-primary-public" })
 }
 
 resource "aws_subnet" "a" {
@@ -280,7 +285,7 @@ resource "aws_route" "london_to_frankfurt" {
 }
 
 resource "aws_instance" "vm_a" {
-  ami                         = var.image_id_frankfurt
+  ami                         = var.image_id_primary
   instance_type               = "m7i.xlarge"
   subnet_id                   = aws_subnet.a.id
   private_ip                  = "10.60.1.10"
@@ -310,7 +315,7 @@ resource "aws_instance" "vm_a" {
 
 resource "aws_instance" "vm_b_frankfurt" {
   count                       = local.inter_region ? 0 : 1
-  ami                         = var.image_id_frankfurt
+  ami                         = var.image_id_primary
   instance_type               = "m7i.xlarge"
   subnet_id                   = local.cross_zone ? aws_subnet.b_frankfurt[0].id : aws_subnet.a.id
   private_ip                  = local.subnet_b_frankfurt_ip

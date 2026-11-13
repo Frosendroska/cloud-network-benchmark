@@ -244,7 +244,8 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                     AzureRuntimeOptions.concrete_ubuntu_image(options["selected_image"])
                 elif provider == "gcp":
                     from .providers.gcp import validate_ubuntu_image_identities
-                    validate_ubuntu_image_identities(options["images"])
+                    selected_regions = set(data["provider_configs"]["gcp"]["regions"].values())
+                    validate_ubuntu_image_identities(options["images"], selected_regions=selected_regions)
         # Credential refresh is a reviewed operator fact, never inferred from a login.
         refresh = settings.get("credential_refresh", {})
         if not refresh.get("confirmed") or not refresh.get("valid_through_utc"):

@@ -5,7 +5,28 @@ locals {
   region_b = join("-", slice(split("-", var.zone_b), 0, length(split("-", var.zone_b)) - 1))
   ips      = var.scenario == "inter_region" ? ["10.80.1.10", "10.81.1.11"] : ["10.80.1.10", "10.80.1.11"]
 }
+resource "terraform_data" "scope_guard" {
+  input = var.project_id
+  lifecycle {
+    precondition {
+      condition = contains([
+        "same_zone|europe-west3-a|europe-west3-a",
+        "cross_zone|europe-west3-a|europe-west3-b",
+        "placement_optimization|europe-west3-a|europe-west3-a",
+        "inter_region|europe-west3-a|europe-west2-a",
+        "same_zone|europe-north1-a|europe-north1-a",
+      ], "${var.scenario}|${var.zone_a}|${var.zone_b}")
+      error_message = "GCP protection accepts only the selected baseline topology or Finland same-zone pair."
+    }
+    precondition {
+      condition = can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_a)) &&
+        can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_b))
+      error_message = "GCP protection requires two concrete pinned Ubuntu 24.04 amd64 images."
+    }
+  }
+}
 resource "google_compute_network" "attempt" {
+  depends_on              = [terraform_data.scope_guard]
   name                    = "${var.namespace}-net"
   auto_create_subnetworks = false
   mtu                     = 1460
@@ -58,6 +79,7 @@ resource "google_compute_firewall" "pair_icmp" {
   }
 }
 resource "google_compute_resource_policy" "compact" {
+  depends_on = [terraform_data.scope_guard]
   count  = var.scenario == "placement_optimization" ? 1 : 0
   name   = "${var.namespace}-compact"
   region = local.region_a

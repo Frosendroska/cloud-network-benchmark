@@ -52,6 +52,18 @@ def test_regions_can_pin_distinct_concrete_image_names(validate_images):
     assert validate_images({"europe-west3": OBSERVED, "europe-west2": LEGACY}) == []
 
 
+def test_explicit_finland_image_can_join_baseline_map(validate_images):
+    assert validate_images({"europe-west3": LEGACY, "europe-west2": LEGACY,
+                            "europe-north1": OBSERVED}) == []
+
+
+def test_finland_only_image_map_requires_finland_selected_region():
+    from cloud_network_benchmark.providers.gcp import validate_ubuntu_image_identities
+    validate_ubuntu_image_identities({"europe-north1": OBSERVED}, selected_regions={"europe-north1"})
+    with pytest.raises(ValueError, match="every selected GCP region"):
+        validate_ubuntu_image_identities({"europe-north1": OBSERVED}, selected_regions={"europe-west3"})
+
+
 @pytest.mark.parametrize("image", [
     OBSERVED.replace("ubuntu-os-cloud", "another-project"),
     OBSERVED.replace("ubuntu-os-cloud", "ubuntu-os-cloud-devel"),

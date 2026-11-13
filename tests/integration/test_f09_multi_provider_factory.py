@@ -150,12 +150,14 @@ class GcpSourceRunner:
         raise AssertionError(f"unexpected GCP command {action}: {request.argv}")
 
 
+@pytest.mark.parametrize("north", [False, True], ids=["frankfurt", "finland"])
 def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shaped_commands(
-        tmp_path, repository_root, monkeypatch):
+        tmp_path, repository_root, monkeypatch, north):
     """Use real F11, GCP provider hooks and F09 finalizer with only command replies faked."""
     import cloud_network_benchmark.lifecycle_adapters as adapters
 
-    config = repository_root / "configs/tests/exp-902-gcp-single-provider.yaml"
+    config = repository_root / "configs/tests" / (
+        "exp-902-gcp-single-provider-north.yaml" if north else "exp-902-gcp-single-provider.yaml")
     campaign, _ = resolve_campaign(config, repository_root)
     initialized = initialize_campaign(config, repository_root, tmp_path / "results",
         clock=lambda: NOW, token_source=lambda: "gcp-source-shaped")
@@ -191,8 +193,9 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
             "bootstrap": bootstrap, "guest_remote_root": "/var/lib/cnb/runtime",
             "diagnostic_interfaces": {"gcp": {"vm_a": "ens4", "vm_b": "ens4"}}},
         "providers": {"gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
-                "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
-                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"},
+                "images": ({"europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105"}
+                    if north else {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
+                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"}),
                 "public_key_path": pub, "authentication_reference": "fake-gcp-auth"},
             "bootstrap_template": repository_root / "terraform/gcp/pair/main.tf",
             "terraform_directory": repository_root / "terraform/gcp",
@@ -233,6 +236,15 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert "gcp-pair-outputs" in [request.action_id for request in runner.requests]
     assert "gcp-pair-apply" in [request.action_id for request in runner.requests]
     assert "gcp-pair-destroy" in [request.action_id for request in runner.requests]
+    if north:
+        assert runner.deployment.vm_a.region == runner.deployment.vm_b.region == "europe-north1"
+        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-a"
+        assert runner.driver.settings.images == runtime["providers"]["gcp"]["options"]["images"]
+        assert all("europe-west3" not in request.argv and "europe-west2" not in request.argv
+            for request in runner.requests if request.action_id.startswith("gcp-"))
+        assert all("--regions=europe-north1" in request.argv
+            for request in runner.requests if request.action_id.startswith((
+                "gcp-address-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-")))
     # Reopen only the cleanup obligation to model a process loss after the
     # provider journal was written. The default CLI must reload the original
     # saved provider settings and reconcile without creating a new attempt.

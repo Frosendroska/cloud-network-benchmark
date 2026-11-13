@@ -2,8 +2,8 @@ variable "region" {
   type = string
 
   validation {
-    condition     = contains(["eu-central-1", "eu-west-2"], var.region)
-    error_message = "AWS safety protection is limited to the selected Frankfurt and London regions."
+    condition     = contains(["eu-central-1", "eu-west-2", "eu-north-1"], var.region)
+    error_message = "AWS safety protection is limited to the selected Frankfurt, London and Stockholm regions."
   }
 }
 
