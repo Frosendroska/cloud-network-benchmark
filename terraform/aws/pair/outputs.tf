@@ -1,7 +1,7 @@
 locals {
-  instance_b         = local.inter_region ? aws_instance.vm_b_london[0] : aws_instance.vm_b_frankfurt[0]
-  zone_ids_primary   = zipmap(data.aws_availability_zones.primary.names, data.aws_availability_zones.primary.zone_ids)
-  zone_ids_london    = local.inter_region ? zipmap(data.aws_availability_zones.london[0].names, data.aws_availability_zones.london[0].zone_ids) : {}
+  instance_b       = local.inter_region ? aws_instance.vm_b_london[0] : aws_instance.vm_b_frankfurt[0]
+  zone_ids_primary = zipmap(data.aws_availability_zones.primary.names, data.aws_availability_zones.primary.zone_ids)
+  zone_ids_london  = local.inter_region ? zipmap(data.aws_availability_zones.london[0].names, data.aws_availability_zones.london[0].zone_ids) : {}
 }
 
 output "deployment" {

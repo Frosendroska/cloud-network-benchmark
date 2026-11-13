@@ -19,8 +19,8 @@ resource "terraform_data" "scope_guard" {
       error_message = "GCP protection accepts only the selected baseline topology or Finland same-zone pair."
     }
     precondition {
-      condition = can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_a)) &&
-        can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_b))
+      condition = (can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_a)) &&
+      can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_b)))
       error_message = "GCP protection requires two concrete pinned Ubuntu 24.04 amd64 images."
     }
   }
@@ -80,9 +80,9 @@ resource "google_compute_firewall" "pair_icmp" {
 }
 resource "google_compute_resource_policy" "compact" {
   depends_on = [terraform_data.scope_guard]
-  count  = var.scenario == "placement_optimization" ? 1 : 0
-  name   = "${var.namespace}-compact"
-  region = local.region_a
+  count      = var.scenario == "placement_optimization" ? 1 : 0
+  name       = "${var.namespace}-compact"
+  region     = local.region_a
   group_placement_policy {
     collocation = "COLLOCATED"
   }

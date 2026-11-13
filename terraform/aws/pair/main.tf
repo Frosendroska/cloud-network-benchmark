@@ -32,8 +32,8 @@ resource "terraform_data" "account_guard" {
       error_message = "AWS credentials resolve to a different account than the admitted attempt."
     }
     precondition {
-      condition = var.primary_region == "eu-central-1" && var.primary_zone == "eu-central-1a" ||
-        var.scenario == "same_zone" && var.primary_region == "eu-north-1" && var.primary_zone == "eu-north-1a"
+      condition = (var.primary_region == "eu-central-1" && var.primary_zone == "eu-central-1a" ||
+      var.scenario == "same_zone" && var.primary_region == "eu-north-1" && var.primary_zone == "eu-north-1a")
       error_message = "Stockholm is admitted only for the reviewed same-zone eu-north-1a pair."
     }
   }
