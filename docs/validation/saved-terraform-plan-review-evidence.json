@@ -1,0 +1,37 @@
+{
+  "changed_executable_sha256": {
+    "src/cloud_network_benchmark/lifecycle_runtime.py": "aa0cfe521266bd03a6f7c3027371af01aa34be9c3d6302faa91966dbbc8b346f",
+    "src/cloud_network_benchmark/providers/aws.py": "fef70c9845d22fa5602fd40fe964dc7ce8812ba15b160dc83789ecefac696f3b",
+    "src/cloud_network_benchmark/providers/gcp.py": "7aa9b8fb5f09fd473e4bfe4343eb826f64015621e29bc55011d62d4ef612d071",
+    "src/cloud_network_benchmark/terraform_plan.py": "da6128cd908a4ec44c072e5584a845700f8240e2f8332b688a0654c6b189966d"
+  },
+  "cloud_acceptance": "not performed",
+  "final_test_file_sha256": "ccc31e1d483e2f12ca83ed610dfb813db0c8a296187b84f311afa3584f4bb449",
+  "implementation_commit": "f1918f0d3a93c10e618647021318b11a0f8e02a3",
+  "local_factory_limit": "18 factory cases collected but not executed locally; optional matplotlib is absent. Existing affected provider/runtime/financial tests passed.",
+  "local_junit": {
+    "/private/tmp/cnb-saved-plan-final-delta.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "ddaf29edd3aa212b2d544f4f63bc43764f5311fecc40fd0196444acbc22358a8",
+      "skipped": 0,
+      "tests": 63
+    },
+    "/private/tmp/cnb-saved-plan-final-local.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "43d3d819306efefaee0996e64b90d34cbb830614d089251609275d12d8b46811",
+      "skipped": 0,
+      "tests": 306
+    },
+    "/private/tmp/cnb-saved-plan-local.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "b6105f6530eca1267ff2cc15ee556eb595264c0d55f06498320b528c68991d0f",
+      "skipped": 0,
+      "tests": 304
+    }
+  },
+  "native_status": "not run: source transfer rejected by automatic approval review; explicit payload/destination authorization requested",
+  "paid_authority": "old source card must be re-reviewed and rebound; no new run IDs or launch"
+}

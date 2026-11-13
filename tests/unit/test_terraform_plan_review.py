@@ -279,3 +279,25 @@ def test_recursive_financial_binding_includes_actual_child_roots(tmp_path):
     paths={item["path"] for item in binding["sources"]}
     assert all(str(tf/name) in paths for name in ("main.tf","expiry.py",".terraform.lock.hcl"))
     assert any(path.endswith("/terraform_plan.py") for path in paths)
+
+
+def test_gcp_fractional_deadline_is_not_rounded_up(tmp_path,monkeypatch):
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    from tests.unit.test_gcp_provider import settings
+    runner=SavedPlanRunner({})
+    driver=GcpProviderDriver(runner,settings(tmp_path))
+    monkeypatch.setattr(tp.time,"monotonic",lambda:10.0)
+    driver._deadline=10.25
+    driver._run("gcp-read-only-fixture",["gcloud","fixture"],tmp_path)
+    assert runner.requests[-1].timeout_seconds==0.25
+
+
+def test_operator_rejection_never_applies(tmp_path,monkeypatch):
+    original=tp.await_review
+    def rejected(directory,binding,deadline):
+        (directory/"operator-review.json").write_text(json.dumps({"decision":"rejected","binding":binding,"reviewer":"fixture","inspection":"unexpected scope"}))
+        return original(directory,binding,deadline)
+    monkeypatch.setattr(tp,"await_review",rejected)
+    req,runner=request(tmp_path)
+    with pytest.raises(tp.PlanReviewError,match="rejected"):tp.reviewed_apply(req,runner.run)
+    assert not any("apply" in r.argv for r in runner.requests)

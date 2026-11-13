@@ -48,7 +48,28 @@ FRAMEWORK_IMPLEMENTATION_NOTES, experiment/prompts/M04/M05 and BUDGET_RULES.
 ## Tasks
 
 - [x] SP1 Inspect original apply/deadline/cleanup and binding paths; preserve user edits.
-- [ ] SP2 Implement private saved-plan creation, explicit scope checks, bounded receipt and same-plan apply.
-- [ ] SP3 Wire AWS/GCP only and recursive executable source binding.
-- [ ] SP4 Focused fake-command rejection/identity/deadline/cleanup tests and affected regressions.
-- [ ] SP5 Record validation and executable operator recipe; converge and selectively commit.
+- [x] SP2 Implement private saved-plan creation, explicit scope checks, bounded receipt and same-plan apply.
+- [x] SP3 Wire AWS/GCP only and recursive executable source binding.
+- [x] SP4 Focused fake-command rejection/identity/deadline/cleanup tests and affected regressions.
+- [x] SP5 Record validation and executable operator recipe; converge and selectively commit.
+
+
+## Convergence — 14 November 2026
+
+R1/R2: all four command boundaries use plan/show, explicit provider allowlists and
+critical checks; full JSON and state/input/source/plan identities are private and
+bound to technical operator inspection before same-binary apply. R3: configurable
+bounded receipt wait, request-hash CLI, rejection/missing/mismatch/tamper/deadline
+tests; zero-wait default blocks. R4: launch-only interception, original expiry and
+financial gates, per-provider recovery untouched; real-boundary destroy tests and
+legacy cleanup regressions pass. Recursive financial discovery now binds child
+Terraform/lock/expiry code. R5: final local 306/306 (61 new-boundary cases), zero
+failures/errors/skips; source/hash/test evidence and operator recipe committed.
+No actionable local implementation finding remains. Eighteen factory cases and
+native Terraform compatibility are explicitly unproved: optional local matplotlib
+is absent, and automatic approval review rejected source egress to Halle pending
+explicit payload/destination authorization. This is a validation limitation, not
+paid readiness. No full unchanged baseline, live run, new run ID, authority card,
+ledger, reservation or cloud resource was created. Source commit f1918f0; later
+validation-only commit preserves those four executable hashes. User documentation
+edits and the Thesis/frozen launch source remain untouched.

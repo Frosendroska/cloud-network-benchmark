@@ -84,9 +84,11 @@ workflow before its original STOP time. No wait extends those deadlines.
 
 ## Validation
 
-Local Python 3.13.7: 304 affected cases passed with zero failures/errors/skips,
-including 59 real saved-plan boundary cases and the financial/runtime/provider
-regressions. JUnit: `/private/tmp/cnb-saved-plan-local.xml`. Earlier invocations
+Local Python 3.13.7: the final 306 affected cases passed with zero failures/errors/skips,
+including 61 real saved-plan boundary cases and the financial/runtime/provider
+regressions. JUnit: `/private/tmp/cnb-saved-plan-final-local.xml`.
+The prior 304-case run and 63-case final delta also passed; their separate hashes
+are retained in the adjacent evidence JSON. Earlier invocations
 using the system Python 3.9 and a Python without pytest did not collect tests;
 those are setup failures, not passing checks. A fixture omission (`stderr`) in
 the new test runner was repaired before the passing run.
@@ -96,5 +98,35 @@ old apply/output fakes cannot emit real plan files. Their pass proves retained
 stage behavior only. The new repair suite exercises the real boundary with
 materialized private files, fake external commands and explicit operator receipts,
 including the four provider dispatches and review-free destroy. No production
-bypass or auto-approval option exists. Native evidence will be recorded below;
-no unchanged full offline baseline is repeated.
+bypass or auto-approval option exists. Native validation is not claimed;
+no unchanged full offline baseline was repeated.
+
+
+Executable repair commit: `f1918f0d3a93c10e618647021318b11a0f8e02a3`.
+The later validation commit adds two focused tests and documentation only; the
+four changed executable files remain byte-identical to this implementation commit.
+[Machine-readable source and JUnit bindings](saved-terraform-plan-review-evidence.json)
+retain their exact SHA-256 values. These are the source changes the execution chat
+must review: `terraform_plan.py`, `providers/aws.py`, `providers/gcp.py` and
+`lifecycle_runtime.py`. Rebuild the full financial binding from the actual selected
+runtime/source; do not splice these hashes into the old card or reset its ledger.
+
+Halle tools/read-only access were confirmed and a new empty private validation
+directory was created at `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
+Automatic approval review **rejected** transfer of the source/tests/documentation
+because explicit trusted user authorization for that payload and destination was
+required. No source was transferred and no native tests ran. An explicit transfer
+question is pending; no alternate egress path was used. Local Git export is
+`/private/tmp/cnb-saved-plan.fast-export`. No frozen source, credentials, launch
+inputs or existing remote checkout was modified. Stalled local archive processes
+were stopped without touching the SSH master or remote host.
+
+Eighteen affected factory cases were collected but not run locally because this
+venv lacks optional matplotlib. They are intended for the isolated native delta,
+together with the affected repair/provider/runtime/financial tests. The old
+1,718-case/20-check and d83d271 281-case native results remain historical evidence,
+not validation of this executable repair. Real saved-plan provider compatibility,
+permissions, network/guest interface assumptions, independent expiry, live
+transport and absence after cleanup remain unproved until separate authorized
+provider acceptance. The proposed native builtin-only Terraform check would also
+verify same-plan application/custom local state-path semantics without a cloud.
