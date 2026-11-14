@@ -95,7 +95,7 @@ def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     if saved.provider == Provider.AWS:
         from .providers import aws
         settings = __import__("cloud_network_benchmark.providers.aws", fromlist=["AwsRuntimeSettings"]).AwsRuntimeSettings.model_validate(saved.settings)
-        return settings.private_state_root / aws._namespace(deployment) / deployment.run_id / deployment.deployment_id / "attempt.json"
+        return settings.private_state_root / saved.expiry_request.resource_namespace / deployment.run_id / deployment.deployment_id / "attempt.json"
     if saved.provider == Provider.GCP:
         settings = __import__("cloud_network_benchmark.providers.gcp", fromlist=["GcpRuntimeSettings"]).GcpRuntimeSettings.model_validate(saved.settings)
         prefix = hashlib.sha256(deployment.run_id.encode()).hexdigest()[:12]
@@ -114,11 +114,12 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings, SAFETY_LEAD_SECONDS
         settings = AwsRuntimeSettings.model_validate(saved.settings)
         driver = AwsProviderDriver.__new__(AwsProviderDriver); driver.settings = settings
-        expected_namespace = __import__("cloud_network_benchmark.providers.aws", fromlist=["_namespace"])._namespace(d)
+        from .providers.aws import _namespace, _legacy_namespace
+        expected_namespaces = {_namespace(d), _legacy_namespace(d)}
         expected_target = driver._target_selector(d, driver._regions(d))
         expected_action = "stop"
         from .contracts.common import Provider as P
-        if (r.resource_namespace != expected_namespace or r.target_selector != expected_target
+        if (r.resource_namespace not in expected_namespaces or r.target_selector != expected_target
                 or r.action != expected_action or saved.provider_lead_seconds != SAFETY_LEAD_SECONDS
                 or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)):
             raise ValueError("saved AWS request target differs from the original deployment")
@@ -153,6 +154,8 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
     utc_now = utc_now or clock.utc_now
     monotonic_now = monotonic_now or clock.monotonic
     if saved.provider == Provider.AWS:
+        if not Path(record.journal_reference).is_file() or Path(record.journal_reference).is_symlink():
+            raise ValueError("original AWS recovery journal is unavailable")
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
         result = AwsProviderDriver(runner, AwsRuntimeSettings.model_validate(saved.settings),
             clock=utc_now).cleanup(d)
@@ -353,6 +356,10 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
                 or identity.deployment_id != saved.deployment.deployment_id
                 or getattr(identity.provider, "value", identity.provider) != str(saved.provider)):
             raise ValueError("Azure cleanup result identity differs from the saved deployment")
+    if saved.provider == Provider.AWS and result is not None:
+        inventory = getattr(getattr(result,"inventory",None),"value",None)
+        if isinstance(inventory,dict):
+            absent_ids.extend(_nested_resource_ids(inventory.get("safety_targets",{})))
     absent_ids = list(dict.fromkeys(item for item in absent_ids if isinstance(item, str) and item.strip()))
     verified_absent = result is not None and _result_is_absent(saved.provider, result, absent_ids)
     at = utc_now()

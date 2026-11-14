@@ -1100,7 +1100,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cleanup_runner=cleanup_runner, cleanup_utc_now=clock.utc_now,
         cleanup_monotonic_now=clock.monotonic)
     assert cleanup_code == 1
-    assert all(action == "gcp-inventory-all-zones" or action.startswith("azure-")
+    assert all(action in {"gcp-inventory-all-zones", "aws-get-caller-identity---output"} or action.startswith("azure-")
         for action in cleanup_runner.actions), cleanup_runner.actions
     assert not any("apply" in action or "measure" in action for action in cleanup_runner.actions)
     state = built["ledger"].inspect()
@@ -1116,7 +1116,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cleanup_runner=tamper_runner, cleanup_utc_now=clock.utc_now,
         cleanup_monotonic_now=clock.monotonic)
     assert tamper_code == 1
-    assert all(action == "gcp-inventory-all-zones" or action.startswith("azure-")
+    assert all(action in {"gcp-inventory-all-zones", "aws-get-caller-identity---output"} or action.startswith("azure-")
         for action in tamper_runner.actions), tamper_runner.actions
 
 

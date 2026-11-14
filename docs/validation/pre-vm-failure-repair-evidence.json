@@ -1,0 +1,96 @@
+{
+  "status": "passing_credential_free_affected_delta",
+  "implementation_revision": "eb91626507d0419003a739ecc314dbbf9549fc14",
+  "native_summary_sha256": "3e3c46fa09711eef7e609b3df085ec4bfb434471c40d7f6cb836f63a4d5b0a5e",
+  "native_pytest_log_sha256": "53ca3cc092a5e2d5dbcf0caf6de32517d45643c2c55c74473663650949af78f0",
+  "native_junit_sha256": "c9a45be061c736884e6dc17438badc08e7ef69eb26152cd0bf72a56ac9bab6a3",
+  "native_pytest": {
+    "tests": 266,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "native_driver_checks": 15,
+  "native_scopes": [
+    {
+      "root": "safety",
+      "scope_passed": true,
+      "mock_test_cases": 2,
+      "managed_count": 3,
+      "summary": {
+        "status": "pass",
+        "passed": 2,
+        "failed": 0,
+        "errored": 0,
+        "skipped": 0
+      },
+      "adapter": "native resource_changes preserved; omitted format/variables envelope supplied from native output snapshot"
+    },
+    {
+      "root": "pair",
+      "scope_passed": true,
+      "mock_test_cases": 2,
+      "managed_count": 14,
+      "summary": {
+        "status": "pass",
+        "passed": 2,
+        "failed": 0,
+        "errored": 0,
+        "skipped": 0
+      },
+      "adapter": "native resource_changes preserved; omitted format/variables envelope supplied from native output snapshot"
+    }
+  ],
+  "namespace_proof": {
+    "run_id": "20261022T120000Z-exp-900-91f75a46-aws",
+    "deployment_id": "20261022T120000Z-exp-900-91f75a46-aws-deployment",
+    "legacy_namespace": "cnb-20261022T120000Z-exp-900-91f75a46-aws-20261022T120000Z-exp-900-91f75a46-aws-deployment",
+    "legacy_length": 90,
+    "bounded_namespace": "cnb-20261022T120000Z-exp-900-91f75a46-aws-20261022T1200-6396d4f2460cd32ddd79cbca",
+    "bounded_length": 80,
+    "run_and_deployment_ids_unchanged": true,
+    "origin": "normal initialize_campaign output; synthetic offline scope only"
+  },
+  "source_clean_before_after": true,
+  "executable_sha256": {
+    "src/cloud_network_benchmark/providers/aws.py": "ca4314da868aecd0fd1b6e4629fb3601ddaa08772d5454b0ffdf46a4afd8b1d3",
+    "src/cloud_network_benchmark/lifecycle_runtime.py": "0049d0901e7899412fc5a8140822bc3555ac8a6638409062746a8413ad1d471c",
+    "src/cloud_network_benchmark/lifecycle_cleanup.py": "09d525d15ec62877640502fc5f35a41245c62e09b4f08ea36a5319d797a99554",
+    "src/cloud_network_benchmark/lifecycle_cli.py": "9b7f7e0addbc0fe570db6977ac28eee662b71c727790ace4517e0f39dc01d520",
+    "src/cloud_network_benchmark/lifecycle_projection.py": "a1ce0d2da79ab20bd5f8aa0b4f9ee7d3cb19ef1738da98cc4f363dd4f4478273",
+    "src/cloud_network_benchmark/orchestration.py": "db0c78964555ba50757cca46355e9561ffc09ab26b186151396d9f0b7e56ac13",
+    "src/cloud_network_benchmark/terraform_plan.py": "e61da894b767fed33c15bec4f5fdf5a9c8569d95b33eeac13048a086d38e6433"
+  },
+  "unchanged_terraform_locks": {
+    "pair": "9201db7c30cea542b9605344223abe162348f27fcac8fd8b31590238c9e1e3eb",
+    "safety": "9201db7c30cea542b9605344223abe162348f27fcac8fd8b31590238c9e1e3eb"
+  },
+  "archive": {
+    "remote": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/pre-vm-repair-eb91626-native-evidence.zip",
+    "local": "/private/tmp/cnb-pre-vm-eb91626-native-evidence.zip",
+    "bytes": 2689066,
+    "sha256": "b4fb3e8aaf485686f9f52cb1a4256554e6e5232ba990e94fef660d5450d6a537",
+    "crc_verified": true,
+    "manifest_files_verified": 34
+  },
+  "transfer_identity_check": {
+    "initial_export_rewrote_signed_merge": true,
+    "initial_check_stopped_before_tests": true,
+    "files_and_trees_matched": true,
+    "original_commit_objects_restored": true,
+    "validated_full_revision": "eb91626507d0419003a739ecc314dbbf9549fc14"
+  },
+  "local_junit_sha256": {
+    "cnb-pre-vm-repair-local.xml": "29d18ed38d6eddcf96c234b2e736ab2bd2b7dbe9dc184ef97525da3870c06946",
+    "cnb-pre-vm-reporting-local.xml": "95ffbf051881d4dbb8de27404bfd8312419419e27783104bda227ce120e2bc53",
+    "cnb-pre-vm-plan-logs-local.xml": "fd6e0a61e226c7b251c287c47793cf78c39492e8109ef0fcdc8047cd8e278954"
+  },
+  "limits": [
+    "Affected delta only; no unchanged broad baseline repeated.",
+    "Terraform cases use mock providers, plan only. Native resource_changes are preserved; omitted format/variables envelope comes from a native output snapshot.",
+    "Synthetic financial test isolation grants no launch or financial-readiness evidence.",
+    "Original active launch source, inputs, state, authority, recovery journal and ledger were not accessed or changed by this validation.",
+    "No cloud environment or credentials loaded; no provider creation, paid retry or actual financial reconciliation.",
+    "Fresh reviewed bindings/authority are required before changed-code live acceptance."
+  ]
+}

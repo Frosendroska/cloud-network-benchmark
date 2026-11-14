@@ -89,9 +89,28 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+class CountingRunner:
+    """Count actual command/copy dispatches, including failures and cleanup."""
+    def __init__(self, delegate):
+        self.delegate = delegate
+        self.actions = []
+
+    def run(self, request):
+        self.actions.append(request.action_id)
+        return self.delegate.run(request)
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        self.actions.append(request.action_id)
+        return self.delegate.run_bounded_copy(request,destination,maximum_payload_bytes)
+
+
 def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=None,
-         cleanup_runner=None, cleanup_utc_now=None, cleanup_monotonic_now=None) -> int:
+         cleanup_runner=None, cleanup_utc_now=None, cleanup_monotonic_now=None, run_clock=None) -> int:
     parser = _parser()
+    runner = None
+    lifecycle = None
+    initialized = None
+    children = {}
     try:
         args = parser.parse_args(argv)
         if args.action in {"preview", "run"}:
@@ -134,26 +153,13 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     def utc_now():
                         return datetime.now(timezone.utc)
 
-                class CountingRunner:
-                    def __init__(self):
-                        self.delegate = SubprocessCommandRunner()
-                        self.actions = []
-
-                    def run(self, request):
-                        self.actions.append(request.action_id)
-                        return self.delegate.run(request)
-
-                    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
-                        self.actions.append(request.action_id)
-                        return self.delegate.run_bounded_copy(request, destination, maximum_payload_bytes)
-
                 costs = load_cost_inputs(args.cost_inputs)
                 selected_campaign, _ = resolve_campaign(args.config, Path.cwd(),
                     schedule_entry=(None if args.schedule is None else
                         next((entry for entry in load_schedule(args.schedule,
                             config_paths={resolved.config_id: args.config}, repository_root=Path.cwd())
                             if entry.entry_id == args.row_id), None)))
-                runner, clock = CountingRunner(), Clock()
+                runner, clock = CountingRunner(SubprocessCommandRunner()), (run_clock or Clock())
                 built = build_runtime(campaign=selected_campaign, parent=initialized,
                     children=children, costs=costs, runtime=runtime,
                     controller_session_id=args.controller_session, runner=runner, clock=clock,
@@ -164,10 +170,14 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     clock=clock, recovery_path=built["recovery_path"],
                     recovery_factory=built["recovery_factory"])
                 validations = {}
+                finalization_failure = None
                 if lifecycle.provider_results and lifecycle.reservation_evidence is not None:
-                    validations = finalize_production_batch(
-                        parent_path=runtime["initialized_campaign_manifest"], children=children,
-                        parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
+                    try:
+                        validations = finalize_production_batch(
+                            parent_path=runtime["initialized_campaign_manifest"], children=children,
+                            parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
+                    except (OSError, ValueError) as exc:
+                        finalization_failure = {"category":"post_cleanup_validation_failed","message":str(exc)}
                 data_valid = bool(validations) and all(
                     value[0].validation_status.data_validity == "valid"
                     for value in validations.values())
@@ -175,7 +185,7 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"}
                 report.update(status=("complete" if lifecycle.completed and data_valid else
                     "rejected" if lifecycle.admission_status != "reserved" else "failed"),
-                    reason_codes=sorted((set(lifecycle.admission_reasons)
+                    reason_codes=sorted((({"post_cleanup_validation_failed"} if finalization_failure else set()) | set(lifecycle.admission_reasons)
                         | ({lifecycle.primary_failure} if lifecycle.primary_failure else set()))
                         | (set(report["reason_codes"]) - unevaluated)),
                     execution_scope=args.execution_scope, campaign_id=initialized.campaign_id,
@@ -189,10 +199,11 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
                             if provider in validations else None)}
                         for provider, item in lifecycle.provider_results.items()},
+                    finalization_failure=finalization_failure,
                     external_calls=len(runner.actions))
                 print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                       f"Lifecycle run {report['status']}; admission: {report['admission_status']}; external calls: {report['external_calls']}",
-                      file=sys.stdout if lifecycle.completed else sys.stderr)
+                      file=sys.stdout if report["status"] == "complete" else sys.stderr)
                 return 0 if report["status"] == "complete" else 1
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
@@ -233,9 +244,10 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             recovery = SavedLifecycleRecovery.validate_unique(
                 json.loads(args.recovery.read_text(encoding="utf-8")))
             clock = CleanupClock()
+            runner = CountingRunner(cleanup_runner or SubprocessCommandRunner())
             result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
                 current_session_id=args.controller_session,
-                runner=cleanup_runner or SubprocessCommandRunner(),
+                runner=runner,
                 utc_now=cleanup_utc_now or clock.utc_now,
                 monotonic_now=cleanup_monotonic_now or clock.monotonic)
         report = {"status": "complete" if result.complete else "blocked",
@@ -247,16 +259,23 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     if key in {"cleanup", "reconciled", "absence_proved", "billable_resources_present",
                                "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason"}}
                     for provider, item in result.providers.items()},
-                "external_calls": sum(item.get("cleanup") in {"attempted", "succeeded", "failed"}
-                                       for item in result.providers.values())}
+                "external_calls": len(runner.actions) if runner is not None else 0}
         print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Cleanup {report['status']}: execution was not resumed.",
                   file=sys.stdout if result.complete else sys.stderr)
         return 0 if result.complete else 1
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(json.dumps({"status": "invalid", "reason_codes": ["invalid_lifecycle_request"],
-                          "error": str(exc), "external_calls": 0}, sort_keys=True), file=sys.stderr)
-        return 2
+        error_report = {"status":"failed" if lifecycle is not None else "invalid",
+            "reason_codes":["lifecycle_reporting_failed" if lifecycle is not None else "invalid_lifecycle_request"],
+            "error":str(exc),"external_calls":len(runner.actions) if runner is not None else 0}
+        if lifecycle is not None:
+            error_report.update(primary_failure=lifecycle.primary_failure,
+                campaign_id=initialized.campaign_id,run_ids={key:value.run_id for key,value in children.items()},
+                providers={key:{"execution_state":value.execution_state,"cleanup_state":value.cleanup_state,
+                    "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures}
+                    for key,value in lifecycle.provider_results.items()})
+        print(json.dumps(error_report,sort_keys=True),file=sys.stderr)
+        return 1 if lifecycle is not None else 2
 
 
 if __name__ == "__main__":

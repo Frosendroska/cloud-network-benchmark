@@ -313,7 +313,8 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
     namespaces = {}
     for provider, child in children.items():
         if provider == "aws":
-            namespaces[provider] = f"cnb-{child.run_id}-{child.deployment_id}"
+            from .providers.aws import _namespace
+            namespaces[provider] = _namespace(child)
         elif provider == "gcp":
             namespaces[provider] = child.run_id
         else:
@@ -597,7 +598,8 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         for provider, child in children.items():
             if provider == "aws":
                 private_provider_root = (Path(private_root) / "aws").absolute()
-                namespace = f"cnb-{child.run_id}-{child.deployment_id}"
+                from .providers.aws import _namespace
+                namespace = _namespace(child)
                 journal = private_provider_root / namespace / child.run_id / child.deployment_id / "attempt.json"
             elif provider == "gcp":
                 prefix = hashlib.sha256(child.run_id.encode()).hexdigest()[:12]

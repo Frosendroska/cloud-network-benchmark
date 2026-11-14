@@ -978,6 +978,7 @@ def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, r
         workflow_factory=built["workflow_factory"], clock=clock,
         recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
     provider_result = result.provider_results["aws"]
+    assert "stabilize" in provider_result.values, provider_result
     assert provider_result.values["stabilize"].succeeded is True
     assert provider_result.values["stabilize"].evidence["elapsed_seconds"] >= 60
     assert clock.elapsed >= 60

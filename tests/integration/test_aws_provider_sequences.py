@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
 import pytest
+from tests.unit.test_aws_provider import legacy_cleanup_read_reply
 
 pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
@@ -26,6 +27,10 @@ class QueueRunner:
         self.actions = []
 
     def run(self, request):
+        identity = legacy_cleanup_read_reply(request)
+        if identity is not None:
+            if hasattr(self,"actions"): self.actions.append(request.action_id)
+            return identity
         self.actions.append(request.action_id)
         # Local provider-cache initialization has its own successful boundary;
         # it must not consume a queued cloud/apply failure response.
@@ -52,6 +57,10 @@ class RegistrationRunner:
         self.fail_london_start = fail_london_start
 
     def run(self, request):
+        identity = legacy_cleanup_read_reply(request)
+        if identity is not None:
+            if hasattr(self,"actions"): self.actions.append(request.action_id)
+            return identity
         action = request.action_id
         self.actions.append(action)
         code, stdout = 0, "{}"
@@ -239,7 +248,7 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
     ])
     driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
     assert driver._start_or_recover_automation(
-        "eu-central-1", {"document_name": "expiry", "document_version": "1"}, params, "token"
+        "eu-central-1", {"document_name": "expiry", "document_version": "1", "role_arn":"arn:aws:iam::123456789012:role/expiry"}, params, "token"
     ) is None
 
 
@@ -306,6 +315,10 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             outcome = apply_outcome if request.action_id == "aws-pair-apply" else CommandOutcome.SUCCEEDED
             if "expiry-read-terminal" in request.action_id or "expiry-confirm-cancel" in request.action_id:
@@ -357,7 +370,7 @@ def test_pair_apply_failure_attempts_destroy_and_preserves_primary_failure(tmp_p
         assert "apply failed" in str(exc)
     else:
         raise AssertionError("timed-out apply must preserve its primary failure")
-    assert runner.actions[:3] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-destroy"]
+    assert runner.actions[:4] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-get-caller-identity---output", "aws-pair-destroy"]
     assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == "terraform_apply"
@@ -373,6 +386,10 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             if request.action_id == "aws-pair-apply":
                 state = next(item.removeprefix("-state=") for item in request.argv if item.startswith("-state="))
@@ -430,7 +447,7 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
             assert "AWS pair Terraform output failed" in str(exc)
     else:
         raise AssertionError("missing output must fail the attempt")
-    assert runner.actions[:4] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output", "aws-pair-destroy"]
+    assert runner.actions[:5] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output", "aws-get-caller-identity---output", "aws-pair-destroy"]
     assert {action for action in runner.actions if action.startswith("aws-expiry-read-terminal-")} == {"aws-expiry-read-terminal-eu-central-1", "aws-expiry-read-terminal-eu-west-2"}
     journal = driver._load_journal(attempt, deployment)
     assert journal["primary_failure"]["category"] == ("output_invalid" if output_outcome == CommandOutcome.SUCCEEDED else "terraform_output")
@@ -447,6 +464,10 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             sequence.append(request.action_id)
             if request.action_id == "aws-pair-apply":
@@ -537,6 +558,10 @@ def test_cleanup_keeps_safety_support_when_execution_cancellation_is_unverified(
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
@@ -579,6 +604,10 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
             self.destroy_attempts = 0
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             if request.action_id == "aws-pair-destroy":
                 self.destroy_attempts += 1
@@ -602,7 +631,7 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
     assert failed.cleanup_state == "failed"
     assert failed.cleanup_failure.category == "terraform_destroy"
     retried = driver.cleanup(deployment)
-    assert retried.cleanup_state == "succeeded"
+    assert retried.cleanup_state == "succeeded", retried.model_dump(mode="json")
     assert runner.destroy_attempts == 2
 
 
@@ -619,6 +648,10 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
         "RunId": [deployment.run_id], "DeploymentId": [deployment.deployment_id], "Region": [regions[0]]}
     class TerminalRunner:
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             if request.action_id.startswith("aws-expiry-read-terminal-"):
                 output = terminal_automation("exec-one", "expiry", parameters, status=terminal,
                     sleep_status=sleep_status, stop_status=stop_status)
@@ -641,13 +674,13 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
     driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
         "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
         "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
-        "executions": {regions[0]: "exec-one"}, "safety": {regions[0]: {"document_name": "expiry", "document_version": "1"}},
+        "executions": {regions[0]: "exec-one"}, "safety": {regions[0]: {"document_name": "expiry", "document_version": "1", "role_arn":"arn:aws:iam::123456789012:role/expiry"}},
         "regional_parameters": {regions[0]: parameters},
         "expiry_evidence": expiry.model_dump(mode="json")})
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     driver._verify_safety_absent = lambda *_args: True
     result = driver.cleanup(deployment)
-    assert result.cleanup_state == "succeeded"
+    assert result.cleanup_state == "succeeded", result.model_dump(mode="json")
     assert result.expiry.value.state == expiry_state
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]["state"] == terminal
     outcome = result.expiry.value.provider_metadata.value["regional_outcomes"][regions[0]]
@@ -674,6 +707,10 @@ def test_cleanup_cancels_active_stop_step_after_sleep_completed(tmp_path):
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             if request.action_id == f"aws-expiry-read-terminal-{region}":
                 output = active
@@ -700,12 +737,12 @@ def test_cleanup_cancels_active_stop_step_after_sleep_completed(tmp_path):
     driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
         "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
         "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
-        "executions": {region: "exec-one"}, "safety": {region: {"document_name": "expiry", "document_version": "1"}},
+        "executions": {region: "exec-one"}, "safety": {region: {"document_name": "expiry", "document_version": "1", "role_arn":"arn:aws:iam::123456789012:role/expiry"}},
         "regional_parameters": {region: parameters}, "expiry_evidence": expiry.model_dump(mode="json")})
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     driver._verify_safety_absent = lambda *_args: True
     result = driver.cleanup(deployment)
-    assert result.cleanup_state == "succeeded"
+    assert result.cleanup_state == "succeeded", result.model_dump(mode="json")
     assert result.expiry.value.state == "cancelled"
     assert "aws-expiry-cancel-eu-central-1" in runner.actions
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][region]["steps"][1]["StepStatus"] == "Cancelled"
@@ -730,6 +767,10 @@ def test_cleanup_preserves_mixed_s4_expiry_outcomes_truthfully(tmp_path, statuse
 
     class MixedRunner:
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             region = next((item for item in regions if request.action_id.endswith(item)), regions[0])
             if request.action_id.startswith("aws-expiry-read-terminal-"):
                 return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
@@ -749,7 +790,7 @@ def test_cleanup_preserves_mixed_s4_expiry_outcomes_truthfully(tmp_path, statuse
         expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
         target_selector=driver._target_selector(deployment, regions),
         provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: f"exec-{region}" for region in regions}}))
-    safety = {region: {"document_name": f"expiry-{region}", "document_version": "1"} for region in regions}
+    safety = {region: {"document_name": f"expiry-{region}", "document_version": "1", "role_arn":f"arn:aws:iam::123456789012:role/expiry-{region}"} for region in regions}
     driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
         "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
         "pair_state_path": str(attempt / "pair.tfstate"), "regions": regions,
@@ -758,7 +799,7 @@ def test_cleanup_preserves_mixed_s4_expiry_outcomes_truthfully(tmp_path, statuse
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     driver._verify_safety_absent = lambda *_args: True
     result = driver.cleanup(deployment)
-    assert result.cleanup_state == "succeeded"
+    assert result.cleanup_state == "succeeded", result.model_dump(mode="json")
     assert result.expiry.value.state == expected
     assert (result.expiry.value.failure is not None) == (expected == "failed")
     observed = result.expiry.value.provider_metadata.value["regional_outcomes"]

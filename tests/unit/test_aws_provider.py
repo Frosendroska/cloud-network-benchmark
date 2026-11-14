@@ -42,6 +42,18 @@ NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fake-key"
 
 
+def legacy_cleanup_read_reply(request):
+    """Source-shaped cleanup reads for old stage fakes; real negatives are separate."""
+    if request.argv[1:3] == ["sts", "get-caller-identity"]:
+        return CommandResult(action_id=request.action_id,outcome="succeeded",started_at=NOW,
+            finished_at=NOW,duration_seconds=0,exit_code=0,stdout=json.dumps({"Account":"123456789012"}),stderr="")
+    for prefix,code in (("aws-expiry-document-absence-","InvalidDocument"),("aws-expiry-role-absence-","NoSuchEntity")):
+        if request.action_id.startswith(prefix):
+            return CommandResult(action_id=request.action_id,outcome="failed",started_at=NOW,
+                finished_at=NOW,duration_seconds=0,exit_code=254,stdout="",stderr=f"An error occurred ({code}) when calling the lookup operation")
+    return None
+
+
 def make_deployment(repository_root: Path = ROOT, config_path: str = "configs/tests/exp-900-single-provider.yaml"):
     resolved, _ = resolve_campaign(repository_root / config_path, repository_root)
     observation = next(item for item in resolved.observations if item.provider == "aws")
@@ -435,6 +447,10 @@ def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_prese
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
@@ -453,7 +469,7 @@ def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_prese
     })
     driver._inventory_region = lambda _deployment, _region, failures: failures.append(primary) or {"complete": False, "remaining": {"volumes": ["inventory_unknown"]}}
     result = driver.cleanup(deployment)
-    assert runner.actions == ["terraform-init-aws-pair-destroy", "aws-pair-destroy"]
+    assert runner.actions == ["aws-get-caller-identity---output", "terraform-init-aws-pair-destroy", "aws-pair-destroy"]
     assert result.cleanup_state == "failed"
     assert result.primary_failure.category == "terraform_apply"
     assert result.cleanup_failure.category == "inventory_incomplete"
@@ -465,6 +481,10 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
             self.actions = []
 
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             self.actions.append(request.action_id)
             if request.action_id == "aws-pair-destroy":
                 raise OSError("fake command transport failed")
@@ -485,7 +505,7 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     result = driver.cleanup(deployment)
     journal = driver._load_journal(attempt, deployment)
-    assert runner.actions == ["terraform-init-aws-pair-destroy", "aws-pair-destroy"]
+    assert runner.actions == ["aws-get-caller-identity---output", "terraform-init-aws-pair-destroy", "aws-pair-destroy"]
     assert result.cleanup_state == "failed"
     assert result.primary_failure.category == "terraform_apply"
     assert journal["launch_blocked"] is True
@@ -495,6 +515,10 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
 def test_cleanup_returns_failed_evidence_when_final_journal_write_raises(tmp_path):
     class Runner:
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
 
@@ -541,6 +565,10 @@ def test_safety_support_absence_requires_not_found_from_both_apis(tmp_path):
 def test_cleanup_inventory_blocks_on_denied_or_truncated_aws_cli_results(tmp_path, failure_operation, token_operation):
     class Runner:
         def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                if hasattr(self,"actions"): self.actions.append(request.action_id)
+                return identity
             operation = request.argv[2]
             if operation == failure_operation:
                 return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,

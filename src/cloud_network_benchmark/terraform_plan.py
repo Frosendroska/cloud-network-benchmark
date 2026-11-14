@@ -262,6 +262,7 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
     try:
         prefix = argv[:2]
         plan = execute(request.action_id + "-plan", [*prefix, "plan", "-input=false", "-no-color", f"-state={state}", f"-var-file={variables}", f"-out={binary}"])
+        _private(directory / "plan-result.json", _json(plan.durable_view()))
         if plan.outcome != "succeeded" or plan.exit_code != 0:
             raise PlanReviewError("Terraform saved-plan creation failed")
         if not binary.stat().st_size: raise PlanReviewError("Terraform did not materialize the saved plan")

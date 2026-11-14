@@ -199,6 +199,8 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         default=evaluated_at)
     creation = stage_times.get("create")
     execution = ExecutionState(result.execution_state)
+    if execution == ExecutionState.INITIALIZED and result.primary_failure:
+        execution = ExecutionState.FAILED
     if execution == ExecutionState.PROVISION_READY and current.execution_state == ExecutionState.INITIALIZED:
         current = update_child_execution(child_path, ExecutionState.PROVISION_READY,
             creation["finished_at"] if creation else evaluated_at, parent_manifest_path=parent_path)
@@ -209,7 +211,10 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
             observed_at = stage_times.get(stage, {}).get("finished_at", terminal_at)
             provider = getattr(child.provider, "value", child.provider)
             cause = result.primary_failure or f"{provider} lifecycle failed"
-            failure = _failure(cause, observed_at, "lifecycle_failure")
+            observed_failure = getattr(result.values.get("protect"),"failure",None)
+            failure = observed_failure or _failure(cause, observed_at, "lifecycle_failure")
+            if observed_failure is not None:
+                observed_at = observed_failure.occurred_at
             target = ExecutionState.INTERRUPTED if result.interrupted else ExecutionState.FAILED
             current = update_child_execution(child_path, target, observed_at, failure,
                 parent_manifest_path=parent_path)

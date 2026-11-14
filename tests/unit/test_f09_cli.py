@@ -99,7 +99,7 @@ def test_recovery_journal_is_private_exclusive_and_cli_cleanup_never_resumes(tmp
             "cleanup_open":False, "billing_final":False, "incurred_usd":None, "provider":record.provider})
     report = json.loads(capsys.readouterr().out)
     assert code == 0 and report["status"] == "complete" and report["execution"] == "not_resumed"
-    assert actions == ["aws"] and report["external_calls"] == 1
+    assert actions == ["aws"] and report["external_calls"] == 0
     saved = SavedLifecycleRecovery.validate_unique(json.loads(recovery_path.read_text()))
     assert saved.providers[0].cleanup_open is False
     assert saved.providers[0].creation_may_have_started is False
