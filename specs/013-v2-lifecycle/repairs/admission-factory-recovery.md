@@ -59,10 +59,13 @@ plot rendering are outside this Python repair delta.
 - [x] AF5 Source-bound AWS receipt replay and target-tamper rejection.
 - [x] AF6a Affected local delta: 246 passed, zero failures/errors/skips; three
   unchanged PowerShell cases deselected.
-- [ ] AF6b Exact-source isolated Halle delta and log/hash verification. SSH to the
-  named host rejects available keys; no credential/authentication change or
-  browser fallback is authorized. Connection clarification is pending.
-- [ ] AF7 Commit and return exact-source handoff with evidence limitations.
+- [x] AF6b Exact-source Halle: 246/246 passed, zero failures/errors/skips; all six
+  driver checks, clean source, eight archive payload hashes, CRC, JUnit and five
+  executable hashes verified. Original eb91626 reproduces six expected failures
+  with tracked executable sources unchanged; its three payload hashes and CRC
+  verified separately.
+- [x] AF7 Implementation a46593d committed; exact-source evidence, hashes and
+  bounded handoff recorded in docs/validation/admission-factory-recovery.md.
 
 The original approved batch did not create benchmark VMs or measurements. Its
 AWS review receipt missed the fixed review deadline; that is execution timing,
