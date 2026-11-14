@@ -3,12 +3,11 @@
     "src/cloud_network_benchmark/lifecycle_runtime.py": "aa0cfe521266bd03a6f7c3027371af01aa34be9c3d6302faa91966dbbc8b346f",
     "src/cloud_network_benchmark/providers/aws.py": "fef70c9845d22fa5602fd40fe964dc7ce8812ba15b160dc83789ecefac696f3b",
     "src/cloud_network_benchmark/providers/gcp.py": "7aa9b8fb5f09fd473e4bfe4343eb826f64015621e29bc55011d62d4ef612d071",
-    "src/cloud_network_benchmark/terraform_plan.py": "da6128cd908a4ec44c072e5584a845700f8240e2f8332b688a0654c6b189966d"
+    "src/cloud_network_benchmark/terraform_plan.py": "18e0652da6e9e22515309891419a9a0adefc825752a32f0a522a295fe72363af"
   },
   "cloud_acceptance": "not performed",
-  "final_test_file_sha256": "ccc31e1d483e2f12ca83ed610dfb813db0c8a296187b84f311afa3584f4bb449",
-  "implementation_commit": "f1918f0d3a93c10e618647021318b11a0f8e02a3",
-  "local_factory_limit": "18 factory cases collected but not executed locally; optional matplotlib is absent. Existing affected provider/runtime/financial tests passed.",
+  "final_test_file_sha256": "ebc098be59be662caa2e7d59bcccc483e9039b0d40fb38c41a03d09c3f420a95",
+  "implementation_commit": "4da3cc95f1ca46ea7ce67141a01facdb83f90343",
   "local_junit": {
     "/private/tmp/cnb-saved-plan-final-delta.xml": {
       "errors": 0,
@@ -30,8 +29,239 @@
       "sha256": "b6105f6530eca1267ff2cc15ee556eb595264c0d55f06498320b528c68991d0f",
       "skipped": 0,
       "tests": 304
+    },
+    "/private/tmp/cnb-saved-plan-state-repair.xml": {
+      "errors": 0,
+      "failures": 0,
+      "sha256": "868ddf722a6ab180b5106e57cb6e2f43cf24b9ed5800a5190b1105b5c5060dfa",
+      "skipped": 0,
+      "tests": 71
     }
   },
-  "native_status": "not run: source transfer rejected by automatic approval review; explicit payload/destination authorization requested",
+  "native_f1918f0": {
+    "archive_path": "/private/tmp/cnb-saved-plan-f1918f0-native-evidence.zip",
+    "archive_sha256": "bd7584bda63c23304e57c97caf71742103cc0f257510a0f41b947d59c8a6263e",
+    "direct_state_flag_probe": {
+      "custom_state_exists": true,
+      "default_state_absent": true,
+      "passed": true,
+      "saved_input": {
+        "type": "string",
+        "value": "saved"
+      },
+      "steps": [
+        {
+          "action": "init",
+          "exit_code": 0
+        },
+        {
+          "action": "plan",
+          "exit_code": 0
+        },
+        {
+          "action": "show",
+          "exit_code": 0
+        },
+        {
+          "action": "apply",
+          "exit_code": 0
+        }
+      ]
+    },
+    "mock_scope": {
+      "complete": true,
+      "final_checks": [
+        {
+          "init_exit": 0,
+          "init_sha256": "cd74f61b6e4290cdbca4e9a1240b3016a4c89d417f7c792bb003bf702a43f7c2",
+          "mock-plan_exit": 0,
+          "mock-plan_sha256": "42fe7cd7d67ec29bc6a27a642fd1f58ba67918857c47259e5207862216cd44fc",
+          "plan_event_keys": [
+            [
+              "@level",
+              "@message",
+              "@module",
+              "@testfile",
+              "@testrun",
+              "@timestamp",
+              "test_plan",
+              "type"
+            ]
+          ],
+          "provider": "aws",
+          "root": "pair",
+          "scope_count": 14,
+          "scope_passed": true
+        },
+        {
+          "init_exit": 0,
+          "init_sha256": "68f00693dfa9e061e78b9329dfd843a32eb7e322d18a1dd7829892b42b216b9b",
+          "mock-plan_exit": 0,
+          "mock-plan_sha256": "85ee1e3341ef8fae3c123a06cebd6d5317ec2556217d42769e01848278dc17da",
+          "plan_event_keys": [
+            [
+              "@level",
+              "@message",
+              "@module",
+              "@testfile",
+              "@testrun",
+              "@timestamp",
+              "test_plan",
+              "type"
+            ]
+          ],
+          "provider": "aws",
+          "root": "safety",
+          "scope_count": 3,
+          "scope_passed": true
+        },
+        {
+          "init_exit": 0,
+          "init_sha256": "72890b8199cbcbe96340ec2d28315dc463948f66b5f923204501511798423625",
+          "mock-plan_exit": 0,
+          "mock-plan_sha256": "360c8b25d5fa0d98d8993198022d0014ae4c5c5d4a0157ffb35836de33430147",
+          "plan_event_keys": [
+            [
+              "@level",
+              "@message",
+              "@module",
+              "@testfile",
+              "@testrun",
+              "@timestamp",
+              "test_plan",
+              "type"
+            ]
+          ],
+          "provider": "gcp",
+          "root": "pair",
+          "scope_count": 3,
+          "scope_passed": true
+        },
+        {
+          "init_exit": 0,
+          "init_sha256": "72890b8199cbcbe96340ec2d28315dc463948f66b5f923204501511798423625",
+          "mock-plan_exit": 0,
+          "mock-plan_sha256": "206044768e6e54886568e45df8beeb78b92ed29cb9094658cf71b82b37d54e1b",
+          "plan_event_keys": [
+            [
+              "@level",
+              "@message",
+              "@module",
+              "@testfile",
+              "@testrun",
+              "@timestamp",
+              "test_plan",
+              "type"
+            ]
+          ],
+          "provider": "gcp",
+          "root": "protection",
+          "scope_count": 8,
+          "scope_passed": true
+        }
+      ],
+      "method": "Native mock resource_changes preserved; test JSON envelope normalized with variables from a scratch-only output. GCP computed project supplied explicitly by mock fixture; unknown project correctly rejected in original mock.",
+      "revision": "f1918f0d3a93c10e618647021318b11a0f8e02a3"
+    },
+    "summary": {
+      "builtin_only_no_cloud": true,
+      "checks": [
+        {
+          "exit_code": 0,
+          "log_sha256": "cab0f1d851065649abe0afdfceca08db8cd39c99e18f6e7e3f403368338502fd",
+          "name": "source-revision",
+          "seconds": 0.011
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "source-status-before",
+          "seconds": 0.183
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "5b3e43dc38ca01e3f5a7854ba50d4330864b0c1e0f646650b2c78cf072acc366",
+          "name": "python-version",
+          "seconds": 0.012
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "0675fa39d0f82715cf8435eb117e9127b9d5a0c6b2254052f58495b3502151ad",
+          "name": "terraform-version",
+          "seconds": 0.173
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "d930da79f5e7fd6007dc402fae8ce3be4f46cae7c3487af4a284c25623bb5ceb",
+          "name": "affected-pytest",
+          "seconds": 974.614
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "ae862bccbe5e24bda645217af6271e5121235932a15cc6db9124eb34451baec2",
+          "name": "builtin-init",
+          "seconds": 0.12
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "34563d0f97bef863d411216c8a4efd5ae23c3df62e7cdc868003f6a471e992ed",
+          "name": "builtin-plan",
+          "seconds": 0.186
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "782068d46e137fdc6ea66d66748b824b28b0d99631ad9a7f30adcc5ea4822041",
+          "name": "builtin-show",
+          "seconds": 0.141
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "ef8761e2c32dba5e4a334c91d0f5cf2b96177c02b07265a4e4a83341e8d5eaee",
+          "name": "builtin-saved-apply",
+          "seconds": 0.137
+        },
+        {
+          "exit_code": 1,
+          "name": "builtin-same-plan-custom-state"
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "source-status-after",
+          "seconds": 0.051
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "diff-check",
+          "seconds": 0.011
+        }
+      ],
+      "complete": false,
+      "credential_environment_keys": [
+        "CHECKPOINT_DISABLE",
+        "HOME",
+        "MPLCONFIGDIR",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "TF_IN_AUTOMATION",
+        "THESIS_ROOT",
+        "TMPDIR"
+      ],
+      "pytest": {
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 322
+      },
+      "pytest_sha256": "bdbdc35b886f01309399ba884f6d7b66898b636660a3eb13d5243511681e0e70",
+      "revision": "f1918f0d3a93c10e618647021318b11a0f8e02a3",
+      "source_unchanged": true
+    },
+    "summary_sha256": "c704c6683319838c50185fc483ea7a6c5dd72dd411948070311f140f6ded9cf2",
+    "verified_manifest_entries": 56
+  },
+  "native_status": "f1918f0: 322 Python cases pass, overall state-path check fails; corrected 4da3cc9 native delta pending explicit source-transfer approval",
   "paid_authority": "old source card must be re-reviewed and rebound; no new run IDs or launch"
 }

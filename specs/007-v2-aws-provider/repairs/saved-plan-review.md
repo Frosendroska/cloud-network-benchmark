@@ -73,3 +73,22 @@ paid readiness. No full unchanged baseline, live run, new run ID, authority card
 ledger, reservation or cloud resource was created. Source commit f1918f0; later
 validation-only commit preserves those four executable hashes. User documentation
 edits and the Thesis/frozen launch source remain untouched.
+
+
+## Native finding supersedes the earlier convergence — 14 November 2026
+
+- [x] SP6 Preserve f1918f0 native evidence: 322 Python cases passed; overall driver
+  failed the local custom-state-path check. Four schema/mock roots pass with the
+  declared GCP computed-project fixture. No cloud calls/resources.
+- [x] SP7 Repair R4: saved-plan apply must explicitly retain the original `-state`
+  override. Commit 4da3cc9 changes only the helper argv and four-root regression.
+  Independent native builtin flag probe and 71 focused local cases pass.
+- [ ] SP8 Obtain explicit transfer approval for corrected 4da3cc9, run only the
+  71-case native delta and builtin helper/state check, verify/download evidence,
+  update the operator handoff and source bindings, then converge this finding.
+
+The prior no-actionable-finding statement is superseded by this native discovery.
+The f1918f0 source is not a passing native repair. Its passing Python/factory and
+scope/mock evidence is retained without relabelling it cloud/provider acceptance.
+The earlier source transfer approval was explicitly scoped to f1918f0; automatic
+review rejected later payload expansion. A specific 4da3cc9 question is pending.

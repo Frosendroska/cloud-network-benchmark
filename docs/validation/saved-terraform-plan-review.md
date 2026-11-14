@@ -32,7 +32,7 @@ failure category. Directories are 0700; files 0600. The request binds full binar
 JSON, original input/state, source (including lock/expiry script), action and
 resource scope hashes. Inputs/state/source/binary/JSON are rechecked immediately
 before apply. The apply argv is only `terraform -chdir=<root> apply -input=false
-<same saved.tfplan>`: no vars, auto-approve or recomputed plan. Failure preserves
+-state=<original attempt state> <same saved.tfplan>`: no vars, auto-approve or recomputed plan. Failure preserves
 evidence and follows original cleanup handling. Destroy/recovery bypasses this
 launch-only gate even without a receipt; failed cleanup still blocks launch.
 
@@ -70,7 +70,7 @@ workflow before its original STOP time. No wait extends those deadlines.
    the actual absolute directory and the SHA-256 of the request you inspected:
 
    ```sh
-   python -m cloud_network_benchmark.terraform_plan /absolute/private/action-review-directory \
+   PYTHONPATH=/absolute/reviewed/source/src /absolute/venv/bin/python -m cloud_network_benchmark.terraform_plan /absolute/private/action-review-directory \
      --request-sha256 ACTUAL_INSPECTED_REQUEST_SHA256 \
      --reviewer 'operator identity' \
      --inspection 'Actual checks and comparison with the exact approved source/card'
@@ -102,31 +102,65 @@ bypass or auto-approval option exists. Native validation is not claimed;
 no unchanged full offline baseline was repeated.
 
 
-Executable repair commit: `f1918f0d3a93c10e618647021318b11a0f8e02a3`.
-The later validation commit adds two focused tests and documentation only; the
-four changed executable files remain byte-identical to this implementation commit.
-[Machine-readable source and JUnit bindings](saved-terraform-plan-review-evidence.json)
-retain their exact SHA-256 values. These are the source changes the execution chat
-must review: `terraform_plan.py`, `providers/aws.py`, `providers/gcp.py` and
-`lifecycle_runtime.py`. Rebuild the full financial binding from the actual selected
-runtime/source; do not splice these hashes into the old card or reset its ledger.
 
-Halle tools/read-only access were confirmed and a new empty private validation
-directory was created at `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
-Automatic approval review **rejected** transfer of the source/tests/documentation
-because explicit trusted user authorization for that payload and destination was
-required. No source was transferred and no native tests ran. An explicit transfer
-question is pending; no alternate egress path was used. Local Git export is
-`/private/tmp/cnb-saved-plan.fast-export`. No frozen source, credentials, launch
-inputs or existing remote checkout was modified. Stalled local archive processes
-were stopped without touching the SSH master or remote host.
+## Native audit and state-path correction — 14 November 2026
 
-Eighteen affected factory cases were collected but not run locally because this
-venv lacks optional matplotlib. They are intended for the isolated native delta,
-together with the affected repair/provider/runtime/financial tests. The old
-1,718-case/20-check and d83d271 281-case native results remain historical evidence,
-not validation of this executable repair. Real saved-plan provider compatibility,
-permissions, network/guest interface assumptions, independent expiry, live
-transport and absence after cleanup remain unproved until separate authorized
-provider acceptance. The proposed native builtin-only Terraform check would also
-verify same-plan application/custom local state-path semantics without a cloud.
+Current executable repair: `4da3cc95f1ca46ea7ce67141a01facdb83f90343`.
+It supersedes `f1918f0d3a93c10e618647021318b11a0f8e02a3`: native Terraform
+showed that a saved-plan apply **does not retain the legacy `-state` override**
+used while planning. The old argv applied the saved binary into the source
+root's default state location. That breaks attempt isolation and original-state
+cleanup. The correction passes `-state=<original attempt state>` on saved-plan
+apply too, while retaining the same binary and excluding vars/replanning.
+The updated four-root regression asserts that exact original-state argument.
+
+The authorized isolated f1918f0 run completed with Python 3.12.3 / Terraform
+1.16.6, clean source before/after and **322 Python cases passed**, zero failures,
+errors or skips, including all 18 affected factory cases. The driver overall
+**did not pass**: its custom-state-path check failed. An independent builtin
+probe confirmed the custom state was absent and default state existed. A separate
+builtin-only probe with the original `-state` flag passed: original saved input,
+custom state present, default state absent. These probes create only local
+`terraform_data` state; they do not contact a provider or create billable resources.
+The probe also accounts for Terraform's typed `input` encoding in state.
+
+Four native mock-provider roots passed scope inspection (AWS pair 14 managed
+addresses, safety 3; GCP protection 8, pair 3). Terraform test's verbose JSON
+requires an envelope adapter; native resource changes were preserved and input
+variables supplied through a scratch-only output. The original GCP protection
+mock left project unknown, which the validator correctly rejected. The final
+synthetic fixture explicitly supplied that computed project at plan time. This
+is schema/mock evidence, not real provider planning, permissions or acceptance.
+Initial harness failures and the unknown-project rejection remain in the archive.
+
+Source/test transfer of f1918f0 was explicitly approved. Automatic approval review
+rejected the later 38a5507 payload as outside that exact approval, so only f1918f0
+was transferred. The frozen launch inputs, source and existing checkouts remain
+unchanged; validation used `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
+A new transfer question covers corrected **4da3cc9**; its native delta is pending
+that approval. Do not treat the old Python pass or the direct flag probe as a
+complete native pass of the corrected helper. Only the focused 71-case native
+delta and builtin helper/state check are needed; the unchanged broad baseline
+will not be rerun. The corrected source passed 71 focused local cases, zero
+failures/errors/skips, in `/private/tmp/cnb-saved-plan-state-repair.xml`.
+
+The f1918f0 archive was downloaded and verified for ZIP CRC, all 56 manifest
+entries, each driver log hash, exact revision/source hashes and JUnit counts/hash.
+Archive: `/private/tmp/cnb-saved-plan-f1918f0-native-evidence.zip` (8,981,641 bytes).
+Native original: `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| f1918f0 native archive | `bd7584bda63c23304e57c97caf71742103cc0f257510a0f41b947d59c8a6263e` |
+| original summary (overall failure retained) | `c704c6683319838c50185fc483ea7a6c5dd72dd411948070311f140f6ded9cf2` |
+| original 322-case JUnit | `bdbdc35b886f01309399ba884f6d7b66898b636660a3eb13d5243511681e0e70` |
+
+[Machine-readable source/test/native bindings](saved-terraform-plan-review-evidence.json)
+contain the current four executable hashes. Only `terraform_plan.py` changed in
+the state-path correction; AWS/GCP/lifecycle source bytes retain their f1918f0
+hashes. Rebuild the full financial binding for the actual reviewed source/runtime;
+do not splice hashes into the old card, reset a ledger, regenerate run IDs or
+silently reuse the expired execution window. No cloud resources, expiry
+registration, financial ledger/reservation, paid attempt or cloud API call was
+made. Real saved-provider-plan compatibility, provider acceptance and live
+transport/expiry/cleanup remain separate and unproved.
