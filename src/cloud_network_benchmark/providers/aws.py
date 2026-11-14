@@ -811,8 +811,8 @@ class AwsProviderDriver:
         lookup = self._lookup_automation(region, safety, params)
         if lookup is not None and len(lookup[0]) == 1:
             return lookup[0][0]
-        rejected = (start.outcome == "failed" and start.exit_code not in (None, 0)
-            and re.search(r"\(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
+        rejected = (start.outcome == "failed" and start.exit_code not in (None, 0) and not start.stdout.strip()
+            and re.match(r"\s*An error occurred \(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
         if rejected and lookup is not None and lookup[1] == 0:
             exc = AwsProviderError("AWS rejected expiry start; complete lookup found no exact-document execution",
                 category="expiry_start_rejected", action_id=start.action_id)
@@ -839,7 +839,8 @@ class AwsProviderDriver:
             return None
         matches, exact_ids = [], set()
         for item in executions:
-            if not isinstance(item, dict) or not isinstance(item.get("DocumentName"), str):
+            if (not isinstance(item, dict) or not isinstance(item.get("DocumentName"), str)
+                    or not item["DocumentName"].startswith(safety["document_name"])):
                 return None
             # AWS supports a prefix filter only; a neighboring document is not
             # evidence about this attempt and must never be read/cancelled.

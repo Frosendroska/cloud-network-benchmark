@@ -40,6 +40,7 @@ def main():
     parser.add_argument('--revision',required=True)
     parser.add_argument('--thesis',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--aws-only',action='store_true',help='Only the final AWS rejection/completeness delta; no Terraform rerun')
     parser.add_argument('--terraform',type=Path,required=True)
     parser.add_argument('--mirror',type=Path,required=True)
     parser.add_argument('--expected-tests',type=int,required=True)
@@ -73,11 +74,14 @@ def main():
     before=run('source-before',['git','status','--porcelain']).stdout
     if revision!=args.revision or before: raise ValueError('source must be clean at exact reviewed revision')
     run('python-version',[sys.executable,'--version'])
-    run('affected-pytest',[sys.executable,'-m','pytest','-q','-p','no:cacheprovider',*TESTS,
-        '-k','not runbook_fake_process_retries_late_and_creating_targets_without_controller',
+    tests = ['tests/unit/test_aws_provider.py','tests/integration/test_aws_provider_sequences.py',
+        'tests/integration/test_pre_vm_failure_recovery.py','tests/integration/test_provider_precreation_boundaries.py'] if args.aws_only else TESTS
+    selector = 'aws' if args.aws_only else 'not runbook_fake_process_retries_late_and_creating_targets_without_controller'
+    run('affected-pytest',[sys.executable,'-m','pytest','-q','-p','no:cacheprovider',*tests,
+        '-k',selector,
         '--junitxml='+str(out/'pytest.xml')])
     native=[]
-    for name in ('expiry','pair'):
+    for name in (() if args.aws_only else ('expiry','pair')):
         original=source/'terraform/azure'/name
         root=out/'terraform'/name
         root.mkdir(parents=True)
@@ -106,7 +110,7 @@ def main():
     counts={k:sum(int(s.get(k,'0')) for s in tree.iter('testsuite')) for k in ('tests','failures','errors','skipped')}
     summary={'revision':revision,'checks':rows,'pytest':counts,'source_clean_before_after':before==after==b'',
         'source_sha256':{p:hashlib.sha256((source/p).read_bytes()).hexdigest() for p in SOURCES},
-        'environment_keys':sorted(env),'scope':'affected provider precreation/recovery Python delta and eight Azure native mocked plans only',
+        'environment_keys':sorted(env),'scope':'final AWS rejection/completeness delta only' if args.aws_only else 'affected provider precreation/recovery Python delta and eight Azure native mocked plans only',
         'terraform':native,'terraform_version':run('terraform-version',[str(terraform),'version','-json']).stdout.decode(),
         'mirror':str(mirror),
         'complete':before==after==b'' and all(r['exit_code']==0 for r in rows)

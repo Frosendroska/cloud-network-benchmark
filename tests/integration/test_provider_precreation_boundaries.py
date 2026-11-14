@@ -327,3 +327,15 @@ def test_aws_rejected_start_cleanup_after_expiry_rechecks_bound_absence(tmp_path
     assert all(p.read_bytes()==value for p,value in originals.items())
     assert not any('start-automation-execution' in q.argv or 'apply' in q.argv for q in cleanup.requests)
     if case!='rejected': assert not any('destroy' in q.argv for q in cleanup.requests)
+
+
+@pytest.mark.parametrize('case', ['empty-document','foreign-prefix','secondary-error','nonempty-stdout'])
+def test_aws_malformed_or_secondary_error_cannot_become_definitive_rejection(case):
+    payload={'AutomationExecutionMetadataList':[]};error=REJECT;stdout=''
+    if case in {'empty-document','foreign-prefix'}:
+        payload['AutomationExecutionMetadataList']=[{'DocumentName':'' if case=='empty-document' else 'unrelated-document','AutomationExecutionId':'unknown'}]
+    if case=='secondary-error': error='An error occurred (AccessDeniedException) when calling StartAutomationExecution: context: '+REJECT
+    if case=='nonempty-stdout': stdout='unexpected partial output'
+    runner=Commands([(254,stdout,error),(0,json.dumps(payload),'')])
+    assert aws_driver(runner)._start_or_recover_automation('eu-north-1',SAFETY,PARAMS,'token') is None
+    assert len(runner.requests)==2

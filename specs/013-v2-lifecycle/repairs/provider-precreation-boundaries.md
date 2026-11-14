@@ -43,8 +43,8 @@ this repair artifact and bounded validation evidence.
 - [x] PB1 AWS lookup, rejection recovery and private diagnostics with regressions.
 - [x] PB2 GCP canonical properties, durable diagnostics and complete inventory.
 - [x] PB3 Azure no-registration preflight and typed precreation absence.
-- [ ] PB4 Affected local checks and exact-source isolated native delta.
-- [ ] PB5 Record evidence, unresolved causes and source identity; commit/push.
+- [x] PB4 Affected local checks and exact-source isolated native delta.
+- [x] PB5 Record evidence, unresolved causes and source identity; commit/push.
 
 Reported live outcomes are execution-chat evidence, distinct from these tests:
 all three attempts stopped before VM creation, zero benchmarks, and independently
@@ -52,5 +52,14 @@ closed cleanup. The EUR8 attempt authority is consumed. No offline test is
 provider acceptance or authority for another run.
 
 Local affected delta: 461 passed, three unchanged PowerShell cases deselected.
-After the final diagnostic refactor, all 86 GCP-selected cases passed. Native
-validation and exact-source evidence are pending the implementation commit.
+After the final diagnostic refactor, all 86 GCP-selected cases passed. Exact-source Halle validation passed 461/461 Python cases and 8/8 Azure mocked
+plans at 2cb096a. Source/locks stayed unchanged. Nine selected regressions fail
+as expected on a46593d. Archives, JUnit and executable hashes were independently
+verified; see docs/validation/provider-precreation-boundaries.md and its evidence
+JSON. Implementation and evidence are committed on the existing repair branch.
+
+Final audit addendum: require the primary AWS CLI rejection (with blank stdout),
+and reject empty/foreign-prefix metadata document names as incomplete evidence.
+Four new negative cases cover those edges. The affected AWS-only delta is rerun
+on the final source; unchanged GCP/Azure and Terraform evidence stays bound to
+2cb096a and its executable/root hashes.
