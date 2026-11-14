@@ -81,6 +81,9 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
     provider = providers.get("azurerm", {})
     _same(provider.get("full_name"), "registry.terraform.io/hashicorp/azurerm", "Azure provider configuration")
     _same(provider.get("expressions", {}).get("subscription_id"), {"references":["var.subscription_id"]}, "Azure subscription binding")
+    _same(provider.get("expressions", {}).get("resource_provider_registrations"), {"constant_value":"none"}, "Azure automatic provider registration suppression")
+    if provider.get("expressions", {}).get("resource_providers_to_register", {"constant_value":[]}) != {"constant_value":[]}:
+        raise PlanReviewError("Azure automatic provider registration list must remain empty")
     configs = {x["address"]: x for x in configuration.get("root_module", {}).get("resources", [])}
     for item in plan.get("resource_changes", []):
         if item.get("mode") == "data" or item["address"] in r:

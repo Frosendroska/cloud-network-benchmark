@@ -483,8 +483,12 @@ class GcpProviderDriver:
                 raise GcpProviderError("registered template identity or absolute STOP policy changed before creation", category="expiry_mismatch")
 
     def _validate_template(self, described: dict[str, Any], item: dict[str, Any], role: str, deployment: ProviderDeploymentInput | None, trigger: datetime) -> None:
-        props = described.get("properties", {})
-        scheduling = props.get("scheduling", {})
+        props = described.get("properties", {}) if isinstance(described, dict) else None
+        if not isinstance(props, dict):
+            self._template_mismatch(deployment, role, ["properties"], {"properties": props})
+        if not isinstance(props.get("scheduling"), dict):
+            self._template_mismatch(deployment, role, ["scheduling"], {"scheduling": props.get("scheduling")})
+        scheduling = props["scheduling"]
         expected_name = f"{self._namespace(deployment)}-{role[-1]}"
         expected_region = deployment.vm_a.region if role == "vm_a" or deployment is None else deployment.vm_b.region
         expected_zone = deployment.vm_a.zone if role == "vm_a" or deployment is None else deployment.vm_b.zone
@@ -496,7 +500,7 @@ class GcpProviderDriver:
         expected_network = f"projects/{self.settings.project_id}/global/networks/{self._namespace(deployment)}-net"
         expected_subnet = f"projects/{self.settings.project_id}/regions/{expected_region}/subnetworks/{self._namespace(deployment)}-" + ("b" if role == "vm_b" and deployment.scenario == "inter_region" else "a")
         if item.get("zone") != exp_zone:
-            raise GcpProviderError("template role is bound to a different selected zone", category="expiry_mismatch")
+            self._template_mismatch(deployment, role, ["identity.zone"], {"identity.zone": item.get("zone")})
         link = str(item.get("self_link_unique", ""))
         described_id = self._int64(described.get("id"))
         item_id = self._int64(item.get("id"))
@@ -505,37 +509,88 @@ class GcpProviderDriver:
         expected_link = f"projects/{self.settings.project_id}/global/instanceTemplates/{expected_name}"
         disk = props.get("disks", [])
         nics = props.get("networkInterfaces", [])
-        metadata = {x.get("key"): x.get("value") for x in props.get("metadata", {}).get("items", [])}
+        raw_metadata = props.get("metadata", {})
+        metadata_items = raw_metadata.get("items", []) if isinstance(raw_metadata, dict) else None
+        shape_checks = {
+            "disks": isinstance(disk, list) and all(isinstance(x, dict) and isinstance(x.get("initializeParams"), dict) for x in disk),
+            "networkInterfaces": isinstance(nics, list) and all(isinstance(x, dict) for x in nics),
+            "metadata": (isinstance(metadata_items, list)
+                and all(isinstance(x, dict) and isinstance(x.get("key"), str) for x in metadata_items)
+                and len({x["key"] for x in metadata_items}) == len(metadata_items)),
+            "reservationAffinity": isinstance(props.get("reservationAffinity", {}), dict),
+        }
+        malformed = [key for key, matches in shape_checks.items() if not matches]
+        if malformed:
+            self._template_mismatch(deployment, role, malformed, {key: props.get(key) for key in malformed})
+        metadata = {x["key"]: x.get("value") for x in metadata_items}
         labels = props.get("labels", {})
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
         expected_policy = self._selected_policy_path(deployment)
         raw_policies = props.get("resourcePolicies", [])
         policy_paths = [self._compute_path(policy) for policy in raw_policies] if isinstance(raw_policies, list) else None
         policy_matches = policy_paths == ([expected_policy] if expected_policy else [])
-        if (described_id is None or item_id is None or described_id != item_id or described.get("name") != item.get("name") or item.get("name") != expected_name
-            or rest_path != expected_link or unique_path != expected_link or unique_id != str(described_id)
-            or scheduling.get("provisioningModel") != "STANDARD" or scheduling.get("instanceTerminationAction") != "STOP"
-            or scheduling.get("terminationTime") != trigger.isoformat().replace("+00:00", "Z")
-            or scheduling.get("automaticRestart") is not False or "maxRunDuration" in scheduling
-            or props.get("machineType", "").rsplit("/", 1)[-1] != "n2-standard-4"
-            or len(disk) != 1 or not disk[0].get("boot") or disk[0].get("autoDelete") is not True
-            or disk[0].get("initializeParams", {}).get("sourceImage", "").split("projects/", 1)[-1] != exp_image.split("projects/", 1)[-1]
-            or disk[0].get("initializeParams", {}).get("diskType", "").rsplit("/", 1)[-1] != "pd-balanced"
-            or not self._matches_int(disk[0].get("initializeParams", {}).get("diskSizeGb"), 32)
-            or disk[0].get("initializeParams", {}).get("diskName") != f"{self._namespace(deployment)}-{role[-1]}-boot" or disk[0].get("initializeParams", {}).get("labels") != expected_labels
-            or len(nics) != 1 or nics[0].get("nicType") != "GVNIC" or nics[0].get("networkIP") != exp_ip or self._compute_path(nics[0].get("network")) != expected_network or self._compute_path(nics[0].get("subnetwork")) != expected_subnet
-            or self._unsupported_network_tier(props.get("networkPerformanceConfig")) or props.get("minCpuPlatform")
-            or scheduling.get("nodeAffinities")
-            or len(nics[0].get("accessConfigs", [])) != 1
-            or metadata.get("enable-guest-attributes") != "TRUE" or metadata.get("enable-oslogin") != "FALSE" or metadata.get("block-project-ssh-keys") != "TRUE"
-            or metadata.get("cnb-bootstrap-template") != deployment.bootstrap_template
-            or metadata.get("cnb-bootstrap-inputs") != json.dumps(deployment.bootstrap_inputs, sort_keys=True, separators=(",", ":"))
-            or metadata.get("cnb-network-intent") != json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-            or metadata.get("ssh-keys") != f"benchmark:{self.settings.public_key}"
-            or props.get("reservationAffinity", {}).get("consumeReservationType") != "NO_RESERVATION"
-            or not policy_matches or (item.get("expected_policy") and self._compute_path(item.get("expected_policy")) != expected_policy)
-            or labels != expected_labels or "maxRunDuration" in props or props.get("guestAccelerators")):
-            raise GcpProviderError("immutable template properties or project-scoped unique identity differ from the selected role", category="expiry_mismatch")
+        # Named predicates keep mismatch evidence precise without persisting raw
+        # metadata (which includes SSH keys and bootstrap input contents).
+        checks = {
+            "identity": (described_id is not None and item_id == described_id
+                and described.get("name") == item.get("name") == expected_name
+                and rest_path == unique_path == expected_link and unique_id == str(described_id)),
+            "scheduling.provisioningModel": scheduling.get("provisioningModel") == "STANDARD",
+            "scheduling.instanceTerminationAction": scheduling.get("instanceTerminationAction") == "STOP",
+            "scheduling.terminationTime": self._same_utc_instant(scheduling.get("terminationTime"), trigger),
+            "scheduling.automaticRestart": scheduling.get("automaticRestart") is False,
+            "scheduling.maxRunDuration": "maxRunDuration" not in scheduling,
+            "machineType": str(props.get("machineType", "")).rsplit("/", 1)[-1] == "n2-standard-4",
+            "disks": (len(disk) == 1 and disk[0].get("boot") is True and disk[0].get("autoDelete") is True
+                and str(disk[0].get("initializeParams", {}).get("sourceImage", "")).split("projects/", 1)[-1] == exp_image.split("projects/", 1)[-1]
+                and str(disk[0].get("initializeParams", {}).get("diskType", "")).rsplit("/", 1)[-1] == "pd-balanced"
+                and self._matches_int(disk[0].get("initializeParams", {}).get("diskSizeGb"), 32)
+                and disk[0].get("initializeParams", {}).get("diskName") == f"{self._namespace(deployment)}-{role[-1]}-boot"
+                and disk[0].get("initializeParams", {}).get("labels") == expected_labels),
+            "networkInterfaces": (len(nics) == 1 and nics[0].get("nicType") == "GVNIC"
+                and nics[0].get("networkIP") == exp_ip and self._compute_path(nics[0].get("network")) == expected_network
+                and self._compute_path(nics[0].get("subnetwork")) == expected_subnet
+                and isinstance(nics[0].get("accessConfigs"), list) and len(nics[0]["accessConfigs"]) == 1),
+            "networkPerformanceConfig": not self._unsupported_network_tier(props.get("networkPerformanceConfig")),
+            "minCpuPlatform": not props.get("minCpuPlatform"),
+            "scheduling.nodeAffinities": not scheduling.get("nodeAffinities"),
+            "metadata": (metadata.get("enable-guest-attributes") == "TRUE"
+                and metadata.get("enable-oslogin") == "FALSE" and metadata.get("block-project-ssh-keys") == "TRUE"
+                and metadata.get("cnb-bootstrap-template") == deployment.bootstrap_template
+                and metadata.get("cnb-bootstrap-inputs") == json.dumps(deployment.bootstrap_inputs, sort_keys=True, separators=(",", ":"))
+                and metadata.get("cnb-network-intent") == json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+                and metadata.get("ssh-keys") == f"benchmark:{self.settings.public_key}"),
+            "reservationAffinity": props.get("reservationAffinity", {}).get("consumeReservationType") == "NO_RESERVATION",
+            "resourcePolicies": bool(policy_matches and (not item.get("expected_policy") or self._compute_path(item["expected_policy"]) == expected_policy)),
+            "labels": labels in (expected_labels, {**expected_labels, "goog-terraform-provisioned": "true"}),
+            "maxRunDuration": "maxRunDuration" not in props,
+            "guestAccelerators": not props.get("guestAccelerators"),
+        }
+        mismatches = [key for key, matches in checks.items() if not matches]
+        if mismatches:
+            fields = {"identity": (described.get("id"), described.get("name"), described.get("selfLink")),
+                **{key: scheduling.get(key.split(".", 1)[1]) if key.startswith("scheduling.") else props.get(key)
+                   for key in checks if key != "identity"}}
+            self._template_mismatch(deployment, role, mismatches, fields)
+
+    def _template_mismatch(self, deployment: ProviderDeploymentInput, role: str,
+                           mismatches: list[str], fields: dict[str, Any]) -> None:
+        diagnostic = {"role": role, "mismatched_fields": mismatches,
+            "observed_field_sha256": {key: hashlib.sha256(json.dumps(fields[key], sort_keys=True).encode()).hexdigest() for key in mismatches}}
+        if self._active_attempt is not None:
+            journal = self._load(self._active_attempt, deployment)
+            journal.setdefault("template_validation_diagnostics", []).append(diagnostic)
+            self._save(self._active_attempt, journal)
+        raise GcpProviderError("immutable template properties or project-scoped unique identity differ from the selected role: " + ", ".join(mismatches), category="expiry_mismatch")
+
+    @staticmethod
+    def _same_utc_instant(value: Any, expected: datetime) -> bool:
+        if not isinstance(value, str): return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.tzinfo is not None and parsed.utcoffset() is not None and parsed == expected
+        except ValueError:
+            return False
 
     def _assert_no_open_cleanup(self, deployment: ProviderDeploymentInput) -> None:
         root = self.settings.private_state_root.expanduser().absolute()
@@ -649,6 +704,12 @@ class GcpProviderDriver:
                 if fingerprint not in event_hashes:
                     event_hashes.add(fingerprint); events.append(event)
             journal["commands"] = events
+            diagnostics = []
+            for entry in (*current.get("template_validation_diagnostics", []), *journal.get("template_validation_diagnostics", [])):
+                if entry not in diagnostics:
+                    diagnostics.append(entry)
+            if diagnostics:
+                journal["template_validation_diagnostics"] = diagnostics[-16:]
             prior_disks = current.get("observed_disks", [])
             incoming_disks = journal.get("observed_disks", [])
             if not isinstance(prior_disks, list) or not isinstance(incoming_disks, list):
@@ -840,7 +901,7 @@ class GcpProviderDriver:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
         if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
         if args and args[0] == "compute" and len(args) > 1 and args[1] == "instances" and args[2:3] == ["list"] or args and args[0] == "compute" and len(args) > 2 and args[2] == "list":
-            if re.search(r"(?i)(warning|incomplete|denied|permission|partial|some zones|not all|failed to list)", result.stderr or ""):
+            if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
         try:
             return json.loads(result.stdout)
@@ -962,31 +1023,42 @@ class GcpProviderDriver:
         expected_instance_names = {f"{namespace}-a", f"{namespace}-b"}
         response = self._gcloud_json(["compute", "instances", "list", "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
         if not isinstance(response, list): raise GcpProviderError("all-zone instance inventory pagination shape unknown", category="inventory_unknown")
+        self._validate_inventory_items(response, "instances")
         instances.extend(item for item in response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_vms or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()) or item.get("name") in expected_instance_names)
         disk_response = self._gcloud_json(["compute", "disks", "list", "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
         if not isinstance(disk_response, list): raise GcpProviderError("all-zone disk inventory pagination shape unknown", category="inventory_unknown")
+        self._validate_inventory_items(disk_response, "disks")
         expected_disk_names = {f"{namespace}-a-boot", f"{namespace}-b-boot"}
         disks.extend(item for item in disk_response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_disks or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()) or item.get("name") in expected_disk_names)
-        for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
-            result = self._gcloud_json(["compute", "addresses", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-address-inventory-{region}")
-            if not isinstance(result, list): raise GcpProviderError("regional address inventory pagination shape unknown", category="inventory_unknown")
-            addresses.extend(item for item in result if str(item.get("name", "")).startswith(namespace))
-            result = self._gcloud_json(["compute", "subnetworks", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-subnet-inventory-{region}")
-            if not isinstance(result, list): raise GcpProviderError("subnetwork inventory pagination shape unknown", category="inventory_unknown")
-            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace))
-        for collection, command in (("instance_templates", ["compute", "instance-templates", "list"]), ("networks", ["compute", "networks", "list"]), ("firewalls", ["compute", "firewall-rules", "list"]), ("routes", ["compute", "routes", "list"])):
-            result = self._gcloud_json([*command, "--project", self.settings.project_id, "--format=json"], f"gcp-{collection}-inventory")
-            if not isinstance(result, list): raise GcpProviderError(f"{collection} inventory pagination shape unknown", category="inventory_unknown")
-            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace) or (collection == "instance_templates" and (str(item.get("id")), item.get("name")) in known_templates))
-        for region in sorted({deployment.vm_a.region, deployment.vm_b.region}):
-            result = self._gcloud_json(["compute", "resource-policies", "list", f"--regions={region}", "--project", self.settings.project_id, "--format=json"], f"gcp-policy-inventory-{region}")
-            if not isinstance(result, list): raise GcpProviderError("resource policy inventory pagination shape unknown", category="inventory_unknown")
-            support.extend(item for item in result if str(item.get("name", "")).startswith(namespace))
-        global_addresses = self._gcloud_json(["compute", "addresses", "list", "--global", "--project", self.settings.project_id, "--format=json"], "gcp-global-address-inventory")
-        if not isinstance(global_addresses, list): raise GcpProviderError("global address inventory pagination shape unknown", category="inventory_unknown")
-        addresses.extend(item for item in global_addresses if str(item.get("name", "")).startswith(namespace))
+        # Aggregated project-wide lists include every region and global scope.
+        # --regions on addresses is not a supported complete-list query and can
+        # produce warnings even for empty output. Never suppress such warnings.
+        collections = (
+            ("addresses", "addresses", addresses), ("subnetworks", "subnet", support),
+            ("instance-templates", "instance_templates", support), ("networks", "networks", support),
+            ("firewall-rules", "firewalls", support), ("routes", "routes", support),
+            ("resource-policies", "policy", support))
+        for command, action, target in collections:
+            result = self._gcloud_json(["compute", command, "list", "--project", self.settings.project_id, "--format=json"],
+                f"gcp-{action}-inventory-all-scopes")
+            if not isinstance(result, list):
+                raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")
+            self._validate_inventory_items(result, command)
+            for item in result:
+                if (item["name"].startswith(namespace + "-")
+                        or (command == "instance-templates" and (str(item.get("id")), item["name"]) in known_templates)):
+                    target.append(item)
         resources = [*instances, *disks, *addresses, *support]
         return {"pages_complete": True, "zone_scope": "all_project_zones", "regions_scanned": sorted({deployment.vm_a.region, deployment.vm_b.region}), "completed_scopes": ["all_project_zones", *sorted({deployment.vm_a.region, deployment.vm_b.region}), "global"], "instances": instances, "disks": disks, "addresses": addresses, "support_resources": support, "resources": resources}
+
+    def _validate_inventory_items(self, items: list[Any], collection: str) -> None:
+        for item in items:
+            if (not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip()
+                    or not isinstance(item.get("labels", {}), dict)):
+                raise GcpProviderError(f"{collection} inventory has an incomplete observation", category="inventory_unknown")
+            link = item.get("selfLink")
+            if link is not None and not (self._compute_path(link) or "").startswith(f"projects/{self.settings.project_id}/"):
+                raise GcpProviderError(f"{collection} inventory has a foreign project identity", category="inventory_unknown")
 
     @staticmethod
     def _failure(exc: Exception) -> FailureEvidence:

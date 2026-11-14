@@ -425,21 +425,52 @@ def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeO
 
 
 def _is_exact_not_found(result: CommandResult) -> bool:
-    for text in (result.stdout, result.stderr):
-        try:
-            payload=json.loads(text)
-            code=payload.get("error",{}).get("code") if isinstance(payload,dict) else None
-            if code in {"ResourceNotFound","NotFound"}: return True
-        except (json.JSONDecodeError,AttributeError):
-            pass
-        if re.search(r"(?:^|\n)\s*(?:ERROR:\s*)?\(ResourceNotFound\)(?:\s|$)",text): return True
-    return False
+    texts = [text for text in (result.stdout, result.stderr) if text.strip()]
+    if len(texts) != 1:
+        return False
+    text = texts[0]
+    try:
+        payload = json.loads(text)
+        code = payload.get("error", {}).get("code") if isinstance(payload, dict) else None
+        return code in {"ResourceNotFound", "NotFound"}
+    except (json.JSONDecodeError, AttributeError):
+        return re.match(r"\s*(?:ERROR:\s*)?\(ResourceNotFound\)(?:\s|$)", text) is not None
+
+
+def _assert_subscription(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
+                         clock: Callable[[], float]) -> CommandResult:
+    result = _command(runner, options, root, ["az", "account", "show", "--subscription", options.subscription_id,
+        "--query", "{id:id,tenantId:tenantId,state:state}", "--output", "json"], "subscription_preflight", clock)
+    value = json.loads(result.stdout)
+    if (result.stderr.strip() or not isinstance(value, dict)
+            or str(value.get("id", "")).lower() != options.subscription_id.lower()
+            or str(value.get("tenantId", "")).lower() != options.tenant_id.lower()
+            or value.get("state") != "Enabled"):
+        raise RuntimeError("expected Enabled Azure subscription/tenant identity is unproved")
+    return result
+
+
+def _validate_provider_registrations(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
+                                    clock: Callable[[], float]) -> None:
+    _assert_subscription(runner, options, root, clock)
+    for namespace in ("Microsoft.Compute", "Microsoft.Network", "Microsoft.Automation", "Microsoft.Authorization"):
+        result = _command(runner, options, root, ["az", "provider", "show", "--namespace", namespace,
+            "--subscription", options.subscription_id, "--query", "{id:id,namespace:namespace,registrationState:registrationState}",
+            "--output", "json"], "provider_registration_preflight", clock)
+        value = json.loads(result.stdout)
+        if (result.stderr.strip() or not isinstance(value, dict)
+                or value.get("namespace") != namespace or value.get("registrationState") != "Registered"
+                or str(value.get("id", "")).lower() != f"/subscriptions/{options.subscription_id}/providers/{namespace}".lower()):
+            raise RuntimeError("required preexisting Azure provider registration is unproved: " + namespace)
 
 
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
              clock: Callable[[], float], *, allow_not_found: bool = False) -> CommandResult:
     remaining = options.cap_deadline_monotonic-clock()
     if remaining <= 0: raise TimeoutError("original reservation deadline elapsed")
+    if argv[:1] == ["az"] and "--subscription" not in argv:
+        index = next((i for i,value in enumerate(argv) if value.startswith("--")), len(argv))
+        argv = [*argv[:index], "--subscription", options.subscription_id, *argv[index:]]
     environment = dict(os.environ)
     tf_root = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("-chdir=")), "terraform")
     environment["TF_DATA_DIR"] = str(root / ("terraform-data-" + Path(tf_root).name))
@@ -477,13 +508,17 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
 
 
 def _prove_vm_absent(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
-                     resource_id: str, clock: Callable[[], float]) -> CommandResult:
-    """Accept only an explicit Azure ResourceNotFound response for the exact VM GET."""
+                     resource_id: str, clock: Callable[[], float], *, absent_parent_group: str | None = None) -> CommandResult:
+    """Accept exact VM absence, or typed parent absence already independently proved."""
+    match = re.fullmatch(r"/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Compute/virtualMachines/([^/]+)", resource_id, re.I)
+    if (not match or match.group(1).lower() != options.subscription_id.lower()
+            or (absent_parent_group is not None and match.group(2) != absent_parent_group)):
+        raise ValueError("VM absence query is outside the original subscription/group")
     remaining = options.cap_deadline_monotonic-clock()
     if remaining <= 0:
         raise TimeoutError("original reservation deadline elapsed")
     request = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type="vm_absence_by_id",
-        argv=["az", "resource", "show", "--ids", resource_id, "--output", "json"],
+        argv=["az", "resource", "show", "--subscription", options.subscription_id, "--ids", resource_id, "--output", "json"],
         cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=min(options.command_timeout_seconds, remaining),
         environment=dict(os.environ), environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
     try:
@@ -506,6 +541,24 @@ def _prove_vm_absent(runner: CommandRunner, options: AzureRuntimeOptions, root: 
         raise RuntimeError("VM remains present by direct resource ID: " + resource_id)
     if result.outcome == "failed" and _is_exact_not_found(result):
         return result
+    if result.outcome == "failed" and absent_parent_group is not None:
+        # Only the primary typed CLI/ARM error, bound to this exact parent.
+        # An authorization error merely mentioning ResourceGroupNotFound is not proof.
+        group_message = f"Resource group '{absent_parent_group}' could not be found."
+        primary = re.fullmatch(r"\s*(?:ERROR:\s*)?\(ResourceGroupNotFound\)\s+" + re.escape(group_message)
+            + r"(?:\s*Code: ResourceGroupNotFound\s*Message: " + re.escape(group_message) + r")?\s*", result.stderr)
+        if primary and not result.stdout.strip():
+            return result
+        for text, other in ((result.stdout, result.stderr), (result.stderr, result.stdout)):
+            if other.strip():
+                continue
+            try:
+                payload = json.loads(text)
+                error = payload.get("error", {}) if isinstance(payload, dict) else {}
+                if error.get("code") == "ResourceGroupNotFound" and error.get("message") == group_message:
+                    return result
+            except (ValueError, AttributeError):
+                pass
     raise RuntimeError(f"direct VM absence query is not proof: {result.outcome}: {result.stderr[:500]}")
 
 
@@ -523,6 +576,7 @@ def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, ro
         result=_command(runner,options,root,["az","rest","--method","GET","--url",next_url,"--output","json"],
             action if page==0 else f"{action}_page_{page+1}",clock)
         evidence.append(_safe_cleanup_action(options,result))
+        if result.stderr.strip(): raise RuntimeError(f"{action} returned an inventory diagnostic; completeness is unproved")
         if not result.stdout.strip(): raise RuntimeError(f"{action} returned blank collection output")
         try: payload=json.loads(result.stdout)
         except json.JSONDecodeError as exc: raise RuntimeError(f"{action} returned malformed JSON") from exc
@@ -532,11 +586,13 @@ def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, ro
             if not isinstance(item,dict) or any(not isinstance(item.get(field),str) or not item[field].strip() for field in required_fields):
                 raise RuntimeError(f"{action} contains an incomplete resource observation")
             identity=item[required_fields[0]].lower()
+            if not identity.startswith(f"/subscriptions/{options.subscription_id}/".lower()):
+                raise RuntimeError(f"{action} returned a foreign subscription resource identity")
             if identity in seen_ids: raise RuntimeError(f"{action} contains a duplicate resource identity")
             seen_ids.add(identity); values.append(item)
         link=payload.get("nextLink")
         if link in (None,""): return values,evidence
-        if not isinstance(link,str) or not link.startswith(scope_prefix):
+        if not isinstance(link,str) or not (link == scope_prefix or link.startswith(scope_prefix + "?")):
             raise RuntimeError(f"{action} returned an invalid continuation URL")
         next_url=link
     raise RuntimeError(f"{action} exceeded the bounded 1000-page inventory limit")
@@ -599,6 +655,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
     root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options)
+    _validate_provider_registrations(runner, options, root, clock)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"
     sched = name + "-once"
@@ -1130,6 +1187,14 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
     expected_vm_ids=[f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}/providers/Microsoft.Compute/virtualMachines/{_slug(deployment)}-{role}" for role in ("a","b")]
     if state.get("vm_ids") != expected_vm_ids:
         raise ValueError("recovery journal contains foreign target identities; refusing cleanup")
+    expected_group = f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
+    expected_account = expected_group + f"/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
+    prereq = state.get("expiry", {})
+    if (prereq.get("automation_account_id") not in (None, expected_account)
+            or prereq.get("resource_group_id") not in (None, expected_group)
+            or any(prereq.get(key) and not str(prereq[key]).lower().startswith(expected_group.lower() + "/")
+                   for key in ("role_assignment_id", "role_definition_id"))):
+        raise ValueError("recovery journal contains foreign expiry identities; refusing cleanup")
     try:
         # Pair destroy precedes inventory. Expiry remains until direct inventory proves both VMs absent.
         input_names=state.get("terraform_inputs",{})
@@ -1150,11 +1215,19 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
             if state.get("expiry_state") not in (None,"preparing","failed"): raise RuntimeError("expiry Terraform inputs are missing after expiry preparation")
             expiry_vars=_persist_tfvars(root,journal,"expiry",expected_expiry)
         else: expiry_vars=_recovery_tfvars(root,journal,"expiry",expected_expiry)
+        actions.append(_safe_cleanup_action(options, _assert_subscription(runner, options, root, clock)))
         _tf(root,options,runner,clock,"terraform/azure/pair","init","-input=false",action="pair_recovery_init")
         result=_tf(root,options,runner,clock,"terraform/azure/pair","destroy","-auto-approve","-input=false",f"-var-file={pair_vars}",action="pair_destroy")
         actions.append(_safe_cleanup_action(options,result))
+        parent = _command(runner, options, root, ["az", "group", "exists", "--name", state["resource_group"],
+            "--output", "json"], "parent_group_absence", clock)
+        parent_exists = json.loads(parent.stdout)
+        if parent.stderr.strip() or type(parent_exists) is not bool:
+            raise RuntimeError("exact parent group absence/presence is unproved")
+        actions.append(_safe_cleanup_action(options, parent))
         for vm_id in expected_vm_ids:
-            actions.append(_safe_cleanup_action(options,_prove_vm_absent(runner,options,root,vm_id,clock)))
+            actions.append(_safe_cleanup_action(options,_prove_vm_absent(runner,options,root,vm_id,clock,
+                absent_parent_group=state["resource_group"] if not parent_exists else None)))
         prereq=state.get("expiry",{})
         applied=any(item.get("request",{}).get("action_type")=="expiry_prerequisites"
                     and "apply" in item.get("request",{}).get("argv",[])
@@ -1167,9 +1240,14 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
             if not all(isinstance(value,str) and value for value in recovered.values()):
                 raise RuntimeError("interrupted expiry prerequisite identities cannot be recovered completely")
             prereq.update(recovered); state["expiry"]=prereq; _atomic_private(journal,state)
-        found,inventory_evidence=_read_arm_collection(runner,options,root,
-            f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}/resources?api-version=2021-04-01",
-            "pair_inventory",clock,("id","type"))
+        endpoint = (f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}/resources?api-version=2021-04-01"
+            if parent_exists else f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01")
+        found,inventory_evidence=_read_arm_collection(runner,options,root,endpoint,"pair_inventory",clock,("id","type"))
+        if not parent_exists:
+            prefix = f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}/".lower()
+            found = [item for item in found if item["id"].lower().startswith(prefix)]
+            if found:
+                raise RuntimeError("parent absence contradicts subscription resource inventory")
         actions.extend(inventory_evidence)
         metadata=state.get("expiry",{}).get("metadata",{})
         prereq=state.get("expiry",{})
@@ -1191,7 +1269,7 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         if residual:
             raise RuntimeError("VMs or pair resources remain after pair destroy: " + ", ".join(str(x) for x in residual))
         account=prereq.get("automation_account_id")
-        if account:
+        if account and parent_exists:
             child_info=prereq
             for collection,key in (("jobSchedules","job_schedule_id"),("schedules","schedule"),("runbooks","runbook")):
                 child=child_info.get(key)
@@ -1199,23 +1277,23 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_recovery_init")
         exp=_tf(root,options,runner,clock,"terraform/azure/expiry","destroy","-auto-approve","-input=false",f"-var-file={expiry_vars}",action="expiry_destroy")
         actions.append(_safe_cleanup_action(options,exp))
-        if account:
+        if account and parent_exists:
             account_absence=_command(runner,options,root,["az","resource","show","--ids",account,"--output","json"],"automation_account_absence",clock,allow_not_found=True)
             actions.append(_safe_cleanup_action(options,account_absence))
             if account_absence.outcome!="failed" or not _is_exact_not_found(account_absence):
                 raise RuntimeError("Automation account absence is not proven by exact resource identity")
         verify=_command(runner,options,root,["az","group","exists","--name",state["resource_group"],"--output","tsv"],"expiry_inventory",clock)
         actions.append(_safe_cleanup_action(options,verify))
-        if verify.stdout.strip().lower()!="false": raise RuntimeError("attempt resource group removal is not verified")
+        if verify.stderr.strip() or verify.stdout.strip().lower()!="false": raise RuntimeError("attempt resource group removal is not verified")
         residual_roles=_command(runner,options,root,["az","role","assignment","list","--scope",f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}","--all","--output","json"],"role_cleanup_inventory",clock)
-        if not residual_roles.stdout.strip(): raise RuntimeError("role assignment inventory is blank")
+        if residual_roles.stderr.strip() or not residual_roles.stdout.strip(): raise RuntimeError("role assignment inventory is blank or incomplete")
         assignments=json.loads(residual_roles.stdout)
         if not isinstance(assignments,list): raise RuntimeError("role assignment inventory is malformed")
         if assignments:
             raise RuntimeError("role assignment inventory still contains resources after expiry destroy")
         actions.append(_safe_cleanup_action(options,residual_roles))
         residual_defs=_command(runner,options,root,["az","role","definition","list","--name",_slug(deployment)+"-deallocate-only","--output","json"],"role_definition_cleanup_inventory",clock)
-        if not residual_defs.stdout.strip(): raise RuntimeError("custom role definition inventory is blank")
+        if residual_defs.stderr.strip() or not residual_defs.stdout.strip(): raise RuntimeError("custom role definition inventory is blank or incomplete")
         definitions=json.loads(residual_defs.stdout)
         if not isinstance(definitions,list): raise RuntimeError("custom role definition inventory is malformed")
         expected_role=str(prereq.get("role_definition_id","")).lower()

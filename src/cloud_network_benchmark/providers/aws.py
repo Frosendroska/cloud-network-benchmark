@@ -223,7 +223,14 @@ class AwsProviderDriver:
                     if region not in journal.setdefault("registration_attempted_regions", []):
                         journal["registration_attempted_regions"].append(region)
                         self._save_journal(attempt, journal)
-                    execution_id = self._start_or_recover_automation(region, outputs[region], expected, token)
+                    try:
+                        execution_id = self._start_or_recover_automation(region, outputs[region], expected, token)
+                    except AwsProviderError as exc:
+                        rejection = getattr(exc, "rejection_evidence", None)
+                        if exc.category == "expiry_start_rejected" and rejection:
+                            journal.setdefault("registration_rejections", {})[region] = rejection
+                            self._save_journal(attempt, journal)
+                        raise
                     if not execution_id:
                         journal.setdefault("registration_uncertain_regions", []).append(region)
                         self._save_journal(attempt, journal)
@@ -303,7 +310,8 @@ class AwsProviderDriver:
         A lost or malformed start/readback is ambiguous. Preserve that region's
         support resources, while cleaning independently safe regions.
         """
-        uncertain = set(journal.get("registration_uncertain_regions", []))
+        uncertain = set(journal.get("registration_uncertain_regions", [])) | (
+            set(journal.get("registration_attempted_regions", [])) - set(journal.get("executions", {})))
         for region in journal.get("regions", []):
             if region in uncertain:
                 continue
@@ -489,6 +497,28 @@ class AwsProviderDriver:
 
         uncertain = set(journal.get("registration_uncertain_regions", [])) | (
             set(journal.get("registration_attempted_regions", [])) - set(journal.get("executions", {})))
+        for region in list(uncertain):
+            rejection = journal.get("registration_rejections", {}).get(region, {})
+            safety = journal.get("safety", {}).get(region)
+            if not safety or not rejection:
+                continue
+            try:
+                trigger = datetime.fromisoformat(journal["expiry_trigger"])
+                params = self._automation_parameters(deployment, region, trigger, safety["role_arn"])
+                digest = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+                if (rejection.get("lookup_complete") is not True
+                        or rejection.get("matching_document_execution_count") != 0
+                        or rejection.get("error_code") != "InvalidAutomationExecutionParametersException"
+                        or rejection.get("parameters_sha256") != digest
+                        or rejection.get("document_name") != safety["document_name"]
+                        or rejection.get("document_version") != safety["document_version"]
+                        or rejection.get("client_token") != journal.get("tokens", {}).get(region)):
+                    continue
+                lookup = self._lookup_automation(region, safety, params)
+                if lookup is not None and lookup[1] == 0:
+                    uncertain.discard(region)
+            except (KeyError, ValueError, AwsProviderError):
+                pass
         if uncertain:
             failure = _failure(AwsProviderError("expiry execution identity remains uncertain; preserve support resources", category="expiry_uncertain"),self.clock())
             return self._failed_cleanup(inventory_by_region,[*failures,failure],primary,failure,deployment)
@@ -773,39 +803,69 @@ class AwsProviderDriver:
                 execution_id = json.loads(start.stdout)["AutomationExecutionId"]
             except (ValueError, KeyError, TypeError):
                 execution_id = None
-            if execution_id:
+            if isinstance(execution_id, str) and execution_id.strip():
                 return execution_id
-        # The start may have reached AWS even when the local response was lost. Search once;
-        # only one exact parameter match can recover it. Never issue a second Start call.
-        describe = self._run(
-            f"aws-expiry-recover-{region}",
-            [self.settings.aws_cli, "ssm", "describe-automation-executions", "--filters", f"Key=DocumentName,Values={safety['document_name']}", "--region", region, "--output", "json"],
-            self.settings.registration_timeout_seconds,
-        )
-        if not _succeeded(describe):
+        # One start only. A lost response is uncertain even when a lookup is
+        # empty. A typed server rejection plus complete exact-document absence
+        # can establish a rejected pre-VM attempt, never successful protection.
+        lookup = self._lookup_automation(region, safety, params)
+        if lookup is not None and len(lookup[0]) == 1:
+            return lookup[0][0]
+        rejected = (start.outcome == "failed" and start.exit_code not in (None, 0)
+            and re.search(r"\(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
+        if rejected and lookup is not None and lookup[1] == 0:
+            exc = AwsProviderError("AWS rejected expiry start; complete lookup found no exact-document execution",
+                category="expiry_start_rejected", action_id=start.action_id)
+            exc.rejection_evidence = {"error_code": "InvalidAutomationExecutionParametersException",
+                "document_name": safety["document_name"], "document_version": safety["document_version"],
+                "parameters_sha256": hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(),
+                "client_token": token, "lookup_complete": True, "matching_document_execution_count": 0}
+            raise exc
+        return None
+
+    def _lookup_automation(self, region: str, safety: dict[str, str], params: dict[str, list[str]]) -> tuple[list[str], int] | None:
+        describe = self._run(f"aws-expiry-recover-{region}",
+            [self.settings.aws_cli, "ssm", "describe-automation-executions", "--filters",
+             f"Key=DocumentNamePrefix,Values={safety['document_name']}", "--region", region, "--output", "json"],
+            self.settings.registration_timeout_seconds)
+        if not _succeeded(describe) or describe.stderr.strip():
             return None
         try:
-            executions = json.loads(describe.stdout).get("AutomationExecutionMetadataList", [])
-        except (ValueError, TypeError):
+            payload = json.loads(describe.stdout)
+            executions = payload["AutomationExecutionMetadataList"]
+            if not isinstance(executions, list) or payload.get("NextToken"):
+                return None
+        except (ValueError, KeyError, TypeError):
             return None
-        matches = []
+        matches, exact_ids = [], set()
         for item in executions:
-            execution_id = item.get("AutomationExecutionId")
-            if not execution_id:
+            if not isinstance(item, dict) or not isinstance(item.get("DocumentName"), str):
+                return None
+            # AWS supports a prefix filter only; a neighboring document is not
+            # evidence about this attempt and must never be read/cancelled.
+            if item["DocumentName"] != safety["document_name"]:
                 continue
-            result = self._run(
-                f"aws-expiry-recover-read-{region}",
-                [self.settings.aws_cli, "ssm", "get-automation-execution", "--automation-execution-id", str(execution_id), "--region", region, "--output", "json"],
-                self.settings.registration_timeout_seconds,
-            )
-            if _succeeded(result):
-                try:
-                    if _automation_matches(_json_execution(result.stdout), safety, params, str(execution_id)):
-                        matches.append(str(execution_id))
-                except (ValueError, AwsProviderError):
-                    # A malformed candidate cannot establish ownership or permit pair creation.
-                    continue
-        return matches[0] if len(matches) == 1 else None
+            execution_id = item.get("AutomationExecutionId")
+            if not isinstance(execution_id, str) or not execution_id or execution_id in exact_ids:
+                return None
+            exact_ids.add(execution_id)
+            result = self._run(f"aws-expiry-recover-read-{region}",
+                [self.settings.aws_cli, "ssm", "get-automation-execution", "--automation-execution-id", execution_id,
+                 "--region", region, "--output", "json"], self.settings.registration_timeout_seconds)
+            if not _succeeded(result) or result.stderr.strip():
+                return None
+            try:
+                execution = _json_execution(result.stdout)
+                if (execution.get("AutomationExecutionId") != execution_id
+                        or execution.get("DocumentName") != safety["document_name"]
+                        or not isinstance(execution.get("Parameters"), dict)):
+                    return None
+                if (execution.get("DocumentVersion") == safety["document_version"]
+                        and execution["Parameters"] == params):
+                    matches.append(execution_id)
+            except (ValueError, AwsProviderError):
+                return None
+        return matches, len(exact_ids)
 
     def _confirm_automation(self, region: str, execution_id: str, safety: dict[str, str], params: dict[str, list[str]]) -> dict[str, Any]:
         for _ in range(6):
@@ -1409,6 +1469,19 @@ class AwsProviderDriver:
                 "exit_code": result.exit_code,
                 "redactions_applied": bool(result.redactions),
             }
+            if action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")):
+                diagnostic = {}
+                for field in ("stdout", "stderr"):
+                    raw = getattr(result, field)
+                    redacted = result.model_copy(update={"redactions": [*result.redactions,
+                        getattr(self.settings, "authentication_reference", ""), getattr(self.settings, "public_key", "")]}).durable_view()[field]
+                    redacted = re.sub(r"(?:AKIA|ASIA)[A-Z0-9]{16}", "[REDACTED_ACCESS_KEY_ID]", redacted)
+                    redacted = re.sub(r"(?i)((?:aws_secret_access_key|aws_session_token|authorization)\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]", redacted)
+                    redacted = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", redacted, flags=re.S)
+                    diagnostic[field] = redacted[:8192]
+                    diagnostic[field+"_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+                    diagnostic[field+"_truncated"] = len(redacted) > 8192
+                record["diagnostic"] = diagnostic
             self._active_commands.append(record)
             if self._active_attempt is not None:
                 command_log = self._active_attempt / "commands.jsonl"
@@ -1520,7 +1593,7 @@ def _restrict_private_file(path: Path) -> None:
 
 def _json_execution(stdout: str) -> dict[str, Any]:
     value = json.loads(stdout)
-    execution = value.get("AutomationExecution")
+    execution = value.get("AutomationExecution") if isinstance(value, dict) else None
     if not isinstance(execution, dict):
         raise AwsProviderError("GetAutomationExecution response omitted AutomationExecution", category="expiry_readback_invalid")
     return execution

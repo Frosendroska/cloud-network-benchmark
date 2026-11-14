@@ -47,7 +47,12 @@ class AutomationRunner:
         if request.action_type=="schedule_create": self.schedule=json.loads(request.argv[request.argv.index("--body")+1])
         if request.action_type=="job_binding_create": self.binding=json.loads(request.argv[request.argv.index("--body")+1])
         out=""
-        if request.action_type=="expiry_outputs":
+        if request.action_type=="subscription_preflight":
+            out=json.dumps({"id":self.o.subscription_id,"tenantId":self.o.tenant_id,"state":"Enabled"})
+        elif request.action_type=="provider_registration_preflight":
+            namespace=request.argv[request.argv.index("--namespace")+1]
+            out=json.dumps({"id":f"/subscriptions/{self.o.subscription_id}/providers/{namespace}","namespace":namespace,"registrationState":"Registered"})
+        elif request.action_type=="expiry_outputs":
             values={"resource_group_id":self.group_id,"automation_account_id":self.account,"principal_id":"00000000-0000-0000-0000-000000000003","role_assignment_id":self.assignment_id,"role_definition_id":self.role_id}
             out=json.dumps({k:{"value":v} for k,v in values.items()})
         elif request.action_type=="pair_output":
@@ -127,7 +132,9 @@ class CleanupRunner(AutomationRunner):
         if request.action_type=="vm_absence_by_id":
             self.requests.append(request)
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr="(ResourceNotFound) VM not found")
-        if request.action_type=="pair_inventory_page_2":
+        if request.action_type=="parent_group_absence":
+            self.requests.append(request); out=json.dumps(self.account_present)
+        elif request.action_type=="pair_inventory_page_2":
             self.requests.append(request)
             resources=[] if not self.residual else [{"id":self.group_id+"/providers/Microsoft.Network/networkInterfaces/leftover","type":"Microsoft.Network/networkInterfaces"}]
             out=json.dumps({"value":resources})
@@ -383,7 +390,7 @@ def test_marketplace_image_metadata_uses_exact_x64_canonical_urn(repository_root
         "sku":"server","version":"24.04.20261001","source":"marketplace",
     }
     request=next(request for request in runner.requests if request.action_type=="image_preflight")
-    assert request.argv==["az","vm","image","show","--location","germanywestcentral","--urn",selected,"--output","json"]
+    assert request.argv==["az","vm","image","show","--subscription",o.subscription_id,"--location","germanywestcentral","--urn",selected,"--output","json"]
 
 
 @pytest.mark.parametrize("response", [
@@ -506,7 +513,7 @@ def test_cleanup_never_proves_absence_without_exact_account_removal(
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     kwargs={}
     if case == "foreign_predelete_account":
-        kwargs["account_resource_id"] = _slug(d) + "/providers/Microsoft.Automation/automationAccounts/foreign"
+        kwargs["account_resource_id"] = registration_runner.group_id + "/providers/Microsoft.Automation/automationAccounts/foreign"
     elif case == "account_still_present":
         kwargs["account_absence"] = "present"
     else:

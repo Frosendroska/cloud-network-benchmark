@@ -42,7 +42,7 @@ class NoProviderCalls:
     def run_bounded_copy(self, *_args): raise AssertionError("no result transfer")
 
 
-def prepared(tmp_path, provider, *, support="0", clock=None):
+def prepared(tmp_path, provider, *, support="0", clock=None, command_timeout_seconds=60):
     """Normal initialized IDs, source-bound runtime/price/FX/card and real ledger."""
     clock = clock or SequentialClock()
     config = ROOT / "configs/tests" / ("exp-902-gcp-single-provider-north.yaml" if provider == "gcp"
@@ -86,7 +86,7 @@ def prepared(tmp_path, provider, *, support="0", clock=None):
             "tenant_id":"00000000-0000-0000-0000-000000000002", "controller_cidr":"203.0.113.4/32",
             "selected_image":"Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
             "ssh_public_key_path":pub, "authentication_reference":"SYNTHETIC-no-credential",
-            "poll_seconds":15,"command_timeout_seconds":60}
+            "poll_seconds":15,"command_timeout_seconds":command_timeout_seconds}
         options["sources"] = {"expiry_cost_path":expiry,"primary_review_path":None}
     else:
         options["sources"] = {"workflow_cost_handoff_path":tmp_path / "SYNTHETIC-gcp-handoff.json",
