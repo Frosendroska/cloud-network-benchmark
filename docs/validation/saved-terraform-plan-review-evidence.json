@@ -38,6 +38,123 @@
       "tests": 71
     }
   },
+  "native_4da3cc9": {
+    "archive_path": "/private/tmp/cnb-saved-plan-4da3cc9-native-delta.zip",
+    "archive_sha256": "113b1659848862d4099652637241dc70a645b989f8b90db1c7b3f2e8bd4eebe2",
+    "native_directory": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation",
+    "summary": {
+      "checks": [
+        {
+          "exit_code": 0,
+          "log_sha256": "7712cfc0b43c422925b61c90c2d9a7326ea0c97a9dd0b3d9533a6569666daacf",
+          "name": "source-revision",
+          "seconds": 0.009
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "source-status-before",
+          "seconds": 0.17
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "b8c2b56663774815ab5e427393d3800c4fa46097923395ea98fa8448e34e61ef",
+          "name": "delta-pytest",
+          "seconds": 5.789
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "ae862bccbe5e24bda645217af6271e5121235932a15cc6db9124eb34451baec2",
+          "name": "builtin-init",
+          "seconds": 0.061
+        },
+        {
+          "exit_code": 0,
+          "name": "actual-helper-same-plan-private-state"
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "source-status-after",
+          "seconds": 0.153
+        },
+        {
+          "exit_code": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "name": "diff-check",
+          "seconds": 0.01
+        }
+      ],
+      "complete": true,
+      "environment_keys": [
+        "CHECKPOINT_DISABLE",
+        "HOME",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+        "TF_IN_AUTOMATION",
+        "THESIS_ROOT",
+        "TMPDIR"
+      ],
+      "executable_sha256": {
+        "src/cloud_network_benchmark/lifecycle_runtime.py": "aa0cfe521266bd03a6f7c3027371af01aa34be9c3d6302faa91966dbbc8b346f",
+        "src/cloud_network_benchmark/providers/aws.py": "fef70c9845d22fa5602fd40fe964dc7ce8812ba15b160dc83789ecefac696f3b",
+        "src/cloud_network_benchmark/providers/gcp.py": "7aa9b8fb5f09fd473e4bfe4343eb826f64015621e29bc55011d62d4ef612d071",
+        "src/cloud_network_benchmark/terraform_plan.py": "18e0652da6e9e22515309891419a9a0adefc825752a32f0a522a295fe72363af"
+      },
+      "helper_proof": {
+        "commands": [
+          [
+            "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+            "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws/pair",
+            "plan",
+            "-input=false",
+            "-no-color",
+            "-state=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/owned.tfstate",
+            "-var-file=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/vars.json",
+            "-out=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws-pair-apply-review-2997hada/saved.tfplan"
+          ],
+          [
+            "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+            "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws/pair",
+            "show",
+            "-json",
+            "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws-pair-apply-review-2997hada/saved.tfplan"
+          ],
+          [
+            "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+            "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws/pair",
+            "apply",
+            "-input=false",
+            "-state=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/owned.tfstate",
+            "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation/aws-pair-apply-review-2997hada/saved.tfplan"
+          ]
+        ],
+        "custom_state_exists": true,
+        "default_state_absent": true,
+        "passed": true,
+        "result": "succeeded",
+        "same_binary": true,
+        "saved_value": {
+          "type": "string",
+          "value": "saved"
+        },
+        "scope_adapter": "test-only one builtin; unchanged provider scope verified separately",
+        "state_arg_retained": true
+      },
+      "pytest": {
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 71
+      },
+      "pytest_sha256": "7452ad54069b8145dc91788e9b9d275d7fc15d5e3d832ca80e762ff949b4eb01",
+      "revision": "4da3cc95f1ca46ea7ce67141a01facdb83f90343",
+      "source_unchanged": true
+    },
+    "summary_sha256": "86057e05005c39f4e3159e12352bb44fbdf0cadcc7d3c2dbf132e9ac8778fc31",
+    "verified_manifest_entries": 14
+  },
   "native_f1918f0": {
     "archive_path": "/private/tmp/cnb-saved-plan-f1918f0-native-evidence.zip",
     "archive_sha256": "bd7584bda63c23304e57c97caf71742103cc0f257510a0f41b947d59c8a6263e",
@@ -262,6 +379,7 @@
     "summary_sha256": "c704c6683319838c50185fc483ea7a6c5dd72dd411948070311f140f6ded9cf2",
     "verified_manifest_entries": 56
   },
-  "native_status": "f1918f0: 322 Python cases pass, overall state-path check fails; corrected 4da3cc9 native delta pending explicit source-transfer approval",
-  "paid_authority": "old source card must be re-reviewed and rebound; no new run IDs or launch"
+  "native_status": "PASS: exact 4da3cc9 corrected native delta 7/7 checks, 71 Python cases with no failures/errors/skips and actual-helper same-binary/private-state proof; earlier 322-case f1918f0 Python pass retained with original overall state failure",
+  "paid_authority": "old source card must be re-reviewed and rebound; no new run IDs or launch",
+  "validation_scope": "Affected offline validation only; original 322-case Python/factory result plus focused 71-case corrected delta and four native mock roots; no unchanged full baseline or real provider acceptance"
 }

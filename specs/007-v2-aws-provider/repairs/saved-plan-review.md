@@ -54,7 +54,7 @@ FRAMEWORK_IMPLEMENTATION_NOTES, experiment/prompts/M04/M05 and BUDGET_RULES.
 - [x] SP5 Record validation and executable operator recipe; converge and selectively commit.
 
 
-## Convergence — 14 November 2026
+## Initial convergence — 14 November 2026 (superseded below)
 
 R1/R2: all four command boundaries use plan/show, explicit provider allowlists and
 critical checks; full JSON and state/input/source/plan identities are private and
@@ -83,7 +83,7 @@ edits and the Thesis/frozen launch source remain untouched.
 - [x] SP7 Repair R4: saved-plan apply must explicitly retain the original `-state`
   override. Commit 4da3cc9 changes only the helper argv and four-root regression.
   Independent native builtin flag probe and 71 focused local cases pass.
-- [ ] SP8 Obtain explicit transfer approval for corrected 4da3cc9, run only the
+- [x] SP8 Obtain explicit transfer approval for corrected 4da3cc9, run only the
   71-case native delta and builtin helper/state check, verify/download evidence,
   update the operator handoff and source bindings, then converge this finding.
 
@@ -91,4 +91,26 @@ The prior no-actionable-finding statement is superseded by this native discovery
 The f1918f0 source is not a passing native repair. Its passing Python/factory and
 scope/mock evidence is retained without relabelling it cloud/provider acceptance.
 The earlier source transfer approval was explicitly scoped to f1918f0; automatic
-review rejected later payload expansion. A specific 4da3cc9 question is pending.
+review rejected later payload expansion. The specific 4da3cc9 transfer was later
+approved; completed corrected validation is recorded below.
+
+
+## Final convergence — corrected source 4da3cc9
+
+SP8 complete after explicit corrected-payload approval. The separate clean native
+checkout at exact 4da3cc95f1ca46ea7ce67141a01facdb83f90343 passed 7/7 checks,
+71 Python cases with zero failures/errors/skips, and the actual helper's local
+builtin same-binary/original-state/no-default-state proof. All four native source
+hashes match local. Downloaded archive CRC, 14 manifest hashes, driver logs,
+JUnit counts/hash and helper proof were independently checked. State/plan bytes
+stay private and outside Git. No unchanged broad baseline was repeated.
+
+R1/R2 retain the four scope mocks and real-boundary rejection/hash/receipt cases;
+R3 bounded deadlines and operator recipe pass; R4 now also retains original
+state on real saved-plan apply while destroy remains independent; R5 has exact
+local/native evidence and honest limits. No actionable implementation finding
+remains. f1918f0's failed audit is preserved separately, never called a complete
+pass. Real provider planning/permissions/expiry/transport/cleanup acceptance and
+source-bound financial approval remain future stages, with no cloud launch or
+new run identity authorized here. Final operational recipe and source bindings
+are in docs/validation/saved-terraform-plan-review.md and its evidence JSON.

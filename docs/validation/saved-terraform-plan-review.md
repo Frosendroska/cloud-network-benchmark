@@ -32,7 +32,8 @@ failure category. Directories are 0700; files 0600. The request binds full binar
 JSON, original input/state, source (including lock/expiry script), action and
 resource scope hashes. Inputs/state/source/binary/JSON are rechecked immediately
 before apply. The apply argv is only `terraform -chdir=<root> apply -input=false
--state=<original attempt state> <same saved.tfplan>`: no vars, auto-approve or recomputed plan. Failure preserves
+-state=<original attempt state> <same saved.tfplan>`: no vars, auto-approve or
+recomputed plan. Failure preserves
 evidence and follows original cleanup handling. Destroy/recovery bypasses this
 launch-only gate even without a receipt; failed cleanup still blocks launch.
 
@@ -84,7 +85,8 @@ workflow before its original STOP time. No wait extends those deadlines.
 
 ## Validation
 
-Local Python 3.13.7: the final 306 affected cases passed with zero failures/errors/skips,
+Local Python 3.13.7 before the state-path correction: 306 affected cases passed
+with zero failures/errors/skips,
 including 61 real saved-plan boundary cases and the financial/runtime/provider
 regressions. JUnit: `/private/tmp/cnb-saved-plan-final-local.xml`.
 The prior 304-case run and 63-case final delta also passed; their separate hashes
@@ -98,8 +100,8 @@ old apply/output fakes cannot emit real plan files. Their pass proves retained
 stage behavior only. The new repair suite exercises the real boundary with
 materialized private files, fake external commands and explicit operator receipts,
 including the four provider dispatches and review-free destroy. No production
-bypass or auto-approval option exists. Native validation is not claimed;
-no unchanged full offline baseline was repeated.
+bypass or auto-approval option exists. The final focused native validation is
+recorded below; no unchanged full offline baseline was repeated.
 
 
 
@@ -137,12 +139,12 @@ Source/test transfer of f1918f0 was explicitly approved. Automatic approval revi
 rejected the later 38a5507 payload as outside that exact approval, so only f1918f0
 was transferred. The frozen launch inputs, source and existing checkouts remain
 unchanged; validation used `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
-A new transfer question covers corrected **4da3cc9**; its native delta is pending
-that approval. Do not treat the old Python pass or the direct flag probe as a
-complete native pass of the corrected helper. Only the focused 71-case native
-delta and builtin helper/state check are needed; the unchanged broad baseline
-will not be rerun. The corrected source passed 71 focused local cases, zero
-failures/errors/skips, in `/private/tmp/cnb-saved-plan-state-repair.xml`.
+The user subsequently approved corrected **4da3cc9** explicitly. Only that exact
+commit was transferred into a separate `state-repair-source` checkout; later
+documentation commits were excluded. The corrected source passed 71 focused
+local cases, zero failures/errors/skips, in
+`/private/tmp/cnb-saved-plan-state-repair.xml`. The unchanged broad suite was not
+rerun; its f1918f0 Python result is retained separately from the final delta.
 
 The f1918f0 archive was downloaded and verified for ZIP CRC, all 56 manifest
 entries, each driver log hash, exact revision/source hashes and JUnit counts/hash.
@@ -154,6 +156,41 @@ Native original: `/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7`.
 | f1918f0 native archive | `bd7584bda63c23304e57c97caf71742103cc0f257510a0f41b947d59c8a6263e` |
 | original summary (overall failure retained) | `c704c6683319838c50185fc483ea7a6c5dd72dd411948070311f140f6ded9cf2` |
 | original 322-case JUnit | `bdbdc35b886f01309399ba884f6d7b66898b636660a3eb13d5243511681e0e70` |
+
+
+## Final corrected native delta — passed
+
+At exact source `4da3cc95f1ca46ea7ce67141a01facdb83f90343`, all **7/7 driver
+checks** passed, including **71 Python cases**, zero failures/errors/skips, and
+an integration probe of the actual corrected helper with Terraform 1.16.6.
+The probe used builtin-only local HCL, a test-only scope adapter admitting exactly
+one `terraform_data` resource, and a synthetic technical review receipt. Provider
+scope validation is covered separately by the unchanged native mock checks.
+There was no production bypass, provider plugin invocation, cloud API or billable
+resource in this probe.
+
+The actual helper generated/showed a saved binary, bound the inspection receipt,
+applied that **same binary** with the original `-state` path, wrote the expected
+saved input to that private state, and created **no default state** in the source
+root. Source was clean and unchanged before/after; all four native executable
+hashes match the current local source. This closes the native state-path finding.
+The original failed audit remains preserved and is not relabelled a complete pass.
+The earlier 322-case run supports unchanged provider/factory/runtime behavior;
+the focused 71-case delta validates the corrected helper and cache boundaries.
+Neither run is real provider acceptance or a repeated full F10 baseline.
+
+Final evidence directory:
+`/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/state-repair-validation`.
+Downloaded archive: `/private/tmp/cnb-saved-plan-4da3cc9-native-delta.zip`
+(10,751 bytes). Verification passed ZIP CRC, all 14 manifest entries, each driver
+log hash, exact revision/clean-state checks, all executable hashes, JUnit counts/
+hash and helper proof. Plan/state bytes were excluded from this archive and Git.
+
+| Final artifact | SHA-256 |
+| --- | --- |
+| corrected native archive | `113b1659848862d4099652637241dc70a645b989f8b90db1c7b3f2e8bd4eebe2` |
+| corrected summary | `86057e05005c39f4e3159e12352bb44fbdf0cadcc7d3c2dbf132e9ac8778fc31` |
+| corrected 71-case JUnit | `7452ad54069b8145dc91788e9b9d275d7fc15d5e3d832ca80e762ff949b4eb01` |
 
 [Machine-readable source/test/native bindings](saved-terraform-plan-review-evidence.json)
 contain the current four executable hashes. Only `terraform_plan.py` changed in
