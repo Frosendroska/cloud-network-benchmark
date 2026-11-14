@@ -156,7 +156,8 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert tp.reviewed_apply(req,runner.run).outcome == "succeeded"
     assert [r.argv[2] for r in runner.requests] == ["plan","show","apply"]
     planned = next(a.split("=",1)[1] for a in runner.requests[0].argv if a.startswith("-out="))
-    assert runner.requests[-1].argv == [*req.argv[:2],"apply","-input=false",planned]
+    state_arg = next(a for a in req.argv if a.startswith("-state="))
+    assert runner.requests[-1].argv == [*req.argv[:2],"apply","-input=false",state_arg,planned]
     directory=Path(planned).parent
     evidence=json.loads((directory/"review-request.json").read_text())
     assert evidence["plan_sha256"] == hashlib.sha256(Path(planned).read_bytes()).hexdigest()

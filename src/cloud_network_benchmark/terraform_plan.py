@@ -271,7 +271,9 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         _private(directory / "accepted-review.json", _json(receipt))
         _same((_hash(binary), _hash(json_path), _hash(variables), source_hash(root), _hash(state) if state.exists() or state.is_symlink() else None),
               (binary_hash, binding["json_sha256"], inputs_hash, sources_hash, state_hash), "reviewed artifact hashes")
-        result = execute(request.action_id, [*prefix, "apply", "-input=false", str(binary)])
+        # The legacy local -state override is not carried into a saved plan's
+        # backend configuration. Keep apply on the original attempt state too.
+        result = execute(request.action_id, [*prefix, "apply", "-input=false", f"-state={state}", str(binary)])
         _private(directory / "apply-result.json", _json({"action_id": result.action_id, "outcome": str(result.outcome), "exit_code": result.exit_code}))
         return result
     except BaseException as exc:
