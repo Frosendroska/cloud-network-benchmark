@@ -81,7 +81,36 @@ No source conflict or research clarification is introduced.
   manifest/init and selected factory cases, then 61 shared saved-plan regressions
   plus 17 new-case reruns after adding private plan-result retention: 266 distinct
   passing cases across local checkpoints, zero failures/errors/skips.
-- [ ] PV6 Credential-free native affected delta and unchanged Terraform limits.
-- [ ] PV7 Verify artifacts/hashes, converge and provide exact commit handoff.
+- [x] PV6 Credential-free native affected delta and unchanged Terraform limits.
+- [x] PV7 Verify artifacts/hashes, converge and provide exact commit handoff.
 
 No full unchanged baseline, cloud acceptance or paid readiness is claimed.
+
+## Final convergence
+
+Exact implementation eb91626507d0419003a739ecc314dbbf9549fc14 passed all 266
+native affected Python cases and 15 driver checks, zero failures/errors/skips.
+Both AWS roots preserve their constraints/locks, accept the normal generated
+bounded namespace, and reject the original 90-character input: four mock test
+cases, plus actual native exact-scope checks (safety 3 / pair 14 managed addresses).
+Mac readback verified archive CRC, all 34 manifest hashes, JUnit/counts/logs,
+clean native source and seven current executable hashes. Initial signed-merge
+export identity mismatch stopped before tests and was corrected with original
+commit metadata before exact-source validation; its diagnostic remains retained.
+
+R1/R2: shared bounded helper reaches F11/provider/recovery, original long namespace
+cleanup retains saved paths/bytes and blocks missing/ambiguous journals. R3/R4:
+real initialized-ID orchestration reaches strict failed validation without guest
+timestamps, preserves typed provider cause and private failed-plan output, reports
+actual dispatches even when projection fails. R5/R6: authenticated 12-category
+regional inventory, exact IAM/SSM absence, partial apply/output cleanup and unknown
+execution blocking all covered. R7: original F11 cleanup reconciliation closes
+absence only and retains liability; no production financial guard was changed.
+
+No remaining bounded offline implementation finding. Existing live cleanup,
+reconciliation and PM tracking remain with the execution chat. A future live
+attempt requires separately reviewed new source bindings and exact authority;
+this repair does not use the active private batch, rerun a cloud, release a
+liability or establish real provider/guest/controller-failure acceptance.
+
+See [validation and exact hashes](../../../docs/validation/pre-vm-failure-repair.md).

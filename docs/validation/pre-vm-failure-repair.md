@@ -1,6 +1,8 @@
 # AWS pre-VM failure and lifecycle reporting repair
 
-14 November 2026. Baseline ccb8a7e, with executable trees matching 0b70033.
+14 November 2026. Tested implementation **eb91626507d0419003a739ecc314dbbf9549fc14**
+on `codex/aws-pre-vm-failure-repair`. Baseline ccb8a7e had executable trees matching
+0b70033.
 [Bounded repair artifact](../../specs/013-v2-lifecycle/repairs/pre-vm-failure.md).
 
 The execution chat reported a 90-character namespace from normal initialization
@@ -58,9 +60,39 @@ the actual saved-plan boundary; only external commands are injected. Synthetic
 financial fixtures retain their explicitly scoped test isolation and grant no
 financial-readiness evidence.
 
-Native validation is pending at this source checkpoint. It will use the affected
-Python delta and two AWS Terraform mock roots with bounded-positive/old-long-negative
-inputs; unchanged broad baselines and paid execution are excluded.
+Native Linux Python 3.12.3 at exact **eb91626**: **266/266 cases passed**,
+zero failures/errors/skips. Terraform 1.16.6: both AWS roots init with readonly
+locks and validate; **four mock test cases** passed (two bounded positives,
+two original-long expected rejections). Actual native resource-change scope
+checks passed: safety three managed addresses, pair fourteen. The driver passed
+**15/15 checks**, with clean source before/after and all seven executable hashes
+matching the Mac. The Terraform roots, constraints and locks are unchanged.
+Native input proof comes from normal initialize_campaign output: old namespace
+90 characters, bounded namespace 80, full run/deployment IDs retained.
+
+Mock plan output omits ordinary show's format/variables envelope; the adapter
+adds only those from the native input snapshot and preserves native
+resource_changes. These are mock-provider plans, never provider apply/acceptance.
+The first transfer identity check stopped before tests because fast-export
+rewrote a signed merge commit; matching trees were verified and the original
+commit objects were restored before the passing exact-source run. That initial
+check is retained in the archive.
+
+[Machine-readable source/log/JUnit evidence](pre-vm-failure-repair-evidence.json).
+Downloaded archive `/private/tmp/cnb-pre-vm-eb91626-native-evidence.zip`,
+2,689,066 bytes; CRC and **34 file hashes** independently verified on the Mac.
+Archive SHA-256:
+`b4fb3e8aaf485686f9f52cb1a4256554e6e5232ba990e94fef660d5450d6a537`.
+Native summary SHA-256:
+`3e3c46fa09711eef7e609b3df085ec4bfb434471c40d7f6cb836f63a4d5b0a5e`.
+Native JUnit SHA-256:
+`c9a45be061c736884e6dc17438badc08e7ef69eb26152cd0bf72a56ac9bab6a3`.
+Native pytest log SHA-256:
+`53ca3cc092a5e2d5dbcf0caf6de32517d45643c2c55c74473663650949af78f0`.
+Remote source/evidence remains separate under
+`/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/pre-vm-repair-*`.
+No unchanged broad suite, cloud credential/environment, provider apply, real
+financial mutation, active input or original execution-state change was used.
 
 ## Handoff boundary
 
