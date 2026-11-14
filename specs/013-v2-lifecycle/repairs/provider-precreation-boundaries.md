@@ -63,3 +63,8 @@ and reject empty/foreign-prefix metadata document names as incomplete evidence.
 Four new negative cases cover those edges. The affected AWS-only delta is rerun
 on the final source; unchanged GCP/Azure and Terraform evidence stays bound to
 2cb096a and its executable/root hashes.
+
+AWS addendum aae0918: 117/117 local and exact-source Halle cases pass, zero
+failures/errors/skips. Source clean before/after; CRC, ten payload and ten source
+hashes plus JUnit verified. Seven unchanged source/root hashes retain the prior
+GCP/Azure/eight mocked-plan evidence without rerunning that unchanged baseline.
