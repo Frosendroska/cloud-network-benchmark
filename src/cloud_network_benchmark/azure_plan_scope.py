@@ -34,19 +34,30 @@ def _refs(node, field):
     return [ref for child in children for ref in _refs(child, field)]
 
 
-def _link(actual, expected, config, field, target):
-    """Known ARM IDs must match; computed IDs require the exact planned reference."""
+def _link(actual, expected, config, field, target, *, dynamic=False, condition=None):
+    """Prove known IDs or the exact static attribute/dynamic per-role reference."""
     if actual is not None and expected is not None and not (isinstance(actual,list) and any(x is None for x in actual)):
         normalize = lambda x: [s.lower() for s in x] if isinstance(x, list) else x.lower()
         _same(normalize(actual), normalize(expected), "Azure " + field)
         return
+    if isinstance(actual,list) and isinstance(expected,list):
+        _same(len(actual),len(expected),"Azure " + field + " cardinality")
     refs = _refs(config, field)
-    if not refs or not any(ref == target or ref.startswith(target + ".") for ref in refs):
-        raise PlanReviewError("unproved computed Azure " + field)
-    allowed = (target, "each.key", "each.value", "count.index")
-    if any(not any(ref == prefix or ref.startswith(prefix + ".") or ref.startswith(prefix + "[") for prefix in allowed)
-           for ref in refs):
-        raise PlanReviewError("foreign computed Azure " + field)
+    if dynamic:
+        # Terraform truncates a traversal at a dynamic index. Require the owned
+        # collection plus the role loop; a literal other-role index is forbidden.
+        allowed = {target, "each.key", "each.value", "each.value.vnet_key"}
+        proved = target in refs and any(x in refs for x in ("each.key", "each.value.vnet_key"))
+    else:
+        # Static references must reach the actual ID attribute, not merely the
+        # same resource (e.g. tenant_id instead of principal_id).
+        parts = target.split(".")
+        allowed = {".".join(parts[:i]) for i in range(2,len(parts)+1)}
+        allowed |= {ref.split("[",1)[0] for ref in list(allowed)}
+        proved = target in refs
+    if condition is not None: allowed.add(condition)
+    if not proved or not refs or set(refs) - allowed:
+        raise PlanReviewError("unproved or foreign computed Azure " + field)
 
 
 def security_rules(role: str, v: dict) -> list[dict]:
@@ -92,15 +103,15 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
         for key in ("not_actions","data_actions","not_data_actions"):
             if permission.get(key): raise PlanReviewError("unexpected Azure permission " + key)
         config = configs.get("azurerm_role_definition.deallocate", {})
-        _link(role.get("scope"),group_id,config,"scope","azurerm_resource_group.attempt")
-        _link(role.get("assignable_scopes"),[group_id],config,"assignable_scopes","azurerm_resource_group.attempt")
+        _link(role.get("scope"),group_id,config,"scope","azurerm_resource_group.attempt.id")
+        _link(role.get("assignable_scopes"),[group_id],config,"assignable_scopes","azurerm_resource_group.attempt.id")
         assignment = r["azurerm_role_assignment.deallocate"]
         config = configs.get("azurerm_role_assignment.deallocate", {})
-        _link(assignment.get("scope"),group_id,config,"scope","azurerm_resource_group.attempt")
+        _link(assignment.get("scope"),group_id,config,"scope","azurerm_resource_group.attempt.id")
         role_id = role.get("role_definition_resource_id")
-        _link(assignment.get("role_definition_id"),role_id,config,"role_definition_id","azurerm_role_definition.deallocate")
+        _link(assignment.get("role_definition_id"),role_id,config,"role_definition_id","azurerm_role_definition.deallocate.role_definition_resource_id")
         principal = _one(account["identity"],"identity").get("principal_id")
-        _link(assignment.get("principal_id"),principal,config,"principal_id","azurerm_automation_account.expiry")
+        _link(assignment.get("principal_id"),principal,config,"principal_id","azurerm_automation_account.expiry.identity[0].principal_id")
         _same(assignment.get("principal_type"),"ServicePrincipal","Azure role principal type")
         if assignment.get("role_definition_name") or assignment.get("condition") or assignment.get("delegated_managed_identity_resource_id"):
             raise PlanReviewError("unexpected Azure assignment scope")
@@ -124,8 +135,8 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
         config = configs.get("azurerm_network_interface.pair",{})
         key = role if v["create_peering"] else "a"
         subnet = arm("Microsoft.Network/virtualNetworks",f"{group}-{key}-vnet") + "/subnets/benchmark"
-        _link(ip.get("subnet_id"),subnet,config,"subnet_id","azurerm_subnet.pair")
-        _link(ip.get("public_ip_address_id"),arm("Microsoft.Network/publicIPAddresses",f"{group}-{role}-pip"),config,"public_ip_address_id","azurerm_public_ip.pair")
+        _link(ip.get("subnet_id"),subnet,config,"subnet_id","azurerm_subnet.pair",dynamic=True)
+        _link(ip.get("public_ip_address_id"),arm("Microsoft.Network/publicIPAddresses",f"{group}-{role}-pip"),config,"public_ip_address_id","azurerm_public_ip.pair",dynamic=True)
         nsg = r[f'azurerm_network_security_group.pair["{role}"]']
         _fields(nsg,{**common,"name":f"{group}-{role}-nsg"},"Azure NSG")
         rules = nsg.get("security_rule",[])
@@ -137,12 +148,12 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
                 if actual.get(field): raise PlanReviewError("unexpected Azure NSG multi-source/port rule")
         assoc = r[f'azurerm_network_interface_security_group_association.pair["{role}"]']
         config = configs.get("azurerm_network_interface_security_group_association.pair",{})
-        _link(assoc.get("network_interface_id"),arm("Microsoft.Network/networkInterfaces",f"{group}-{role}-nic"),config,"network_interface_id","azurerm_network_interface.pair")
-        _link(assoc.get("network_security_group_id"),arm("Microsoft.Network/networkSecurityGroups",f"{group}-{role}-nsg"),config,"network_security_group_id","azurerm_network_security_group.pair")
+        _link(assoc.get("network_interface_id"),arm("Microsoft.Network/networkInterfaces",f"{group}-{role}-nic"),config,"network_interface_id","azurerm_network_interface.pair",dynamic=True)
+        _link(assoc.get("network_security_group_id"),arm("Microsoft.Network/networkSecurityGroups",f"{group}-{role}-nsg"),config,"network_security_group_id","azurerm_network_security_group.pair",dynamic=True)
         vm = r[f'azurerm_linux_virtual_machine.pair["{role}"]']
         _fields(vm,{**common,"name":f"{group}-{role}","computer_name":role,"size":"Standard_D4s_v5","zone":v["zone_"+role],"priority":"Regular","admin_username":v["admin_username"],"disable_password_authentication":True},"Azure VM")
         config = configs.get("azurerm_linux_virtual_machine.pair",{})
-        _link(vm.get("network_interface_ids"),[arm("Microsoft.Network/networkInterfaces",f"{group}-{role}-nic")],config,"network_interface_ids","azurerm_network_interface.pair")
+        _link(vm.get("network_interface_ids"),[arm("Microsoft.Network/networkInterfaces",f"{group}-{role}-nic")],config,"network_interface_ids","azurerm_network_interface.pair",dynamic=True)
         _fields(_one(vm.get("os_disk"),"OS disk"),dict(caching="ReadWrite",storage_account_type="StandardSSD_LRS",disk_size_gb=32),"Azure OS disk")
         _fields(_one(vm.get("admin_ssh_key"),"SSH key"),dict(username=v["admin_username"],public_key=v["ssh_public_key"]),"Azure SSH key")
         if v["selected_image"].startswith("/"):
@@ -154,7 +165,7 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
         if vm.get("identity") or vm.get("additional_capabilities") or vm.get("host_group_id") or vm.get("dedicated_host_id") or vm.get("capacity_reservation_group_id"):
             raise PlanReviewError("unexpected Azure VM identity/capacity scope")
         if v["create_ppg"]:
-            _link(vm.get("proximity_placement_group_id"),arm("Microsoft.Compute/proximityPlacementGroups",v["placement_group_name"]),config,"proximity_placement_group_id","azurerm_proximity_placement_group.pair")
+            _link(vm.get("proximity_placement_group_id"),arm("Microsoft.Compute/proximityPlacementGroups",v["placement_group_name"]),config,"proximity_placement_group_id","azurerm_proximity_placement_group.pair[0].id",condition="var.create_ppg")
         elif vm.get("proximity_placement_group_id"): raise PlanReviewError("unexpected Azure placement")
     if v["create_ppg"]:
         _fields(r["azurerm_proximity_placement_group.pair[0]"],dict(name=v["placement_group_name"],location=v["location"],resource_group_name=group,allowed_vm_sizes=["Standard_D4s_v5"],tags=tags),"Azure PPG")
@@ -162,4 +173,4 @@ def validate(r: dict, root: str, v: dict, plan: dict) -> None:
         for role,other in (("a","b"),("b","a")):
             a = r[f"azurerm_virtual_network_peering.{role}_to_{other}[0]"]
             _fields(a,dict(name=f"{group}-{role}-to-{other}",resource_group_name=group,virtual_network_name=f"{group}-{role}-vnet",allow_virtual_network_access=True,allow_forwarded_traffic=False,allow_gateway_transit=False,use_remote_gateways=False),"Azure peering")
-            _link(a.get("remote_virtual_network_id"),arm("Microsoft.Network/virtualNetworks",f"{group}-{other}-vnet"),configs.get(f"azurerm_virtual_network_peering.{role}_to_{other}",{}),"remote_virtual_network_id","azurerm_virtual_network.pair")
+            _link(a.get("remote_virtual_network_id"),arm("Microsoft.Network/virtualNetworks",f"{group}-{other}-vnet"),configs.get(f"azurerm_virtual_network_peering.{role}_to_{other}",{}),"remote_virtual_network_id",f'azurerm_virtual_network.pair["{other}"].id')

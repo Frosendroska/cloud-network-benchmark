@@ -185,3 +185,63 @@ def test_legacy_recovery_without_input_hash_or_admin_variable_retains_original_b
     state=json.loads(journal.read_text());state.pop("terraform_input_sha256");az._atomic_private(journal,state)
     assert az._recovery_tfvars(workspace,journal,"pair",az.build_pair_inputs(d,o))==path
     assert "admin_username" not in json.loads(path.read_text())
+
+
+@pytest.mark.parametrize("refs,valid",[
+ (["azurerm_automation_account.expiry.identity[0].principal_id","azurerm_automation_account.expiry.identity","azurerm_automation_account.expiry"],True),
+ (["azurerm_automation_account.expiry.identity[0].tenant_id","azurerm_automation_account.expiry"],False),
+ (["azurerm_automation_account.expiry"],False),
+])
+def test_unknown_principal_requires_principal_attribute_not_just_resource(refs,valid):
+    v,r=azure_scope("expiry");r["azurerm_role_assignment.deallocate"].pop("principal_id")
+    p=azure_document(v,r)
+    config=next(x for x in p["configuration"]["root_module"]["resources"] if x["address"]=="azurerm_role_assignment.deallocate")
+    config["expressions"]["principal_id"]={"references":refs}
+    if valid: assert tp.validate_scope(p,"azure",ROOT/"terraform/azure/expiry",v)
+    else:
+        with pytest.raises(tp.PlanReviewError): tp.validate_scope(p,"azure",ROOT/"terraform/azure/expiry",v)
+
+
+@pytest.mark.parametrize("refs,valid",[
+ (["azurerm_network_interface.pair","each.key"],True),
+ (["azurerm_network_interface.pair"],False),
+ (['azurerm_network_interface.pair["b"].id','azurerm_network_interface.pair["b"]','azurerm_network_interface.pair'],False),
+])
+def test_unknown_vm_nic_cannot_switch_to_literal_other_role(refs,valid):
+    v,r=azure_scope();r['azurerm_linux_virtual_machine.pair["a"]']["network_interface_ids"]=[None]
+    p=azure_document(v,r)
+    config=next(x for x in p["configuration"]["root_module"]["resources"] if x["address"]=="azurerm_linux_virtual_machine.pair")
+    config["expressions"]["network_interface_ids"]={"references":refs}
+    if valid: assert tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
+    else:
+        with pytest.raises(tp.PlanReviewError): tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
+
+
+def test_unknown_legacy_ppg_retains_exact_index_and_declared_condition():
+    v,r=azure_scope("pair","placement_optimization","germanywestcentral")
+    for role in ("a","b"):r[f'azurerm_linux_virtual_machine.pair["{role}"]']["proximity_placement_group_id"]=None
+    p=azure_document(v,r)
+    config=next(x for x in p["configuration"]["root_module"]["resources"] if x["address"]=="azurerm_linux_virtual_machine.pair")
+    config["expressions"]["proximity_placement_group_id"]={"references":["var.create_ppg","azurerm_proximity_placement_group.pair[0].id","azurerm_proximity_placement_group.pair[0]","azurerm_proximity_placement_group.pair"]}
+    assert tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
+
+
+@pytest.mark.parametrize("other,valid",[("b",True),("a",False)])
+def test_unknown_legacy_peering_requires_the_opposite_network(other,valid):
+    v,r=azure_scope("pair","inter_region","germanywestcentral")
+    r['azurerm_virtual_network_peering.a_to_b[0]']["remote_virtual_network_id"]=None
+    p=azure_document(v,r)
+    config=next(x for x in p["configuration"]["root_module"]["resources"] if x["address"]=="azurerm_virtual_network_peering.a_to_b")
+    config["expressions"]["remote_virtual_network_id"]={"references":[f'azurerm_virtual_network.pair["{other}"].id',f'azurerm_virtual_network.pair["{other}"]','azurerm_virtual_network.pair']}
+    if valid: assert tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
+    else:
+        with pytest.raises(tp.PlanReviewError): tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
+
+
+def test_unknown_vm_nic_list_still_requires_one_attachment():
+    v,r=azure_scope();r['azurerm_linux_virtual_machine.pair["a"]']["network_interface_ids"]=[None,None]
+    p=azure_document(v,r)
+    config=next(x for x in p["configuration"]["root_module"]["resources"] if x["address"]=="azurerm_linux_virtual_machine.pair")
+    config["expressions"]["network_interface_ids"]={"references":["azurerm_network_interface.pair","each.key"]}
+    with pytest.raises(tp.PlanReviewError,match="cardinality"):
+        tp.validate_scope(p,"azure",ROOT/"terraform/azure/pair",v)
