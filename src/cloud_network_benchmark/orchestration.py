@@ -435,8 +435,12 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
     if stage == "protect":
         from .contracts.admission import ExpiryEvidence
         actual_provider = getattr(getattr(value, "provider", None), "value", getattr(value, "provider", None))
+        reason = "registered expiry evidence is missing or mismatched"
+        failure = getattr(value,"failure",None)
+        if failure is not None:
+            reason += f": {failure.category}: {failure.message}"
         return (isinstance(value, ExpiryEvidence) and value.state == "registered"
-                and actual_provider == provider, "registered expiry evidence is missing or mismatched")
+                and actual_provider == provider, reason)
     if stage == "claim":
         return (getattr(value, "eligible", None) is True and getattr(value, "creation_granted", None) is True,
                 "F11 creation claim was not granted")
@@ -809,6 +813,11 @@ def execute_provider_workflows(
                     else:
                         item.secondary_failures.append(failure)
                 results[provider].cleanup_state = "succeeded" if succeeded else "failed"
+    for item in results.values():
+        if item.execution_state == "initialized":
+            if item.primary_failure is None:
+                item.primary_failure = "batch aborted before creation after provider protection/claim failure"
+            item.execution_state = "failed"
     failures = [item.primary_failure for item in results.values() if item.primary_failure]
     failures.extend(f"{item.provider} cleanup failed" for item in results.values() if item.cleanup_state == "failed")
     completed = (not protection_failed and not interrupted and not failures

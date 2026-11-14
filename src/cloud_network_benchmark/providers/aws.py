@@ -443,7 +443,8 @@ class AwsProviderDriver:
         self._active_commands = []
         journal = self._load_journal(attempt, deployment)
         failures: list[FailureEvidence] = []
-        primary = FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else self._active_primary_failure
+        cause = journal.get("primary_failure") or journal.get("registration_failure")
+        primary = FailureEvidence.model_validate(cause) if cause else self._active_primary_failure
         inventory_by_region: dict[str, Any] = {}
         regions = journal.get("regions") or self._regions(deployment)
         scope = journal.get("deployment_scope")
@@ -452,6 +453,14 @@ class AwsProviderDriver:
             return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
         self._registration_deadline = None
         self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
+
+        try:
+            identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
+            if identity.get("Account") != self.settings.account_id:
+                raise AwsProviderError("cleanup caller account differs from the original scope", category="scope_mismatch")
+        except Exception as exc:
+            failure = _failure(exc,self.clock())
+            return self._failed_cleanup(inventory_by_region,[failure],primary,failure,deployment)
 
         if journal.get("creation_may_have_started"):
             state_path = Path(journal.get("pair_state_path", attempt / "pair.tfstate"))
@@ -468,16 +477,21 @@ class AwsProviderDriver:
                         failures.append(_failure(AwsProviderError("AWS pair Terraform destroy failed", category="terraform_destroy", action_id="aws-pair-destroy"), self.clock()))
                 except Exception as exc:
                     failures.append(_failure(exc, self.clock()))
-            for region in regions:
-                try:
-                    inventory_by_region[region] = self._inventory_region(deployment, region, failures)
-                except Exception as exc:
-                    failures.append(_failure(exc, self.clock()))
-                    inventory_by_region[region] = {"complete": False, "remaining": {"inventory": ["inventory_unknown"]}, "resources": {}}
-            if any(not item.get("complete") or item.get("remaining") for item in inventory_by_region.values()):
-                failure = _failure(AwsProviderError("AWS resource inventory is unknown or contains leftovers", category="inventory_incomplete"), self.clock())
-                return self._failed_cleanup(inventory_by_region, failures, primary, failure, deployment)
+        for region in regions:
+            try:
+                inventory_by_region[region] = self._inventory_region(deployment, region, failures)
+            except Exception as exc:
+                failures.append(_failure(exc, self.clock()))
+                inventory_by_region[region] = {"complete": False, "remaining": {"inventory": ["inventory_unknown"]}, "resources": {}}
+        if any(not item.get("complete") or item.get("remaining") for item in inventory_by_region.values()):
+            failure = _failure(AwsProviderError("AWS resource inventory is unknown or contains leftovers", category="inventory_incomplete"), self.clock())
+            return self._failed_cleanup(inventory_by_region, failures, primary, failure, deployment)
 
+        uncertain = set(journal.get("registration_uncertain_regions", [])) | (
+            set(journal.get("registration_attempted_regions", [])) - set(journal.get("executions", {})))
+        if uncertain:
+            failure = _failure(AwsProviderError("expiry execution identity remains uncertain; preserve support resources", category="expiry_uncertain"),self.clock())
+            return self._failed_cleanup(inventory_by_region,[*failures,failure],primary,failure,deployment)
         # Expiry remains until pair absence is confirmed in every involved region.
         for region in regions:
             execution_id = journal.get("executions", {}).get(region)
@@ -499,30 +513,32 @@ class AwsProviderDriver:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
         safety_absent: dict[str, bool] = {}
+        safety_targets: dict[str, Any] = {}
         for region in regions:
-            if region not in journal.get("safety", {}):
-                safety_absent[region] = True
-                continue
             try:
-                result = self._run(
-                f"aws-safety-destroy-{region}",
-                [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "destroy", "-input=false", "-auto-approve", f"-state={attempt / f'safety-{region}.tfstate'}", f"-var-file={attempt / f'safety-{region}.tfvars.json'}"],
-                self.settings.command_timeout_seconds,
-                cwd=attempt,
-                )
-                terraform_destroyed = _succeeded(result)
+                safety = journal.get("safety", {}).get(region)
+                if safety is None:
+                    safety = self._prospective_safety(deployment,region,attempt,journal)
+                role_arn = safety["role_arn"]
+                document_arn = f"arn:aws:ssm:{region}:{self.settings.account_id}:document/{safety['document_name']}"
+                safety_targets[region] = {"role":{"arn":role_arn},"document":{"arn":document_arn}}
+                # State and vars can exist even when apply/output failed before
+                # the journal acquired a safety output. Always use original bytes.
+                variables = attempt/f"safety-{region}.tfvars.json"
+                terraform_destroyed = True
+                if variables.exists():
+                    if variables.is_symlink(): raise AwsProviderError("unsafe original safety inputs",category="state_path_unsafe")
+                    result = self._run(f"aws-safety-destroy-{region}",
+                        [self.settings.terraform,f"-chdir={self._root() / 'terraform/aws/safety'}","destroy","-input=false","-auto-approve",f"-state={attempt / f'safety-{region}.tfstate'}",f"-var-file={variables}"],
+                        self.settings.command_timeout_seconds,cwd=attempt)
+                    terraform_destroyed = _succeeded(result)
+                safety_absent[region] = self._verify_safety_absent(region,safety)
+                if not terraform_destroyed or not safety_absent[region]:
+                    raise AwsProviderError(f"AWS safety cleanup or independent absence failed in {region}",category="safety_destroy")
             except Exception as exc:
-                failures.append(_failure(exc, self.clock()))
-                terraform_destroyed = False
-            try:
-                safety_absent[region] = self._verify_safety_absent(region, journal["safety"][region])
-            except Exception as exc:
-                failures.append(_failure(exc, self.clock()))
+                failures.append(_failure(exc,self.clock()))
                 safety_absent[region] = False
-            if not terraform_destroyed:
-                failures.append(_failure(AwsProviderError(f"AWS safety Terraform cleanup failed in {region}", category="safety_destroy", action_id=f"aws-safety-destroy-{region}"), self.clock()))
-            if not safety_absent[region]:
-                failures.append(_failure(AwsProviderError(f"AWS safety support cleanup failed in {region}", category="safety_destroy", action_id=f"aws-safety-destroy-{region}"), self.clock()))
+        journal["cleanup_safety_targets"] = safety_targets
         journal["last_cleanup_inventory"] = inventory_by_region
         journal["commands"] = list(self._active_commands)
         journal["cleanup_attempted_at"] = self.clock().astimezone(timezone.utc).isoformat()
@@ -543,18 +559,35 @@ class AwsProviderDriver:
             expiry = expiry.model_copy(update={"state": state, "failure": failure, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
         result = AwsCleanupResult(
-            cleanup_state=CleanupState.SUCCEEDED if journal.get("creation_may_have_started") else CleanupState.NOT_REQUIRED,
-            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "complete": True}),
+            cleanup_state=CleanupState.SUCCEEDED,
+            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "safety_targets": safety_targets, "complete": True}),
             expiry=Evidence[ExpiryEvidence](value=expiry) if expiry else Evidence[ExpiryEvidence](unavailable_reason="expiry not registered"),
             primary_failure=primary,
         )
         journal["cleanup_state"] = result.cleanup_state.value if hasattr(result.cleanup_state, "value") else result.cleanup_state
+        journal["launch_blocked"] = False
         try:
             self._save_journal(attempt, journal)
         except Exception as exc:
             failure = _failure(exc, self.clock())
             return self._failed_cleanup(inventory_by_region, [*failures, failure], primary, failure, deployment)
         return result
+
+    def _prospective_safety(self, deployment: ProviderDeploymentInput, region: str, attempt: Path, journal: dict) -> dict[str,str]:
+        """Expected lookup targets, not evidence that resources were ever created."""
+        namespace = attempt.parent.parent.name
+        variables = attempt/f"safety-{region}.tfvars.json"
+        if variables.exists():
+            if variables.is_symlink(): raise AwsProviderError("unsafe original safety inputs",category="state_path_unsafe")
+            original = json.loads(variables.read_text())
+            expected = {"account_id":self.settings.account_id,"region":region,
+                "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"resource_namespace":namespace}
+            if original != expected: raise AwsProviderError("original safety inputs differ from owned recovery scope",category="scope_mismatch")
+        elif journal.get("deployment_scope",{}).get("resource_namespace",namespace) != namespace:
+            raise AwsProviderError("original safety namespace is missing or mismatched",category="scope_mismatch")
+        digest = hashlib.sha256(f"{deployment.run_id}:{deployment.deployment_id}:{region}".encode()).hexdigest()[:24]
+        name = "cnb-expiry-" + namespace.replace(".","-")[:24] + "-" + digest
+        return {"role_arn":f"arn:aws:iam::{self.settings.account_id}:role/{name}","document_name":name}
 
     def _verify_safety_absent(self, region: str, safety: dict[str, str]) -> bool:
         role_name = safety["role_arn"].rsplit("/", 1)[-1]
@@ -650,7 +683,7 @@ class AwsProviderDriver:
             raise AwsProviderError("private state root is a symlink; AWS launches remain blocked", category="residual_cleanup_unknown")
         if not root.exists():
             return
-        prefix = f"cnb-{deployment.run_id}-"
+        prefix = "cnb-"
         for namespace in root.iterdir():
             if not namespace.name.startswith(prefix):
                 continue
@@ -679,7 +712,7 @@ class AwsProviderDriver:
                     raise AwsProviderError("an earlier AWS attempt journal is unreadable; launches remain blocked", category="residual_cleanup_unknown") from exc
                 if journal.get("run_id") != deployment.run_id:
                     continue
-                if journal.get("creation_may_have_started") and journal.get("cleanup_state") != CleanupState.SUCCEEDED.value:
+                if (journal.get("creation_may_have_started") or journal.get("registration_failure") or journal.get("registration_uncertain_regions") or journal.get("cleanup_state") == "failed") and journal.get("cleanup_state") != CleanupState.SUCCEEDED.value:
                     raise AwsProviderError("an earlier AWS attempt has unresolved cleanup; new launches are blocked", category="residual_cleanup_required")
 
     def _apply_safety_root(self, deployment: ProviderDeploymentInput, region: str, attempt: Path) -> dict[str, str]:
@@ -1218,6 +1251,8 @@ class AwsProviderDriver:
         journal = self._load_journal(self._attempt_dir(deployment), deployment)
         expiry = self._expiry_from_journal(deployment, journal)
         journal["cleanup_state"] = "failed"
+        journal["last_cleanup_inventory"] = inventory
+        journal["cleanup_attempted_at"] = self.clock().astimezone(timezone.utc).isoformat()
         journal["launch_blocked"] = True
         journal["cleanup_failure"] = failure.model_dump(mode="json")
         journal["secondary_failures"] = [item.model_dump(mode="json") for item in secondary]
@@ -1268,6 +1303,21 @@ class AwsProviderDriver:
             raise AwsProviderError("private state root must not be a symlink", category="state_path_unsafe")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(root, 0o700)
+        # Existing long namespaces are recovery identities, never migration inputs.
+        owned = []
+        for namespace in dict.fromkeys((_namespace(deployment), _legacy_namespace(deployment))):
+            if len(namespace.encode()) > 255:  # Such a legacy component could never exist on these hosts.
+                continue
+            candidate = root / namespace / deployment.run_id / deployment.deployment_id
+            if any(part.is_symlink() for part in (root/namespace, candidate.parent, candidate, candidate/"attempt.json")):
+                raise AwsProviderError("attempt state path must not contain symlinks", category="state_path_unsafe")
+            if (candidate/"attempt.json").is_file():
+                self._load_journal(candidate,deployment)
+                owned.append(candidate)
+        if len(owned) > 1:
+            raise AwsProviderError("multiple namespace journals claim this attempt; recovery is ambiguous", category="state_identity_mismatch")
+        if owned:
+            return owned[0]
         path = root
         for component in (_namespace(deployment), deployment.run_id, deployment.deployment_id):
             path = path / component
@@ -1437,8 +1487,15 @@ def _expiry_price(root: Path, settings: AwsRuntimeSettings) -> dict[str, Any]:
     return {**payload, "observed_sha256": digest}
 
 
-def _namespace(deployment: ProviderDeploymentInput) -> str:
+def _legacy_namespace(deployment: ProviderDeploymentInput) -> str:
     return f"cnb-{deployment.run_id}-{deployment.deployment_id}"
+
+
+def _namespace(deployment: ProviderDeploymentInput) -> str:
+    original = _legacy_namespace(deployment)
+    if len(original) <= 80:
+        return original
+    return original[:55].rstrip("-._") + "-" + hashlib.sha256(original.encode()).hexdigest()[:24]
 
 
 def _timestamp(value: datetime) -> str:
