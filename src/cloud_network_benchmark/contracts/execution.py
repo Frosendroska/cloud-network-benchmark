@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import selectors
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,9 @@ from typing import Dict, List, Literal, Optional, Protocol, Sequence
 from pydantic import ConfigDict, Field, model_validator
 
 from .common import CommandOutcome, StrictModel
+
+
+BOUNDED_COPY_EOF_MARKER = "CNB-RESULT-TRANSFER-EOF-v1"
 
 
 class CommandRequest(StrictModel):
@@ -127,6 +132,102 @@ class CommandRunner(Protocol):
 
 
 class SubprocessCommandRunner:
+    def run_bounded_copy(self, request: CommandRequest, destination: Path,
+                         maximum_payload_bytes: int) -> CommandResult:
+        """Stream binary SSH stdout to an exclusive file without reading past its cap.
+
+        The remote command must independently bound stdout. This local bound
+        protects the controller if the remote source changes or misbehaves;
+        SSH framing, stderr and provider-billed wire bytes are not measured.
+        """
+        if (request.action_type != "ssh" or request.stdin is not None
+                or type(maximum_payload_bytes) is not int or maximum_payload_bytes < 0):
+            raise ValueError("bounded copy requires an SSH request and nonnegative byte cap")
+        started = datetime.now(timezone.utc)
+        monotonic_started = time.monotonic()
+        process = None
+        outcome = CommandOutcome.FAILED
+        exit_code = 1
+        stderr = ""
+        try:
+            with Path(destination).open("xb", buffering=0) as output:
+                process = subprocess.Popen(request.argv, cwd=Path(request.cwd),
+                    env=request.environment or None, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                    start_new_session=True)
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ, "payload")
+                    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                    copied = 0
+                    if maximum_payload_bytes == 0:
+                        selector.unregister(process.stdout)
+                        process.stdout.close()
+                    while selector.get_map():
+                        remaining = request.timeout_seconds - (time.monotonic() - monotonic_started)
+                        if remaining <= 0:
+                            outcome, exit_code, stderr = CommandOutcome.TIMED_OUT, None, "bounded copy timed out"
+                            break
+                        for key, _ in selector.select(timeout=min(remaining, .25)):
+                            if key.data == "payload":
+                                chunk = os.read(key.fileobj.fileno(), min(65536, maximum_payload_bytes - copied))
+                                if not chunk:
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                                    continue
+                                output.write(chunk)
+                                copied += len(chunk)
+                                if copied == maximum_payload_bytes:
+                                    # Do not consume a probe byte on the controller.
+                                    # The remote bounded command checks for one more
+                                    # source byte and reports it via exit status.
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                            else:
+                                chunk = os.read(key.fileobj.fileno(), 65536)
+                                if not chunk:
+                                    selector.unregister(key.fileobj)
+                                    key.fileobj.close()
+                                elif len(stderr) < 8192:
+                                    stderr += chunk.decode("utf-8", errors="replace")[:8192 - len(stderr)]
+                    if outcome != CommandOutcome.TIMED_OUT:
+                        remaining = request.timeout_seconds - (time.monotonic() - monotonic_started)
+                        if remaining <= 0:
+                            outcome, exit_code, stderr = CommandOutcome.TIMED_OUT, None, "bounded copy timed out"
+                        else:
+                            try:
+                                exit_code = process.wait(timeout=remaining)
+                                marker_seen = BOUNDED_COPY_EOF_MARKER in stderr.splitlines()
+                                if exit_code == 0 and not marker_seen:
+                                    exit_code = 1
+                                    stderr += "\nbounded copy remote EOF proof missing"
+                                outcome = CommandOutcome.SUCCEEDED if exit_code == 0 else CommandOutcome.FAILED
+                            except subprocess.TimeoutExpired:
+                                outcome, exit_code, stderr = CommandOutcome.TIMED_OUT, None, "bounded copy timed out"
+                    os.fsync(output.fileno())
+        except KeyboardInterrupt:
+            outcome, exit_code, stderr = CommandOutcome.INTERRUPTED, None, "bounded copy interrupted"
+        except OSError as exc:
+            outcome, exit_code, stderr = CommandOutcome.FAILED, 1, f"bounded copy local error: {type(exc).__name__}"
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+        monotonic_finished = time.monotonic()
+        finished = datetime.now(timezone.utc)
+        duration = monotonic_finished - monotonic_started
+        stderr = "\n".join(line for line in stderr.splitlines()
+            if line != BOUNDED_COPY_EOF_MARKER)
+        return CommandResult(action_id=request.action_id, outcome=outcome,
+            started_at=started, finished_at=finished, duration_seconds=duration,
+            duration_basis="monotonic", monotonic_started=monotonic_started,
+            monotonic_finished=monotonic_finished,
+            utc_elapsed_discrepancy_seconds=(finished - started).total_seconds() - duration,
+            exit_code=exit_code, stdout="", stderr=stderr, redactions=request.redactions)
+
     def run(self, request: CommandRequest) -> CommandResult:
         started = datetime.now(timezone.utc)
         monotonic_started = time.monotonic()

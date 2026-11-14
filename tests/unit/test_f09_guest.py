@@ -298,9 +298,13 @@ def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp
     if not Path("/proc/self/stat").is_file():
         pytest.skip("the local test host has no Linux /proc process identity interface")
     connected = connection(tmp_path)
+    # Hold the leader until its identity and a real child are observed. Avoid a
+    # race between the original immediate exit and reading /proc/getpgid.
     leader = subprocess.Popen([sys.executable, "-c",
-        "import os,time; child=os.fork(); os._exit(0) if child else time.sleep(30)"],
-        start_new_session=True)
+        "import os,sys,time\nchild=os.fork()\nif child:\n print(child,flush=True); sys.stdin.readline(); os._exit(0)\nelse: time.sleep(30)"],
+        start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    child_pid = int(leader.stdout.readline())
+    assert Path(f"/proc/{child_pid}/stat").is_file()
     pid = leader.pid
     stat_path = Path(f"/proc/{pid}/stat")
     import time
@@ -317,11 +321,15 @@ def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp
         "start_ticks": int(tail[19])}
     process_path = tmp_path / "owned-child-session.process.json"
     process_path.write_text(json.dumps(record, sort_keys=True))
+    leader.stdin.write("exit\n"); leader.stdin.flush(); leader.stdin.close()
     leader.wait(timeout=2)
+    leader.stdout.close()
     assert not stat_path.exists(), "test precondition: session leader has exited"
     class LocalScopedRunner:
         def run(self, command):
-            tokens = shlex.split(command.argv[-1])
+            remote = shlex.split(command.argv[-1])
+            assert remote[:2] == ["sh", "-c"]
+            tokens = shlex.split(remote[2])
             assert tokens[:2] == ["python3", "-c"]
             completed = subprocess.run([sys.executable, "-c", tokens[2], *tokens[3:]],
                 capture_output=True, text=True, timeout=8)
@@ -332,11 +340,23 @@ def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp
                 exit_code=completed.returncode, stdout=completed.stdout,
                 stderr=completed.stderr)
     actions = []
-    status = _stop_remote_f03(connected, record, record["invocation_id"],
-        process_path=str(process_path), runner=LocalScopedRunner(), deadline=deadline(),
-        clock=lambda:100, actions=actions)
-    assert status == "process_group_stopped"
-    assert actions and "process_group_stopped" in actions[-1].result["stdout"]
+    try:
+        status = _stop_remote_f03(connected, record, record["invocation_id"],
+            process_path=str(process_path), runner=LocalScopedRunner(), deadline=deadline(),
+            clock=lambda:100, actions=actions)
+        assert status == "process_group_stopped", actions[-1].result
+        assert actions and "process_group_stopped" in actions[-1].result["stdout"]
+        try:
+            raw = Path(f"/proc/{child_pid}/stat").read_text()
+        except FileNotFoundError:
+            pass
+        else:
+            assert raw[raw.rfind(")") + 2:].split()[0] in {"Z", "X"}
+    finally:
+        try:
+            os.killpg(pid, 9)
+        except ProcessLookupError:
+            pass
 
 
 def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
@@ -364,7 +384,9 @@ def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
     process_path.write_text(json.dumps(record, sort_keys=True))
     class LocalScopedRunner:
         def run(self, command):
-            tokens = shlex.split(command.argv[-1])
+            remote = shlex.split(command.argv[-1])
+            assert remote[:2] == ["sh", "-c"]
+            tokens = shlex.split(remote[2])
             completed = subprocess.run([sys.executable, "-c", tokens[2], *tokens[3:]],
                 capture_output=True, text=True, timeout=3)
             now = datetime.now(timezone.utc)
@@ -657,3 +679,105 @@ def test_standalone_diagnostics_run_only_for_explicit_guest_role(tmp_path, role)
             root=Path(__file__).parents[1] / "fixtures/f04", clock=FakeClock(),
             run_command=lambda *_:{"returncode":1,"stdout":"","stderr":"fixture"},
             snapshot_reader=lambda *_:snapshot(0), stop_requested=lambda:False)
+
+
+@pytest.mark.parametrize("case,expected,signals", [
+    ("term", "process_group_stopped", [15]),
+    ("kill", "process_group_stopped", [15, 9]),
+    ("orphan", "process_group_stopped", [15]),
+    ("zombie", "process_group_stopped", []),
+    ("reused", "cancellation_unverified", []),
+    ("boot", "cancellation_unverified", []),
+    ("record", "cancellation_unverified", []),
+    ("session", "cancellation_unverified", []),
+    ("older_member", "cancellation_unverified", []),
+    ("reused_during_term", "cancellation_unverified", [15]),
+    ("never_exits", "cancellation_unverified", [15, 9]),
+])
+def test_f03_scoped_stop_payload_identity_zombies_and_bounded_escalation(
+        tmp_path, monkeypatch, case, expected, signals):
+    """Execute the exact shipped Python/argv with synthetic /proc on every OS."""
+    import builtins
+    import contextlib
+    import io
+    import json
+    import os
+    import shlex
+    import sys
+    import time
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.lifecycle_adapters import _stop_remote_f03
+    from tests.fixtures.f02r.support import connection, deadline
+
+    connected = connection(tmp_path)
+    record = {"deployment_id": connected.deployment_id, "invocation_id": "payload-test",
+              "pid": 100, "process_group": 100, "session_id": 100,
+              "boot_id": "test-boot", "start_ticks": 200}
+    process_path = tmp_path / "process.json"
+    process_path.write_text(json.dumps(record | ({"invocation_id": "other"} if case == "record" else {})))
+    # PID, PGID, SID, start ticks, state. A child may remain after its leader exits.
+    members = {100: [100, 100, 200, "S"], 101: [100, 100, 201, "S"]}
+    if case == "orphan":
+        del members[100]
+    if case == "zombie":
+        for row in members.values(): row[3] = "Z"
+    if case == "reused": members[100][2] += 1
+    if case == "session": members[101][1] = 99
+    if case == "older_member": members[101][2] = 199
+    observed_signals = []
+    elapsed = [0.0]
+    original_open, original_listdir = builtins.open, os.listdir
+
+    def proc_open(path, *args, **kwargs):
+        path = str(path)
+        if path == "/proc/sys/kernel/random/boot_id":
+            return io.StringIO("other-boot" if case == "boot" else "test-boot")
+        if path.startswith("/proc/") and path.endswith("/stat"):
+            pid = int(path.split("/")[2])
+            pgid, sid, ticks, state = members[pid]
+            tail = [state, "1", str(pgid), str(sid), *(["0"] * 15), str(ticks)]
+            return io.StringIO(f"{pid} (synthetic name) " + " ".join(tail))
+        return original_open(path, *args, **kwargs)
+
+    def killpg(group, sig):
+        assert group == 100
+        observed_signals.append(int(sig))
+        if case == "reused_during_term":
+            members[100][2] += 1
+        elif case != "never_exits" and (int(sig) == 9 or case != "kill"):
+            for row in members.values(): row[3] = "Z"
+
+    class PayloadRunner:
+        def run(self, command):
+            remote = shlex.split(command.argv[-1])
+            assert remote[:2] == ["sh", "-c"]
+            tokens = shlex.split(remote[2])
+            assert tokens[:2] == ["python3", "-c"]
+            stdout = io.StringIO()
+            with monkeypatch.context() as patch, contextlib.redirect_stdout(stdout):
+                patch.setattr(sys, "argv", ["-c", *tokens[3:]])
+                patch.setattr(builtins, "open", proc_open)
+                patch.setattr(os, "listdir", lambda path: list(map(str, members)) if path == "/proc" else original_listdir(path))
+                patch.setattr(os, "killpg", killpg)
+                patch.setattr(time, "monotonic", lambda: elapsed[0])
+                patch.setattr(time, "sleep", lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
+                error = ""
+                try:
+                    exec(tokens[2], {})
+                    code = 0
+                except SystemExit as exc:
+                    code = exc.code if isinstance(exc.code, int) else 1
+                    error = str(exc.code)
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=command.action_id,
+                outcome="succeeded" if code == 0 else "failed", started_at=now,
+                finished_at=now + timedelta(seconds=elapsed[0]), duration_seconds=elapsed[0], exit_code=code,
+                stdout=stdout.getvalue(), stderr=error)
+
+    actions = []
+    assert _stop_remote_f03(connected, record, record["invocation_id"],
+        process_path=str(process_path), runner=PayloadRunner(), deadline=deadline(),
+        clock=lambda: 100, actions=actions) == expected, json.dumps(actions[-1].result)
+    assert observed_signals == signals, json.dumps(actions[-1].result)
+    assert elapsed[0] <= 5.0

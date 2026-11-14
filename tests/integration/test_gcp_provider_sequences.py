@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 import pytest
 
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
+
 from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID, GcpProviderDriver, SAFETY_LEAD_SECONDS
 from cloud_network_benchmark.contracts.admission import ReservationEvidence
 from cloud_network_benchmark.contracts.common import Evidence, StringEvidence
@@ -66,6 +68,21 @@ def test_provider_rejects_noncanonical_scenario_zones(tmp_path):
         case=deployment.model_copy(update={"scenario":scenario,"vm_a":a,"vm_b":b})
         with pytest.raises(GcpProviderError, match="selected V2 topology"):
             GcpProviderDriver._validate_deployment(case)
+
+
+def test_finland_provider_scope_rejects_non_acceptance_identity_before_commands(tmp_path):
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, _ = _cleanup_fixture(tmp_path)
+    deployment = deployment.model_copy(update={
+        "vm_a": deployment.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a"}),
+        "vm_b": deployment.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a"}),
+    })
+    GcpProviderDriver._validate_deployment(deployment)
+    for changed in (deployment.model_copy(update={"experiment_id": "EXP-999"}),
+                    deployment.model_copy(update={"context": "standard"}),
+                    deployment.model_copy(update={"mode": "short_study"})):
+        with pytest.raises(GcpProviderError, match="Finland is limited"):
+            GcpProviderDriver._validate_deployment(changed)
 
 
 def test_incomplete_gcloud_inventory_warning_and_malformed_response_fail_closed(tmp_path):
@@ -226,19 +243,30 @@ def test_success_and_repeated_cleanup_keep_saved_primary_failure(tmp_path,monkey
     assert json.loads((attempt/"attempt.json").read_text())["primary_failure"]["message"]=="original pair failure"
 
 
-@pytest.mark.parametrize(("scenario", "policy_mutation"), [
-    ("same_zone", None), ("cross_zone", None), ("placement_optimization", None), ("inter_region", None),
-    ("placement_optimization", "extra"), ("placement_optimization", "duplicate"),
-    ("placement_optimization", "missing"), ("placement_optimization", "foreign"),
-    ("placement_optimization", "mismatched"),
+@pytest.mark.parametrize(("scenario", "policy_mutation", "north"), [
+    ("same_zone", None, False), ("cross_zone", None, False),
+    ("placement_optimization", None, False), ("inter_region", None, False),
+    ("placement_optimization", "extra", False), ("placement_optimization", "duplicate", False),
+    ("placement_optimization", "missing", False), ("placement_optimization", "foreign", False),
+    ("placement_optimization", "mismatched", False),
+    ("same_zone", None, True),
 ])
-def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario, policy_mutation):
+def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario, policy_mutation, north):
     import base64, hashlib, json, struct
     from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
     from cloud_network_benchmark.contracts.execution import CommandResult
     from cloud_network_benchmark.providers.gcp import GcpProviderDriver
 
     base, fixture_driver = _cleanup_fixture(tmp_path)
+    if north:
+        north_network = base.vm_a.network.model_copy(update={
+            "address_spaces": {"europe-north1": "10.80.1.0/24"},
+            "subnets": {"europe-north1": ["10.80.1.0/24"]},
+        })
+        base = base.model_copy(update={
+            "vm_a": base.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
+            "vm_b": base.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
+        })
     vm_b = base.vm_b
     placement = base.placement
     if scenario == "cross_zone":
@@ -249,6 +277,9 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
         vm_b = vm_b.model_copy(update={"region": "europe-west2", "zone": "europe-west2-a"})
     deployment = base.model_copy(update={"scenario": scenario, "vm_b": vm_b, "placement": placement})
     settings = fixture_driver.settings
+    if north:
+        settings = settings.model_copy(update={"images": {**settings.images,
+            "europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105"}})
     if scenario in {"cross_zone", "inter_region"}:
         settings = settings.model_copy(update={"primary_review_decision": StructuredEvidence(value={"decision":"approved", "scenario":scenario, "source_path":"review.md", "source_sha256":"a"*64, "reviewed_at":"2026-10-23T12:00:00Z"})})
     now = datetime.now(timezone.utc)
@@ -327,12 +358,24 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
         assert driver.cleanup(deployment).cleanup_state == "succeeded"
         return
     output=driver.provision(deployment)
+    if north:
+        assert (output.vm_a.region, output.vm_b.region) == ("europe-north1", "europe-north1")
+        assert (output.vm_a.zone, output.vm_b.zone) == ("europe-north1-a", "europe-north1-a")
+        protection_vars = json.loads((driver._attempt_dir(deployment)/"protection"/"vars.json").read_text())
+        assert (protection_vars["zone_a"], protection_vars["zone_b"]) == ("europe-north1-a", "europe-north1-a")
+        assert protection_vars["image_a"] == protection_vars["image_b"] == settings.images["europe-north1"]
     assert (output.vm_a.private_ipv4,output.vm_b.private_ipv4)==(("10.80.1.10","10.80.1.11") if scenario!="inter_region" else ("10.80.1.10","10.81.1.11"))
     assert output.vm_a.connection.host == "8.8.8.8" and output.vm_b.connection.host == "1.1.1.1"
     pair_vars=json.loads((driver._attempt_dir(deployment)/"pair"/"vars.json").read_text())
     assert pair_vars["template_a"] == expiry.provider_metadata.value["templates"]["vm_a"]["self_link_unique"]
     assert len([x for x in runner.requests if x.action_id=="gcp-pair-apply"])==1
-    assert driver.cleanup(deployment).cleanup_state == "succeeded"
+    cleaned = driver.cleanup(deployment)
+    assert cleaned.cleanup_state == "succeeded"
+    if north:
+        assert cleaned.inventory.value["regions_scanned"] == ["europe-north1"]
+        regional_requests = [request for request in runner.requests if request.action_id.startswith((
+            "gcp-address-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-"))]
+        assert regional_requests and all("--regions=europe-north1" in request.argv for request in regional_requests)
 
 
 def test_registration_observes_both_absolute_stop_templates_before_any_pair(tmp_path, monkeypatch):

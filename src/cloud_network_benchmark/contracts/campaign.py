@@ -316,11 +316,13 @@ class ProviderConfiguration(StrictModel):
         if set(self.network.address_spaces) != regions or set(self.network.subnets) != regions:
             raise ValueError("network address spaces/subnets must match selected regions")
         expected_networks = {
-            Provider.AWS: {"eu-central-1": "10.60.0.0/16", "eu-west-2": "10.61.0.0/16"},
-            Provider.AZURE: {"germanywestcentral": "10.70.0.0/16", "uksouth": "10.71.0.0/16"},
-            Provider.GCP: {"europe-west3": "10.80.1.0/24", "europe-west2": "10.81.1.0/24"},
+            Provider.AWS: {"eu-central-1": "10.60.0.0/16", "eu-west-2": "10.61.0.0/16", "eu-north-1": "10.60.0.0/16"},
+            Provider.AZURE: {"germanywestcentral": "10.70.0.0/16", "uksouth": "10.71.0.0/16", "swedencentral": "10.70.0.0/16"},
+            Provider.GCP: {"europe-west3": "10.80.1.0/24", "europe-west2": "10.81.1.0/24", "europe-north1": "10.80.1.0/24"},
         }[provider]
         for region in regions:
+            if region not in expected_networks:
+                raise ValueError(f"unsupported {provider.value} region: {region}")
             if self.network.address_spaces[region] != expected_networks[region]:
                 raise ValueError(f"unexpected network range for {provider.value} {region}")
         if provider == Provider.GCP and self.placement.kind == "compact_placement_policy" and not self.placement.collocated:
@@ -392,6 +394,8 @@ class CampaignConfiguration(StrictModel):
                 raise ValueError(f"admission.{name} does not match mode/scenario")
         for provider in providers:
             item = self.provider_configs[provider]
+            if item.provider != provider:
+                raise ValueError(f"provider configuration does not match selected {provider.value}")
             same_region = item.regions.vm_a == item.regions.vm_b
             same_zone = item.zones.vm_a == item.zones.vm_b
             placement = item.placement.kind
@@ -428,7 +432,21 @@ class CampaignConfiguration(StrictModel):
                     Scenario.INTER_REGION: (("europe-west3", "europe-west2"), ("europe-west3-a", "europe-west2-a")),
                 },
             }[provider][scenario]
-            if (tuple(item.regions.model_dump().values()), tuple(item.zones.model_dump().values())) != expected_locality:
+            locality = (tuple(item.regions.model_dump().values()), tuple(item.zones.model_dump().values()))
+            northern_locality = {
+                Provider.AZURE: (("swedencentral", "swedencentral"), ("1", "1")),
+                Provider.AWS: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
+                Provider.GCP: (("europe-north1", "europe-north1"), ("europe-north1-a", "europe-north1-a")),
+            }.get(provider)
+            northern_acceptance = (
+                scenario == Scenario.SAME_ZONE
+                and mode == ExperimentMode.ACCEPTANCE
+                and self.context == "failure_check"
+                and providers == {provider}
+                and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}.get(provider)
+                and locality == northern_locality
+            )
+            if locality != expected_locality and not northern_acceptance:
                 raise ValueError(f"{provider.value} regions/zones do not match the registered {scenario.value} design")
             expected_collocated = provider == Provider.GCP and scenario == Scenario.PLACEMENT_OPTIMIZATION
             if item.placement.collocated != expected_collocated:

@@ -178,7 +178,7 @@ def _common_n(settings):
     return CommonNState.model_validate(frozen).model_dump(mode="json")
 
 
-def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
+def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_preparation: bool = False) -> list[str]:
     """Read-only preflight; an empty list is local readiness, not cloud acceptance."""
     errors = []
     try:
@@ -242,10 +242,10 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
                     uuid.UUID(options["subscription_id"])
                     uuid.UUID(options["tenant_id"])
                     AzureRuntimeOptions.concrete_ubuntu_image(options["selected_image"])
-                elif (set(options["images"]) != {"europe-west3", "europe-west2"} or not all(
-                        isinstance(image, str) and re.fullmatch(r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-[a-z0-9-]+", image)
-                        for image in options["images"].values())):
-                    raise ValueError("set concrete GCP Ubuntu image resource identities for Frankfurt and London")
+                elif provider == "gcp":
+                    from .providers.gcp import validate_ubuntu_image_identities
+                    selected_regions = set(data["provider_configs"]["gcp"]["regions"].values())
+                    validate_ubuntu_image_identities(options["images"], selected_regions=selected_regions)
         # Credential refresh is a reviewed operator fact, never inferred from a login.
         refresh = settings.get("credential_refresh", {})
         if not refresh.get("confirmed") or not refresh.get("valid_through_utc"):
@@ -284,7 +284,12 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path) -> list[str]:
             disk_path = disk_path.parent
         if shutil.disk_usage(disk_path).free < minimum:
             raise ValueError("insufficient local free disk for the declared stage requirement")
-        errors.extend(check_provider_identities(settings["providers"]))
+        # Check the installed bounded transport before read-only identity APIs.
+        # Source-bound amounts and approval still fail closed at admission.
+        if not local_preparation:
+            from .financial_controls import require_transfer_capability
+            require_transfer_capability()
+            errors.extend(check_provider_identities(settings["providers"]))
     except (ValueError, KeyError, OSError, TypeError) as exc:
         errors.append(str(exc) if not isinstance(exc, KeyError) else f"missing operator setting: {exc.args[0]}")
     return errors
@@ -331,9 +336,15 @@ def _cost_payload(settings, root):
                     raise ValueError("price components require finite nonnegative amounts and positive quantities")
                 normalized[name] = {**value, "amount_usd": str(amount), "quantity": str(quantity)}
             regions = sorted(set(data["provider_configs"][provider]["regions"].values()))
+            transfer = pricing.get("result_transfer", {}).get(category, {}).get(provider)
+            if not isinstance(transfer, dict):
+                raise ValueError(f"supply priced pricing.result_transfer.{category}.{provider} payload and protocol allowances")
             rows[provider] = {"envelope_id": f"{config_id}-{provider}", "provider": provider,
                 "priced_on": checked, "source_kind": "provider-price-input", "regions": regions,
-                "unit_basis": "one-two-vm-provider-run", "components": normalized}
+                "unit_basis": "one-two-vm-provider-run", "components": normalized,
+                "result_transfer": transfer}
+            from .financial_controls import transfer_terms
+            transfer_terms(rows[provider])
         templates[config_id] = rows
     funding = pricing.get("funding")
     if not isinstance(funding, dict):
@@ -502,7 +513,7 @@ def _frozen_config(data, alias, settings, entry_id):
 def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                   results_root: Path, clock) -> dict[str, Any]:
     """Prepare identities durably; only read-only identity commands may run."""
-    errors = validate_stage_inputs(plan, settings, root)
+    errors = validate_stage_inputs(plan, settings, root, local_preparation=True)
     if errors:
         raise ValueError("; ".join(errors))
     root = Path(root).resolve()

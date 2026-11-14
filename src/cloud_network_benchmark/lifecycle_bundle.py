@@ -276,6 +276,7 @@ def retry_manifest(manifest: RetrievalManifest, artifact_ids: Sequence[str]) -> 
 def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runner: Any,
                            filesystem: Path, deadline: Any,
                            retry_admission: Callable[[RetrievalItem], bool],
+                           transfer_admission: Callable[[RetrievalItem, int], bool] | None = None,
                            consume_retry: Callable[[str], bool] | None = None,
                            reservation_id: str, provider_trigger: datetime,
                            retry_seconds: float, now_utc: Callable[[], datetime],
@@ -289,12 +290,15 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
     throughout, so the cleanup reserve is not reset between rounds.
     """
     first = run_retrieval(connection, manifest, runner, filesystem, deadline=deadline,
-                          clock=clock, max_attempts=1)
+                          clock=clock, max_attempts=1, transfer_admission=transfer_admission)
     merged = first
     consumed = set(already_retried)
     # Without a durable consumer, refuse retries rather than allow repeated
     # finalization to obtain another transfer attempt.
     retry_ids = retry_failed_items(first, already_retried=tuple(consumed)) if consume_retry is not None else ()
+    if transfer_admission is not None:
+        attempted = {entry.artifact_id for entry in first.attempts}
+        retry_ids = tuple(artifact_id for artifact_id in retry_ids if artifact_id in attempted)
     if any(action.result.get("outcome") == "interrupted" for action in first.actions):
         retry_ids = ()
     for artifact_id in retry_ids:
@@ -323,7 +327,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
         consumed.add(artifact_id)
         one_item = retry_manifest(manifest, (artifact_id,))
         second = run_retrieval(connection, one_item, runner, filesystem, deadline=deadline,
-                               clock=clock, max_attempts=1, attempt_offset=1)
+                               clock=clock, max_attempts=1, attempt_offset=1,
+                               transfer_admission=transfer_admission)
         attempts = [*merged.attempts, *second.attempts]
         by_id = {record.artifact_id: record for record in merged.records}
         by_id.update({record.artifact_id: record for record in second.records})
@@ -386,6 +391,23 @@ def retrieve_closed_bundle_with_ledger(*, ledger: Any, reservation_id: str,
     def admitted(_item: RetrievalItem) -> bool:
         decision = ledger.check_stage_fit(reservation_id, stage="retrieval", remaining=allowance)
         return getattr(decision, "eligible", None) is True
+
+    reservation = ledger.inspect()["reservations"].get(reservation_id)
+    if reservation is None:
+        raise ValueError("retrieval reservation is unavailable")
+    if reservation.get("execution_scope") == "paid_request":
+        provider = kwargs["connection"].provider
+        if provider not in reservation.get("result_transfer", {}):
+            raise ValueError("paid result-transfer allowance is unavailable")
+        if not callable(getattr(kwargs["runner"], "run_bounded_copy", None)):
+            raise ValueError("paid bounded result-transfer runner is unavailable")
+
+        def charge(item: RetrievalItem, attempt: int) -> bool:
+            identity = f"{manifest.deployment_id}:{item.artifact_id}:{attempt}"
+            return ledger.debit_result_transfer(reservation_id, provider=provider,
+                attempt_id=identity, maximum_payload_bytes=item.expected_size_bytes)
+
+        kwargs["transfer_admission"] = charge
 
     kwargs["already_retried"] = tuple(consumed)
     kwargs["reservation_id"] = reservation_id

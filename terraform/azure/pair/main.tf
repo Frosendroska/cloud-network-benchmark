@@ -51,6 +51,7 @@ resource "azurerm_public_ip" "pair" {
   location            = each.value.location
   resource_group_name = data.azurerm_resource_group.pair.name
   allocation_method   = "Static"
+  ip_version          = "IPv4"
   sku                 = "Standard"
   zones               = [each.value.zone]
   tags                = local.tags
@@ -139,10 +140,12 @@ resource "azurerm_network_interface" "pair" {
   location                       = each.value.location
   resource_group_name            = data.azurerm_resource_group.pair.name
   accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
   ip_configuration {
     name                          = "private"
     subnet_id                     = azurerm_subnet.pair[each.value.vnet_key].id
     private_ip_address_allocation = "Static"
+    private_ip_address_version    = "IPv4"
     private_ip_address            = each.value.ip
     public_ip_address_id          = azurerm_public_ip.pair[each.key].id
   }
@@ -164,11 +167,11 @@ resource "azurerm_linux_virtual_machine" "pair" {
   size                            = "Standard_D4s_v5"
   zone                            = each.value.zone
   priority                        = "Regular"
-  admin_username                  = "ubuntu"
+  admin_username                  = var.admin_username
   network_interface_ids           = [azurerm_network_interface.pair[each.key].id]
   disable_password_authentication = true
   admin_ssh_key {
-    username   = "ubuntu"
+    username   = var.admin_username
     public_key = var.ssh_public_key
   }
   source_image_id = startswith(var.selected_image, "/") ? var.selected_image : null

@@ -55,18 +55,21 @@ NETWORK_LIMIT = {
     "checked_on": "2026-10-22",
     "caveat": "Instance family network documentation; credits and achieved throughput are not inferred.",
 }
-REGION_FOR_ZONE = {"eu-central-1a": "eu-central-1", "eu-central-1b": "eu-central-1", "eu-west-2a": "eu-west-2"}
+REGION_FOR_ZONE = {"eu-central-1a": "eu-central-1", "eu-central-1b": "eu-central-1", "eu-west-2a": "eu-west-2", "eu-north-1a": "eu-north-1"}
 ROLE_PRIVATE_IPS = {
     "same_zone": ("10.60.1.10", "10.60.1.11"),
     "cross_zone": ("10.60.1.10", "10.60.2.10"),
     "placement_optimization": ("10.60.1.10", "10.60.1.11"),
     "inter_region": ("10.60.1.10", "10.61.1.10"),
 }
-ALLOWED_SCENARIO_REGIONS = {
-    "same_zone": ("eu-central-1", "eu-central-1"),
-    "cross_zone": ("eu-central-1", "eu-central-1"),
-    "placement_optimization": ("eu-central-1", "eu-central-1"),
-    "inter_region": ("eu-central-1", "eu-west-2"),
+ALLOWED_SCENARIO_LOCALITIES = {
+    "same_zone": {
+        (("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a")),
+        (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
+    },
+    "cross_zone": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1b"))},
+    "placement_optimization": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a"))},
+    "inter_region": {(("eu-central-1", "eu-west-2"), ("eu-central-1a", "eu-west-2a"))},
 }
 TERMINAL_AUTOMATION_STATES = {"Success", "Cancelled", "TimedOut", "Failed"}
 
@@ -86,6 +89,7 @@ class AwsRuntimeSettings(StrictModel):
     complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
+    plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=90, gt=0, le=600)
 
@@ -108,8 +112,10 @@ class AwsRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_paths(self) -> "AwsRuntimeSettings":
-        if set(self.ami_ids) - {"eu-central-1", "eu-west-2"} or not self.ami_ids:
+        if set(self.ami_ids) - {"eu-central-1", "eu-west-2", "eu-north-1"} or not self.ami_ids:
             raise ValueError("ami_ids may identify only the selected AWS regions")
+        if any(not re.fullmatch(r"ami-[a-f0-9]{8,17}", image) for image in self.ami_ids.values()):
+            raise ValueError("ami_ids must contain pinned AWS AMI IDs")
         if not self.authentication_reference.strip():
             raise ValueError("authentication_reference must be a non-secret runtime reference")
         return self
@@ -178,6 +184,9 @@ class AwsProviderDriver:
             self._active_attempt = attempt
             self._active_commands = []
             journal = self._load_journal(attempt, deployment)
+            scope = self._deployment_scope(deployment)
+            if journal.get("deployment_scope") and journal["deployment_scope"] != scope:
+                raise AwsProviderError("existing expiry journal has a different source-bound AWS scope", category="scope_mismatch")
             if journal.get("registered"):
                 evidence = ExpiryEvidence.model_validate(journal["expiry_evidence"])
                 if evidence.state == "registered" and evidence.expires_at.value == trigger:
@@ -186,6 +195,7 @@ class AwsProviderDriver:
 
             # Reservation cap start is supplied by the caller and must already be active.
             journal.update({
+                "deployment_scope": scope,
                 "cap_started_at": reservation.cap_started_at.value.isoformat(),
                 "cap_expires_at": reservation.expires_at.value.isoformat(),
                 "reservation_id": reservation.reservation_id.value,
@@ -328,6 +338,8 @@ class AwsProviderDriver:
         self._active_primary_failure = None
         journal = self._load_journal(attempt, deployment)
         self._block_on_residual_cleanup(deployment)
+        if journal.get("deployment_scope") and journal["deployment_scope"] != self._deployment_scope(deployment):
+            raise AwsProviderError("deployment differs from the registered AWS scope", category="scope_mismatch")
         if not journal.get("registered") or set(journal.get("registered_regions", [])) != set(self._regions(deployment)):
             raise AwsProviderError("private expiry journal does not confirm every involved region", category="expiry_required")
         registered = self._expiry_from_journal(deployment, journal)
@@ -434,6 +446,10 @@ class AwsProviderDriver:
         primary = FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else self._active_primary_failure
         inventory_by_region: dict[str, Any] = {}
         regions = journal.get("regions") or self._regions(deployment)
+        scope = journal.get("deployment_scope")
+        if scope and (scope.get("account_id") != self.settings.account_id or regions != list(dict.fromkeys(scope.get("regions", [])))):
+            failure = _failure(AwsProviderError("cleanup account or regions differ from registered AWS scope", category="scope_mismatch"), self.clock())
+            return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
         self._registration_deadline = None
         self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
 
@@ -779,15 +795,13 @@ class AwsProviderDriver:
 
     def _pair_variables(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
         scenario = str(deployment.scenario)
-        regions = ALLOWED_SCENARIO_REGIONS[scenario]
+        regions = self._regions(deployment)
         if any(region not in self.settings.ami_ids for region in set(regions)):
             raise AwsProviderError("a regional Canonical AMI ID is missing", category="ami_missing")
         if deployment.provider_options.get("instance_market_type") != "on_demand":
             raise AwsProviderError("AWS spot instances are not permitted", category="shape_mismatch")
         if scenario == "inter_region" and not _primary_review_valid(self.settings.primary_review_decision, scenario, self.clock().astimezone(timezone.utc)):
             raise AwsProviderError("S4 requires sourced priority review and admission", category="review_required")
-        if tuple(regions) != (deployment.vm_a.region, deployment.vm_b.region):
-            raise AwsProviderError("AWS scenario regions differ from the selected provider locality", category="scenario_mismatch")
         if scenario == "cross_zone" and deployment.vm_a.zone == deployment.vm_b.zone:
             raise AwsProviderError("cross_zone requires distinct selected zones", category="scenario_mismatch")
         if scenario in {"same_zone", "placement_optimization"} and deployment.vm_a.zone != deployment.vm_b.zone:
@@ -803,7 +817,9 @@ class AwsProviderDriver:
             "deployment_id": deployment.deployment_id,
             "scenario": scenario,
             "controller_cidr": self.settings.controller_cidr,
-            "image_id_frankfurt": self.settings.ami_ids["eu-central-1"],
+            "primary_region": deployment.vm_a.region,
+            "primary_zone": deployment.vm_a.zone,
+            "image_id_primary": self.settings.ami_ids[deployment.vm_a.region],
             "image_id_london": self.settings.ami_ids.get("eu-west-2", "ami-00000000000000000"),
             "host_key_bootstrap": _host_key_cloud_init(self.settings.public_key),
             "placement_group_name": deployment.placement.name or f"{_namespace(deployment)}-cluster",
@@ -820,10 +836,12 @@ class AwsProviderDriver:
             missing = [name for name in required if not details.get(name)]
             if missing:
                 raise AwsProviderError(f"Terraform output {role} missing {', '.join(missing)}", category="output_incomplete")
-            expected_region = dict(zip(("vm_a", "vm_b"), ALLOWED_SCENARIO_REGIONS[str(deployment.scenario)]))[role]
-            expected_zone = "eu-central-1a" if role == "vm_a" else ("eu-west-2a" if str(deployment.scenario) == "inter_region" else "eu-central-1b" if str(deployment.scenario) == "cross_zone" else "eu-central-1a")
+            expected_region = deployment.vm_a.region if role == "vm_a" else deployment.vm_b.region
+            expected_zone = deployment.vm_a.zone if role == "vm_a" else deployment.vm_b.zone
             if details["region"] != expected_region or details["zone"] != expected_zone:
                 raise AwsProviderError(f"observed {role} region/zone does not match the selected scenario", category="locality_mismatch")
+            if details["image_id"] != self.settings.ami_ids.get(expected_region):
+                raise AwsProviderError(f"observed {role} AMI differs from the pinned regional image", category="image_shape_mismatch")
             if details["shape"] != "m7i.xlarge" or details["architecture"] != "x86_64" or details["image_owner_id"] != "099720109477":
                 raise AwsProviderError(f"observed {role} shape/image identity does not match Ubuntu 24.04 amd64 requirements", category="image_shape_mismatch")
             identity = f"{details['image_id']}:{details['image_owner_id']}:ubuntu-noble-24.04-amd64-hvm"
@@ -1217,11 +1235,29 @@ class AwsProviderDriver:
         )
 
     def _regions(self, deployment: ProviderDeploymentInput) -> list[str]:
-        expected = ALLOWED_SCENARIO_REGIONS[str(deployment.scenario)]
-        actual = (deployment.vm_a.region, deployment.vm_b.region)
-        if actual != expected:
-            raise AwsProviderError(f"AWS scenario regions must be {expected}, got {actual}", category="scenario_mismatch")
-        return list(dict.fromkeys(expected))
+        scenario = str(deployment.scenario)
+        actual = ((deployment.vm_a.region, deployment.vm_b.region), (deployment.vm_a.zone, deployment.vm_b.zone))
+        if actual not in ALLOWED_SCENARIO_LOCALITIES.get(scenario, set()) or any(REGION_FOR_ZONE.get(zone) != region for region, zone in zip(*actual)):
+            raise AwsProviderError(f"AWS scenario region/zone combination is unsupported: {actual}", category="scenario_mismatch")
+        if "eu-north-1" in actual[0] and not (
+            scenario == "same_zone" and deployment.mode == "acceptance"
+            and deployment.context == "failure_check" and deployment.experiment_id == "EXP-900"
+        ):
+            raise AwsProviderError("Stockholm is limited to the reviewed EXP-900 acceptance check", category="scenario_mismatch")
+        return list(dict.fromkeys(actual[0]))
+
+    def _deployment_scope(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+        regions = self._regions(deployment)
+        if any(region not in self.settings.ami_ids for region in regions):
+            raise AwsProviderError("a regional Canonical AMI ID is missing", category="ami_missing")
+        return {
+            "account_id": self.settings.account_id,
+            "scenario": str(deployment.scenario),
+            "regions": [deployment.vm_a.region, deployment.vm_b.region],
+            "zones": [deployment.vm_a.zone, deployment.vm_b.zone],
+            "ami_ids": {region: self.settings.ami_ids[region] for region in regions},
+            "config_sha256": deployment.config_sha256,
+        }
 
     def _target_selector(self, deployment: ProviderDeploymentInput, regions: list[str]) -> str:
         return f"account={self.settings.account_id};regions={','.join(regions)};tags=cnb_run_id:{deployment.run_id}&cnb_deployment_id:{deployment.deployment_id}"
@@ -1277,7 +1313,7 @@ class AwsProviderDriver:
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
         registration_action = action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")) and "-cancel-" not in action_id
-        if self._registration_deadline is not None and registration_action:
+        if self._registration_deadline is not None and (registration_action or action_id.startswith("aws-safety-apply-")):
             remaining = int(self._registration_deadline - time.monotonic())
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
@@ -1309,28 +1345,33 @@ class AwsProviderDriver:
         if remaining_after_init <= 0:
             raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
         request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
-        result = self.runner.run(request)
-        # Persist only redacted command identity/outcome/timing, never provider stdout.
-        record = {
-            "action_id": result.action_id,
-            "argv": request.durable_view()["argv"],
-            "outcome": str(result.outcome),
-            "started_at": result.started_at.isoformat(),
-            "finished_at": result.finished_at.isoformat(),
-            "duration_seconds": result.duration_seconds,
-            "duration_basis": result.duration_basis,
-            "exit_code": result.exit_code,
-            "redactions_applied": bool(result.redactions),
-        }
-        self._active_commands.append(record)
-        if self._active_attempt is not None:
-            command_log = self._active_attempt / "commands.jsonl"
-            with command_log.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(command_log, 0o600)
-        return result
+        def execute(request):
+            result = self.runner.run(request)
+            # Persist only redacted command identity/outcome/timing, never provider stdout.
+            record = {
+                "action_id": result.action_id,
+                "argv": request.durable_view()["argv"],
+                "outcome": str(result.outcome),
+                "started_at": result.started_at.isoformat(),
+                "finished_at": result.finished_at.isoformat(),
+                "duration_seconds": result.duration_seconds,
+                "duration_basis": result.duration_basis,
+                "exit_code": result.exit_code,
+                "redactions_applied": bool(result.redactions),
+            }
+            self._active_commands.append(record)
+            if self._active_attempt is not None:
+                command_log = self._active_attempt / "commands.jsonl"
+                with command_log.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(command_log, 0o600)
+            return result
+        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+            from ..terraform_plan import reviewed_apply
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+        return execute(request)
 
     def _aws_json(self, *argv: str) -> dict[str, Any]:
         action_id = "aws-" + "-".join(argv[1:3]).replace("_", "-")

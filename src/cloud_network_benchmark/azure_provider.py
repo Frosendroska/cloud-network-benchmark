@@ -56,6 +56,7 @@ class AzureRuntimeOptions(StrictModel):
     poll_seconds: int = Field(ge=1, le=300)
     command_timeout_seconds: float = Field(gt=0)
     expiry_cost_input: dict[str, Any]
+    plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
 
     @field_validator("subscription_id", "tenant_id")
     @classmethod
@@ -184,8 +185,6 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         raise ValueError("Azure disk must be StandardSSD_LRS_E4")
     if d.vm_a.acceleration.kind != "accelerated_networking" or d.vm_b.acceleration.kind != "accelerated_networking":
         raise ValueError("both Azure NICs require Accelerated Networking")
-    if d.vm_a.region != "germanywestcentral" or d.vm_b.region not in {"germanywestcentral", "uksouth"}:
-        raise ValueError("Azure locality must use Frankfurt and optionally London")
     expected = {
         Scenario.SAME_ZONE: ("germanywestcentral", "germanywestcentral", "1", "1", "none"),
         Scenario.CROSS_ZONE: ("germanywestcentral", "germanywestcentral", "1", "2", "none"),
@@ -193,12 +192,17 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         Scenario.INTER_REGION: ("germanywestcentral", "uksouth", "1", "1", "none"),
     }[Scenario(d.scenario)]
     got = (d.vm_a.region, d.vm_b.region, d.vm_a.zone, d.vm_b.zone, d.placement.kind)
-    if got != expected:
+    sweden_component = (d.experiment_id == "EXP-901" and d.mode == ExperimentMode.ACCEPTANCE
+        and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE
+        and got == ("swedencentral", "swedencentral", "1", "1", "none"))
+    if got != expected and not sweden_component:
         raise ValueError(f"scenario locality/placement mismatch: expected {expected}, got {got}")
     if d.scenario == Scenario.PLACEMENT_OPTIMIZATION and not d.placement.name:
         raise ValueError("placement optimization requires a named PPG")
     if d.scenario != Scenario.PLACEMENT_OPTIMIZATION and d.placement.name is not None:
         raise ValueError("PPG is only valid for placement_optimization")
+    if d.vm_a.connection_user != d.vm_b.connection_user:
+        raise ValueError("Azure pair requires the same configured admin user on both VMs")
     reservation = d.reservation.value
     if reservation is None or reservation.state != "reserved" or reservation.reservation_id.value is None:
         raise ValueError("matching active reservation evidence is required")
@@ -285,6 +289,7 @@ def _persist_tfvars(root: Path, journal: Path, name: str, values: dict[str, Any]
     os.chmod(path, 0o600)
     state = json.loads(journal.read_text(encoding="utf-8"))
     state.setdefault("terraform_inputs", {})[name] = path.name
+    state.setdefault("terraform_input_sha256", {})[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     _atomic_private(journal, state)
     return path
 
@@ -299,7 +304,13 @@ def _recovery_tfvars(root: Path, journal: Path, name: str, expected: dict[str,An
         raise RuntimeError(f"private {name} Terraform input is missing or has unsafe permissions")
     try: payload=json.loads(path.read_text(encoding="utf-8"))
     except (OSError,json.JSONDecodeError) as exc: raise RuntimeError(f"private {name} Terraform input is malformed") from exc
-    if payload!=expected: raise RuntimeError(f"private {name} Terraform input no longer matches this deployment")
+    digest = state.get("terraform_input_sha256", {}).get(name)
+    if digest is not None and digest != hashlib.sha256(path.read_bytes()).hexdigest():
+        raise RuntimeError(f"private {name} Terraform input no longer matches its original hash")
+    if digest is None and name == "pair" and "admin_username" not in payload:
+        expected = {key:value for key,value in expected.items() if key != "admin_username"}
+    if (digest is None and payload != expected) or any(payload.get(key) != value for key,value in expected.items()):
+        raise RuntimeError(f"private {name} Terraform input no longer matches this deployment")
     return path
 
 
@@ -384,12 +395,13 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
     now = reservation.cap_started_at.value
     _validate_request(deployment, options, now, None, check_live_clock=False)
     scenario = Scenario(deployment.scenario)
-    return {"resource_group_name": _slug(deployment), "location": "germanywestcentral",
+    return {"resource_group_name": _slug(deployment), "location": deployment.vm_a.region,
         "subscription_id": options.subscription_id, "deployment_id": deployment.deployment_id,
         "config_sha256": deployment.config_sha256, "controller_cidr": options.controller_cidr,
         "ssh_public_key": options.ssh_public_key, "selected_image": options.selected_image,
+        "admin_username": deployment.vm_a.connection_user,
         "placement_group_name": deployment.placement.name or "", "scenario": scenario.value,
-        "region_a": "germanywestcentral", "region_b": "uksouth" if scenario == Scenario.INTER_REGION else "germanywestcentral",
+        "region_a": deployment.vm_a.region, "region_b": deployment.vm_b.region,
         "zone_a": "1", "zone_b": "2" if scenario == Scenario.CROSS_ZONE else "1",
         "private_a": "10.70.0.4", "private_b": "10.71.0.4" if scenario == Scenario.INTER_REGION else "10.70.0.5",
         "create_peering": scenario == Scenario.INTER_REGION, "create_ppg": scenario == Scenario.PLACEMENT_OPTIMIZATION,
@@ -418,21 +430,29 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     req = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type=action, argv=argv,
         cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=min(options.command_timeout_seconds, remaining),
         environment=environment, environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
-    try:
-        result = runner.run(req)
-    except Exception as exc:
+    def execute(req: CommandRequest) -> CommandResult:
+        try:
+            result = runner.run(req)
+        except Exception as exc:
+            journal = root / "recovery.json"
+            if journal.is_file() and not journal.is_symlink():
+                state=json.loads(journal.read_text(encoding="utf-8"))
+                state.setdefault("actions", []).append({"action_id":req.action_id,"action_type":action,"request":req.durable_view(),"outcome":"unknown","error":_redact(options,exc)[:500]})
+                _atomic_private(journal,state)
+            raise RuntimeError(_redact(options, exc)) from exc
+        result = result.model_copy(update={"redactions":list(set(result.redactions + req.redactions))})
         journal = root / "recovery.json"
         if journal.is_file() and not journal.is_symlink():
             state=json.loads(journal.read_text(encoding="utf-8"))
-            state.setdefault("actions", []).append({"action_id":req.action_id,"action_type":action,"request":req.durable_view(),"outcome":"unknown","error":_redact(options,exc)[:500]})
+            state.setdefault("actions", []).append({"request":req.durable_view(),"result":_safe_result_view(options,result)})
             _atomic_private(journal,state)
-        raise RuntimeError(_redact(options, exc)) from exc
-    result = result.model_copy(update={"redactions":list(set(result.redactions + req.redactions))})
-    journal = root / "recovery.json"
-    if journal.is_file() and not journal.is_symlink():
-        state=json.loads(journal.read_text(encoding="utf-8"))
-        state.setdefault("actions", []).append({"request":req.durable_view(),"result":_safe_result_view(options,result)})
-        _atomic_private(journal,state)
+        return result
+    if "apply" in argv and any(arg.startswith("-chdir=") for arg in argv):
+        from .terraform_plan import reviewed_apply
+        req = req.model_copy(update={"cwd": str(root)})
+        result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds)
+    else:
+        result = execute(req)
     if result.outcome != "succeeded" and not (allow_not_found and _is_exact_not_found(result)):
         raise RuntimeError(_redact(options,f"{action} failed with {result.outcome}: {result.stderr[:1000]}"))
     if len(result.stdout.encode("utf-8"))>1_000_000 or len(result.stderr.encode("utf-8"))>1_000_000:
@@ -565,7 +585,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     root, journal = _workspace(options, deployment)
     pair_vars = _persist_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
     expiry_values={"subscription_id":options.subscription_id,"tenant_id":options.tenant_id,
-        "resource_group_name":name,"deployment_id":deployment.deployment_id,"location":"germanywestcentral"}
+        "resource_group_name":name,"deployment_id":deployment.deployment_id,"location":deployment.vm_a.region}
     expiry_vars = _persist_tfvars(root,journal,"expiry",expiry_values)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"
@@ -580,13 +600,20 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     _atomic_private(journal, state)
     # Terraform creates only the attempt group, Basic Automation identity, and narrow role.
     _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_init")
-    _tf(root,options,runner,clock,"terraform/azure/expiry","apply","-auto-approve","-input=false",f"-var-file={expiry_vars}",action="expiry_prerequisites")
+    review_now, review_mono = utc_now().astimezone(UTC), clock()
+    review_slack = min(options.cap_deadline_monotonic-review_mono,
+        (trigger-review_now).total_seconds()) - options.post_registration_workflow_seconds
+    if review_slack <= 0: raise TimeoutError("expiry plan review no longer fits before the workflow allowance")
+    review_options = options.model_copy(update={"cap_deadline_monotonic":review_mono+review_slack})
+    _tf(root,review_options,runner,clock,"terraform/azure/expiry","apply","-input=false",f"-var-file={expiry_vars}",action="expiry_prerequisites")
     expiry_outputs = json.loads(_tf(root,options,runner,clock,"terraform/azure/expiry","output","-json",action="expiry_outputs").stdout)
     expiry_ids = {key: item.get("value") for key, item in expiry_outputs.items()}
     required_outputs = ("resource_group_id", "automation_account_id", "principal_id", "role_assignment_id", "role_definition_id")
     if any(not expiry_ids.get(key) for key in required_outputs):
         raise RuntimeError("expiry prerequisite outputs are incomplete")
     account_read=json.loads(_command(runner,options,root,_azure_rest("GET",f"{account}?api-version={AUTOMATION_API}"),"automation_account_readback",clock).stdout)
+    if account_read.get("location") != deployment.vm_a.region:
+        raise RuntimeError("Automation account region mismatch")
     account_identity=account_read.get("identity",{})
     if account_identity.get("type")!="SystemAssigned" or account_identity.get("principalId","").lower()!=str(expiry_ids["principal_id"]).lower():
         raise RuntimeError("Automation account system-assigned identity readback mismatch")
@@ -597,7 +624,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     base = f"{account}/runbooks/{rb}?api-version={AUTOMATION_API}"
     script_path = Path(__file__).resolve().parents[2] / "terraform/azure/expiry/deallocate.ps1"
     script = script_path.read_text(encoding="utf-8")
-    runbook = {"location":"germanywestcentral","properties":{"runbookType":"PowerShell","logVerbose":False,"logProgress":True,"description":"F06 deallocate-only expiry"}}
+    runbook = {"location":deployment.vm_a.region,"properties":{"runbookType":"PowerShell","logVerbose":False,"logProgress":True,"description":"F06 deallocate-only expiry"}}
     state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["runbook"]="creating"; _atomic_private(journal,state)
     _command(runner, options, root, _azure_rest("PUT", base, runbook), "runbook_draft", clock)
     state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["runbook"]="draft"; _atomic_private(journal,state)
@@ -612,6 +639,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     published={}
     while True:
         published = json.loads(_command(runner, options, root, _azure_rest("GET", base), "runbook_readback", clock).stdout or "{}")
+        if published.get("location") != deployment.vm_a.region:
+            raise RuntimeError("Automation runbook region mismatch")
         if (published.get("properties", {}).get("state") == "Published"
                 and published.get("properties", {}).get("runbookType") == "PowerShell"
                 and published.get("properties", {}).get("runtimeEnvironment") in (None, "", "PowerShell-5.1")):
@@ -677,7 +706,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     registered_at = utc_now().astimezone(UTC)
     if trigger <= registered_at + timedelta(seconds=options.post_registration_workflow_seconds):
         raise ValueError("post-registration workflow no longer fits actual trigger")
-    metadata = {"mechanism":"azure_automation_once_deallocate","api_version":AUTOMATION_API,"resource_group":name,
+    metadata = {"mechanism":"azure_automation_once_deallocate","api_version":AUTOMATION_API,"resource_group":name,"location":deployment.vm_a.region,
         "reservation_id":reservation.reservation_id.value,"source_sha256":reservation.source_sha256,
         "runbook":rb,"schedule":sched,"job_schedule_id":job_id,"trigger":trigger.isoformat(),"target_ids":ids,
         "published_content_sha256":digest,"runtime":"PowerShell 5.1","module":{"name":"Az.Accounts","version":module_props["version"]},
@@ -720,11 +749,15 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
         raise ValueError("registered expiry target identities do not match the deterministic pair")
     runbook_url = f"{account}/runbooks/{m['runbook']}?api-version={AUTOMATION_API}"
     runbook = json.loads(_command(runner, options, root, _azure_rest("GET", runbook_url), "expiry_runbook_recheck", clock).stdout or "{}")
+    if runbook.get("location") != deployment.vm_a.region:
+        raise RuntimeError("registered runbook region changed")
     if runbook.get("properties", {}).get("state") != "Published":
         raise RuntimeError("registered runbook is no longer Published")
     if runbook.get("properties", {}).get("runbookType") != "PowerShell" or runbook.get("properties", {}).get("runtimeEnvironment") not in (None, "", "PowerShell-5.1"):
         raise RuntimeError("registered runbook runtime changed")
     account_read=json.loads(_command(runner,options,root,_azure_rest("GET",f"{account}?api-version={AUTOMATION_API}"),"expiry_account_recheck",clock).stdout)
+    if account_read.get("location") != deployment.vm_a.region:
+        raise RuntimeError("registered Automation account region changed")
     if account_read.get("identity",{}).get("type") != "SystemAssigned" or account_read.get("identity",{}).get("principalId","").lower() != str(m.get("managed_identity_principal_id","")).lower():
         raise RuntimeError("registered Automation system-assigned identity changed")
     content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{m['runbook']}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "expiry_content_recheck", clock)
@@ -823,11 +856,12 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
 def _tf(root: Path, options: AzureRuntimeOptions, runner: CommandRunner, clock: Callable[[], float],
         workdir: str, *args: str, action: str) -> CommandResult:
     state = root / ("expiry.tfstate" if workdir.endswith("/expiry") else "pair.tfstate")
-    argv = ["terraform", f"-chdir={workdir}", *args]
+    source_root = Path(__file__).resolve().parents[2] / workdir
+    argv = ["terraform", f"-chdir={source_root}", *args]
     if args and args[0] in {"apply", "destroy", "output"}:
-        argv += ["-state", str(state)]
+        argv += [f"-state={state}"]
     if args and args[0] == "init":
-        argv += [f"-backend-config=path={state}"]
+        argv += [f"-backend-config=path={state}", "-lockfile=readonly"]
     return _command(runner, options, root, argv, action, clock)
 
 
@@ -852,7 +886,7 @@ def _key_material(text: str) -> str:
 
 
 def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner, root: Path,
-                             clock: Callable[[],float]) -> dict[str,Any]:
+                             clock: Callable[[],float], region: str) -> dict[str,Any]:
     image=options.selected_image
     if image.startswith("/"):
         version_id=image
@@ -868,7 +902,7 @@ def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner
         actual={"id":version.get("id"),"architecture":architecture,"publisher":publisher,"offer":offer,"sku":sku,
                 "version":version.get("name") or version_id.rstrip("/").split("/")[-1],"source":"shared_gallery"}
     else:
-        result=json.loads(_command(runner,options,root,["az","vm","image","show","--location","germanywestcentral","--urn",image,"--output","json"],"image_preflight",clock).stdout)
+        result=json.loads(_command(runner,options,root,["az","vm","image","show","--location",region,"--urn",image,"--output","json"],"image_preflight",clock).stdout)
         image_id=result.get("id") if isinstance(result,dict) else None
         image_name=result.get("name") if isinstance(result,dict) else None
         if not isinstance(image_id,str) or not isinstance(image_name,str):
@@ -880,6 +914,9 @@ def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner
         os_metadata=result.get("osDiskImage")
         actual={"id":image_id,"architecture":result.get("architecture"),"operating_system":os_metadata.get("operatingSystem") if isinstance(os_metadata,dict) else None,
                 "publisher":publisher,"offer":offer,"sku":sku,"version":image_name,"source":"marketplace"}
+        if (str(result.get("location", "")).lower() != region.lower()
+                or f"/locations/{region.lower()}/" not in image_id.lower()):
+            raise ValueError("Marketplace image response is for a different region")
         if image_name.lower()!=version.lower():
             raise ValueError("Marketplace image name and resource version identity disagree")
     if str(actual.get("architecture") or "").lower() not in {"x64","amd64"} or str(actual.get("publisher") or "").lower()!="canonical" or not re.search(r"(?i)(ubuntu-24_04|ubuntu-24\.04|ubuntu2404|noble)",str(actual.get("offer",""))+" "+str(actual.get("sku",""))):
@@ -895,8 +932,13 @@ def _validate_image_metadata(options: AzureRuntimeOptions, runner: CommandRunner
 
 
 def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root: Path,
-                      vm_id: str, clock: Callable[[],float], requested: str) -> str:
+                      vm_id: str, clock: Callable[[],float], requested: str, region: str, zone: str, admin_user: str) -> str:
     payload=json.loads(_command(runner,options,root,["az","vm","show","--ids",vm_id,"--output","json"],"vm_image_observation",clock).stdout)
+    if (str(payload.get("id", "")).lower() != vm_id.lower() or payload.get("location") != region
+            or payload.get("zones") != [zone]
+            or payload.get("hardwareProfile", {}).get("vmSize") != "Standard_D4s_v5"
+            or payload.get("osProfile", {}).get("adminUsername") != admin_user):
+        raise ValueError("authenticated Azure VM identity, locality or shape differs from the request")
     storage=payload.get("storageProfile",payload.get("properties",{}).get("storageProfile",{}))
     ref=storage.get("imageReference",{})
     if requested.startswith("/"):
@@ -931,21 +973,27 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
             raise TimeoutError("remaining complete workflow no longer fits before the registered trigger")
         if options.cap_deadline_monotonic-fresh_mono < options.post_registration_workflow_seconds:
             raise TimeoutError("remaining complete workflow no longer fits within the original monotonic cap")
-        image_probe=_validate_image_metadata(options,runner,root,clock)
+        image_probe=_validate_image_metadata(options,runner,root,clock,deployment.vm_a.region)
         state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=True; state["pair_state"]="creating"; _atomic_private(journal,state)
-        args=["apply","-auto-approve","-input=false",f"-var-file={pair_vars}"]
+        args=["apply","-input=false",f"-var-file={pair_vars}"]
         preapply_utc=utc_now().astimezone(UTC); preapply_mono=clock()
         if deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds) or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds:
             state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=False; state["pair_state"]="not_started"; _atomic_private(journal,state)
             raise TimeoutError("complete workflow no longer fits immediately before pair apply")
-        apply=_tf(root,options,runner,clock,"terraform/azure/pair",*args,action="pair_apply"); results.append(apply.durable_view())
+        review_slack = min(options.cap_deadline_monotonic-preapply_mono,
+            (deployment.expiry.value.expires_at.value-preapply_utc).total_seconds()) - options.post_registration_workflow_seconds
+        if review_slack <= 0: raise TimeoutError("pair plan review no longer fits before the workflow allowance")
+        review_options = options.model_copy(update={"cap_deadline_monotonic":preapply_mono+review_slack})
+        apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply"); results.append(apply.durable_view())
         out=_tf(root,options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
         outputs=json.loads(out.stdout)
         observed_images={}
         vms=[]; key_lines=[]
         for role in ("a","b"):
             data=_validate_vm_output_data(deployment,options,role,outputs["vm_"+role]["value"],ids[0 if role=="a" else 1])
-            data["image"]=_observe_vm_image(options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image)
+            data["image"]=_observe_vm_image(options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image,deployment.vm_a.region if role=="a" else deployment.vm_b.region,
+                deployment.vm_a.zone if role=="a" else deployment.vm_b.zone,
+                deployment.vm_a.connection_user if role=="a" else deployment.vm_b.connection_user)
             observed_images[role]=data["image"]
             valid_outputs[role]=data
             nonce=secrets.token_urlsafe(24)
@@ -1056,6 +1104,8 @@ def _partial_empty_vm(role: str, reason: str) -> ProviderVmOutput:
 
 def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
             clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureCleanupResult:
+    options = options.model_copy(update={"cap_deadline_monotonic": clock() +
+        (deployment.cleanup_timeout_seconds or options.command_timeout_seconds)})
     start=utc_now().astimezone(UTC); root=options.attempt_root; journal=root/"recovery.json"; actions=[]; failures=[]; resources=[]
     if not journal.is_file() or journal.is_symlink():
         failures.append(FailureEvidence(category="recovery_missing",message="private recovery journal unavailable",occurred_at=start))
@@ -1074,9 +1124,16 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         if "pair" not in input_names:
             if state.get("creation_may_have_started"): raise RuntimeError("pair Terraform inputs are missing after resource creation may have started")
             pair_vars=_persist_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
-        else: pair_vars=_recovery_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
+        else:
+            # New journals bind original bytes, so future mappings/prices/images cannot
+            # regenerate recovery inputs. Legacy journals retain their strict comparison.
+            expected_pair = ({"subscription_id":options.subscription_id,"resource_group_name":_slug(deployment),
+                "deployment_id":deployment.deployment_id,"config_sha256":deployment.config_sha256,
+                "location":deployment.vm_a.region,"region_a":deployment.vm_a.region,"region_b":deployment.vm_b.region}
+                if state.get("terraform_input_sha256",{}).get("pair") else build_pair_inputs(deployment,options))
+            pair_vars=_recovery_tfvars(root,journal,"pair",expected_pair)
         expected_expiry={"subscription_id":options.subscription_id,"tenant_id":options.tenant_id,
-            "resource_group_name":_slug(deployment),"deployment_id":deployment.deployment_id,"location":"germanywestcentral"}
+            "resource_group_name":_slug(deployment),"deployment_id":deployment.deployment_id,"location":deployment.vm_a.region}
         if "expiry" not in input_names:
             if state.get("expiry_state") not in (None,"preparing","failed"): raise RuntimeError("expiry Terraform inputs are missing after expiry preparation")
             expiry_vars=_persist_tfvars(root,journal,"expiry",expected_expiry)
@@ -1088,6 +1145,7 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
             actions.append(_safe_cleanup_action(options,_prove_vm_absent(runner,options,root,vm_id,clock)))
         prereq=state.get("expiry",{})
         applied=any(item.get("request",{}).get("action_type")=="expiry_prerequisites"
+                    and "apply" in item.get("request",{}).get("argv",[])
                     and item.get("result",{}).get("outcome")=="succeeded" for item in state.get("actions",[]))
         if applied and not prereq.get("role_assignment_id"):
             _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_recovery_identity_init")

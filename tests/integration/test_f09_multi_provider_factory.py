@@ -21,6 +21,8 @@ from cloud_network_benchmark.bootstrap import BootstrapConfig, SourceBuild
 from cloud_network_benchmark.readiness import ReadinessConfig
 
 
+pytestmark = pytest.mark.usefixtures('isolated_legacy_saved_plan_boundary', 'isolated_legacy_provider_financial_boundary')
+
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 
@@ -71,6 +73,9 @@ class FailedExternalCommands:
         return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
             finished_at=NOW, duration_seconds=0, exit_code=1, stdout="", stderr="injected offline failure")
 
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        raise AssertionError(f"protection failure must not reach result transfer: {request.action_id}")
+
 
 class GcpSourceRunner:
     """Source-shaped gcloud/Terraform replies for an observed real GCP driver."""
@@ -81,6 +86,9 @@ class GcpSourceRunner:
         self.actions = []
         self.error = None
         self.clock = None
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        raise AssertionError(f"GCP provider-only protection fixture must not reach result transfer: {request.action_id}")
 
     def run(self, request):
         import base64, hashlib, struct
@@ -142,12 +150,14 @@ class GcpSourceRunner:
         raise AssertionError(f"unexpected GCP command {action}: {request.argv}")
 
 
+@pytest.mark.parametrize("north", [False, True], ids=["frankfurt", "finland"])
 def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shaped_commands(
-        tmp_path, repository_root, monkeypatch):
+        tmp_path, repository_root, monkeypatch, north):
     """Use real F11, GCP provider hooks and F09 finalizer with only command replies faked."""
     import cloud_network_benchmark.lifecycle_adapters as adapters
 
-    config = repository_root / "configs/tests/exp-902-gcp-single-provider.yaml"
+    config = repository_root / "configs/tests" / (
+        "exp-902-gcp-single-provider-north.yaml" if north else "exp-902-gcp-single-provider.yaml")
     campaign, _ = resolve_campaign(config, repository_root)
     initialized = initialize_campaign(config, repository_root, tmp_path / "results",
         clock=lambda: NOW, token_source=lambda: "gcp-source-shaped")
@@ -183,8 +193,9 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
             "bootstrap": bootstrap, "guest_remote_root": "/var/lib/cnb/runtime",
             "diagnostic_interfaces": {"gcp": {"vm_a": "ens4", "vm_b": "ens4"}}},
         "providers": {"gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
-                "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
-                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"},
+                "images": ({"europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105"}
+                    if north else {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
+                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"}),
                 "public_key_path": pub, "authentication_reference": "fake-gcp-auth"},
             "bootstrap_template": repository_root / "terraform/gcp/pair/main.tf",
             "terraform_directory": repository_root / "terraform/gcp",
@@ -225,6 +236,15 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert "gcp-pair-outputs" in [request.action_id for request in runner.requests]
     assert "gcp-pair-apply" in [request.action_id for request in runner.requests]
     assert "gcp-pair-destroy" in [request.action_id for request in runner.requests]
+    if north:
+        assert runner.deployment.vm_a.region == runner.deployment.vm_b.region == "europe-north1"
+        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-a"
+        assert runner.driver.settings.images == runtime["providers"]["gcp"]["options"]["images"]
+        assert all("europe-west3" not in request.argv and "europe-west2" not in request.argv
+            for request in runner.requests if request.action_id.startswith("gcp-"))
+        assert all("--regions=europe-north1" in request.argv
+            for request in runner.requests if request.action_id.startswith((
+                "gcp-address-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-")))
     # Reopen only the cleanup obligation to model a process loss after the
     # provider journal was written. The default CLI must reload the original
     # saved provider settings and reconcile without creating a new attempt.
@@ -281,7 +301,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
                 "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
                 "ssh_public_key_path": pub, "authentication_reference": str(identity),
-                "poll_seconds": 15, "command_timeout_seconds": 60},
+                "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
             "bootstrap_template": repository_root / "terraform/azure/pair/main.tf",
             "terraform_directory": repository_root / "terraform/azure",
             "sources": {"expiry_cost_path": expiry_cost, "primary_review_path": None}}}}
@@ -290,6 +310,8 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
         def __init__(self):
             self.delegate = None
             self.requests = []
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            raise AssertionError(f"Azure provider-only protection fixture must not reach result transfer: {request.action_id}")
         def run(self, request):
             assert self.delegate is not None, "actual Azure hook must bind the cleanup runner before protection"
             self.requests.append(request)
@@ -297,7 +319,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
             if request.action_type == "vm_image_observation":
                 self.delegate.requests.append(request)
                 publisher, offer, sku, version = self.delegate.o.selected_image.split(":")
-                payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                     "offer": offer, "sku": sku, "exactVersion": version}}}
                 return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
                     started_at=clock.utc_now(), finished_at=clock.utc_now(), duration_seconds=0,
@@ -328,6 +350,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
     assert set(result.provider_results) == {"azure"}
     provider = result.provider_results["azure"]
     assert provider.values["protect"].state == "registered", provider.values["protect"].failure
+    assert observed["options"].plan_review_timeout_seconds == 30
     assert provider.values["claim"].eligible is True
     assert provider.values["claim"].creation_granted is True
     assert provider.values["create"] is not None, (provider.primary_failure, provider.values)
@@ -367,12 +390,16 @@ def _costs(path: Path, campaign, children):
         for name in ("compute", "disks", "addresses", "traffic_export", "tax", "uncertainty"):
             parts[name] = {"amount_usd": "0.1", "quantity": "1", "unit": "unit",
                 "inclusion_rule": "synthetic test input", "funding_bucket": "primary"}
+        parts["traffic_export"].update(quantity="1", unit="GB-egress")
         parts["expiry_cleanup_support"] = {"amount_usd": "0.0139", "quantity": "1",
             "unit": "region-session", "inclusion_rule": "synthetic test input", "funding_bucket": "primary"}
         components[provider] = {"envelope_id": f"synthetic-{provider}", "provider": provider,
             "run_id": children[provider].run_id, "priced_on": "2026-10-22",
             "source_kind": "provider-price-input", "regions": regions[provider],
-            "unit_basis": "one-two-vm-provider-run", "components": parts}
+            "unit_basis": "one-two-vm-provider-run", "components": parts,
+            "result_transfer": {"payload_limit_bytes": 900_000_000,
+                "protocol_overhead_allowance_bytes": 100_000_000,
+                "protocol_overhead_priced_usd": "0.001"}}
     payload = json.loads((ROOT / "tests/fixtures/f11/cost-inputs.json").read_text())
     payload.update(cost_input_id=campaign.admission.cost_input_id, prices_checked_on="2026-10-22",
         acquired_on="2026-10-22", refresh_required_before_paid_execution=False,
@@ -439,8 +466,12 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         import tests.integration.test_f09_aws_runtime_factory as aws_runtime_test
         monkeypatch.setattr(aws_runtime_test, "NOW", synthetic_now)
     campaign, _ = resolve_campaign(config, ROOT, schedule_entry=schedule_entry)
+    # Keep real implementation identity for the staged-source guard. Only the
+    # design identity belongs to this explicitly synthetic, cloud-free fixture.
+    from cloud_network_benchmark.manifests import StaticGitProvenance
     initialized = initialize_campaign(config, ROOT, tmp_path / "results",
-        clock=lambda: NOW, token_source=lambda: "campaign", schedule_entry=schedule_entry)
+        clock=lambda: NOW, token_source=lambda: "campaign", schedule_entry=schedule_entry,
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
     parent, children = load_initialized_campaign(parent_path, repository_root=ROOT, config_path=config)
     costs = _costs(tmp_path / "costs.json", campaign, children)
@@ -512,7 +543,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
                 "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
                 "ssh_public_key_path": pub, "authentication_reference": str(identities["azure"]),
-                "poll_seconds": 15, "command_timeout_seconds": 60},
+                "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
                 "bootstrap_template": ROOT / "terraform/azure/pair/main.tf", "terraform_directory": ROOT / "terraform/azure",
                 "sources": {"expiry_cost_path": azure_cost, "primary_review_path": None}},
             "gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
@@ -579,6 +610,16 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 claims = state["reservations"][self.reservation_id]["creation_claims"]
                 assert set(claims) == {"aws", "azure", "gcp"}, claims
                 self.claim_snapshot_at_first_apply = tuple(sorted(claims))
+            def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+                assert request.action_type == "ssh", request.action_type
+                assert request.action_id.startswith("f02r-retrieve-"), request.action_id
+                assert "-i" in request.argv, request.argv
+                identity = request.argv[request.argv.index("-i") + 1]
+                provider = self.identity_provider.get(identity)
+                assert provider is not None, f"bounded copy lacks a known provider identity: {request.action_id}"
+                self.requests.append(request)
+                self.actions.append(request.action_id)
+                return self.remote[provider].run_bounded_copy(request, destination, maximum_payload_bytes)
             def run(self, request):
                 self.requests.append(request)
                 self.actions.append(request.action_id)
@@ -637,7 +678,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     if request.action_type == "vm_image_observation":
                         self.azure.requests.append(request)
                         publisher, offer, sku, version = self.azure.o.selected_image.split(":")
-                        payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                             "offer": offer, "sku": sku, "exactVersion": version}}}
                         now = clock.utc_now()
                         return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
@@ -905,6 +946,15 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         assert reservation_record["provider_cleanup"] == {p: True for p in children}, {
             provider: (item.cleanup_state, item.primary_failure, item.secondary_failures)
             for provider, item in result.provider_results.items()}
+        for provider, identity in identities.items():
+            copy_requests = [request for request in runner.requests
+                if request.action_id.startswith("f02r-retrieve-") and request.action_type == "ssh"
+                and not request.action_id.startswith("f02r-retrieve-observe-")
+                and "-i" in request.argv and request.argv[request.argv.index("-i") + 1] == str(identity)]
+            transfer = reservation_record["result_transfer"][provider]
+            assert copy_requests, (provider, runner.actions)
+            assert 0 < transfer["debited_bytes"] <= transfer["payload_limit_bytes"]
+            assert len(transfer["attempts"]) == len(copy_requests), (provider, transfer, copy_requests)
         assert reservation_id not in ledger_state["cleanup_open"]
         assert reservation_id not in ledger_state["cleanup_blocked"]
         assert all(item["final"] is False for item in reservation_record["provider_billing"].values())

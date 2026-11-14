@@ -143,6 +143,10 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         self.actions.append(request.action_id)
                         return self.delegate.run(request)
 
+                    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+                        self.actions.append(request.action_id)
+                        return self.delegate.run_bounded_copy(request, destination, maximum_payload_bytes)
+
                 costs = load_cost_inputs(args.cost_inputs)
                 selected_campaign, _ = resolve_campaign(args.config, Path.cwd(),
                     schedule_entry=(None if args.schedule is None else

@@ -33,7 +33,23 @@ variable "controller_cidr" {
   }
 }
 
-variable "image_id_frankfurt" { type = string }
+variable "primary_region" {
+  type = string
+  validation {
+    condition     = contains(["eu-central-1", "eu-north-1"], var.primary_region)
+    error_message = "AWS pair primary region must be Frankfurt or the reviewed Stockholm same-zone region."
+  }
+}
+
+variable "primary_zone" {
+  type = string
+  validation {
+    condition     = contains(["eu-central-1a", "eu-north-1a"], var.primary_zone)
+    error_message = "AWS pair primary zone must be the reviewed Frankfurt or Stockholm zone."
+  }
+}
+
+variable "image_id_primary" { type = string }
 variable "image_id_london" { type = string }
 variable "host_key_bootstrap" {
   type      = string

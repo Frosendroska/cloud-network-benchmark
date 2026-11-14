@@ -96,3 +96,8 @@ variable "network_limit_mbps" {
   type    = number
   default = 12500
 }
+
+variable "admin_username" {
+  type    = string
+  default = "ubuntu"
+}

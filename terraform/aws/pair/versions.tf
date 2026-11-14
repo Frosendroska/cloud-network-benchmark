@@ -10,10 +10,10 @@ terraform {
 }
 
 provider "aws" {
-  region = "eu-central-1"
+  region = var.primary_region
 }
 
 provider "aws" {
   alias  = "london"
-  region = "eu-west-2"
+  region = var.scenario == "inter_region" ? "eu-west-2" : var.primary_region
 }

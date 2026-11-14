@@ -1,0 +1,116 @@
+# Saved-plan review repair — AWS F05 / GCP F07
+
+Date: 14 November 2026. Branch: `codex/saved-terraform-plan-review`.
+Base: `cfeefba77fcbe5a543a8796b5940ab5a6038825a`; executable baseline `d83d271`.
+This is a bounded repair of the existing F05/F07 apply boundary, not a new
+application feature or authorization for paid work. GCP owns its provider scope;
+this shared repair record is linked from its tasks.
+
+## Specification and clarification
+
+R1. Before each AWS safety/pair and GCP protection/pair apply, generate a real
+saved Terraform plan using the original private vars/state. Inspect its JSON,
+require exact input variables and provider resource allowlists, reject drift,
+unexpected creation, existing managed resources, deletes, updates and replacement.
+Validate critical provider-specific machine/image/disk/IP/network/expiry scope.
+R2. Retain private binary/JSON, source/input/state hashes, scope result and an
+operator review receipt. Bind the receipt to this exact request, including full
+plan JSON. Recheck those bytes immediately before applying the same saved plan;
+never recompute on apply. No Terraform vars or auto-approve on saved-plan apply.
+R3. Provide a bounded file review point inside the original command/registration/
+precreate deadline. No receipt, rejection, tampering or timeout blocks apply.
+Default zero wait fails closed. Optional runtime wait changes are source-bound
+and require fresh financial review. This receipt records technical inspection,
+not financial authorization. No automatic cloud retry or new run IDs.
+R4. Preserve expiry-before-VM, financial admission, bounded result transfer,
+original identities, evidence, deadline and cleanup-only recovery. Destroy never
+enters this gate. Private plans/state/JSON must remain outside Git.
+R5. Focused credential-free tests prove exact scope, reviewed-plan identity,
+rejection, deadlines and cleanup accessibility; retain precise native limitations.
+
+## Plan and artifact analysis before implementation
+
+Use one small shared saved-plan command helper with explicit AWS/GCP validators;
+intercept only Terraform apply in the existing provider command boundaries.
+Expose an optional bounded review wait in existing provider options. Capture
+source files recursively so the actual child Terraform roots and expiry script
+are included in financial source bindings. No new infrastructure/dependency.
+Existing fake-stage tests may isolate the new plan boundary explicitly; dedicated
+repair tests must exercise the real boundary with fake commands and real private
+files. Old stage tests are not proof of saved-plan review.
+
+Constitution check: I/III exact hashes/private evidence; II local files only;
+IV separate provider scopes; V fail-closed launch and independent cleanup. No
+research protocol, quota, money or approval change. No source conflicts found.
+Sources read: AGENTS, constitution 2.1.0, current Thesis design, DECISIONS,
+FRAMEWORK_IMPLEMENTATION_NOTES, experiment/prompts/M04/M05 and BUDGET_RULES.
+
+## Tasks
+
+- [x] SP1 Inspect original apply/deadline/cleanup and binding paths; preserve user edits.
+- [x] SP2 Implement private saved-plan creation, explicit scope checks, bounded receipt and same-plan apply.
+- [x] SP3 Wire AWS/GCP only and recursive executable source binding.
+- [x] SP4 Focused fake-command rejection/identity/deadline/cleanup tests and affected regressions.
+- [x] SP5 Record validation and executable operator recipe; converge and selectively commit.
+
+
+## Initial convergence — 14 November 2026 (superseded below)
+
+R1/R2: all four command boundaries use plan/show, explicit provider allowlists and
+critical checks; full JSON and state/input/source/plan identities are private and
+bound to technical operator inspection before same-binary apply. R3: configurable
+bounded receipt wait, request-hash CLI, rejection/missing/mismatch/tamper/deadline
+tests; zero-wait default blocks. R4: launch-only interception, original expiry and
+financial gates, per-provider recovery untouched; real-boundary destroy tests and
+legacy cleanup regressions pass. Recursive financial discovery now binds child
+Terraform/lock/expiry code. R5: final local 306/306 (61 new-boundary cases), zero
+failures/errors/skips; source/hash/test evidence and operator recipe committed.
+No actionable local implementation finding remains. Eighteen factory cases and
+native Terraform compatibility are explicitly unproved: optional local matplotlib
+is absent, and automatic approval review rejected source egress to Halle pending
+explicit payload/destination authorization. This is a validation limitation, not
+paid readiness. No full unchanged baseline, live run, new run ID, authority card,
+ledger, reservation or cloud resource was created. Source commit f1918f0; later
+validation-only commit preserves those four executable hashes. User documentation
+edits and the Thesis/frozen launch source remain untouched.
+
+
+## Native finding supersedes the earlier convergence — 14 November 2026
+
+- [x] SP6 Preserve f1918f0 native evidence: 322 Python cases passed; overall driver
+  failed the local custom-state-path check. Four schema/mock roots pass with the
+  declared GCP computed-project fixture. No cloud calls/resources.
+- [x] SP7 Repair R4: saved-plan apply must explicitly retain the original `-state`
+  override. Commit 4da3cc9 changes only the helper argv and four-root regression.
+  Independent native builtin flag probe and 71 focused local cases pass.
+- [x] SP8 Obtain explicit transfer approval for corrected 4da3cc9, run only the
+  71-case native delta and builtin helper/state check, verify/download evidence,
+  update the operator handoff and source bindings, then converge this finding.
+
+The prior no-actionable-finding statement is superseded by this native discovery.
+The f1918f0 source is not a passing native repair. Its passing Python/factory and
+scope/mock evidence is retained without relabelling it cloud/provider acceptance.
+The earlier source transfer approval was explicitly scoped to f1918f0; automatic
+review rejected later payload expansion. The specific 4da3cc9 transfer was later
+approved; completed corrected validation is recorded below.
+
+
+## Final convergence — corrected source 4da3cc9
+
+SP8 complete after explicit corrected-payload approval. The separate clean native
+checkout at exact 4da3cc95f1ca46ea7ce67141a01facdb83f90343 passed 7/7 checks,
+71 Python cases with zero failures/errors/skips, and the actual helper's local
+builtin same-binary/original-state/no-default-state proof. All four native source
+hashes match local. Downloaded archive CRC, 14 manifest hashes, driver logs,
+JUnit counts/hash and helper proof were independently checked. State/plan bytes
+stay private and outside Git. No unchanged broad baseline was repeated.
+
+R1/R2 retain the four scope mocks and real-boundary rejection/hash/receipt cases;
+R3 bounded deadlines and operator recipe pass; R4 now also retains original
+state on real saved-plan apply while destroy remains independent; R5 has exact
+local/native evidence and honest limits. No actionable implementation finding
+remains. f1918f0's failed audit is preserved separately, never called a complete
+pass. Real provider planning/permissions/expiry/transport/cleanup acceptance and
+source-bound financial approval remain future stages, with no cloud launch or
+new run identity authorized here. Final operational recipe and source bindings
+are in docs/validation/saved-terraform-plan-review.md and its evidence JSON.

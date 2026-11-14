@@ -68,12 +68,16 @@ def operator_settings(tmp_path, root, monkeypatch):
             "funding": {"primary": "100", "replacements": "0", "tax": "20", "uncertainty": "25"},
             "expiry": {"aws": {"automation_step_price": ".001", "script_second_price": ".00001"},
                 "azure": {"automation_rate_per_job_minute": ".001", "job_minutes_bound": "5"},
-                "gcp": {"zero_support_rationale": "synthetic fixture no cost"}}, "components": {}},
+                "gcp": {"zero_support_rationale": "synthetic fixture no cost"}}, "components": {},
+            "result_transfer": {}},
         "stage_inputs": {}}
     for category in ("acceptance", "calibration", "day", "s1", "s3"):
         settings["pricing"]["components"][category] = {provider: {name: {
-            "amount_usd": ".01", "quantity": "1", "unit": "test-unit", "inclusion_rule": "synthetic offline fixture",
+            "amount_usd": ".01", "quantity": "1", "unit": "GB-egress" if name == "traffic_export" else "test-unit", "inclusion_rule": "synthetic offline fixture",
             "funding_bucket": "primary"} for name in COST_COMPONENTS} for provider in ("aws", "azure", "gcp")}
+        settings["pricing"]["result_transfer"][category] = {provider: {
+            "payload_limit_bytes": 1000, "protocol_overhead_allowance_bytes": 1000,
+            "protocol_overhead_priced_usd": ".001"} for provider in ("aws", "azure", "gcp")}
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
     for stage, measurement in (("acceptance", 76), ("week", 226), ("calibration", 1180)):
         settings["stage_inputs"][stage] = {"first_day_utc": tomorrow,
@@ -108,7 +112,7 @@ def load_entry(stage, entry, root):
     return runtime, parent, children, request, plan
 
 
-def test_actual_acceptance_generation_loads_and_two_shared_reservations_are_admitted(repository_root, tmp_path, monkeypatch, request):
+def test_generated_acceptance_does_not_manufacture_financial_authority(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     clock = Clock()
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
@@ -122,11 +126,12 @@ def test_actual_acceptance_generation_loads_and_two_shared_reservations_are_admi
         runtime, parent, children, request, plan = load_entry(stage, entry, repository_root)
         namespaces.extend(plan.namespaces.values())
         decision = book.reserve(request, plan=plan)
-        assert decision.status == "reserved", decision.reasons
+        assert decision.status == "rejected"
+        assert decision.reasons == ("financial_authorization_invalid",)
         assert len(children) == 3
         assert all(child.mode == "acceptance" for child in children.values())
         assert all(Path(row["bootstrap_template"]).is_file() for row in runtime["providers"].values())
-    assert len(book.inspect()["reservations"]) == 2
+    assert len(book.inspect()["reservations"]) == 0
     assert len(namespaces) == len(set(namespaces)) == 6
 
 
@@ -176,18 +181,18 @@ def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isol
     for entry in entries[:2]:
         _, _, _, request, plan = load_entry(stage, entry, repository_root)
         denied = book.reserve(request, plan=plan)
-        assert denied.status in {"rejected", "pending"} and "prerequisite_pending" in denied.reasons
-        # Keep real paid source-template and accounting validation; only the
-        # empirical acceptance boundary is explicitly fake in this offline case.
+        assert denied.status in {"rejected", "pending"} and "financial_authorization_invalid" in denied.reasons
+        # An empirical acceptance stub cannot override missing financial authority.
         with monkeypatch.context() as approval_boundary:
             approval_boundary.setattr("cloud_network_benchmark.admission._validate_paid_acceptance_evidence", lambda *_: None)
             admitted = book.reserve(request, plan=plan)
-        assert admitted.status == "reserved", admitted.reasons
-    assert len(book.inspect()["reservations"]) == 2
-    assert {row["session"] for row in book.inspect()["reservations"].values()} == {stage["controller_session_id"]}
+        assert admitted.status == "rejected"
+        assert admitted.reasons == ("financial_authorization_invalid",)
+    assert len(book.inspect()["reservations"]) == 0
+    assert {row["session"] for row in book.inspect()["reservations"].values()} == set()
 
 
-def test_complete_static_check_uses_only_readonly_identity_boundary_without_mutation(repository_root, tmp_path, monkeypatch):
+def test_complete_static_check_reaches_identity_review_without_mutation(repository_root, tmp_path, monkeypatch):
     import copy
     import cloud_network_benchmark.campaign_inputs as inputs
 

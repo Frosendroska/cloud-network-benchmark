@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
+
 from cloud_network_benchmark.contracts.execution import CommandResult
 
 

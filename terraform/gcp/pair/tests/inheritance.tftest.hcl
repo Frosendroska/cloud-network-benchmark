@@ -29,3 +29,29 @@ run "exactly_two_inherited_roles" {
     error_message = "the pair root creates exactly two inherited VM resources"
   }
 }
+
+run "finland_same_zone_inherits_original_templates" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-a"
+    zone_b = "europe-north1-a"
+  }
+  assert {
+    condition = (google_compute_instance_from_template.vm_a.project == var.project_id &&
+      google_compute_instance_from_template.vm_b.project == var.project_id &&
+      google_compute_instance_from_template.vm_a.zone == "europe-north1-a" &&
+      google_compute_instance_from_template.vm_b.zone == "europe-north1-a" &&
+      google_compute_instance_from_template.vm_a.source_instance_template == var.template_a &&
+    google_compute_instance_from_template.vm_b.source_instance_template == var.template_b)
+    error_message = "Finland pair must inherit both registered templates in the original project and zone"
+  }
+}
+
+run "reject_unreviewed_finland_zone" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-a"
+    zone_b = "europe-north1-b"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}

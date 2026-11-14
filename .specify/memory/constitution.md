@@ -118,9 +118,19 @@ permissions, networking, expiry or deletion.
 
 Before resource-creating side effects, admission MUST reserve the complete workflow lifetime and
 cost and register an independent provider-side compute expiry fallback. Account for incurred
-costs, active reservations, remaining primary work, tax and uncertainty within the $300 total,
-protecting the $50 buffer. Prices and overall lifetime caps MUST come from identified, dated
-register/config inputs; refresh them before paid execution. Expiry registration failure MUST
+costs, active reservations, remaining primary work, tax, FX/card fees and other thesis liabilities
+within the confirmed EUR 300 all-in whole-thesis ceiling. The 10 November 2026 Thesis financial
+decision supersedes historical USD budget labels; USD quotes MUST NOT be relabelled EUR.
+Working/protected allocations are recommendations until explicitly approved. Admission MUST
+enforce source-bound human authorization, exact run or fixed-batch scope/counts, validity window,
+numeric gross and personal unreimbursed-cash ceilings and conservative sourced FX. Missing values
+MUST block new work. Credits MUST NOT reduce gross liability; promised reimbursement MUST NOT
+reduce cash exposure. Shared accounting MUST retain incurred/unbilled and concurrent commitments
+across restart and reconciliation. Prices MUST be verified against official sources within 24
+hours before launch. Missing cumulative transfer enforcement MUST be reported explicitly and MUST
+NOT be represented by an inventory, retry limit or planning allowance. Existing stricter controls
+MUST remain. Prices and overall lifetime caps MUST come from identified, dated register/config
+inputs; refresh them before paid execution. Expiry registration failure MUST
 prevent VM creation. Concrete expiry mechanisms, cap-start events and failed-copy handling MUST
 be specified within the source bounds by the owning features; no destructive retention policy
 or additional copying timer is implied.
@@ -129,6 +139,8 @@ Once resource creation may have started, every terminal path MUST attempt cleanu
 available failure evidence. Retrieval or cleanup failures MUST NOT hide the primary failure.
 Normal cleanup MUST delete and verify removal of VMs, disks, public addresses and other billable
 experiment resources. Residual resources MUST keep cleanup open and block further launches.
+Original scoped cleanup and reconciliation MUST remain available after approval expiry, exhausted
+funding or stale quotes, without authorizing new provisioning or measurement.
 
 Paid acceptance is a separate authorized stage after F10: registered ten-second all-cloud phases,
 server-failure and abrupt controller-loss checks MUST prove real execution, retrieval, expiry and
@@ -194,4 +206,4 @@ for new principles or materially expanded guidance, PATCH for non-semantic refin
 plans, tasks, implementation and convergence MUST verify compliance. Non-compliance requires an
 explicit source-backed design update or user-authorized governance amendment before proceeding.
 
-**Version**: 2.0.0 | **Ratified**: 2026-09-24 | **Last Amended**: 2026-10-21
+**Version**: 2.1.0 | **Ratified**: 2026-09-24 | **Last Amended**: 2026-11-10

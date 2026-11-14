@@ -45,6 +45,42 @@ run "same_zone" {
   }
 }
 
+run "finland_same_zone" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-a"
+    zone_b = "europe-north1-a"
+  }
+  assert {
+    condition = (google_compute_subnetwork.a.region == "europe-north1" &&
+      google_compute_instance_template.role["vm_a"].machine_type == "n2-standard-4" &&
+      google_compute_instance_template.role["vm_b"].machine_type == "n2-standard-4" &&
+      google_compute_instance_template.role["vm_a"].scheduling[0].instance_termination_action == "STOP" &&
+    google_compute_instance_template.role["vm_b"].scheduling[0].termination_time == var.expiry_time)
+    error_message = "Finland roles must use the original zone, shape, subnetwork and absolute STOP policy"
+  }
+}
+
+run "reject_finland_cross_zone" {
+  command = plan
+  variables {
+    scenario = "cross_zone"
+    zone_a   = "europe-north1-a"
+    zone_b   = "europe-north1-b"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}
+
+run "reject_finland_image_alias" {
+  command = plan
+  variables {
+    zone_a  = "europe-north1-a"
+    zone_b  = "europe-north1-a"
+    image_b = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}
+
 run "cross_zone" {
   command = plan
   variables {

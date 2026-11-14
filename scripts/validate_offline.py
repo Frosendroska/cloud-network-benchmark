@@ -80,6 +80,15 @@ def has_provider_binary(root: Path) -> bool:
     return False
 
 
+def terraform_platform() -> str:
+    """Resolve the local Terraform package target; never use another OS's cache."""
+    system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
+    architecture = {"x86_64": "amd64", "AMD64": "amd64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine())
+    require(system is not None and architecture is not None,
+            f"unsupported Terraform host platform: {platform.system()} {platform.machine()}")
+    return f"{system}_{architecture}"
+
+
 def prerequisites(evidence: Path, terraform: Path, pwsh: Path, mirror: Path):
     state = source_state()
     require(state["clean"], "source checkout must be clean before execution")
@@ -102,6 +111,7 @@ def prerequisites(evidence: Path, terraform: Path, pwsh: Path, mirror: Path):
     require(pwsh.is_file() and os.access(pwsh, os.X_OK), f"PowerShell executable unavailable: {pwsh}")
     require(mirror.is_dir() and has_provider_binary(mirror), "prepared filesystem provider mirror is missing packages")
     locks = {"aws": ("aws", "6.70.0"), "azurerm": ("azure", "4.81.0"), "google": ("gcp", "7.46.1")}
+    package_target = terraform_platform()
     for rel in ROOTS:
         path = ROOT / "terraform" / rel
         lock = path / ".terraform.lock.hcl"
@@ -114,9 +124,9 @@ def prerequisites(evidence: Path, terraform: Path, pwsh: Path, mirror: Path):
         require(re.search(rf'\bversion\s*=\s*"{re.escape(version)}"', lock_text) is not None,
                 f"unexpected {provider} lock in {rel}")
         cached = path / ".terraform/providers"
-        platform_rel = Path("registry.terraform.io/hashicorp") / provider / version / "darwin_arm64"
+        platform_rel = Path("registry.terraform.io/hashicorp") / provider / version / package_target
         require(cached.is_dir() and has_provider_binary(cached / platform_rel), f"initialized local providers missing: {rel}")
-        require(has_provider_binary(mirror / platform_rel), f"locked darwin_arm64 package missing from mirror: {provider} {version}")
+        require(has_provider_binary(mirror / platform_rel), f"locked {package_target} package missing from mirror: {provider} {version}")
     for rel, testfile in MOCKS.items():
         content = (ROOT / "terraform" / rel / testfile).read_text()
         run_count = len(re.findall(r'(?m)^\s*run\s+"', content))
@@ -282,7 +292,8 @@ def main(argv=None):
         if rel in MOCKS:
             checks.append((f"mock-{rel.replace('/', '-')}", [str(args.terraform), f"-chdir={ROOT / 'terraform' / rel}", "test", "-no-color"]))
     try:
-        thesis_root = Path(os.environ.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis")).resolve(strict=True)
+        from cloud_network_benchmark.manifests import thesis_repository_root
+        thesis_root = thesis_repository_root(ROOT).resolve(strict=True)
         thesis_revision = subprocess.run(["git", "-C", str(thesis_root), "rev-parse", "HEAD"],
             text=True, capture_output=True, check=True).stdout.strip()
         tf_config = evidence / "terraform.rc"
@@ -295,7 +306,7 @@ def main(argv=None):
             if (upper.startswith(("AWS_", "AZURE_", "ARM_", "GOOGLE_", "GCP_", "CLOUDSDK_", "TF_VAR_"))
                     or upper in {"SSH_AUTH_SOCK", "SSH_AGENT_PID", "GH_TOKEN", "GITHUB_TOKEN"}):
                 env.pop(key, None)
-        env.update({"PYTHONPATH": "src", "THESIS_ROOT": env.get("THESIS_ROOT", "/Users/katya/Desktop/University/Masters/Thesis"),
+        env.update({"PYTHONPATH": "src", "THESIS_ROOT": str(thesis_root),
             "MPLBACKEND": "Agg", "MPLCONFIGDIR": str(evidence / "matplotlib"), "PATH": str(args.pwsh.parent) + os.pathsep + env.get("PATH", ""),
             "TF_CLI_CONFIG_FILE": str(tf_config), "CHECKPOINT_DISABLE": "1", "TF_IN_AUTOMATION": "1"})
         Path(env["MPLCONFIGDIR"]).mkdir()

@@ -34,6 +34,9 @@ override.tf.json
 *_override.tf.json
 terraform.tfplan
 *.tfplan
+# Private saved-plan JSON and operator inspection receipts
+**/aws-*-review-*/
+**/gcp-*-review-*/
 
 # Python and test artifacts
 __pycache__/
@@ -71,3 +74,5 @@ results/processed/*
 # Local autonomous coordinator checkpoints and logs (recover from Git/PRs as needed).
 .codex/autonomous-state.json
 .codex/autonomous-evidence/
+
+**/azure-*-review-*/

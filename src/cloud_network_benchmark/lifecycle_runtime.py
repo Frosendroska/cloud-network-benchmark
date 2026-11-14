@@ -132,7 +132,13 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         "azure": {"expiry_cost_path", "primary_review_path"}}
     for provider, value in providers.items():
         row = _keys(value, {"options", "bootstrap_template", "terraform_directory", "sources"}, f"providers.{provider}")
-        options = _keys(row["options"], option_keys[provider], f"providers.{provider}.options")
+        optional = {"plan_review_timeout_seconds"}
+        present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
+        options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
+        if "plan_review_timeout_seconds" in present:
+            seconds = options["plan_review_timeout_seconds"]
+            if type(seconds) is not int or not 0 <= seconds <= 600:
+                raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
         for name in ("public_key_path", "ssh_public_key_path"):
             if name in options:
                 options[name] = _source_path(path.parent, options[name], f"providers.{provider}.{name}")
@@ -172,7 +178,9 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         source = _source_path(reference.parent, declared_path, f"approval_evidence.{key}.source_path")
         if hashlib.sha256(source.read_bytes()).hexdigest() != declared_hash:
             raise ValueError(f"approval evidence {key} source hash does not match its bytes")
-        root["approval_evidence"][key] = evidence
+        root["approval_evidence"][key] = {**evidence, "source_path": str(source)}
+    root["runtime_source"] = {"path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     return root
 
 
@@ -352,8 +360,44 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         optional_review_evidence=({"priority": prerequisites["optional_review"]}
             if "optional_review" in prerequisites else {}),
         observation_id=next(iter(children.values())).observation_id,
-        cost_envelopes=envelopes)
+        cost_envelopes=envelopes,
+        financial_binding=_financial_runtime_binding(runtime, children))
     return request, plan
+
+
+def _financial_runtime_binding(runtime, children):
+    """Bind actual executable/template bytes, effective settings and initialized revision.
+
+    Does not read credentials or emit their contents. Only source digests are retained.
+    """
+    from .financial_controls import digest
+    from .manifests import RepositoryGitProvenance
+    root = Path(__file__).resolve().parents[2]
+    sources = dict()
+    def add(path):
+        path = Path(path).absolute()
+        if path.is_file() and not path.is_symlink():
+            sources[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in (root / "src/cloud_network_benchmark").rglob("*.py"):
+        add(path)
+    for row in runtime["providers"].values():
+        add(row["bootstrap_template"])
+        for path in Path(row["terraform_directory"]).rglob("*"):
+            if ".terraform" not in path.parts and (path.suffix in {".tf", ".py", ".ps1"} or path.name == ".terraform.lock.hcl"):
+                add(path)
+        for path in row["sources"].values():
+            if path is not None:
+                add(path)
+    source = runtime.get("runtime_source")
+    if source:
+        sources[source["path"]] = source["sha256"]
+    return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
+        "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
+                                         for c in children.values()}),
+        "runtime_source": source,
+        "effective_runtime_sha256": digest({k: v for k, v in runtime.items()
+            if k not in {"approval_evidence", "runtime_source", "sleep"}}),
+        "sources": [{"path": p, "sha256": h} for p, h in sorted(sources.items())]}
 
 
 def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
@@ -439,7 +483,7 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
                 or hashlib.sha256(review_source.read_bytes()).hexdigest() != declared_hash):
             raise ValueError("AWS primary review source hash does not match its bytes")
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
-    settings = AwsRuntimeSettings(**settings_values)
+    settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0))
     driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
     trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -482,6 +526,15 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
     ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=controller_session_id)
+    # Invalid authority or unsourced transfer terms must not initialize a new
+    # accounting file.
+    from .financial_controls import validate_paid_financial_plan
+    pending_request, pending_plan = build_admission_request(campaign=campaign, parent=parent,
+        children=children, costs=costs, runtime=runtime, controller_session_id=controller_session_id)
+    validate_paid_financial_plan(pending_plan, pending_request, scope_id=ledger.scope_id, now=clock.utc_now())
+    if pending_plan.execution_scope == "paid_request" and not callable(getattr(runner, "run_bounded_copy", None)):
+        from .financial_controls import FinancialError
+        raise FinancialError("financial_transfer_transport_unavailable")
     if not ledger.path.exists():
         if runtime["ledger"]["initialize_if_missing"] is not True:
             raise ValueError("ledger is missing and runtime configuration forbids initialization")
@@ -648,7 +701,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 review = row["sources"].get("primary_review_path")
                 if review is None: raise ValueError("AWS scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = AwsRuntimeSettings(**settings_args)
+            settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
@@ -679,7 +732,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 review = sources.get("primary_review_path")
                 if review is None: raise ValueError("GCP scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = GcpRuntimeSettings(**settings_args)
+            settings = GcpRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             driver = GcpProviderDriver(runner, settings, clock=clock.utc_now)
             trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -717,7 +770,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     runtime["allowance"], "preparation").total_seconds),
                 cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
-                command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price)
+                command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
+                plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             name, ids = azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AZURE, action="deallocate",

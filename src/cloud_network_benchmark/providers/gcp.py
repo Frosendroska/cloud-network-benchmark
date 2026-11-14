@@ -27,7 +27,27 @@ from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
 SAFETY_LEAD_SECONDS = 30
 CONTROLLER_SESSION_ID = str(uuid.uuid4())
 NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": True, "source": "https://cloud.google.com/compute/docs/network-bandwidth", "checked_on": "2026-10-23"}
-REGION_ZONES = {"europe-west3": ("europe-west3-a", "europe-west3-b"), "europe-west2": ("europe-west2-a",)}
+REGION_ZONES = {
+    "europe-west3": ("europe-west3-a", "europe-west3-b"),
+    "europe-west2": ("europe-west2-a",),
+    "europe-north1": ("europe-north1-a",),
+}
+BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
+NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
+
+
+def validate_ubuntu_image_identities(images: dict[str, str], *, selected_regions: set[str] | None = None) -> None:
+    """Require dated Ubuntu 24.04 amd64 image resources, never family aliases."""
+    allowed_maps = (BASELINE_IMAGE_REGIONS, NORTHERN_IMAGE_REGIONS,
+                    BASELINE_IMAGE_REGIONS | NORTHERN_IMAGE_REGIONS)
+    if not isinstance(images, dict) or frozenset(images) not in allowed_maps:
+        raise ValueError("images must pin the selected Frankfurt/London or Finland image identities")
+    if selected_regions is not None and not selected_regions <= images.keys():
+        raise ValueError("images must pin every selected GCP region")
+    # Noble is the published image name; retain dated legacy configuration names.
+    pattern = r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-(?:noble-amd64-v|lts-amd64-v?)[0-9]{8}"
+    if any(not isinstance(value, str) or not re.fullmatch(pattern, value) for value in images.values()):
+        raise ValueError("images must be immutable Ubuntu 24.04 amd64 image identities, not aliases or families")
 
 
 class GcpRuntimeSettings(StrictModel):
@@ -46,6 +66,7 @@ class GcpRuntimeSettings(StrictModel):
     support_cost_evidence: StructuredEvidence
     complete_workflow_remaining_seconds: float = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
+    plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=180, gt=0, le=600)
 
@@ -75,10 +96,7 @@ class GcpRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
-        if set(self.images) != {"europe-west3", "europe-west2"}:
-            raise ValueError("images must pin the selected Frankfurt and London image identities")
-        if any(not re.fullmatch(r"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-[a-z0-9-]+", value) for value in self.images.values()):
-            raise ValueError("images must be immutable Ubuntu 24.04 amd64 image identities, not aliases or families")
+        validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
             if field not in handoff:
@@ -237,6 +255,7 @@ class GcpProviderDriver:
     def provision(self, deployment: ProviderDeploymentInput) -> ProviderDeploymentOutput:
         self._deadline = None
         self._validate_deployment(deployment)
+        self._validate_selected_images(deployment)
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
@@ -368,6 +387,7 @@ class GcpProviderDriver:
 
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
+        self._validate_selected_images(deployment)
         reservation = deployment.reservation.value
         if reservation is None or reservation.state != "reserved":
             raise GcpProviderError("active reservation evidence is required", category="reservation_required")
@@ -412,19 +432,29 @@ class GcpProviderDriver:
     def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
-        if deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}:
-            raise GcpProviderError("F07 supports only Frankfurt roles and London receiver", category="scenario_unsupported")
+        northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
+                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
+        if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
+                            and deployment.experiment_id == "EXP-902"):
+            raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
+        if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
+            raise GcpProviderError("only the selected Frankfurt/London topology or Finland same-zone pair is supported", category="scenario_unsupported")
         if deployment.vm_a.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"} or deployment.vm_b.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"}:
             raise GcpProviderError("GCP roles must use selected n2-standard-4 shape", category="shape_unsupported")
         if deployment.vm_a.role != "vm_a" or deployment.vm_b.role != "vm_b" or deployment.vm_a.function != "client_traffic_generator" or deployment.vm_b.function != "server_receiver":
             raise GcpProviderError("GCP deployment requires exact client A and receiver B identities", category="identity_mismatch")
         expected_zones = {"same_zone": ("europe-west3-a", "europe-west3-a"), "cross_zone": ("europe-west3-a", "europe-west3-b"), "placement_optimization": ("europe-west3-a", "europe-west3-a"), "inter_region": ("europe-west3-a", "europe-west2-a")}
-        if deployment.scenario not in expected_zones or (deployment.vm_a.zone, deployment.vm_b.zone) != expected_zones[deployment.scenario]:
+        if not northern and (deployment.scenario not in expected_zones or (deployment.vm_a.zone, deployment.vm_b.zone) != expected_zones[deployment.scenario]):
             raise GcpProviderError("scenario zones must match the selected V2 topology", category="scenario_unsupported")
         if deployment.scenario == "placement_optimization" and deployment.placement.kind != "compact_placement_policy":
             raise GcpProviderError("S3 requires same-zone compact placement", category="scenario_unsupported")
         if deployment.scenario == "inter_region" and deployment.vm_b.region != "europe-west2":
             raise GcpProviderError("S4 receiver must be in London", category="scenario_unsupported")
+
+    def _validate_selected_images(self, deployment: ProviderDeploymentInput) -> None:
+        selected = {deployment.vm_a.region, deployment.vm_b.region}
+        if not selected <= self.settings.images.keys():
+            raise GcpProviderError("selected GCP region has no pinned Ubuntu image", category="image_mismatch")
 
     def _validate_review(self, deployment: ProviderDeploymentInput) -> None:
         evidence = self.settings.primary_review_decision
@@ -713,7 +743,7 @@ class GcpProviderDriver:
         if self._deadline is not None:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
-            limit = min(limit, max(1, int(remaining)))
+            limit = min(limit, remaining)
         from ..terraform_work import private_terraform_environment, initialize_terraform
         command_deadline = time.monotonic() + limit
         request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
@@ -724,9 +754,14 @@ class GcpProviderDriver:
         if remaining_after_init <= 0:
             raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
         request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
-        result = self.runner.run(request)
-        self._record_command(request, result)
-        return result
+        def execute(request):
+            result = self.runner.run(request)
+            self._record_command(request, result)
+            return result
+        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+            from ..terraform_plan import reviewed_apply
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+        return execute(request)
 
     def _record_command(self, request: CommandRequest, result: CommandResult) -> None:
         attempt = self._active_attempt
@@ -759,6 +794,19 @@ class GcpProviderDriver:
             variables = json.loads(vars_path.read_text(encoding="utf-8"))
             if variables.get("project_id") != self.settings.project_id:
                 raise GcpProviderError("Terraform inputs belong to another project", category="state_identity_mismatch")
+            if (variables.get("zone_a"), variables.get("zone_b")) != (deployment.vm_a.zone, deployment.vm_b.zone):
+                raise GcpProviderError("Terraform inputs changed the original role zones", category="state_identity_mismatch")
+            if root == "protection":
+                expected = {
+                    "namespace": self._namespace(deployment),
+                    "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario,
+                    "image_a": self.settings.images.get(deployment.vm_a.region),
+                    "image_b": self.settings.images.get(deployment.vm_b.region),
+                }
+            else:
+                expected = {"name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b"}
+            if any(variables.get(key) != value for key, value in expected.items()):
+                raise GcpProviderError("Terraform inputs changed the original attempt scope", category="state_identity_mismatch")
         else:
             variables = None
         common = {"project_id": self.settings.project_id}
@@ -776,6 +824,10 @@ class GcpProviderDriver:
             journal["pair_binding"] = {"config_sha256": hashlib.sha256(serialized_vars).hexdigest(), "template_a": template["template_a"], "template_b": template["template_b"], "project_id": self.settings.project_id, "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
             self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
+        if root == "pair" and action == "apply":
+            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+            slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
+            self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
             raise GcpProviderError(f"GCP Terraform {root} {action} failed", category="terraform_failed", action_id=rc.action_id)

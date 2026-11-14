@@ -50,3 +50,35 @@ def deny_external_io(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "create_connection", blocked)
     monkeypatch.setattr(subprocess, "run", blocked)
     monkeypatch.setattr(subprocess, "Popen", blocked)
+
+
+@pytest.fixture
+def isolated_legacy_provider_financial_boundary(monkeypatch):
+    """Isolate only old fake provider-stage tests from the new financial barrier.
+
+    These tests cannot establish financial readiness. Real guard rejection and
+    locked accounting are exercised separately in test_financial_admission.py.
+    There is no corresponding bypass in production or in runtime config.
+    """
+    import cloud_network_benchmark.admission as admission
+    import cloud_network_benchmark.financial_controls as financial
+    monkeypatch.setattr(admission, 'validate_paid_financial_plan', lambda *_a, **_k: None)
+    monkeypatch.setattr(financial, 'validate_paid_financial_plan', lambda *_a, **_k: None)
+    monkeypatch.setattr(admission, 'revalidate_financial_record', lambda *_a, **_k: None)
+
+
+@pytest.fixture
+def isolated_legacy_saved_plan_boundary(monkeypatch):
+    """Old fake stage runners model apply/output, not Terraform plan files.
+
+    Scope of this explicit mock is only their existing stage behavior. Real plan
+    creation/review/hash/cleanup dispatch is covered in test_terraform_plan_review.
+    No production setting or runner can select this test-only isolation.
+    """
+    import cloud_network_benchmark.terraform_plan as plans
+
+    def original_apply(request, run, **_kwargs):
+        assert "apply" in request.argv
+        return run(request)
+
+    monkeypatch.setattr(plans, "reviewed_apply", original_apply)

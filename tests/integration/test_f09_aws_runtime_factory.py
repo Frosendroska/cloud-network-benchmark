@@ -5,8 +5,9 @@ import hashlib
 import base64
 import json
 import re
+import shlex
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -15,9 +16,11 @@ import yaml
 from cloud_network_benchmark.admission import load_cost_inputs
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.contracts.common import Provider
-from cloud_network_benchmark.contracts.execution import CommandResult
+from cloud_network_benchmark.contracts.execution import BOUNDED_COPY_EOF_MARKER, CommandResult
 from cloud_network_benchmark.lifecycle_runtime import build_runtime
 from cloud_network_benchmark.orchestration import run_lifecycle
+
+pytestmark = pytest.mark.usefixtures('isolated_legacy_saved_plan_boundary', 'isolated_legacy_provider_financial_boundary')
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
@@ -41,16 +44,85 @@ class FakeAwsRunner:
     """Replies locally to every command; no process or cloud is contacted."""
     def __init__(self):
         self.actions = []
+        self.requests = []
         self.run_id = ""
         self.deployment_id = ""
         self.expiry_request = None
+        self.region = "eu-central-1"
+        self.zone = "eu-central-1a"
+        self.image_id = "ami-0123456789abcdef0"
+        self.pair_variables = None
+        self.complete_cleanup = False
+        self.destroyed = False
         self.private_a, self.private_b = "10.60.1.10", "10.60.1.11"
         self.public_a, self.public_b = "8.8.8.8", "1.1.1.1"
 
     def run(self, request):
         action = request.action_id
         self.actions.append(action)
+        self.requests.append(request)
         stdout = "{}"
+        exit_code, stderr = 0, ""
+        if self.complete_cleanup and action == "aws-pair-destroy":
+            self.destroyed = True
+        if self.complete_cleanup and action.startswith("aws-describe-") and "--filters" in request.argv:
+            collections = {
+                "instances": "Reservations", "volumes": "Volumes", "network-interfaces": "NetworkInterfaces",
+                "security-groups": "SecurityGroups", "subnets": "Subnets", "route-tables": "RouteTables",
+                "internet-gateways": "InternetGateways", "vpcs": "Vpcs",
+                "vpc-peering-connections": "VpcPeeringConnections", "placement-groups": "PlacementGroups",
+                "key-pairs": "KeyPairs", "addresses": "Addresses",
+            }
+            operation = request.argv[2]
+            stdout = json.dumps({collections[operation.removeprefix("describe-")]: []})
+        elif self.complete_cleanup and self.destroyed and action.startswith("aws-describe-") and any(
+                token in request.argv for token in ("--instance-ids", "--volume-ids", "--network-interface-ids")):
+            exit_code = 1
+            code = ("InvalidInstanceID.NotFound" if "--instance-ids" in request.argv else
+                "InvalidVolume.NotFound" if "--volume-ids" in request.argv else "InvalidNetworkInterfaceID.NotFound")
+            stderr = f"An error occurred ({code}) when calling Describe"
+        elif self.complete_cleanup and action.startswith("aws-expiry-read-terminal-"):
+            region = action.removeprefix("aws-expiry-read-terminal-")
+            trigger = (self.expiry_request.expires_at.value.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if self.expiry_request is not None else "2026-10-22T12:14:00Z")
+            parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
+                "ExpiryTriggerUtc": [trigger], "RunId": [self.run_id],
+                "DeploymentId": [self.deployment_id], "Region": [region]}
+            stdout = json.dumps({"AutomationExecution": {"AutomationExecutionId": f"exec-{region}",
+                "DocumentName": f"expiry-{region}", "DocumentVersion": "1",
+                "AutomationExecutionStatus": "InProgress", "CurrentAction": "aws:sleep",
+                "CurrentStepName": "waitUntilExpiry", "Parameters": parameters,
+                "StepExecutionsTruncated": False, "StepExecutions": [{"StepName": "waitUntilExpiry",
+                    "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": trigger}}]}})
+        elif self.complete_cleanup and action.startswith("aws-expiry-confirm-cancel-"):
+            region = action.removeprefix("aws-expiry-confirm-cancel-")
+            trigger = (self.expiry_request.expires_at.value.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if self.expiry_request is not None else "2026-10-22T12:14:00Z")
+            parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{region}"],
+                "ExpiryTriggerUtc": [trigger], "RunId": [self.run_id],
+                "DeploymentId": [self.deployment_id], "Region": [region]}
+            stdout = json.dumps({"AutomationExecution": {"AutomationExecutionId": f"exec-{region}",
+                "DocumentName": f"expiry-{region}", "DocumentVersion": "1", "Parameters": parameters,
+                "StepExecutionsTruncated": False, "StepExecutions": [{"StepName": "waitUntilExpiry",
+                    "Action": "aws:sleep", "StepStatus": "Cancelled", "Inputs": {"Timestamp": trigger}}],
+                "AutomationExecutionStatus": "Cancelled"}})
+        elif self.complete_cleanup and action.startswith(("aws-expiry-document-absence-", "aws-expiry-role-absence-")):
+            exit_code = 1
+            code = "InvalidDocument" if "document" in action else "NoSuchEntity"
+            stderr = f"An error occurred ({code}) when calling Describe"
+        if self.complete_cleanup and action.startswith("aws-describe-") and (
+                self.destroyed or "--filters" in request.argv):
+            return CommandResult(action_id=action, outcome="succeeded" if exit_code == 0 else "failed",
+                started_at=NOW, finished_at=NOW, duration_seconds=0, exit_code=exit_code,
+                stdout=stdout, stderr=stderr)
+        if self.complete_cleanup and action.startswith(("aws-expiry-read-terminal-",
+                "aws-expiry-confirm-cancel-", "aws-expiry-document-absence-", "aws-expiry-role-absence-")):
+            return CommandResult(action_id=action, outcome="succeeded" if exit_code == 0 else "failed",
+                started_at=NOW, finished_at=NOW, duration_seconds=0, exit_code=exit_code,
+                stdout=stdout, stderr=stderr)
+        if action == "aws-pair-apply":
+            variables_path = next(Path(value.removeprefix("-var-file=")) for value in request.argv if value.startswith("-var-file="))
+            self.pair_variables = json.loads(variables_path.read_text(encoding="utf-8"))
         if action.startswith("aws-safety-apply-"):
             state = next(value.removeprefix("-state=") for value in request.argv if value.startswith("-state="))
             Path(state).write_text("fake-state")
@@ -64,13 +136,13 @@ class FakeAwsRunner:
         elif action == "aws-pair-output":
             stdout = json.dumps({"deployment": {"value": {"vms": {
                 "vm_a": {"instance_id": "i-vm-a", "private_ipv4": self.private_a, "public_ipv4": self.public_a,
-                    "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
-                    "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
+                    "region": self.region, "zone": self.zone, "zone_id": "use1-az2",
+                    "image_id": self.image_id, "image_owner_id": "099720109477",
                     "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-a",
                     "placement_group": None, "placement_group_strategy": None},
                 "vm_b": {"instance_id": "i-vm-b", "private_ipv4": self.private_b, "public_ipv4": self.public_b,
-                    "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "use1-az2",
-                    "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
+                    "region": self.region, "zone": self.zone, "zone_id": "use1-az2",
+                    "image_id": self.image_id, "image_owner_id": "099720109477",
                     "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-b",
                     "placement_group": None, "placement_group_strategy": None}},
                 "network": {}, "placement": {}}}})
@@ -84,16 +156,16 @@ class FakeAwsRunner:
             stdout = json.dumps({"Reservations": [{"Instances": [{"InstanceId": instance_id,
                 "State": {"Name": "running"}, "Tags": [{"Key": "cnb_run_id", "Value": self.run_id},
                     {"Key": "cnb_deployment_id", "Value": self.deployment_id}, {"Key": "cnb_role", "Value": role}],
-                "InstanceType": "m7i.xlarge", "ImageId": "ami-0123456789abcdef0",
+                "InstanceType": "m7i.xlarge", "ImageId": self.image_id,
                 "PrivateIpAddress": private_ip, "PublicIpAddress": public_ip,
-                "Placement": {"AvailabilityZone": "eu-central-1a", "GroupName": None},
+                "Placement": {"AvailabilityZone": self.zone, "GroupName": None},
                 "NetworkInterfaces": [{"InterfaceType": "interface"}],
                 "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-a" if role == "vm_a" else "vol-b",
                     "DeleteOnTermination": True}}], "LaunchTime": "2026-10-22T11:50:00Z"}]}]})
         elif action.startswith("aws-describe-instance-topology"):
             stdout = json.dumps({"Instances": [{"ZoneId": "use1-az2"}]})
         elif action.startswith("aws-describe-images"):
-            stdout = json.dumps({"Images": [{"ImageId": "ami-0123456789abcdef0", "OwnerId": "099720109477",
+            stdout = json.dumps({"Images": [{"ImageId": self.image_id, "OwnerId": "099720109477",
                 "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
                 "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]})
         elif action.startswith("aws-describe-volumes"):
@@ -127,8 +199,8 @@ class FakeAwsRunner:
                 "StepExecutionsTruncated": False, "StepExecutions": [{"StepName": "waitUntilExpiry",
                     "Action": "aws:sleep", "StepStatus": "InProgress",
                     "Inputs": {"Timestamp": trigger}}]}})
-        result = CommandResult(action_id=action, outcome="succeeded", started_at=NOW,
-            finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+        result = CommandResult(action_id=action, outcome="succeeded" if exit_code == 0 else "failed", started_at=NOW,
+            finished_at=NOW, duration_seconds=0, exit_code=exit_code, stdout=stdout, stderr=stderr)
         return result
 
 
@@ -156,6 +228,41 @@ class FakePreparedAwsRunner(FakeAwsRunner):
     def _now(self):
         clock = getattr(self, "clock", None)
         return clock.utc_now() if clock is not None else NOW
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        """Model a charged SSH copy from one fake VM, including remote excess detection."""
+        assert request.action_type == "ssh"
+        assert request.action_id.startswith("f02r-retrieve-")
+        assert request.argv[0] == "ssh" and request.argv[1] == "-T"
+        assert type(maximum_payload_bytes) is int and maximum_payload_bytes >= 0
+        role_by_host = {self.public_a: "vm_a", self.public_b: "vm_b"}
+        role = role_by_host[request.argv[-2].rsplit("@", 1)[-1]]
+        remote_argv = shlex.split(request.argv[-1])
+        assert remote_argv[:2] == ["sh", "-c"] and len(remote_argv) == 3
+        script = remote_argv[2]
+        match = re.search(
+            r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
+            script,
+        )
+        assert match is not None, script
+        assert int(match.group(2)) == maximum_payload_bytes
+        assert "os.read(3, 1)" in script and BOUNDED_COPY_EOF_MARKER in script
+        source_tokens = shlex.split(match.group(1))
+        assert len(source_tokens) == 1
+        relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/work")
+        root = self.workspace_roots[role]
+        source = root / relative
+        assert source.resolve().is_relative_to(root.resolve())
+        assert source.is_file() and not source.is_symlink()
+        self.actions.append(request.action_id)
+        with source.open("rb") as remote, Path(destination).open("xb") as local:
+            local.write(remote.read(maximum_payload_bytes))
+        within_cap = source.stat().st_size <= maximum_payload_bytes
+        return CommandResult(action_id=request.action_id,
+            outcome="succeeded" if within_cap else "failed", started_at=self._now(),
+            finished_at=self._now(), duration_seconds=0,
+            exit_code=0 if within_cap else 1, stdout="",
+            stderr="" if within_cap else "remote source exceeds charged payload cap")
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -621,26 +728,30 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         (root / "iperf3-server.err").write_text("\n".join(source_lines) + "\n", encoding="utf-8")
 
 
-def _cost_source(path: Path, run_id: str, cost_input_id: str) -> None:
+def _cost_source(path: Path, run_id: str, cost_input_id: str, *, region: str = "eu-central-1") -> None:
     payload = json.loads((ROOT / "tests/fixtures/f11/cost-inputs.json").read_text())
     payload.update(cost_input_id=cost_input_id, prices_checked_on="2026-10-22",
         acquired_on="2026-10-22", source_sha256="a" * 64,
         funding={"primary": "250", "replacements": "0", "tax": "0", "uncertainty": "0"},
         refresh_required_before_paid_execution=False)
-    region = "eu-central-1"
     components = {}
     for name in ("compute", "disks", "addresses", "traffic_export", "tax", "uncertainty"):
         components[name] = {"amount_usd": "0.1", "quantity": "1", "unit": "unit",
             "inclusion_rule": "synthetic test source", "funding_bucket": "primary"}
+    components["traffic_export"].update(quantity="1.1", unit="GB-egress")
     components["expiry_cleanup_support"] = {"amount_usd": "0.0139", "quantity": "1",
         "unit": "region-session", "inclusion_rule": "synthetic test source", "funding_bucket": "primary"}
     payload["provider_run_envelopes"] = {"aws": {"envelope_id": "fixture-aws", "provider": "aws",
         "run_id": run_id, "priced_on": "2026-10-22", "source_kind": "provider-price-input",
-        "regions": [region], "unit_basis": "one-two-vm-provider-run", "components": components}}
+        "regions": [region], "unit_basis": "one-two-vm-provider-run", "components": components,
+        "result_transfer": {"payload_limit_bytes": 1_000_000_000,
+            "protocol_overhead_allowance_bytes": 100_000_000,
+            "protocol_overhead_priced_usd": "0.01"}}}
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
-def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_digest, *, full_native=False):
+def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_digest, *, full_native=False,
+        region="eu-central-1"):
     aws_fixture = repository_root / "tests/fixtures/aws/cost-inputs/aws-ssm-automation-public-2026-10-22.json"
     fixture_hash = hashlib.sha256(aws_fixture.read_bytes()).hexdigest()
     refs = {}
@@ -692,36 +803,45 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
         "approval_evidence": {gate: json.loads(path.read_text()) for gate, path in refs.items()},
         "access": access,
         "providers": {"aws": {"options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
-            "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}, "public_key_path": key,
+            "ami_ids": {region: "ami-0123456789abcdef0"}, "public_key_path": key,
             "authentication_reference": str(identity)},
             "bootstrap_template": repository_root / "terraform/aws/pair/main.tf",
             "terraform_directory": repository_root / "terraform/aws",
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity"), [
-    ("failure_check", False, False, "partial"),
-    ("failure_check", True, False, "partial"),
-    ("failure_check", True, True, "valid"),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region"), [
+    ("failure_check", False, False, "partial", "eu-central-1"),
+    ("failure_check", True, False, "partial", "eu-central-1"),
+    ("failure_check", True, True, "valid", "eu-central-1"),
+    ("failure_check", True, True, "valid", "eu-north-1"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, context_name, full_native, late_tail, expected_validity):
+        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail, expected_validity, region):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
-    source_config = repository_root / "configs/tests/exp-900-single-provider.yaml"
+    source_config = repository_root / "configs/tests" / (
+        "exp-900-single-provider-north.yaml" if region == "eu-north-1" else "exp-900-single-provider.yaml")
     config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
     config_data["context"] = context_name
     config = repository_root / "configs/tests" / f"f09-{tmp_path.name}-{context_name}.yaml"
     request.addfinalizer(lambda: config.unlink(missing_ok=True))
     config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    # Keep real implementation identity for the staged-source guard. Only the
+    # design identity belongs to this explicitly synthetic, cloud-free fixture.
+    from cloud_network_benchmark.manifests import StaticGitProvenance
     initialized = initialize_campaign(config, repository_root, tmp_path / "results",
-        clock=lambda: NOW, token_source=lambda: "campaign")
+        clock=lambda: NOW, token_source=lambda: "campaign",
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
     parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
         config_path=config)
     child = children["aws"]
     runner = FakePreparedAwsRunner()
+    runner.region = region
+    runner.zone = "eu-north-1a" if region == "eu-north-1" else "eu-central-1a"
+    runner.complete_cleanup = region == "eu-north-1"
     runner.full_native = full_native
     runner.late_tail = late_tail
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
@@ -729,9 +849,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)
-    _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id)
+    _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id, region=region)
     costs = load_cost_inputs(cost_path)
-    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256, full_native=full_native)
+    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256,
+        full_native=full_native, region=region)
     clock = FakeClock()
     runtime["sleep"] = clock.sleep
     built = build_runtime(campaign=campaign, parent=parent,
@@ -747,7 +868,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["protect"].state == "registered"
     assert provider_result.values["claim"].eligible is True, provider_result.values
     assert provider_result.values["claim"].creation_granted is True, provider_result.values
-    assert provider_result.primary_failure is not None
+    if region == "eu-north-1":
+        assert provider_result.primary_failure is None
+    else:
+        assert provider_result.primary_failure is not None
     assert provider_result.values["create"].run_id == child.run_id
     assert provider_result.creation_may_have_started is True
     assert provider_result.values["cleanup"] is not None
@@ -771,11 +895,29 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["close"].succeeded is True, provider_result.values["close"].evidence
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
+    assert any(action.startswith("f02r-retrieve-") for action in runner.actions)
     assert any(action.startswith("f02r-") for action in runner.actions)
-    assert "aws-expiry-start-eu-central-1" in runner.actions
+    assert f"aws-expiry-start-{region}" in runner.actions
     assert "aws-pair-apply" in runner.actions
     assert "aws-pair-output" in runner.actions
     assert "aws-pair-destroy" in runner.actions
+    assert runner.pair_variables["primary_region"] == region
+    assert runner.pair_variables["primary_zone"] == runner.zone
+    assert runner.pair_variables["image_id_primary"] == runner.image_id
+    if region == "eu-north-1":
+        assert provider_result.cleanup_state == "succeeded", (
+            provider_result.values["cleanup"].cleanup_failure,
+            [(f.category, f.message) for f in provider_result.values["cleanup"].secondary_failures],
+            [action for action in runner.actions if action.startswith("aws-")])
+        assert runner.destroyed
+        assert any(action.startswith("aws-describe-addresses") for action in runner.actions)
+        assert "aws-expiry-cancel-eu-north-1" in runner.actions
+        assert "aws-safety-destroy-eu-north-1" in runner.actions
+        assert "aws-expiry-document-absence-eu-north-1" in runner.actions
+        assert all("eu-central-1" not in request.argv and "eu-west-2" not in request.argv
+            for request in runner.requests if request.action_id.startswith("aws-"))
+        assert all(request.argv[request.argv.index("--region") + 1] == region
+            for request in runner.requests if request.action_id.startswith("aws-") and "--region" in request.argv)
     from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
     from cloud_network_benchmark.contracts.validation import ValidatorInput
     from cloud_network_benchmark.validation import validate_bundle
@@ -817,7 +959,7 @@ def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, r
     parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
         config_path=config)
     child = children["aws"]
-    runner = FakeAwsRunner()
+    runner = FakePreparedAwsRunner()
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)

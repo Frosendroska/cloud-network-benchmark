@@ -17,7 +17,7 @@ from pydantic import Field, model_validator
 from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
 from .contracts.artifacts import ArtifactInput, ArtifactRecord, resolve_artifact_path
 from .contracts.common import ArtifactExpectation, CommandOutcome, Evidence, FailureEvidence, StrictModel, StringEvidence, VmRole
-from .contracts.execution import CommandRequest, CommandResult, CommandRunner
+from .contracts.execution import BOUNDED_COPY_EOF_MARKER, CommandRequest, CommandResult, CommandRunner
 
 
 def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
@@ -176,6 +176,19 @@ def _inventory_script(source_path: str) -> str:
             "set -- $hash && printf '%s %s\\n' \"$size\" \"$1\"; else exit 1; fi")
 
 
+def _bounded_stream_script(source_path: str, maximum_bytes: int) -> str:
+    """Send at most the charged payload bytes, probing for excess remotely."""
+    path = shlex.quote(source_path)
+    ancestors = " && ".join(f"[ ! -L {shlex.quote(str(parent))} ]"
+        for parent in reversed(PurePosixPath(source_path).parents) if str(parent) != "/")
+    return (f"if {ancestors} && [ -f {path} ] && [ ! -L {path} ]; then "
+            f"exec 3< {path} || exit 1; "
+            f"dd bs=65536 count={maximum_bytes} iflag=count_bytes status=none <&3 || exit 1; "
+            "python3 -c 'import os,sys; sys.exit(0 if os.read(3, 1) == b\"\" else 1)' || exit 1; "
+            f"printf '{BOUNDED_COPY_EOF_MARKER}\\n' >&2; "
+            "else exit 1; fi")
+
+
 def _failure_record(item: RetrievalItem, category: str, message: str, action_id: str | None = None) -> FailureEvidence:
     return _evidence_failure(item, category, message, action_id)
 
@@ -210,7 +223,7 @@ def _evidence_failure(item: RetrievalItem, category: str, message: str, action_i
     return FailureEvidence(category=category, message=message, action_id=action_id, occurred_at=datetime.now(timezone.utc), details={"artifact_id": item.artifact_id})
 
 
-def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic, max_attempts: int = 2, attempt_offset: int = 0, retry_admission: Callable[[RetrievalItem], bool] | None = None) -> RetrievalResult:
+def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic, max_attempts: int = 2, attempt_offset: int = 0, retry_admission: Callable[[RetrievalItem], bool] | None = None, transfer_admission: Callable[[RetrievalItem, int], bool] | None = None) -> RetrievalResult:
     # Keep the historical two-attempt default for existing F02 callers. F09
     # supplies an explicit one-retry ceiling and a fresh F11 check immediately
     # before that retry. Validate before path creation or command execution.
@@ -317,6 +330,28 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="not copied"), sha256=StringEvidence(unavailable_reason="not copied"), retrieval_state="failed", failure=failure_record))
             stop = True
             continue
+        # Reserve the first attempt before even observing this artifact. This
+        # also stops inventory/control work once the shared payload cap is gone.
+        first_attempt = attempt_offset + 1
+        if transfer_admission is not None:
+            try:
+                charged = transfer_admission(item, first_attempt)
+            except Exception:
+                charged = False
+            if not charged:
+                reason = "result_transfer_allowance_exhausted"
+                failure = _evidence_failure(item, reason, "durable payload allowance refused this attempt")
+                failures.append(failure.model_dump(mode="json"))
+                primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host,
+                    role=item.source_role, category=reason, message="result transfer stopped before remote inventory",
+                    source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path,
+                    kind=item.kind, producer=item.source_role, unit_id=item.unit_id,
+                    deployment_id=item.deployment_id, closed=True,
+                    size_bytes=Evidence[int](unavailable_reason=reason),
+                    sha256=StringEvidence(unavailable_reason=reason), retrieval_state="failed", failure=failure))
+                stop = True
+                continue
         # Verify remote closed-file observations at the source before SCP.
         observe_script = _inventory_script(item.source_path)
         obs_request = _request(f"f02r-retrieve-observe-{item.artifact_id}", vm, ["sh", "-c", observe_script], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "ssh")
@@ -364,6 +399,20 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 reason = "cleanup_allowance_reached_before_transfer"
                 stop = True
                 break
+            if transfer_admission is not None and attempt != first_attempt:
+                try:
+                    charged = transfer_admission(item, attempt)
+                except Exception:
+                    charged = False
+                if not charged:
+                    reason = "result_transfer_allowance_exhausted"
+                    stop = True
+                    failure = _evidence_failure(item, reason, "durable payload allowance refused this attempt")
+                    failures.append(failure.model_dump(mode="json"))
+                    primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host,
+                        role=item.source_role, category=reason, message="result transfer stopped before payload",
+                        source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                    break
             staging = child_root / ".f02r-attempts" / f"{item.artifact_id}-{attempt}-{uuid4().hex}.part"
             try:
                 staging.parent.mkdir(parents=True, exist_ok=True)
@@ -376,16 +425,26 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                     reason = "cleanup_allowance_reached_before_transfer"
                     stop = True
                     break
-                remote = f"{vm.user}@{vm.host}:{item.source_path}"
-                req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm, [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
-                result = _execute(runner, req)
+                if transfer_admission is None:
+                    remote = f"{vm.user}@{vm.host}:{item.source_path}"
+                    req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm,
+                        [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
+                    result = _execute(runner, req)
+                else:
+                    req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm,
+                        ["sh", "-c", _bounded_stream_script(item.source_path, item.expected_size_bytes)],
+                        min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "ssh")
+                    if req.argv[-1] != "[request-construction-failed]":
+                        req = req.model_copy(update={"argv": [req.argv[0], "-T", *req.argv[1:]]})
+                    result = (_execute(runner, req) if req.argv[-1] == "[request-construction-failed]"
+                        else runner.run_bounded_copy(req, staging, item.expected_size_bytes))
             except Exception as exc:
                 reason = "staging_or_runner_error"
                 attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="failed", reason=reason))
                 failure = _evidence_failure(item, reason, "transfer could not be staged or invoked", None)
                 failures.append(failure.model_dump(mode="json")); primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host, role=item.source_role, category=reason, message=type(exc).__name__, source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
                 continue
-            actions.append(_action(req.action_id, "scp", vm, req, result))
+            actions.append(_action(req.action_id, req.action_type, vm, req, result))
             size = digest = None
             reason = None
             if req.argv and req.argv[-1] == "[request-construction-failed]":
@@ -485,7 +544,7 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 break
         if not item_verified:
             last_attempt = next((attempt for attempt in reversed(attempts) if attempt.artifact_id == item.artifact_id), None)
-            if reason != "cleanup_allowance_reached_before_transfer":
+            if reason not in {"cleanup_allowance_reached_before_transfer", "result_transfer_allowance_exhausted"}:
                 reason = last_attempt.reason if last_attempt and last_attempt.reason else reason or "transfer_incomplete"
             failure = _evidence_failure(item, reason, "artifact was not verified and published within the available cleanup allowance")
             if reason == "cleanup_allowance_reached_before_transfer":

@@ -29,6 +29,8 @@ from .contracts.admission import (ExpiryEvidence, ExpiryRequest, ReservationEvid
                                   ReservationRequest)
 from .contracts.common import Evidence, ExperimentMode, Provider, StringEvidence
 from .scheduling import assess_provider_skew, inspect_schedule, load_schedule
+from .financial_controls import (FinancialError, validate_paid_financial_plan,
+    check_shared_finances, revalidate_financial_record, validate_stored_commitment, transfer_terms)
 
 
 def _decimal(value: Any, name: str = "money") -> Decimal:
@@ -128,7 +130,8 @@ def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest)
         envelope = plan.cost_envelopes[provider]
         required = {"envelope_id", "provider", "run_id", "priced_on", "source_kind", "source_path",
             "source_sha256", "regions", "unit_basis", "components"}
-        if not isinstance(envelope, Mapping) or set(envelope) != required:
+        expected = required | ({"result_transfer"} if plan.execution_scope == "paid_request" else set())
+        if not isinstance(envelope, Mapping) or set(envelope) != expected:
             raise ValueError("cost_envelope_invalid: missing or unknown envelope fields")
         if (not all(isinstance(envelope.get(key), str) and envelope[key].strip() for key in
             ("envelope_id", "provider", "run_id", "priced_on", "source_kind", "source_path", "unit_basis"))
@@ -188,6 +191,11 @@ def _validate_cost_envelopes(plan: "AdmissionPlan", request: ReservationRequest)
             total += amount
             bucket_totals[component["funding_bucket"]] = bucket_totals.get(component["funding_bucket"], Decimal("0")) + amount
             if component_name == "expiry_cleanup_support": support_totals[provider] = amount
+        if plan.execution_scope == "paid_request":
+            try:
+                transfer_terms(envelope)
+            except FinancialError as exc:
+                raise ValueError(f"cost_envelope_invalid: {exc.reason}") from exc
         totals[provider] = total.quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
         source_key = (envelope["source_path"], envelope["source_sha256"])
         common_sources[source_key] = source
@@ -370,6 +378,7 @@ class AdmissionPlan:
     optional_review_evidence: Mapping[str, Any] = field(default_factory=dict)
     observation_id: str | None = None
     cost_envelopes: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    financial_binding: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.execution_scope not in {"offline_simulation", "paid_request"}:
@@ -574,6 +583,27 @@ class BudgetLedger:
                 _decimal(item.get("reserved_cost_usd"), "reserved cost")
                 _decimal(item.get("incurred_usd", "0"), "incurred cost")
                 _decimal(item.get("released_usd", "0"), "released funding")
+                if "financial" in item:
+                    validate_stored_commitment(item, scope_id=self.scope_id)
+                if item.get("execution_scope") == "paid_request":
+                    transfers = item.get("result_transfer")
+                    if not isinstance(transfers, dict) or set(transfers) != set(item.get("plan", {}).get("providers", [])):
+                        raise ValueError("ledger_unavailable")
+                    for provider, transfer in transfers.items():
+                        cap, overhead = transfer_terms(item["plan"]["cost_envelopes"][provider])
+                        if (not isinstance(transfer, dict) or set(transfer) != {"payload_limit_bytes", "protocol_overhead_allowance_bytes", "debited_bytes", "attempts"}
+                                or transfer["payload_limit_bytes"] != cap or transfer["protocol_overhead_allowance_bytes"] != overhead
+                                or type(transfer["debited_bytes"]) is not int or not 0 <= transfer["debited_bytes"] <= cap
+                                or not isinstance(transfer["attempts"], dict)):
+                            raise ValueError("ledger_unavailable")
+                        charges = 0
+                        for attempt_id, charge in transfer["attempts"].items():
+                            if (not isinstance(attempt_id, str) or not attempt_id.strip()
+                                    or type(charge) is not int or charge < 0):
+                                raise ValueError("ledger_unavailable")
+                            charges += charge
+                        if charges != transfer["debited_bytes"]:
+                            raise ValueError("ledger_unavailable")
                 _duration(item.get("cap_start_monotonic"), "monotonic activation")
                 _duration(item.get("allowance"), "workflow allowance")
                 _hash(item.get("plan", {}).get("fingerprint", ""), "plan fingerprint")
@@ -585,6 +615,14 @@ class BudgetLedger:
                     raise ValueError("ledger_unavailable")
                 if len(set(item.get("creation_claims", []))) != len(item.get("creation_claims", [])) or not set(item.get("creation_claims", [])) <= ProviderSet:
                     raise ValueError("ledger_unavailable")
+                if item.get("execution_scope") == "paid_request":
+                    proof = item.get("creation_quote_checked_at", {})
+                    if not isinstance(proof, dict) or set(proof) != set(item.get("creation_claims", [])):
+                        raise ValueError("ledger_unavailable")
+                    for checked_at in proof.values():
+                        if (not isinstance(checked_at, str)
+                                or not evidence.cap_started_at.value <= _utc(datetime.fromisoformat(checked_at)) <= evidence.expires_at.value):
+                            raise ValueError("ledger_unavailable")
             for key, claim in state["claims"].items():
                 if not key.strip() or not isinstance(claim, dict) or set(claim) != {"fingerprint", "evidence"}:
                     raise ValueError("ledger_unavailable")
@@ -709,6 +747,11 @@ class BudgetLedger:
         except ValueError as exc:
             reason = "source_mismatch" if "source_mismatch" in str(exc) else "cost_envelope_invalid"
             return AdmissionDecision("rejected", False, None, (reason,), 0)
+        try:
+            financial = validate_paid_financial_plan(plan, request, scope_id=self.scope_id,
+                                                    now=self.utc_now())
+        except FinancialError as exc:
+            return AdmissionDecision("rejected", False, None, (exc.reason,), 0)
         reasons = []
         support_components: list[Decimal] = []
         if plan.execution_scope == "paid_request":
@@ -806,7 +849,7 @@ class BudgetLedger:
                 "cleanup":plan.allowance.cleanup_seconds,"source_id":plan.allowance.source_id,
                 "provider_leads":dict(plan.allowance.provider_leads_seconds)},
                 "provider_support":dict(plan.provider_support), "original_failure":plan.original_failure,
-                "cost_envelopes":dict(plan.cost_envelopes),
+                "cost_envelopes":dict(plan.cost_envelopes), "financial": financial,
                 "optional_reviewed":plan.optional_reviewed,"optional_review_evidence":dict(plan.optional_review_evidence),
                 "observation_id":plan.observation_id,"scheduled_start":campaign.scheduled_start.isoformat() if campaign.scheduled_start else None}
             fingerprint = hashlib.sha256(json.dumps({"request": request.model_dump(mode="json"), "source": plan.costs.payload_sha256, "plan":plan_payload}, sort_keys=True, default=str).encode()).hexdigest()
@@ -889,6 +932,12 @@ class BudgetLedger:
             commitment = active + spent + remaining
             if commitment > Decimal("250") or commitment + Decimal("50") > Decimal("300"):
                 return AdmissionDecision("rejected", False, None, ("budget_exhausted",), state["revision"])
+            if financial is not None:
+                try:
+                    check_shared_finances(state, financial, remaining_usd=max(remaining-price, Decimal("0")))
+                except (FinancialError, ValueError, KeyError, TypeError) as exc:
+                    reason = exc.reason if isinstance(exc, FinancialError) else "financial_ledger_invalid"
+                    return AdmissionDecision("rejected", False, None, (reason,), state["revision"])
             now = _utc(self.utc_now())
             deadline = min([now + timedelta(seconds=request.lifetime_cap_seconds)] + [now + timedelta(seconds=request.lifetime_cap_seconds - float(v)) for v in plan.allowance.provider_leads_seconds.values()])
             workflow_seconds = plan.allowance.fit_seconds(now=now, scheduled_start=campaign.scheduled_start)
@@ -920,6 +969,16 @@ class BudgetLedger:
             # Activation precedes provider expiry registration; until sourced cleanup
             # proves absence, a controller restart must conservatively block launches.
             rec["cleanup_open"] = True
+            rec["execution_scope"] = plan.execution_scope
+            if financial is not None:
+                rec["financial"] = financial
+            if plan.execution_scope == "paid_request":
+                rec["creation_quote_checked_at"] = {}
+                rec["result_transfer"] = {provider: {
+                    "payload_limit_bytes": transfer_terms(envelope)[0],
+                    "protocol_overhead_allowance_bytes": transfer_terms(envelope)[1],
+                    "debited_bytes": 0, "attempts": {}}
+                    for provider, envelope in plan.cost_envelopes.items()}
             rec["provider_cleanup"] = {name: False for name in selected}
             state["cleanup_open"].append(rid)
             rec["context"] = str(getattr(campaign.context,"value",campaign.context))
@@ -951,6 +1010,12 @@ class BudgetLedger:
         state = self.inspect()
         rec = state["reservations"].get(reservation_id)
         if not rec: return StageDecision(False, ("ledger_unavailable",), None)
+        if stage != "cleanup":
+            try:
+                revalidate_financial_record(rec, state=state, now=self.utc_now(),
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+            except FinancialError as exc:
+                return StageDecision(False, (exc.reason,), None)
         originals = rec.get("allowance_fields", {})
         remain_fields = {"registration_seconds":remaining.registration_seconds,"provision_seconds":remaining.provision_seconds,
             "readiness_seconds":remaining.readiness_seconds,"stabilization_seconds":remaining.stabilization_seconds,
@@ -1005,11 +1070,66 @@ class BudgetLedger:
         if live <= 0 or remaining_total > live: reasons.append("workflow_time_insufficient")
         return StageDecision(not reasons, tuple(reasons), deadline)
 
+    def debit_result_transfer(self, reservation_id: str, *, provider: Provider | str,
+                              attempt_id: str, maximum_payload_bytes: int) -> bool:
+        """Durably consume a complete attempt's maximum before any remote payload.
+
+        Unknown/partial attempts retain the full debit. The attempt identity is
+        never reusable, even after controller restart or successful cleanup.
+        """
+        name = Provider(provider).value
+        if (not attempt_id or type(maximum_payload_bytes) is not int
+                or maximum_payload_bytes < 0):
+            raise ValueError("invalid result-transfer attempt")
+        fd = self._lock()
+        try:
+            state = self._read()
+            rec = state["reservations"].get(reservation_id)
+            if not rec or rec.get("execution_scope") != "paid_request" or name not in rec.get("result_transfer", {}):
+                return False
+            if (rec.get("session") != self.controller_session_id or rec.get("lifecycle_terminal")
+                    or rec.get("terminal_released") or rec.get("provider_cleanup", {}).get(name)
+                    or state.get("budget_blocked")):
+                return False
+            try:
+                revalidate_financial_record(rec, state=state, now=self.utc_now(),
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+            except FinancialError:
+                return False
+            transfer = rec["result_transfer"][name]
+            if attempt_id in transfer["attempts"]:
+                return False
+            if transfer["debited_bytes"] >= transfer["payload_limit_bytes"]:
+                return False
+            next_total = transfer["debited_bytes"] + maximum_payload_bytes
+            if next_total > transfer["payload_limit_bytes"]:
+                blocked = state.setdefault("budget_blocked", [])
+                if reservation_id not in blocked:
+                    blocked.append(reservation_id)
+                    self._write(state)
+                return False
+            transfer["attempts"][attempt_id] = maximum_payload_bytes
+            transfer["debited_bytes"] = next_total
+            self._write(state)
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
     def claim_creation(self, reservation_id: str, *, provider: Provider, expiry_requests: Sequence[ExpiryRequest], expiry_evidence: Sequence[ExpiryEvidence]) -> StageDecision:
         fd = self._lock()
         try:
             state = self._read(); rec = state["reservations"].get(reservation_id)
             if not rec: return StageDecision(False,("ledger_unavailable",),None)
+            provider_name = Provider(provider).value
+            claim_now = _utc(self.utc_now())
+            new_paid_claim = (rec.get("execution_scope") == "paid_request"
+                              and provider_name not in rec.get("creation_claims", []))
+            try:
+                revalidate_financial_record(rec, state=state, now=claim_now,
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]),
+                    quote_freshness_at=claim_now if new_paid_claim else None)
+            except FinancialError as exc:
+                return StageDecision(False, (exc.reason,), None)
             evidence_now = ReservationEvidence.model_validate(rec["evidence"])
             if evidence_now.state != "reserved" or rec.get("terminal_released") or rec.get("lifecycle_terminal"):
                 return StageDecision(False,("reservation_terminal",),evidence_now.expires_at.value)
@@ -1084,11 +1204,13 @@ class BudgetLedger:
             rec["provider_deadline"] = deadline.isoformat()
             rec["expiry_fingerprint"] = expiry_fingerprint
             claims = rec.setdefault("creation_claims", [])
-            if Provider(provider).value in claims:
+            if provider_name in claims:
                 if clock_discrepancy_added:
                     self._write(state)
                 return StageDecision(True,("creation_already_claimed",),deadline,False)
-            claims.append(Provider(provider).value)
+            claims.append(provider_name)
+            if new_paid_claim:
+                rec["creation_quote_checked_at"][provider_name] = claim_now.isoformat()
             rec["cleanup_open"] = True
             if reservation_id not in state["cleanup_open"]: state["cleanup_open"].append(reservation_id)
             self._write(state)

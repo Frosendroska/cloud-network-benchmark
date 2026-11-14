@@ -17,3 +17,18 @@ run "expiry_prerequisites_only" {
     error_message = "expiry permissions must be deallocation-only"
   }
 }
+
+run "sweden_expiry" {
+  command = plan
+  variables {
+    subscription_id     = "00000000-0000-0000-0000-000000000001"
+    tenant_id           = "00000000-0000-0000-0000-000000000002"
+    resource_group_name = "f06-attempt"
+    deployment_id       = "campaign-azure-deployment"
+    location            = "swedencentral"
+  }
+  assert {
+    condition     = azurerm_resource_group.attempt.location == "swedencentral" && azurerm_automation_account.expiry.location == "swedencentral"
+    error_message = "Both independent expiry prerequisites must use the selected Sweden location."
+  }
+}

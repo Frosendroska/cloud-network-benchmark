@@ -89,15 +89,18 @@ class ArtifactRecord(StrictModel):
         path = resolve_artifact_path(child_root, self.path)
         size = 0
         digest = hashlib.sha256()
-        with path.open("rb") as stream:
+        # Own the only read buffer; default I/O buffering can add 1 MiB on NFS.
+        buffer = bytearray(1024 * 1024)
+        view = memoryview(buffer)
+        with path.open("rb", buffering=0) as stream:
             while True:
                 if budget_check is not None:
                     budget_check(size, digest.hexdigest())
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
+                count = stream.readinto(buffer)
+                if not count:
                     break
-                size += len(chunk)
-                digest.update(chunk)
+                size += count
+                digest.update(view[:count])
                 if budget_check is not None:
                     budget_check(size, digest.hexdigest())
         if self.size_bytes.value != size:

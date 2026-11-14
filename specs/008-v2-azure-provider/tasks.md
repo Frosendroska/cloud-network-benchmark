@@ -97,3 +97,10 @@ Establish validation/journal first; prove pure pair semantics; register the genu
 ## Phase 9: Convergence
 
 - [x] T040 Align Marketplace image parsing and positive fixtures with the actual command boundary in `src/cloud_network_benchmark/azure_provider.py`, F06 tests and `docs/validation/f06-azure-provider.md`. `_validate_image_metadata` invokes `az vm image show`, but the T039 repair requires raw REST `properties.architecture` and `properties.osDiskImage`; Azure CLI flattens these to top-level `architecture`/`osDiskImage`. Microsoft's CLI example shows top-level OS metadata (https://learn.microsoft.com/en-us/azure/virtual-machines/linux/cli-ps-findimage), and its Trusted Launch FAQ shows top-level CLI `architecture` separately from the nested REST/PowerShell shape (https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq). A convergence probe using the documented CLI-shaped matching x64/Linux/id/name response fails with `Marketplace image response lacks Compute image identity or properties`, while the 81 passing focused tests feed the CLI fake raw REST JSON. Either parse the documented CLI output or explicitly use authenticated `az rest` for the nested response; keep exact observed id/name/publisher/offer/SKU/version, x64/Linux checks and fail-closed missing/mismatched/arm64 cases. Test the selected boundary's real argv and response shape, and correct the validation documentation's corresponding claim per FR-002/007/012, T034/T039 and plan: source-grounded actual-image identity (partial).
+
+## Bounded Sweden component repair — 14 November 2026
+
+Specification, clarifications, reviewed plan, tasks and convergence evidence:
+[repairs/sweden-component.md](repairs/sweden-component.md). This extends the
+existing F06 implementation under the current Thesis preparation packet only.
+It grants no launch/spending authority and preserves the research scenarios.

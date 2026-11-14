@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 from pydantic import ValidationError
 
 from cloud_network_benchmark.config import resolve_campaign
@@ -110,6 +112,18 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
             "reviewed_at": NOW.isoformat(),
         })
     return AwsRuntimeSettings(**values)
+
+
+def test_stockholm_provider_scope_rejects_non_acceptance_identity_before_commands(tmp_path):
+    deployment = make_deployment(config_path="configs/tests/exp-900-single-provider-north.yaml")
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment=deployment,
+        ami_ids={"eu-north-1": "ami-0123456789abcdef0"}), clock=lambda: NOW)
+    assert driver._regions(deployment) == ["eu-north-1"]
+    for changed in (deployment.model_copy(update={"experiment_id": "EXP-999"}),
+                    deployment.model_copy(update={"context": "standard"}),
+                    deployment.model_copy(update={"mode": "short_study"})):
+        with pytest.raises(AwsProviderError, match="Stockholm is limited"):
+            driver._regions(changed)
 
 
 def make_request(driver, deployment):
@@ -797,7 +811,9 @@ def test_frozen_scenarios_match_aws_regions_and_pair_root(scenario, file, tmp_pa
     variables = driver._pair_variables(deployment)
     assert variables["scenario"] == scenario
     assert variables["controller_cidr"].endswith("/32")
-    assert variables["image_id_frankfurt"] == "ami-0123456789abcdef0"
+    assert variables["primary_region"] == "eu-central-1"
+    assert variables["primary_zone"] == "eu-central-1a"
+    assert variables["image_id_primary"] == "ami-0123456789abcdef0"
 
 
 def test_pair_hcl_keeps_exact_two_vm_topologies_and_private_ingress():
