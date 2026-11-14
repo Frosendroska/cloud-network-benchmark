@@ -65,10 +65,37 @@ fail-closed launch, independent expiry and cleanup. No new infrastructure class.
 - [x] AS-T4 Retain deadlines, expiry and original hashed recovery inputs; fix user.
 - [x] AS-T5 Add focused configuration/scope/failure/restart/runtime regressions.
 - [x] AS-T6 Run local focused checks and original draft validation.
-- [ ] AS-T7 Run justified native delta and verify private logs/hashes.
-- [ ] AS-T8 Converge native findings and publish exact implementation handoff.
+- [x] AS-T7 Run justified native delta and verify private logs/hashes.
+- [x] AS-T8 Converge native findings and publish exact implementation handoff.
 
 Analysis: each AS requirement maps to an owned code path and a focused check.
 No research geography, N, UTC window, cost total or spending authority is inferred.
 A component is not evidence of registered controller/server-failure acceptance.
 Native and live boundaries remain explicit in the validation report.
+
+## Final convergence
+
+Implementation 266bd48 passed 250 affected native Python cases and the local
+Terraform builtin state proof. Preserve its incomplete driver: new HCL set
+assertion/default mocks failed. Terraform-only correction ad91123 passed both
+roots, eight mock test cases and six exact scope checks (34 driver checks).
+Convergence then tightened unknown computed IDs to the actual static attribute,
+per-role dynamic collection, one NIC, and exact legacy PPG/peering target. Repair
+0b70033 passed all 63 focused native cases, including ten new negatives/positives,
+and six replays of the unchanged native plan artifacts (11 driver checks).
+
+AS1/2: allowed original Sweden draft, contract/deployment rejection boundaries,
+legacy topologies, image/expiry/pair/admin/host identities. AS3/4: private exact
+saved plan/state/receipt, critical known values and computed references, deadline
+slack. AS5/6: original hashed/legacy inputs, expired restart and failure cleanup,
+F11 factory reconciliation and source binding including PowerShell. AS7: configured
+admin user reaches Terraform and authenticated VM readback. AS8: exact committed
+sources/hashes and private native artifacts verified; 260 distinct case identities
+across checkpoints (313 executions), no new full baseline.
+
+No remaining bounded offline implementation finding. Actual Azure provider
+plan/show, capacity, expiry/guest/controller failure/full deletion and source-bound
+EUR/cash/window approval remain separate acceptance stages. Native scope-envelope
+and builtin adapters are explicitly disclosed; they are not cloud evidence.
+Final implementation: 0b70033e8c49ade91637f0770adc6e7c76fd50ec. See
+[validation and hashes](../../../docs/validation/azure-sweden-component.md).

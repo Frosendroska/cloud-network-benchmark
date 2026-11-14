@@ -1,0 +1,238 @@
+{
+  "status": "passing_credential_free_affected_delta",
+  "implementation_revision": "266bd48712da096501da0b45c4014387564ec126",
+  "terraform_correction_revision": "ad911230640fa33baf81d451a6fa5413810f3059",
+  "documentation_revision": "recorded by the commit containing this report",
+  "native_python": {
+    "tests": 250,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "native_python_revision": "266bd48712da096501da0b45c4014387564ec126",
+  "native_python_log_sha256": "d895b1d1bfea70ecebf736350e427c0a12585fda51b5042c54131f1763665f73",
+  "native_python_junit_sha256": "496d733edb6d942db21d5361275dbd28c468ed69bc13b47eca34f326dced2c64",
+  "native_factory_log_sha256": "1f0d011219f01864a373d9b9b29b997d88c06449b9408ed0c7d9736ac0441649",
+  "native_factory_junit_sha256": "6fa0897889d021db2c59d8317ea34afe98b59d3d4b7b78d489ebbd9c6f6f41e6",
+  "initial_driver_complete": false,
+  "initial_summary_sha256": "19c351cf8239bdaf54cbd0bb34317ce7ed3d0d169a6006f57f8cf0cc9135f745",
+  "corrected_driver_complete": true,
+  "corrected_driver_checks": 34,
+  "corrected_summary_sha256": "9d1521d736da78cf0b32188e82610dd35877d928b005f7fecff9995eaa48c277",
+  "native_terraform_test_summaries": {
+    "pair": [
+      {
+        "status": "pass",
+        "passed": 6,
+        "failed": 0,
+        "errored": 0,
+        "skipped": 0
+      }
+    ],
+    "expiry": [
+      {
+        "status": "pass",
+        "passed": 2,
+        "failed": 0,
+        "errored": 0,
+        "skipped": 0
+      }
+    ]
+  },
+  "native_scope_checks": [
+    {
+      "root": "expiry",
+      "scenario": "same_zone",
+      "region": "swedencentral",
+      "passed": true,
+      "managed_count": 4,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    },
+    {
+      "root": "pair",
+      "scenario": "same_zone",
+      "region": "swedencentral",
+      "passed": true,
+      "managed_count": 12,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    },
+    {
+      "root": "pair",
+      "scenario": "same_zone",
+      "region": "germanywestcentral",
+      "passed": true,
+      "managed_count": 12,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    },
+    {
+      "root": "pair",
+      "scenario": "cross_zone",
+      "region": "germanywestcentral",
+      "passed": true,
+      "managed_count": 12,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    },
+    {
+      "root": "pair",
+      "scenario": "placement_optimization",
+      "region": "germanywestcentral",
+      "passed": true,
+      "managed_count": 13,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    },
+    {
+      "root": "pair",
+      "scenario": "inter_region",
+      "region": "germanywestcentral",
+      "passed": true,
+      "managed_count": 16,
+      "envelope_adapter": "variables/format and synthetic provider-configuration envelope; computed IDs explicitly mocked, production unknown-reference graph covered by unit cases"
+    }
+  ],
+  "builtin_same_plan_original_state_proof": {
+    "result": "succeeded",
+    "same_binary": true,
+    "state_arg_retained": true,
+    "custom_state_exists": true,
+    "default_state_absent": true,
+    "saved_value": {
+      "value": "saved",
+      "type": "string"
+    },
+    "commands": [
+      [
+        "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+        "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin/azure/pair",
+        "plan",
+        "-input=false",
+        "-no-color",
+        "-state=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin-owned.tfstate",
+        "-var-file=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin-vars.json",
+        "-out=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/azure-pair-apply-review-mc9avi7q/saved.tfplan"
+      ],
+      [
+        "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+        "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin/azure/pair",
+        "show",
+        "-json",
+        "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/azure-pair-apply-review-mc9avi7q/saved.tfplan"
+      ],
+      [
+        "/u/halle/brek/home_at/cnb/tools/bin/terraform",
+        "-chdir=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin/azure/pair",
+        "apply",
+        "-input=false",
+        "-state=/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/builtin-owned.tfstate",
+        "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-validation/azure-pair-apply-review-mc9avi7q/saved.tfplan"
+      ]
+    ],
+    "adapter": "test-only one local builtin; no provider apply",
+    "passed": true
+  },
+  "builtin_proof_sha256": "e468338eb3f5043224a126283986c94ee5f077c75cc417e2a9ae75f3b683187a",
+  "native_sources_clean_before_after": true,
+  "current_executable_sha256": {
+    "src/cloud_network_benchmark/azure_provider.py": "ca1ad82ceb8dbb876aedebb9c6587887d2eb01693d90300b5ed639b0bd94ba85",
+    "src/cloud_network_benchmark/azure_plan_scope.py": "bac081537c48053c79e4d58ec49420158732ffe4fa865bd6bc085d68e4023271",
+    "src/cloud_network_benchmark/contracts/campaign.py": "18d5dca88ade8ab547887fd5c807427a7b92d6c0a21c28fdcc7f221c0dcd7b2a",
+    "src/cloud_network_benchmark/lifecycle_runtime.py": "aee93b52972d6a07fa4e4fdd1ab26f14344cd0544ebdcf6eb0c77d9dec2c5f69",
+    "src/cloud_network_benchmark/terraform_plan.py": "c9c62df072bbed6ba60bbd51ac2e5e0efe0d2439cc97e188a51238c80e53697a",
+    "terraform/azure/pair/main.tf": "1a19cfbea6ad90bf7be4f1433e4476a147181c4535c3e59aa1b91fa198b10202",
+    "terraform/azure/pair/variables.tf": "2760cb7bc707aa7ebd696e3023ce04f28fae3b83859594c9fe968265a4710d60",
+    "terraform/azure/expiry/main.tf": "05ed6cd7d3011f00566766a4f22fb301a8bcb60a8cef04245df3cf49a3bfc242",
+    "terraform/azure/expiry/deallocate.ps1": "60b14f3d2c7d1be0687ea97adb0dc67aa0ba61e0520c58ab82196338e718f60a"
+  },
+  "archive": {
+    "remote": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/azure-sweden-final-native-evidence.zip",
+    "local": "/private/tmp/cnb-azure-sweden-final-native-evidence.zip",
+    "sha256": "c19c8a585b067b4f88c208c180de6dea56077186f6cf373c42f910ab0d5c3fda",
+    "bytes": 6524857,
+    "manifest_files_verified": 191,
+    "crc_verified": true
+  },
+  "limits": [
+    "Affected delta only; existing AWS/GCP baseline reused.",
+    "Python/builtin at 266bd48; Terraform correction ad91123 validated separately; final computed-ID repair 0b70033 has 63 passing native cases and replays six unchanged native scope artifacts. 260 distinct cases across checkpoints, not one new full-suite run.",
+    "Native mock test plans omit normal show envelope: format/variables plus synthetic configuration envelope supplied; managed resource_changes retained unchanged. Computed IDs explicitly mocked. Unknown-reference graph unit-tested; actual Azure provider plan/show integration unproved.",
+    "No cloud credentials loaded, provider apply/expiry registration, VM/IAM, real ledger/reservation or paid authority created.",
+    "Offline readiness is distinct from provider acceptance, cash authorization and research evidence."
+  ],
+  "final_implementation_revision": "0b70033e8c49ade91637f0770adc6e7c76fd50ec",
+  "final_scope_delta": {
+    "pytest": {
+      "tests": 63,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "pytest_sha256": "e9de9073ad87cb2546b41536c1b0ea479ee1d57589b340c5c0786331db09c373",
+    "changed_paths": [
+      "src/cloud_network_benchmark/azure_plan_scope.py",
+      "tests/unit/test_azure_saved_plan.py"
+    ],
+    "reused_summary_sha256": "9d1521d736da78cf0b32188e82610dd35877d928b005f7fecff9995eaa48c277",
+    "replayed_native_scope_artifacts": [
+      {
+        "name": "scope-expiry-swedencentral-same_zone-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "4f0f6024c171506249cfec5b0f0dd9de461d9fc39de3a6c6d764de676ac62b9d",
+        "managed_count": 4,
+        "root": "expiry",
+        "scenario": "same_zone",
+        "region": "swedencentral"
+      },
+      {
+        "name": "scope-pair-swedencentral-same_zone-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "c1d54c984593862e7bae2e0f29d323ac3c31f6622323c43ccef30e2ed87c5dbf",
+        "managed_count": 12,
+        "root": "pair",
+        "scenario": "same_zone",
+        "region": "swedencentral"
+      },
+      {
+        "name": "scope-pair-germanywestcentral-same_zone-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "909ce3735faa00e60a564ba4409b9db99a7e5fad5147fa4dc811a282e22dff22",
+        "managed_count": 12,
+        "root": "pair",
+        "scenario": "same_zone",
+        "region": "germanywestcentral"
+      },
+      {
+        "name": "scope-pair-germanywestcentral-cross_zone-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "4426afada74308151d36b80282b28e38cf85c149a6cb769b036efddb83c1f117",
+        "managed_count": 12,
+        "root": "pair",
+        "scenario": "cross_zone",
+        "region": "germanywestcentral"
+      },
+      {
+        "name": "scope-pair-germanywestcentral-placement_optimization-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "a5efdcb69be8a5c2c907cb8f3d96504392bffccb9214b4a621c1021495331d77",
+        "managed_count": 13,
+        "root": "pair",
+        "scenario": "placement_optimization",
+        "region": "germanywestcentral"
+      },
+      {
+        "name": "scope-pair-germanywestcentral-inter_region-replay",
+        "exit_code": 0,
+        "source_plan_log_sha256": "259b7b9e3e9a53164f122e11ffa391137b7b98018291bdc5aa880117a21826ac",
+        "managed_count": 16,
+        "root": "pair",
+        "scenario": "inter_region",
+        "region": "germanywestcentral"
+      }
+    ],
+    "source_unchanged": true,
+    "log_sha256": "6689b489435538855fc8401e07aca75c8f3e8ce9a7dda3b81a77d69eed9d23da",
+    "summary_sha256": "e35cf50978e049bc862ce592e408bfd4430ba767f725b3bd084c8ddb31ec79cc",
+    "driver_checks": 11
+  },
+  "distinct_affected_case_identities": 260,
+  "initial_cases_rerun_in_final_delta": 53,
+  "new_final_case_identities": 10
+}
