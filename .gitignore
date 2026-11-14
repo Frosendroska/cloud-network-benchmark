@@ -74,3 +74,5 @@ results/processed/*
 # Local autonomous coordinator checkpoints and logs (recover from Git/PRs as needed).
 .codex/autonomous-state.json
 .codex/autonomous-evidence/
+
+**/azure-*-review-*/

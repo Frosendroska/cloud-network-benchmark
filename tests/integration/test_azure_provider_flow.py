@@ -11,6 +11,8 @@ from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, r
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
 from cloud_network_benchmark.contracts.execution import CommandResult
+pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
+
 from tests.fixtures.f06 import RESPONSE_FIXTURES
 from tests.contract.test_azure_provider_contract import deployment, options
 
@@ -64,6 +66,7 @@ class AutomationRunner:
             self.publish_reads+=1
             state="Published" if self.publish_reads>self.publish_delay else "Draft"
             payload=json.loads(json.dumps(RESPONSE_FIXTURES["runbook_published"] if state=="Published" else RESPONSE_FIXTURES["runbook_draft"]))
+            payload["location"]=self.d.vm_a.region
             payload.setdefault("properties",{}).update({"runbookType":"PowerShell","runtimeEnvironment":"PowerShell-5.1"})
             out=json.dumps(payload)
         elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script
@@ -85,7 +88,7 @@ class AutomationRunner:
             out=json.dumps([{"id":self.role_id,"assignableScopes":[self.group_id],"permissions":[{"actions":["Microsoft.Compute/virtualMachines/read","Microsoft.Compute/virtualMachines/instanceView/read","Microsoft.Compute/virtualMachines/deallocate/action"],"notActions":[],"dataActions":[],"notDataActions":[]}]}])
         elif request.action_type=="automation_module_readback": out=json.dumps({"properties":{"provisioningState":"Succeeded","version":"3.0.0"}})
         elif request.action_type=="expiry_module_recheck": out=json.dumps(self.module_recheck if self.module_recheck is not None else {"properties":{"provisioningState":"Succeeded","version":"3.0.0"}})
-        elif request.action_type in {"automation_account_readback","expiry_account_recheck"}: out=json.dumps({"identity":{"type":"SystemAssigned","principalId":"00000000-0000-0000-0000-000000000003"}})
+        elif request.action_type in {"automation_account_readback","expiry_account_recheck"}: out=json.dumps({"location":self.d.vm_a.region,"identity":{"type":"SystemAssigned","principalId":"00000000-0000-0000-0000-000000000003"}})
         elif request.action_type=="image_preflight":
             if "--urn" in request.argv:
                 _,offer,sku,version=request.argv[request.argv.index("--urn")+1].split(":")
@@ -98,7 +101,8 @@ class AutomationRunner:
             out=json.dumps({"id":request.argv[request.argv.index("--ids")+1],"name":"24.04.20261001"})
         elif request.action_type=="vm_image_observation":
             actual=self.o.selected_image+"-foreign" if self.vm_image_mismatch else self.o.selected_image
-            out=json.dumps({"storageProfile":{"imageReference":{"id":actual}}})
+            vm=self.d.vm_a if request.argv[request.argv.index("--ids")+1].endswith("-a") else self.d.vm_b
+            out=json.dumps({"id":request.argv[request.argv.index("--ids")+1],"location":vm.region,"zones":[vm.zone],"hardwareProfile":{"vmSize":vm.vm_shape},"osProfile":{"adminUsername":vm.connection_user},"storageProfile":{"imageReference":{"id":actual}}})
         outcome=CommandOutcome.FAILED if request.action_type==self.fail_at else CommandOutcome.SUCCEEDED
         return CommandResult(action_id=request.action_id,outcome=outcome,started_at=self.now,finished_at=self.now,duration_seconds=0,
             exit_code=1 if outcome==CommandOutcome.FAILED else 0,stdout=out,stderr="injected failure" if outcome==CommandOutcome.FAILED else "")
@@ -372,7 +376,7 @@ def test_marketplace_image_metadata_uses_exact_x64_canonical_urn(repository_root
     selected="Canonical:ubuntu-24_04-lts:server:24.04.20261001"
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"selected_image":selected})
     runner=AutomationRunner(d,o,datetime.now(timezone.utc))
-    image=_validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.)
+    image=_validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.,d.vm_a.region)
     assert image=={
         "id":f"/subscriptions/{o.subscription_id}/providers/Microsoft.Compute/locations/germanywestcentral/publishers/Canonical/artifacttypes/vmimage/offers/ubuntu-24_04-lts/skus/server/versions/24.04.20261001",
         "architecture":"x64","operating_system":"Linux","publisher":"Canonical","offer":"ubuntu-24_04-lts",
@@ -401,7 +405,7 @@ def test_marketplace_compute_readback_requires_complete_matching_x64_linux_ident
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"selected_image":selected})
     runner=AutomationRunner(d,o,datetime.now(timezone.utc),marketplace_response=response)
     with pytest.raises(ValueError):
-        _validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.)
+        _validate_image_metadata(o,runner,_workspace(o,d)[0],lambda:1.,d.vm_a.region)
 
 
 def test_absolute_nonzero_monotonic_origin_survives_mapping_registration_provision_and_cleanup(repository_root:Path,tmp_path:Path):
@@ -482,8 +486,8 @@ def test_cleanup_proves_vm_absence_and_blocks_expiry_teardown_for_residual_pair_
     for name in (("pair",) if residual else ("pair","expiry")):
         init=next(request for request in runner.requests if request.action_type==name+"_recovery_init")
         destroy_request=next(request for request in runner.requests if request.action_type==name+"_destroy")
-        assert f"-chdir=terraform/azure/{name}" in init.argv
-        assert f"-chdir=terraform/azure/{name}" in destroy_request.argv
+        assert any(arg.endswith(f"/terraform/azure/{name}") for arg in init.argv)
+        assert any(arg.endswith(f"/terraform/azure/{name}") for arg in destroy_request.argv)
         assert any(arg.endswith(f"{name}.auto.tfvars.json") for arg in destroy_request.argv)
     if residual:
             assert not any(kind.endswith("_delete") for kind in cleanup_actions)

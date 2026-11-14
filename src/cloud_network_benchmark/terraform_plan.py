@@ -1,4 +1,4 @@
-"""Private, deadline-bound saved-plan review for the existing AWS/GCP roots.
+"""Private, deadline-bound saved-plan review for the existing provider roots.
 
 The operator receipt is technical inspection evidence, never paid authorization.
 Only apply enters this boundary; original scoped destroy remains independent.
@@ -41,7 +41,7 @@ def _private(path: Path, content: bytes) -> None:
 
 def source_hash(root: Path) -> str:
     files = sorted(p for p in root.rglob("*") if p.is_file()
-                   and (p.suffix in {".tf", ".py"} or p.name == ".terraform.lock.hcl")
+                   and (p.suffix in {".tf", ".py", ".ps1"} or p.name == ".terraform.lock.hcl")
                    and ".terraform" not in p.parts)
     return hashlib.sha256(_json({str(p.relative_to(root)): _hash(p) for p in files})).hexdigest()
 
@@ -58,6 +58,9 @@ def _fields(actual: dict, expected: dict, label: str) -> None:
 
 def expected_addresses(provider: str, root: str, v: dict) -> set[str]:
     """Exact managed addresses, including count/for_each instances and guards."""
+    if provider == "azure":
+        from .azure_plan_scope import addresses
+        return addresses(root, v)
     if provider == "aws" and root == "safety":
         return {"aws_iam_role.expiry", "aws_iam_role_policy.expiry", "aws_ssm_document.expiry"}
     if provider == "gcp" and root == "pair":
@@ -96,21 +99,27 @@ def validate_scope(plan: dict, provider: str, root: Path, v: dict) -> list[dict]
     for check in plan.get("checks", []):
         if check.get("status") in {"fail", "error"}: raise PlanReviewError("Terraform plan checks failed")
     resources = {}
-    data_allowed = {"data.aws_caller_identity.current", "data.aws_availability_zones.primary", "data.aws_availability_zones.london[0]"} if provider == "aws" else set()
+    data_allowed = {"data.aws_caller_identity.current", "data.aws_availability_zones.primary", "data.aws_availability_zones.london[0]"} if provider == "aws" else ({"data.azurerm_resource_group.pair"} if provider == "azure" and root.name == "pair" else set())
     for item in plan.get("resource_changes", []):
         address, change = item["address"], item["change"]
         if item.get("mode") == "data":
             if address not in data_allowed or change["actions"] not in (["read"], ["no-op"]):
                 raise PlanReviewError("unexpected Terraform data action")
+            if provider == "azure":
+                _same(change.get("after", {}).get("name"), v["resource_group_name"], "Azure existing resource group")
+                _same(item.get("provider_name"), "registry.terraform.io/hashicorp/azurerm", "Azure data provider")
             continue
         if address in resources or change["actions"] != ["create"] or change.get("before") is not None or item.get("previous_address") or item.get("importing") or change.get("importing"):
             raise PlanReviewError("only fresh creation is reviewable; update/delete/replacement/import rejected")
-        expected_provider = ("terraform.io/builtin/terraform" if item["type"] == "terraform_data" else f"registry.terraform.io/hashicorp/{'google' if provider == 'gcp' else 'aws'}")
+        expected_provider = ("terraform.io/builtin/terraform" if item["type"] == "terraform_data" else f"registry.terraform.io/hashicorp/{ {'gcp': 'google', 'azure': 'azurerm', 'aws': 'aws'}[provider]}")
         _same(item.get("provider_name"), expected_provider, "provider identity")
         resources[address] = change["after"]
     _same(set(resources), expected_addresses(provider, root.name, v), "resource address scope")
     if provider == "aws": _aws_scope(resources, root, v)
-    else: _gcp_scope(resources, root.name, v)
+    elif provider == "gcp": _gcp_scope(resources, root.name, v)
+    else:
+        from .azure_plan_scope import validate
+        validate(resources, root.name, v, plan)
     return [{"address": key, "actions": ["create"]} for key in sorted(resources)]
 
 
@@ -234,8 +243,8 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
     argv = request.argv
     root = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-chdir=")))
     provider = root.parent.name
-    if provider not in {"aws", "gcp"} or "apply" not in argv:
-        raise PlanReviewError("saved-plan boundary accepts only AWS/GCP apply")
+    if provider not in {"aws", "azure", "gcp"} or "apply" not in argv:
+        raise PlanReviewError("saved-plan boundary accepts only provider apply")
     variables = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-var-file=")))
     state = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-state=")))
     directory = Path(tempfile.mkdtemp(prefix=request.action_id + "-review-", dir=request.cwd))

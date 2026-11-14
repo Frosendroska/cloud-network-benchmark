@@ -301,7 +301,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
                 "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
                 "ssh_public_key_path": pub, "authentication_reference": str(identity),
-                "poll_seconds": 15, "command_timeout_seconds": 60},
+                "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
             "bootstrap_template": repository_root / "terraform/azure/pair/main.tf",
             "terraform_directory": repository_root / "terraform/azure",
             "sources": {"expiry_cost_path": expiry_cost, "primary_review_path": None}}}}
@@ -319,7 +319,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
             if request.action_type == "vm_image_observation":
                 self.delegate.requests.append(request)
                 publisher, offer, sku, version = self.delegate.o.selected_image.split(":")
-                payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                     "offer": offer, "sku": sku, "exactVersion": version}}}
                 return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
                     started_at=clock.utc_now(), finished_at=clock.utc_now(), duration_seconds=0,
@@ -350,6 +350,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
     assert set(result.provider_results) == {"azure"}
     provider = result.provider_results["azure"]
     assert provider.values["protect"].state == "registered", provider.values["protect"].failure
+    assert observed["options"].plan_review_timeout_seconds == 30
     assert provider.values["claim"].eligible is True
     assert provider.values["claim"].creation_granted is True
     assert provider.values["create"] is not None, (provider.primary_failure, provider.values)
@@ -542,7 +543,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
                 "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
                 "ssh_public_key_path": pub, "authentication_reference": str(identities["azure"]),
-                "poll_seconds": 15, "command_timeout_seconds": 60},
+                "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
                 "bootstrap_template": ROOT / "terraform/azure/pair/main.tf", "terraform_directory": ROOT / "terraform/azure",
                 "sources": {"expiry_cost_path": azure_cost, "primary_review_path": None}},
             "gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
@@ -677,7 +678,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     if request.action_type == "vm_image_observation":
                         self.azure.requests.append(request)
                         publisher, offer, sku, version = self.azure.o.selected_image.split(":")
-                        payload = {"storageProfile": {"imageReference": {"publisher": publisher,
+                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                             "offer": offer, "sku": sku, "exactVersion": version}}}
                         now = clock.utc_now()
                         return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,

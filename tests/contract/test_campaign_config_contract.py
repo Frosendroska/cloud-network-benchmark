@@ -73,7 +73,7 @@ def test_common_n_requires_source_evidence_and_fallback_consistency(repository_r
 
 
 def _northern_acceptance(repository_root: Path, provider: str, region: str, zone: str) -> dict:
-    filename = "exp-900-single-provider.yaml" if provider == "aws" else "exp-902-gcp-single-provider.yaml"
+    filename = {"aws":"exp-900-single-provider.yaml", "azure":"exp-901-azure-single-provider.yaml", "gcp":"exp-902-gcp-single-provider.yaml"}[provider]
     data = yaml.safe_load((repository_root / "configs/tests" / filename).read_text(encoding="utf-8"))
     item = data["provider_configs"][provider]
     old_region = item["regions"]["vm_a"]
@@ -86,7 +86,7 @@ def _northern_acceptance(repository_root: Path, provider: str, region: str, zone
 
 @pytest.mark.parametrize(
     ("provider", "region", "zone"),
-    [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a")],
+    [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a"), ("azure", "swedencentral", "1")],
 )
 def test_northern_locality_is_accepted_for_named_same_zone_checks(
     repository_root: Path, provider: str, region: str, zone: str,
@@ -105,6 +105,7 @@ def test_northern_locality_is_accepted_for_named_same_zone_checks(
     [
         ("aws", "eu-north-1", "eu-north-1a", "eu-north-1b", "EXP-999"),
         ("gcp", "europe-north1", "europe-north1-a", "europe-north1-b", "EXP-999"),
+        ("azure", "swedencentral", "1", "2", "EXP-999"),
     ],
 )
 def test_northern_locality_rejects_wrong_zone_identity_and_network(
@@ -120,8 +121,8 @@ def test_northern_locality_rejects_wrong_zone_identity_and_network(
     data["experiment_id"] = wrong_experiment
     with pytest.raises(ValueError, match="regions/zones do not match"):
         CampaignConfiguration.model_validate(data)
-    data["experiment_id"] = "EXP-900" if provider == "aws" else "EXP-902"
-    item["network"]["address_spaces"][region] = "10.99.0.0/16" if provider == "aws" else "10.99.1.0/24"
+    data["experiment_id"] = {"aws":"EXP-900", "azure":"EXP-901", "gcp":"EXP-902"}[provider]
+    item["network"]["address_spaces"][region] = "10.99.0.0/16" if provider != "gcp" else "10.99.1.0/24"
     item["network"]["subnets"][region] = ["10.99.1.0/24"]
     with pytest.raises(ValueError, match="unexpected network range"):
         CampaignConfiguration.model_validate(data)
@@ -132,6 +133,7 @@ def test_northern_locality_rejects_wrong_zone_identity_and_network(
     [
         ("aws", "eu-north-1", "eu-north-1a", "eu-future-1", "eu-future-1a"),
         ("gcp", "europe-north1", "europe-north1-a", "europe-future1", "europe-future1-a"),
+        ("azure", "swedencentral", "1", "futurecentral", "1"),
     ],
 )
 def test_unknown_region_is_a_structured_validation_error(
@@ -156,7 +158,7 @@ def test_unknown_region_is_a_structured_validation_error(
     assert any(f"unsupported {provider} region: {unknown_region}" in issue["message"] for issue in error["details"]["issues"])
 
 
-@pytest.mark.parametrize(("provider", "region", "zone"), [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a")])
+@pytest.mark.parametrize(("provider", "region", "zone"), [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a"), ("azure", "swedencentral", "1")])
 def test_northern_locality_does_not_extend_research_study(
     repository_root: Path, provider: str, region: str, zone: str,
 ) -> None:

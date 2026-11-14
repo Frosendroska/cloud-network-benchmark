@@ -134,3 +134,25 @@ run "reject_cross_zone_same_zone" {
   }
   expect_failures = [var.scenario]
 }
+
+run "sweden_component" {
+  command = plan
+  variables {
+    scenario       = "same_zone"
+    location       = "swedencentral"
+    region_a       = "swedencentral"
+    region_b       = "swedencentral"
+    zone_a         = "1"
+    zone_b         = "1"
+    selected_image = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
+    admin_username = "azureuser"
+  }
+  assert {
+    condition     = length(azurerm_linux_virtual_machine.pair) == 2 && alltrue([for vm in values(azurerm_linux_virtual_machine.pair) : vm.location == "swedencentral" && vm.zone == "1" && vm.source_image_reference[0].version == "24.04.202610250" && vm.admin_username == "azureuser" && vm.admin_ssh_key[0].username == "azureuser"])
+    error_message = "The component must retain the exact Sweden zone and image on both VMs."
+  }
+  assert {
+    condition     = length(local.vnets) == 1 && length(azurerm_proximity_placement_group.pair) == 0 && length(azurerm_virtual_network_peering.a_to_b) == 0
+    error_message = "The Sweden component has one VNet and no placement group or peering."
+  }
+}

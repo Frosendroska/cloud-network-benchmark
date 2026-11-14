@@ -164,11 +164,11 @@ resource "azurerm_linux_virtual_machine" "pair" {
   size                            = "Standard_D4s_v5"
   zone                            = each.value.zone
   priority                        = "Regular"
-  admin_username                  = "ubuntu"
+  admin_username                  = var.admin_username
   network_interface_ids           = [azurerm_network_interface.pair[each.key].id]
   disable_password_authentication = true
   admin_ssh_key {
-    username   = "ubuntu"
+    username   = var.admin_username
     public_key = var.ssh_public_key
   }
   source_image_id = startswith(var.selected_image, "/") ? var.selected_image : null

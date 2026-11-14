@@ -317,7 +317,7 @@ class ProviderConfiguration(StrictModel):
             raise ValueError("network address spaces/subnets must match selected regions")
         expected_networks = {
             Provider.AWS: {"eu-central-1": "10.60.0.0/16", "eu-west-2": "10.61.0.0/16", "eu-north-1": "10.60.0.0/16"},
-            Provider.AZURE: {"germanywestcentral": "10.70.0.0/16", "uksouth": "10.71.0.0/16"},
+            Provider.AZURE: {"germanywestcentral": "10.70.0.0/16", "uksouth": "10.71.0.0/16", "swedencentral": "10.70.0.0/16"},
             Provider.GCP: {"europe-west3": "10.80.1.0/24", "europe-west2": "10.81.1.0/24", "europe-north1": "10.80.1.0/24"},
         }[provider]
         for region in regions:
@@ -434,6 +434,7 @@ class CampaignConfiguration(StrictModel):
             }[provider][scenario]
             locality = (tuple(item.regions.model_dump().values()), tuple(item.zones.model_dump().values()))
             northern_locality = {
+                Provider.AZURE: (("swedencentral", "swedencentral"), ("1", "1")),
                 Provider.AWS: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
                 Provider.GCP: (("europe-north1", "europe-north1"), ("europe-north1-a", "europe-north1-a")),
             }.get(provider)
@@ -442,7 +443,7 @@ class CampaignConfiguration(StrictModel):
                 and mode == ExperimentMode.ACCEPTANCE
                 and self.context == "failure_check"
                 and providers == {provider}
-                and self.experiment_id == {Provider.AWS: "EXP-900", Provider.GCP: "EXP-902"}.get(provider)
+                and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}.get(provider)
                 and locality == northern_locality
             )
             if locality != expected_locality and not northern_acceptance:

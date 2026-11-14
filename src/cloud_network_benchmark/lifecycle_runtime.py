@@ -132,7 +132,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         "azure": {"expiry_cost_path", "primary_review_path"}}
     for provider, value in providers.items():
         row = _keys(value, {"options", "bootstrap_template", "terraform_directory", "sources"}, f"providers.{provider}")
-        optional = {"plan_review_timeout_seconds"} if provider in {"aws", "gcp"} else set()
+        optional = {"plan_review_timeout_seconds"}
         present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
         options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
         if "plan_review_timeout_seconds" in present:
@@ -383,7 +383,7 @@ def _financial_runtime_binding(runtime, children):
     for row in runtime["providers"].values():
         add(row["bootstrap_template"])
         for path in Path(row["terraform_directory"]).rglob("*"):
-            if ".terraform" not in path.parts and (path.suffix in {".tf", ".py"} or path.name == ".terraform.lock.hcl"):
+            if ".terraform" not in path.parts and (path.suffix in {".tf", ".py", ".ps1"} or path.name == ".terraform.lock.hcl"):
                 add(path)
         for path in row["sources"].values():
             if path is not None:
@@ -770,7 +770,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     runtime["allowance"], "preparation").total_seconds),
                 cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
-                command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price)
+                command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
+                plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
             name, ids = azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AZURE, action="deallocate",
