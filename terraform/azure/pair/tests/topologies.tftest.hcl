@@ -148,7 +148,7 @@ run "sweden_component" {
     admin_username = "azureuser"
   }
   assert {
-    condition     = length(azurerm_linux_virtual_machine.pair) == 2 && alltrue([for vm in values(azurerm_linux_virtual_machine.pair) : vm.location == "swedencentral" && vm.zone == "1" && vm.source_image_reference[0].version == "24.04.202610250" && vm.admin_username == "azureuser" && vm.admin_ssh_key[0].username == "azureuser"])
+    condition     = length(azurerm_linux_virtual_machine.pair) == 2 && alltrue([for vm in values(azurerm_linux_virtual_machine.pair) : vm.location == "swedencentral" && vm.zone == "1" && vm.source_image_reference[0].version == "24.04.202610250" && vm.admin_username == "azureuser" && one(vm.admin_ssh_key).username == "azureuser"])
     error_message = "The component must retain the exact Sweden zone and image on both VMs."
   }
   assert {

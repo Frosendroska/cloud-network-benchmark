@@ -51,6 +51,7 @@ resource "azurerm_public_ip" "pair" {
   location            = each.value.location
   resource_group_name = data.azurerm_resource_group.pair.name
   allocation_method   = "Static"
+  ip_version          = "IPv4"
   sku                 = "Standard"
   zones               = [each.value.zone]
   tags                = local.tags
@@ -139,10 +140,12 @@ resource "azurerm_network_interface" "pair" {
   location                       = each.value.location
   resource_group_name            = data.azurerm_resource_group.pair.name
   accelerated_networking_enabled = true
+  ip_forwarding_enabled          = false
   ip_configuration {
     name                          = "private"
     subnet_id                     = azurerm_subnet.pair[each.value.vnet_key].id
     private_ip_address_allocation = "Static"
+    private_ip_address_version    = "IPv4"
     private_ip_address            = each.value.ip
     public_ip_address_id          = azurerm_public_ip.pair[each.key].id
   }
