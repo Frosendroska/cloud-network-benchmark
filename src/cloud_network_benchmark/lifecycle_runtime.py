@@ -608,8 +608,10 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                 journal = Path(private_root) / "azure" / child.run_id / child.deployment_id / "recovery.json"
             providers.append(SavedProviderRecovery(provider=provider, deployment_id=child.deployment_id,
                 journal_reference=str(journal), expiry_registered=False,
-                creation_may_have_started=False, cleanup_open=False,
-                cleanup_settings_reference=cleanup_references.get(provider)))
+                creation_may_have_started=False, cleanup_open=True,
+                cleanup_settings_reference=cleanup_references.get(provider, str(
+                    Path(private_root) / "f09-cleanup" / provider /
+                    f"{child.run_id}-{child.deployment_id}.json"))))
         return SavedLifecycleRecovery(schema_version=1, attempt_id=parent.campaign_id,
             controller_session_id=controller_session_id,
             reservation_id=reservation.reservation_id.value,
@@ -752,6 +754,13 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             lead = float(runtime["allowance"].provider_leads_seconds[provider])
             trigger = reservation.expires_at.value - timedelta(seconds=lead)
             cap_end = float(record["cap_start_monotonic"]) + float(record["cap_seconds"])
+            # Preserve the original monotonic cap and clamp against UTC using
+            # monotonic-before-UTC sampling. This also handles old reservations
+            # whose original sequential samples gave them a slightly later cap.
+            anchor_mono = clock.monotonic()
+            anchor_utc = clock.utc_now()
+            cap_end = min(cap_end, anchor_mono +
+                (reservation.expires_at.value - anchor_utc).total_seconds())
             attempt_root = (Path(private_root) / "azure" / child.run_id / child.deployment_id).absolute()
             price = json.loads(row["sources"]["expiry_cost_path"].read_text())
             admission_evidence = {"reservation_id": reservation.reservation_id.value,
@@ -774,7 +783,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
                 plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
-            name, ids = azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
+            name, ids = azure_provider._validate_request(deployment, options,
+                reservation.cap_started_at.value, None, check_live_clock=False)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AZURE, action="deallocate",
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
@@ -783,6 +793,10 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
                     deployment=deployment, request=requests[provider], reservation=reservation,
                     provider_lead_seconds=lead, settings=options, private_root=Path(private_root)))
+            # Local recovery and original Terraform inputs must exist before
+            # the advancing-clock preflight can fail. No provider calls here.
+            azure_provider.prepare_recovery(deployment, options)
+            azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             options_by_provider[provider] = (options, None)
 
     protected: dict[str, Any] = {}

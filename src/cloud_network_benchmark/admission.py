@@ -775,7 +775,7 @@ class BudgetLedger:
             for provider in request.selected_providers:
                 support = plan.provider_support.get(Provider(provider).value)
                 if (not support or not support.get("source_sha256")
-                    or not (support.get("included_usd") or support.get("expiry_cost_included_usd"))):
+                    or not ({"included_usd", "expiry_cost_included_usd"} & set(support))):
                     reasons.append("support_cost_missing")
                 elif (support.get("source_sha256") != plan.costs.payload_sha256
                     or support.get("source_path") != plan.costs.source_path):
@@ -785,8 +785,12 @@ class BudgetLedger:
                         _hash(support["source_sha256"], "support source hash")
                         include_key = "expiry_cost_included_usd" if "expiry_cost_included_usd" in support else "included_usd"
                         support_amount = _decimal(support[include_key], "provider support inclusion")
-                        if not support["source_path"].strip() or support_amount <= 0:
-                            raise ValueError("support inclusion must be sourced and positive")
+                        # GCP's native STOP templates have an explicitly priced
+                        # zero support line. The complete source envelope was
+                        # re-read above; a missing/unpriced line is never zero.
+                        if (not support["source_path"].strip()
+                                or (support_amount == 0 and Provider(provider) != Provider.GCP)):
+                            raise ValueError("support inclusion must be sourced and priced")
                         if Provider(provider) == Provider.AWS:
                             support_scope = plan.costs.payload.get("provider_support", {}).get("aws", {})
                             if (not support.get("expiry_input_id")
@@ -938,6 +942,10 @@ class BudgetLedger:
                 except (FinancialError, ValueError, KeyError, TypeError) as exc:
                     reason = exc.reason if isinstance(exc, FinancialError) else "financial_ledger_invalid"
                     return AdmissionDecision("rejected", False, None, (reason,), state["revision"])
+            # Sample monotonic first: its original cap must end no later than
+            # the UTC cap sampled afterwards. Reuse this one anchor for every
+            # derived deadline instead of adding sequential read latency.
+            cap_start = _duration(self.monotonic_now(), "monotonic activation")
             now = _utc(self.utc_now())
             deadline = min([now + timedelta(seconds=request.lifetime_cap_seconds)] + [now + timedelta(seconds=request.lifetime_cap_seconds - float(v)) for v in plan.allowance.provider_leads_seconds.values()])
             workflow_seconds = plan.allowance.fit_seconds(now=now, scheduled_start=campaign.scheduled_start)
@@ -950,9 +958,9 @@ class BudgetLedger:
                 cap_start_policy_id=StringEvidence(value="reservation-activation-before-provider-expiry"), source_path=request.source_path,
                 source_sha256=request.source_sha256, reasons=[])
             rec = {"reservation_id": rid, "evidence": evidence.model_dump(mode="json"), "reserved_cost_usd": str(price), "incurred_usd": "0", "session": self.controller_session_id,
-                   "cap_start_monotonic": _duration(self.monotonic_now(), "monotonic activation"), "cap_seconds": request.lifetime_cap_seconds,
-                   "provider_trigger_monotonic": _duration(self.monotonic_now(), "monotonic activation") + min(request.lifetime_cap_seconds-float(v) for v in plan.allowance.provider_leads_seconds.values()),
-                   "scheduled_start_monotonic": _duration(self.monotonic_now(), "monotonic activation") + max(0.0, (_utc(campaign.scheduled_start)-now).total_seconds()) if campaign.scheduled_start else None,
+                   "cap_start_monotonic": cap_start, "cap_seconds": request.lifetime_cap_seconds,
+                   "provider_trigger_monotonic": cap_start + min(request.lifetime_cap_seconds-float(v) for v in plan.allowance.provider_leads_seconds.values()),
+                   "scheduled_start_monotonic": cap_start + max(0.0, (_utc(campaign.scheduled_start)-now).total_seconds()) if campaign.scheduled_start else None,
                    "allowance": workflow_seconds,
                    "funding_moves": {k: str(v) for k, v in plan.funding.items()},
                    "allowance_fields": {"registration_seconds":plan.allowance.registration_seconds,"provision_seconds":plan.allowance.provision_seconds,

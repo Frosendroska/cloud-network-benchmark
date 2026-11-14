@@ -408,6 +408,22 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
         "active_priority": "Regular", "network_limit_mbps": 12500}
 
 
+def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions) -> tuple[Path, Path, Path, Path]:
+    """Save the original local cleanup identity/inputs before live preflight.
+
+    This records prospective targets only. It makes no provider call or absence
+    claim, and does not require an unexpired approval, quote or launch cap.
+    """
+    pair_values = build_pair_inputs(deployment, options)
+    root, journal = _workspace(options, deployment)
+    pair_vars = _persist_tfvars(root, journal, "pair", pair_values)
+    expiry_vars = _persist_tfvars(root, journal, "expiry", {
+        "subscription_id": options.subscription_id, "tenant_id": options.tenant_id,
+        "resource_group_name": _slug(deployment), "deployment_id": deployment.deployment_id,
+        "location": deployment.vm_a.region})
+    return root, journal, pair_vars, expiry_vars
+
+
 def _is_exact_not_found(result: CommandResult) -> bool:
     for text in (result.stdout, result.stderr):
         try:
@@ -582,11 +598,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("expiry request namespace does not match deterministic attempt")
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
-    root, journal = _workspace(options, deployment)
-    pair_vars = _persist_tfvars(root,journal,"pair",build_pair_inputs(deployment,options))
-    expiry_values={"subscription_id":options.subscription_id,"tenant_id":options.tenant_id,
-        "resource_group_name":name,"deployment_id":deployment.deployment_id,"location":deployment.vm_a.region}
-    expiry_vars = _persist_tfvars(root,journal,"expiry",expiry_values)
+    root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"
     sched = name + "-once"

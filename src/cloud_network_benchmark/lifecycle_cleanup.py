@@ -430,6 +430,9 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> 
                 expected_ids = _known_resource_ids(_expected_journal(saved))
                 state = json.loads(_expected_journal(saved).read_text(encoding="utf-8"))
                 expected_ids.extend(_nested_resource_ids(state.get("safety", {})))
+                # Pre-VM cleanup receipts also include prospective role/document
+                # targets independently proved absent and saved by the driver.
+                expected_ids.extend(_nested_resource_ids(state.get("cleanup_safety_targets", {})))
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             elif saved.provider == Provider.GCP:
