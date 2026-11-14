@@ -19,7 +19,7 @@ STAGES = [
     ('finish', 'Reconcile & finish', 'Runner + laptop', 'Close the expected sample, resources, costs and research provenance.', ['Resolve every cleanup liability using original private recovery state.', 'Verify final downloads/second copies, all failed/missed slots and actual costs.', 'Review final reports with Codex and update Thesis run references/canonical findings.', 'Confirm full experiment-resource absence; review any replacement or P2/P3 separately.']),
 ]
 COMMAND_LABELS = [
-    'Laptop · connect to the runner', 'Runner · install once', 'Runner · complete offline/native checks',
+    'Laptop · connect to the runner', 'Halle · home-directory setup and first Python tests', 'Runner · install once', 'Runner · complete offline/native checks',
     'Runner · authenticate with reviewed identities', 'Runner · settings and systemd service',
     'Runner · restore shell context and check', 'Runner · acceptance', 'Runner · supervised failure continuation',
     'Runner · calibration', 'Laptop · recommend common N', 'Runner · DAY', 'Runner · WEEK',
