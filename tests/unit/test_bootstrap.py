@@ -61,6 +61,46 @@ def test_explicit_https_and_digest_are_required():
     with pytest.raises(Exception): SourceBuild(tool="sockperf",source_url="http://bad",source_reference="src",archive_name="a.tar",source_sha256="x")
 
 
+def test_package_install_refreshes_indexes_and_stops_when_refresh_fails(tmp_path):
+    import os
+
+    config = bootstrap_config()
+    command = _recipe(config.sources[0], config)[0]
+    assert command[:3] == ["sudo", "sh", "-c"]
+    script = command[3]
+    assert script.index("apt-get update") < script.index("apt-get install -y")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    apt_get = fake_bin / "apt-get"
+    state = tmp_path / "apt-index-ready"
+    log = tmp_path / "apt.log"
+    apt_get.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "if [ \"$1\" = update ]; then\n"
+        "  [ \"${APT_UPDATE_FAIL:-0}\" = 0 ] || { echo 'synthetic apt index refresh failure' >&2; exit 17; }\n"
+        f"  : > {shlex.quote(str(state))}; exit 0\n"
+        "fi\n"
+        f"[ -f {shlex.quote(str(state))} ] || {{ echo 'package index is stale' >&2; exit 100; }}\n"
+        "[ \"$1\" = install ]\n"
+    )
+    apt_get.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    refreshed = subprocess.run(["sh", "-c", script], text=True, capture_output=True, env=env)
+    assert refreshed.returncode == 0, refreshed.stderr
+    assert log.read_text().splitlines() == ["update", "install -y " + " ".join(config.bootstrap_packages)]
+
+    state.unlink()
+    log.unlink()
+    env["APT_UPDATE_FAIL"] = "1"
+    failed = subprocess.run(["sh", "-c", script], text=True, capture_output=True, env=env)
+    assert failed.returncode == 17
+    assert "synthetic apt index refresh failure" in failed.stderr
+    assert log.read_text().splitlines() == ["update"]
+
+
 def test_matching_existing_listeners_are_reused_and_conflicts_fail_closed(tmp_path):
     c=connection(tmp_path); runner=BootstrapRunner(existing_listeners=True,existing_acl=True)
     outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)

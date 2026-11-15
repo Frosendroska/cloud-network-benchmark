@@ -378,7 +378,7 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
                     f"[ ! -e {binary_q} ] || exit 43; {patch_clause}cd {source_dir_q} && {build}./configure --prefix={prefix_q} && make -j2 && make install && "
                     f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s %s %s\\n' {ref_q} {digest_q} {cache_q} \"$config_sha\" \"$1\" > {marker_q}")
     commands = [
-        ["sudo", "apt-get", "install", "-y", *config.bootstrap_packages],
+        ["sudo", "sh", "-c", "apt-get update && apt-get install -y " + " ".join(shlex.quote(package) for package in config.bootstrap_packages)],
         ["curl", "--fail", "--location", "--silent", "--show-error", "--output", archive, source.source_url],
         ["sha256sum", archive],
         ["tar", "-xf", archive, "-C", config.workspace],
