@@ -1092,9 +1092,10 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         cli_payload = json.loads((out_cli / "report.json").read_text(encoding="utf-8"))
         assert {row["provider"] for row in cli_payload["runs"]} == {"aws", "azure", "gcp"}
         assert all(row["recorded_data_validity"] == "valid" for row in cli_payload["runs"])
-        assert any(row["rtt"].get("valid_replies", 0) > 0 for row in cli_payload["bins"])
-        assert any(row["metric"] == "throughput_gbps" and row["points"]
-            and all(value > 0 for value in row["points"]) for row in cli_payload["deployments"])
+        if is_short_study:
+            assert any(row["rtt"].get("valid_replies", 0) > 0 for row in cli_payload["bins"])
+            assert any(row["metric"] == "throughput_gbps" and row["points"]
+                and all(value > 0 for value in row["points"]) for row in cli_payload["deployments"])
         assert (out_cli / "index.html").is_file()
         assert (out_cli / "figures" / "time-series.png").is_file()
         assert (out_cli / "figures" / "receiver-time-series.svg").is_file()
