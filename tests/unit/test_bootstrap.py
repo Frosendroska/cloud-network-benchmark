@@ -161,7 +161,7 @@ def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_p
     source=next(item for item in c.sources if item.tool=="iperf3")
     binary=Path(c.install_prefix)/"bin/iperf3"; binary.parent.mkdir(parents=True); binary.write_bytes(b"compiled binary")
     digest=hashlib.sha256(binary.read_bytes()).hexdigest(); marker=Path(c.install_prefix)/".f02r-iperf3.identity"
-    config_hash=subprocess.run(["sh", "-c", _build_config_prelude(c) + "printf '%s' \"$config_sha\""],text=True,capture_output=True,check=True).stdout
+    config_hash=subprocess.run(["sh", "-c", _build_config_prelude(source, c) + "printf '%s' \"$config_sha\""],text=True,capture_output=True,check=True).stdout
     marker.write_text(f"{source.source_reference} {source.source_sha256} legacy {config_hash} {digest}\n")
     probe=subprocess.run(["sh","-c",_identity_preflight_script(source,c)],text=True,capture_output=True)
     assert probe.returncode==0 and probe.stdout.strip()=="matching"
@@ -369,6 +369,8 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
             return response
     outcome = run_bootstrap(connection(tmp_path), config, PatchedRunner(), deadline=deadline(), clock=lambda: 100)
     assert outcome.succeeded
+    iperf_probe = next(action for action in outcome.actions if action.action_id == "f02r-vm_a-iperf3-9")
+    assert "/var/lib/cnb/install/bin/iperf3" in iperf_probe.request["argv"][-1]
     for build in outcome.builds:
         assert "\nCopyright" in build.compiler_version
         assert "\n" in build.binary_version
@@ -376,8 +378,9 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
         assert build.patch_sha256 == (sock_sha if build.tool == "sockperf" else iperf_sha)
         assert build.observation_semantics == ("sockperf-3.10-enabled-v1" if build.tool == "sockperf" else "iperf-3.17.1-stats-v1")
         assert build.build_configuration and build.artifact_id
-        assert build.build_configuration == (f"CC=${{CC:-cc}}; compiler={build.compiler_version}; "
-            "./configure --prefix=/var/lib/cnb/install; make -j2")
+        assert build.build_configuration == (f"CC=${{CC:-cc}}; compiler={build.compiler_version}; " +
+            ("./configure --prefix=/var/lib/cnb/install; make -j2" if build.tool == "sockperf" else
+             "./configure --prefix=/var/lib/cnb/install --disable-shared; make -j2"))
     assert "compiler=$(cc --version)" in _recipe(config.sources[0], config)[-1][-1]
     assert "--version | head -n 1" not in _recipe(config.sources[0], config)[-1][-1]
 

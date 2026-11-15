@@ -41,7 +41,7 @@ SOURCES = (
 )
 REQUIRED = ("cc", "make", "autoconf", "automake", "libtoolize", "pkg-config", "curl", "sha256sum",
             "tar", "patch", "base64", "grep", "cmp")
-COMMAND_TIMEOUT_SECONDS = 90
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def digest(path: Path) -> str:
