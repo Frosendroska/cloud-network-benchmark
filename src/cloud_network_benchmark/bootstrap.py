@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 17954)
+Total output lines: 876
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -72,7 +75,7 @@ class SourceBuild(StrictModel):
         pinned = {
             "5ebd327da983225321818c0355db922515e026bd": (
                 "tool_patches/sockperf-3.10-acquisition.patch",
-                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc",
                 "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
             "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
                 "tool_patches/iperf-3.17.1-acquisition.patch",
@@ -228,7 +231,23 @@ class BootstrapResult(StrictModel):
 def _required_capabilities(tool: str) -> List[str]:
     if tool == "sockperf":
         return ["server", "under-load", "-i", "-p", "-m", "--mps", "--reply-every", "--full-rtt", "--no-rdtsc", "--full-log", "-t"]
-    return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "cubic", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
+    return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
+
+
+def _tcp_congestion_probe_script(algorithm: str = "cubic") -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", algorithm):
+        raise ValueError("TCP congestion algorithm must be a short kernel identifier")
+    script = ("import socket\n"
+        "sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+        "try:\n"
+        f"    sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,b'{algorithm}')\n"
+        "    observed=sock.getsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,16).rstrip(b'\\0')\n"
+        f"    if observed != b'{algorithm}': raise RuntimeError('TCP congestion algorithm readback mismatch')\n"
+        "finally:\n"
+        "    sock.close()\n"
+        f"print('CNB_TCP_CONGESTION={algorithm}')\n")
+    # Remote argv rejects control characters; encode the short Python probe as one safe token.
+    return f"exec(bytes.fromhex('{script.encode().hex()}'))"
 
 
 def _build_config_prelude(config: BootstrapConfig) -> str:
@@ -417,6 +436,9 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
             f"if [ -f {identity_path} ]; then cmp -s {identity_tmp} {identity_path} || exit 43; rm {identity_tmp}; "
             f"else mv {identity_tmp} {identity_path}; fi && cat {identity_path}")
         commands.append(["sh", "-c", identity_script])
+    if source.tool == "iperf3":
+        # Help proves -C exists; the kernel socket probe separately proves the requested value.
+        commands.append(["python3", "-c", _tcp_congestion_probe_script()])
     return commands
 
 
@@ -521,65 +543,7 @@ def _failure_result(connection, actions, vm, request, result, category, message,
 
 def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> BootstrapResult:
     actions: List[RemoteActionEvidence] = []
-    builds: List[BuildObservation] = []
-    listeners: List[ListenerObservation] = []
-    sources = {source.tool: source for source in config.sources}
-    tool_index = 0
-    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
-        init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
-        if not _identity_references_available(vm):
-            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
-            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
-            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable between VM preparations", builds, listeners)
-        if deadline.remaining(clock, readiness=True) <= 0:
-            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="no time remains before remote preparation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-        for argv, timeout_name, kind in init:
-            timeout = min(getattr(connection.timeouts, timeout_name), deadline.remaining(clock, readiness=True))
-            req = _request(f"f02r-{role}-cloud-init", vm, argv, timeout)
-            result = _execute(runner, req)
-            actions.append(_action(req.action_id, "ssh", vm, req, result))
-            if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
-                return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
-        if not _identity_references_available(vm):
-            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
-            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
-            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable", builds, listeners)
-        if role == "vm_b":
-            for tool, port, stdout_path, stderr_path in (("sockperf", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
-                remaining = deadline.remaining(clock, readiness=True)
-                if remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
-                observed = _execute(runner, inspect_request)
-                actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
-                if observed.outcome == CommandOutcome.SUCCEEDED:
-                    load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
-                    if load_state != "not-found":
-                        cat_remaining = deadline.remaining(clock, readiness=True)
-                        if cat_remaining <= 0:
-                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                        cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
-                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                        if (cat_result.outcome != CommandOutcome.SUCCEEDED or
-                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
-                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
-                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
-                elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
-                    return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
-        for source in config.sources:
-            remaining = deadline.remaining(clock, readiness=True)
-            if remaining <= 0:
-                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            identity_request = _request(f"f02r-{role}-{source.tool}-identity-preflight", vm, ["sh", "-c", _identity_preflight_script(source, config)], min(connection.timeouts.command_seconds, remaining))
-            identity_result = _execute(runner, identity_request)
-            actions.append(_action(identity_request.action_id, "ssh", vm, identity_request, identity_result))
-            if identity_result.outcome != CommandOutcome.SUCCEEDED:
-                return _failure_result(connection, actions, vm, identity_request, identity_result, "installed_identity_mismatch", f"existing {source.tool} source or binary identity conflicts with requested build", builds, listeners)
-            remaining = deadline.remaining(clock, readiness=True)
-            if remaining <= 0:
-                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
+…1954 tokens truncated…t = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
             workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
             try:
                 workspace_result = _execute(runner, workspace_request)
@@ -607,7 +571,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 result = _execute(runner, req)
                 actions.append(_action(aid, "ssh", vm, req, result))
                 if result.outcome != CommandOutcome.SUCCEEDED:
-                    return _failure_result(connection, actions, vm, req, result, "source_build_failed", f"{source.tool} build action failed", builds, listeners)
+                    category = "tcp_congestion_control_unavailable" if source.tool == "iperf3" and argv[:2] == ["python3", "-c"] else "source_build_failed"
+                    message = ("iperf3 preparation could not verify the required CUBIC congestion control"
+                               if category == "tcp_congestion_control_unavailable" else f"{source.tool} build action failed")
+                    return _failure_result(connection, actions, vm, req, result, category, message, builds, listeners)
                 text = result.stdout.strip()
                 for secret in (vm.authentication_reference, vm.host_key_reference):
                     text = re.sub(r"(?i)(password|token|secret|private[_ -]?key)\s*[=:]\s*\S+", r"\1=[REDACTED]", text)
@@ -642,11 +609,16 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if not observed_hash:
                         return _failure_result(connection, actions, vm, req, result, "binary_hash_missing", f"{source.tool} binary hash was not observed", builds, listeners)
                     evidence["binary_sha256"] = observed_hash
-                elif source.observation_patch_path is not None and index == len(recipe) - 2:
+                elif source.tool == "iperf3" and argv[:2] == ["python3", "-c"]:
+                    if text != "CNB_TCP_CONGESTION=cubic":
+                        return _failure_result(connection, actions, vm, req, result, "tcp_congestion_control_unavailable",
+                            "iperf3 preparation could not verify the required CUBIC congestion control", builds, listeners)
+                    evidence["tcp_congestion_control"] = "cubic"
+                elif source.observation_patch_path is not None and argv[:2] == ["sh", "-c"] and "grep -a -F 'CNB_ACQ_V1'" in argv[-1]:
                     if text != "CNB_ACQ_V1":
                         return _failure_result(connection, actions, vm, req, result, "observation_capability_missing", f"{source.tool} installed binary lacks CNB_ACQ_V1 capability", builds, listeners)
                     evidence["observation_capability"] = text
-                elif source.observation_patch_path is not None and index == len(recipe) - 1:
+                elif source.observation_patch_path is not None and argv[:2] == ["sh", "-c"] and "CNB_BUILD_V1" in argv[-1]:
                     try:
                         identity = _parse_build_identity(result.stdout, source)
                     except ValueError as exc:

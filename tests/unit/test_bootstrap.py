@@ -6,7 +6,7 @@ import sys
 import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
-from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap, _required_capabilities
+from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap, _required_capabilities, _tcp_congestion_probe_script
 from cloud_network_benchmark.bootstrap import _build_config_prelude, _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
 
 
@@ -123,6 +123,37 @@ def test_missing_tool_capability_stops_before_listener_preparation(tmp_path):
     runner=MissingHelp(); outcome=run_bootstrap(c,bootstrap_config(),runner,deadline=deadline(),clock=lambda:100)
     assert not outcome.succeeded and outcome.failure.category=="capability_missing"
     assert not any("listener" in request.action_id for request in runner.requests)
+
+
+def test_iperf_help_option_and_kernel_algorithm_are_checked_separately(tmp_path):
+    help_text = ("Usage: iperf3 [options]\n-s -c -B -p -P -t -O -i -l\n"
+        "-C, --congestion <algo> set TCP congestion control algorithm\n-Z, --zerocopy\n"
+        "-J --get-server-output --json-stream --forceflush")
+    assert "cubic" not in help_text.lower()
+    assert _capabilities_observed(help_text, "iperf3")
+    assert _tcp_congestion_probe_script().startswith("exec(bytes.fromhex('")
+
+    class UnsupportedCubic(BootstrapRunner):
+        def run(self, request):
+            if request.argv and request.argv[-1].startswith("python3 -c "):
+                from fixtures.f02r.support import result
+                return result(request.action_id, success=False, stderr="setsockopt TCP_CONGESTION cubic: unsupported")
+            return super().run(request)
+
+    runner = UnsupportedCubic()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+        deadline=deadline(), clock=lambda: 100)
+    assert not outcome.succeeded
+    assert outcome.failure.category == "tcp_congestion_control_unavailable"
+    assert not any("listener" in request.action_id for request in runner.requests)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="TCP_CONGESTION probe requires Linux")
+def test_kernel_rejects_an_unavailable_congestion_algorithm():
+    probe = subprocess.run([sys.executable, "-c", _tcp_congestion_probe_script("cnb-missing")],
+        text=True, capture_output=True)
+    assert probe.returncode != 0
+    assert "CNB_TCP_CONGESTION=" not in probe.stdout
 
 
 def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_path):

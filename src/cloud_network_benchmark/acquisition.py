@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 16964)
+Total output lines: 1219
+
 """Conservative replay of source-emitted acquisition evidence.
 
 The module intentionally treats observation logs as the authority.  Runtime timing
@@ -503,7 +506,7 @@ def _expected_build_identity(tool: str) -> tuple[str, str, str, str]:
     if tool == "sockperf":
         return ("5ebd327da983225321818c0355db922515e026bd",
                 "tool_patches/sockperf-3.10-acquisition.patch",
-                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc",
                 "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e")
     return ("2acfcfe94e928e74542c9f107e02aa6dd4748a79",
             "tool_patches/iperf-3.17.1-acquisition.patch",
@@ -570,62 +573,7 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
     outcome = getattr(outcome, "value", outcome)
     # Failed/interrupted commands may still have independently verifiable closed
     # receiver intervals in their stderr. Consumers retain those intervals while
-    # the command outcome keeps the unobserved tail explicitly incomplete.
-    if command[0].producer != source.producer:
-        raise ValueError("acquisition command producer does not match source")
-    if log.unit_id not in {None, command[0].unit_id}:
-        raise ValueError("acquisition log unit does not match its producing command")
-    native_client: ArtifactRecord | None = None
-    native_receiver: ArtifactRecord | None = None
-    for item in native:
-        if item.deployment_id != log.deployment_id:
-            raise ValueError("native acquisition artifacts must share the source deployment")
-        if source.tool == "sockperf" and (item.producer != source.producer or item.kind != "sockperf-csv"):
-            raise ValueError("Sockperf source must reference its native client CSV")
-        if source.tool == "iperf3":
-            if item.producer == VmRole.VM_A and item.kind in {"iperf3-json", "iperf3-client-jsonl"}:
-                if native_client is not None:
-                    raise ValueError("iperf3 source must reference exactly one native client artifact")
-                native_client = item
-            elif item.producer == VmRole.VM_B and item.kind == "iperf3-server-jsonl":
-                if native_receiver is not None:
-                    raise ValueError("iperf3 source must reference at most one native receiver artifact")
-                native_receiver = item
-            else:
-                raise ValueError("iperf3 source references an unsupported native artifact")
-        if source.tool == "sockperf" and item.unit_id not in {None, command[0].unit_id}:
-            raise ValueError("Sockperf native artifact must match its producing measurement unit")
-        item.verify_materialized_file(child_root)
-    native_metadata: Mapping[str, object] | None = None
-    if source.tool == "iperf3":
-        if native_client is None:
-            raise ValueError("iperf3 source must reference one native client artifact")
-        client_commands = [row for row in commands if row.deployment_id == log.deployment_id
-            and row.producer == VmRole.VM_A and row.unit_id == native_client.unit_id
-            and (row.result.get("action_id") or row.request.get("action_id"))
-                == f"iperf3-{native_client.unit_id}"]
-        if len(client_commands) != 1:
-            raise ValueError("iperf3 native client artifact must match one client command in its unit")
-        receiver_path = None
-        if native_receiver is not None:
-            if native_receiver.unit_id is not None:
-                raise ValueError("persistent iperf3 receiver artifact must be deployment-scoped")
-            receiver_path = resolve_artifact_path(child_root, native_receiver.path)
-        if not _native_iperf_cookie(resolve_artifact_path(child_root, native_client.path), source.session_id):
-            raise ValueError("native iperf client JSON start.cookie does not match the referenced session")
-        native_metadata = _native_iperf_metadata(resolve_artifact_path(child_root, native_client.path),
-            source.session_id, receiver_path)
-        if native_metadata is None:
-            raise ValueError("native iperf client/receiver JSON lacks a unique session and receiver interval output")
-    builds = [item for item in build_evidence if getattr(item, "artifact_id", None) == source.build_artifact_id
-              and getattr(item, "role", None) == source.producer]
-    if len(builds) != 1:
-        raise ValueError("acquisition source must match one observed build artifact")
-    observed = builds[0]
-    build_record = one(source.build_artifact_id)
-    if (build_record.kind != "build-identity" or build_record.deployment_id != log.deployment_id
-            or build_record.producer != source.producer or build_record.unit_id is not None):
-        raise ValueError("build identity artifact must be a closed same-deployment producer artifact")
+    …964 tokens truncated…sed same-deployment producer artifact")
     build_record.verify_materialized_file(child_root)
     identity_bytes = resolve_artifact_path(child_root, build_record.path).read_bytes()
     if getattr(observed, "identity_bytes", None) is None or identity_bytes != observed.identity_bytes.encode("utf-8"):

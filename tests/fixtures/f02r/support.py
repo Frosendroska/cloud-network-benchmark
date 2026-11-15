@@ -68,6 +68,7 @@ class BootstrapRunner:
         elif aid.endswith("-6") and any(f"-{tool}-6" in aid for tool in ("sockperf","iperf3")): out="sockperf version 3.10" if "sockperf" in aid else "iperf3 version 3.17"
         elif aid.endswith("-7") and any(f"-{tool}-7" in aid for tool in ("sockperf","iperf3")): out="c"*64+f" /var/lib/cnb/install/bin/{'sockperf' if 'sockperf' in aid else 'iperf3'}"
         elif aid.endswith("-8") and any(f"-{tool}-8" in aid for tool in ("sockperf","iperf3")): out=("Usage: sockperf [options]\nserver under-load" if "sockperf" in aid else "Usage: iperf3 [options]\n-s -c -B -p -P -t -O -i -l -C cubic -Z -J --get-server-output --json-stream --forceflush")
+        elif request.argv and request.argv[-1].startswith("python3 -c "): out="CNB_TCP_CONGESTION=cubic"
         elif aid.endswith("-9") and "sockperf" in aid: out="Usage: sockperf server -i -p"
         elif aid.endswith("-10") and "sockperf" in aid: out="Usage: sockperf under-load -i -p -m --mps --reply-every --full-rtt --no-rdtsc --full-log -t"
         elif "listener-" in aid: out="Active: active (running)"

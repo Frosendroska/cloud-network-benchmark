@@ -142,6 +142,9 @@ def main() -> int:
                     if not row["binary_sha256"]:
                         row.update(status="failed", failed_command="binary_digest_missing")
                         break
+                if argv[:2] == ["python3", "-c"] and out.strip() != "CNB_TCP_CONGESTION=cubic":
+                    row.update(status="failed", failed_command="tcp_congestion_control_unavailable")
+                    break
                 help_required = None
                 if source.tool == "sockperf" and index == 9:
                     help_required = ["server", "-i", "-p"]
@@ -150,7 +153,9 @@ def main() -> int:
                         "--full-rtt", "--no-rdtsc", "--full-log", "-t"]
                 elif source.tool == "iperf3" and index == 8:
                     help_required = _required_capabilities(source.tool)
-                if help_required and not _capabilities_observed(out, source.tool, required=help_required):
+                elif source.tool == "sockperf" and index == 8:
+                    help_required = []
+                if help_required is not None and not _capabilities_observed(out, source.tool, required=help_required):
                     row.update(status="failed", failed_command=f"capability_check_{index}")
                     break
             if row.get("status") == "failed":
