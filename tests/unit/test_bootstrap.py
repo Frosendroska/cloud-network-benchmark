@@ -104,6 +104,103 @@ def test_nested_build_script_is_syntax_safe_and_identity_reuse_is_verified(tmp_p
     assert conflict.returncode != 0
 
 
+def test_fresh_host_identity_preflight_does_not_need_compiler_and_state_fails_closed(tmp_path):
+    import os
+    import shlex
+    from fixtures.f02r.support import result
+
+    config = bootstrap_config().model_copy(update={
+        "remote_root": str(tmp_path), "workspace": str(tmp_path / "work"),
+        "install_prefix": str(tmp_path / "install"),
+    })
+    source = next(item for item in config.sources if item.tool == "sockperf")
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    env = {**os.environ, "PATH": str(empty_path)}
+
+    # /bin/sh builtins alone must identify the pristine state and avoid cc/sha256sum.
+    fresh = subprocess.run(["/bin/sh", "-c", _identity_preflight_script(source, config)],
+        text=True, capture_output=True, env=env)
+    assert fresh.returncode == 0 and fresh.stdout.strip() == "missing"
+
+    for state_kind in ("source", "archive", "binary", "marker", "build-identity", "dangling-source", "mismatched"):
+        state_root = tmp_path / state_kind
+        state_config = config.model_copy(update={
+            "workspace": str(state_root / "work"),
+            "install_prefix": str(state_root / "install"),
+        })
+        state_source = next(item for item in state_config.sources if item.tool == "sockperf")
+        if state_kind == "source":
+            Path(state_config.workspace, source.source_reference).mkdir(parents=True)
+        elif state_kind == "dangling-source":
+            Path(state_config.workspace).mkdir(parents=True)
+            Path(state_config.workspace, source.source_reference).symlink_to("missing-source-target")
+        elif state_kind == "archive":
+            Path(state_config.workspace).mkdir(parents=True)
+            Path(state_config.workspace, source.archive_name).touch()
+        else:
+            Path(state_config.install_prefix).mkdir(parents=True)
+            identity_path = (Path(state_config.install_prefix) / "bin/sockperf" if state_kind == "binary"
+                else Path(state_config.install_prefix) / (".f02r-sockperf.identity" if state_kind in {"marker", "mismatched"}
+                else ".f02r-sockperf.build-identity"))
+            identity_path.parent.mkdir(parents=True, exist_ok=True)
+            if state_kind == "mismatched":
+                identity_path.write_text("wrong source identity\n")
+                binary_path = Path(state_config.install_prefix) / "bin/sockperf"
+                binary_path.parent.mkdir(parents=True, exist_ok=True)
+                binary_path.write_bytes(b"conflicting binary")
+            else:
+                identity_path.touch()
+        stateful = subprocess.run(["/bin/sh", "-c", _identity_preflight_script(state_source, state_config)],
+            text=True, capture_output=True, env=env)
+        assert stateful.returncode == 42, (state_kind, stateful.returncode, stateful.stderr)
+
+    class ShellPreflightRunner(BootstrapRunner):
+        def __init__(self, *, partial_state=False):
+            super().__init__()
+            self.partial_state = partial_state
+
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.endswith("identity-preflight"):
+                if self.partial_state:
+                    Path(config.workspace).mkdir(parents=True, exist_ok=True)
+                    Path(config.workspace, source.source_reference).symlink_to("missing-source-target")
+                remote_argv = shlex.split(request.argv[-1])
+                proc = subprocess.run(["/bin/sh", "-c", remote_argv[2]], text=True,
+                    capture_output=True, env=env)
+                return result(request.action_id, proc.stdout, success=proc.returncode == 0,
+                    stderr=proc.stderr)
+            for build_source in config.sources:
+                if request.action_id.endswith(f"{build_source.tool}-2"):
+                    return result(request.action_id, build_source.source_sha256 + f"  {config.workspace}/{build_source.archive_name}")
+                if request.action_id.endswith(f"{build_source.tool}-7"):
+                    return result(request.action_id, "c" * 64 + f"  {config.install_prefix}/bin/{build_source.tool}")
+            if request.action_id == "f02r-vm_a-iperf3-8":
+                return result(request.action_id, success=False, stderr="stop after fake build-flow observation")
+            self.requests.pop()
+            return super().run(request)
+
+    fresh_runner = ShellPreflightRunner()
+    fresh_result = run_bootstrap(connection(tmp_path), config, fresh_runner,
+        deadline=deadline(), clock=lambda: 100)
+    assert not fresh_result.succeeded and fresh_result.failure.category == "source_build_failed"
+    actions = [request.action_id for request in fresh_runner.requests]
+    assert actions.index("f02r-vm_a-sockperf-identity-preflight") < actions.index("f02r-vm_a-sockperf-workspace")
+    assert all(action in actions for action in (
+        "f02r-vm_a-sockperf-0", "f02r-vm_a-sockperf-4",
+        "f02r-vm_a-iperf3-0", "f02r-vm_a-iperf3-4"))
+
+    (tmp_path / "partial").mkdir()
+    partial_runner = ShellPreflightRunner(partial_state=True)
+    partial_result = run_bootstrap(connection(tmp_path / "partial"), config, partial_runner,
+        deadline=deadline(), clock=lambda: 100)
+    assert not partial_result.succeeded and partial_result.failure.category == "installed_identity_mismatch"
+    partial_actions = [request.action_id for request in partial_runner.requests]
+    assert "f02r-vm_a-sockperf-identity-preflight" in partial_actions
+    assert not any(action.endswith("-workspace") or action.endswith("-0") for action in partial_actions)
+
+
 def test_shell_unsafe_build_values_are_rejected_and_help_is_token_based():
     c=bootstrap_config()
     with pytest.raises(Exception): type(c).model_validate({**c.model_dump(),"workspace":"/var/lib/cnb/work;touch"})

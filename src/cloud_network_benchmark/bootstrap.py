@@ -423,10 +423,18 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
 def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> str:
     binary = shlex.quote(f"{config.install_prefix}/bin/{source.tool}")
     marker = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.identity")
+    build_identity = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.build-identity")
+    source_dir = shlex.quote(f"{config.workspace}/{source.source_reference}")
+    archive = shlex.quote(f"{config.workspace}/{source.archive_name}")
+    patch = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
     reference, digest = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
     patch_digest = shlex.quote(source.observation_patch_sha256 or "legacy")
-    return (_build_config_prelude(config) +
-            f"if [ ! -e {marker} ]; then [ ! -e {binary} ] || exit 43; printf 'missing\\n'; exit 0; fi; "
+    return (f"if [ ! -e {marker} ] && [ ! -L {marker} ] && [ ! -e {binary} ] && [ ! -L {binary} ] && "
+            f"[ ! -e {build_identity} ] && [ ! -L {build_identity} ] && [ ! -e {source_dir} ] && [ ! -L {source_dir} ] && "
+            f"[ ! -e {archive} ] && [ ! -L {archive} ] && [ ! -e {patch} ] && [ ! -L {patch} ]; then "
+            "printf 'missing\\n'; exit 0; fi; "
+            + _build_config_prelude(config) +
+            f"if [ ! -f {marker} ]; then exit 43; fi; "
             f"IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
             f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_patch\" = {patch_digest} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
 
