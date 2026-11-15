@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 19800)
-Total output lines: 1227
-
 """End-to-end raw-source binding over the existing F03/F01R evidence records."""
 from __future__ import annotations
 
@@ -506,7 +503,244 @@ def _bind_two_stream_iperf_fixture(tmp_path, *, final_duration_us=1_000,
     receiver.result["outcome"] = receiver_outcome
     client = _command("iperf3-short-multiflow", VmRole.VM_A, "short-multiflow")
     build = _build("iperf3", VmRole.VM_B, "two-stream-build")
-    records = [log, native, *_build_records(tmp_path…3800 tokens truncated…_source_windows(tmp_path, source, records, [changed_command], [build]))
+    records = [log, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    return sources[0], records, [client, receiver], [build]
+
+
+def test_iperf_native_reporter_short_all_zero_tail_is_explicit_and_keeps_closed_prefix(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path)
+    windows = []
+    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval.*1000 us"):
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    # Both omitted rows and the normal one-second zero-byte reports remain
+    # independently correlated; only the final 1 ms interval is unsupported.
+    assert len(windows) == 4
+    assert sum(window.omitted is False for window in windows) == 2
+
+
+def test_iperf_native_reporter_accepts_per_stream_skew_on_terminal_zero_tail(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(
+        tmp_path, final_skew_us=1)
+    windows = []
+    with pytest.raises(ValueError, match=r"filtered the final all-stream zero-byte interval.*stream 18 \[6000000, 6001001\)"):
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    assert len(windows) == 4
+
+
+@pytest.mark.parametrize(("duration", "byte_counts"), [
+    (1_000, (0, 1)),  # a positive stream prevents all-stream suppression
+    (1_000_000, (0, 0)),  # normal one-second zero-byte intervals are reported
+])
+def test_iperf_zero_byte_reporting_is_not_overfiltered(duration, byte_counts, tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path,
+        final_duration_us=duration, final_bytes=byte_counts, include_final_native=True)
+    windows = list(iter_source_windows(tmp_path, source, records, commands, builds))
+    assert len(windows) == 6
+    assert sum(window.omitted is False for window in windows) == 4
+
+
+def test_iperf_short_zero_tail_with_failed_receiver_is_unknown_not_reporter_filtered(tmp_path):
+    source, records, commands, builds = _bind_two_stream_iperf_fixture(tmp_path,
+        receiver_outcome="failed")
+    windows = []
+    with pytest.raises(ValueError, match="unknown unmatched interval tail") as error:
+        for window in iter_source_windows(tmp_path, source, records, commands, builds):
+            windows.append(window)
+    assert "filtered" not in str(error.value)
+    assert len(windows) == 4
+
+
+def _truncated_diagnostic_client(cookie: str, duration: int) -> bytes:
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": 5, "duration": duration,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    start = json.dumps({"event": "start", "data": {"cookie": cookie, "test_start": settings}})
+    return (start + "\n" + '{"event":"end","data":').encode()
+
+
+def test_truncated_diagnostic_client_retains_only_correlated_closed_receiver_prefix(
+        repository_root, tmp_path):
+    cookie = "diagnostic-client-truncated"
+    log_bytes = ((ROOT / "iperf-receiver.log").read_bytes()
+        .replace(b'"duration":60', b'"duration":86400')
+        .replace(b'"cookie":"native-cookie-1"', f'"cookie":"{cookie}"'.encode()))
+    log = _record(tmp_path, "truncated-client-log", "retrieval/diagnostic-iperf.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
+    client_native = _record(tmp_path, "truncated-client-native", "retrieval/diagnostic-client.jsonl",
+        "iperf3-client-jsonl", VmRole.VM_A, _truncated_diagnostic_client(cookie, 86400), "diagnostic-day")
+    server_native = _record(tmp_path, "truncated-client-server", "retrieval/diagnostic-server.jsonl",
+        "iperf3-server-jsonl", VmRole.VM_B,
+        _native_iperf_server_jsonl(cookie, duration=86400))
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-diagnostic-day", VmRole.VM_A, "diagnostic-day")
+    build = _build("iperf3", VmRole.VM_B, "diagnostic-iperf-build")
+    build_a = _build("iperf3", VmRole.VM_A, "diagnostic-iperf-client-build")
+    build_records = _build_records(tmp_path, DEPLOYMENT, [build, build_a])
+    records = [log, client_native, server_native, *build_records]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert len(sources) == 1
+    raw_hashes_before = {item.artifact_id: hashlib.sha256((tmp_path / item.path).read_bytes()).hexdigest()
+        for item in records}
+    windows = []
+    with pytest.raises(ValueError, match="A-side diagnostic iperf client JSONL has an unknown truncated final event"):
+        for window in iter_source_windows(tmp_path, sources[0], records, [client, receiver], [build]):
+            windows.append(window)
+    assert len(windows) == 2 and windows[0].omitted is True and windows[1].omitted is False
+    assert raw_hashes_before == {item.artifact_id: hashlib.sha256((tmp_path / item.path).read_bytes()).hexdigest()
+        for item in records}
+
+    resolved = observation(repository_root, "diagnostic_day")
+    runtime_context = context(resolved, tmp_path)
+    deployment_id = runtime_context.identity.deployment_id
+    # F03 uses its own deployment identity; rematerialize the same immutable
+    # bytes with that identity so the binder exercises the actual runtime scope.
+    f03_records = [
+        _record(tmp_path, "truncated-client-log", "retrieval/diagnostic-iperf.stderr",
+            "iperf3-observation-stderr", VmRole.VM_B, log_bytes, None, deployment_id),
+        _record(tmp_path, "truncated-client-native", "retrieval/diagnostic-client.jsonl",
+            "iperf3-client-jsonl", VmRole.VM_A, _truncated_diagnostic_client(cookie, 86400), "diagnostic-day", deployment_id),
+        _record(tmp_path, "truncated-client-server", "retrieval/diagnostic-server.jsonl",
+            "iperf3-server-jsonl", VmRole.VM_B, _native_iperf_server_jsonl(cookie, duration=86400), None, deployment_id),
+    ]
+    f03_receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None, deployment_id)
+    f03_receiver.result["outcome"] = "succeeded"
+    runtime = dataclass_replace(runtime_context, source_artifact_records=tuple(f03_records),
+        build_observations=(build, build_a), receiver_command_evidence=(f03_receiver,))
+    clock = FakeClock()
+    result = run_measurement(resolved, runtime, processes=_fixture_processes(clock), clock=clock)
+    timing = next(row for row in result.timings if row.unit_id == "diagnostic-day")
+    assert timing.acquisition_sources.value is not None
+    assert any(source.tool == "iperf3" for source in timing.acquisition_sources.value)
+    note = next(row for row in result.timing_notes
+        if row.get("unit_id") == "diagnostic-day" and "acquisition_coverage_reason" in row)
+    assert "unknown tail" in note["acquisition_coverage_reason"]
+    assert "truncated final event" in note["acquisition_coverage_reason"]
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_start", "contradictory_cookie", "invalid_complete_record"])
+def test_client_jsonl_rejects_ambiguous_or_contradictory_complete_prefix(mutation, tmp_path):
+    cookie = "diagnostic-client-contradiction"
+    log_bytes = ((ROOT / "iperf-receiver.log").read_bytes()
+        .replace(b'"cookie":"native-cookie-1"', f'"cookie":"{cookie}"'.encode()))
+    log = _record(tmp_path, "contradictory-client-log", "retrieval/contradictory-client.stderr",
+        "iperf3-observation-stderr", VmRole.VM_B, log_bytes)
+    settings = {"protocol": "TCP", "num_streams": 1, "omit": 5, "duration": 86400,
+        "interval": 1, "blksize": 131072, "reverse": False}
+    start = json.dumps({"event": "start", "data": {"cookie": cookie, "test_start": settings}})
+    if mutation == "duplicate_start":
+        client_bytes = (start + "\n" + start + "\n" + '{"event":"end","data":').encode()
+    elif mutation == "contradictory_cookie":
+        wrong = json.dumps({"event": "start", "data": {"cookie": "other-cookie", "test_start": settings}})
+        client_bytes = (start + "\n" + wrong + "\n").encode()
+    else:
+        client_bytes = (start + '\n{"event":"interval","data":}\n').encode()
+    client_native = _record(tmp_path, "contradictory-client-native", "retrieval/contradictory-client.jsonl",
+        "iperf3-client-jsonl", VmRole.VM_A, client_bytes, "diagnostic-day")
+    server_native = _record(tmp_path, "contradictory-client-server", "retrieval/contradictory-server.jsonl",
+        "iperf3-server-jsonl", VmRole.VM_B,
+        _native_iperf_server_jsonl(cookie, duration=86400))
+    receiver = _command("f02r-vm_b-listener-iperf3", VmRole.VM_B, None)
+    client = _command("iperf3-diagnostic-day", VmRole.VM_A, "diagnostic-day")
+    build = _build("iperf3", VmRole.VM_B, "contradictory-client-build")
+    records = [log, client_native, server_native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    sources = bind_acquisition_sources(child_root=tmp_path,
+        run_identity=SimpleNamespace(deployment_id=DEPLOYMENT), commands=[client],
+        receiver_command_evidence=[receiver], build_evidence=[build], source_artifact_records=records)
+    assert sources == ()
+
+
+@pytest.mark.parametrize("corrupt_position", ["first", "second"])
+def test_f03_corrupt_sockperf_native_candidate_does_not_erase_other_unit(corrupt_position,
+        repository_root, tmp_path):
+    resolved = observation(repository_root, "short_study")
+    processes = _fixture_processes(FakeClock())
+    build = _build("sockperf", VmRole.VM_A, "sock-build")
+    units = list(resolved.measurement_units[:2])
+    assert len(units) == 2 and units[0].unit_id != units[1].unit_id
+    valid_index, corrupt_index = ((1, 0) if corrupt_position == "first" else (0, 1))
+    records = []
+    for index, unit in enumerate(units):
+        action = f"sockperf-{unit.unit_id}"
+        log_bytes = (ROOT / "sockperf-window.log").read_text(encoding="utf-8").replace(
+            "sockperf-short-multiflow", action).encode()
+        log = _record(tmp_path, f"sock-log-{index}", f"retrieval/sock-{index}.stderr",
+            "sockperf-observation-stderr", VmRole.VM_A, log_bytes,
+            unit.unit_id, context(resolved, tmp_path).identity.deployment_id)
+        native = _record(tmp_path, f"sock-native-{index}", f"retrieval/sock-{index}.csv",
+            "sockperf-csv", VmRole.VM_A, b"materialized native csv\n", unit.unit_id,
+            context(resolved, tmp_path).identity.deployment_id)
+        if index == corrupt_index:
+            (tmp_path / native.path).write_bytes(b"corrupt after materialization")
+        records.extend((log, native))
+    runtime = dataclass_replace(context(resolved, tmp_path), build_observations=(build,),
+        source_artifact_records=tuple(records))
+    assembled = run_measurement(resolved, runtime, processes=processes, clock=processes.clock)
+    valid_unit = units[valid_index].unit_id
+    valid_timing = next(item for item in assembled.timings if item.unit_id == valid_unit)
+    assert valid_timing.acquisition_sources.value is not None
+    assert any(source.log_artifact_id == f"sock-log-{valid_index}"
+        for source in valid_timing.acquisition_sources.value)
+
+
+def test_mutated_closed_source_bytes_are_rejected_before_replay(tmp_path):
+    log = (ROOT / "sockperf-window.log").read_bytes()
+    row = _record(tmp_path, "sock-log", "retrieval/sockperf.stderr", "sockperf-observation-stderr",
+                  VmRole.VM_A, log, "short-multiflow")
+    native = _record(tmp_path, "sock-csv", "measurements/short-multiflow/sockperf.csv", "sockperf-csv",
+                     VmRole.VM_A, b"native", "short-multiflow")
+    from cloud_network_benchmark.contracts import AcquisitionSource
+    source = AcquisitionSource(tool="sockperf", semantics_id="sockperf-3.10-enabled-v1", producer=VmRole.VM_A,
+        command_action_id="short-multiflow-sockperf", invocation_id="short-multiflow-sockperf",
+        boot_id="12345678-1234-1234-1234-123456789abc", clock_domain="CLOCK_MONOTONIC",
+        log_artifact_id=row.artifact_id, log_path=row.path, native_artifact_ids=[native.artifact_id],
+        build_artifact_id="sock-build")
+    build = _build("sockperf", VmRole.VM_A, "sock-build")
+    records = [row, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    (tmp_path / row.path).write_bytes(log + b"altered")
+    with pytest.raises(ValueError, match="size does not match"):
+        list(iter_source_windows(tmp_path, source, records,
+            [_command("short-multiflow-sockperf", VmRole.VM_A, "short-multiflow")],
+            [build]))
+
+
+def test_mutated_build_command_path_and_duplicate_artifact_refs_are_rejected(tmp_path):
+    log = (ROOT / "sockperf-window.log").read_bytes()
+    row = _record(tmp_path, "sock-log", "retrieval/sockperf.stderr", "sockperf-observation-stderr",
+                  VmRole.VM_A, log, "short-multiflow")
+    native = _record(tmp_path, "sock-csv", "measurements/short-multiflow/sockperf.csv", "sockperf-csv",
+                     VmRole.VM_A, b"native", "short-multiflow")
+    from cloud_network_benchmark.contracts import AcquisitionSource
+    source = AcquisitionSource(tool="sockperf", semantics_id="sockperf-3.10-enabled-v1", producer=VmRole.VM_A,
+        command_action_id="sockperf-short-multiflow", invocation_id="sockperf-short-multiflow",
+        boot_id="12345678-1234-1234-1234-123456789abc", clock_domain="CLOCK_MONOTONIC",
+        log_artifact_id=row.artifact_id, log_path=row.path, native_artifact_ids=[native.artifact_id],
+        build_artifact_id="sock-build")
+    commands = [_command("sockperf-short-multiflow", VmRole.VM_A, "short-multiflow")]
+    build = _build("sockperf", VmRole.VM_A, "sock-build")
+    records = [row, native, *_build_records(tmp_path, DEPLOYMENT, [build])]
+    for field, value in (("patch_sha256", "f" * 64), ("patch_path", "tool_patches/other.patch"),
+                         ("source_sha256", "c" * 64), ("upstream_commit", "1" * 40),
+                         ("binary_sha256", None), ("observation_capability", None)):
+        changed = SimpleNamespace(**{**vars(build), field: value})
+        with pytest.raises(ValueError):
+            list(iter_source_windows(tmp_path, source, records, commands, [changed]))
+    with pytest.raises(ValueError, match="uniquely"):
+        list(iter_source_windows(tmp_path, source, [row, native], commands, [build]))
+    changed_command = _command("sockperf-short-multiflow", VmRole.VM_A, "short-multiflow")
+    changed_command.request["argv"][0] = "/opt/other/bin/sockperf"
+    with pytest.raises(ValueError, match="executable"):
+        list(iter_source_windows(tmp_path, source, records, [changed_command], [build]))
+    changed_command = _command("sockperf-short-multiflow", VmRole.VM_A, "short-multiflow")
+    changed_command.request["acquisition_invocation_id"] = "different-invocation"
+    with pytest.raises(ValueError, match="environment identity"):
+        list(iter_source_windows(tmp_path, source, records, [changed_command], [build]))
     build_path = tmp_path / records[-1].path
     original = build_path.read_bytes()
     build_path.write_bytes(original + b"substituted")
