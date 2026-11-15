@@ -31,7 +31,7 @@ SOURCES = (
          source_sha256="a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e",
          upstream_commit="5ebd327da983225321818c0355db922515e026bd",
          observation_patch_path="tool_patches/sockperf-3.10-acquisition.patch",
-         observation_patch_sha256="3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285"),
+         observation_patch_sha256="bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc"),
     dict(tool="iperf3", source_url="https://codeload.github.com/esnet/iperf/tar.gz/2acfcfe94e928e74542c9f107e02aa6dd4748a79",
          source_reference="iperf-2acfcfe94e928e74542c9f107e02aa6dd4748a79", archive_name="iperf3.tar.gz",
          source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
