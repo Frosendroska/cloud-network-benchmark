@@ -120,6 +120,13 @@ def _preparation_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None
     if failure is None:
         return None, None
     actions = []
+    def bounded_diagnostic(value: Any) -> Any:
+        """Keep short output byte-for-byte and retain the useful end of long output."""
+        if not isinstance(value, str) or len(value) <= 4096:
+            return value
+        marker = "\n...[truncated; retained final diagnostic characters]...\n"
+        return marker + value[-(4096 - len(marker)):]
+
     for name in ("bootstrap", "readiness"):
         for action in getattr(evidence.get(name), "actions", ()) or ():
             row = action.model_dump(mode="json") if hasattr(action, "model_dump") else {}
@@ -136,7 +143,7 @@ def _preparation_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None
                 "request": {**{k: (str(request[k])[:256] if isinstance(request[k], str) else request[k])
                     for k in ("action_id", "action_type", "timeout_seconds") if k in request},
                     **({"argv": safe_argv} if safe_argv is not None else {})},
-                "result": {k: (str(response[k])[:4096] if k in {"stdout", "stderr"} else response[k])
+                "result": {k: (bounded_diagnostic(response[k]) if k in {"stdout", "stderr"} else response[k])
                     for k in ("outcome", "exit_code", "started_at", "finished_at", "stdout", "stderr", "redactions_applied")
                     if k in response}})
     omitted = max(0, len(actions) - 24)

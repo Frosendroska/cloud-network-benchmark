@@ -44,6 +44,36 @@ def test_bootstrap_failure_retains_bounded_redacted_action_diagnostics():
     assert "stdin" not in serialized and "environment" not in serialized
 
 
+def test_long_preparation_failure_keeps_compiler_error_tail_after_redaction():
+    from datetime import timedelta
+    from cloud_network_benchmark.access import _action
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
+
+    secret = "/private/build/token"
+    vm = SimpleNamespace(host="192.0.2.2", role="vm_a", authentication_reference=secret,
+        host_key_reference=secret)
+    request = CommandRequest(action_id="build-4", action_type="ssh", argv=["ssh", "build"], cwd=".",
+        timeout_seconds=3, redactions=[secret])
+    started = datetime(2026, 11, 15, tzinfo=timezone.utc)
+    short = "configure completed\n"
+    long_stderr = ("prefix noise " * 500) + f"failed with {secret}\nfinal compiler error: missing libtoolize"
+    response = CommandResult(action_id="build-4", outcome="failed", started_at=started,
+        finished_at=started + timedelta(seconds=1), duration_seconds=1, exit_code=2,
+        stdout=short, stderr=long_stderr, redactions=[secret])
+    action = _action("build-4", "ssh", vm, request, response)
+    failure = _failure("bootstrap_command_failed", "build failed", "build-4")
+    result = SimpleNamespace(values={"prepare": SimpleNamespace(stage="prepare", evidence={
+        "bootstrap": SimpleNamespace(failure=failure, actions=[action])})})
+
+    _selected, payload = _preparation_failure(result)
+    output = payload["actions"][0]["result"]
+    assert output["stdout"] == short
+    assert len(output["stderr"]) <= 4096
+    assert "final compiler error: missing libtoolize" in output["stderr"]
+    assert "...[truncated; retained final diagnostic characters]..." in output["stderr"]
+    assert secret not in output["stderr"]
+
+
 def test_readiness_failure_keeps_later_close_failure_separate():
     failure = _failure("readiness_deadline_exhausted", "deadline", "probe-8")
     readiness = SimpleNamespace(failure=failure, actions=[])
