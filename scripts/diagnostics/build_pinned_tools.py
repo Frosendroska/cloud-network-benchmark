@@ -80,6 +80,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared-host", action="store_true", help="acknowledge dependency installation is intentionally skipped")
     parser.add_argument("--evidence-dir", type=Path, required=True, help="new or empty local directory for full logs and evidence")
+    parser.add_argument("--source-cache", type=Path, help="optional directory containing previously hash-verified pinned archives")
     args = parser.parse_args()
     if not args.prepared_host:
         parser.error("pass --prepared-host only after confirming this host already has the build dependencies")
@@ -110,14 +111,31 @@ def main() -> int:
                 "source_sha256_expected": source.source_sha256, "patch_path": source.observation_patch_path,
                 "patch_sha256_expected": source.observation_patch_sha256, "commands": []}
             commands = _recipe(source, config)
+            cached_archive = (args.source_cache / source.archive_name) if args.source_cache else None
+            use_cache = cached_archive is not None and cached_archive.is_file() and not cached_archive.is_symlink()
+            if use_cache:
+                observed_cache_sha = digest(cached_archive)
+                if observed_cache_sha != source.source_sha256:
+                    row.update(status="failed", failed_command="source_cache_digest_mismatch",
+                        source_cache_sha256_observed=observed_cache_sha)
+                    summary["tools"].append(row)
+                    continue
+                shutil.copyfile(cached_archive, workspace / source.archive_name)
+                row["source_cache_used"] = True
             # Recipe[0] is the production apt install action, explicitly omitted on this host.
             for index, argv in enumerate(commands[1:], start=1):
                 label = {1: "download", 2: "archive_sha256", 3: "extract", 4: "production_source_build_recipe",
                          5: "compiler_version", 6: "tool_version", 7: "binary_sha256", 8: "tool_help"}.get(index, f"production_check_{index}")
                 out_path, err_path = evidence / f"{source.tool}-{index:02d}-{label}.stdout", evidence / f"{source.tool}-{index:02d}-{label}.stderr"
-                return_code, timed_out, elapsed = run_logged(argv, root, env, out_path, err_path)
+                if use_cache and index == 1:
+                    out_path.write_text("verified pinned source archive copied from local cache\n")
+                    err_path.write_text("")
+                    return_code, timed_out, elapsed = 0, False, 0.0
+                else:
+                    return_code, timed_out, elapsed = run_logged(argv, root, env, out_path, err_path)
                 out, err = out_path.read_text(errors="replace"), err_path.read_text(errors="replace")
-                record = {"label": label, "argv": argv, "exit_code": return_code,
+                record = {"label": label, "operation": "verified_cache_copy" if use_cache and index == 1 else "command",
+                    "argv": None if use_cache and index == 1 else argv, "exit_code": return_code,
                     "timed_out": timed_out, "timeout_seconds": COMMAND_TIMEOUT_SECONDS,
                     "duration_seconds": round(elapsed, 3),
                     "stdout_path": out_path.name, "stdout_sha256": digest(out_path), "stdout_bytes": out_path.stat().st_size,
