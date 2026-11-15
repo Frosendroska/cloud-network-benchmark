@@ -1082,6 +1082,18 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         out_a, out_b = selection_root / "report-a", selection_root / "report-b"
         write_analysis(report_a, out_a)
         write_analysis(report_b, out_b)
+        # Exercise the public CLI using the finalizer's actual on-disk F09
+        # inputs and validation results, not a reconstructed ValidatorInput.
+        from cloud_network_benchmark.cli import main as analyze_main
+        out_cli = selection_root / "report-cli"
+        assert analyze_main(["analyze", "--selection", str(selection_a),
+            "--output", str(out_cli)]) == 0
+        cli_payload = json.loads((out_cli / "report.json").read_text(encoding="utf-8"))
+        assert {row["provider"] for row in cli_payload["runs"]} == {"aws", "azure", "gcp"}
+        assert all(row["recorded_data_validity"] == "valid" for row in cli_payload["runs"])
+        assert (out_cli / "index.html").is_file()
+        assert (out_cli / "figures" / "time-series.png").is_file()
+        assert (out_cli / "figures" / "receiver-time-series.svg").is_file()
         files_a = {p.relative_to(out_a): p.read_bytes() for p in out_a.rglob("*") if p.is_file()}
         files_b = {p.relative_to(out_b): p.read_bytes() for p in out_b.rglob("*") if p.is_file()}
         assert files_a and files_a == files_b
