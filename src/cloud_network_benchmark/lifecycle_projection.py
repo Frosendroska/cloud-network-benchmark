@@ -146,6 +146,17 @@ def _preparation_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None
         "occurred_at": failure.occurred_at.isoformat(), "omitted_action_count": omitted, "actions": actions}
 
 
+def _preparation_failure_declaration(result: Any) -> Any | None:
+    """Return the fixed artifact declaration when failed preparation evidence exists."""
+    _failure, payload = _preparation_failure(result)
+    if payload is None:
+        return None
+    from .contracts.artifacts import ArtifactInput
+    return ArtifactInput(artifact_id="f09-preparation-failure",
+        path="metadata/preparation-failure.json", kind="lifecycle_failure_diagnostics",
+        producer="controller", unit_id=None, expectation="required")
+
+
 def _controller_record(root: Path, deployment_id: str, declaration: Any, payload: bytes | None = None) -> Any:
     from .contracts.artifacts import ArtifactRecord, resolve_artifact_path
     from .contracts.common import Evidence, StringEvidence
@@ -345,10 +356,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
     records = _records_from(result)
     preparation_failure, preparation_payload = _preparation_failure(result)
     if preparation_payload is not None:
-        from .contracts.artifacts import ArtifactInput
-        declaration = ArtifactInput(artifact_id="f09-preparation-failure",
-            path="metadata/preparation-failure.json", kind="lifecycle_failure_diagnostics",
-            producer="controller", unit_id=None, expectation="required")
+        declaration = _preparation_failure_declaration(result)
         declarations.append(declaration)
         payload = (json.dumps(preparation_payload, sort_keys=True, indent=2) + "\n").encode()
         record = _controller_record(root, child.deployment_id, declaration, payload)
@@ -420,6 +428,9 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
         build_observations=builds)
     remote = _guest_execution_from(result)
     _include_guest_outcome_source(declarations, remote)
+    preparation_declaration = _preparation_failure_declaration(result)
+    if preparation_declaration is not None:
+        declarations.append(preparation_declaration)
     for role in ("vm_a", "vm_b"):
         declarations.extend(_declarations(role))
     artifacts = {}
