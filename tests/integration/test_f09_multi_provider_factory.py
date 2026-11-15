@@ -138,7 +138,7 @@ class GcpSourceRunner:
             return result(value)
         if action == "gcp-guest-hostkeys":
             blob = base64.b64encode(struct.pack(">I", 11)+b"ssh-ed25519"+struct.pack(">I", 32)+b"h"*32).decode()
-            return result({"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]}})
+            return result([{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}])
         if action.startswith("gcp-boot-disk"):
             return result({"id": "2001" if role == "vm_a" else "2002", "name": f"{namespace}-{suffix}-boot",
                 "zone": f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/zones/{intent.zone}",

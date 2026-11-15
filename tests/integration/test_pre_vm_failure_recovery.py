@@ -6,6 +6,7 @@ import hashlib
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from cloud_network_benchmark.providers.aws import AwsProviderDriver, _namespace, _legacy_namespace
 from cloud_network_benchmark.contracts.common import Evidence, FailureEvidence, Provider
@@ -125,18 +126,28 @@ def test_pre_vm_cleanup_requires_independent_original_scope_absence(tmp_path,iss
 
 def test_legacy_saved_cleanup_keeps_original_namespace_inputs_state_and_request(tmp_path):
     from cloud_network_benchmark.lifecycle_cleanup import save_cleanup_settings,cleanup_saved_provider
-    from cloud_network_benchmark.providers.aws import SAFETY_LEAD_SECONDS
+    from cloud_network_benchmark.providers.aws import AwsProviderDriver,AwsProviderError,SAFETY_LEAD_SECONDS,AwsRuntimeSettings
     d,settings,driver,runner,attempt=direct_attempt(tmp_path,legacy=True)
     original={p:p.read_bytes() for p in (attempt/'safety-eu-central-1.tfvars.json',attempt/'safety-eu-central-1.tfstate')}
     request=ExpiryRequest(schema_version=2,run_id=d.run_id,deployment_id=d.deployment_id,provider='aws',action='stop',
         resource_namespace=_legacy_namespace(d),target_selector=driver._target_selector(d,['eu-central-1']),
         expires_at=Evidence(value=d.reservation.value.expires_at.value-timedelta(seconds=SAFETY_LEAD_SECONDS)),reservation_id=d.reservation.value.reservation_id)
+    legacy_settings=settings.model_dump(mode='json')
+    legacy_settings.pop('post_registration_workflow_seconds')
+    legacy_settings.pop('post_provision_workflow_seconds')
+    with pytest.raises(ValidationError): AwsRuntimeSettings.model_validate(legacy_settings)
     saved=save_cleanup_settings(provider='aws',deployment=d,request=request,reservation=d.reservation.value,
-        provider_lead_seconds=float(SAFETY_LEAD_SECONDS),settings=settings,private_root=tmp_path/'recovery')
+        provider_lead_seconds=float(SAFETY_LEAD_SECONDS),settings=legacy_settings,private_root=tmp_path/'recovery')
     record=SimpleNamespace(provider='aws',deployment_id=d.deployment_id,journal_reference=str(attempt/'attempt.json'),cleanup_settings_reference=str(saved))
+    snapshot=saved.read_bytes()
+    from cloud_network_benchmark.lifecycle_cleanup import _aws_cleanup_settings
+    adapted=_aws_cleanup_settings(legacy_settings)
+    with pytest.raises(AwsProviderError,match='phase allowances are inconsistent'):
+        AwsProviderDriver(runner,adapted,clock=lambda:NOW+timedelta(days=2))._validate_registration(d,request)
     result,retained,_=cleanup_saved_provider(record,runner=runner,utc_now=lambda:NOW+timedelta(days=2))
     assert result.cleanup_state=='succeeded',result.model_dump(mode='json')
     assert retained.expiry_request==request
+    assert retained.settings==legacy_settings and saved.read_bytes()==snapshot
     assert not (settings.private_state_root/_namespace(d)).exists()
     for path,raw in original.items():assert path.read_bytes()==raw
     assert all(str(attempt) in str(q.cwd) for q in runner.requests if 'destroy' in q.argv)

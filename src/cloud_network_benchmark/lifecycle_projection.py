@@ -58,6 +58,29 @@ def _outcome(result: Any, stage: str) -> Any:
     return value
 
 
+def _failed_stage(result: Any, stage_times: Mapping[str, Any]) -> str | None:
+    """Find the earliest attempted stage that failed, including raised errors.
+
+    Exceptions raised before a typed stage outcome is returned leave no value
+    in ``result.values``. Their timestamp is still present in ``stage_times``;
+    using it prevents cleanup from being recorded after the later cleanup
+    high-water mark and then rejecting the earlier cleanup-start event.
+    """
+    candidates = ("protect", "claim", "create", "prepare", "stabilize", "measure", "close", "retrieve")
+    failure = getattr(result, "primary_failure", None)
+    if isinstance(failure, str) and " failed (" in failure:
+        name = failure.split(" ", 1)[-1].split(" failed (", 1)[0]
+        if name in candidates and name in stage_times:
+            return name
+    for name in candidates:
+        if name not in stage_times:
+            continue
+        outcome = _outcome(result, name)
+        if outcome is not None and not outcome.succeeded:
+            return name
+    return None
+
+
 def _guest_from(result: Any) -> Any:
     measured = _outcome(result, "measure")
     evidence = getattr(measured, "evidence", None)
@@ -80,6 +103,47 @@ def _builds_from(result: Any) -> list[Any]:
     evidence = getattr(prepared, "evidence", None)
     bootstrap = evidence.get("bootstrap") if isinstance(evidence, dict) else None
     return list(getattr(bootstrap, "builds", ()) or ())
+
+
+def _preparation_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None, None]:
+    """Return bounded, already-redacted bootstrap/readiness failure evidence."""
+    prepared = _outcome(result, "prepare")
+    evidence = getattr(prepared, "evidence", None)
+    if not isinstance(evidence, dict):
+        return None, None
+    failure = None
+    for name in ("bootstrap", "readiness"):
+        observed = getattr(evidence.get(name), "failure", None)
+        if observed is not None:
+            failure = observed
+            break
+    if failure is None:
+        return None, None
+    actions = []
+    for name in ("bootstrap", "readiness"):
+        for action in getattr(evidence.get(name), "actions", ()) or ():
+            row = action.model_dump(mode="json") if hasattr(action, "model_dump") else {}
+            request, response = row.get("request", {}), row.get("result", {})
+            argv = request.get("argv")
+            safe_argv = ([str(value)[:256] for value in argv[:32]
+                          if isinstance(value, (str, int, float, bool))]
+                         if isinstance(argv, list) else None)
+            # Remote action evidence is redacted by the access runner. Keep a
+            # small bounded diagnostic view and omit arbitrary nested payloads.
+            actions.append({"action_id": str(row.get("action_id", ""))[:256],
+                "action_type": str(row.get("action_type", ""))[:128],
+                "vm_id": str(row.get("vm_id", ""))[:256], "role": str(row.get("role", ""))[:32],
+                "request": {**{k: (str(request[k])[:256] if isinstance(request[k], str) else request[k])
+                    for k in ("action_id", "action_type", "timeout_seconds") if k in request},
+                    **({"argv": safe_argv} if safe_argv is not None else {})},
+                "result": {k: (str(response[k])[:4096] if k in {"stdout", "stderr"} else response[k])
+                    for k in ("outcome", "exit_code", "started_at", "finished_at", "stdout", "stderr", "redactions_applied")
+                    if k in response}})
+    omitted = max(0, len(actions) - 24)
+    actions = actions[-24:]
+    return failure, {"schema_version": 1, "stage": str(failure.stage)[:64], "category": str(failure.category)[:256],
+        "message": str(failure.message)[:1000], "action_id": str(failure.action_id)[:256] if failure.action_id else None,
+        "occurred_at": failure.occurred_at.isoformat(), "omitted_action_count": omitted, "actions": actions}
 
 
 def _controller_record(root: Path, deployment_id: str, declaration: Any, payload: bytes | None = None) -> Any:
@@ -206,13 +270,21 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
             creation["finished_at"] if creation else evaluated_at, parent_manifest_path=parent_path)
     elif execution == ExecutionState.FAILED:
         if current.execution_state not in {ExecutionState.FAILED, ExecutionState.INTERRUPTED}:
-            stage = next((name for name in ("protect", "claim", "create", "prepare", "stabilize", "measure", "close", "retrieve")
-                if _outcome(result, name) is not None and not _outcome(result, name).succeeded), None)
+            stage = _failed_stage(result, stage_times)
             observed_at = stage_times.get(stage, {}).get("finished_at", terminal_at)
             provider = getattr(child.provider, "value", child.provider)
             cause = result.primary_failure or f"{provider} lifecycle failed"
             observed_failure = getattr(result.values.get("protect"),"failure",None)
-            failure = observed_failure or _failure(cause, observed_at, "lifecycle_failure")
+            if stage == "prepare":
+                preparation_failure, _ = _preparation_failure(result)
+                if preparation_failure is not None:
+                    failure = _failure(preparation_failure.message[:1000],
+                        preparation_failure.occurred_at, preparation_failure.category)
+                    failure = failure.model_copy(update={"action_id": preparation_failure.action_id})
+                else:
+                    failure = observed_failure or _failure(cause, observed_at, "lifecycle_failure")
+            else:
+                failure = observed_failure or _failure(cause, observed_at, "lifecycle_failure")
             if observed_failure is not None:
                 observed_at = observed_failure.occurred_at
             target = ExecutionState.INTERRUPTED if result.interrupted else ExecutionState.FAILED
@@ -271,6 +343,17 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         from .diagnostics import _declarations
         declarations.extend(_declarations(role))
     records = _records_from(result)
+    preparation_failure, preparation_payload = _preparation_failure(result)
+    if preparation_payload is not None:
+        from .contracts.artifacts import ArtifactInput
+        declaration = ArtifactInput(artifact_id="f09-preparation-failure",
+            path="metadata/preparation-failure.json", kind="lifecycle_failure_diagnostics",
+            producer="controller", unit_id=None, expectation="required")
+        declarations.append(declaration)
+        payload = (json.dumps(preparation_payload, sort_keys=True, indent=2) + "\n").encode()
+        record = _controller_record(root, child.deployment_id, declaration, payload)
+        if record is not None:
+            records.append(record)
     records.extend(_materialize_controller_evidence(root, child, result, declarations))
     if _value(child.mode) == "diagnostic_day":
         parent_units = {unit.unit_id for unit in child.measurement_units}

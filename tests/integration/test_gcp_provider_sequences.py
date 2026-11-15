@@ -333,7 +333,7 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
                         "mismatched": [f"projects/{settings.project_id}/regions/europe-west2/resourcePolicies/{namespace}-compact"],
                     }[policy_mutation]
                 return result(instance)
-            if action == "gcp-guest-hostkeys": return result({"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":host_blob}]}})
+            if action == "gcp-guest-hostkeys": return result([{"namespace":"hostkeys","key":"ssh-ed25519","value":host_blob}])
             if action.startswith("gcp-boot-disk"):
                 return result({"id":str(2001 if role=="vm_a" else 2002),"name":f"{namespace}-{suffix}-boot","zone":zone_path,"sizeGb":"32","type":f"zones/{intent.zone}/diskTypes/pd-balanced","sourceImage":settings.images[intent.region],"labels":{"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}})
             if action.startswith("gcp-image-read"): return result({"architecture":"X86_64","name":settings.images[intent.region].rsplit("/",1)[-1],"guestOsFeatures":[{"type":"GVNIC"}]})
@@ -368,6 +368,7 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     assert output.vm_a.connection.host == "8.8.8.8" and output.vm_b.connection.host == "1.1.1.1"
     pair_vars=json.loads((driver._attempt_dir(deployment)/"pair"/"vars.json").read_text())
     assert pair_vars["template_a"] == expiry.provider_metadata.value["templates"]["vm_a"]["self_link_unique"]
+    assert pair_vars["scenario"] == scenario
     assert len([x for x in runner.requests if x.action_id=="gcp-pair-apply"])==1
     cleaned = driver.cleanup(deployment)
     assert cleaned.cleanup_state == "succeeded"
@@ -664,7 +665,7 @@ def test_restarted_controller_rejects_changed_address_for_saved_vm_identity(tmp_
     identity = {"id": "101", "name": name, "zone": f"https://compute.googleapis.com/compute/v1/projects/{first.settings.project_id}/zones/{zone}", "selfLink": f"https://compute.googleapis.com/compute/v1/projects/{first.settings.project_id}/zones/{zone}/instances/{name}", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "1.1.1.1"}]}]}
     def read(args, action):
         if action == "gcp-guest-hostkeys":
-            return {"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]}}
+            return [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]
         return identity
     monkeypatch.setattr(restarted, "_gcloud_json", read)
     with pytest.raises(GcpProviderError, match="management IPv4 changed for an already bound VM identity"):
@@ -701,7 +702,7 @@ def test_pair_apply_records_exact_template_binding_input_hash(tmp_path,monkeypat
         stdout='{"instances":{}}' if action=="gcp-pair-outputs" else ""
         return CommandResult(action_id=action,outcome="succeeded",started_at=now,finished_at=now,duration_seconds=0.0,exit_code=0,stdout=stdout,stderr="")
     monkeypatch.setattr(driver,"_run",fake_run)
-    driver._terraform(attempt,"pair","apply",deployment,{"template_a":"projects/test/global/instanceTemplates/unique-a","template_b":"projects/test/global/instanceTemplates/unique-b"})
+    driver._terraform(attempt,"pair","apply",deployment,{"template_a":"projects/test/global/instanceTemplates/unique-a","template_b":"projects/test/global/instanceTemplates/unique-b","scenario":"same_zone"})
     variables=(attempt/"pair"/"vars.json").read_bytes()
     binding=json.loads((attempt/"attempt.json").read_text())["pair_binding"]
     assert binding["config_sha256"]==hashlib.sha256(variables).hexdigest()
@@ -735,7 +736,7 @@ def test_s1_fake_provision_normalizes_authenticated_vm_disk_image_and_hostkey_re
         if action.startswith("gcp-image-read"):
             return {"architecture":"X86_64","name":driver.settings.images[intent.region].rsplit("/",1)[-1],"guestOsFeatures":[{"type":"GVNIC"}]}
         if action=="gcp-guest-hostkeys":
-            return {"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":hostkey}]}}
+            return [{"namespace":"hostkeys","key":"ssh-ed25519","value":hostkey}]
         if action.startswith("gcp-hostkey-instance"):
             return {"id":"101" if role=="vm_a" else "102","name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","zone":zone_path,"selfLink":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/instances/{namespace}-{'a' if role=='vm_a' else 'b'}","networkInterfaces":[{"networkIP":address,"accessConfigs":[{"natIP":"8.8.8.8"}]}]}
         return {"id":"101" if role=="vm_a" else "102","name":f"{namespace}-{'a' if role=='vm_a' else 'b'}","zone":zone_path,"selfLink":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/instances/{namespace}-{'a' if role=='vm_a' else 'b'}","machineType":"n2-standard-4","scheduling":{"provisioningModel":"STANDARD","instanceTerminationAction":"STOP","terminationTime":trigger.isoformat().replace("+00:00","Z"),"automaticRestart":False},"reservationAffinity":{"consumeReservationType":"NO_RESERVATION"},"networkInterfaces":[{"network":f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/global/networks/{namespace}-net","networkIP":address,"subnetwork":f"https://www.googleapis.com/compute/v1/projects/cnb-test-12345/regions/europe-west3/subnetworks/{namespace}-a","nicType":"GVNIC","accessConfigs":[{"natIP":"8.8.8.8"}]}],"disks":[{"boot":True,"source":f"https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/{intent.zone}/disks/{namespace}-{'a' if role=='vm_a' else 'b'}-boot"}],"resourcePolicies":[]}
@@ -991,6 +992,45 @@ def test_s4_inventory_scans_both_regions_global_addresses_and_exact_known_ids(tm
     assert [item["id"] for item in inventory["instances"]] == ["101"]
     assert [item["id"] for item in inventory["disks"]] == ["201"]
     assert {item["name"] for item in inventory["support_resources"]} == {"known-template", f"{namespace}-net"}
+
+
+def test_cleanup_inventory_uses_valid_gcloud_subnet_list_grammar(tmp_path):
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    deployment, base = _cleanup_fixture(tmp_path)
+
+    class GcloudGrammarRunner:
+        # Simulate gcloud's command parser: invalid resource paths fail instead
+        # of returning a plausible empty inventory.
+        valid_lists = {
+            ("compute", "instances", "list"), ("compute", "disks", "list"),
+            ("compute", "addresses", "list"), ("compute", "networks", "subnets", "list"),
+            ("compute", "instance-templates", "list"), ("compute", "networks", "list"),
+            ("compute", "firewall-rules", "list"), ("compute", "routes", "list"),
+            ("compute", "resource-policies", "list"),
+        }
+
+        def __init__(self):
+            self.commands = []
+
+        def run(self, request):
+            now = datetime.now(timezone.utc)
+            args = tuple(request.argv[1:])
+            command = args[:args.index("--project")]
+            self.commands.append(command)
+            if command not in self.valid_lists:
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
+                    finished_at=now, duration_seconds=0, exit_code=2, stdout="",
+                    stderr="Invalid choice: 'subnetworks'. Did you mean 'networks'? ")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                finished_at=now, duration_seconds=0, exit_code=0, stdout="[]", stderr="")
+
+    runner = GcloudGrammarRunner()
+    driver = GcpProviderDriver(runner, base.settings)
+    inventory = driver._inventory(deployment)
+    assert inventory["pages_complete"] is True
+    assert ("compute", "networks", "subnets", "list") in runner.commands
+    assert ("compute", "subnetworks", "list") not in runner.commands
 
 
 def test_later_inventory_failure_keeps_protection_and_launch_blocked(tmp_path, monkeypatch):

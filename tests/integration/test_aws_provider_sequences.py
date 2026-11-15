@@ -158,6 +158,8 @@ def make_inter_region_attempt(tmp_path, scenario="inter_region"):
             "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
         }),
         complete_workflow_remaining_seconds=120,
+        post_registration_workflow_seconds=120,
+        post_provision_workflow_seconds=100,
     )
     if observation.admission.requires_primary_review:
         settings_values["primary_review_decision"] = StructuredEvidence(value={"decision": "approved", "scenario": scenario,
@@ -255,7 +257,16 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
 def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_path):
     deployment, settings = make_inter_region_attempt(tmp_path)
     runner = RegistrationRunner()
-    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
+    settle_calls = []
+    settings = settings.model_copy(update={"iam_settle_seconds": 30})
+    deadline_during_settle = []
+    def settle(seconds):
+        journal = driver._load_journal(driver._attempt_dir(deployment), deployment)
+        assert set(journal["safety"]) == {"eu-central-1", "eu-west-2"}
+        deadline_during_settle.append(driver._registration_deadline)
+        settle_calls.append(seconds)
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW,
+        sleeper=settle)
     reservation = deployment.reservation.value
     regions = driver._regions(deployment)
     request = ExpiryRequest(
@@ -268,6 +279,8 @@ def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_p
     )
     evidence = driver.register_expiry(deployment, request)
     assert evidence.state == "registered"
+    assert settle_calls == [30]
+    assert deadline_during_settle == [driver._registration_deadline]
     assert {action for action in runner.actions if action.startswith("aws-expiry-confirm-")} == {
         "aws-expiry-confirm-eu-central-1", "aws-expiry-confirm-eu-west-2",
     }
@@ -275,6 +288,26 @@ def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_p
         index for index, action in enumerate(runner.actions) if action.startswith("aws-expiry-start-")
     )
     assert "aws-pair-apply" not in runner.actions
+
+
+def test_iam_settle_that_cannot_fit_registration_deadline_never_starts(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    runner = RegistrationRunner()
+    settings = settings.model_copy(update={"iam_settle_seconds": 2, "registration_timeout_seconds": 1})
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW, sleeper=lambda _seconds: pytest.fail("must not sleep"))
+    reservation = deployment.reservation.value
+    regions = driver._regions(deployment)
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="aws", action="stop",
+        expires_at=Evidence[datetime](value=reservation.expires_at.value - timedelta(seconds=360)),
+        reservation_id=reservation.reservation_id,
+        resource_namespace=f"cnb-{deployment.run_id}-{deployment.deployment_id}",
+        target_selector=driver._target_selector(deployment, regions))
+
+    result = driver.register_expiry(deployment, request)
+
+    assert result.state == "failed"
+    assert not any(action.startswith("aws-expiry-start-") for action in runner.actions)
 
 
 def test_s4_uncertain_second_region_registration_keeps_pair_launch_blocked(tmp_path):
@@ -529,7 +562,7 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
         "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expiry.expires_at.value.isoformat(),
     })
     driver._confirm_automation = lambda region, *_args: sequence.append(f"expiry-confirm-{region}")
-    driver._verify_observed_instance = lambda expected, *_args: expected
+    driver._verify_observed_instance = lambda expected, *_args, **_kwargs: expected
     driver._verify_host_key = lambda detail: {"known_hosts_path": str(attempt / f"{detail['instance_id']}.known_hosts")}
     result = driver.provision(deployment)
     assert runner.actions == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output"]

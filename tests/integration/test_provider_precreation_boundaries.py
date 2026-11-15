@@ -33,6 +33,7 @@ PARAMS = {'RunId':['original-run'], 'DeploymentId':['original-deployment'],
     'AutomationAssumeRole':['arn:aws:iam::123456789012:role/cnb-expiry'],
     'ExpiryTriggerUtc':['2026-11-14T20:00:00Z'], 'Region':['eu-north-1']}
 REJECT = 'An error occurred (InvalidAutomationExecutionParametersException) when calling the StartAutomationExecution operation: The defined assume role is unable to be assumed.'
+CAPTURED_AWS_CLI_REJECT = '\naws: [ERROR]: ' + REJECT + '\n'
 
 
 def aws_driver(runner):
@@ -82,6 +83,20 @@ def test_aws_rejection_requires_server_error_and_complete_exact_absence(tmp_path
     # An empty successful lookup cannot resolve a lost local Start response.
     lost=Commands([(1,'','connection lost'),(0,'{"AutomationExecutionMetadataList":[]}','')])
     assert aws_driver(lost)._start_or_recover_automation('eu-north-1',SAFETY,PARAMS,'original-token') is None
+
+
+def test_aws_cli_error_prefix_preserves_typed_rejection_and_cleanup_evidence(tmp_path):
+    runner=Commands([(254,'',CAPTURED_AWS_CLI_REJECT),(0,'{"AutomationExecutionMetadataList":[]}','')])
+    driver=aws_driver(runner); driver._active_attempt=tmp_path
+    with pytest.raises(AwsProviderError,match='rejected expiry start') as raised:
+        driver._start_or_recover_automation('eu-north-1',SAFETY,PARAMS,'original-token')
+    evidence=raised.value.rejection_evidence
+    assert evidence['lookup_complete'] and evidence['matching_document_execution_count']==0
+    assert evidence['error_code']=='InvalidAutomationExecutionParametersException'
+    assert evidence['client_token']=='original-token'
+    assert len(runner.requests)==2
+    assert sum('start-automation-execution' in q.argv for q in runner.requests)==1
+    assert json.loads((tmp_path/'commands.jsonl').read_text().splitlines()[0])['diagnostic']['stderr']==CAPTURED_AWS_CLI_REJECT
 
 
 def test_aws_private_diagnostic_is_redacted_bounded_and_hashes_original(tmp_path):
@@ -295,7 +310,8 @@ def test_aws_rejected_start_cleanup_after_expiry_rechecks_bound_absence(tmp_path
     safety={**driver._prospective_safety(d,region,attempt,journal),'document_version':'1'}
     trigger=d.reservation.value.expires_at.value-timedelta(seconds=240)
     params=driver._automation_parameters(d,region,trigger,safety['role_arn'])
-    runner=Commands([(254,'',REJECT),(0,'{"AutomationExecutionMetadataList":[]}','')])
+    start_stderr=CAPTURED_AWS_CLI_REJECT if case=='rejected' else REJECT
+    runner=Commands([(254,'',start_stderr),(0,'{"AutomationExecutionMetadataList":[]}','')])
     driver.runner=runner
     with pytest.raises(AwsProviderError) as raised:
         driver._start_or_recover_automation(region,safety,params,'original-token')

@@ -5,3 +5,4 @@ variable "zone_a" { type = string }
 variable "zone_b" { type = string }
 variable "template_a" { type = string }
 variable "template_b" { type = string }
+variable "scenario" { type = string }

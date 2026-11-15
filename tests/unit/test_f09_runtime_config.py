@@ -125,19 +125,22 @@ def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repositor
     observation = campaign.observations[0]
     envelope = {"provider_run_envelopes": {"aws": {"run_id": child.run_id}}}
     costs = CostInputs("test-costs", "2026-10-23", str(source), digest, digest, envelope, ("fixture",), False)
-    allowance = WorkflowAllowance(10, 20, 10, 60, 76, 1, 10, 10, "test-policy", {"aws": 360})
+    allowance = WorkflowAllowance(105, 180, 210, 60, 100, 15, 45, 120, "test-policy", {"aws": 360})
     runtime = {"allowance": allowance, "providers": {"aws": {
         "options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
             "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"},
             "public_key_path": public_key, "authentication_reference": "test-key-ref",
-            "plan_review_timeout_seconds": 30},
+            "plan_review_timeout_seconds": 60, "iam_settle_seconds": 30},
         "bootstrap_template": repository_root / "terraform/aws/bootstrap.yaml",
         "terraform_directory": repository_root / "terraform/aws",
         "sources": {"expiry_cost_path": provider_root / "aws-ssm-automation-public-2026-10-22.json",
             "primary_review_path": None}}}}
     class Clock:
-        utc_now = staticmethod(lambda: now)
-        monotonic = staticmethod(lambda: 100.0)
+        current = now
+        @classmethod
+        def utc_now(cls): return cls.current
+        @staticmethod
+        def monotonic(): return 100.0
     class Ledger:
         def inspect(self):
             return {"reservations": {"reservation-aws-test": {"cap_start_monotonic": 100,
@@ -158,4 +161,31 @@ def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repositor
     assert captured["deployment"].resolved_sha256.value == "a" * 64
     assert captured["request"].expires_at.value == reservation.expires_at.value - timedelta(seconds=360)
     assert captured["driver"].settings.cost_input_sha256 == digest
-    assert captured["driver"].settings.plan_review_timeout_seconds == 30
+    assert captured["driver"].settings.complete_workflow_remaining_seconds == 835
+    assert captured["driver"].settings.post_registration_workflow_seconds == 730
+    assert captured["driver"].settings.post_provision_workflow_seconds == 550
+    assert captured["driver"].settings.registration_timeout_seconds == 105
+    assert captured["driver"].settings.plan_review_timeout_seconds == 60
+    assert captured["driver"].settings.iam_settle_seconds == 30
+    # At the full sourced registration allowance, the fixed 840s trigger span
+    # still leaves exactly the sourced 180s provisioning phase after reserving
+    # readiness through cleanup; the 1,200s reservation cap is unchanged.
+    full_registration_remaining = 840 - 105
+    full_registration_apply_window = (full_registration_remaining
+        - captured["driver"].settings.post_provision_workflow_seconds)
+    assert full_registration_apply_window == 185
+    from cloud_network_benchmark.providers.aws import _pair_apply_timeout_seconds
+    assert _pair_apply_timeout_seconds(180, 120, 60, full_registration_apply_window) == 180
+    # Advance the production driver's injected clock by the observed 74s registration.
+    # The fixed cap remains 1,200s and AWS's trigger remains 840s after activation.
+    Clock.current = now + timedelta(seconds=74)
+    remaining_after_registration = (captured["request"].expires_at.value - captured["driver"].clock()).total_seconds()
+    assert remaining_after_registration == 766
+    assert remaining_after_registration < captured["driver"].settings.complete_workflow_remaining_seconds
+    assert remaining_after_registration >= captured["driver"].settings.post_registration_workflow_seconds
+    available_to_provision = (remaining_after_registration
+        - captured["driver"].settings.post_provision_workflow_seconds)
+    assert available_to_provision == 216  # 180s sourced provision allowance plus 36s available slack.
+    # 60s review is inside the 180s provision phase, leaving the normal 120s
+    # command budget. The trigger slack is not mistaken for extra phase budget.
+    assert _pair_apply_timeout_seconds(180, 120, 60, available_to_provision) == 180

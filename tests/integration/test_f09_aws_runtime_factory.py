@@ -158,12 +158,10 @@ class FakeAwsRunner:
                     {"Key": "cnb_deployment_id", "Value": self.deployment_id}, {"Key": "cnb_role", "Value": role}],
                 "InstanceType": "m7i.xlarge", "ImageId": self.image_id,
                 "PrivateIpAddress": private_ip, "PublicIpAddress": public_ip,
-                "Placement": {"AvailabilityZone": self.zone, "GroupName": None},
+                "Placement": {"AvailabilityZone": self.zone, "AvailabilityZoneId": "use1-az2", "GroupName": None},
                 "NetworkInterfaces": [{"InterfaceType": "interface"}],
                 "BlockDeviceMappings": [{"Ebs": {"VolumeId": "vol-a" if role == "vm_a" else "vol-b",
                     "DeleteOnTermination": True}}], "LaunchTime": "2026-10-22T11:50:00Z"}]}]})
-        elif action.startswith("aws-describe-instance-topology"):
-            stdout = json.dumps({"Instances": [{"ZoneId": "use1-az2"}]})
         elif action.startswith("aws-describe-images"):
             stdout = json.dumps({"Images": [{"ImageId": self.image_id, "OwnerId": "099720109477",
                 "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",

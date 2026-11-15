@@ -876,7 +876,7 @@ class GcpProviderDriver:
         elif root == "protection":
             template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
         else:
-            template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
+            template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario}
         template.update(extra)
         serialized_vars = json.dumps(template, sort_keys=True).encode("utf-8")
         self._write_private(vars_path, serialized_vars)
@@ -900,7 +900,7 @@ class GcpProviderDriver:
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
         if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
-        if args and args[0] == "compute" and len(args) > 1 and args[1] == "instances" and args[2:3] == ["list"] or args and args[0] == "compute" and len(args) > 2 and args[2] == "list":
+        if args[:1] == ["compute"] and "list" in args and "--format=json" in args:
             if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
         try:
@@ -1034,12 +1034,15 @@ class GcpProviderDriver:
         # --regions on addresses is not a supported complete-list query and can
         # produce warnings even for empty output. Never suppress such warnings.
         collections = (
-            ("addresses", "addresses", addresses), ("subnetworks", "subnet", support),
-            ("instance-templates", "instance_templates", support), ("networks", "networks", support),
-            ("firewall-rules", "firewalls", support), ("routes", "routes", support),
-            ("resource-policies", "policy", support))
-        for command, action, target in collections:
-            result = self._gcloud_json(["compute", command, "list", "--project", self.settings.project_id, "--format=json"],
+            ("addresses", "addresses", ["compute", "addresses", "list"], addresses),
+            ("subnetworks", "subnet", ["compute", "networks", "subnets", "list"], support),
+            ("instance-templates", "instance_templates", ["compute", "instance-templates", "list"], support),
+            ("networks", "networks", ["compute", "networks", "list"], support),
+            ("firewall-rules", "firewalls", ["compute", "firewall-rules", "list"], support),
+            ("routes", "routes", ["compute", "routes", "list"], support),
+            ("resource-policies", "policy", ["compute", "resource-policies", "list"], support))
+        for command, action, argv, target in collections:
+            result = self._gcloud_json([*argv, "--project", self.settings.project_id, "--format=json"],
                 f"gcp-{action}-inventory-all-scopes")
             if not isinstance(result, list):
                 raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")
@@ -1160,7 +1163,11 @@ class GcpProviderDriver:
         after = self._gcloud_json(["compute", "instances", "describe", name, "--zone", zone, "--project", self.settings.project_id, "--format=json"], "gcp-hostkey-instance-after")
         if not self._same_vm_identity(after, initial, name, zone) or self._public_ip(after) != self._public_ip(initial):
             raise GcpProviderError("instance identity changed after host-key read", category="hostkey_identity_mismatch")
-        items = response.get("queryValue", {}).get("items", [])
+        # gcloud's --format=json projection returns queryValue.items directly as
+        # a list; it does not return the REST response envelope.
+        if not isinstance(response, list):
+            raise GcpProviderError("guest attributes must be a CLI item list", category="hostkey_unavailable")
+        items = response
         key = None
         for entry in items:
             if not isinstance(entry, dict) or entry.get("namespace") != "hostkeys":
