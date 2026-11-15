@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
+import signal
 import shutil
 import subprocess
 import sys
@@ -39,6 +41,7 @@ SOURCES = (
 )
 REQUIRED = ("cc", "make", "autoconf", "automake", "libtoolize", "pkg-config", "curl", "sha256sum",
             "tar", "patch", "base64", "grep", "cmp")
+COMMAND_TIMEOUT_SECONDS = 90
 
 
 def digest(path: Path) -> str:
@@ -47,6 +50,30 @@ def digest(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def run_logged(argv: list[str], cwd: Path, env: dict[str, str], stdout_path: Path, stderr_path: Path):
+    started = time.monotonic()
+    timed_out = False
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+        try:
+            return_code = proc.wait(timeout=COMMAND_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                return_code = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                return_code = proc.wait()
+    return return_code, timed_out, time.monotonic() - started
 
 
 def main() -> int:
@@ -87,18 +114,18 @@ def main() -> int:
             for index, argv in enumerate(commands[1:], start=1):
                 label = {1: "download", 2: "archive_sha256", 3: "extract", 4: "production_source_build_recipe",
                          5: "compiler_version", 6: "tool_version", 7: "binary_sha256", 8: "tool_help"}.get(index, f"production_check_{index}")
-                started = time.monotonic()
                 out_path, err_path = evidence / f"{source.tool}-{index:02d}-{label}.stdout", evidence / f"{source.tool}-{index:02d}-{label}.stderr"
-                with out_path.open("wb") as stdout, err_path.open("wb") as stderr:
-                    proc = subprocess.run(argv, cwd=root, env=env, stdout=stdout, stderr=stderr, check=False)
-                elapsed = time.monotonic() - started
+                return_code, timed_out, elapsed = run_logged(argv, root, env, out_path, err_path)
                 out, err = out_path.read_text(errors="replace"), err_path.read_text(errors="replace")
-                record = {"label": label, "argv": argv, "exit_code": proc.returncode, "duration_seconds": round(elapsed, 3),
+                record = {"label": label, "argv": argv, "exit_code": return_code,
+                    "timed_out": timed_out, "timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+                    "duration_seconds": round(elapsed, 3),
                     "stdout_path": out_path.name, "stdout_sha256": digest(out_path), "stdout_bytes": out_path.stat().st_size,
                     "stderr_path": err_path.name, "stderr_sha256": digest(err_path), "stderr_bytes": err_path.stat().st_size}
                 row["commands"].append(record)
-                if proc.returncode:
-                    row.update(status="failed", failed_command=label)
+                if return_code:
+                    row.update(status="failed", failed_command=label,
+                        failure="command_timed_out" if timed_out else "command_failed")
                     break
                 if index == 2:
                     observed = _sha256sum_output(out, str(workspace / source.archive_name))
@@ -128,15 +155,29 @@ def main() -> int:
                     break
             if row.get("status") == "failed":
                 summary["tools"].append(row)
-                break
-            identity_action = next(item for item in row["commands"]
-                if item["label"].startswith("production_check_") and
-                "CNB_BUILD_V1" in (evidence / item["stdout_path"]).read_text(errors="replace"))
-            identity = _parse_build_identity((evidence / identity_action["stdout_path"]).read_text(errors="replace"), source)
-            row["build_identity"] = identity
-            row["identity_preflight"] = subprocess.run(["sh", "-c", _identity_preflight_script(source, config)],
-                cwd=root, env=env, text=True, capture_output=True, check=True).stdout.strip()
-            row["status"] = "passed"
+                continue
+            try:
+                identity_action = next(item for item in row["commands"]
+                    if item["label"].startswith("production_check_") and
+                    "CNB_BUILD_V1" in (evidence / item["stdout_path"]).read_text(errors="replace"))
+                identity = _parse_build_identity((evidence / identity_action["stdout_path"]).read_text(errors="replace"), source)
+                row["build_identity"] = identity
+                argv = ["sh", "-c", _identity_preflight_script(source, config)]
+                out_path, err_path = evidence / f"{source.tool}-identity-preflight.stdout", evidence / f"{source.tool}-identity-preflight.stderr"
+                return_code, timed_out, elapsed = run_logged(argv, root, env, out_path, err_path)
+                out, err = out_path.read_text(errors="replace"), err_path.read_text(errors="replace")
+                row["commands"].append({"label": "identity_preflight", "argv": argv, "exit_code": return_code,
+                    "timed_out": timed_out, "timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+                    "duration_seconds": round(elapsed, 3), "stdout_path": out_path.name,
+                    "stdout_sha256": digest(out_path), "stdout_bytes": out_path.stat().st_size,
+                    "stderr_path": err_path.name, "stderr_sha256": digest(err_path),
+                    "stderr_bytes": err_path.stat().st_size})
+                if return_code or out.strip() != "matching":
+                    raise ValueError("production identity preflight failed" + (" by timeout" if timed_out else ""))
+                row["identity_preflight"] = out.strip()
+                row["status"] = "passed"
+            except Exception as exc:
+                row.update(status="failed", failed_command="identity_validation", error=str(exc))
             summary["tools"].append(row)
     summary["status"] = "passed" if len(summary["tools"]) == 2 and all(row["status"] == "passed" for row in summary["tools"]) else "failed"
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
