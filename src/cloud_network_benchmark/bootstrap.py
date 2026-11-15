@@ -1,4 +1,629 @@
-YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíÛ8ñ:-jZ.¶›­–)Þ³Vg&öÒõögWGW&Uõò–×÷'Bææ÷FF–öç0 ¦g&öÒFFWF–ÖR–×÷'BFFWF–ÖRÂF–ÖW¦öæP¦–×÷'B†6†Æ– ¦–×÷'B&6Sc@¦–×÷'BÖF€¦–×÷'B&P¦–×÷'B6†ÆW€¦–×÷'BF–ÖP¦g&öÒG—–ær–×÷'B6ÆÆ&ÆRÂF–7BÂÆ—7BÂÆ—FW&ÂÂ÷F–öæÀ¦g&öÒW&ÆÆ–"ç'6R–×÷'BW&Ç'6P¦g&öÒF†Æ–"–×÷'BF‚ÂW&U÷6—…F€ ¦g&öÒ–FçF–2–×÷'Bf–VÆBÂf–VÆE÷fÆ–FF÷"ÂÖöFVÅ÷fÆ–FF÷  ¦g&öÒæ66W72–×÷'B66W74f–ÇW&TWf–FVæ6RÂ6öææV7F–öä÷WGWBÂ&VÖ÷FT7F–öäWf–FVæ6RÂ&VÖ÷FTFVFÆ–æRÂö7F–öâÂöW†V7WFR2÷'Våö6öÖÖæBÂöf–ÇW&RÂö–FVçF—G•÷&VfW&Væ6W5öf–Æ&ÆRÂ÷&WVW7B2ö'V–ÆE÷&WVW7BÂ÷&WVW7Eöf–ÇW&P¦g&öÒæ6öçG&7G2æ6öÖÖöâ–×÷'B6öÖÖæD÷WF6öÖRÂ–FVçF—G”6öçFW‡BÂ7G&–7DÖöFVÀ¦g&öÒæ6öçG&7G2æW†V7WF–öâ–×÷'B6öÖÖæE&WVW7BÂ6öÖÖæE'VææW ¦g&öÒæ6öçG&7G2æ'F–f7G2–×÷'B'F–f7E&V6÷&@¦g&öÒæ6öçG&7G2æ6öÖÖöâ–×÷'BWf–FVæ6RÂ7G&–ætWf–FVæ6RÂfÕ&öÆP  ¦FVb÷&WVW7B†7F–öåö–BÂ6öææV7F–öâÂ&wbÂF–ÖV÷WBÂ7F–öå÷G—SÒ'76‚"’Óâ6öÖÖæE&WVW7C ¢""$¶VWÆö6Â&WVW7BÖ6öç7G'V7F–öâf–ÇW&W2–ç6–FRF†R7F–öâWf–FVæ6R7G&VÒâ"" ¢G'“ ¢&WGW&âö'V–ÆE÷&WVW7B†7F–öåö–BÂ6öææV7F–öâÂ&wbÂF–ÖV÷WBÂ7F–öå÷G—R¢W†6WBW†6WF–öã ¢6fU÷F–ÖV÷WBÒF–ÖV÷WB–bÖF‚æ—6f–æ—FR‡F–ÖV÷WB’æBF–ÖV÷WBâVÇ6Rã¢&WGW&â6öÖÖæE&WVW7B†7F–öåö–CÖ7F–öåö–BÂ7F–öå÷G—SÖ7F–öå÷G—RÀ¢&wcÕ²'67"–b7F–öå÷G—RÓÒ'67"VÇ6R'76‚"Â%·&WVW7BÖ6öç7G'V7F–öâÖf–ÆVEÒ%ÒÂ7vCÒ"â"À¢Vçf—&öæÖVçEö6Æ76–f–6F–öãÒ&6öçF–ç5÷6V7&WE÷&VfW&Væ6W2"ÂF–ÖV÷WE÷6V6öæG3×6fU÷F–ÖV÷WBÀ¢&VF7F–öç3Õ¶6öææV7F–öâæWF†VçF–6F–öå÷&VfW&Væ6RÂ6öææV7F–öâæ†÷7Eö¶W•÷&VfW&Væ6UÒ  ¦FVböW†V7WFR‡'VææW#¢6öÖÖæE'VææW"Â&WVW7C¢6öÖÖæE&WVW7B“ ¢–b&WVW7Bæ&wbæB&WVW7Bæ&we²ÓÒÓÒ%·&WVW7BÖ6öç7G'V7F–öâÖf–ÆVEÒ# ¢g&öÒFFWF–ÖR–×÷'BFFWF–ÖRÂF–ÖW¦öæP¢g&öÒæ6öçG&7G2æ6öÖÖöâ–×÷'B6öÖÖæD÷WF6öÖP¢g&öÒæ6öçG&7G2æW†V7WF–öâ–×÷'B6öÖÖæE&W7VÇ@¢æ÷rÒFFWF–ÖRææ÷r‡F–ÖW¦öæRçWF2¢&WGW&â6öÖÖæE&W7VÇB†7F–öåö–C×&WVW7Bæ7F–öåö–BÂ÷WF6öÖSÔ6öÖÖæD÷WF6öÖRäd”ÄTBÂ7F'FVEöCÖæ÷rÀ¢f–æ—6†VEöCÖæ÷rÂGW&F–öå÷6V6öæG3ÓÂW†—Eö6öFSÓÂ7FF÷WCÒ""À¢7FFW'#Ò'&WVW7B6öç7G'V7F–öâf–ÆVC¢WF†VçF–6FVBG&ç7÷'B&VfÆ–v‡B"Â&VF7F–öç3×&WVW7Bç&VF7F–öç2¢&WGW&â÷'Våö6öÖÖæB‡'VææW"Â&WVW7B  ¦6Æ726÷W&6T'V–ÆB…7G&–7DÖöFVÂ“ ¢FööÃ¢Æ—FW&Å²'6ö6·W&b"Â&—W&c2%Ð¢6÷W&6U÷W&Ã¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢6÷W&6U÷&VfW&Væ6S¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢&6†—fUöæÖS¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢6÷W&6U÷6†#Sc¢7G"Òf–VÆB‡GFW&ã×"%å¶ÖcÓ•×³cGÒB"¢ö'6W'fF–öå÷F6…÷Fƒ¢7G"ÂæöæRÒæöæP¢ö'6W'fF–öå÷F6…÷6†#Sc¢7G"ÂæöæRÒf–VÆB†FVfVÇCÔæöæRÂGFW&ã×"%å¶ÖcÓ•×³cGÒB"¢W7G&VÕö6öÖÖ—C¢7G"ÂæöæRÒf–VÆB†FVfVÇCÔæöæRÂGFW&ã×"%å¶ÖcÓ•×³CÒB" ¢ÖöFVÅ÷fÆ–FF÷"†ÖöFSÒ&gFW""¢FVb6fU÷6÷W&6R‡6VÆb“ ¢'6VBÒW&Ç'6R‡6VÆbç6÷W&6U÷W&Â¢–b'6VBç66†VÖRÒ&‡GG2"÷"æ÷B'6VBææWFÆö2÷"'6VBçW6W&æÖR÷"'6VBç77v÷&C ¢&—6RfÇVTW'&÷"‚'6÷W&6RU$Â×W7B&R7&VFVçF–ÂÖg&VR…EE2"¢f÷"æÖRÂfÇVR–â‚‚'6÷W&6U÷&VfW&Væ6R"Â6VÆbç6÷W&6U÷&VfW&Væ6R’Â‚&&6†—fUöæÖR"Â6VÆbæ&6†—fUöæÖR’“ ¢–bfÇVRç7F'G7v—F‚‚"Ò"’÷""ò"–âfÇVR÷"%ÅÂ"–âfÇVR÷"æ÷B&RægVÆÆÖF6‚‡"%´Õ¦×£Ó•Õ´Õ¦×£Ó’åò²Õ×³Ã#wÒ"ÂfÇVR“ ¢&—6RfÇVTW'&÷"†b'¶æÖWÒ×W7B&R6fR–FVçF–f–W"÷"&6VæÖR"¢–b‡6VÆbæö'6W'fF–öå÷F6…÷F‚—2æöæR’Ò‡6VÆbæö'6W'fF–öå÷F6…÷6†#Sb—2æöæR“ ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâF6‚F‚æBF–vW7B×W7B&R7WÆ–VBFövWF†W""¢–b6VÆbæö'6W'fF–öå÷F6…÷F‚—2æ÷BæöæRæB€¢6VÆbæö'6W'fF–öå÷F6…÷F‚ç7F'G7v—F‚‚"ò"’÷""ââ"–âW&U÷6—…F‚‡6VÆbæö'6W'fF–öå÷F6…÷F‚’ç'G0¢÷"%ÅÂ"–â6VÆbæö'6W'fF–öå÷F6…÷F€¢“ ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâF6‚F‚×W7B&R6fR6¶vR×&VÆF—fRF‚"¢–ææVBÒ°¢#VV&C3#vF“ƒ3##S3#ƒ†33SVF#“##SVS#f&B#¢€¢'FööÅ÷F6†W2÷6ö6·W&bÓ2ãÖ7V—6—F–öâçF6‚"À¢&&fVS“ƒ33sSsvƒc3#F3#vFC–3cCC3FcCF3&VFVC#CccCƒsV3Vf2"À¢&3VFc3SS#–ccsVcFf#vC“Vf3ƒ–fFF3scVCs#SSF&Sss6c†R"Â'6ö6·W&bÒ"’À¢#&6f6fS“FS“#†SsCSC&3–cvS&fFCCsC†s’#¢€¢'FööÅ÷F6†W2ö—W&bÓ2ãrãÖ7V—6—F–öâçF6‚"À¢##“fFF#FcvF3#C3sf&#6CCvfVV333VfVVF3SS#“s–#ScfS–#ƒcc"À¢&Cf#FC&3v##Sv3V#vf&C&FScfc#&&C3C#ƒ“S†#Vc&S#ƒƒ““S#fS##sCSƒƒffR"Â&—W&bÒ"’À¢Ð¢W‡V7FVE÷&Vf—‚Ò'6ö6·W&bÒ"–b6VÆbçFööÂÓÒ'6ö6·W&b"VÇ6R&—W&bÒ ¢–ææVE÷&VfW&Væ6RÒæW‡B‚†6öÖÖ—Bf÷"6öÖÖ—BÂfÇVW2–â–ææVBæ—FV×2‚¢–bfÇVW5³5ÒÓÒW‡V7FVE÷&Vf—‚æB6VÆbç6÷W&6U÷&VfW&Væ6RÓÒfÇVW5³5Ò²6öÖÖ—B’ÂæöæR¢–b–ææVE÷&VfW&Væ6R—2æ÷BæöæRæB6VÆbçW7G&VÕö6öÖÖ—BÒ–ææVE÷&VfW&Væ6S ¢&—6RfÇVTW'&÷"‚'–ææVB6÷W&6R&VfW&Væ6R&WV—&W2—G2W†7Bö'6W'fF–öâ6÷W&6R–FVçF—G’"¢–b6VÆbçW7G&VÕö6öÖÖ—B–â–ææVC ¢W‡V7FVE÷F‚ÂW‡V7FVEöF–vW7BÂW‡V7FVE÷6÷W&6UöF–vW7BÂ&Vf—‚Ò–ææVE·6VÆbçW7G&VÕö6öÖÖ—EÐ¢–b6VÆbæö'6W'fF–öå÷F6…÷F‚ÒW‡V7FVE÷F‚÷"6VÆbæö'6W'fF–öå÷F6…÷6†#SbÒW‡V7FVEöF–vW7C ¢&—6RfÇVTW'&÷"‚'–ææVBW7G&VÒ6÷W&6R&WV—&W2—G2W†7B6¶vVBö'6W'fF–öâF6‚–FVçF—G’"¢–b6VÆbç6÷W&6U÷&VfW&Væ6RÒ&Vf—‚²6VÆbçW7G&VÕö6öÖÖ—C ¢&—6RfÇVTW'&÷"‚'–ææVB6÷W&6R&6†—fRW‡G&7F–öâF—&V7F÷'’FöW2æ÷BÖF6‚—G2W7G&VÒ6öÖÖ—B"¢–b6VÆbç6÷W&6U÷6†#SbÒW‡V7FVE÷6÷W&6UöF–vW7C ¢&—6RfÇVTW'&÷"‚'–ææVBW7G&VÒ6÷W&6R&WV—&W2F†Röff–6–Â&6†—fRF–vW7B"¢VÆ–b6VÆbæö'6W'fF–öå÷F6…÷F‚—2æ÷BæöæS ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâF6†–ær—27W÷'FVBöæÇ’f÷"F†R–ææVBW7G&VÒ6öÖÖ—G2"¢&WGW&â6VÆ`  ¦6Æ72&ö÷G7G&6öæf–r…7G&–7DÖöFVÂ“ ¢6÷W&6W3¢Æ—7Eµ6÷W&6T'V–ÆEÒÒf–VÆB†Ö–åöÆVæwFƒÓ"ÂÖ…öÆVæwFƒÓ"¢&VÖ÷FU÷&ö÷C¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢v÷&·76S¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢–ç7FÆÅ÷&Vf—ƒ¢7G"Òf–VÆB†Ö–åöÆVæwFƒÓ¢&ö÷G7G&÷6¶vW3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆÖ&F¢²&'V–ÆBÖW76VçF–Â"Â&WFö6öæb"Â&WFöÖ¶R"Â&Æ–'FööÂ"Â'¶rÖ6öæf–r"Â&7W&Â"Â&6Ö6W'F–f–6FW2"Â'F""Â&w¦—"Â&—&÷WFS""Â&—WF–Ç2×–ær"Â&æWF6BÖ÷Væ'6B"Â&ægF&ÆW2"Â'—F†öã2×fVçb%Ò ¢ÖöFVÅ÷fÆ–FF÷"†ÖöFSÒ&gFW""¢FVbfÆ–FFU÷F‡5öæE÷FööÇ2‡6VÆb“ ¢–b·2çFööÂf÷"2–â6VÆbç6÷W&6W7ÒÒ²'6ö6·W&b"Â&—W&c2'Ó ¢&—6RfÇVTW'&÷"‚&W†7FÇ’öæR6ö6·W&bæBöæR—W&c26÷W&6R—2&WV—&VB"¢f÷"æÖR–â‚'&VÖ÷FU÷&ö÷B"Â'v÷&·76R"Â&–ç7FÆÅ÷&Vf—‚"“ ¢fÇVRÒvWFGG"‡6VÆbÂæÖR¢–bæ÷BfÇVRç7F'G7v—F‚‚"ò"’÷"W&U÷6—…F‚‡fÇVR’æ5÷÷6—‚‚’ÒfÇVR÷""ââ"–âfÇVRç7Æ—B‚"ò"’÷"ç’†÷&B†2’Â3"f÷"2–âfÇVR“ ¢&—6RfÇVTW'&÷"†b'¶æÖWÒ×W7B&Ræ÷&ÖÆ—¦VB'6öÇWFRF‚"¢–bæ÷B&RægVÆÆÖF6‚‡""õ´Õ¦×£Ó’åòòÕÒ²"ÂfÇVR’÷"ç’‡'B–â²"â"Â"ââ'Òf÷"'B–âfÇVRç7Æ—B‚"ò"’“ ¢&—6RfÇVTW'&÷"†b'¶æÖWÒ6öçF–ç26†VÆÂ×Vç6fRF‚6†&7FW'2"¢–bæÖRÒ'&VÖ÷FU÷&ö÷B"æBæ÷BfÇVRç7F'G7v—F‚‡6VÆbç&VÖ÷FU÷&ö÷Bç'7G&—‚"ò"’²"ò"“ ¢&—6RfÇVTW'&÷"†b'¶æÖWÒ×W7B&RVæFW"&VÖ÷FU÷&ö÷B"¢–bç’†æ÷B&RægVÆÆÖF6‚‡"%´Õ¦×£Ó•Õ´Õ¦×£Ó’²âÕ×³Ãc7Ò"Â’f÷"–â6VÆbæ&ö÷G7G&÷6¶vW2“ ¢&—6RfÇVTW'&÷"‚&&ö÷G7G&6¶vRæÖW2×W7B&R6–×ÆR6¶vR–FVçF–f–W'2"¢&WGW&â6VÆ`  ¦6Æ72'V–ÆDö'6W'fF–öâ…7G&–7DÖöFVÂ“ ¢&öÆS¢7G ¢FööÃ¢7G ¢6÷W&6U÷&VfW&Væ6S¢7G ¢6÷W&6U÷6†#Sc¢7G ¢6ö×–ÆW%÷fW'6–öã¢7G ¢&–æ'•÷Fƒ¢7G ¢&–æ'•÷fW'6–öã¢7G ¢&–æ'•÷6†#Sc¢7G ¢6&–Æ—F–W3¢Æ—7E·7G%Ð¢'F–f7Eö–C¢7G"ÂæöæRÒæöæP¢W7G&VÕö6öÖÖ—C¢7G"ÂæöæRÒæöæP¢F6…÷Fƒ¢7G"ÂæöæRÒæöæP¢F6…÷6†#Sc¢7G"ÂæöæRÒæöæP¢'V–ÆEö6öæf–wW&F–öã¢7G"ÂæöæRÒæöæP¢ö'6W'fF–öåö6&–Æ—G“¢7G"ÂæöæRÒæöæP¢ö'6W'fF–öå÷6VÖçF–73¢7G"ÂæöæRÒæöæP¢–FVçF—G•ö'—FW3¢7G"ÂæöæRÒæöæP ¢ÖöFVÅ÷fÆ–FF÷"†ÖöFSÒ&gFW""¢FVb6ö×ÆWFUöö'6W'fF–öâ‡6VÆb“ ¢–bæ÷BÆÂ‚‡6VÆbç6÷W&6U÷&VfW&Væ6RÂ6VÆbæ6ö×–ÆW%÷fW'6–öâç7G&—‚’Â6VÆbæ&–æ'•÷F‚ç7F'G7v—F‚‚"ò"’Â6VÆbæ&–æ'•÷fW'6–öâç7G&—‚’’“ ¢&—6RfÇVTW'&÷"‚&'V–ÆBö'6W'fF–öâ×W7B&WF–â7GVÂ6÷W&6Rö6ö×–ÆW"ö&–æ'’Wf–FVæ6R"¢–bæ÷B&RægVÆÆÖF6‚‡"%¶ÖcÓ•×³cGÒ"Â6VÆbç6÷W&6U÷6†#Sb’÷"æ÷B&RægVÆÆÖF6‚‡"%¶ÖcÓ•×³cGÒ"Â6VÆbæ&–æ'•÷6†#Sb“ ¢&—6RfÇVTW'&÷"‚'6÷W&6RæB&–æ'’ö'6W'fF–öç2&WV—&RÆ÷vW&66R4„Ó#Sb"¢–bæ÷B6WB…÷&WV—&VEö6&–Æ—F–W2‡6VÆbçFööÂ’’ÃÒ6WB‡6VÆbæ6&–Æ—F–W2“ ¢&—6RfÇVTW'&÷"‚&'V–ÆBö'6W'fF–öâ—2Ö—76–ær&WV—&VB6&–Æ—G’Wf–FVæ6R"¢ö'6W'fVEöf–VÆG2Ò‡6VÆbçW7G&VÕö6öÖÖ—BÂ6VÆbçF6…÷F‚Â6VÆbçF6…÷6†#SbÀ¢6VÆbæ'V–ÆEö6öæf–wW&F–öâÂ6VÆbæö'6W'fF–öåö6&–Æ—G’Â6VÆbæö'6W'fF–öå÷6VÖçF–72¢–bç’‡fÇVR—2æ÷BæöæRf÷"fÇVR–âö'6W'fVEöf–VÆG2’æBæ÷BÆÂ‡fÇVR—2æ÷BæöæRf÷"fÇVR–âö'6W'fVEöf–VÆG2“ ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâ'V–ÆB–FVçF—G’×W7B&R6ö×ÆWFR÷"Væf–Æ&ÆR"¢–b6VÆbæö'6W'fF–öåö6&–Æ—G’—2æ÷BæöæS ¢W‡V7FVBÒ'6ö6·W&bÓ2ãÖVæ&ÆVB×c"–b6VÆbçFööÂÓÒ'6ö6·W&b"VÇ6R&—W&bÓ2ãrã×7FG2×c ¢–b6VÆbæö'6W'fF–öåö6&–Æ—G’Ò$4ä%ô5õc"÷"6VÆbæö'6W'fF–öå÷6VÖçF–72ÒW‡V7FVC ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâ'V–ÆB6&–Æ—G’FöW2æ÷BÖF6‚FööÂ6VÖçF–72"¢–bæ÷B&RægVÆÆÖF6‚‡"%¶ÖcÓ•×³CÒ"Â6VÆbçW7G&VÕö6öÖÖ—B÷"""’÷"æ÷B&RægVÆÆÖF6‚‡"%¶ÖcÓ•×³cGÒ"Â6VÆbçF6…÷6†#Sb÷"""“ ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâ'V–ÆB&WV—&W2–ææVBW7G&VÒ6öÖÖ—BæBF6‚F–vW7B"¢–bæ÷B6VÆbæ–FVçF—G•ö'—FW3 ¢&—6RfÇVTW'&÷"‚&ö'6W'fF–öâ'V–ÆB&WV—&W26GW&VB÷&–v–æÂ'V–ÆB–FVçF—G’6–FV6"'—FW2"¢&WGW&â6VÆ`  ¦FVbÖFW&–Æ—¦Uö'V–ÆEö–FVçF—G•ö'F–f7G2‡&ö÷C¢F‚ÂFWÆ÷–ÖVçEö–C¢7G"À¢'V–ÆG3¢Æ—7E´'V–ÆDö'6W'fF–öåÒÂGWÆU´'V–ÆDö'6W'fF–öâÂââåÒ’ÓâGWÆU´'F–f7E&V6÷&BÂââåÓ ¢""%W'6—7BW†7B&VÖ÷FR6–FV6"'—FW26GW&VB'’F†R&ö÷G7G&6öÖÖæBâ"" ¢&V6÷&G3¢Æ—7E´'F–f7E&V6÷&EÒÒµÐ¢f÷"'V–ÆB–â'V–ÆG3 ¢–b'V–ÆBæ–FVçF—G•ö'—FW2—2æöæR÷"'V–ÆBæ'F–f7Eö–B—2æöæS ¢6öçF–çVP¢&rÒ'V–ÆBæ–FVçF—G•ö'—FW2æVæ6öFR‚'WFbÓ‚"¢F‚Òb&ÖWFFFö'V–ÆB÷¶'V–ÆBç&öÆWÒ×¶'V–ÆBçFööÇÒæ–FVçF—G’ ¢F&vWBÒ&ö÷BòF€¢F&vWBç&VçBæÖ¶F—"‡&VçG3ÕG'VRÂW†—7Eöö³ÕG'VR¢–bF&vWBæW†—7G2‚’æBF&vWBç&VEö'—FW2‚’Ò&s ¢&—6RfÇVTW'&÷"‚&'V–ÆB–FVçF—G’6–FV6"6öæfÆ–7G2v—F‚W†—7F–ærGFV×BWf–FVæ6R"¢–bæ÷BF&vWBæW†—7G2‚“ ¢F&vWBçw&—FUö'—FW2‡&r¢&öÆRÒfÕ&öÆR†'V–ÆBç&öÆR¢&V6÷&BÒ'F–f7E&V6÷&B†'F–f7Eö–CÖ'V–ÆBæ'F–f7Eö–BÂFƒ×F‚Â¶–æCÒ&'V–ÆBÖ–FVçF—G’"À¢&öGV6W#×&öÆRÂVæ—Eö–CÔæöæRÂFWÆ÷–ÖVçEö–CÖFWÆ÷–ÖVçEö–BÂ6Æ÷6VCÕG'VRÀ¢6—¦Uö'—FW3ÔWf–FVæ6U¶–çEÒ‡fÇVSÖÆVâ‡&r’’Â6†#ScÕ7G&–ætWf–FVæ6R‡fÇVSÖ†6†Æ–"ç6†#Sb‡&r’æ†W†F–vW7B‚’’À¢&WG&–WfÅ÷7FFSÒ'fW&–f–VB"¢&V6÷&BçfW&–g•öÖFW&–Æ—¦VEöf–ÆR‡&ö÷B¢&V6÷&G2æVæB‡&V6÷&B¢&WGW&âGWÆR‡&V6÷&G2  ¦6Æ72Æ—7FVæW$ö'6W'fF–öâ…7G&–7DÖöFVÂ“ ¢&öÆS¢7G"Ò'fÕö" ¢FööÃ¢7G ¢FG&W73¢7G ¢&÷Fö6öÃ¢7G ¢÷'C¢–ç@¢Væ—C¢7G ¢&–æ'•÷Fƒ¢7G ¢7FF÷WE÷Fƒ¢7G ¢7FFW'%÷Fƒ¢7G ¢ÆÆ÷vVE÷6÷W&6S¢7G ¢7FFS¢Æ—FW&Å²'&W&VB"Â&7F—fR"Â&Ö—6ÖF6‚"Â&f–ÆVB%Ð  ¦6Æ72&ö÷G7G&&W7VÇB…7G&–7DÖöFVÂ“ ¢7V66VVFVC¢&ööÀ¢–FVçF—G“¢–FVçF—G”6öçFW‡@¢FWÆ÷–ÖVçEö–C¢7G ¢7F–öç3¢Æ—7Eµ&VÖ÷FT7F–öäWf–FVæ6UÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢f–ÇW&S¢66W74f–ÇW&TWf–FVæ6RÂæöæRÒæöæP¢'V–ÆG3¢Æ—7E´'V–ÆDö'6W'fF–öåÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B¢Æ—7FVæW'3¢Æ—7E´Æ—7FVæW$ö'6W'fF–öåÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B ¢ÖöFVÅ÷fÆ–FF÷"†ÖöFSÒ&gFW""¢FVb7V66W76gVÅ÷&W7VÇEö—5ö6ö×ÆWFR‡6VÆb“ ¢–b6VÆbç7V66VVFVC ¢–bÆVâ‡6VÆbæ'V–ÆG2’ÒB÷"²†"ç&öÆRÂ"çFööÂ’f÷""–â6VÆbæ'V–ÆG7ÒÒ²‡"ÂB’f÷""–â‚'fÕö"Â'fÕö""’f÷"B–â‚'6ö6·W&b"Â&—W&c2"—Ó ¢&—6RfÇVTW'&÷"‚'7V66W76gVÂ&W&F–öâ&WV—&W2&÷F‚FööÇ2ö'6W'fVBöâ&÷F‚d×2"¢–bÆVâ‡6VÆbæÆ—7FVæW'2’Ò"÷"²‡‚çFööÂÂ‚ç&÷Fö6öÂÂ‚ç÷'B’f÷"‚–â6VÆbæÆ—7FVæW'7ÒÒ²‚'6ö6·W&b"Â'VG"Â’Â‚&—W&c2"Â'F7"ÂS#—Ó ¢&—6RfÇVTW'&÷"‚'7V66W76gVÂ&W&F–öâ&WV—&W2&÷F‚–çFVæFVBW'6—7FVçBÆ—7FVæW'2"¢–bç’‡‚ç7FFRÒ&7F—fR"f÷"‚–â6VÆbæÆ—7FVæW'2“ ¢&—6RfÇVTW'&÷"‚'7V66W76gVÂ&W&F–öâ&WV—&W2ÖF6†–ær7F—fRÆ—7FVæW'2"¢–bç’‡‚æFG&W72Ò6VÆbæÆ—7FVæW'5³ÒæFG&W72f÷"‚–â6VÆbæÆ—7FVæW'2“ ¢&—6RfÇVTW'&÷"‚&Æ—7FVæW'2×W7B6†&R"w2&—fFRFG&W72"¢&WGW&â6VÆ`  ¦FVb÷&WV—&VEö6&–Æ—F–W2‡FööÃ¢7G"’ÓâÆ—7E·7G%Ó ¢–bFööÂÓÒ'6ö6·W&b# ¢&WGW&â²'6W'fW""Â'VæFW"ÖÆöB"Â"Ö’"Â"×"Â"ÖÒ"Â"ÒÖ×2"Â"Ò×&WÇ’ÖWfW'’"Â"ÒÖgVÆÂ×'GB"Â"ÒÖæò×&GG62"Â"ÒÖgVÆÂÖÆör"Â"×B%Ð¢&WGW&â²"×2"Â"Ö2"Â"Ô""Â"×"Â"Õ"Â"×B"Â"Ôò"Â"Ö’"Â"ÖÂ"Â"Ô2"Â"Õ¢"Â"Ô¢"Â"ÒÖvWB×6W'fW"Ö÷WGWB"Â"ÒÖ§6öâ×7G&VÒ"Â"ÒÖf÷&6VfÇW6‚%Ð  ¦FVb÷F7ö6öævW7F–öå÷&ö&U÷67&—B†Æv÷&—F†Ó¢7G"Ò&7V&–2"’Óâ7G# ¢–bæ÷B&RægVÆÆÖF6‚‡"%´Õ¦×£Ó•òÕ×³ÃWÒ"ÂÆv÷&—F†Ò“ ¢&—6RfÇVTW'&÷"‚%D56öævW7F–öâÆv÷&—F†Ò×W7B&R6†÷'B¶W&æVÂ–FVçF–f–W""¢67&—BÒ‚&–×÷'B6ö6¶WEÆâ ¢'6ö6³×6ö6¶WBç6ö6¶WB‡6ö6¶WBäeô”äUBÇ6ö6¶WBå4ô4µõ5E$TÒ•Æâ ¢'G'“¥Æâ ¢b"6ö6²ç6WG6ö6¶÷B‡6ö6¶WBä•$õDõõD5Ç6ö6¶WBåD5ô4ôätU5D”ôâÆ"w¶Æv÷&—F†×Òr•Æâ ¢"ö'6W'fVC×6ö6²ævWG6ö6¶÷B‡6ö6¶WBä•$õDõõD5Ç6ö6¶WBåD5ô4ôätU5D”ôâÃb’ç'7G&—†"uÅÃr•Æâ ¢b"–bö'6W'fVBÒ"w¶Æv÷&—F†×Òs¢&—6R'VçF–ÖTW'&÷"‚uD56öævW7F–öâÆv÷&—F†Ò&VF&6²Ö—6ÖF6‚r•Æâ ¢&f–æÆÇ“¥Æâ ¢"6ö6²æ6Æ÷6R‚•Æâ ¢b'&–çB‚t4ä%õD5ô4ôätU5D”ôã×¶Æv÷&—F†×Òr•Æâ"¢2&VÖ÷FR&wb&V¦V7G26öçG&öÂ6†&7FW'3²Væ6öFRF†R6†÷'B—F†öâ&ö&R2öæR6fRFö¶Vâà¢&WGW&âb&W†V2†'—FW2æg&öÖ†W‚‚w·67&—BæVæ6öFR‚’æ†W‚‚—Òr’’   ¦FVbö6öæf–wW&Uö6öÖÖæB‡6÷W&6S¢6÷W&6T'V–ÆBÂ6öæf–s¢&ö÷G7G&6öæf–r’Óâ7G# ¢6†&VBÒ"ÒÖF—6&ÆR×6†&VB"–b6÷W&6RçFööÂÓÒ&—W&c2"VÇ6R" ¢&WGW&âb"âö6öæf–wW&RÒ×&Vf—ƒ×¶6öæf–ræ–ç7FÆÅ÷&Vf—‡×·6†&VGÒ   ¦FVbö'V–ÆEö6öæf–u÷&VÇVFR‡6÷W&6S¢6÷W&6T'V–ÆBÂ6öæf–s¢&ö÷G7G&6öæf–r’Óâ7G# ¢7V2Ò6†ÆW‚çV÷FR†b'µö6öæf–wW&Uö6öÖÖæB‡6÷W&6RÂ6öæf–r—Ó²Ö¶RÖ£""¢26öÖÖæB7V'7F—GWF–öâ&VÖ÷fW2F†RFW&Ö–æÂæWvÆ–æR'WB&WF–ç2F†R6ö×ÆWFP¢2×VÇF–Æ–æRfW'6–öâ&ææW"W6VB'’'V–ÆDö'6W'fF–öâæBF†R6–FV6"à¢&WGW&â‚&6ö×–ÆW#ÒB†62Ò×fW'6–öâ’ÇÂW†—BC#² ¢b&6fsÒB‡&–çFbrW5ÅÆârÂ"G·´43¢Ö67×ÕÂ"Â"F6ö×–ÆW%Â"·7V7ÒÂ6†#Sg7VÒ’ÇÂW†—BC#² ¢'6WBÒÒF6fs²6öæf–u÷6†ÒC²"  ¦FVbö6&–Æ—F–W5öö'6W'fVB‡FW‡C¢7G"ÂFööÃ¢7G"Â¢Â&WV—&VC¢Æ—7E·7G%ÒÂæöæRÒæöæR’Óâ&ööÃ ¢–bæ÷BFW‡Bç7G&—‚’÷"'W6vR"æ÷B–âFW‡BæÆ÷vW"‚’÷"&W'&÷""–âFW‡BæÆ÷vW"‚’÷"'Væ¶æ÷vâ÷F–öâ"–âFW‡BæÆ÷vW"‚“ ¢&WGW&âfÇ6P¢Fö¶Vç2Ò6WB‡&Ræf–æFÆÂ‡""ÒÕ´Õ¦×£Ó’ÕÒ·ÂÕ´Õ¦×£Ó•×Å´Õ¦×¥Õ´Õ¦×£Ó’ÕÒ¢"ÂFW‡B’¢&WGW&â6WB‡&WV—&VB–b&WV—&VB—2æ÷BæöæRVÇ6R÷&WV—&VEö6&–Æ—F–W2‡FööÂ’’ÃÒFö¶Vç0  ¦FVb÷Væ—EöÖF6†W2‡FW‡C¢7G"Â6öæf–u÷FW‡C¢7G"ÂFööÃ¢7G"ÂFG&W73¢7G"Â÷'C¢–çBÂ&Vf—ƒ¢7G"Â7FF÷WE÷Fƒ¢7G"Â7FFW'%÷Fƒ¢7G"À¢ö'6W'fF–öåö–C¢7G"ÂæöæRÒæöæR’Óâ&ööÃ ¢f–VÆG2ÒF–7B†Æ–æRç7Æ—B‚#Ò"Â’f÷"Æ–æR–âFW‡Bç7Æ—FÆ–æW2‚’–b#Ò"–âÆ–æR¢ÖF6‚Ò&Rç6V&6‚‡"&&weÅµÅÓÒ‚â£ò“²"Âf–VÆG2ævWB‚$W†V57F'B"Â""’¢–bæ÷BÖF6ƒ ¢&WGW&âfÇ6P¢G'“ ¢&wbÒ6†ÆW‚ç7Æ—B†ÖF6‚æw&÷Wƒ’¢W†6WBfÇVTW'&÷# ¢&WGW&âfÇ6P¢&–æ'’Òb'·&Vf—‡Òö&–â÷·FööÇÒ ¢W‡V7FVBÒ¶&–æ'’Â'6W'fW""Â"Ö’"ÂFG&W72Â"×"Â7G"‡÷'B•Ò–bFööÂÓÒ'6ö6·W&b"VÇ6R¶&–æ'’Â"×2"Â"Ô""ÂFG&W72Â"×"Â7G"‡÷'B’Â"ÒÖ§6öâ×7G&VÒ"Â"ÒÖf÷&6VfÇW6‚%Ð¢&WGW&â†f–VÆG2ævWB‚$ÆöE7FFR"’ÓÒ&ÆöFVB"æBf–VÆG2ævWB‚$7F—fU7FFR"’ÓÒ&7F—fR ¢æBf–VÆG2ævWB‚$Ö–å”B"Â#"’æ—6F–v—B‚’æB–çB†f–VÆG2ævWB‚$Ö–å”B"Â#"’’â ¢æB&wbÓÒW‡V7FVBæBf–VÆG2ævWB‚%&W7F'B"’ÓÒ&æò ¢æBf–VÆG2ævWB‚%7FæF&D÷WGWB"’ÓÒ&VæB ¢æBf–VÆG2ævWB‚%7FæF&DW'&÷""’ÓÒ&VæB ¢æB÷Væ—EöÆöuöFW7F–æF–öç5öÖF6‚†6öæf–u÷FW‡BÂ7FF÷WE÷F‚Â7FFW'%÷F‚¢æB†ö'6W'fF–öåö–B—2æöæR÷"÷Væ—EöVçf—&öæÖVçEöÖF6†W2‡FW‡BÂ6öæf–u÷FW‡BÂö'6W'fF–öåö–B’’  ¦FVb÷Væ—EöÆöuöFW7F–æF–öç5öÖF6‚‡FW‡C¢7G"Â7FF÷WE÷Fƒ¢7G"Â7FFW'%÷Fƒ¢7G"’Óâ&ööÃ ¢VffV7F—fRÒ²%7FæF&D÷WGWB#¢æöæRÂ%7FæF&DW'&÷"#¢æöæWÐ¢6V7F–öâÒæöæP¢f÷"&r–âFW‡Bç7Æ—FÆ–æW2‚“ ¢Æ–æRÒ&rç7G&—‚¢–bæ÷BÆ–æR÷"Æ–æRç7F'G7v—F‚‚‚"2"Â#²"’“ ¢6öçF–çVP¢–bÆ–æRç7F'G7v—F‚‚%²"’æBÆ–æRæVæG7v—F‚‚%Ò"“ ¢6V7F–öâÒÆ–æU³¢ÓÐ¢6öçF–çVP¢–b6V7F–öâÒ%6W'f–6R"÷"#Ò"æ÷B–âÆ–æS ¢6öçF–çVP¢¶W’ÂfÇVRÒÆ–æRç7Æ—B‚#Ò"Â¢–b¶W’–âVffV7F—fS ¢27—7FVÖBw2V×G’76–væÖVçB&W6WG2â–æ†W&—FVB6WGF–æs²F†P¢27V'6WVVçBVffV7F—fRfÇVR×W7B7F–ÆÂ&RW‡Æ–6—BæBW†7Bà¢VffV7F—fU¶¶W•ÒÒfÇVR÷"æöæP¢&WGW&âVffV7F—fRÓÒ²%7FæF&D÷WGWB#¢b&VæC§·7FF÷WE÷F‡Ò"Â%7FæF&DW'&÷"#¢b&VæC§·7FFW'%÷F‡Ò'Ð  ¦FVb÷Væ—EöVçf—&öæÖVçEöÖF6†W2‡6†÷u÷FW‡C¢7G"Â6öæf–u÷FW‡C¢7G"Âö'6W'fF–öåö–C¢7G"’Óâ&ööÃ ¢W‡V7FVBÒb$4ä%ô5T•4•D”ôåô”C×¶ö'6W'fF–öåö–GÒ ¢f–VÆG2ÒF–7B†Æ–æRç7Æ—B‚#Ò"Â’f÷"Æ–æR–â6†÷u÷FW‡Bç7Æ—FÆ–æW2‚’–b#Ò"–âÆ–æR¢VffV7F—fRÒæöæP¢6V7F–öâÒæöæP¢f÷"&r–â6öæf–u÷FW‡Bç7Æ—FÆ–æW2‚“ ¢Æ–æRÒ&rç7G&—‚¢–bÆ–æRç7F'G7v—F‚‚%²"’æBÆ–æRæVæG7v—F‚‚%Ò"“ ¢6V7F–öâÒÆ–æU³¢ÓÐ¢VÆ–b6V7F–öâÓÒ%6W'f–6R"æBÆ–æRç7F'G7v—F‚‚$Vçf—&öæÖVçCÒ"“ ¢VffV7F—fRÒÆ–æRç7Æ—B‚#Ò"Â•³Ð¢&WGW&âW‡V7FVB–âf–VÆG2ævWB‚$Vçf—&öæÖVçB"Â""’æBVffV7F—fRÓÒW‡V7FV@  ¦FVb÷&ö6W75ö–FVçF—G•ö6öÖÖæB‡Væ—C¢7G"Â&–æ'“¢7G"’ÓâÆ—7E·7G%Ó ¢Væ—E÷Â&–æ'•÷Ò6†ÆW‚çV÷FR‡Væ—B’Â6†ÆW‚çV÷FR†&–æ'’¢67&—BÒ†b'–CÒB‡7—7FVÖ7FÂ6†÷rÒ×&÷W'G“ÔÖ–å”BÒ×fÇVR·Væ—E÷Ò’ÇÂW†—B² ¢b&66RG–B–ârwÂ¥²Ó•Ò¢’W†—B³²W63²²Â"G–EÂ"ÖwBÒÇÂW†—B² ¢b&7GVÃÒB‡&VFÆ–æ²Öb÷&ö2òG–BöW†R’ÇÂW†—B²²Â"F7GVÅÂ"Ò¶&–æ'•÷ÒÒÇÂW†—B² ¢'&–çFbrW5ÅÆârÂ"F7GVÅÂ#²6†#Sg7VÒ÷&ö2òG–BöW†R"¢&WGW&â²'7VFò"Â'6‚"Â"Ö2"Â67&—EÐ  ¦FVb÷&ö6W75ö–FVçF—G•öÖF6†W2‡FW‡C¢7G"Â&–æ'“¢7G"ÂW‡V7FVE÷6†#Sc¢7G"’Óâ&ööÃ ¢Æ–æW2ÒFW‡Bç7G&—‚’ç7Æ—FÆ–æW2‚¢&WGW&â†ÆVâ†Æ–æW2’ÓÒ"æBÆ–æW5³ÒÓÒ&–æ'¢æB&RægVÆÆÖF6‚‡"%¶ÖcÓ•×³cGÕÇ2²÷&ö2õ³Ó•Õ³Ó•Ò¢öW†R"ÂÆ–æW5³Ò’—2æ÷BæöæP¢æBÆ–æW5³Òç7Æ—B‚•³ÒÓÒW‡V7FVE÷6†#Sb  ¦FVbö6ÅöÖF6†W2‡FW‡C¢7G"Â6÷W&6S¢7G"ÂFG&W73¢7G"Â6†–ã¢7G"ÂæöæRÒæöæR’Óâ&ööÃ ¢Æ–æW2Ò·&Rç7V"‡"%Æ&6÷VçFW"6¶WG2ÆB²'—FW2ÆBµÆ""Â""ÂÆ–æRç7G&—‚’’ç7G&—‚’f÷"Æ–æR–âFW‡Bç7Æ—FÆ–æW2‚’–bÆ–æRç7G&—‚•Ð¢F&ÆUöÆ–æW2Ò¶Æ–æRf÷"Æ–æR–âÆ–æW2–b&RægVÆÆÖF6‚‡"'F&ÆR–æWB6æ%öc'"Ç²"ÂÆ–æR•Ð¢6†–åöÆ–æW2Ò¶Æ–æRf÷"Æ–æR–âÆ–æW2–b&RægVÆÆÖF6‚‡"&6†–â´Õ¦×£Ó•õÒ²Ç²"ÂÆ–æR•Ð¢–bÆVâ‡F&ÆUöÆ–æW2’Ò÷"ÆVâ†6†–åöÆ–æW2’Ò ¢&WGW&âfÇ6P¢7GVÅö6†–âÒ6†–åöÆ–æW5³Òç7Æ—B‚•³Ð¢–b6†–â—2æ÷BæöæRæB7GVÅö6†–âÒ6†–ã ¢&WGW&âfÇ6P¢7F'BÒÆ–æW2æ–æFW‚†6†–åöÆ–æW5³Ò’²¢G'“ ¢VæBÒÆ–æW2æ–æFW‚‚'Ò"Â7F'B¢W†6WBfÇVTW'&÷# ¢&WGW&âfÇ6P¢&öG’Ò²""æ¦ö–â†Æ–æRç7Æ—B‚’’f÷"Æ–æR–âÆ–æW5·7F'C¦VæEÕÐ¢†VFW'2Ò¶Æ–æRf÷"Æ–æR–â&öG’–b&RægVÆÆÖF6‚‡"'G—Rf–ÇFW"†öö²–çWB&–÷&—G’ÓõÆB³²öÆ–7’66WC²"ÂÆ–æR•Ð¢'VÆW2Ò¶Æ–æRf÷"Æ–æR–â&öG’–bÆ–æRæ÷B–â†VFW'5Ð¢6÷W&6Uöf÷&×2Ò·6÷W&6RÂb'·6÷W&6WÒó3"'Ð¢W‡V7FVE÷'VÆW2Ò°¢æW‡B‚†b&—6FG"¶†÷7GÒ—FFG"¶FG&W77ÒVGG÷'B66WB"f÷"†÷7B–â6÷W&6Uöf÷&×2–bb&—6FG"¶†÷7GÒ—FFG"¶FG&W77ÒVGG÷'B66WB"–â'VÆW2’Â""’À¢b&—FFG"¶FG&W77ÒVGG÷'BG&÷"À¢æW‡B‚†b&—6FG"¶†÷7GÒ—FFG"¶FG&W77ÒF7G÷'BS#66WB"f÷"†÷7B–â6÷W&6Uöf÷&×2–bb&—6FG"¶†÷7GÒ—FFG"¶FG&W77ÒF7G÷'BS#66WB"–â'VÆW2’Â""’À¢b&—FFG"¶FG&W77ÒF7G÷'BS#G&÷"À¢Ð¢&WGW&âÆVâ††VFW'2’ÓÒæBÆÂ†W‡V7FVE÷'VÆW2’æB'VÆW2ÓÒW‡V7FVE÷'VÆW2æBÆ–æW5¶VæB²¥ÒÓÒ²'Ò%Ð  ¦FVb÷&V6—R‡6÷W&6S¢6÷W&6T'V–ÆBÂ6öæf–s¢&ö÷G7G&6öæf–r’ÓâÆ—7E´Æ—7E·7G%ÕÓ ¢&6†—fRÒb'¶6öæf–rçv÷&·76WÒ÷·6÷W&6Ræ&6†—fUöæÖWÒ ¢6÷W&6UöF—"Òb'¶6öæf–rçv÷&·76WÒ÷·6÷W&6Rç6÷W&6U÷&VfW&Væ6WÒ ¢&Vf—‚Ò6öæf–ræ–ç7FÆÅ÷&Vf—€¢6÷W&6UöF—%÷Â&Vf—…÷Ò6†ÆW‚çV÷FR‡6÷W&6UöF—"’Â6†ÆW‚çV÷FR‡&Vf—‚¢&–æ'’Òb'·&Vf—‡Òö&–â÷·6÷W&6RçFööÇÒ ¢Ö&¶W"Òb'·&Vf—‡Òòæc'"×·6÷W&6RçFööÇÒæ–FVçF—G’ ¢Ö&¶W%÷Â&–æ'•÷Ò6†ÆW‚çV÷FR†Ö&¶W"’Â6†ÆW‚çV÷FR†&–æ'’¢&Ve÷ÂF–vW7E÷Ò6†ÆW‚çV÷FR‡6÷W&6Rç6÷W&6U÷&VfW&Væ6R’Â6†ÆW‚çV÷FR‡6÷W&6Rç6÷W&6U÷6†#Sb¢'V–ÆBÒ"âöWFövVâç6‚bb"–b6÷W&6RçFööÂÓÒ'6ö6·W&b"VÇ6R" ¢F6…ö6ÆW6RÒ" ¢66†U÷F6‚Ò&ÆVv7’ ¢–b6÷W&6Ræö'6W'fF–öå÷F6…÷F‚—2æ÷BæöæS ¢F6…÷F‚ÒF‚…õöf–ÆUõò’ç&VçBò6÷W&6Ræö'6W'fF–öå÷F6…÷F€¢F6…ö'—FW2ÒF6…÷F‚ç&VEö'—FW2‚¢F6…öF–vW7BÒ†6†Æ–"ç6†#Sb‡F6…ö'—FW2’æ†W†F–vW7B‚¢–bF6…öF–vW7BÒ6÷W&6Ræö'6W'fF–öå÷F6…÷6†#Sc ¢&—6RfÇVTW'&÷"‚'6¶vVBö'6W'fF–öâF6‚F–vW7BFöW2æ÷BÖF6‚&WVW7FVB–FVçF—G’"¢F6…÷Ò6†ÆW‚çV÷FR†b'¶6öæf–rçv÷&·76WÒ÷·6÷W&6RçFööÇÒæ7V—6—F–öâçF6‚"¢Væ6öFVBÒ&6ScBæ#cFVæ6öFR‡F6…ö'—FW2’æFV6öFR‚&66–’"¢F6…ö6ÆW6RÒ†b'&–çFbrW2r·6†ÆW‚çV÷FR†Væ6öFVB—ÒÂ&6ScBÖBâ·F6…÷Òbb ¢b'&–çFbrW2W5ÅÆâr·6†ÆW‚çV÷FR‡F6…öF–vW7B—Ò·F6…÷ÒÂ6†#Sg7VÒÖ2Òbb ¢b&6B·6÷W&6UöF—%÷ÒbbF6‚ÒÖ&F6‚ÒÖgW§£Ó×Â·F6…÷Òbb"¢66†U÷F6‚ÒF6…öF–vW7@¢F6…÷Ò6†ÆW‚çV÷FR†b'¶6öæf–rçv÷&·76WÒ÷·6÷W&6RçFööÇÒæ7V—6—F–öâçF6‚"¢66†U÷Ò6†ÆW‚çV÷FR†66†U÷F6‚¢6öæf–wW&RÒö6öæf–wW&Uö6öÖÖæB‡6÷W&6RÂ6öæf–r¢'V–ÆE÷67&—BÒ…ö'V–ÆEö6öæf–u÷&VÇVFR‡6÷W&6RÂ6öæf–r’°¢b&–b²Öb¶Ö&¶W%÷ÒÓ²F†Vâ”e3Òrr&VB×"öÆE÷&VböÆE÷6†öÆE÷F6‚öÆEö6öæf–röÆEö&–âÂ¶Ö&¶W%÷Ó² ¢b&7W'&VçCÒB‡6†#Sg7VÒ¶&–æ'•÷Ò’ÇÂW†—BC#²6WBÒÒF7W'&VçC² ¢b%²Â"FöÆE÷&VeÂ"Ò·&Ve÷ÒÒbb²Â"FöÆE÷6†Â"Ò¶F–vW7E÷ÒÒbb²Â"FöÆE÷F6…Â"Ò¶66†U÷ÒÒbb²Â"FöÆEö6öæf–uÂ"ÒÂ"F6öæf–u÷6†Â"Òbb²Â"FöÆEö&–åÂ"ÒÂ"CÂ"ÒÇÂW†—BC#²W†—B²f“² ¢b%²ÖR¶&–æ'•÷ÒÒÇÂW†—BC3²·F6…ö6ÆW6WÖ6B·6÷W&6UöF—%÷Òbb¶'V–ÆG×¶6öæf–wW&WÒbbÖ¶RÖ£"bbÖ¶R–ç7FÆÂbb ¢b&7W'&VçCÒB‡6†#Sg7VÒ¶&–æ'•÷Ò’bb6WBÒÒF7W'&VçBbb&–çFbrW2W2W2W2W5ÅÆâr·&Ve÷Ò¶F–vW7E÷Ò¶66†U÷ÒÂ"F6öæf–u÷6†Â"Â"CÂ"â¶Ö&¶W%÷Ò"¢6öÖÖæG2Ò°¢²'7VFò"Â'6‚"Â"Ö2"Â&BÖvWBWFFRbbBÖvWB–ç7FÆÂ×’"²""æ¦ö–â‡6†ÆW‚çV÷FR‡6¶vR’f÷"6¶vR–â6öæf–ræ&ö÷G7G&÷6¶vW2•ÒÀ¢²&7W&Â"Â"ÒÖf–Â"Â"ÒÖÆö6F–öâ"Â"Ò×6–ÆVçB"Â"Ò×6†÷rÖW'&÷""Â"ÒÖ÷WGWB"Â&6†—fRÂ6÷W&6Rç6÷W&6U÷W&ÅÒÀ¢²'6†#Sg7VÒ"Â&6†—fUÒÀ¢²'F""Â"×†b"Â&6†—fRÂ"Ô2"Â6öæf–rçv÷&·76UÒÀ¢²'6‚"Â"Ö2"Â'V–ÆE÷67&—EÒÀ¢²&62"Â"Ò×fW'6–öâ%ÒÀ¢¶b'·&Vf—‡Òö&–â÷·6÷W&6RçFööÇÒ"Â"Ò×fW'6–öâ%ÒÀ¢²'6†#Sg7VÒ"Âb'·&Vf—‡Òö&–â÷·6÷W&6RçFööÇÒ%ÒÀ¢Ð¢6öÖÖæG2æVæB…¶b'·&Vf—‡Òö&–â÷·6÷W&6RçFööÇÒ"Â"ÒÖ†VÇ%Ò¢–b6÷W&6RçFööÂÓÒ'6ö6·W&b# ¢6öÖÖæG2æW‡FVæB…µ¶b'·&Vf—‡Òö&–â÷6ö6·W&b"Â'6W'fW""Â"ÒÖ†VÇ%ÒÀ¢¶b'·&Vf—‡Òö&–â÷6ö6·W&b"Â'VæFW"ÖÆöB"Â"ÒÖ†VÇ%ÕÒ¢–b6÷W&6Ræö'6W'fF–öå÷F6…÷F‚—2æ÷BæöæS ¢6&–Æ—G•ö&–æ'’Ò&–æ'•÷¢6öÖÖæG2æVæB…²'6‚"Â"Ö2"Âb&w&WÖÔbt4ä%ô5õcr¶6&–Æ—G•ö&–æ'—ÒâöFWböçVÆÂbb&–çFb4ä%ô5õc%Ò¢–FVçF—G•÷Æ–âÒb'·&Vf—‡Òòæc'"×·6÷W&6RçFööÇÒæ'V–ÆBÖ–FVçF—G’ ¢–FVçF—G•÷F‚Ò6†ÆW‚çV÷FR†–FVçF—G•÷Æ–â¢–FVçF—G•÷F×Ò–FVçF—G•÷Æ–â²"âBBçF× ¢2¶VWF†—2FW67&—F–öâ'—FRÖf÷"Ö'—FRÆ–væVBv—F‚'V–ÆDö'6W'fF–öâw0¢26GW&VB6öæf–s²6†VÆÂÖW‡æBöæÇ’F†Rö'6W'fVB6ö×–ÆW"fW'6–öâà¢'V–ÆEö6öæf–u÷&Vf—‚Ò$43ÒG´43¢Ö67Ó²6ö×–ÆW#Ò ¢'V–ÆEö6öæf–u÷7Vff—‚Òb#²µö6öæf–wW&Uö6öÖÖæB‡6÷W&6RÂ6öæf–r—Ó²Ö¶RÖ£" ¢6öæf–u÷&VÇVFRÒö'V–ÆEö6öæf–u÷&VÇVFR‡6÷W&6RÂ6öæf–r¢–FVçF—G•÷67&—BÒ†6öæf–u÷&VÇVFR°¢b&&–æ'•÷fW'6–öãÒB…Â'¶&–æ'—ÕÂ"Ò×fW'6–öâ’ÇÂW†—BC#² ¢b&&–æ'•ö†6ƒÒB‡6†#Sg7VÒ¶&–æ'•÷Ò’ÇÂW†—BC#²6WBÒÒF&–æ'•ö†6ƒ²&–æ'•÷6†ÒC² ¢&6ö×–ÆW%ö#cCÒB‡&–çFbrW2rÂ"F6ö×–ÆW%Â"Â&6ScB×s’ÇÂW†—BC#² ¢'fW'6–öåö#cCÒB‡&–çFbrW2rÂ"F&–æ'•÷fW'6–öåÂ"Â&6ScB×s’ÇÂW†—BC#² ¢b&6öæf–uö#cCÒB‡&–çFbrW2W2W2r·6†ÆW‚çV÷FR†'V–ÆEö6öæf–u÷&Vf—‚—ÒÂ"F6ö×–ÆW%Â"·6†ÆW‚çV÷FR†'V–ÆEö6öæf–u÷7Vff—‚—ÒÂ&6ScB×s’ÇÂW†—BC#² ¢b'&–çFbrW5ÅÆârt4ä%ô%T”ÄEõcrwFööÃ×·6÷W&6RçFööÇÒrw6÷W&6U÷&VfW&Væ6S×·6÷W&6Rç6÷W&6U÷&VfW&Væ6WÒr ¢b"w6÷W&6U÷6†#Sc×·6÷W&6Rç6÷W&6U÷6†#SgÒrwW7G&VÕö6öÖÖ—C×·6÷W&6RçW7G&VÕö6öÖÖ—B÷"rwÒr ¢b"wF6…÷Fƒ×·6÷W&6Ræö'6W'fF–öå÷F6…÷F‡ÒrwF6…÷6†#Sc×·6÷W&6Ræö'6W'fF–öå÷F6…÷6†#SgÒr ¢%Â&6ö×–ÆW%÷fW'6–öåö#cCÒF6ö×–ÆW%ö#cEÂ"Â&'V–ÆEö6öæf–wW&F–öåö#cCÒF6öæf–uö#cEÂ" ¢b"v&–æ'•÷Fƒ×¶&–æ'—ÒrÂ&&–æ'•÷fW'6–öåö#cCÒGfW'6–öåö#cEÂ"Â&&–æ'•÷6†#ScÒF&–æ'•÷6†Â" ¢b"vö'6W'fF–öåö6&–Æ—G“Ô4ä%ô5õcrvö'6W'fF–öå÷6VÖçF–73×²w6ö6·W&bÓ2ãÖVæ&ÆVB×cr–b6÷W&6RçFööÂÓÒw6ö6·W&brVÇ6Rv—W&bÓ2ãrã×7FG2×cwÒr ¢b"v6&–Æ—F–W3×²rÂræ¦ö–â…÷&WV—&VEö6&–Æ—F–W2‡6÷W&6RçFööÂ’—Òrâ¶–FVçF—G•÷F×Òbb ¢b&–b²Öb¶–FVçF—G•÷F‡ÒÓ²F†Vâ6××2¶–FVçF—G•÷F×Ò¶–FVçF—G•÷F‡ÒÇÂW†—BC3²&Ò¶–FVçF—G•÷F×Ó² ¢b&VÇ6R×b¶–FVçF—G•÷F×Ò¶–FVçF—G•÷F‡Ó²f’bb6B¶–FVçF—G•÷F‡Ò"¢6öÖÖæG2æVæB…²'6‚"Â"Ö2"Â–FVçF—G•÷67&—EÒ¢–b6÷W&6RçFööÂÓÒ&—W&c2# ¢2†VÇ&÷fW2Ô2W†—7G3²F†R¶W&æVÂ6ö6¶WB&ö&R6W&FVÇ’&÷fW2F†R&WVW7FVBfÇVRà¢6öÖÖæG2æVæB…²'—F†öã2"Â"Ö2"Â÷F7ö6öævW7F–öå÷&ö&U÷67&—B‚•Ò¢&WGW&â6öÖÖæG0  ¦FVbö–FVçF—G•÷&VfÆ–v‡E÷67&—B‡6÷W&6S¢6÷W&6T'V–ÆBÂ6öæf–s¢&ö÷G7G&6öæf–r’Óâ7G# ¢&–æ'’Ò6†ÆW‚çV÷FR†b'¶6öæf–ræ–ç7FÆÅ÷&Vf—‡Òö&–â÷·6÷W&6RçFööÇÒ"¢Ö&¶W"Ò6†ÆW‚çV÷FR†b'¶6öæf–ræ–ç7FÆÅ÷&Vf—‡Òòæc'"×·6÷W&6RçFööÇÒæ–FVçF—G’"¢'V–ÆEö–FVçF—G’Ò6†ÆW‚çV÷FR†b'¶6öæf–ræ–ç7FÆÅ÷&Vf—‡Òòæc'"×·6÷W&6RçFööÇÒæ'V–ÆBÖ–FVçF—G’"¢6÷W&6UöF—"Ò6†ÆW‚çV÷FR†b'¶6öæf–rçv÷&·76WÒ÷·6÷W&6Rç6÷W&6U÷&VfW&Væ6WÒ"¢&6†—fRÒ6†ÆW‚çV÷FR†b'¶6öæf–rçv÷&·76WÒ÷·6÷W&6Ræ&6†—fUöæÖWÒ"¢F6‚Ò6†ÆW‚çV÷FR†b'¶6öæf–rçv÷&·76WÒ÷·6÷W&6RçFööÇÒæ7V—6—F–öâçF6‚"¢&VfW&Væ6RÂF–vW7BÒ6†ÆW‚çV÷FR‡6÷W&6Rç6÷W&6U÷&VfW&Væ6R’Â6†ÆW‚çV÷FR‡6÷W&6Rç6÷W&6U÷6†#Sb¢F6…öF–vW7BÒ6†ÆW‚çV÷FR‡6÷W&6Ræö'6W'fF–öå÷F6…÷6†#Sb÷"&ÆVv7’"¢&WGW&â†b&–b²ÖR¶Ö&¶W'ÒÒbb²ÔÂ¶Ö&¶W'ÒÒbb²ÖR¶&–æ'—ÒÒbb²ÔÂ¶&–æ'—ÒÒbb ¢b%²ÖR¶'V–ÆEö–FVçF—G—ÒÒbb²ÔÂ¶'V–ÆEö–FVçF—G—ÒÒbb²ÖR·6÷W&6UöF—'ÒÒbb²ÔÂ·6÷W&6UöF—'ÒÒbb ¢b%²ÖR¶&6†—fWÒÒbb²ÔÂ¶&6†—fWÒÒbb²ÖR·F6‡ÒÒbb²ÔÂ·F6‡ÒÓ²F†Vâ ¢'&–çFbvÖ—76–æuÅÆâs²W†—B²f“² ¢²ö'V–ÆEö6öæf–u÷&VÇVFR‡6÷W&6RÂ6öæf–r’°¢b&–b²Öb¶Ö&¶W'ÒÓ²F†VâW†—BC3²f“² ¢b$”e3Òrr&VB×"öÆE÷&VböÆE÷6†öÆE÷F6‚öÆEö6öæf–röÆEö&–âÂ¶Ö&¶W'Ó²7W'&VçCÒB‡6†#Sg7VÒ¶&–æ'—Ò’ÇÂW†—BC#²6WBÒÒF7W'&VçC² ¢b%²Â"FöÆE÷&VeÂ"Ò·&VfW&Væ6WÒÒbb²Â"FöÆE÷6†Â"Ò¶F–vW7GÒÒbb²Â"FöÆE÷F6…Â"Ò·F6…öF–vW7GÒÒbb²Â"FöÆEö6öæf–uÂ"ÒÂ"F6öæf–u÷6†Â"Òbb²Â"FöÆEö&–åÂ"ÒÂ"CÂ"ÒÇÂW†—BC#²&–çFbvÖF6†–æuÅÆâr"  ¦FVb÷6†#Sg7VÕö÷WGWB‡FW‡C¢7G"ÂW‡V7FVE÷Fƒ¢7G"’Óâ7G"ÂæöæS ¢Æ–æW2ÒFW‡Bç7G&—‚’ç7Æ—FÆ–æW2‚¢–bÆVâ†Æ–æW2’Ò ¢&WGW&âæöæP¢ÖF6‚Ò&RægVÆÆÖF6‚‡""…¶ÖcÓ•×³cGÒ•Ç2µÂ£ò‚â²’"ÂÆ–æW5³Òç7G&—‚’¢&WGW&âÖF6‚æw&÷Wƒ’–bÖF6‚æBÖF6‚æw&÷Wƒ"’ÓÒW‡V7FVE÷F‚VÇ6RæöæP  ¦FVb÷'6Uö'V–ÆEö–FVçF—G’‡FW‡C¢7G"Â6÷W&6S¢6÷W&6T'V–ÆB’ÓâF–7E·7G"Â7G%Ó ¢Æ–æW2ÒFW‡Bç7Æ—FÆ–æW2‚¢–bæ÷BÆ–æW2÷"Æ–æW5³ÒÒ$4ä%ô%T”ÄEõc# ¢&—6RfÇVTW'&÷"‚'&VÖ÷FR'V–ÆB–FVçF—G’6–FV6"—2Ö—76–ær—G2f÷&ÖBÖ&¶W""¢f–VÆG3¢F–7E·7G"Â7G%ÒÒ·Ð¢f÷"Æ–æR–âÆ–æW5³¥Ó ¢¶W’Â6WÂfÇVRÒÆ–æRç'F—F–öâ‚#Ò"¢–bæ÷B6W÷"¶W’–âf–VÆG3 ¢&—6RfÇVTW'&÷"‚'&VÖ÷FR'V–ÆB–FVçF—G’6–FV6"†2ÖÆf÷&ÖVB÷"GWÆ–6FRf–VÆG2"¢f–VÆG5¶¶W•ÒÒfÇVP¢&WV—&VBÒ²'FööÂ"Â'6÷W&6U÷&VfW&Væ6R"Â'6÷W&6U÷6†#Sb"Â'W7G&VÕö6öÖÖ—B"Â'F6…÷F‚"À¢'F6…÷6†#Sb"Â&6ö×–ÆW%÷fW'6–öåö#cB"Â&'V–ÆEö6öæf–wW&F–öåö#cB"Â&&–æ'•÷F‚"À¢&&–æ'•÷fW'6–öåö#cB"Â&&–æ'•÷6†#Sb"Â&ö'6W'fF–öåö6&–Æ—G’"Â&ö'6W'fF–öå÷6VÖçF–72"Â&6&–Æ—F–W2'Ð¢–bf–VÆG2æ¶W—2‚’Ò&WV—&VC ¢&—6RfÇVTW'&÷"‚'&VÖ÷FR'V–ÆB–FVçF—G’6–FV6"f–VÆG2&R–æ6ö×ÆWFR÷"VæW‡V7FVB"¢f÷"¶W’ÂW‡V7FVB–â‚‚'FööÂ"Â6÷W&6RçFööÂ’Â‚'6÷W&6U÷&VfW&Væ6R"Â6÷W&6Rç6÷W&6U÷&VfW&Væ6R’À¢‚'6÷W&6U÷6†#Sb"Â6÷W&6Rç6÷W&6U÷6†#Sb’Â‚'W7G&VÕö6öÖÖ—B"Â6÷W&6RçW7G&VÕö6öÖÖ—B÷"""’À¢‚'F6…÷F‚"Â6÷W&6Ræö'6W'fF–öå÷F6…÷F‚÷"""’À¢‚'F6…÷6†#Sb"Â6÷W&6Ræö'6W'fF–öå÷F6…÷6†#Sb÷"""’À¢‚&ö'6W'fF–öåö6&–Æ—G’"Â$4ä%ô5õc"’“ ¢–bf–VÆG5¶¶W•ÒÒW‡V7FVC ¢&—6RfÇVTW'&÷"†b'&VÖ÷FR'V–ÆB–FVçF—G’6–FV6"¶¶W—ÒFöW2æ÷BÖF6‚&WVW7FVB'V–ÆB"¢f÷"¶W’–â‚&6ö×–ÆW%÷fW'6–öåö#cB"Â&'V–ÆEö6öæf–wW&F–öåö#cB"Â&&–æ'•÷fW'6–öåö#cB"“ ¢G'“ ¢f–VÆG5¶¶W’²%öFV6öFVB%ÒÒ&6ScBæ#cFFV6öFR†f–VÆG5¶¶W•ÒÂfÆ–FFSÕG'VR’æFV6öFR‚'WFbÓ‚"¢W†6WB…fÇVTW'&÷"ÂVæ–6öFTFV6öFTW'&÷"’2W†3 ¢&—6RfÇVTW'&÷"†b'&VÖ÷FR'V–ÆB–FVçF—G’6–FV6"¶¶W—Ò—2–çfÆ–B"’g&öÒW†0¢–bæ÷B&RægVÆÆÖF6‚‡""õµåÆî4ãËh‘éì¶»§q«^te during build", builds, listeners)
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+import base64
+import math
+import re
+import shlex
+import time
+from typing import Callable, Dict, List, Literal, Optional
+from urllib.parse import urlparse
+from pathlib import Path, PurePosixPath
+
+from pydantic import Field, field_validator, model_validator
+
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
+from .contracts.common import CommandOutcome, IdentityContext, StrictModel
+from .contracts.execution import CommandRequest, CommandRunner
+from .contracts.artifacts import ArtifactRecord
+from .contracts.common import Evidence, StringEvidence, VmRole
+
+
+def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
+    """Keep local request-construction failures inside the action evidence stream."""
+    try:
+        return _build_request(action_id, connection, argv, timeout, action_type)
+    except Exception:
+        safe_timeout = timeout if math.isfinite(timeout) and timeout > 0 else 0.001
+        return CommandRequest(action_id=action_id, action_type=action_type,
+            argv=["scp" if action_type == "scp" else "ssh", "[request-construction-failed]"], cwd=".",
+            environment_classification="contains_secret_references", timeout_seconds=safe_timeout,
+            redactions=[connection.authentication_reference, connection.host_key_reference])
+
+
+def _execute(runner: CommandRunner, request: CommandRequest):
+    if request.argv and request.argv[-1] == "[request-construction-failed]":
+        from datetime import datetime, timezone
+        from .contracts.common import CommandOutcome
+        from .contracts.execution import CommandResult
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED, started_at=now,
+            finished_at=now, duration_seconds=0, exit_code=1, stdout="",
+            stderr="request construction failed: authenticated transport preflight", redactions=request.redactions)
+    return _run_command(runner, request)
+
+
+class SourceBuild(StrictModel):
+    tool: Literal["sockperf", "iperf3"]
+    source_url: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+    archive_name: str = Field(min_length=1)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_patch_path: str | None = None
+    observation_patch_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    upstream_commit: str | None = Field(default=None, pattern=r"^[a-f0-9]{40}$")
+
+    @model_validator(mode="after")
+    def safe_source(self):
+        parsed = urlparse(self.source_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("source URL must be credential-free HTTPS")
+        for name, value in (("source_reference", self.source_reference), ("archive_name", self.archive_name)):
+            if value.startswith("-") or "/" in value or "\\" in value or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", value):
+                raise ValueError(f"{name} must be a safe identifier or basename")
+        if (self.observation_patch_path is None) != (self.observation_patch_sha256 is None):
+            raise ValueError("observation patch path and digest must be supplied together")
+        if self.observation_patch_path is not None and (
+            self.observation_patch_path.startswith("/") or ".." in PurePosixPath(self.observation_patch_path).parts
+            or "\\" in self.observation_patch_path
+        ):
+            raise ValueError("observation patch path must be a safe package-relative path")
+        pinned = {
+            "5ebd327da983225321818c0355db922515e026bd": (
+                "tool_patches/sockperf-3.10-acquisition.patch",
+                "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc",
+                "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
+            "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
+                "tool_patches/iperf-3.17.1-acquisition.patch",
+                "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661",
+                "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe", "iperf-"),
+        }
+        expected_prefix = "sockperf-" if self.tool == "sockperf" else "iperf-"
+        pinned_reference = next((commit for commit, values in pinned.items()
+                                 if values[3] == expected_prefix and self.source_reference == values[3] + commit), None)
+        if pinned_reference is not None and self.upstream_commit != pinned_reference:
+            raise ValueError("pinned source reference requires its exact observation source identity")
+        if self.upstream_commit in pinned:
+            expected_path, expected_digest, expected_source_digest, prefix = pinned[self.upstream_commit]
+            if self.observation_patch_path != expected_path or self.observation_patch_sha256 != expected_digest:
+                raise ValueError("pinned upstream source requires its exact packaged observation patch identity")
+            if self.source_reference != prefix + self.upstream_commit:
+                raise ValueError("pinned source archive extraction directory does not match its upstream commit")
+            if self.source_sha256 != expected_source_digest:
+                raise ValueError("pinned upstream source requires the official archive digest")
+        elif self.observation_patch_path is not None:
+            raise ValueError("observation patching is supported only for the pinned upstream commits")
+        return self
+
+
+class BootstrapConfig(StrictModel):
+    sources: List[SourceBuild] = Field(min_length=2, max_length=2)
+    remote_root: str = Field(min_length=1)
+    workspace: str = Field(min_length=1)
+    install_prefix: str = Field(min_length=1)
+    bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables", "python3-venv"])
+
+    @model_validator(mode="after")
+    def validate_paths_and_tools(self):
+        if {s.tool for s in self.sources} != {"sockperf", "iperf3"}:
+            raise ValueError("exactly one Sockperf and one iperf3 source is required")
+        for name in ("remote_root", "workspace", "install_prefix"):
+            value = getattr(self, name)
+            if not value.startswith("/") or PurePosixPath(value).as_posix() != value or ".." in value.split("/") or any(ord(c) < 32 for c in value):
+                raise ValueError(f"{name} must be a normalized absolute path")
+            if not re.fullmatch(r"/[A-Za-z0-9._/-]+", value) or any(part in {".", ".."} for part in value.split("/")):
+                raise ValueError(f"{name} contains shell-unsafe path characters")
+            if name != "remote_root" and not value.startswith(self.remote_root.rstrip("/") + "/"):
+                raise ValueError(f"{name} must be under remote_root")
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.-]{0,63}", p) for p in self.bootstrap_packages):
+            raise ValueError("bootstrap package names must be simple package identifiers")
+        return self
+
+
+class BuildObservation(StrictModel):
+    role: str
+    tool: str
+    source_reference: str
+    source_sha256: str
+    compiler_version: str
+    binary_path: str
+    binary_version: str
+    binary_sha256: str
+    capabilities: List[str]
+    artifact_id: str | None = None
+    upstream_commit: str | None = None
+    patch_path: str | None = None
+    patch_sha256: str | None = None
+    build_configuration: str | None = None
+    observation_capability: str | None = None
+    observation_semantics: str | None = None
+    identity_bytes: str | None = None
+
+    @model_validator(mode="after")
+    def complete_observation(self):
+        if not all((self.source_reference, self.compiler_version.strip(), self.binary_path.startswith("/"), self.binary_version.strip())):
+            raise ValueError("build observation must retain actual source/compiler/binary evidence")
+        if not re.fullmatch(r"[a-f0-9]{64}", self.source_sha256) or not re.fullmatch(r"[a-f0-9]{64}", self.binary_sha256):
+            raise ValueError("source and binary observations require lowercase SHA-256")
+        if not set(_required_capabilities(self.tool)) <= set(self.capabilities):
+            raise ValueError("build observation is missing required capability evidence")
+        observed_fields = (self.upstream_commit, self.patch_path, self.patch_sha256,
+                           self.build_configuration, self.observation_capability, self.observation_semantics)
+        if any(value is not None for value in observed_fields) and not all(value is not None for value in observed_fields):
+            raise ValueError("observation build identity must be complete or unavailable")
+        if self.observation_capability is not None:
+            expected = "sockperf-3.10-enabled-v1" if self.tool == "sockperf" else "iperf-3.17.1-stats-v1"
+            if self.observation_capability != "CNB_ACQ_V1" or self.observation_semantics != expected:
+                raise ValueError("observation build capability does not match tool semantics")
+            if not re.fullmatch(r"[a-f0-9]{40}", self.upstream_commit or "") or not re.fullmatch(r"[a-f0-9]{64}", self.patch_sha256 or ""):
+                raise ValueError("observation build requires pinned upstream commit and patch digest")
+            if not self.identity_bytes:
+                raise ValueError("observation build requires captured original build identity sidecar bytes")
+        return self
+
+
+def materialize_build_identity_artifacts(root: Path, deployment_id: str,
+        builds: List[BuildObservation] | tuple[BuildObservation, ...]) -> tuple[ArtifactRecord, ...]:
+    """Persist exact remote sidecar bytes captured by the bootstrap command."""
+    records: list[ArtifactRecord] = []
+    for build in builds:
+        if build.identity_bytes is None or build.artifact_id is None:
+            continue
+        raw = build.identity_bytes.encode("utf-8")
+        path = f"metadata/build/{build.role}-{build.tool}.identity"
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() != raw:
+            raise ValueError("build identity sidecar conflicts with existing attempt evidence")
+        if not target.exists():
+            target.write_bytes(raw)
+        role = VmRole(build.role)
+        record = ArtifactRecord(artifact_id=build.artifact_id, path=path, kind="build-identity",
+            producer=role, unit_id=None, deployment_id=deployment_id, closed=True,
+            size_bytes=Evidence[int](value=len(raw)), sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()),
+            retrieval_state="verified")
+        record.verify_materialized_file(root)
+        records.append(record)
+    return tuple(records)
+
+
+class ListenerObservation(StrictModel):
+    role: str = "vm_b"
+    tool: str
+    address: str
+    protocol: str
+    port: int
+    unit: str
+    binary_path: str
+    stdout_path: str
+    stderr_path: str
+    allowed_source: str
+    state: Literal["prepared", "active", "mismatch", "failed"]
+
+
+class BootstrapResult(StrictModel):
+    succeeded: bool
+    identity: IdentityContext
+    deployment_id: str
+    actions: List[RemoteActionEvidence] = Field(default_factory=list)
+    failure: AccessFailureEvidence | None = None
+    builds: List[BuildObservation] = Field(default_factory=list)
+    listeners: List[ListenerObservation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def successful_result_is_complete(self):
+        if self.succeeded:
+            if len(self.builds) != 4 or {(b.role, b.tool) for b in self.builds} != {(r, t) for r in ("vm_a", "vm_b") for t in ("sockperf", "iperf3")}:
+                raise ValueError("successful preparation requires both tools observed on both VMs")
+            if len(self.listeners) != 2 or {(x.tool, x.protocol, x.port) for x in self.listeners} != {("sockperf", "udp", 11111), ("iperf3", "tcp", 5201)}:
+                raise ValueError("successful preparation requires both intended persistent listeners")
+            if any(x.state != "active" for x in self.listeners):
+                raise ValueError("successful preparation requires matching active listeners")
+            if any(x.address != self.listeners[0].address for x in self.listeners):
+                raise ValueError("listeners must share B's private address")
+        return self
+
+
+def _required_capabilities(tool: str) -> List[str]:
+    if tool == "sockperf":
+        return ["server", "under-load", "-i", "-p", "-m", "--mps", "--reply-every", "--full-rtt", "--no-rdtsc", "--full-log", "-t"]
+    return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
+
+
+def _tcp_congestion_probe_script(algorithm: str = "cubic") -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", algorithm):
+        raise ValueError("TCP congestion algorithm must be a short kernel identifier")
+    script = ("import socket\n"
+        "sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+        "try:\n"
+        f"    sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,b'{algorithm}')\n"
+        "    observed=sock.getsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,16).rstrip(b'\\0')\n"
+        f"    if observed != b'{algorithm}': raise RuntimeError('TCP congestion algorithm readback mismatch')\n"
+        "finally:\n"
+        "    sock.close()\n"
+        f"print('CNB_TCP_CONGESTION={algorithm}')\n")
+    # Remote argv rejects control characters; encode the short Python probe as one safe token.
+    return f"exec(bytes.fromhex('{script.encode().hex()}'))"
+
+
+def _configure_command(source: SourceBuild, config: BootstrapConfig) -> str:
+    shared = " --disable-shared" if source.tool == "iperf3" else ""
+    return f"./configure --prefix={config.install_prefix}{shared}"
+
+
+def _build_config_prelude(source: SourceBuild, config: BootstrapConfig) -> str:
+    spec = shlex.quote(f"{_configure_command(source, config)}; make -j2")
+    # Command substitution removes the terminal newline but retains the complete
+    # multiline version banner used by BuildObservation and the sidecar.
+    return ("compiler=$(cc --version) || exit 42; "
+            f"cfg=$(printf '%s\\n' \"${{CC:-cc}}\" \"$compiler\" {spec} | sha256sum) || exit 42; "
+            "set -- $cfg; config_sha=$1; ")
+
+
+def _capabilities_observed(text: str, tool: str, *, required: List[str] | None = None) -> bool:
+    if not text.strip() or "usage" not in text.lower() or "error" in text.lower() or "unknown option" in text.lower():
+        return False
+    tokens = set(re.findall(r"--[A-Za-z0-9-]+|-[A-Za-z0-9]|[A-Za-z][A-Za-z0-9-]*", text))
+    return set(required if required is not None else _required_capabilities(tool)) <= tokens
+
+
+def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str,
+                  observation_id: str | None = None) -> bool:
+    fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    match = re.search(r"argv\[\]=(.*?);", fields.get("ExecStart", ""))
+    if not match:
+        return False
+    try:
+        argv = shlex.split(match.group(1))
+    except ValueError:
+        return False
+    binary = f"{prefix}/bin/{tool}"
+    expected = [binary, "server", "-i", address, "-p", str(port)] if tool == "sockperf" else [binary, "-s", "-B", address, "-p", str(port), "--json-stream", "--forceflush"]
+    return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
+            and fields.get("MainPID", "0").isdigit() and int(fields.get("MainPID", "0")) > 0
+            and argv == expected and fields.get("Restart") == "no"
+            and fields.get("StandardOutput") == "append"
+            and fields.get("StandardError") == "append"
+            and _unit_log_destinations_match(config_text, stdout_path, stderr_path)
+            and (observation_id is None or _unit_environment_matches(text, config_text, observation_id)))
+
+
+def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
+    effective = {"StandardOutput": None, "StandardError": None}
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        if section != "Service" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in effective:
+            # systemd's empty assignment resets an inherited setting; the
+            # subsequent effective value must still be explicit and exact.
+            effective[key] = value or None
+    return effective == {"StandardOutput": f"append:{stdout_path}", "StandardError": f"append:{stderr_path}"}
+
+
+def _unit_environment_matches(show_text: str, config_text: str, observation_id: str) -> bool:
+    expected = f"CNB_ACQUISITION_ID={observation_id}"
+    fields = dict(line.split("=", 1) for line in show_text.splitlines() if "=" in line)
+    effective = None
+    section = None
+    for raw in config_text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Service" and line.startswith("Environment="):
+            effective = line.split("=", 1)[1]
+    return expected in fields.get("Environment", "") and effective == expected
+
+
+def _process_identity_command(unit: str, binary: str) -> list[str]:
+    unit_q, binary_q = shlex.quote(unit), shlex.quote(binary)
+    script = (f"pid=$(systemctl show --property=MainPID --value {unit_q}) || exit 1; "
+              f"case $pid in ''|*[!0-9]*) exit 1;; esac; [ \"$pid\" -gt 0 ] || exit 1; "
+              f"actual=$(readlink -f /proc/$pid/exe) || exit 1; [ \"$actual\" = {binary_q} ] || exit 1; "
+              "printf '%s\\n' \"$actual\"; sha256sum /proc/$pid/exe")
+    return ["sudo", "sh", "-c", script]
+
+
+def _process_identity_matches(text: str, binary: str, expected_sha256: str) -> bool:
+    lines = text.strip().splitlines()
+    return (len(lines) == 2 and lines[0] == binary
+            and re.fullmatch(r"[a-f0-9]{64}\s+/proc/[1-9][0-9]*/exe", lines[1]) is not None
+            and lines[1].split()[0] == expected_sha256)
+
+
+def _acl_matches(text: str, source: str, address: str, chain: str | None = None) -> bool:
+    lines = [re.sub(r"\bcounter packets \d+ bytes \d+\b", "", line.strip()).strip() for line in text.splitlines() if line.strip()]
+    table_lines = [line for line in lines if re.fullmatch(r"table inet cnb_f02r \{", line)]
+    chain_lines = [line for line in lines if re.fullmatch(r"chain [A-Za-z0-9_]+ \{", line)]
+    if len(table_lines) != 1 or len(chain_lines) != 1:
+        return False
+    actual_chain = chain_lines[0].split()[1]
+    if chain is not None and actual_chain != chain:
+        return False
+    start = lines.index(chain_lines[0]) + 1
+    try:
+        end = lines.index("}", start)
+    except ValueError:
+        return False
+    body = [" ".join(line.split()) for line in lines[start:end]]
+    headers = [line for line in body if re.fullmatch(r"type filter hook input priority -?\d+; policy accept;", line)]
+    rules = [line for line in body if line not in headers]
+    source_forms = {source, f"{source}/32"}
+    expected_rules = [
+        next((f"ip saddr {host} ip daddr {address} udp dport 11111 accept" for host in source_forms if f"ip saddr {host} ip daddr {address} udp dport 11111 accept" in rules), ""),
+        f"ip daddr {address} udp dport 11111 drop",
+        next((f"ip saddr {host} ip daddr {address} tcp dport 5201 accept" for host in source_forms if f"ip saddr {host} ip daddr {address} tcp dport 5201 accept" in rules), ""),
+        f"ip daddr {address} tcp dport 5201 drop",
+    ]
+    return len(headers) == 1 and all(expected_rules) and rules == expected_rules and lines[end + 1:] == ["}"]
+
+
+def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
+    archive = f"{config.workspace}/{source.archive_name}"
+    source_dir = f"{config.workspace}/{source.source_reference}"
+    prefix = config.install_prefix
+    source_dir_q, prefix_q = shlex.quote(source_dir), shlex.quote(prefix)
+    binary = f"{prefix}/bin/{source.tool}"
+    marker = f"{prefix}/.f02r-{source.tool}.identity"
+    marker_q, binary_q = shlex.quote(marker), shlex.quote(binary)
+    ref_q, digest_q = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
+    build = "./autogen.sh && " if source.tool == "sockperf" else ""
+    patch_clause = ""
+    cache_patch = "legacy"
+    if source.observation_patch_path is not None:
+        patch_path = Path(__file__).parent / source.observation_patch_path
+        patch_bytes = patch_path.read_bytes()
+        patch_digest = hashlib.sha256(patch_bytes).hexdigest()
+        if patch_digest != source.observation_patch_sha256:
+            raise ValueError("packaged observation patch digest does not match requested identity")
+        patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+        encoded = base64.b64encode(patch_bytes).decode("ascii")
+        patch_clause = (f"printf '%s' {shlex.quote(encoded)} | base64 -d > {patch_q} && "
+                        f"printf '%s  %s\\n' {shlex.quote(patch_digest)} {patch_q} | sha256sum -c - && "
+                        f"cd {source_dir_q} && patch --batch --fuzz=0 -p1 < {patch_q} && ")
+        cache_patch = patch_digest
+    patch_q = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+    cache_q = shlex.quote(cache_patch)
+    configure = _configure_command(source, config)
+    build_script = (_build_config_prelude(source, config) +
+                    f"if [ -f {marker_q} ]; then IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker_q}; "
+                    f"current=$(sha256sum {binary_q}) || exit 42; set -- $current; "
+                    f"[ \"$old_ref\" = {ref_q} ] && [ \"$old_sha\" = {digest_q} ] && [ \"$old_patch\" = {cache_q} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; exit 0; fi; "
+                    f"[ ! -e {binary_q} ] || exit 43; {patch_clause}cd {source_dir_q} && {build}{configure} && make -j2 && make install && "
+                    f"current=$(sha256sum {binary_q}) && set -- $current && printf '%s %s %s %s %s\\n' {ref_q} {digest_q} {cache_q} \"$config_sha\" \"$1\" > {marker_q}")
+    commands = [
+        ["sudo", "sh", "-c", "apt-get update && apt-get install -y " + " ".join(shlex.quote(package) for package in config.bootstrap_packages)],
+        ["curl", "--fail", "--location", "--silent", "--show-error", "--output", archive, source.source_url],
+        ["sha256sum", archive],
+        ["tar", "-xf", archive, "-C", config.workspace],
+        ["sh", "-c", build_script],
+        ["cc", "--version"],
+        [f"{prefix}/bin/{source.tool}", "--version"],
+        ["sha256sum", f"{prefix}/bin/{source.tool}"],
+    ]
+    commands.append([f"{prefix}/bin/{source.tool}", "--help"])
+    if source.tool == "sockperf":
+        commands.extend([[f"{prefix}/bin/sockperf", "server", "--help"],
+                         [f"{prefix}/bin/sockperf", "under-load", "--help"]])
+    if source.observation_patch_path is not None:
+        capability_binary = binary_q
+        commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {capability_binary} >/dev/null && printf CNB_ACQ_V1"])
+        identity_plain = f"{prefix}/.f02r-{source.tool}.build-identity"
+        identity_path = shlex.quote(identity_plain)
+        identity_tmp = identity_plain + ".$$.tmp"
+        # Keep this description byte-for-byte aligned with BuildObservation's
+        # captured config; shell-expand only the observed compiler version.
+        build_config_prefix = "CC=${CC:-cc}; compiler="
+        build_config_suffix = f"; {_configure_command(source, config)}; make -j2"
+        config_prelude = _build_config_prelude(source, config)
+        identity_script = (config_prelude +
+            f"binary_version=$(\"{binary}\" --version) || exit 42; "
+            f"binary_hash=$(sha256sum {binary_q}) || exit 42; set -- $binary_hash; binary_sha=$1; "
+            "compiler_b64=$(printf '%s' \"$compiler\" | base64 -w0) || exit 42; "
+            "version_b64=$(printf '%s' \"$binary_version\" | base64 -w0) || exit 42; "
+            f"config_b64=$(printf '%s%s%s' {shlex.quote(build_config_prefix)} \"$compiler\" {shlex.quote(build_config_suffix)} | base64 -w0) || exit 42; "
+            f"printf '%s\\n' 'CNB_BUILD_V1' 'tool={source.tool}' 'source_reference={source.source_reference}' "
+            f"'source_sha256={source.source_sha256}' 'upstream_commit={source.upstream_commit or ''}' "
+            f"'patch_path={source.observation_patch_path}' 'patch_sha256={source.observation_patch_sha256}' "
+            "\"compiler_version_b64=$compiler_b64\" \"build_configuration_b64=$config_b64\" "
+            f"'binary_path={binary}' \"binary_version_b64=$version_b64\" \"binary_sha256=$binary_sha\" "
+            f"'observation_capability=CNB_ACQ_V1' 'observation_semantics={'sockperf-3.10-enabled-v1' if source.tool == 'sockperf' else 'iperf-3.17.1-stats-v1'}' "
+            f"'capabilities={','.join(_required_capabilities(source.tool))}' > {identity_tmp} && "
+            f"if [ -f {identity_path} ]; then cmp -s {identity_tmp} {identity_path} || exit 43; rm {identity_tmp}; "
+            f"else mv {identity_tmp} {identity_path}; fi && cat {identity_path}")
+        commands.append(["sh", "-c", identity_script])
+    if source.tool == "iperf3":
+        # Help proves -C exists; the kernel socket probe separately proves the requested value.
+        commands.append(["python3", "-c", _tcp_congestion_probe_script()])
+    return commands
+
+
+def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> str:
+    binary = shlex.quote(f"{config.install_prefix}/bin/{source.tool}")
+    marker = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.identity")
+    build_identity = shlex.quote(f"{config.install_prefix}/.f02r-{source.tool}.build-identity")
+    source_dir = shlex.quote(f"{config.workspace}/{source.source_reference}")
+    archive = shlex.quote(f"{config.workspace}/{source.archive_name}")
+    patch = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+    reference, digest = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
+    patch_digest = shlex.quote(source.observation_patch_sha256 or "legacy")
+    return (f"if [ ! -e {marker} ] && [ ! -L {marker} ] && [ ! -e {binary} ] && [ ! -L {binary} ] && "
+            f"[ ! -e {build_identity} ] && [ ! -L {build_identity} ] && [ ! -e {source_dir} ] && [ ! -L {source_dir} ] && "
+            f"[ ! -e {archive} ] && [ ! -L {archive} ] && [ ! -e {patch} ] && [ ! -L {patch} ]; then "
+            "printf 'missing\\n'; exit 0; fi; "
+            + _build_config_prelude(source, config) +
+            f"if [ ! -f {marker} ]; then exit 43; fi; "
+            f"IFS=' ' read -r old_ref old_sha old_patch old_config old_bin < {marker}; current=$(sha256sum {binary}) || exit 42; set -- $current; "
+            f"[ \"$old_ref\" = {reference} ] && [ \"$old_sha\" = {digest} ] && [ \"$old_patch\" = {patch_digest} ] && [ \"$old_config\" = \"$config_sha\" ] && [ \"$old_bin\" = \"$1\" ] || exit 42; printf 'matching\\n'")
+
+
+def _sha256sum_output(text: str, expected_path: str) -> str | None:
+    lines = text.strip().splitlines()
+    if len(lines) != 1:
+        return None
+    match = re.fullmatch(r"([a-f0-9]{64})\s+\*?(.+)", lines[0].strip())
+    return match.group(1) if match and match.group(2) == expected_path else None
+
+
+def _parse_build_identity(text: str, source: SourceBuild) -> dict[str, str]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "CNB_BUILD_V1":
+        raise ValueError("remote build identity sidecar is missing its format marker")
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep or key in fields:
+            raise ValueError("remote build identity sidecar has malformed or duplicate fields")
+        fields[key] = value
+    required = {"tool", "source_reference", "source_sha256", "upstream_commit", "patch_path",
+        "patch_sha256", "compiler_version_b64", "build_configuration_b64", "binary_path",
+        "binary_version_b64", "binary_sha256", "observation_capability", "observation_semantics", "capabilities"}
+    if fields.keys() != required:
+        raise ValueError("remote build identity sidecar fields are incomplete or unexpected")
+    for key, expected in (("tool", source.tool), ("source_reference", source.source_reference),
+            ("source_sha256", source.source_sha256), ("upstream_commit", source.upstream_commit or ""),
+            ("patch_path", source.observation_patch_path or ""),
+            ("patch_sha256", source.observation_patch_sha256 or ""),
+            ("observation_capability", "CNB_ACQ_V1")):
+        if fields[key] != expected:
+            raise ValueError(f"remote build identity sidecar {key} does not match requested build")
+    for key in ("compiler_version_b64", "build_configuration_b64", "binary_version_b64"):
+        try:
+            fields[key + "_decoded"] = base64.b64decode(fields[key], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"remote build identity sidecar {key} is invalid") from exc
+    if not re.fullmatch(r"/[^\n]+/bin/" + re.escape(source.tool), fields["binary_path"]):
+        raise ValueError("remote build identity sidecar executable path is invalid")
+    if not re.fullmatch(r"[a-f0-9]{64}", fields["binary_sha256"]):
+        raise ValueError("remote build identity sidecar binary digest is invalid")
+    return fields
+
+
+def _compiler_identity_observed(text: str) -> bool:
+    value = text.strip()
+    if not value or re.search(r"(?i)\b(error|not found|unknown option)\b", value):
+        return False
+    identified = re.search(r"(?im)^(?:gcc|g\+\+|clang|Apple clang|cc\s*\()", value) is not None
+    versioned = re.search(r"\b\d+(?:\.\d+){1,3}\b", value) is not None
+    return identified and versioned
+
+
+def _canonical_version_text(text: str) -> str:
+    """Use the complete banner, removing only command-output framing whitespace."""
+    return text.strip()
+
+
+def _sha256sum_output(text: str, expected_path: str) -> str | None:
+    lines = text.strip().splitlines()
+    if len(lines) != 1:
+        return None
+    match = re.fullmatch(r"([a-f0-9]{64})\s+\*?(.+)", lines[0].strip())
+    return match.group(1) if match and match.group(2) == expected_path else None
+
+
+def render_commands(config: BootstrapConfig, role: str) -> List[List[str]]:
+    commands: List[List[str]] = [["cloud-init", "status", "--wait"]]
+    for source in config.sources:
+        commands.extend(_recipe(source, config))
+    return commands
+
+
+def _failure_result(connection, actions, vm, request, result, category, message, builds, listeners):
+    if result.outcome == CommandOutcome.INTERRUPTED:
+        category, message = "command_interrupted", "remote preparation command was interrupted"
+    elif "request construction failed" in result.stderr:
+        category, message = "transport_preflight_failed", "authenticated remote request could not be constructed"
+    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+                           actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
+
+
+def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> BootstrapResult:
+    actions: List[RemoteActionEvidence] = []
+    builds: List[BuildObservation] = []
+    listeners: List[ListenerObservation] = []
+    sources = {source.tool: source for source in config.sources}
+    tool_index = 0
+    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
+        init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable between VM preparations", builds, listeners)
+        if deadline.remaining(clock, readiness=True) <= 0:
+            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="no time remains before remote preparation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+        for argv, timeout_name, kind in init:
+            timeout = min(getattr(connection.timeouts, timeout_name), deadline.remaining(clock, readiness=True))
+            req = _request(f"f02r-{role}-cloud-init", vm, argv, timeout)
+            result = _execute(runner, req)
+            actions.append(_action(req.action_id, "ssh", vm, req, result))
+            if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
+                return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable", builds, listeners)
+        if role == "vm_b":
+            for tool, port, stdout_path, stderr_path in (("sockperf", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
+                remaining = deadline.remaining(clock, readiness=True)
+                if remaining <= 0:
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
+                observed = _execute(runner, inspect_request)
+                actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
+                if observed.outcome == CommandOutcome.SUCCEEDED:
+                    load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
+                    if load_state != "not-found":
+                        cat_remaining = deadline.remaining(clock, readiness=True)
+                        if cat_remaining <= 0:
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                        cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
+                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        if (cat_result.outcome != CommandOutcome.SUCCEEDED or
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
+                elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
+                    return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
+        for source in config.sources:
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            identity_request = _request(f"f02r-{role}-{source.tool}-identity-preflight", vm, ["sh", "-c", _identity_preflight_script(source, config)], min(connection.timeouts.command_seconds, remaining))
+            identity_result = _execute(runner, identity_request)
+            actions.append(_action(identity_request.action_id, "ssh", vm, identity_request, identity_result))
+            if identity_result.outcome != CommandOutcome.SUCCEEDED:
+                return _failure_result(connection, actions, vm, identity_request, identity_result, "installed_identity_mismatch", f"existing {source.tool} source or binary identity conflicts with requested build", builds, listeners)
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
+            workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
+            try:
+                workspace_result = _execute(runner, workspace_request)
+            except Exception as exc:
+                failure = AccessFailureEvidence(stage="bootstrap", role=role, category="workspace_setup_failed", message=type(exc).__name__, action_id=workspace_request.action_id, occurred_at=datetime.now(timezone.utc))
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=failure, builds=builds, listeners=listeners)
+            actions.append(_action(workspace_request.action_id, "ssh", vm, workspace_request, workspace_result))
+            if workspace_result.outcome != CommandOutcome.SUCCEEDED:
+                return _failure_result(connection, actions, vm, workspace_request, workspace_result, "workspace_setup_failed", "could not prepare writable deployment paths", builds, listeners)
+            recipe = _recipe(source, config)
+            evidence: Dict[str, str] = {}
+            capability_outputs: list[str] = []
+            identity_text: str | None = None
+            for index, argv in enumerate(recipe):
+                if not _identity_references_available(vm):
+                    failed_request, failed_result = _request_failure(f"f02r-{role}-{source.tool}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
+                    actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+                    return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable during build", builds, listeners)
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
