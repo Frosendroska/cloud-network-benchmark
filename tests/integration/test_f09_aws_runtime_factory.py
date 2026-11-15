@@ -222,6 +222,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.diagnostics_outcomes = {}
         self.inventory_roles = {}
         self.full_native = False
+        self.analysis_fixture_interior_rtt = False
 
     def _now(self):
         clock = getattr(self, "clock", None)
@@ -477,13 +478,24 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                             csv_path = Path(native_request.argv[native_request.argv.index("--full-log") + 1])
                             sample_start = handle.started_monotonic + 1.5
                             sample_end = handle.started_monotonic + 1.1 + duration + late_tail - .05 - .00001
+                            midpoint = handle.started_monotonic + 1.1 + duration / 2
+                            rows = [
+                                f"0, {sample_start:.6f}, {sample_start + .000001:.6f}, 1.000",
+                                f"1, {sample_end:.6f}, {sample_end + .000001:.6f}, 1.000",
+                            ]
+                            if self.analysis_fixture_interior_rtt:
+                                # The ordinary fixture keeps its two boundary
+                                # replies. This opt-in midpoint gives the
+                                # finalization-to-analysis bridge one supported
+                                # RTT sample without weakening parser bounds.
+                                rows.append(f"2, {midpoint:.6f}, {midpoint + .000001:.6f}, 1.000")
+                            received = len(rows)
                             csv_path.write_text("sockperf: test output\n------------------------------\n"
                                 "packet, txTime(sec), rxTime(sec), rtt(usec)\n"
-                                f"0, {sample_start:.6f}, {sample_start + .000001:.6f}, 1.000\n"
-                                f"1, {sample_end:.6f}, {sample_end + .000001:.6f}, 1.000\n"
+                                + "\n".join(rows) + "\n"
                                 "------------------------------\n"
-                                f"[Total Run] RunTime={duration + late_tail:.3f} sec; Warm up time=5000 msec; SentMessages={int((duration + late_tail) * 1000)}; ReceivedMessages=2\n"
-                                f"[Valid Duration] RunTime={duration + late_tail - .45:.3f} sec; SentMessages={int((duration + late_tail - .45) * 1000)}; ReceivedMessages=2\n",
+                                f"[Total Run] RunTime={duration + late_tail:.3f} sec; Warm up time=5000 msec; SentMessages={int((duration + late_tail) * 1000)}; ReceivedMessages={received}\n"
+                                f"[Valid Duration] RunTime={duration + late_tail - .45:.3f} sec; SentMessages={int((duration + late_tail - .45) * 1000)}; ReceivedMessages={received}\n",
                                 encoding="utf-8")
                         elif executable == "iperf3":
                             duration = int(native_request.argv[native_request.argv.index("-t") + 1])
