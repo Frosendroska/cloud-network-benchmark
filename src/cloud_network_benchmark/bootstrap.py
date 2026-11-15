@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 17954)
-Total output lines: 876
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -543,7 +540,65 @@ def _failure_result(connection, actions, vm, request, result, category, message,
 
 def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> BootstrapResult:
     actions: List[RemoteActionEvidence] = []
-…1954 tokens truncated…t = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
+    builds: List[BuildObservation] = []
+    listeners: List[ListenerObservation] = []
+    sources = {source.tool: source for source in config.sources}
+    tool_index = 0
+    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
+        init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable between VM preparations", builds, listeners)
+        if deadline.remaining(clock, readiness=True) <= 0:
+            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="no time remains before remote preparation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+        for argv, timeout_name, kind in init:
+            timeout = min(getattr(connection.timeouts, timeout_name), deadline.remaining(clock, readiness=True))
+            req = _request(f"f02r-{role}-cloud-init", vm, argv, timeout)
+            result = _execute(runner, req)
+            actions.append(_action(req.action_id, "ssh", vm, req, result))
+            if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
+                return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
+        if not _identity_references_available(vm):
+            failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable"))
+            actions.append(_action(failed_request.action_id, "ssh", vm, failed_request, failed_result))
+            return _failure_result(connection, actions, vm, failed_request, failed_result, "transport_preflight_failed", "SSH identity reference became unavailable", builds, listeners)
+        if role == "vm_b":
+            for tool, port, stdout_path, stderr_path in (("sockperf", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
+                remaining = deadline.remaining(clock, readiness=True)
+                if remaining <= 0:
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
+                inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
+                observed = _execute(runner, inspect_request)
+                actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
+                if observed.outcome == CommandOutcome.SUCCEEDED:
+                    load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
+                    if load_state != "not-found":
+                        cat_remaining = deadline.remaining(clock, readiness=True)
+                        if cat_remaining <= 0:
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                        cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
+                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        if (cat_result.outcome != CommandOutcome.SUCCEEDED or
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
+                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
+                elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
+                    return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
+        for source in config.sources:
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            identity_request = _request(f"f02r-{role}-{source.tool}-identity-preflight", vm, ["sh", "-c", _identity_preflight_script(source, config)], min(connection.timeouts.command_seconds, remaining))
+            identity_result = _execute(runner, identity_request)
+            actions.append(_action(identity_request.action_id, "ssh", vm, identity_request, identity_result))
+            if identity_result.outcome != CommandOutcome.SUCCEEDED:
+                return _failure_result(connection, actions, vm, identity_request, identity_result, "installed_identity_mismatch", f"existing {source.tool} source or binary identity conflicts with requested build", builds, listeners)
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
             workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
             try:
                 workspace_result = _execute(runner, workspace_request)
