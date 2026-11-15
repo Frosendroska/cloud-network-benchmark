@@ -408,7 +408,8 @@ def _recipe(source: SourceBuild, config: BootstrapConfig) -> List[List[str]]:
         commands.extend([[f"{prefix}/bin/sockperf", "server", "--help"],
                          [f"{prefix}/bin/sockperf", "under-load", "--help"]])
     if source.observation_patch_path is not None:
-        commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {binary_q} >/dev/null && printf CNB_ACQ_V1"])
+        capability_binary = binary_q if source.tool == "sockperf" else shlex.quote(f"{prefix}/lib/libiperf.so")
+        commands.append(["sh", "-c", f"grep -a -F 'CNB_ACQ_V1' {capability_binary} >/dev/null && printf CNB_ACQ_V1"])
         identity_plain = f"{prefix}/.f02r-{source.tool}.build-identity"
         identity_path = shlex.quote(identity_plain)
         identity_tmp = identity_plain + ".$$.tmp"
