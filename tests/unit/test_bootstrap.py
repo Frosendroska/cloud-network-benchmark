@@ -30,6 +30,249 @@ def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_pat
     assert any("10.0.0.2" in rule and "5201" in rule and "drop" in rule for rule in acl_rules)
 
 
+def test_opted_in_runner_overlaps_vm_preparation_and_keeps_role_order(tmp_path):
+    from threading import Barrier, Lock
+
+    class ConcurrentRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+        def __init__(self):
+            super().__init__()
+            self.started = Barrier(2)
+            self.guard = Lock()
+            self.active = 0
+            self.max_active = 0
+            self.per_role = {"vm_a": [], "vm_b": []}
+
+        def run(self, request):
+            role = "vm_a" if "vm_a" in request.action_id else "vm_b"
+            if request.action_id.endswith("cloud-init"):
+                with self.guard:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                self.started.wait(timeout=5)
+            self.per_role[role].append(request.action_id)
+            try:
+                return super().run(request)
+            finally:
+                if request.action_id.endswith("cloud-init"):
+                    with self.guard:
+                        self.active -= 1
+
+    runner = ConcurrentRunner()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=deadline(), clock=lambda: 100)
+    assert outcome.succeeded
+    assert runner.max_active == 2
+    for requests in runner.per_role.values():
+        assert requests[0].endswith("cloud-init")
+        assert requests.index(next(x for x in requests if x.endswith("sockperf-0"))) < requests.index(
+            next(x for x in requests if x.endswith("iperf3-0")))
+    assert [item.role for item in outcome.builds] == ["vm_a", "vm_a", "vm_b", "vm_b"]
+    roles_in_order = [action.role for action in outcome.actions]
+    assert roles_in_order == sorted(roles_in_order, key=lambda role: 0 if role == "vm_a" else 1)
+
+
+def test_shared_readiness_deadline_is_not_reset_between_workers(tmp_path):
+    from threading import Barrier, Lock
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.access import RemoteDeadline
+
+    class SharedClock:
+        value = 10.0
+        lock = Lock()
+
+        def __call__(self):
+            with self.lock:
+                return self.value
+
+    clock = SharedClock()
+    now = datetime.now(timezone.utc)
+    limit = RemoteDeadline(readiness_deadline_monotonic=15, overall_deadline_monotonic=20,
+        cleanup_reserve_seconds=1, cap_started_at=now, cap_expires_at=now + timedelta(seconds=30))
+
+    class ExpiringRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+        def __init__(self):
+            super().__init__()
+            self.started = Barrier(2)
+            self.guard = Lock()
+            self.arrivals = 0
+
+        def run(self, request):
+            if request.action_id.endswith("cloud-init"):
+                self.started.wait(timeout=5)
+                with self.guard:
+                    self.arrivals += 1
+                    if self.arrivals == 2:
+                        clock.value = 16
+            return super().run(request)
+
+    runner = ExpiringRunner()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=limit, clock=clock)
+    assert not outcome.succeeded
+    assert outcome.failure.category == "readiness_deadline_exhausted"
+    assert {action.role for action in outcome.actions} == {"vm_a", "vm_b"}
+    assert all(action.action_id.endswith("cloud-init") for action in outcome.actions)
+
+
+def test_worker_exception_after_success_keeps_its_partial_evidence(tmp_path):
+    from threading import current_thread
+
+    class LaterFailureClock:
+        def __init__(self):
+            self.vm_a_calls = 0
+
+        def __call__(self):
+            if current_thread().name == "cnb-bootstrap_0":
+                self.vm_a_calls += 1
+                if self.vm_a_calls == 3:
+                    raise RuntimeError("synthetic deadline clock failure")
+            return 100
+
+    class ConcurrentRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+    runner = ConcurrentRunner()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=deadline(), clock=LaterFailureClock())
+    assert not outcome.succeeded
+    assert outcome.failure.category == "preparation_worker_failed"
+    assert outcome.failure.role == "vm_a"
+    assert any(action.action_id == "f02r-vm_a-cloud-init" for action in outcome.actions)
+    assert {action.role for action in outcome.actions} == {"vm_a", "vm_b"}
+
+
+def test_vm_b_primary_failure_is_not_replaced_by_vm_a_peer_cancellation(tmp_path):
+    from threading import Barrier
+
+    class VmBFailureRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+        def __init__(self):
+            super().__init__()
+            self.started = Barrier(2)
+
+        def run(self, request):
+            if request.action_id.endswith("cloud-init"):
+                self.started.wait(timeout=5)
+                if "vm_b" in request.action_id:
+                    return result(request.action_id, success=False, stderr="vm_b failed first")
+            return super().run(request)
+
+    runner = VmBFailureRunner()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=deadline(), clock=lambda: 100)
+    assert not outcome.succeeded
+    assert outcome.failure.category == "cloud_init_failed"
+    assert outcome.failure.role == "vm_b"
+    assert {action.role for action in outcome.actions} == {"vm_a", "vm_b"}
+    assert not any("listener-" in action.action_id for action in outcome.actions)
+
+
+def test_main_thread_interrupt_cancels_and_joins_inflight_role_workers(tmp_path, monkeypatch):
+    import concurrent.futures
+    import threading
+    from threading import Barrier, Event
+
+    release_inflight = Event()
+    inflight = Event()
+    cloud_init_barrier = Barrier(2)
+    original_event = threading.Event
+
+    class CancellationEvent(original_event):
+        def set(self):
+            super().set()
+            release_inflight.set()
+
+    created_events = []
+
+    def event_factory(*args, **kwargs):
+        event = (CancellationEvent(*args, **kwargs) if not created_events
+                 else original_event(*args, **kwargs))
+        created_events.append(event)
+        return event
+
+    class BlockingRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+        def __init__(self):
+            super().__init__()
+            self.active = 0
+            self.guard = threading.Lock()
+
+        def run(self, request):
+            if request.action_id.endswith("cloud-init"):
+                cloud_init_barrier.wait(timeout=5)
+            else:
+                with self.guard:
+                    self.active += 1
+                inflight.set()
+                release_inflight.wait(timeout=5)
+            try:
+                return super().run(request)
+            finally:
+                if not request.action_id.endswith("cloud-init"):
+                    with self.guard:
+                        self.active -= 1
+
+    runner = BlockingRunner()
+
+    def interrupted_completion(_futures):
+        assert inflight.wait(timeout=5)
+        with runner.guard:
+            assert runner.active >= 1
+        raise KeyboardInterrupt()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(threading, "Event", event_factory)
+    monkeypatch.setattr(concurrent.futures, "as_completed", interrupted_completion)
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=deadline(), clock=lambda: 100)
+    assert not outcome.succeeded
+    assert outcome.failure.category == "command_interrupted"
+    assert {action.role for action in outcome.actions} == {"vm_a", "vm_b"}
+    assert not any(action.action_id.startswith(("f02r-vm_b-listener-inspect-",
+        "f02r-vm_b-listener-sockperf", "f02r-vm_b-listener-iperf3",
+        "f02r-vm_b-acl-pre")) for action in outcome.actions)
+    assert runner.active == 0
+    assert created_events[0].is_set()
+    assert all(len([x for x in runner.requests if role in x.action_id]) <= 2
+               for role in ("vm_a", "vm_b"))
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_concurrent_failure_preserves_peer_evidence_and_never_starts_listeners(tmp_path, raises):
+    from threading import Barrier
+
+    class FailingConcurrentRunner(BootstrapRunner):
+        supports_concurrent_commands = True
+
+        def __init__(self):
+            super().__init__()
+            self.started = Barrier(2)
+
+        def run(self, request):
+            if request.action_id.endswith("cloud-init"):
+                self.started.wait(timeout=5)
+                if "vm_a" in request.action_id:
+                    if raises:
+                        raise RuntimeError("synthetic runner exception")
+                    return result(request.action_id, success=False, stderr="synthetic failure")
+            return super().run(request)
+
+    runner = FailingConcurrentRunner()
+    outcome = run_bootstrap(connection(tmp_path), bootstrap_config(), runner,
+                            deadline=deadline(), clock=lambda: 100)
+    assert not outcome.succeeded
+    assert outcome.failure.role == "vm_a"
+    assert {action.role for action in outcome.actions} == {"vm_a", "vm_b"}
+    assert not outcome.listeners
+    assert not any("f02r-vm_b-listener-" in action.action_id for action in outcome.actions)
+
+
 def test_source_digest_mismatch_stops_before_extract_or_other_vm(tmp_path):
     c=connection(tmp_path)
     class BadDigest(BootstrapRunner):

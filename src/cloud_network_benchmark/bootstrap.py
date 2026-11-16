@@ -545,13 +545,38 @@ def _failure_result(connection, actions, vm, request, result, category, message,
                            actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
 
 
+class _CancellationRunner:
+    """Stop a peer before its next remote dispatch after another role fails."""
+    def __init__(self, delegate, cancellation):
+        self.delegate = delegate
+        self.cancellation = cancellation
+
+    def run(self, request):
+        if not self.cancellation.is_set():
+            return self.delegate.run(request)
+        from datetime import datetime, timezone
+        from .contracts.execution import CommandResult
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.INTERRUPTED,
+            started_at=now, finished_at=now, duration_seconds=0, exit_code=None,
+            stdout="", stderr="peer preparation failed; command not dispatched",
+            redactions=request.redactions)
+
+
 def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> BootstrapResult:
     actions: List[RemoteActionEvidence] = []
     builds: List[BuildObservation] = []
     listeners: List[ListenerObservation] = []
     sources = {source.tool: source for source in config.sources}
     tool_index = 0
-    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
+    worker_state = {role: {"actions": [], "builds": [], "listeners": []}
+                    for _, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b"))}
+    def prepare_role(vm, role, cancellation=None):
+        actions = worker_state[role]["actions"]
+        builds = worker_state[role]["builds"]
+        listeners = worker_state[role]["listeners"]
+        tool_index = 0
+        command_runner = _CancellationRunner(runner, cancellation) if cancellation is not None else runner
         init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
         if not _identity_references_available(vm):
             failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
@@ -562,7 +587,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
         for argv, timeout_name, kind in init:
             timeout = min(getattr(connection.timeouts, timeout_name), deadline.remaining(clock, readiness=True))
             req = _request(f"f02r-{role}-cloud-init", vm, argv, timeout)
-            result = _execute(runner, req)
+            result = _execute(command_runner, req)
             actions.append(_action(req.action_id, "ssh", vm, req, result))
             if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
                 return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
@@ -577,7 +602,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
                 inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
-                observed = _execute(runner, inspect_request)
+                observed = _execute(command_runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
                 if observed.outcome == CommandOutcome.SUCCEEDED:
                     load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
@@ -586,7 +611,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         if cat_remaining <= 0:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
-                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if (cat_result.outcome != CommandOutcome.SUCCEEDED or
                             not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
                                 "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
@@ -598,7 +623,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
             identity_request = _request(f"f02r-{role}-{source.tool}-identity-preflight", vm, ["sh", "-c", _identity_preflight_script(source, config)], min(connection.timeouts.command_seconds, remaining))
-            identity_result = _execute(runner, identity_request)
+            identity_result = _execute(command_runner, identity_request)
             actions.append(_action(identity_request.action_id, "ssh", vm, identity_request, identity_result))
             if identity_result.outcome != CommandOutcome.SUCCEEDED:
                 return _failure_result(connection, actions, vm, identity_request, identity_result, "installed_identity_mismatch", f"existing {source.tool} source or binary identity conflicts with requested build", builds, listeners)
@@ -608,7 +633,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
             workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
             try:
-                workspace_result = _execute(runner, workspace_request)
+                workspace_result = _execute(command_runner, workspace_request)
             except Exception as exc:
                 failure = AccessFailureEvidence(stage="bootstrap", role=role, category="workspace_setup_failed", message=type(exc).__name__, action_id=workspace_request.action_id, occurred_at=datetime.now(timezone.utc))
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=failure, builds=builds, listeners=listeners)
@@ -630,7 +655,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 timeout = min(connection.timeouts.command_seconds, remaining)
                 aid = f"f02r-{role}-{source.tool}-{index}"
                 req = _request(aid, vm, argv, timeout)
-                result = _execute(runner, req)
+                result = _execute(command_runner, req)
                 actions.append(_action(aid, "ssh", vm, req, result))
                 if result.outcome != CommandOutcome.SUCCEEDED:
                     category = "tcp_congestion_control_unavailable" if source.tool == "iperf3" and argv[:2] == ["python3", "-c"] else "source_build_failed"
@@ -713,167 +738,250 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                                            observation_capability=evidence.get("observation_capability"),
                                            observation_semantics=("sockperf-3.10-enabled-v1" if source.tool == "sockperf" else "iperf-3.17.1-stats-v1") if evidence.get("observation_capability") else None,
                                            identity_bytes=identity_text))
-        if role == "vm_b":
-            # Establish the private-only ingress chain before starting either listener.
-            chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
-            pre_id = "f02r-vm_b-acl-preflight-inspect"
-            pre_remaining = deadline.remaining(clock, readiness=True)
-            if pre_remaining <= 0:
-                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before guest restriction", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            pre_request = _request(pre_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, pre_remaining))
-            pre_result = _execute(runner, pre_request)
-            actions.append(_action(pre_id, "ssh", vm, pre_request, pre_result))
-            if pre_result.outcome == CommandOutcome.SUCCEEDED:
-                if not _acl_matches(pre_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
-                    return _failure_result(connection, actions, vm, pre_request, pre_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
-            elif pre_result.outcome == CommandOutcome.FAILED and any(text in (pre_result.stdout + pre_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
-                rules = [
-                    ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
-                    ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
-                ]
-                for index, argv in enumerate(rules):
-                    remaining = deadline.remaining(clock, readiness=True)
-                    if remaining <= 0:
-                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while restricting guest ingress", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                    request = _request(f"f02r-vm_b-acl-pre-create-{index}", vm, argv, min(connection.timeouts.command_seconds, remaining))
-                    result = _execute(runner, request)
-                    actions.append(_action(request.action_id, "ssh", vm, request, result))
-                    if result.outcome != CommandOutcome.SUCCEEDED:
-                        return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
-            else:
-                return _failure_result(connection, actions, vm, pre_request, pre_result, "listener_acl_inspection_failed", "could not inspect guest benchmark ACL", builds, listeners)
-            for tool, protocol, port, stdout_path, stderr_path in (("sockperf", "udp", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", "tcp", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
-                prefix = config.install_prefix
-                address = connection.private_ipv4_b
-                server_argv = [f"{prefix}/bin/{tool}", *( ["server", "-i", address, "-p", str(port)] if tool == "sockperf" else ["-s", "-B", address, "-p", str(port), "--json-stream", "--forceflush"])]
-                unit = f"cnb-{connection.deployment_id}-{tool}"
-                inspect_id = f"f02r-vm_b-listener-inspect-{tool}"
+        from types import SimpleNamespace
+        return SimpleNamespace(succeeded=True, failure=None, actions=actions, builds=builds, listeners=listeners)
+
+    roles = ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b"))
+    outcomes = {}
+    if getattr(runner, "supports_concurrent_commands", False):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Event
+        cancellation = Event()
+        pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cnb-bootstrap")
+        futures = {pool.submit(prepare_role, vm, role, cancellation): role for vm, role in roles}
+        interrupted = None
+        primary_failure = None
+        try:
+            for future in as_completed(futures):
+                role = futures[future]
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    cancellation.set()
+                    outcome = BootstrapResult(succeeded=False, identity=connection.identity,
+                        deployment_id=connection.deployment_id,
+                        actions=worker_state[role]["actions"], builds=worker_state[role]["builds"],
+                        listeners=worker_state[role]["listeners"],
+                        failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                            category="preparation_worker_failed", message=type(exc).__name__,
+                            occurred_at=datetime.now(timezone.utc)))
+                outcomes[role] = outcome
+                if not outcome.succeeded:
+                    if primary_failure is None:
+                        primary_failure = outcome
+                    cancellation.set()
+        except BaseException as exc:
+            cancellation.set()
+            interrupted = exc
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+        for future, role in futures.items():
+            if role in outcomes:
+                continue
+            try:
+                outcomes[role] = future.result()
+            except BaseException as exc:
+                outcomes[role] = BootstrapResult(succeeded=False, identity=connection.identity,
+                    deployment_id=connection.deployment_id,
+                    actions=worker_state[role]["actions"], builds=worker_state[role]["builds"],
+                    listeners=worker_state[role]["listeners"],
+                    failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                        category="preparation_worker_failed", message=type(exc).__name__,
+                        occurred_at=datetime.now(timezone.utc)))
+        if interrupted is not None:
+            prior = outcomes.get("vm_a")
+            outcomes["vm_a"] = BootstrapResult(succeeded=False, identity=connection.identity,
+                deployment_id=connection.deployment_id,
+                actions=prior.actions if prior is not None else [],
+                builds=prior.builds if prior is not None else [],
+                listeners=prior.listeners if prior is not None else [],
+                failure=AccessFailureEvidence(stage="bootstrap", category="command_interrupted",
+                    message=type(interrupted).__name__, occurred_at=datetime.now(timezone.utc)))
+            primary_failure = outcomes["vm_a"]
+    else:
+        for vm, role in roles:
+            outcome = prepare_role(vm, role)
+            outcomes[role] = outcome
+            if not outcome.succeeded:
+                break
+    for vm, role in roles:
+        outcome = outcomes.get(role)
+        if outcome is not None:
+            actions.extend(outcome.actions)
+            builds.extend(outcome.builds)
+            listeners.extend(outcome.listeners)
+    failures = [outcomes[role] for _, role in roles if role in outcomes and not outcomes[role].succeeded]
+    if failures:
+        failed = primary_failure if getattr(runner, "supports_concurrent_commands", False) and primary_failure is not None else failures[0]
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=failed.failure, builds=builds, listeners=listeners)
+    if len(outcomes) != 2:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role="vm_b",
+                category="readiness_deadline_exhausted", message="preparation stopped after peer failure",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    vm, role = connection.vm_b, "vm_b"
+    if role == "vm_b":
+        # Establish the private-only ingress chain before starting either listener.
+        chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
+        pre_id = "f02r-vm_b-acl-preflight-inspect"
+        pre_remaining = deadline.remaining(clock, readiness=True)
+        if pre_remaining <= 0:
+            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before guest restriction", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+        pre_request = _request(pre_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, pre_remaining))
+        pre_result = _execute(runner, pre_request)
+        actions.append(_action(pre_id, "ssh", vm, pre_request, pre_result))
+        if pre_result.outcome == CommandOutcome.SUCCEEDED:
+            if not _acl_matches(pre_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
+                return _failure_result(connection, actions, vm, pre_request, pre_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
+        elif pre_result.outcome == CommandOutcome.FAILED and any(text in (pre_result.stdout + pre_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
+            rules = [
+                ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
+                ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
+            ]
+            for index, argv in enumerate(rules):
                 remaining = deadline.remaining(clock, readiness=True)
                 if remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
-                inspect_result = _execute(runner, inspect_request)
-                actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
-                if inspect_result.outcome == CommandOutcome.SUCCEEDED:
-                    output = inspect_result.stdout
-                    fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-                    if fields.get("LoadState") == "not-found":
-                        pass
-                    else:
-                        cat_remaining = deadline.remaining(clock, readiness=True)
-                        if cat_remaining <= 0:
-                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                        cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
-                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                        if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
-                                "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
-                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
-                        proc_id = f"f02r-vm_b-listener-process-{tool}"
-                        proc_remaining = deadline.remaining(clock, readiness=True)
-                        if proc_remaining <= 0:
-                            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                        proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
-                        proc_result = _execute(runner, proc_request)
-                        actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
-                        build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
-                        if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
-                            return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
-                        listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
-                            unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
-                            stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
-                        continue
-                elif inspect_result.outcome != CommandOutcome.FAILED or not any(text in (inspect_result.stdout + inspect_result.stderr).lower() for text in ("not found", "no such file", "could not be found")):
-                    return _failure_result(connection, actions, vm, inspect_request, inspect_result, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
-                stdout_abs = f"{config.workspace}/{stdout_path}"
-                stderr_abs = f"{config.workspace}/{stderr_path}"
-                mkdir_id = f"f02r-vm_b-listener-log-directory-{tool}"
-                mkdir_remaining = deadline.remaining(clock, readiness=True)
-                if mkdir_remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before log setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                mkdir_request = _request(mkdir_id, vm, ["sudo", "install", "-d", "-m", "0755", str(PurePosixPath(stdout_abs).parent)], min(connection.timeouts.command_seconds, mkdir_remaining))
-                mkdir_result = _execute(runner, mkdir_request)
-                actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
-                if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
-                    return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
-                command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs]
-                if tool == "iperf3" and sources[tool].observation_patch_path:
-                    command.append("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
-                command.extend(server_argv)
-                aid = f"f02r-vm_b-listener-{tool}"
-                remaining = deadline.remaining(clock, readiness=True)
-                if remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listeners", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                req = _request(aid, vm, command, min(connection.timeouts.server_seconds, remaining))
-                result = _execute(runner, req)
-                actions.append(_action(aid, "ssh", vm, req, result))
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while restricting guest ingress", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                request = _request(f"f02r-vm_b-acl-pre-create-{index}", vm, argv, min(connection.timeouts.command_seconds, remaining))
+                result = _execute(runner, request)
+                actions.append(_action(request.action_id, "ssh", vm, request, result))
                 if result.outcome != CommandOutcome.SUCCEEDED:
-                    return _failure_result(connection, actions, vm, req, result, "listener_setup_failed", f"{tool} listener was not observed", builds, listeners)
-                verify_id = f"f02r-vm_b-listener-verify-{tool}"
-                verify_remaining = deadline.remaining(clock, readiness=True)
-                if verify_remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener identity verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, verify_remaining))
-                verify_result = _execute(runner, verify_request)
-                actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
-                cat_remaining = deadline.remaining(clock, readiness=True)
-                if cat_remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service output path verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
-                cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
-                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
-                            "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
-                    return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
-                proc_id = f"f02r-vm_b-listener-process-{tool}"
-                proc_remaining = deadline.remaining(clock, readiness=True)
-                if proc_remaining <= 0:
-                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
-                proc_result = _execute(runner, proc_request)
-                actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
-                build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
-                if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
-                    return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
-                listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
-                    unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=stdout_abs,
-                    stderr_path=stderr_abs, allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
-            chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
-            inspect_id = "f02r-vm_b-acl-inspect"
+                    return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
+        else:
+            return _failure_result(connection, actions, vm, pre_request, pre_result, "listener_acl_inspection_failed", "could not inspect guest benchmark ACL", builds, listeners)
+        for tool, protocol, port, stdout_path, stderr_path in (("sockperf", "udp", 11111, "server-logs/sockperf.log", "server-logs/sockperf.err"), ("iperf3", "tcp", 5201, "server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err")):
+            prefix = config.install_prefix
+            address = connection.private_ipv4_b
+            server_argv = [f"{prefix}/bin/{tool}", *( ["server", "-i", address, "-p", str(port)] if tool == "sockperf" else ["-s", "-B", address, "-p", str(port), "--json-stream", "--forceflush"])]
+            unit = f"cnb-{connection.deployment_id}-{tool}"
+            inspect_id = f"f02r-vm_b-listener-inspect-{tool}"
             remaining = deadline.remaining(clock, readiness=True)
             if remaining <= 0:
-                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before ACL inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            inspect = _request(inspect_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, remaining))
-            acl_result = _execute(runner, inspect)
-            actions.append(_action(inspect_id, "ssh", vm, inspect, acl_result))
-            expected_acl = [f"{connection.private_ipv4_a}/32", connection.private_ipv4_b, "11111", "5201", "drop", "hook input"]
-            if acl_result.outcome == CommandOutcome.SUCCEEDED:
-                if not _acl_matches(acl_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
-                    return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
-            elif acl_result.outcome == CommandOutcome.FAILED and any(text in (acl_result.stdout + acl_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
-                rules = [
-                    ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
-                    ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
-                    ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
-                ]
-                for index, argv in enumerate(rules):
-                    aid = f"f02r-vm_b-acl-create-{index}"
-                    remaining = deadline.remaining(clock, readiness=True)
-                    if remaining <= 0:
-                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while applying ACL", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-                    request = _request(aid, vm, argv, min(connection.timeouts.command_seconds, remaining))
-                    result = _execute(runner, request)
-                    actions.append(_action(aid, "ssh", vm, request, result))
-                    if result.outcome != CommandOutcome.SUCCEEDED:
-                        return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
-            else:
-                return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_inspection_failed", "could not inspect guest benchmark ACL", builds, listeners)
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
+            inspect_result = _execute(runner, inspect_request)
+            actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
+            if inspect_result.outcome == CommandOutcome.SUCCEEDED:
+                output = inspect_result.stdout
+                fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+                if fields.get("LoadState") == "not-found":
+                    pass
+                else:
+                    cat_remaining = deadline.remaining(clock, readiness=True)
+                    if cat_remaining <= 0:
+                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                    cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
+                    cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                    if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                            "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
+                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
+                    proc_id = f"f02r-vm_b-listener-process-{tool}"
+                    proc_remaining = deadline.remaining(clock, readiness=True)
+                    if proc_remaining <= 0:
+                        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                    proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
+                    proc_result = _execute(runner, proc_request)
+                    actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
+                    build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
+                    if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
+                        return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
+                    listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
+                        unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
+                        stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
+                    continue
+            elif inspect_result.outcome != CommandOutcome.FAILED or not any(text in (inspect_result.stdout + inspect_result.stderr).lower() for text in ("not found", "no such file", "could not be found")):
+                return _failure_result(connection, actions, vm, inspect_request, inspect_result, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
+            stdout_abs = f"{config.workspace}/{stdout_path}"
+            stderr_abs = f"{config.workspace}/{stderr_path}"
+            mkdir_id = f"f02r-vm_b-listener-log-directory-{tool}"
+            mkdir_remaining = deadline.remaining(clock, readiness=True)
+            if mkdir_remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before log setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            mkdir_request = _request(mkdir_id, vm, ["sudo", "install", "-d", "-m", "0755", str(PurePosixPath(stdout_abs).parent)], min(connection.timeouts.command_seconds, mkdir_remaining))
+            mkdir_result = _execute(runner, mkdir_request)
+            actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
+            if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
+                return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
+            command = ["sudo", "systemd-run", "--unit", unit, "--property=Restart=no", "--property=UMask=0022", "--property=StandardOutput=append:" + stdout_abs, "--property=StandardError=append:" + stderr_abs]
+            if tool == "iperf3" and sources[tool].observation_patch_path:
+                command.append("--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3")
+            command.extend(server_argv)
+            aid = f"f02r-vm_b-listener-{tool}"
+            remaining = deadline.remaining(clock, readiness=True)
+            if remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listeners", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            req = _request(aid, vm, command, min(connection.timeouts.server_seconds, remaining))
+            result = _execute(runner, req)
+            actions.append(_action(aid, "ssh", vm, req, result))
+            if result.outcome != CommandOutcome.SUCCEEDED:
+                return _failure_result(connection, actions, vm, req, result, "listener_setup_failed", f"{tool} listener was not observed", builds, listeners)
+            verify_id = f"f02r-vm_b-listener-verify-{tool}"
+            verify_remaining = deadline.remaining(clock, readiness=True)
+            if verify_remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener identity verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, verify_remaining))
+            verify_result = _execute(runner, verify_request)
+            actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
+            cat_remaining = deadline.remaining(clock, readiness=True)
+            if cat_remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service output path verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
+            cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+            if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
+                    or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
+                        "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
+                return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
+            proc_id = f"f02r-vm_b-listener-process-{tool}"
+            proc_remaining = deadline.remaining(clock, readiness=True)
+            if proc_remaining <= 0:
+                return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+            proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
+            proc_result = _execute(runner, proc_request)
+            actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
+            build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
+            if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
+                return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
+            listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
+                unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=stdout_abs,
+                stderr_path=stderr_abs, allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
+        chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
+        inspect_id = "f02r-vm_b-acl-inspect"
+        remaining = deadline.remaining(clock, readiness=True)
+        if remaining <= 0:
+            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before ACL inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+        inspect = _request(inspect_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, remaining))
+        acl_result = _execute(runner, inspect)
+        actions.append(_action(inspect_id, "ssh", vm, inspect, acl_result))
+        expected_acl = [f"{connection.private_ipv4_a}/32", connection.private_ipv4_b, "11111", "5201", "drop", "hook input"]
+        if acl_result.outcome == CommandOutcome.SUCCEEDED:
+            if not _acl_matches(acl_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
+                return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_mismatch", "existing guest benchmark ACL does not match this deployment", builds, listeners)
+        elif acl_result.outcome == CommandOutcome.FAILED and any(text in (acl_result.stdout + acl_result.stderr).lower() for text in ("no such file", "does not exist", "not found")):
+            rules = [
+                ["sudo", "sh", "-c", "nft list table inet cnb_f02r >/dev/null 2>&1 || nft add table inet cnb_f02r"],
+                ["sudo", "nft", "add", "chain", "inet", "cnb_f02r", chain, "{", "type", "filter", "hook", "input", "priority", "-10", ";", "policy", "accept", ";", "}"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "accept"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "udp", "dport", "11111", "drop"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "saddr", f"{connection.private_ipv4_a}/32", "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "accept"],
+                ["sudo", "nft", "add", "rule", "inet", "cnb_f02r", chain, "ip", "daddr", connection.private_ipv4_b, "tcp", "dport", "5201", "drop"],
+            ]
+            for index, argv in enumerate(rules):
+                aid = f"f02r-vm_b-acl-create-{index}"
+                remaining = deadline.remaining(clock, readiness=True)
+                if remaining <= 0:
+                    return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while applying ACL", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+                request = _request(aid, vm, argv, min(connection.timeouts.command_seconds, remaining))
+                result = _execute(runner, request)
+                actions.append(_action(aid, "ssh", vm, request, result))
+                if result.outcome != CommandOutcome.SUCCEEDED:
+                    return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
+        else:
+            return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_inspection_failed", "could not inspect guest benchmark ACL", builds, listeners)
     if deadline.remaining(clock, readiness=True) <= 0:
         return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions,
                                failure=AccessFailureEvidence(stage="bootstrap", category="readiness_deadline_exhausted", message="preparation completed after the original deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
