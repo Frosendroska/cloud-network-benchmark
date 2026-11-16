@@ -1013,8 +1013,21 @@ class GcpProviderDriver:
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         if root == "pair" and action == "apply":
             trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-            slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
-            self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
+            # post-registration allowance includes this provision stage. Preserve
+            # the downstream reserve after it, while retaining the earlier
+            # absolute provision/command deadline established by provision().
+            provision_allowance = (
+                deployment.provisioning_timeout_seconds
+                or self.settings.registration_timeout_seconds
+            )
+            if provision_allowance > self.settings.post_registration_workflow_seconds:
+                raise GcpProviderError(
+                    "pair provision allowance exceeds the post-registration workflow allowance",
+                    category="cap_insufficient",
+                )
+            downstream_reserve = self.settings.post_registration_workflow_seconds - provision_allowance
+            pair_deadline = time.monotonic() + (trigger - self.clock()).total_seconds() - downstream_reserve
+            self._deadline = min(self._deadline or float("inf"), pair_deadline)
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
             raise GcpProviderError(f"GCP Terraform {root} {action} failed", category="terraform_failed", action_id=rc.action_id)

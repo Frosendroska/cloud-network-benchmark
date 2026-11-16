@@ -159,6 +159,76 @@ def test_fit_is_rechecked_after_template_prereads_before_pair_apply(tmp_path,mon
     assert calls==[]
 
 
+@pytest.mark.parametrize("remaining_after_prereads", [1062.477, 879.99])
+@pytest.mark.parametrize("provision_timeout", [180, None])
+def test_pair_apply_deadline_debits_registration_once_and_keeps_downstream_reserve(
+    tmp_path, monkeypatch, remaining_after_prereads, provision_timeout
+):
+    """Reproduce 107.523s elapsed: 99.772s registration + 7.708s template reads."""
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.providers import gcp as gcp_module
+
+    deployment, driver = _cleanup_fixture(tmp_path)
+    deployment = deployment.model_copy(update={"provisioning_timeout_seconds": provision_timeout})
+    reservation = deployment.reservation.value
+    trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    # Match the packet: 1,150s complete allowance = 90s registration +
+    # 1,060s after registration, including a 180s provision stage.
+    settings = driver.settings.model_copy(update={
+        "complete_workflow_remaining_seconds": 1150.0,
+        "registration_workflow_seconds": 90.0,
+        "post_registration_workflow_seconds": 1060.0,
+    })
+    driver = GcpProviderDriver(object(), settings, clock=lambda: utc_now[0])
+    utc_now = [trigger - timedelta(seconds=remaining_after_prereads)]
+    if remaining_after_prereads >= 1060.0:
+        driver._fit(reservation, trigger, 1060.0)
+    attempt = driver._attempt_dir(deployment)
+    driver._active_attempt = attempt
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id})
+    driver._deadline = 230.0  # absolute 180s provision deadline from monotonic 50
+    monotonic_now = [50.0]
+    monkeypatch.setattr(gcp_module.time, "monotonic", lambda: monotonic_now[0])
+    settings = settings.model_copy(update={"command_timeout_seconds": 300})
+    driver.settings = settings
+    monkeypatch.setattr(
+        "cloud_network_benchmark.terraform_work.initialize_terraform",
+        lambda *_args: monotonic_now.__setitem__(0, monotonic_now[0] + 2.0),
+    )
+    review = []
+    def reviewed(request, execute, *, review_seconds):
+        review.append((request, review_seconds))
+        monotonic_now[0] += 3.0
+        assert driver._deadline - monotonic_now[0] == pytest.approx(175.0)
+        return execute(request.model_copy(update={"timeout_seconds": request.timeout_seconds - 3.0}))
+    monkeypatch.setattr("cloud_network_benchmark.terraform_plan.reviewed_apply", reviewed)
+
+    class Runner:
+        def run(self, request):
+            now = datetime.now(timezone.utc)
+            stdout = '{"instances":{}}' if request.action_id == "gcp-pair-outputs" else ""
+            return CommandResult(
+                action_id=request.action_id, outcome="succeeded", started_at=now,
+                finished_at=now, duration_seconds=0, exit_code=0, stdout=stdout, stderr="",
+            )
+
+    driver.runner = Runner()
+    if remaining_after_prereads < 880.0:
+        with pytest.raises(GcpProviderError, match="absolute GCP command deadline elapsed"):
+            driver._terraform(attempt, "pair", "apply", deployment,
+                {"template_a": "template-a", "template_b": "template-b"})
+        assert not review
+        return
+
+    # At the incident's 1,062.477s remaining, reserving 880s downstream
+    # leaves 182.477s. The original provision deadline at monotonic 230 binds.
+    driver._terraform(attempt, "pair", "apply", deployment,
+        {"template_a": "template-a", "template_b": "template-b"})
+    assert len(review) == 1
+    assert review[0][0].timeout_seconds == pytest.approx(178.0)
+    assert driver._deadline == pytest.approx(230.0)
+
+
 def test_cost_undercoverage_and_changed_cap_are_rejected_before_provider_side_effects(tmp_path):
     from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRequest
     from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
@@ -472,7 +542,7 @@ def _cleanup_fixture(tmp_path):
     observation = observation.model_copy(update={"admission": observation.admission.model_copy(update={"cost_input_sha256": StringEvidence(value=source_hash)})})
     reservation = ReservationEvidence(schema_version=2, campaign_id="cleanup-test", reservation_id=Evidence[str](value="reserve-cleanup-1"), state="reserved", reserved_cost_usd=Evidence[float](value=5), cap_started_at=Evidence[datetime](value=now-timedelta(seconds=1)), expires_at=Evidence[datetime](value=now+timedelta(seconds=1199)), cap_start_policy_id=StringEvidence(value="reserve-first"), source_path="dated-register.csv", source_sha256=source_hash)
     deployment = ProviderDeploymentInput.from_observation(observation, campaign_id="cleanup-test", run_id="cleanup-test-gcp", bootstrap_template="bootstrap/cloud-init.yaml", terraform_directory="terraform/gcp", child_result_path="results/cleanup-test", config_sha256=resolved.config_source.sha256, implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40), reservation=Evidence(value=reservation))
-    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test", authentication_reference="attempt-key-ref", private_state_root=tmp_path/"state", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":5,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=300, registration_workflow_seconds=100, post_registration_workflow_seconds=200)
+    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test", authentication_reference="attempt-key-ref", private_state_root=tmp_path/"state", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":5,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=500, registration_workflow_seconds=100, post_registration_workflow_seconds=400)
     return deployment, GcpProviderDriver(object(), settings)
 
 
