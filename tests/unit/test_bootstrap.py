@@ -563,13 +563,15 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
             upstream_commit=iperf_commit, observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch",
             observation_patch_sha256=iperf_sha)]})
     class PatchedRunner(BootstrapRunner):
+        sockperf_version = "sockperf, version 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
+
         def run(self, request):
             aid = request.action_id
             tool = "sockperf" if "sockperf" in aid else "iperf3"
             if "CNB_BUILD_V1" in request.argv[-1]:
                 import base64
                 source = next(item for item in config.sources if item.tool == tool)
-                version = ("sockperf, version 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition"
+                version = (self.sockperf_version
                            if tool == "sockperf" else
                            "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0")
                 compiler = "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc."
@@ -588,7 +590,7 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
             if aid.endswith(f"{tool}-5"):
                 return result(aid, "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc.\n")
             if aid.endswith(f"{tool}-6"):
-                version = ("sockperf, version 3.10\nCopyright (c) Mellanox Technologies\nBuild options: acquisition\n"
+                version = (self.sockperf_version + "\n"
                            if tool == "sockperf" else
                            "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0\n")
                 return result(aid, version)
@@ -621,16 +623,35 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
     assert "compiler=$(cc --version)" in _recipe(config.sources[0], config)[-1][-1]
     assert "--version | head -n 1" not in _recipe(config.sources[0], config)[-1][-1]
 
-    class MalformedSockperfBanner(PatchedRunner):
-        def run(self, request):
-            if request.action_id.endswith("sockperf-6"):
-                from fixtures.f02r.support import result
-                return result(request.action_id,
-                    "sockperf, release 3.10\nCopyright (c) Mellanox Technologies\n")
-            return super().run(request)
-    rejected = run_bootstrap(connection(tmp_path), config, MalformedSockperfBanner(),
+    class PinnedArchiveBuildBanner(PatchedRunner):
+        sockperf_version = (
+            "sockperf, version 3.10-no.git\n"
+            "   compiled Nov 16 2026, 23:24:27\n\n"
+            "Copyright (C) 2011-2022 Mellanox Technologies Ltd.\n"
+            "SockPerf is open source software, see http://github.com/mellanox/sockperf\n")
+    archive_banner = run_bootstrap(connection(tmp_path), config, PinnedArchiveBuildBanner(),
         deadline=deadline(), clock=lambda: 100)
-    assert not rejected.succeeded and rejected.failure.category == "binary_version_missing"
+    assert archive_banner.succeeded
+    sockperf_build = next(build for build in archive_banner.builds if build.tool == "sockperf")
+    assert sockperf_build.binary_version.startswith("sockperf, version 3.10-no.git\n")
+
+    class LegacySockperfBanner(PatchedRunner):
+        sockperf_version = "sockperf version 3.10\nCopyright (c) Mellanox Technologies\n"
+    legacy_banner = run_bootstrap(connection(tmp_path), config, LegacySockperfBanner(),
+        deadline=deadline(), clock=lambda: 100)
+    assert legacy_banner.succeeded
+
+    class MalformedSockperfBanner(PatchedRunner):
+        pass
+
+    for banner in ("sockperf, release 3.10\nCopyright (c) Mellanox Technologies\n",
+                   "sockperf, version 3.10-no.gitx\nCopyright (c) Mellanox Technologies\n",
+                   "sockperf, version 3.10.\nCopyright (c) Mellanox Technologies\n"):
+        malformed_runner = MalformedSockperfBanner()
+        malformed_runner.sockperf_version = banner
+        rejected = run_bootstrap(connection(tmp_path), config, malformed_runner,
+            deadline=deadline(), clock=lambda: 100)
+        assert not rejected.succeeded and rejected.failure.category == "binary_version_missing"
 
 
 def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):

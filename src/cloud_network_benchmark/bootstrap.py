@@ -680,11 +680,10 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 elif index == 6:
                     version_text = _canonical_version_text(text)
                     if source.tool == "sockperf":
-                        # Pinned Sockperf 3.10 prints "sockperf, version 3.10";
-                        # keep the older explicit "sockperf version" form for
-                        # unpatched builds while rejecting unrelated comma text.
+                        # The pinned archive may append its evidenced "-no.git"
+                        # build suffix to the numeric version.
                         displayed = re.search(
-                            r"(?im)^\s*sockperf(?:,\s+version|\s+version)\s+\d+(?:\.\d+){1,3}(?:\s|$)",
+                            r"(?im)^\s*sockperf(?:,\s+version|\s+version)\s+\d+(?:\.\d+){1,3}(?:-no\.git)?(?:\s|$)",
                             version_text)
                     else:
                         displayed = re.search(r"(?im)^\s*iperf3?(?:\s|:|$)", version_text)
