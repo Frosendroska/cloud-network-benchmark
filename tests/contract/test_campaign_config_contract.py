@@ -86,7 +86,9 @@ def _northern_acceptance(repository_root: Path, provider: str, region: str, zone
 
 @pytest.mark.parametrize(
     ("provider", "region", "zone"),
-    [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a"), ("azure", "swedencentral", "1")],
+    [("aws", "eu-north-1", "eu-north-1a")]
+    + [("gcp", "europe-north1", zone) for zone in ("europe-north1-a", "europe-north1-b", "europe-north1-c")]
+    + [("azure", "swedencentral", "1")],
 )
 def test_northern_locality_is_accepted_for_named_same_zone_checks(
     repository_root: Path, provider: str, region: str, zone: str,
@@ -100,11 +102,24 @@ def test_northern_locality_is_accepted_for_named_same_zone_checks(
     assert config.provider_configs[provider].zones.vm_b == zone
 
 
+@pytest.mark.parametrize(("zone_a", "zone_b"), [
+    ("europe-north1-a", "europe-north1-b"),
+    ("europe-north1-b", "europe-north1-c"),
+    ("europe-north1-c", "europe-north1-a"),
+    ("europe-north1-d", "europe-north1-d"),
+])
+def test_gcp_northern_acceptance_rejects_mixed_or_unapproved_zones(repository_root: Path, zone_a: str, zone_b: str) -> None:
+    data = _northern_acceptance(repository_root, "gcp", "europe-north1", zone_a)
+    data["provider_configs"]["gcp"]["zones"]["vm_b"] = zone_b
+    with pytest.raises(ValueError, match="locality/placement|regions/zones do not match"):
+        CampaignConfiguration.model_validate(data)
+
+
 @pytest.mark.parametrize(
     ("provider", "region", "zone", "wrong_zone", "wrong_experiment"),
     [
         ("aws", "eu-north-1", "eu-north-1a", "eu-north-1b", "EXP-999"),
-        ("gcp", "europe-north1", "europe-north1-a", "europe-north1-b", "EXP-999"),
+        ("gcp", "europe-north1", "europe-north1-a", "europe-north1-d", "EXP-999"),
         ("azure", "swedencentral", "1", "2", "EXP-999"),
     ],
 )
@@ -115,7 +130,7 @@ def test_northern_locality_rejects_wrong_zone_identity_and_network(
     item = data["provider_configs"][provider]
     item["zones"]["vm_a"] = wrong_zone
     item["zones"]["vm_b"] = wrong_zone
-    with pytest.raises(ValueError, match="regions/zones do not match"):
+    with pytest.raises(ValueError, match="locality/placement|regions/zones do not match"):
         CampaignConfiguration.model_validate(data)
     item["zones"] = {"vm_a": zone, "vm_b": zone}
     data["experiment_id"] = wrong_experiment

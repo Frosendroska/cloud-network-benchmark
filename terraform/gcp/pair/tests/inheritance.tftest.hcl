@@ -73,3 +73,45 @@ run "reject_unreviewed_finland_zone" {
   }
   expect_failures = [terraform_data.scope_guard]
 }
+
+run "finland_zone_b_pair" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-b"
+    zone_b = "europe-north1-b"
+  }
+  assert {
+    condition = google_compute_instance_from_template.vm_a.zone == "europe-north1-b" && google_compute_instance_from_template.vm_b.zone == "europe-north1-b"
+    error_message = "approved Finland B pair retains the exact requested zone"
+  }
+}
+
+run "finland_zone_c_pair" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-c"
+    zone_b = "europe-north1-c"
+  }
+  assert {
+    condition = google_compute_instance_from_template.vm_a.zone == "europe-north1-c" && google_compute_instance_from_template.vm_b.zone == "europe-north1-c"
+    error_message = "approved Finland C pair retains the exact requested zone"
+  }
+}
+
+run "reject_unapproved_finland_zone" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-d"
+    zone_b = "europe-north1-d"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}
+
+run "reject_other_mixed_finland_zones" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-b"
+    zone_b = "europe-north1-c"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}

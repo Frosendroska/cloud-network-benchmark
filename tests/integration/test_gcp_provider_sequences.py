@@ -83,6 +83,21 @@ def test_finland_provider_scope_rejects_non_acceptance_identity_before_commands(
                     deployment.model_copy(update={"mode": "short_study"})):
         with pytest.raises(GcpProviderError, match="Finland is limited"):
             GcpProviderDriver._validate_deployment(changed)
+    for zone_a, zone_b in (("europe-north1-a", "europe-north1-b"),
+                            ("europe-north1-b", "europe-north1-c"),
+                            ("europe-north1-c", "europe-north1-a"),
+                            ("europe-north1-d", "europe-north1-d")):
+        changed = deployment.model_copy(update={
+            "vm_a": deployment.vm_a.model_copy(update={"zone": zone_a}),
+            "vm_b": deployment.vm_b.model_copy(update={"zone": zone_b}),
+        })
+        with pytest.raises(GcpProviderError, match="Finland is limited|selected Frankfurt/London"):
+            GcpProviderDriver._validate_deployment(changed)
+    wrong_region = deployment.model_copy(update={
+        "vm_a": deployment.vm_a.model_copy(update={"region": "europe-west3", "zone": "europe-west3-a"}),
+    })
+    with pytest.raises(GcpProviderError, match="selected Frankfurt/London"):
+        GcpProviderDriver._validate_deployment(wrong_region)
 
 
 def test_incomplete_gcloud_inventory_warning_and_malformed_response_fail_closed(tmp_path):
@@ -313,29 +328,30 @@ def test_success_and_repeated_cleanup_keep_saved_primary_failure(tmp_path,monkey
     assert json.loads((attempt/"attempt.json").read_text())["primary_failure"]["message"]=="original pair failure"
 
 
-@pytest.mark.parametrize(("scenario", "policy_mutation", "north"), [
-    ("same_zone", None, False), ("cross_zone", None, False),
-    ("placement_optimization", None, False), ("inter_region", None, False),
-    ("placement_optimization", "extra", False), ("placement_optimization", "duplicate", False),
-    ("placement_optimization", "missing", False), ("placement_optimization", "foreign", False),
-    ("placement_optimization", "mismatched", False),
-    ("same_zone", None, True),
+@pytest.mark.parametrize(("scenario", "policy_mutation", "north_zone"), [
+    ("same_zone", None, None), ("cross_zone", None, None),
+    ("placement_optimization", None, None), ("inter_region", None, None),
+    ("placement_optimization", "extra", None), ("placement_optimization", "duplicate", None),
+    ("placement_optimization", "missing", None), ("placement_optimization", "foreign", None),
+    ("placement_optimization", "mismatched", None),
+    *(('same_zone', None, zone) for zone in ("europe-north1-a", "europe-north1-b", "europe-north1-c")),
 ])
-def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario, policy_mutation, north):
+def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_path, scenario, policy_mutation, north_zone):
     import base64, hashlib, json, struct
     from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
     from cloud_network_benchmark.contracts.execution import CommandResult
     from cloud_network_benchmark.providers.gcp import GcpProviderDriver
 
     base, fixture_driver = _cleanup_fixture(tmp_path)
+    north = north_zone is not None
     if north:
         north_network = base.vm_a.network.model_copy(update={
             "address_spaces": {"europe-north1": "10.80.1.0/24"},
             "subnets": {"europe-north1": ["10.80.1.0/24"]},
         })
         base = base.model_copy(update={
-            "vm_a": base.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
-            "vm_b": base.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
+            "vm_a": base.vm_a.model_copy(update={"region": "europe-north1", "zone": north_zone, "network": north_network}),
+            "vm_b": base.vm_b.model_copy(update={"region": "europe-north1", "zone": north_zone, "network": north_network}),
         })
     vm_b = base.vm_b
     placement = base.placement
@@ -430,9 +446,11 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     output=driver.provision(deployment)
     if north:
         assert (output.vm_a.region, output.vm_b.region) == ("europe-north1", "europe-north1")
-        assert (output.vm_a.zone, output.vm_b.zone) == ("europe-north1-a", "europe-north1-a")
+        assert (output.vm_a.zone, output.vm_b.zone) == (north_zone, north_zone)
         protection_vars = json.loads((driver._attempt_dir(deployment)/"protection"/"vars.json").read_text())
-        assert (protection_vars["zone_a"], protection_vars["zone_b"]) == ("europe-north1-a", "europe-north1-a")
+        assert (protection_vars["zone_a"], protection_vars["zone_b"]) == (north_zone, north_zone)
+        pair_vars = json.loads((driver._attempt_dir(deployment)/"pair"/"vars.json").read_text())
+        assert (pair_vars["zone_a"], pair_vars["zone_b"]) == (north_zone, north_zone)
         assert protection_vars["image_a"] == protection_vars["image_b"] == settings.images["europe-north1"]
     assert (output.vm_a.private_ipv4,output.vm_b.private_ipv4)==(("10.80.1.10","10.80.1.11") if scenario!="inter_region" else ("10.80.1.10","10.81.1.11"))
     assert output.vm_a.connection.host == "8.8.8.8" and output.vm_b.connection.host == "1.1.1.1"

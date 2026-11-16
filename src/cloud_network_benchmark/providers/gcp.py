@@ -30,7 +30,7 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {
     "europe-west3": ("europe-west3-a", "europe-west3-b"),
     "europe-west2": ("europe-west2-a",),
-    "europe-north1": ("europe-north1-a",),
+    "europe-north1": ("europe-north1-a", "europe-north1-b", "europe-north1-c"),
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
@@ -559,7 +559,8 @@ class GcpProviderDriver:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
         northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
-                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
+                    and deployment.vm_a.zone == deployment.vm_b.zone
+                    and deployment.vm_a.zone in REGION_ZONES["europe-north1"])
         if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
                             and deployment.experiment_id == "EXP-902"):
             raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")

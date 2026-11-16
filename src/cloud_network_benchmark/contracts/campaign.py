@@ -433,18 +433,24 @@ class CampaignConfiguration(StrictModel):
                 },
             }[provider][scenario]
             locality = (tuple(item.regions.model_dump().values()), tuple(item.zones.model_dump().values()))
-            northern_locality = {
+            northern_localities = {
                 Provider.AZURE: (("swedencentral", "swedencentral"), ("1", "1")),
                 Provider.AWS: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
-                Provider.GCP: (("europe-north1", "europe-north1"), ("europe-north1-a", "europe-north1-a")),
+                Provider.GCP: {
+                    (("europe-north1", "europe-north1"), (zone, zone))
+                    for zone in ("europe-north1-a", "europe-north1-b", "europe-north1-c")
+                },
             }.get(provider)
+            northern_locality_matches = (
+                locality in northern_localities if provider == Provider.GCP else locality == northern_localities
+            )
             northern_acceptance = (
                 scenario == Scenario.SAME_ZONE
                 and mode == ExperimentMode.ACCEPTANCE
                 and self.context == "failure_check"
                 and providers == {provider}
                 and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}.get(provider)
-                and locality == northern_locality
+                and northern_locality_matches
             )
             if locality != expected_locality and not northern_acceptance:
                 raise ValueError(f"{provider.value} regions/zones do not match the registered {scenario.value} design")

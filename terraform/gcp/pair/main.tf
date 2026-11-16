@@ -7,6 +7,8 @@ resource "terraform_data" "scope_guard" {
         "europe-west3-a|europe-west3-b",
         "europe-west3-a|europe-west2-a",
         "europe-north1-a|europe-north1-a",
+        "europe-north1-b|europe-north1-b",
+        "europe-north1-c|europe-north1-c",
       ], "${var.zone_a}|${var.zone_b}")
       error_message = "GCP pair zones must match a selected baseline topology or Finland same-zone pair."
     }
