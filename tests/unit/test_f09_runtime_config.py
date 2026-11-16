@@ -189,3 +189,78 @@ def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repositor
     # 60s review is inside the 180s provision phase, leaving the normal 120s
     # command budget. The trigger slack is not mistaken for extra phase budget.
     assert _pair_apply_timeout_seconds(180, 120, 60, available_to_provision) == 180
+
+
+def test_gcp_workflow_factory_supplies_full_and_post_registration_allowances(repository_root, tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence
+    from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark.lifecycle_adapters import RemoteStages
+    from cloud_network_benchmark.lifecycle_runtime import build_provider_workflows
+
+    campaign, _ = resolve_campaign(repository_root / "configs/tests/exp-902-gcp-single-provider.yaml",
+                                   repository_root)
+    child = SimpleNamespace(run_id="initialized-campaign-gcp", deployment_id="initialized-campaign-gcp-deployment",
+        observation_id="initialized-gcp-observation", execution_state="initialized", mode="acceptance",
+        config_provenance=SimpleNamespace(sha256=campaign.config_source.sha256,
+            resolved_snapshot_sha256=StringEvidence(value="a" * 64),
+            implementation_git_commit=StringEvidence(value="b" * 40),
+            design_git_commit=StringEvidence(value="c" * 40)))
+    parent = SimpleNamespace(campaign_id="initialized-campaign",
+        child_runs=[SimpleNamespace(provider="gcp", result_path="results/initialized-gcp")])
+    source = tmp_path / "costs.json"
+    payload = {"provider_run_envelopes": {"gcp": {"run_id": child.run_id}}}
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    costs = CostInputs("fixture", "2026-10-23", str(source), digest, digest, payload, ("fixture",), False)
+    now = datetime.now(timezone.utc)
+    reservation = ReservationEvidence(schema_version=2, campaign_id=parent.campaign_id,
+        reservation_id=Evidence[str](value="reservation-gcp-test"), state="reserved",
+        reserved_cost_usd=Evidence[float](value=10), cap_started_at=Evidence[datetime](value=now),
+        expires_at=Evidence[datetime](value=now + timedelta(seconds=1200)),
+        cap_start_policy_id=StringEvidence(value="reservation-activation-before-provider-expiry"),
+        source_path=str(source), source_sha256=digest)
+    workflow_cost = tmp_path / "gcp-cost-handoff.json"
+    workflow_cost.write_text(json.dumps({"source_path": str(source), "source_sha256": digest,
+        "prices_checked_on": "2026-10-23", "estimated_total_usd": 10, "units": {"vm": "hour"}}))
+    public_key = tmp_path / "id_ed25519.pub"
+    public_key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test\n")
+    allowance = WorkflowAllowance(90, 180, 540, 60, 100, 15, 45, 120, "source-bound-fixture", {"gcp": 30})
+    runtime = {"allowance": allowance, "providers": {"gcp": {
+        "options": {"project_id": "cnb-test-12345", "controller_cidr": "203.0.113.4/32",
+            "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001",
+                "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"},
+            "public_key_path": public_key, "authentication_reference": "test-key-ref"},
+        "bootstrap_template": repository_root / "terraform/gcp/bootstrap.yaml",
+        "terraform_directory": repository_root / "terraform/gcp",
+        "sources": {"workflow_cost_handoff_path": workflow_cost,
+            "support_cost_path": repository_root / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
+            "primary_review_path": None}}}}
+
+    class Clock:
+        @staticmethod
+        def utc_now(): return now
+        @staticmethod
+        def monotonic(): return 100.0
+    class Ledger:
+        controller_session_id = "test-session"
+        def inspect(self):
+            return {"reservations": {"reservation-gcp-test": {"session": self.controller_session_id,
+                "cap_start_monotonic": 100, "cap_seconds": 1200}}}
+
+    captured = {}
+    def capture(driver, deployment, request, **kwargs):
+        captured.update(driver=driver, deployment=deployment, request=request, kwargs=kwargs)
+        return SimpleNamespace(provider="gcp")
+    monkeypatch.setattr("cloud_network_benchmark.lifecycle_adapters.gcp_hooks", capture)
+    stages = RemoteStages(*(lambda *_args: None for _ in range(6)))
+    workflows = build_provider_workflows(campaign=campaign, parent=parent,
+        children={"gcp": child}, costs=costs, runtime=runtime, reservation=reservation,
+        ledger=Ledger(), runner=object(), clock=Clock(), stages={"gcp": stages}, private_root=tmp_path)
+
+    assert set(workflows) == {"gcp"}
+    assert captured["driver"].settings.complete_workflow_remaining_seconds == 1150
+    assert captured["driver"].settings.registration_workflow_seconds == 90
+    assert captured["driver"].settings.post_registration_workflow_seconds == 1060
+    assert captured["request"].expires_at.value == reservation.expires_at.value - timedelta(seconds=30)

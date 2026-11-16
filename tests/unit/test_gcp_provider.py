@@ -23,6 +23,8 @@ def settings(tmp_path, **changes):
         "complete_workflow_cost_handoff": StructuredEvidence(value={"source_path": "tracking/run-register-2026-10-23.csv", "source_sha256": "a" * 64, "prices_checked_on": "2026-10-23", "estimated_total_usd": 9.5, "units": {"boot_disk_gib": 32, "public_ipv4": "hour", "transfer": "GiB"}}),
         "support_cost_evidence": StructuredEvidence(value={"id": "gcp-template-placement-support-2026-10-23", "prices_checked_on": "2026-10-23", "source_path": "tests/fixtures/gcp/zero-support-cost-source.md", "source_sha256": "ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf", "template_support_cost_usd": 0, "placement_policy_support_cost_usd": 0, "rationale": "No separate per-template or placement-policy support fee is charged."}),
         "complete_workflow_remaining_seconds": 600.0,
+        "registration_workflow_seconds": 90.0,
+        "post_registration_workflow_seconds": 510.0,
     }
     data.update(changes)
     return GcpRuntimeSettings(**data)
@@ -53,6 +55,24 @@ def test_runtime_rejects_invalid_complete_cost_total(tmp_path, estimate):
 def test_runtime_rejects_nonfinite_complete_workflow_estimate(tmp_path):
     with pytest.raises(ValidationError):
         settings(tmp_path, complete_workflow_remaining_seconds=float("inf"))
+
+
+@pytest.mark.parametrize("estimate", [0, -1, float("inf"), 600.0, 500.0])
+def test_runtime_rejects_malformed_post_registration_workflow_estimate(tmp_path, estimate):
+    with pytest.raises(ValidationError):
+        settings(tmp_path, post_registration_workflow_seconds=estimate)
+
+
+def test_legacy_gcp_cleanup_settings_keep_full_remainder_as_post_registration(tmp_path):
+    from cloud_network_benchmark.lifecycle_cleanup import _gcp_cleanup_settings
+
+    data = settings(tmp_path).model_dump(mode="python")
+    data.pop("registration_workflow_seconds")
+    data.pop("post_registration_workflow_seconds")
+    adapted = _gcp_cleanup_settings(data)
+
+    assert adapted.registration_workflow_seconds == 0
+    assert adapted.post_registration_workflow_seconds == adapted.complete_workflow_remaining_seconds == 600
 
 
 def test_runtime_rejects_malformed_dated_support_cost_source(tmp_path):

@@ -12,7 +12,7 @@ import uuid
 from threading import local
 import time
 from datetime import datetime, timedelta, timezone
-from math import isfinite
+from math import isclose, isfinite
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlparse
@@ -65,6 +65,8 @@ class GcpRuntimeSettings(StrictModel):
     complete_workflow_cost_handoff: StructuredEvidence
     support_cost_evidence: StructuredEvidence
     complete_workflow_remaining_seconds: float = Field(gt=0)
+    registration_workflow_seconds: float = Field(ge=0)
+    post_registration_workflow_seconds: float = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
@@ -94,8 +96,25 @@ class GcpRuntimeSettings(StrictModel):
             raise ValueError("complete workflow estimate must be finite")
         return value
 
+    @field_validator("registration_workflow_seconds")
+    @classmethod
+    def finite_registration_time(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("registration workflow estimate must be finite")
+        return value
+
+    @field_validator("post_registration_workflow_seconds")
+    @classmethod
+    def finite_post_registration_time(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("post-registration workflow estimate must be finite")
+        return value
+
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
+        if not isclose(self.complete_workflow_remaining_seconds - self.post_registration_workflow_seconds,
+                       self.registration_workflow_seconds, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("complete workflow allowance must equal registration plus post-registration work")
         validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
@@ -183,15 +202,16 @@ class GcpProviderDriver:
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         if journal.get("registered"):
             if journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
                 raise GcpProviderError("an earlier controller session cannot reuse registered protection; resolve the attempt through cleanup", category="cleanup_open")
             if journal.get("binding_sha256") != self._binding_fingerprint(deployment):
                 raise GcpProviderError("registered attempt no longer matches its immutable inputs", category="state_identity_mismatch")
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             return ExpiryEvidence.model_validate(journal["expiry"])
         if journal.get("registration_may_have_started"):
             raise GcpProviderError("an earlier interrupted registration cannot be restarted under this attempt", category="cleanup_open")
+        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds, time.monotonic() + max(0.0, (trigger - self.clock()).total_seconds()))
         journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": CONTROLLER_SESSION_ID})
         self._save(attempt, journal)
@@ -223,7 +243,7 @@ class GcpProviderDriver:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise GcpProviderError("registration clock must be timezone-aware", category="cap_order")
             now = now.astimezone(timezone.utc)
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             if not reservation.cap_started_at.value <= now <= trigger:
                 raise GcpProviderError("expiry registration is outside the original reservation window", category="cap_order")
             cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
@@ -276,18 +296,18 @@ class GcpProviderDriver:
             raise GcpProviderError("reservation, project or cost-source identity changed after registration", category="state_identity_mismatch")
         self._assert_no_open_cleanup(deployment)
         trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
         self._verify_registered_templates(journal, trigger, deployment)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
         self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds), time.monotonic() + max(0.0, (trigger-self.clock()).total_seconds()))
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
         try:
             templates = journal["templates"]
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             pair = self._terraform(attempt, "pair", "apply", deployment, {"template_a": templates["vm_a"]["self_link_unique"], "template_b": templates["vm_b"]["self_link_unique"]})
             values = self._outputs(pair).get("instances", {})
             if set(values) != {"vm_a", "vm_b"} or len({str(item.get("id")) for item in values.values()}) != 2 or len({item.get("name") for item in values.values()}) != 2:

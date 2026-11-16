@@ -3,7 +3,7 @@ import pytest
 
 pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
-from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID, GcpProviderDriver, SAFETY_LEAD_SECONDS
+from cloud_network_benchmark.providers.gcp import CONTROLLER_SESSION_ID, GcpProviderDriver, GcpProviderError, SAFETY_LEAD_SECONDS
 from cloud_network_benchmark.contracts.admission import ReservationEvidence
 from cloud_network_benchmark.contracts.common import Evidence, StringEvidence
 
@@ -395,36 +395,54 @@ def test_registration_observes_both_absolute_stop_templates_before_any_pair(tmp_
     now = datetime.now(timezone.utc)
     source_hash = "a" * 64
     observation = observation.model_copy(update={"admission": observation.admission.model_copy(update={"cost_input_sha256": StringEvidence(value=source_hash)})})
-    reservation = ReservationEvidence(schema_version=2, campaign_id="gcp-test", reservation_id=Evidence[str](value="reserve-gcp-1"), state="reserved", reserved_cost_usd=Evidence[float](value=10), cap_started_at=Evidence[datetime](value=now-timedelta(seconds=2)), expires_at=Evidence[datetime](value=now+timedelta(seconds=1198)), cap_start_policy_id=StringEvidence(value="reservation-activation-before-provision"), source_path="dated-register.csv", source_sha256=source_hash)
+    reservation = ReservationEvidence(schema_version=2, campaign_id="gcp-test", reservation_id=Evidence[str](value="reserve-gcp-1"), state="reserved", reserved_cost_usd=Evidence[float](value=10), cap_started_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=now+timedelta(seconds=1200)), cap_start_policy_id=StringEvidence(value="reservation-activation-before-provision"), source_path="dated-register.csv", source_sha256=source_hash)
     deployment = ProviderDeploymentInput.from_observation(observation, campaign_id="gcp-test", run_id="gcp-test-gcp", bootstrap_template="bootstrap/cloud-init.yaml", terraform_directory="terraform/gcp", child_result_path="results/gcp-test", config_sha256=resolved.config_source.sha256, implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40), reservation=Evidence(value=reservation))
     end = reservation.expires_at.value-timedelta(seconds=SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id, provider="gcp", action="stop", expires_at=Evidence[datetime](value=end), reservation_id=reservation.reservation_id, resource_namespace=deployment.run_id, target_selector=f"project=cnb-test-12345;run_id={deployment.run_id};deployment_id={deployment.deployment_id};roles=vm_a,vm_b")
     key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test"
-    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key=key, authentication_reference="attempt-identity", private_state_root=tmp_path/"private", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":10,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=300)
+    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key=key, authentication_reference="attempt-identity", private_state_root=tmp_path/"private", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":10,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=1150, registration_workflow_seconds=90, post_registration_workflow_seconds=1060)
+    clock_now = [now]
     class Runner:
         def run(self, req):
             started=datetime.now(timezone.utc)
             role="vm_a" if "vm_a" in req.action_id else "vm_b"
-            value=_template_response(driver, deployment, role, "111" if role=="vm_a" else "222", end, now-timedelta(seconds=1))
+            value=_template_response(driver, deployment, role, "111" if role=="vm_a" else "222", end, now+timedelta(seconds=1))
             return CommandResult(action_id=req.action_id,outcome="succeeded",started_at=started,finished_at=started,duration_seconds=0.0,exit_code=0,stdout=json.dumps(value),stderr="")
-    driver=GcpProviderDriver(Runner(),settings,clock=lambda:now)
+    driver=GcpProviderDriver(Runner(),settings,clock=lambda:clock_now[0])
     events=[]
     def terraform(_attempt, root_name, action, _deployment, _extra):
         events.append((root_name,action))
         if action == "destroy": return {}
         namespace=driver._namespace(deployment)
+        clock_now[0] = now + timedelta(seconds=102.47)
         return {"templates":{"value":{"vm_a":{"id":"111","name":f"{namespace}-a","self_link_unique":f"projects/cnb-test-12345/global/instanceTemplates/{namespace}-a?uniqueId=111"},"vm_b":{"id":"222","name":f"{namespace}-b","self_link_unique":f"projects/cnb-test-12345/global/instanceTemplates/{namespace}-b?uniqueId=222"}}}}
     monkeypatch.setattr(driver,"_terraform",terraform)
     result=driver.register_expiry(deployment,request)
     assert result.state == "registered", result.failure
     assert set(result.provider_metadata.value["templates"]) == {"vm_a","vm_b"}
+    assert result.registered_at.value == now + timedelta(seconds=102.47)
+    assert result.expires_at.value == now + timedelta(seconds=1170)
+    assert settings.complete_workflow_remaining_seconds == 1150
+    assert settings.registration_workflow_seconds == 90
+    assert settings.post_registration_workflow_seconds == 1060
+    assert reservation.cap_started_at.value == now
+    assert reservation.expires_at.value == now + timedelta(seconds=1200)
+    assert settings.cost_source_path == "dated-register.csv"
+    assert settings.cost_input_sha256 == source_hash
+    assert (result.expires_at.value - clock_now[0]).total_seconds() == pytest.approx(1067.53)
+    with pytest.raises(GcpProviderError, match="whole remaining workflow"):
+        driver._fit(reservation, end, 1068)
     retry=driver.register_expiry(deployment,request)
     assert retry.registered_at == result.registered_at
     assert events == [("protection","apply")]
+    registered_journal = driver._load(driver._attempt_dir(deployment), deployment)
+    assert registered_journal["registered"] is True
+    assert not registered_journal.get("creation_may_have_started")
     restarted=GcpProviderDriver(Runner(),settings,clock=lambda:now)
     assert restarted.register_expiry(deployment,request).registered_at == result.registered_at
     assert events == [("protection","apply")]
 
+    clock_now[0] = now
     partial_deployment=deployment.model_copy(update={"run_id":"gcp-test-partial-gcp","deployment_id":"gcp-test-partial-gcp-deployment"})
     partial_request=request.model_copy(update={"run_id":partial_deployment.run_id,"deployment_id":partial_deployment.deployment_id,"resource_namespace":partial_deployment.run_id,"target_selector":f"project={settings.project_id};run_id={partial_deployment.run_id};deployment_id={partial_deployment.deployment_id};roles=vm_a,vm_b"})
     attempt=driver._attempt_dir(partial_deployment)
@@ -454,7 +472,7 @@ def _cleanup_fixture(tmp_path):
     observation = observation.model_copy(update={"admission": observation.admission.model_copy(update={"cost_input_sha256": StringEvidence(value=source_hash)})})
     reservation = ReservationEvidence(schema_version=2, campaign_id="cleanup-test", reservation_id=Evidence[str](value="reserve-cleanup-1"), state="reserved", reserved_cost_usd=Evidence[float](value=5), cap_started_at=Evidence[datetime](value=now-timedelta(seconds=1)), expires_at=Evidence[datetime](value=now+timedelta(seconds=1199)), cap_start_policy_id=StringEvidence(value="reserve-first"), source_path="dated-register.csv", source_sha256=source_hash)
     deployment = ProviderDeploymentInput.from_observation(observation, campaign_id="cleanup-test", run_id="cleanup-test-gcp", bootstrap_template="bootstrap/cloud-init.yaml", terraform_directory="terraform/gcp", child_result_path="results/cleanup-test", config_sha256=resolved.config_source.sha256, implementation_git_commit=StringEvidence(value="b"*40), design_git_commit=StringEvidence(value="c"*40), reservation=Evidence(value=reservation))
-    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test", authentication_reference="attempt-key-ref", private_state_root=tmp_path/"state", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":5,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=300)
+    settings = GcpRuntimeSettings(project_id="cnb-test-12345", controller_cidr="203.0.113.4/32", images={"europe-west3":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001","europe-west2":"projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"}, public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test", authentication_reference="attempt-key-ref", private_state_root=tmp_path/"state", cost_input_id=observation.admission.cost_input_id, cost_input_sha256=source_hash, cost_source_path="dated-register.csv", complete_workflow_cost_handoff=StructuredEvidence(value={"source_path":"dated-register.csv","source_sha256":source_hash,"prices_checked_on":"2026-10-23","estimated_total_usd":5,"units":{"vm":"hour","disk":"GiB-hour","address":"hour","transfer":"GiB"}}), support_cost_evidence=StructuredEvidence(value={"id":"gcp-template-placement-support-2026-10-23","prices_checked_on":"2026-10-23","source_path":"tests/fixtures/gcp/zero-support-cost-source.md","source_sha256":"ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf","template_support_cost_usd":0,"placement_policy_support_cost_usd":0,"rationale":"No separate per-template or placement-policy support fee is charged."}), complete_workflow_remaining_seconds=300, registration_workflow_seconds=100, post_registration_workflow_seconds=200)
     return deployment, GcpProviderDriver(object(), settings)
 
 

@@ -749,7 +749,10 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "cost_source_path": reservation.source_path,
                 "complete_workflow_cost_handoff": StructuredEvidence(value=handoff),
                 "support_cost_evidence": StructuredEvidence(value=support_evidence),
-                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds)}
+                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds),
+                "registration_workflow_seconds": float(runtime["allowance"].registration_seconds),
+                "post_registration_workflow_seconds": float(_remaining_f11_allowance(
+                    runtime["allowance"], "preparation").total_seconds)}
             if observation.admission.requires_primary_review:
                 review = sources.get("primary_review_path")
                 if review is None: raise ValueError("GCP scenario requires source-bound primary review")
