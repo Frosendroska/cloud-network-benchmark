@@ -216,6 +216,8 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
             absent_ids.extend(_nested_resource_ids(state.get("templates", {})))
             absent_ids.extend(_nested_resource_ids(state.get("observed_resources", {})))
             absent_ids.extend(_nested_resource_ids(state.get("observed_disks", [])))
+            namespace = GcpProviderDriver._namespace(d)
+            absent_ids.extend(_verified_orphan_template_ids(state, {f"{namespace}-a", f"{namespace}-b"}))
         except (OSError, json.JSONDecodeError):
             pass
     else:
@@ -245,6 +247,24 @@ def _nested_resource_ids(value: Any) -> list[str]:
     elif isinstance(value, (list, tuple)):
         for item in value: rows.extend(_nested_resource_ids(item))
     return rows
+
+
+def _verified_orphan_template_ids(state: Any, expected_names: set[str]) -> list[str]:
+    recovery = state.get("orphan_template_recovery") if isinstance(state, dict) else None
+    if not isinstance(recovery, dict) or recovery.get("absence_verified") is not True:
+        return []
+    deleted = recovery.get("deleted")
+    if not isinstance(deleted, list) or len(deleted) != 2 or any(not isinstance(item, dict) for item in deleted):
+        return []
+    names = [item.get("name") for item in deleted]
+    if not all(isinstance(name, str) for name in names) or set(names) != expected_names:
+        return []
+    identities = [item.get("id") for item in deleted if isinstance(item, dict)]
+    if len(identities) != 2 or any(not isinstance(value, str) or not value.isdigit() for value in identities):
+        return []
+    if len(set(identities)) != 2:
+        return []
+    return identities
 
 
 def _journal_ids(path: Path, key: str) -> list[str]:
@@ -376,10 +396,13 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
     elif saved.provider == Provider.AWS:
         absent_ids = _known_resource_ids(journal) + _nested_resource_ids(state.get("safety", {}))
     elif saved.provider == Provider.GCP:
+        from .providers.gcp import GcpProviderDriver
         absent_ids = (_journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
             + _nested_resource_ids(state.get("templates", {}))
             + _nested_resource_ids(state.get("observed_resources", {}))
-            + _nested_resource_ids(state.get("observed_disks", [])))
+            + _nested_resource_ids(state.get("observed_disks", []))
+            + _verified_orphan_template_ids(state, {f"{GcpProviderDriver._namespace(saved.deployment)}-a",
+                                                   f"{GcpProviderDriver._namespace(saved.deployment)}-b"}))
     else:
         absent_ids = [value for value in state.get("vm_ids", ()) if isinstance(value, str)]
         prereq = state.get("expiry", {})
@@ -476,7 +499,7 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> 
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             elif saved.provider == Provider.GCP:
-                from .providers.gcp import GcpCleanupResult
+                from .providers.gcp import GcpCleanupResult, GcpProviderDriver
                 result = GcpCleanupResult.model_validate(receipt["cleanup_result"])
                 journal = _expected_journal(saved)
                 state = json.loads(journal.read_text(encoding="utf-8"))
@@ -484,7 +507,9 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> 
                     + _journal_ids(journal, "observed_disks")
                     + _nested_resource_ids(state.get("templates", {}))
                     + _nested_resource_ids(state.get("observed_resources", {}))
-                    + _nested_resource_ids(state.get("observed_disks", [])))
+                    + _nested_resource_ids(state.get("observed_disks", []))
+                    + _verified_orphan_template_ids(state, {f"{GcpProviderDriver._namespace(saved.deployment)}-a",
+                                                           f"{GcpProviderDriver._namespace(saved.deployment)}-b"}))
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             else:

@@ -497,6 +497,251 @@ def test_cleanup_verifies_compute_absence_before_removing_protection_and_is_idem
     assert commands == [("pair","destroy"),("protection","destroy")]
 
 
+def test_interrupted_registration_recovers_only_fully_proven_orphan_templates(tmp_path, monkeypatch):
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    deployment, driver = _cleanup_fixture(tmp_path)
+    attempt = driver._attempt_dir(deployment)
+    reservation = deployment.reservation.value
+    trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    namespace = driver._namespace(deployment)
+    cap_start = reservation.cap_started_at.value
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "registration_may_have_started": True, "registered": False, "binding_sha256": driver._binding_fingerprint(deployment),
+        "reservation_id": reservation.reservation_id.value, "cap_started_at": cap_start.isoformat(),
+        "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat()})
+    descriptions = {
+        f"{namespace}-a": _template_response(driver, deployment, "vm_a", 7183431637078019760, trigger, cap_start + timedelta(milliseconds=1)),
+        f"{namespace}-b": _template_response(driver, deployment, "vm_b", 7829080923790806671, trigger, cap_start + timedelta(milliseconds=2)),
+    }
+    live = set(descriptions)
+    deleted = []
+    terraform = []
+    monkeypatch.setattr(driver, "_terraform", lambda _attempt, root, action, *_args: terraform.append((root, action)) or {})
+    def read(args, action):
+        if action == "gcp-instance_templates-inventory-all-scopes":
+            return [{"id": descriptions[name]["id"], "name": name, "selfLink": descriptions[name]["selfLink"], "labels": {}}
+                    for name in sorted(live)]
+        if action.startswith("gcp-orphan-template-read-"):
+            return descriptions[args[3]]
+        return []
+    monkeypatch.setattr(driver, "_gcloud_json", read)
+    def command(action, argv, cwd, timeout=None):
+        assert argv[:4] == [driver.settings.gcloud, "compute", "instance-templates", "delete"]
+        assert argv[-3:] == ["--project", driver.settings.project_id, "--quiet"]
+        name = argv[4]
+        assert name in live
+        import json
+        saved = json.loads((attempt / "attempt.json").read_text())["orphan_template_recovery"]
+        assert saved["absence_verified"] is False
+        assert {item["id"] for item in saved["deleted"]} == {"7183431637078019760", "7829080923790806671"}
+        deleted.append((name, argv))
+        live.remove(name)
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=action, outcome="succeeded", started_at=now, finished_at=now,
+                             duration_seconds=0, exit_code=0, stdout="", stderr="")
+    monkeypatch.setattr(driver, "_run", command)
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.inventory.value["pages_complete"] is True and not result.inventory.value["resources"]
+    assert terraform == [("protection", "destroy")]
+    assert [name for name, _argv in deleted] == [f"{namespace}-a", f"{namespace}-b"]
+    import json
+    from cloud_network_benchmark.lifecycle_cleanup import _verified_orphan_template_ids
+    recovery = json.loads((attempt / "attempt.json").read_text())
+    assert recovery["orphan_template_recovery"]["absence_verified"] is True
+    assert set(_verified_orphan_template_ids(recovery, {f"{namespace}-a", f"{namespace}-b"})) == {"7183431637078019760", "7829080923790806671"}
+
+
+@pytest.mark.parametrize("failure", ["partial_delete", "partial_then_wrong_id", "partial_then_wrong_config", "incomplete_readback", "incomplete_initial"])
+def test_orphan_template_recovery_keeps_cleanup_blocked_without_complete_absence(tmp_path, monkeypatch, failure):
+    import json
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    deployment, driver = _cleanup_fixture(tmp_path)
+    attempt = driver._attempt_dir(deployment)
+    reservation = deployment.reservation.value
+    trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    namespace = driver._namespace(deployment)
+    start = reservation.cap_started_at.value
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "registration_may_have_started": True, "registered": False, "binding_sha256": driver._binding_fingerprint(deployment),
+        "reservation_id": reservation.reservation_id.value, "cap_started_at": start.isoformat(),
+        "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat()})
+    descriptions = {
+        f"{namespace}-a": _template_response(driver, deployment, "vm_a", 201, trigger, start + timedelta(milliseconds=1)),
+        f"{namespace}-b": _template_response(driver, deployment, "vm_b", 202, trigger, start + timedelta(milliseconds=2)),
+    }
+    live = set(descriptions)
+    monkeypatch.setattr(driver, "_terraform", lambda *_args: {})
+    def read(args, action):
+        if action == "gcp-instance_templates-inventory-all-scopes":
+            return [{"id": descriptions[name]["id"], "name": name, "selfLink": descriptions[name]["selfLink"], "labels": {}}
+                    for name in sorted(live)]
+        if action.startswith("gcp-orphan-template-read-"): return descriptions[args[3]]
+        return []
+    monkeypatch.setattr(driver, "_gcloud_json", read)
+    deleted = []
+    failed_once = False
+    def command(action, argv, cwd, timeout=None):
+        nonlocal failed_once
+        name = argv[4]
+        deleted.append(name)
+        if failure.startswith("partial") and name.endswith("-b") and not failed_once:
+            failed_once = True
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=action, outcome="failed", started_at=now, finished_at=now,
+                                 duration_seconds=0, exit_code=1, stdout="", stderr="failed")
+        live.remove(name)
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=action, outcome="succeeded", started_at=now, finished_at=now,
+                             duration_seconds=0, exit_code=0, stdout="", stderr="")
+    monkeypatch.setattr(driver, "_run", command)
+    if failure in {"incomplete_readback", "incomplete_initial"}:
+        original_inventory = driver._inventory
+        calls = 0
+        def inventory(_deployment):
+            nonlocal calls
+            calls += 1
+            result = original_inventory(_deployment)
+            failure_call = 2 if failure == "incomplete_initial" else 3
+            return {**result, "pages_complete": False} if calls == failure_call else result
+        monkeypatch.setattr(driver, "_inventory", inventory)
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category == "cleanup_incomplete"
+    saved_state = json.loads((attempt / "attempt.json").read_text())
+    if failure == "incomplete_initial":
+        assert "orphan_template_recovery" not in saved_state
+        assert deleted == []
+    else:
+        saved = saved_state["orphan_template_recovery"]
+        assert saved["absence_verified"] is False
+        assert len(saved["deleted"]) == 2 and len(deleted) == 2
+        expected_remaining = 1 if failure.startswith("partial") else 0
+        assert len(result.inventory.value["support_resources"]) == expected_remaining
+        if failure == "partial_delete":
+            retry = driver.cleanup(deployment)
+            assert retry.cleanup_state == "succeeded"
+            assert json.loads((attempt / "attempt.json").read_text())["orphan_template_recovery"]["absence_verified"] is True
+            assert len(deleted) == 3
+        elif failure in {"partial_then_wrong_id", "partial_then_wrong_config"}:
+            remaining_name = f"{namespace}-b"
+            if failure == "partial_then_wrong_id": descriptions[remaining_name]["id"] = "999"
+            else: descriptions[remaining_name]["properties"]["machineType"] = "n2-standard-8"
+            retry = driver.cleanup(deployment)
+            assert retry.cleanup_state == "failed"
+            assert len(deleted) == 2
+        elif failure == "incomplete_readback":
+            retry = driver.cleanup(deployment)
+            assert retry.cleanup_state == "succeeded"
+            assert json.loads((attempt / "attempt.json").read_text())["orphan_template_recovery"]["absence_verified"] is True
+
+
+def test_verified_orphan_template_ids_are_source_bound_for_cleanup_receipt_replay(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from types import SimpleNamespace
+    from cloud_network_benchmark.contracts.common import Evidence, Provider, StructuredEvidence
+    from cloud_network_benchmark.lifecycle_cleanup import _result_is_absent, _verified_orphan_template_ids, replay_saved_cleanup_receipt
+    from cloud_network_benchmark.providers.gcp import GcpCleanupResult, GcpProviderDriver
+    ids = ["7183431637078019760", "7829080923790806671"]
+    journal = tmp_path / "attempt.json"
+    state = {"run_id": "gcp-replay-run", "deployment_id": "gcp-replay-deployment",
+             "orphan_template_recovery": {"deleted": [], "absence_verified": True}}
+    namespace = GcpProviderDriver._namespace(SimpleNamespace(run_id=state["run_id"], deployment_id=state["deployment_id"]))
+    state["orphan_template_recovery"]["deleted"] = [
+        {"name": f"{namespace}-a", "id": ids[0]}, {"name": f"{namespace}-b", "id": ids[1]}]
+    journal.write_text(json.dumps(state))
+    settings_ref = tmp_path / "settings.json"
+    settings_ref.write_text("saved")
+    settings_ref.chmod(0o600)
+    saved = SimpleNamespace(provider=Provider.GCP, deployment=SimpleNamespace(run_id=state["run_id"], deployment_id=state["deployment_id"]),
+        reservation=SimpleNamespace(reservation_id=SimpleNamespace(value="reservation-1")))
+    monkeypatch.setattr("cloud_network_benchmark.lifecycle_cleanup.load_cleanup_settings", lambda _path: saved)
+    monkeypatch.setattr("cloud_network_benchmark.lifecycle_cleanup._expected_journal", lambda _saved: journal)
+    record = SimpleNamespace(cleanup_settings_reference=str(settings_ref), provider=str(Provider.GCP),
+        deployment_id=state["deployment_id"], journal_reference=str(journal))
+    recovery = SimpleNamespace(reservation_id="reservation-1", ledger_path=str(tmp_path / "ledger.json"), ledger_scope_id="scope-1")
+    result = GcpCleanupResult(cleanup_state="succeeded", inventory=StructuredEvidence(value={
+        "pages_complete": True, "resources": [], "instances": [], "disks": [], "addresses": [], "support_resources": []}),
+        expiry=Evidence(unavailable_reason="no native expiry was registered"))
+    receipt = {"provider": str(Provider.GCP), "reservation_id": "reservation-1", "deployment_id": state["deployment_id"],
+        "absence_proved": True, "absent_resource_ids": ids, "cleanup_result": result.model_dump(mode="json"),
+        "occurred_at": datetime.now(timezone.utc).isoformat()}
+    raw = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    receipt_path = tmp_path / f"reservation-1-{Provider.GCP}-cleanup-{digest[:16]}.json"
+    receipt_path.write_bytes(raw)
+    receipt_path.chmod(0o600)
+    assert set(_verified_orphan_template_ids(state, {f"{namespace}-a", f"{namespace}-b"})) == set(ids)
+    assert _result_is_absent(Provider.GCP, GcpCleanupResult.model_validate(receipt["cleanup_result"]), ids)
+    class Ledger:
+        path = recovery.ledger_path
+        scope_id = recovery.ledger_scope_id
+        events = {}
+        def reconcile(self, event): self.events[event.event_id] = event
+        def inspect(self): return {"reservations": {"reservation-1": {"provider_cleanup": {str(Provider.GCP): True}}}}
+    ledger = Ledger()
+    assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger) is True
+    assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger) is True
+    assert len(ledger.events) == 1
+    assert tuple(sorted(ledger.events.values().__iter__().__next__().absent_resource_ids)) == tuple(ids)
+    state["orphan_template_recovery"]["absence_verified"] = False
+    journal.write_text(json.dumps(state))
+    assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger) is False
+
+
+@pytest.mark.parametrize("mutation", ["wrong_label", "wrong_project", "wrong_name", "wrong_id", "wrong_shape", "wrong_expiry", "created_before_cap", "created_after_trigger"])
+def test_interrupted_registration_rejects_unproven_templates_without_deletion(tmp_path, monkeypatch, mutation):
+    import json
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    deployment, driver = _cleanup_fixture(tmp_path)
+    attempt = driver._attempt_dir(deployment)
+    reservation = deployment.reservation.value
+    trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    namespace = driver._namespace(deployment)
+    start = reservation.cap_started_at.value
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "registration_may_have_started": True, "registered": False, "binding_sha256": driver._binding_fingerprint(deployment),
+        "reservation_id": reservation.reservation_id.value, "cap_started_at": start.isoformat(),
+        "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat()})
+    descriptions = {
+        f"{namespace}-a": _template_response(driver, deployment, "vm_a", 101, trigger, start + timedelta(milliseconds=1)),
+        f"{namespace}-b": _template_response(driver, deployment, "vm_b", 102, trigger, start + timedelta(milliseconds=2)),
+    }
+    listed_ids = {f"{namespace}-a": "101", f"{namespace}-b": "102"}
+    if mutation == "wrong_label": descriptions[f"{namespace}-a"]["properties"]["labels"]["cnb-run"] = "foreign"
+    elif mutation == "wrong_project": descriptions[f"{namespace}-a"]["selfLink"] = descriptions[f"{namespace}-a"]["selfLink"].replace(driver.settings.project_id, "other-project")
+    elif mutation == "wrong_name": descriptions[f"{namespace}-a"]["name"] = "other-template"
+    elif mutation == "wrong_id": descriptions[f"{namespace}-a"]["id"] = "999"
+    elif mutation == "wrong_shape": descriptions[f"{namespace}-a"]["properties"]["machineType"] = "n2-standard-8"
+    elif mutation == "wrong_expiry": descriptions[f"{namespace}-a"]["properties"]["scheduling"]["terminationTime"] = (trigger + timedelta(seconds=1)).isoformat()
+    elif mutation == "created_before_cap": descriptions[f"{namespace}-a"]["creationTimestamp"] = (start - timedelta(seconds=1)).isoformat()
+    elif mutation == "created_after_trigger": descriptions[f"{namespace}-a"]["creationTimestamp"] = (trigger + timedelta(seconds=1)).isoformat()
+    live = set(descriptions)
+    deletes = []
+    monkeypatch.setattr(driver, "_terraform", lambda *_args: {})
+    def read(args, action):
+        if action == "gcp-instance_templates-inventory-all-scopes":
+            return [{"id": listed_ids[name], "name": name,
+                     "selfLink": f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}/global/instanceTemplates/{name}", "labels": {}}
+                    for name in sorted(live)]
+        if action.startswith("gcp-orphan-template-read-"): return descriptions[args[3]]
+        return []
+    monkeypatch.setattr(driver, "_gcloud_json", read)
+    def command(action, argv, cwd, timeout=None):
+        deletes.append(argv)
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=action, outcome="succeeded", started_at=now, finished_at=now,
+                             duration_seconds=0, exit_code=0, stdout="", stderr="")
+    monkeypatch.setattr(driver, "_run", command)
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category in {"expiry_mismatch", "cap_order", "cleanup_incomplete"}
+    assert deletes == []
+    assert result.inventory.value["pages_complete"] is True
+    assert "orphan_template_recovery" not in json.loads((attempt / "attempt.json").read_text())
+
+
 def test_same_attempt_prior_controller_session_blocks_reuse_and_provision_but_allows_cleanup(tmp_path, monkeypatch):
     import json
     import cloud_network_benchmark.providers.gcp as gcp_provider

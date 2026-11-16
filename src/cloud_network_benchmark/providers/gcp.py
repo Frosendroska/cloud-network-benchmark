@@ -380,6 +380,7 @@ class GcpProviderDriver:
             if journal.get("registered") or journal.get("registration_may_have_started"):
                 self._terraform(attempt, "protection", "destroy", deployment, {})
             inventory = self._inventory(deployment)
+            inventory = self._recover_interrupted_templates(journal, deployment, inventory)
             if not inventory["pages_complete"] or inventory["resources"]:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
             expiry = journal.get("expiry")
@@ -404,6 +405,111 @@ class GcpProviderDriver:
             self._save(attempt, journal)
             expiry = journal.get("expiry")
             return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure, primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+
+    def _recover_interrupted_templates(self, journal: dict[str, Any], deployment: ProviderDeploymentInput,
+                                       inventory: dict[str, Any]) -> dict[str, Any]:
+        """Delete only both exact templates proven by an interrupted original registration."""
+        if not (journal.get("registration_may_have_started") and not journal.get("registered")
+                and not journal.get("templates")):
+            return inventory
+        reservation = deployment.reservation.value
+        if (not inventory.get("pages_complete") or not isinstance(reservation, ReservationEvidence)
+                or journal.get("binding_sha256") != self._binding_fingerprint(deployment)
+                or journal.get("reservation_id") != reservation.reservation_id.value):
+            return inventory
+        try:
+            cap_start = datetime.fromisoformat(journal["cap_started_at"].replace("Z", "+00:00"))
+            cap_end = datetime.fromisoformat(journal["cap_expires_at"].replace("Z", "+00:00"))
+            trigger = datetime.fromisoformat(journal["trigger"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            return inventory
+        expected_start = reservation.cap_started_at.value
+        expected_end = reservation.expires_at.value
+        if (cap_start.tzinfo is None or cap_end.tzinfo is None or trigger.tzinfo is None
+                or cap_start != expected_start or cap_end != expected_end
+                or trigger != expected_end - timedelta(seconds=SAFETY_LEAD_SECONDS)):
+            return inventory
+        namespace = self._namespace(deployment)
+        expected_names = {f"{namespace}-a", f"{namespace}-b"}
+        templates = [item for item in inventory.get("support_resources", [])
+                     if item.get("selfLink") and "/instanceTemplates/" in str(item["selfLink"])]
+        saved_recovery = journal.get("orphan_template_recovery")
+        new_recovery = saved_recovery is None
+        if saved_recovery is None:
+            if len(templates) != 2 or {item.get("name") for item in templates} != expected_names:
+                return inventory
+            original_ids = {item["name"]: str(self._int64(item.get("id")) or "") for item in templates}
+            if any(not value for value in original_ids.values()) or len(set(original_ids.values())) != 2:
+                return inventory
+            saved_recovery = {"deleted": [{"name": name, "id": original_ids[name]} for name in sorted(expected_names)],
+                              "absence_verified": False}
+        if not isinstance(saved_recovery, dict) or saved_recovery.get("absence_verified") not in {False, True}:
+            return inventory
+        rows = saved_recovery.get("deleted")
+        if not isinstance(rows, list) or len(rows) != 2 or any(not isinstance(item, dict) for item in rows):
+            return inventory
+        original_ids = {item.get("name"): item.get("id") for item in rows}
+        if (set(original_ids) != expected_names or len(set(original_ids.values())) != 2
+                or any(not isinstance(value, str) or not value.isdigit() or value == "0" for value in original_ids.values())):
+            return inventory
+        current = {item.get("name"): item for item in templates}
+        if len(current) != len(templates) or not set(current) <= expected_names:
+            return inventory
+        remaining: list[tuple[str, str]] = []
+        for role, name in (("vm_a", f"{namespace}-a"), ("vm_b", f"{namespace}-b")):
+            item = current.get(name)
+            if item is None:
+                continue
+            template_id = self._int64(item.get("id"))
+            expected_path = f"projects/{self.settings.project_id}/global/instanceTemplates/{name}"
+            if (template_id is None or str(template_id) != original_ids[name]
+                    or self._compute_path(item.get("selfLink")) != expected_path):
+                return inventory
+            unique = f"projects/{self.settings.project_id}/global/instanceTemplates/{name}?uniqueId={template_id}"
+            identity = {"id": str(template_id), "name": name, "zone": deployment.vm_a.zone if role == "vm_a" else deployment.vm_b.zone,
+                        "self_link_unique": unique,
+                        "expected_policy": self._selected_policy_path(deployment) if deployment.scenario == "placement_optimization" else None}
+            described = self._gcloud_json(["compute", "instance-templates", "describe", name,
+                                           "--project", self.settings.project_id, "--format=json"],
+                                          f"gcp-orphan-template-read-{role}")
+            self._validate_template(described, identity, role, deployment, trigger)
+            self._validate_template_created_at(described.get("creationTimestamp"), cap_start, trigger)
+            remaining.append((name, str(template_id)))
+        if new_recovery:
+            journal["orphan_template_recovery"] = saved_recovery
+            self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+        if saved_recovery["absence_verified"] and current:
+            return inventory
+        if not remaining:
+            if inventory.get("pages_complete"):
+                saved_recovery["absence_verified"] = True
+                self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+            return inventory
+        command_failure: Exception | None = None
+        for name, _template_id in remaining:
+            try:
+                result = self._run("gcp-orphan-template-delete",
+                                   [self.settings.gcloud, "compute", "instance-templates", "delete", name,
+                                    "--project", self.settings.project_id, "--quiet"],
+                                   self.settings.private_state_root)
+                if result.outcome != "succeeded" or result.exit_code != 0:
+                    raise GcpProviderError("verified orphan template deletion failed", category="cleanup_incomplete",
+                                           action_id=result.action_id)
+            except Exception as exc:
+                command_failure = exc
+                break
+        after = self._inventory(deployment)
+        inventory.clear()
+        inventory.update(after)
+        remaining = [item for item in after.get("support_resources", []) if item.get("name") in expected_names
+                     and "/instanceTemplates/" in str(item.get("selfLink", ""))]
+        if command_failure is not None:
+            raise command_failure
+        if not after.get("pages_complete") or remaining:
+            raise GcpProviderError("interrupted registration templates remain or absence is unproven", category="cleanup_incomplete")
+        saved_recovery["absence_verified"] = True
+        self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+        return after
 
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
