@@ -96,17 +96,11 @@ def test_shared_readiness_deadline_is_not_reset_between_workers(tmp_path):
 
         def __init__(self):
             super().__init__()
-            self.started = Barrier(2)
-            self.guard = Lock()
-            self.arrivals = 0
+            self.started = Barrier(2, action=lambda: setattr(clock, "value", 16))
 
         def run(self, request):
             if request.action_id.endswith("cloud-init"):
                 self.started.wait(timeout=5)
-                with self.guard:
-                    self.arrivals += 1
-                    if self.arrivals == 2:
-                        clock.value = 16
             return super().run(request)
 
     runner = ExpiringRunner()
