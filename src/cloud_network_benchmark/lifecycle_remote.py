@@ -34,6 +34,22 @@ class _Attempt:
     f03_process_absent_at: datetime | None = None
 
 
+def _wait_for_stabilization(*, wait_until: float, deadline: Any,
+        clock: Callable[[], float], cancelled: Callable[[], bool],
+        sleep: Callable[[float], None]) -> None:
+    """Wait to the stabilization boundary without deriving sleep from two clocks."""
+    while True:
+        if cancelled():
+            raise InterruptedError("controller cancellation was requested during stabilization")
+        now = clock()
+        if deadline.remaining(lambda: now) <= 0:
+            raise TimeoutError("original provider cap expired during stabilization/slot wait")
+        remaining = wait_until - now
+        if remaining <= 0:
+            return
+        sleep(min(1.0, remaining))
+
+
 def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, children: dict[str, Any],
         runtime: dict[str, Any], ledger: Any, reservation: Any, runner: Any,
         clock: Any, repository_root: Path, recovery_path: Path,
@@ -169,13 +185,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if wait_until + allowance.measurement_seconds + allowance.retrieval_seconds + allowance.cleanup_seconds > item.deadline.overall_deadline_monotonic:
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "stabilization and remaining stages do not fit the original cap"})
-            while clock.monotonic() < wait_until:
-                if cancel_event.is_set():
-                    raise InterruptedError("controller cancellation was requested during stabilization")
-                remaining = wait_until - clock.monotonic()
-                if item.deadline.remaining(clock.monotonic) <= 0:
-                    raise TimeoutError("original provider cap expired during stabilization/slot wait")
-                sleep(min(1.0, remaining))
+            _wait_for_stabilization(wait_until=wait_until, deadline=item.deadline,
+                clock=clock.monotonic, cancelled=cancel_event.is_set, sleep=sleep)
             end_mono, end_utc = clock.monotonic(), clock.utc_now()
             item.stable = {"started_at": start_utc, "finished_at": end_utc,
                 "elapsed_seconds": end_mono-start_mono, "scheduled_start": slot}
