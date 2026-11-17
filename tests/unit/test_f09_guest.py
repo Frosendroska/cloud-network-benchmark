@@ -285,6 +285,7 @@ def test_remote_f03_preserves_partial_outcome_only_after_verified_stop(
 
 def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp_path):
     """Exercise the production stop script against a real local session, offline."""
+    import json
     import os
     import shlex
     import subprocess
