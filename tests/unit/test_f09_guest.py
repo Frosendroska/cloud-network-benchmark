@@ -359,6 +359,62 @@ def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp
             pass
 
 
+def test_f03_dash_status_probe_tracks_running_terminal_and_rejects_absent_or_malformed(
+        tmp_path):
+    """Run the production status probe through Ubuntu's /bin/sh (dash) semantics."""
+    import os
+    import shutil
+    import subprocess
+    from cloud_network_benchmark.lifecycle_adapters import (
+        _f03_guest_status_command, _parse_f03_guest_status,
+    )
+
+    shell = shutil.which("dash")
+    if shell is None:
+        pytest.skip("dash is unavailable on the local test host")
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    status_path = tmp_path / "f03.status"
+    command = _f03_guest_status_command(str(status_path), process.pid)
+
+    def poll():
+        completed = subprocess.run([shell, "-c", command], capture_output=True,
+            text=True, timeout=3)
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    try:
+        assert os.getpgid(process.pid) == process.pid
+        # Reproduce the former production spelling: dash hides its rejected
+        # `--` operand inside the conditional and misreports this live group.
+        former = subprocess.run([shell, "-c", command.replace("kill -0 -", "kill -0 -- -")],
+            capture_output=True, text=True, timeout=3)
+        assert former.returncode == 0 and former.stdout.strip() == "absent"
+        assert _parse_f03_guest_status(poll()) is None
+
+        # An explicit wrapper status remains terminal even after its process exits.
+        status_path.write_text("0\n")
+        os.killpg(process.pid, 15)
+        process.wait(timeout=3)
+        assert _parse_f03_guest_status(poll()) == 0
+
+        # A dead group without the wrapper's numeric status must remain a failure.
+        status_path.unlink()
+        absent = poll()
+        assert absent == "absent"
+        with pytest.raises(RuntimeError, match="without an authenticated terminal status"):
+            _parse_f03_guest_status(absent)
+
+        status_path.write_text("not-a-number\n")
+        malformed = poll()
+        assert malformed == "exited not-a-number"
+        with pytest.raises(ValueError, match="exit status is malformed"):
+            _parse_f03_guest_status(malformed)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=3)
+
+
 def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
     import json
     import os
