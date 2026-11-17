@@ -419,6 +419,7 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
         repository_root, tmp_path):
     """Run the generated wrapper and real guest module with local fake tools."""
     import os
+    import shlex
     import shutil
     import subprocess
     import sys
@@ -444,7 +445,8 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
     shutil.copytree(repository_root / "src/cloud_network_benchmark", package_root)
     python = remote_root / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
-    python.symlink_to(sys.executable)
+    python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    python.chmod(0o755)
     digest = package_tree_sha256(package_root)
     request = GuestRequest.model_validate({**base.model_dump(mode="python"),
         "identity": connected.identity.model_dump(mode="python"),
@@ -506,8 +508,8 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
     assert report.outcome.identity == request.identity
     assert report.outcome_source_bytes
     status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
-    assert any(item.result.stdout.strip() == "running" for item in status_actions)
-    assert status_actions[-1].result.stdout.strip() == "exited 0"
+    assert any(item.result["stdout"].strip() == "running" for item in status_actions)
+    assert status_actions[-1].result["stdout"].strip() == "exited 0"
     assert any("f09-guest-outcome-" in item.action_id for item in report.actions)
     assert report.outcome.commands and report.outcome.failures
     status_file = next(remote_root.glob("control/*.status"))
