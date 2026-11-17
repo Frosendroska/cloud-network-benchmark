@@ -101,6 +101,7 @@ class BootstrapConfig(StrictModel):
     sources: List[SourceBuild] = Field(min_length=2, max_length=2)
     remote_root: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
+    results_workspace: str = "/var/lib/cnb/results"
     install_prefix: str = Field(min_length=1)
     bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables", "python3-venv"])
 
@@ -108,7 +109,7 @@ class BootstrapConfig(StrictModel):
     def validate_paths_and_tools(self):
         if {s.tool for s in self.sources} != {"sockperf", "iperf3"}:
             raise ValueError("exactly one Sockperf and one iperf3 source is required")
-        for name in ("remote_root", "workspace", "install_prefix"):
+        for name in ("remote_root", "workspace", "results_workspace", "install_prefix"):
             value = getattr(self, name)
             if not value.startswith("/") or PurePosixPath(value).as_posix() != value or ".." in value.split("/") or any(ord(c) < 32 for c in value):
                 raise ValueError(f"{name} must be a normalized absolute path")
@@ -116,6 +117,11 @@ class BootstrapConfig(StrictModel):
                 raise ValueError(f"{name} contains shell-unsafe path characters")
             if name != "remote_root" and not value.startswith(self.remote_root.rstrip("/") + "/"):
                 raise ValueError(f"{name} must be under remote_root")
+        paths = (self.workspace, self.results_workspace, self.install_prefix)
+        for index, first in enumerate(paths):
+            if any(first == second or first.startswith(second.rstrip("/") + "/")
+                    or second.startswith(first.rstrip("/") + "/") for second in paths[index + 1:]):
+                raise ValueError("bootstrap sources, native results and installed tools require separate roots")
         if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.-]{0,63}", p) for p in self.bootstrap_packages):
             raise ValueError("bootstrap package names must be simple package identifiers")
         return self
@@ -616,7 +622,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
                         cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if (cat_result.outcome != CommandOutcome.SUCCEEDED or
-                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                            not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.results_workspace}/{stdout_path}", f"{config.results_workspace}/{stderr_path}",
                                 "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
@@ -633,7 +639,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             remaining = deadline.remaining(clock, readiness=True)
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-            mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
+            mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.results_workspace)} {shlex.quote(config.install_prefix)}"
             workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
             try:
                 workspace_result = _execute(command_runner, workspace_request)
@@ -879,7 +885,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                     cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                     cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
-                    if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
+                    if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.results_workspace}/{stdout_path}", f"{config.results_workspace}/{stderr_path}",
                             "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
                         return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
                     proc_id = f"f02r-vm_b-listener-process-{tool}"
@@ -893,13 +899,13 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
                         return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
                     listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
-                        unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
-                        stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
+                        unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.results_workspace}/{stdout_path}",
+                        stderr_path=f"{config.results_workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
                     continue
             elif inspect_result.outcome != CommandOutcome.FAILED or not any(text in (inspect_result.stdout + inspect_result.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                 return _failure_result(connection, actions, vm, inspect_request, inspect_result, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
-            stdout_abs = f"{config.workspace}/{stdout_path}"
-            stderr_abs = f"{config.workspace}/{stderr_path}"
+            stdout_abs = f"{config.results_workspace}/{stdout_path}"
+            stderr_abs = f"{config.results_workspace}/{stderr_path}"
             mkdir_id = f"f02r-vm_b-listener-log-directory-{tool}"
             mkdir_remaining = deadline.remaining(clock, readiness=True)
             if mkdir_remaining <= 0:

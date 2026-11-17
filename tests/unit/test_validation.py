@@ -846,7 +846,7 @@ def test_f02r_persistent_listener_without_process_times_is_retained(repository_r
     value = make_input(repository_root)
     unit = next(item for item in value.measurement_units if item.phase == "multi_flow")
     action = f"f02r-vm_b-listener-{tool}"
-    root = "/var/lib/cnb/work/server-logs"
+    root = "/var/lib/cnb/results/server-logs"
     argv = ["sudo", "systemd-run", "--unit", f"cnb-{value.identity.deployment_id}-{tool}",
         "--property=Restart=no", "--property=UMask=0022",
         f"--property=StandardOutput=append:{root}/{tool}{'.log' if tool == 'sockperf' else '-server.jsonl'}",

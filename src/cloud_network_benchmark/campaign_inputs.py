@@ -416,7 +416,8 @@ def _bootstrap():
          "upstream_commit": "2acfcfe94e928e74542c9f107e02aa6dd4748a79",
          "observation_patch_path": "tool_patches/iperf-3.17.1-acquisition.patch",
          "observation_patch_sha256": "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661"}],
-        "remote_root": "/var/lib/cnb", "workspace": "/var/lib/cnb/work", "install_prefix": "/var/lib/cnb/install"}
+        "remote_root": "/var/lib/cnb", "workspace": "/var/lib/cnb/work",
+        "results_workspace": "/var/lib/cnb/results", "install_prefix": "/var/lib/cnb/install"}
 
 
 def provider_scope(providers):

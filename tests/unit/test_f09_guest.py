@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 import hashlib
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -534,14 +536,28 @@ def test_vm_b_listener_closure_stops_selected_systemd_units_and_observes_closed_
         def __init__(self): self.requests = []
         def run(self, request):
             self.requests.append(request)
-            if request.action_id.startswith("f09-listener-exit-"):
-                return result(request.action_id,
-                    "LoadState=loaded\nActiveState=inactive\nMainPID=0\n"
-                    "InactiveEnterTimestamp=Fri 2026-10-23 10:11:00 UTC\n")
+            if request.action_id.startswith("f09-listener-owner-process-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                return result(request.action_id, json.dumps({"pid":4242,"start_ticks":12345,
+                        "boot_id":"12345678-1234-1234-1234-123456789abc",
+                        "cgroup":f"/system.slice/cnb-{connected.deployment_id}-{tool}.service",
+                        "log_ids":[[1,2],[1,3]]}))
+            if request.action_id.startswith("f09-listener-closed-files-"):
+                return result(request.action_id, json.dumps({"closed_at_utc":"2026-11-17T15:00:00+00:00"}))
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
             return result(request.action_id)
     runner = Runner()
     closure = stop_vm_b_listeners(connected, runner=runner, deadline=deadline(), clock=lambda:100)
-    assert closure.closed and closure.closed_at is not None
+    assert closure.closed and closure.closed_at is not None, (closure.observations, closure.failures,
+        [(x.action_id, x.result.get("outcome"), x.result.get("stdout")) for x in closure.actions])
     assert set(closure.observations) == {"sockperf", "iperf3"}
     stops = [item.argv[-1] for item in runner.requests if "systemctl stop" in item.argv[-1]]
     assert len(stops) == 2
@@ -555,14 +571,92 @@ def test_vm_b_listener_closure_fails_closed_when_unit_is_still_active(tmp_path):
     connected = connection(tmp_path)
     class Runner:
         def run(self, request):
-            if request.action_id.startswith("f09-listener-exit-"):
-                return result(request.action_id,
-                    "LoadState=loaded\nActiveState=active\nMainPID=4321\n"
-                    "InactiveEnterTimestamp=n/a\n")
+            if request.action_id.startswith("f09-listener-owner-process-"):
+                return result(request.action_id, json.dumps({"pid":4242,"start_ticks":12345,
+                    "boot_id":"12345678-1234-1234-1234-123456789abc"}))
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
             return result(request.action_id)
     closure = stop_vm_b_listeners(connected, runner=Runner(), deadline=deadline(), clock=lambda:100)
     assert not closure.closed and closure.closed_at is None
     assert len(closure.failures) == 2
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists() or os.geteuid() != 0,
+    reason="emitted listener closure proof requires Linux /proc and privileged descriptor visibility")
+def test_emitted_listener_closure_script_checks_live_writer_and_closed_process(tmp_path):
+    import shlex
+    import subprocess
+    import sys
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    result_root = tmp_path / "results"
+    logs = result_root / "server-logs"
+    logs.mkdir(parents=True)
+    paths = [logs / "sockperf.log", logs / "sockperf.err"]
+    for path in paths: path.write_bytes(b"")
+
+    def run_case(*, leave_child):
+        source = "import os,sys,time; [open(p,'ab') for p in sys.argv[1:3]]; "
+        source += ("pid=os.fork(); "
+            "(time.sleep(30),os._exit(0)) if pid==0 else (print(pid,flush=True),time.sleep(30))"
+            if leave_child else "time.sleep(30)")
+        process = subprocess.Popen([sys.executable, "-c", source, *(str(path) for path in paths)],
+            stdout=subprocess.PIPE, text=True)
+        child_pid = int(process.stdout.readline()) if leave_child else None
+        stat = Path(f"/proc/{process.pid}/stat").read_text(); ticks = int(stat[stat.rfind(")")+2:].split()[19])
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        log_ids = [[path.stat().st_dev, path.stat().st_ino] for path in paths]
+        unit = f"cnb-{connected.deployment_id}-sockperf"
+        cgroup = f"/sys/fs/cgroup/cnb-closure-test-{process.pid}.service"
+
+        class Runner:
+            def __init__(self): self.requests=[]
+            def run(self, request):
+                self.requests.append(request)
+                aid = request.action_id
+                if aid.startswith("f09-listener-owner-"):
+                    return result(aid, "LoadState=loaded\nActiveState=active\nMainPID="+str(process.pid)+"\n"
+                        f"ControlGroup=/system.slice/{unit}.service\n"
+                        f"StandardOutput=append:{paths[0]}\nStandardError=append:{paths[1]}\n")
+                if aid.startswith("f09-listener-owner-process-"):
+                    return result(aid, json.dumps({"pid":process.pid,"start_ticks":ticks,
+                        "boot_id":boot,"cgroup":f"/system.slice/{unit}.service","log_ids":log_ids}))
+                if aid.startswith("f09-listener-stop-"):
+                    process.terminate(); process.wait(timeout=3)
+                    if leave_child: return result(aid)
+                    return result(aid)
+                return result(aid)
+
+        # Run the generated guest closure program locally against controlled processes.
+        class ExecutingRunner(Runner):
+            def run(self, request):
+                aid=request.action_id
+                if aid.startswith("f09-listener-closed-files-"):
+                    remote=shlex.split(request.argv[-1])
+                    completed=subprocess.run([sys.executable,*remote[2:]],capture_output=True,text=True,check=False)
+                    return result(aid,completed.stdout,success=completed.returncode==0,stderr=completed.stderr)
+                return super().run(request)
+        closure = stop_vm_b_listeners(connected, runner=ExecutingRunner(), results_workspace=str(result_root),
+            deadline=deadline(), clock=lambda:100)
+        if child_pid is not None:
+            try: os.kill(child_pid, 9)
+            except ProcessLookupError: pass
+        return closure
+
+    rejected = run_case(leave_child=True)
+    assert not rejected.closed and any("descriptors remain open" in item for item in rejected.failures)
+    accepted = run_case(leave_child=False)
+    assert accepted.closed and accepted.closed_at is not None
 
 
 def test_remote_workspace_inventory_is_hash_bound_bounded_and_symlink_failing(tmp_path):
@@ -584,14 +678,70 @@ def test_remote_workspace_inventory_is_hash_bound_bounded_and_symlink_failing(tm
             compile(ast.literal_eval(outer.body[0].value.args[0]), "remote-inventory", "exec")
             return result(request.action_id, json.dumps({"files":self.payload}))
     runner = Runner(rows)
-    inventory = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
-        runner=runner, deadline=deadline(), clock=lambda:100)
+    inventory = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/results",
+        runner=runner, deadline=deadline(), clock=lambda:100, expected_paths=["measurements/unit/native.log"])
     assert inventory.failures == () and inventory.files == tuple(rows)
     assert inventory.files[0]["sha256"] == hashlib.sha256(b"native\n").hexdigest()
     malformed = Runner([{**rows[0], "sha256":"bad"}])
-    rejected = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
-        runner=malformed, deadline=deadline(), clock=lambda:100)
+    rejected = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/results",
+        runner=malformed, deadline=deadline(), clock=lambda:100, expected_paths=["measurements/unit/native.log"])
     assert rejected.files == () and rejected.failures
+
+
+def test_actual_staged_workspace_is_separate_from_strict_declared_native_inventory(tmp_path):
+    import subprocess
+    import sys
+    from cloud_network_benchmark.lifecycle_adapters import inventory_remote_workspace
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    guest = tmp_path / "guest"
+    work = guest / "work"
+    results = guest / "results"
+    (work / "runtime").mkdir(parents=True)
+    subprocess.run([sys.executable, "-m", "venv", "--system-site-packages",
+        str(work / "runtime" / "venv")], check=True)
+    bootstrap_source = work / "sockperf-5ebd327da983225321818c0355db922515e026bd"
+    bootstrap_source.mkdir(parents=True)
+    (bootstrap_source / "generated-target").write_text("build artifact")
+    (bootstrap_source / "generated-link").symlink_to("generated-target")
+    (results / "measurements/unit").mkdir(parents=True)
+    native = results / "measurements/unit/sockperf.csv"
+    native.write_bytes(b"native closed result\n")
+    assert any(path.is_symlink() for path in work.rglob("*")), "fixture must reproduce staged runtime/build symlinks"
+
+    class LocalGuestRunner:
+        def __init__(self): self.requests=[]
+        def run(self, request):
+            self.requests.append(request)
+            command = request.argv[-1]
+            completed = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+            return result(request.action_id, completed.stdout, success=completed.returncode == 0,
+                stderr=completed.stderr)
+
+    runner = LocalGuestRunner()
+    inventory = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=runner, deadline=deadline(), clock=lambda:100,
+        expected_paths=["measurements/unit/sockperf.csv"])
+    assert inventory.failures == (), (runner.requests[0].argv, inventory.actions[0].result.get("stderr"))
+    assert [row["path"] for row in inventory.files] == ["measurements/unit/sockperf.csv"]
+    assert inventory.files[0]["size_bytes"] == len(native.read_bytes())
+    oversized = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100, maximum_bytes=4,
+        expected_paths=["measurements/unit/sockperf.csv"])
+    assert oversized.files == () and oversized.failures
+
+    (results / "measurements/unit/foreign.txt").write_text("not declared")
+    unknown = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=["measurements/unit/sockperf.csv"])
+    assert unknown.files == () and unknown.failures
+    (results / "measurements/unit/foreign.txt").unlink()
+    (results / "measurements/unit/escape").symlink_to(native)
+    symlink = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=["measurements/unit/sockperf.csv"])
+    assert symlink.files == () and symlink.failures
 
 
 def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(

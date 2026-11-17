@@ -675,7 +675,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     responder.protocol_elapsed = (12 * 60 if mode_value == "calibration" else
                         86_407 if mode_value == "diagnostic_day" else 60)
                     responder.workspace_roots = {role: root / name / role for role in ("vm_a", "vm_b")}
-                    responder.native_root = responder.workspace_roots["vm_a"]
+                    responder.results_roots = {role: path / "results" for role, path in responder.workspace_roots.items()}
+                    responder.native_root = responder.results_roots["vm_a"]
                 self.requests = []
                 self.actions = []
                 self.ledger = None

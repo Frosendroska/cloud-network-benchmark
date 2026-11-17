@@ -737,22 +737,97 @@ def stop_remote_diagnostics(connection: Any, process: RemoteDiagnosticsProcess, 
 
 
 def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
+        results_workspace: str = "/var/lib/cnb/results",
         clock: Callable[[], float] = __import__("time").monotonic) -> RemoteListenerClosure:
-    """Stop only this deployment's two F02 B-side systemd listeners and verify exit.
+    """Stop only this deployment's B-side units and prove process/log closure.
 
-    systemd owns these listeners; stopping the selected unit waits for its
-    process and append-log descriptors to close. No broad process-name kill is
-    used. Guest terminal timestamps and MainPID/ActiveState must agree.
+    Capture each systemd-owned PID and its cgroup identity before stop. After
+    stop, prove that identity is gone and no process retains either exact native
+    log descriptor. The terminal time is emitted by the authenticated guest
+    only after those checks; transient-unit state is supporting evidence.
     """
     from .access import _action, _execute, _request
     from .contracts.common import CommandOutcome
 
     vm = connection.vm_b
+    workspace = PurePosixPath(results_workspace)
+    if (not results_workspace.startswith("/") or workspace.as_posix() != results_workspace
+            or ".." in workspace.parts):
+        raise ValueError("results workspace must be normalized absolute POSIX")
     actions = []
     observations: dict[str, dict[str, str]] = {}
     failures = []
     for tool in ("sockperf", "iperf3"):
         unit = f"cnb-{connection.deployment_id}-{tool}"
+        stdout_rel, stderr_rel = (("server-logs/sockperf.log", "server-logs/sockperf.err")
+            if tool == "sockperf" else ("server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err"))
+        stdout_path, stderr_path = str(workspace / stdout_rel), str(workspace / stderr_rel)
+        remaining = deadline.remaining(clock, cleanup=True)
+        if remaining <= 0:
+            failures.append(f"{tool} listener stop exceeded the cleanup allowance")
+            continue
+        inspect = _request(f"f09-listener-owner-{connection.deployment_id}-{tool}", vm,
+            ["systemctl", "show", unit,
+             "--property=LoadState,ActiveState,MainPID,ControlGroup,StandardOutput,StandardError"],
+            min(connection.timeouts.server_seconds, remaining))
+        inspected = _execute(runner, inspect)
+        actions.append(_action(inspect.action_id, inspect.action_type, vm, inspect, inspected))
+        if inspected.outcome != CommandOutcome.SUCCEEDED:
+            failures.append(f"{tool} listener owner could not be observed before stop")
+            continue
+        fields = dict(line.split("=", 1) for line in inspected.stdout.splitlines() if "=" in line)
+        observations[tool] = fields
+        raw_pid = fields.get("MainPID", "")
+        if (fields.get("LoadState") != "loaded" or fields.get("ActiveState") != "active"
+                or not raw_pid.isdigit() or int(raw_pid) <= 0
+                or not fields.get("ControlGroup", "").rstrip("/").endswith("/" + unit + ".service")
+                or fields.get("StandardOutput") != "append:" + stdout_path
+                or fields.get("StandardError") != "append:" + stderr_path):
+            failures.append(f"{tool} listener unit identity or native log association is unavailable")
+            continue
+        owner_source = "\n".join((
+            "import json,pathlib,sys",
+            "pid=int(sys.argv[1]); unit=sys.argv[2]",
+            "base=pathlib.Path('/proc')/str(pid); stat=(base/'stat').read_text()",
+            "tail=stat[stat.rfind(')')+2:].split(); start=int(tail[19])",
+            "cg=(base/'cgroup').read_text().splitlines()",
+            "owned=[line.rsplit(':',1)[-1] for line in cg if line.rsplit(':',1)[-1].rstrip('/').endswith('/'+unit+'.service')]",
+            "len(owned)==1 or sys.exit(2)",
+            "paths=[pathlib.Path(sys.argv[i]) for i in (3,4)]",
+            "all(p.is_file() and not p.is_symlink() for p in paths) or sys.exit(3)",
+            "ids=[(p.stat().st_dev,p.stat().st_ino) for p in paths]",
+            "print(json.dumps({'pid':pid,'start_ticks':start,'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'cgroup':owned[0],'log_ids':ids}))",
+        ))
+        owner_code = "exec(" + repr(owner_source) + ")"
+        remaining = deadline.remaining(clock, cleanup=True)
+        if remaining <= 0:
+            failures.append(f"{tool} listener owner capture exceeded the cleanup allowance")
+            continue
+        owner = _request(f"f09-listener-owner-process-{connection.deployment_id}-{tool}", vm,
+            ["sudo", "python3", "-c", owner_code, raw_pid, unit, stdout_path, stderr_path], min(connection.timeouts.command_seconds, remaining))
+        owner_result = _execute(runner, owner)
+        actions.append(_action(owner.action_id, owner.action_type, vm, owner, owner_result))
+        if owner_result.outcome != CommandOutcome.SUCCEEDED:
+            failures.append(f"{tool} listener PID is not owned by its selected systemd unit")
+            continue
+        try:
+            owner_identity = json.loads(owner_result.stdout.strip().splitlines()[-1])
+            if (owner_identity.get("pid") != int(raw_pid)
+                    or isinstance(owner_identity.get("start_ticks"), bool)
+                    or not isinstance(owner_identity.get("start_ticks"), int)
+                    or not re.fullmatch(r"[0-9a-fA-F-]{36}", owner_identity.get("boot_id", ""))
+                    or not isinstance(owner_identity.get("cgroup"), str)
+                    or owner_identity["cgroup"].rstrip("/") != fields.get("ControlGroup", "").rstrip("/")
+                    or not owner_identity["cgroup"].rstrip("/").endswith("/" + unit + ".service")
+                    or not isinstance(owner_identity.get("log_ids"), list)
+                    or len(owner_identity["log_ids"]) != 2
+                    or any(not isinstance(row, list) or len(row) != 2
+                        or any(isinstance(value, bool) or not isinstance(value, int) for value in row)
+                        for row in owner_identity["log_ids"])):
+                raise ValueError("owner identity is incomplete")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            failures.append(f"{tool} listener owner identity is malformed ({type(exc).__name__})")
+            continue
         remaining = deadline.remaining(clock, cleanup=True)
         if remaining <= 0:
             failures.append(f"{tool} listener stop exceeded the cleanup allowance")
@@ -768,31 +843,65 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
         if remaining <= 0:
             failures.append(f"{tool} listener exit observation exceeded the cleanup allowance")
             continue
-        inspect = _request(f"f09-listener-exit-{connection.deployment_id}-{tool}", vm,
-            ["systemctl", "show", unit,
-             "--property=LoadState,ActiveState,MainPID,InactiveEnterTimestamp"],
+        closure_source = "\n".join((
+            "import datetime,json,os,pathlib,sys",
+            "pid=int(sys.argv[1]); start=int(sys.argv[2]); boot=sys.argv[3]; cgroup=sys.argv[4]",
+            "expected_ids={tuple(map(int,sys.argv[5].split(','))),tuple(map(int,sys.argv[6].split(',')))}",
+            "pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==boot or sys.exit(6)",
+            "base=pathlib.Path('/proc')/str(pid)",
+            "if base.exists():",
+            " try:",
+            "  stat=(base/'stat').read_text(); tail=stat[stat.rfind(')')+2:].split()",
+            "  int(tail[19]) == start and sys.exit(7)",
+            " except FileNotFoundError: pass",
+            "cgroot=pathlib.Path('/sys/fs/cgroup')/cgroup.lstrip('/')",
+            "try: cgroot.lstat(); cg_present=True",
+            "except FileNotFoundError: cg_present=False",
+            "if cg_present:",
+            " stack=[cgroot]",
+            " while stack:",
+            "  directory=stack.pop()",
+            "  try: entries=list(os.scandir(directory))",
+            "  except FileNotFoundError: continue",
+            "  procs=directory/'cgroup.procs'",
+            "  try: procs.read_text().strip()=='' or sys.exit(8)",
+            "  except FileNotFoundError: sys.exit(9)",
+            "  stack.extend(pathlib.Path(item.path) for item in entries if item.is_dir(follow_symlinks=False))",
+            "proc=pathlib.Path('/proc')",
+            "for entry in os.scandir(proc):",
+            " if not entry.name.isdigit(): continue",
+            " fds=pathlib.Path(entry.path)/'fd'",
+            " try: descriptors=list(os.scandir(fds))",
+            " except FileNotFoundError: continue",
+            " except PermissionError: sys.exit(10)",
+            " for descriptor in descriptors:",
+            "  try: st=os.stat(descriptor.path)",
+            "  except FileNotFoundError: continue",
+            "  except PermissionError: sys.exit(11)",
+            "  (st.st_dev,st.st_ino) in expected_ids and sys.exit(12)",
+            "all(pathlib.Path(p).is_file() and not pathlib.Path(p).is_symlink() for p in sys.argv[7:9]) or sys.exit(13)",
+            "print(json.dumps({'closed_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}))",
+        ))
+        closure_code = "exec(" + repr(closure_source) + ")"
+        closure_request = _request(f"f09-listener-closed-files-{connection.deployment_id}-{tool}", vm,
+            ["sudo", "python3", "-c", closure_code, str(owner_identity["pid"]),
+             str(owner_identity["start_ticks"]), owner_identity["boot_id"], owner_identity["cgroup"],
+             ",".join(map(str, owner_identity["log_ids"][0])),
+             ",".join(map(str, owner_identity["log_ids"][1])), stdout_path, stderr_path],
             min(connection.timeouts.server_seconds, remaining))
-        inspected = _execute(runner, inspect)
-        actions.append(_action(inspect.action_id, inspect.action_type, vm, inspect, inspected))
-        if inspected.outcome != CommandOutcome.SUCCEEDED:
-            failures.append(f"{tool} listener terminal state could not be observed")
+        closure_result = _execute(runner, closure_request)
+        actions.append(_action(closure_request.action_id, closure_request.action_type, vm, closure_request, closure_result))
+        if closure_result.outcome != CommandOutcome.SUCCEEDED:
+            failures.append(f"{tool} listener process or native log descriptors remain open")
             continue
-        fields = dict(line.split("=", 1) for line in inspected.stdout.splitlines() if "=" in line)
-        observations[tool] = fields
-        if (fields.get("LoadState") != "loaded" or fields.get("ActiveState") != "inactive"
-                or fields.get("MainPID") != "0"):
-            failures.append(f"{tool} listener is not observed inactive with MainPID=0")
-            continue
-        raw_time = fields.get("InactiveEnterTimestamp", "")
         try:
-            observed = datetime.strptime(raw_time, "%a %Y-%m-%d %H:%M:%S %Z")
-            if raw_time.endswith(" UTC"):
-                observed = observed.replace(tzinfo=timezone.utc)
+            terminal = json.loads(closure_result.stdout.strip().splitlines()[-1])["closed_at_utc"]
+            observed = datetime.fromisoformat(terminal)
             if observed.tzinfo is None or observed.utcoffset() is None:
-                raise ValueError("systemd terminal timestamp is not timezone-aware")
+                raise ValueError("guest closure time is not timezone-aware")
             observations[tool]["closed_at_utc"] = observed.astimezone(timezone.utc).isoformat()
-        except ValueError:
-            failures.append(f"{tool} listener terminal timestamp is unavailable or malformed")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            failures.append(f"{tool} guest terminal time is unavailable or malformed ({type(exc).__name__})")
     times = [datetime.fromisoformat(row["closed_at_utc"]) for row in observations.values()
              if "closed_at_utc" in row]
     closed_at = max(times) if len(times) == 2 and not failures else None
@@ -802,8 +911,9 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
 
 def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, runner: Any,
         deadline: Any, clock: Callable[[], float] = __import__("time").monotonic,
-        maximum_files: int = 10000) -> RemoteFileInventory:
-    """Read a bounded, symlink-free inventory and hashes from one closed VM workspace."""
+        maximum_files: int = 10000, maximum_bytes: int | None = None,
+        expected_paths: tuple[str, ...] | list[str] = ()) -> RemoteFileInventory:
+    """Hash only the declared closed native-result files from one results root."""
     from .access import _action, _execute, _request
     from .contracts.common import CommandOutcome
 
@@ -814,39 +924,71 @@ def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, ru
         raise ValueError("remote workspace must be normalized absolute POSIX")
     if isinstance(maximum_files, bool) or not isinstance(maximum_files, int) or maximum_files < 1:
         raise ValueError("inventory file bound must be a positive integer")
+    if maximum_bytes is not None and (isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes < 0):
+        raise ValueError("inventory byte bound must be a nonnegative integer when supplied")
+    if not isinstance(expected_paths, (tuple, list)) or any(not isinstance(path, str) or not path for path in expected_paths):
+        raise ValueError("inventory declarations must be nonempty relative paths")
+    if any(PurePosixPath(path).is_absolute() or PurePosixPath(path).as_posix() != path
+            or ".." in PurePosixPath(path).parts or path.count("{chunk_id}") > 1
+            for path in expected_paths):
+        raise ValueError("inventory declarations must be normalized relative artifact paths")
+    expected_payload = json.dumps(list(expected_paths), separators=(",", ":"))
     vm = connection.vm_a if role == "vm_a" else connection.vm_b
     remaining = deadline.remaining(clock, cleanup=True)
     if remaining <= 0:
         return RemoteFileInventory(connection.deployment_id, role, workspace, (), (),
             ("cleanup allowance exhausted before remote inventory",))
     source = "\n".join((
-        "import hashlib,json,pathlib,sys",
-        "root=pathlib.Path(sys.argv[1]); bound=int(sys.argv[2])",
+        "import hashlib,json,pathlib,stat,sys",
+        "root=pathlib.Path(sys.argv[1]); bound=int(sys.argv[2]); allowed=json.loads(sys.argv[3]); byte_bound=int(sys.argv[4]) if sys.argv[4]!='none' else None",
+        "def declared(rel):",
+        " p=pathlib.PurePosixPath(rel)",
+        " for rule in allowed:",
+        "  r=pathlib.PurePosixPath(rule)",
+        "  if rule.count('{chunk_id}')==1 and p.parent==r.parent:",
+        "   prefix,suffix=r.name.split('{chunk_id}'); name=p.name",
+        "   if name.startswith(prefix) and name.endswith(suffix):",
+        "    chunk=name[len(prefix):len(name)-len(suffix) if suffix else None]",
+        "    if chunk and all(c.isalnum() or c in '._-' for c in chunk): return True",
+        "  elif '{chunk_id}' not in rule and rel==rule: return True",
+        " return False",
         "root.is_dir() and not root.is_symlink() or sys.exit(2)",
-        "rows=[]",
+        "rows=[]; total=0",
         "for path in sorted(root.rglob('*')):",
-        " if path.is_symlink(): sys.exit(3)",
-        " if path.is_file():",
+        " mode=path.lstat().st_mode",
+        " stat.S_ISLNK(mode) and sys.exit(3)",
+        " if stat.S_ISDIR(mode): continue",
+        " stat.S_ISREG(mode) or sys.exit(8)",
+        " if stat.S_ISREG(mode):",
         "  rel=path.relative_to(root).as_posix()",
         "  rel and not rel.startswith('/') and '..' not in pathlib.PurePosixPath(rel).parts or sys.exit(4)",
+        "  declared(rel) or (print('undeclared:'+rel,file=sys.stderr),sys.exit(6))",
         "  h=hashlib.sha256(); size=0",
         "  with path.open('rb') as stream:",
         "   while True:",
         "    chunk=stream.read(1048576)",
         "    if not chunk: break",
         "    h.update(chunk); size+=len(chunk)",
+        "    (byte_bound is None or total+len(chunk)<=byte_bound) or sys.exit(7)",
+        "    total+=len(chunk)",
         "  rows.append({'path':rel,'size_bytes':size,'sha256':h.hexdigest()})",
         "  len(rows)<=bound or sys.exit(5)",
         "print(json.dumps({'files':rows},sort_keys=True,separators=(',',':')))",
     ))
-    command = "python3 -c " + shlex.quote("exec(" + repr(source) + ")") + " " + shlex.quote(workspace) + " " + str(maximum_files)
+    byte_limit_arg = str(maximum_bytes) if maximum_bytes is not None else "none"
+    command = "python3 -c " + shlex.quote("exec(" + repr(source) + ")") + " " + shlex.quote(workspace) + " " + str(maximum_files) + " " + shlex.quote(expected_payload) + " " + byte_limit_arg
     request = _request(f"f09-inventory-{connection.deployment_id}-{role}", vm,
         ["sh", "-c", command], min(connection.timeouts.transfer_seconds, remaining))
     result = _execute(runner, request)
     action = _action(request.action_id, request.action_type, vm, request, result)
     if result.outcome != CommandOutcome.SUCCEEDED:
+        exit_reason = {2: "results root is absent or not a real directory", 3: "symlink found in native results",
+            5: "native result file-count bound exceeded", 6: "undeclared file found in native results",
+            7: "native result byte bound exceeded", 8: "unsupported non-regular entry in native results"}.get(result.exit_code, "remote command failed or exceeded its bound")
+        if result.exit_code == 6 and result.stderr.startswith("undeclared:") and len(result.stderr) <= 256:
+            exit_reason += f" ({result.stderr.removeprefix('undeclared:').strip()})"
         return RemoteFileInventory(connection.deployment_id, role, workspace, (), (action,),
-            ("remote actual-file inventory failed or exceeded its bound",))
+            (f"remote actual-file inventory failed: {exit_reason}",))
     try:
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         rows = payload["files"]
@@ -862,6 +1004,21 @@ def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, ru
                     or isinstance(row["size_bytes"], bool) or not isinstance(row["size_bytes"], int)
                     or row["size_bytes"] < 0 or not re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"]))):
                 raise ValueError("remote file inventory row is invalid")
+            path = row["path"]
+            allowed = False
+            for rule in expected_paths:
+                template = PurePosixPath(rule)
+                candidate = PurePosixPath(path)
+                if rule.count("{chunk_id}") == 1 and candidate.parent == template.parent:
+                    prefix, suffix = template.name.split("{chunk_id}")
+                    name = candidate.name
+                    chunk = name[len(prefix):len(name)-len(suffix) if suffix else None]
+                    allowed |= (name.startswith(prefix) and name.endswith(suffix) and bool(chunk)
+                        and all(char.isalnum() or char in "._-" for char in chunk))
+                elif "{chunk_id}" not in rule and path == rule:
+                    allowed = True
+            if not allowed:
+                raise ValueError("remote inventory contains an undeclared result file")
             checked.append(row)
         if len({row["path"] for row in checked}) != len(checked):
             raise ValueError("remote file inventory paths must be unique")

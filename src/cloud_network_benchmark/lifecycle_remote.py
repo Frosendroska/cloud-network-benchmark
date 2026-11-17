@@ -225,7 +225,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     # no-symlink path, then bind the declared guest path.
                     output_root=repository_root / ".f09-remote-workspace" / deployment.deployment_id / role,
                     duration_seconds=max(total_seconds, diagnostic_duration), prepared=bootstrap)
-                context["output_root"] = runtime["access"]["bootstrap"].workspace
+                context["output_root"] = runtime["access"]["bootstrap"].results_workspace
                 item.diagnostics[role] = start_remote_diagnostics(connection, context,
                     runner=runner, remote_root=str(Path(guest_runtime.remote_root) / "diagnostics-control"),
                     deadline=item.deadline, clock=clock.monotonic)
@@ -297,7 +297,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     finished_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing")))
             guest_request = GuestRequest(schema_version=2, identity=pair.identity,
                 observation=item.observation, b_private_ipv4=connection.private_ipv4_b,
-                output_root=Path(runtime["access"]["bootstrap"].workspace),
+                output_root=Path(runtime["access"]["bootstrap"].results_workspace),
                 effective_deadline_utc=effective_deadline, safe_remaining_seconds=safe,
                 clock_uncertainty_seconds=roundtrip, source_revision=guest_runtime.source_revision,
                 expected_source_revision=item.source_revision,
@@ -349,6 +349,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         runner=runner, deadline=item.deadline, clock=clock.monotonic)
             if item.listener_closure is None or not item.listener_closure.closed or item.listener_closure.failures:
                 item.listener_closure = stop_vm_b_listeners(item.connection, runner=runner,
+                    results_workspace=runtime["access"]["bootstrap"].results_workspace,
                     deadline=item.deadline, clock=clock.monotonic)
             closures = item.closures or {}
             measurement_closed_at = (item.guest.outcome.guest_finished_at if item.guest and item.guest.outcome
@@ -388,13 +389,6 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         or transfer is None or transfer["debited_bytes"] >= transfer["payload_limit_bytes"]):
                     return ProviderStageOutcome("retrieve", False,
                         {"failure": "result_transfer_allowance_exhausted"})
-            for role in ("vm_a", "vm_b"):
-                item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
-                    workspace=runtime["access"]["bootstrap"].workspace, runner=runner,
-                    deadline=item.deadline, clock=clock.monotonic)
-            if any(value.failures for value in item.inventories.values()):
-                return ProviderStageOutcome("retrieve", False,
-                    {"failure": "one or more remote inventories are incomplete", "inventories": item.inventories})
             declarations = lifecycle_declarations(item.observation.artifact_layout,
                 mode=item.observation.mode, measurement_units=item.observation.measurement_units,
                 schedule_supplied=item.observation.schedule_entry.value is not None,
@@ -407,6 +401,39 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 if previous is not None and previous != declaration:
                     raise ValueError("artifact declaration identity is contradictory")
                 unique[declaration.artifact_id] = declaration
+            declarations = list(unique.values())
+            expected_paths = tuple(dict.fromkeys(
+                declaration.path or declaration.path_template
+                for declaration in declarations
+                if declaration.producer != "controller" and (declaration.path or declaration.path_template)))
+            # Bootstrap explicitly configures this scoped stderr sink, even
+            # though the F02 result contract does not currently materialize it.
+            expected_paths = (*expected_paths, "server-logs/sockperf.err")
+            transfer = rec.get("result_transfer", {}).get(provider)
+            inventory_byte_budget = None
+            if rec.get("execution_scope") == "paid_request":
+                if (not isinstance(transfer, Mapping)
+                        or isinstance(transfer.get("payload_limit_bytes"), bool)
+                        or not isinstance(transfer.get("payload_limit_bytes"), int)
+                        or isinstance(transfer.get("debited_bytes"), bool)
+                        or not isinstance(transfer.get("debited_bytes"), int)):
+                    return ProviderStageOutcome("retrieve", False,
+                        {"failure": "result_transfer_inventory_bound_unavailable"})
+                inventory_byte_budget = transfer["payload_limit_bytes"] - transfer["debited_bytes"]
+                if inventory_byte_budget <= 0:
+                    return ProviderStageOutcome("retrieve", False,
+                        {"failure": "result_transfer_allowance_exhausted"})
+            inventoried_bytes = 0
+            for role in ("vm_a", "vm_b"):
+                item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
+                    workspace=runtime["access"]["bootstrap"].results_workspace, runner=runner,
+                    deadline=item.deadline, clock=clock.monotonic, expected_paths=expected_paths,
+                    maximum_bytes=(inventory_byte_budget - inventoried_bytes
+                        if inventory_byte_budget is not None else None))
+                inventoried_bytes += sum(int(row["size_bytes"]) for row in item.inventories[role].files)
+            if any(value.failures for value in item.inventories.values()):
+                return ProviderStageOutcome("retrieve", False,
+                    {"failure": "one or more remote inventories are incomplete", "inventories": item.inventories})
             materialized = materialize_build_identity_artifacts(item.result_root,
                 deployment.deployment_id, item.prepared.evidence["bootstrap"].builds)
             closure_times = {
@@ -416,7 +443,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             manifest = build_remote_closed_inventory(
                 identity=pair_of(provision).identity.model_dump(mode="json"),
                 deployment_id=deployment.deployment_id,
-                remote_workspace=runtime["access"]["bootstrap"].workspace,
+                remote_workspace=runtime["access"]["bootstrap"].results_workspace,
                 declarations=list(unique.values()),
                 remote_files={role: item.inventories[role].files for role in ("vm_a", "vm_b")},
                 source_vm_ids={"vm_a": item.connection.vm_a.host, "vm_b": item.connection.vm_b.host},

@@ -218,6 +218,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.partial_after_first_unit = False
         self.native_root = None
         self.workspace_roots = {}
+        self.results_roots = {}
         self.diagnostics_contexts = {}
         self.diagnostics_outcomes = {}
         self.inventory_roles = {}
@@ -248,8 +249,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         assert "os.read(3, 1)" in script and BOUNDED_COPY_EOF_MARKER in script
         source_tokens = shlex.split(match.group(1))
         assert len(source_tokens) == 1
-        relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/work")
-        root = self.workspace_roots[role]
+        relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/results")
+        root = self.results_roots[role]
         source = root / relative
         assert source.resolve().is_relative_to(root.resolve())
         assert source.is_file() and not source.is_symlink()
@@ -287,7 +288,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 if self.full_native and tool == "iperf3":
                     stdout += "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n"
             elif name.startswith("unit-config-"):
-                stdout = f"[Service]\nStandardOutput=append:/var/lib/cnb/work/server-logs/{'sockperf.log' if tool == 'sockperf' else 'iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/server-logs/{'sockperf.err' if tool == 'sockperf' else 'iperf3-server.err'}\n"
+                stdout = f"[Service]\nStandardOutput=append:/var/lib/cnb/results/server-logs/{'sockperf.log' if tool == 'sockperf' else 'iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/results/server-logs/{'sockperf.err' if tool == 'sockperf' else 'iperf3-server.err'}\n"
                 if self.full_native and tool == "iperf3":
                     stdout += "Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3\n"
             elif name.startswith("process-"):
@@ -568,7 +569,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             self.actions.append(action)
             invocation = action.removeprefix("f09-diagnostics-start-")
             context = self.diagnostics_contexts[invocation]
-            role, root = context["vm_role"], self.workspace_roots[context["vm_role"]]
+            role, root = context["vm_role"], self.results_roots[context["vm_role"]]
             if role == "vm_b":
                 logs = root / "server-logs"
                 logs.mkdir(parents=True, exist_ok=True)
@@ -620,22 +621,62 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             invocation = action.removeprefix("f09-diagnostics-outcome-")
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps(self.diagnostics_outcomes[invocation]),stderr="")
-        if action.startswith("f09-listener-exit-"):
+        if action.startswith("f09-listener-owner-process-"):
             self.actions.append(action)
-            stamp = (self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)).strftime("%a %Y-%m-%d %H:%M:%S UTC")
-            stdout = f"LoadState=loaded\nActiveState=inactive\nMainPID=0\nInactiveEnterTimestamp={stamp}\n"
+            tool = action.rsplit("-", 1)[-1]
+            root = self.results_roots["vm_b"] / "server-logs"
+            out_name, err_name = (("sockperf.log", "sockperf.err") if tool == "sockperf" else
+                ("iperf3-server.jsonl", "iperf3-server.err"))
+            files = [root / out_name, root / err_name]
+            identities = []
+            for path in files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch(exist_ok=True)
+                identities.append([path.stat().st_dev, path.stat().st_ino])
+            unit = f"cnb-{self.deployment_id}-{tool}"
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
+                duration_seconds=0,exit_code=0,stdout=json.dumps({"pid":32000,"start_ticks":1234,
+                    "boot_id":"12345678-1234-4234-8234-123456789abc",
+                    "cgroup":f"/system.slice/{unit}.service","log_ids":identities}),stderr="")
+        if action.startswith("f09-listener-closed-files-"):
+            self.actions.append(action)
+            closed = self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)
+            return CommandResult(action_id=action,outcome="succeeded",started_at=closed,finished_at=closed,
+                duration_seconds=0,exit_code=0,stdout=json.dumps({"closed_at_utc":closed.isoformat()}),stderr="")
+        if action.startswith("f09-listener-owner-"):
+            self.actions.append(action)
+            tool = action.rsplit("-", 1)[-1]
+            unit = f"cnb-{self.deployment_id}-{tool}"
+            root = self.results_roots["vm_b"] / "server-logs"
+            out_name, err_name = (("sockperf.log", "sockperf.err") if tool == "sockperf" else
+                ("iperf3-server.jsonl", "iperf3-server.err"))
+            stdout = (f"LoadState=loaded\nActiveState=active\nMainPID=32000\n"
+                f"ControlGroup=/system.slice/{unit}.service\n"
+                f"StandardOutput=append:/var/lib/cnb/results/server-logs/{out_name}\n"
+                f"StandardError=append:/var/lib/cnb/results/server-logs/{err_name}\n")
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
         if action.startswith("f09-inventory-"):
             self.actions.append(action)
             role = "vm_a" if action.endswith("vm_a") else "vm_b"
-            root = self.workspace_roots[role]
+            root = self.results_roots[role]
+            outer = shlex.split(request.argv[-1])
+            inventory_argv = shlex.split(outer[2])
+            expected = json.loads(inventory_argv[-2])
             rows=[]
             for path in sorted(root.rglob("*")):
                 if path.is_file():
-                    data=path.read_bytes(); rows.append({"path":path.relative_to(root).as_posix(),
+                    rel = path.relative_to(root).as_posix()
+                    if not any((rule == rel) or ("{chunk_id}" in rule and
+                            PurePosixPath(rule).parent == PurePosixPath(rel).parent and
+                            PurePosixPath(rel).name.startswith(PurePosixPath(rule).name.split("{chunk_id}")[0]) and
+                            PurePosixPath(rel).name.endswith(PurePosixPath(rule).name.split("{chunk_id}")[1]))
+                            for rule in expected):
+                        return CommandResult(action_id=action,outcome="failed",started_at=self._now(),finished_at=self._now(),
+                            duration_seconds=0,exit_code=6,stdout="",stderr=f"undeclared:{rel}")
+                    data=path.read_bytes(); rows.append({"path":rel,
                         "size_bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()})
-                    self.inventory_roles[path.relative_to(root).as_posix()] = role
+                    self.inventory_roles[rel] = role
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"files":rows},sort_keys=True,separators=(",",":")),stderr="")
         if action.startswith("f02r-retrieve-observe-"):
@@ -644,20 +685,20 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             assert match is not None, request.argv[-1]
             source = __import__("shlex").split(match.group(1))[0]
             from pathlib import PurePosixPath
-            relative = PurePosixPath(source).relative_to("/var/lib/cnb/work").as_posix()
+            relative = PurePosixPath(source).relative_to("/var/lib/cnb/results").as_posix()
             artifact_id = action.removeprefix("f02r-retrieve-observe-")
             role = "vm_b" if artifact_id.startswith("vm_b_") or artifact_id in {
                 "sockperf_server_log", "iperf3_server_log", "iperf3_server_error"} else "vm_a"
-            local = self.workspace_roots[role] / relative
+            local = self.results_roots[role] / relative
             data = local.read_bytes()
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=f"{len(data)} {hashlib.sha256(data).hexdigest()}",stderr="")
         if action.startswith("f02r-retrieve-") and request.action_type == "scp":
             self.actions.append(action)
-            remote = next(value for value in request.argv if ":/var/lib/cnb/work/" in value)
+            remote = next(value for value in request.argv if ":/var/lib/cnb/results/" in value)
             from pathlib import PurePosixPath
             role = "vm_a" if f"{self.public_a}:" in remote else "vm_b"
-            local = self.workspace_roots[role] / PurePosixPath(remote.split(":",1)[1]).relative_to("/var/lib/cnb/work")
+            local = self.results_roots[role] / PurePosixPath(remote.split(":",1)[1]).relative_to("/var/lib/cnb/results")
             Path(request.argv[-1]).write_bytes(local.read_bytes())
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout="",stderr="")
@@ -669,7 +710,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         return super().run(request)
 
     def _write_source_observed_receiver_logs(self, outcome):
-        root = self.workspace_roots["vm_b"] / "server-logs"
+        root = self.results_roots["vm_b"] / "server-logs"
         root.mkdir(parents=True, exist_ok=True)
         event_lines, source_lines = [], []
         for command in outcome.commands:
@@ -855,7 +896,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.full_native = full_native
     runner.late_tail = late_tail
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
-    runner.native_root = runner.workspace_roots["vm_a"]
+    runner.results_roots = {role: root / "results" for role, root in runner.workspace_roots.items()}
+    runner.native_root = runner.results_roots["vm_a"]
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
     cost_path = tmp_path / "refreshed-costs.json"
     campaign, _ = resolve_campaign(config, repository_root)

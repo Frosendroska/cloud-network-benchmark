@@ -849,8 +849,8 @@ def test_repeated_preparation_rejects_effective_log_override_or_reset(tmp_path,o
         def run(self,request):
             if request.action_id=="f02r-vm_b-preflight-listener-config-sockperf":
                 return result(request.action_id,
-                    "[Service]\nStandardOutput=append:/var/lib/cnb/work/server-logs/sockperf.log\n"
-                    "StandardError=append:/var/lib/cnb/work/server-logs/sockperf.err\n"
+                    "[Service]\nStandardOutput=append:/var/lib/cnb/results/server-logs/sockperf.log\n"
+                    "StandardError=append:/var/lib/cnb/results/server-logs/sockperf.err\n"
                     "# /etc/systemd/system/override.conf\n[Service]\n"+override)
             return super().run(request)
     outcome=run_bootstrap(c,bootstrap_config(),WrongDropin(existing_listeners=True,existing_acl=True),deadline=deadline(),clock=lambda:100)
