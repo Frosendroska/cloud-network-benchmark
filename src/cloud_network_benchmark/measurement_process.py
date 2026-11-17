@@ -55,6 +55,9 @@ class LocalProcess:
     preview: dict[str, bytearray] = field(default_factory=lambda: {"stdout": bytearray(), "stderr": bytearray()})
     stream_errors: list[str] = field(default_factory=list)
     threads: list[threading.Thread] = field(default_factory=list)
+    exit_observed: threading.Event = field(default_factory=threading.Event)
+    drains_done: set[str] = field(default_factory=set)
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
     result: Optional[CommandResult] = None
     process_exit_monotonic: Optional[float] = None
     finished_at: Optional[datetime] = None
@@ -115,16 +118,22 @@ class LocalMeasurementProcesses:
 
     def _watch_exit(self, handle: LocalProcess) -> None:
         handle.process.wait()
-        exited_monotonic, exited_at = self.clock.monotonic(), self.clock.utc_now()
-        handle.process_exit_monotonic = exited_monotonic
+        with handle.state_lock:
+            exited_monotonic, exited_at = self.clock.monotonic(), self.clock.utc_now()
+            handle.process_exit_monotonic = exited_monotonic
+            handle.exit_observed.set()
         event = ProcessEvent(handle, "exit", "", exited_monotonic, exited_at)
-        while True:
-            try:
-                handle.events.put(event, timeout=0.1)
-                return
-            except queue.Full:
-                # The event is only a wake-up; process state is available from poll().
-                return
+        self._publish_completion(handle, event)
+
+    def _publish_completion(self, handle: LocalProcess, event: ProcessEvent) -> None:
+        """Publish a bounded wake-up; poll also observes the durable completion state."""
+        try:
+            handle.events.put(event, timeout=0.1)
+        except queue.Full:
+            # A full queue already contains wake-ups. next_event periodically
+            # returns to poll(), so dropping this notification cannot hide the
+            # completed state or strand the consumer until its whole deadline.
+            return
 
     def _drain(self, handle: LocalProcess, channel: str, pipe: object, target: BinaryIO) -> None:
         try:
@@ -151,8 +160,16 @@ class LocalMeasurementProcesses:
         finally:
             try:
                 pipe.close()  # type: ignore[attr-defined]
-            finally:
+            except BaseException as exc:
+                handle.stream_errors.append(f"{channel} stream close failed: {type(exc).__name__}: {exc}")
+            try:
                 target.flush()
+            except BaseException as exc:
+                handle.stream_errors.append(f"{channel} stream flush failed: {type(exc).__name__}: {exc}")
+            with handle.state_lock:
+                handle.drains_done.add(channel)
+            now_mono, now_utc = self.clock.monotonic(), self.clock.utc_now()
+            self._publish_completion(handle, ProcessEvent(handle, f"{channel}_closed", "", now_mono, now_utc))
 
     def next_event(self, handles: Sequence[object], deadline_monotonic: float) -> Optional[ProcessEvent]:
         del handles  # events are tagged by their owning handle
@@ -160,7 +177,9 @@ class LocalMeasurementProcesses:
         if timeout <= 0:
             return None
         try:
-            return self._events.get(timeout=timeout)
+            # Completion flags are authoritative, including when a bounded
+            # output queue was full and a terminal wake-up could not be queued.
+            return self._events.get(timeout=min(timeout, 0.05))
         except queue.Empty:
             return None
 
@@ -169,7 +188,10 @@ class LocalMeasurementProcesses:
         if item.result is not None:
             return item.result
         code = item.process.poll()
-        if code is None or any(thread.is_alive() for thread in item.threads):
+        with item.state_lock:
+            exit_observed = item.exit_observed.is_set()
+            drains_done = item.drains_done == {"stdout", "stderr"}
+        if code is None or not exit_observed or not drains_done:
             return None
         return self._finish(item, CommandOutcome.SUCCEEDED if code == 0 else CommandOutcome.FAILED, code)
 

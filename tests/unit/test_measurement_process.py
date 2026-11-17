@@ -1,6 +1,8 @@
 from io import BytesIO
+import queue
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -76,6 +78,108 @@ def test_local_adapter_drains_both_streams_preserves_bytes_and_bounds_redacted_p
         pass
     else:
         raise AssertionError("existing output destination was overwritten")
+
+
+def test_real_child_completion_is_pollable_after_exit_wakeup_before_waiter_returns(tmp_path):
+    enqueued = threading.Event()
+    release_waiter = threading.Event()
+
+    class GatedQueue(queue.Queue):
+        def put(self, item, block=True, timeout=None):
+            super().put(item, block=block, timeout=timeout)
+            if item.channel == "exit":
+                enqueued.set()
+                assert release_waiter.wait(2)
+
+    runner = LocalMeasurementProcesses(SystemMeasurementClock())
+    runner._events = GatedQueue(maxsize=32)
+    request = CommandRequest(action_id="real-child-exit-wakeup", action_type="measurement",
+        argv=[sys.executable, "-c", "pass"], cwd=str(tmp_path), timeout_seconds=3)
+    handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    try:
+        assert enqueued.wait(2)
+        drain_deadline = time.monotonic() + 1
+        while handle.drains_done != {"stdout", "stderr"} and time.monotonic() < drain_deadline:
+            time.sleep(0.001)
+        assert {"stdout", "stderr"} <= handle.drains_done
+        event = runner.next_event([handle], time.monotonic() + 1)
+        assert event is not None and event.channel == "exit" and event.handle is handle
+        assert handle.threads[-1].is_alive()  # The publisher is held after enqueue.
+        result = runner.poll(handle)
+        assert result is not None and result.outcome == "succeeded"
+        assert result.duration_seconds < 1
+    finally:
+        release_waiter.set()
+        for thread in handle.threads:
+            thread.join(timeout=1)
+    assert not any(thread.is_alive() for thread in handle.threads)
+
+
+@pytest.mark.parametrize("stop_before_drain", [False, True])
+def test_process_exit_during_stream_drain_waits_for_flush_and_keeps_shutdown_deadline(
+        tmp_path, monkeypatch, stop_before_drain):
+    release_drain = threading.Event()
+    first_read = threading.Event()
+
+    class BlockingPipe:
+        def __init__(self, first):
+            self.first, self.sent = first, False
+
+        def read(self, _size):
+            if not self.sent:
+                self.sent = True
+                first_read.set()
+                return self.first
+            release_drain.wait(2)
+            return b""
+
+        def close(self):
+            pass
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            self.stdout, self.stderr, self.stdin = BlockingPipe(b"out"), BlockingPipe(b"err"), None
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
+    runner = LocalMeasurementProcesses(SystemMeasurementClock())
+    request = CommandRequest(action_id="exit-during-drain", action_type="measurement",
+        argv=["fake-tool"], cwd=str(tmp_path), timeout_seconds=3)
+    handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    assert first_read.wait(1)
+    deadline = time.monotonic() + 1
+    event = None
+    while time.monotonic() < deadline and (event is None or event.channel != "exit"):
+        event = runner.next_event([handle], deadline)
+    assert event is not None and event.channel == "exit"
+    assert runner.poll(handle) is None  # Exit alone cannot finalize before both drains flush.
+    if stop_before_drain:
+        with pytest.raises(TimeoutError, match="could not be reaped before deadline"):
+            runner.stop(handle, time.monotonic() + 0.01)
+    release_drain.set()
+    for thread in handle.threads:
+        thread.join(timeout=1)
+    result = runner.poll(handle)
+    assert result is not None
+    if stop_before_drain:
+        assert result.outcome == "failed"
+        assert "stream flush failed" in result.stderr
+    else:
+        assert result.outcome == "succeeded"
+    assert (tmp_path / "out").read_bytes() == b"out"
+    assert (tmp_path / "err").read_bytes() == b"err"
 
 
 def test_start_failure_closes_partial_files_and_never_overwrites(tmp_path, monkeypatch):
