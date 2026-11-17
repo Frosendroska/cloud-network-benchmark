@@ -295,6 +295,267 @@ def test_vm_a_measurement_and_actual_inventory_exclude_prepared_vm_b_identity(re
     assert not any(path.startswith("metadata/build/vm_b-") for path in inventoried_paths)
 
 
+def test_f09_closed_both_role_inventory_retrieves_and_seals_receiver_artifact(repository_root, tmp_path):
+    """Compose guest production, listener close, strict inventories and bounded bundle copy."""
+    import subprocess
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.bootstrap import BuildObservation, materialize_build_identity_artifacts
+    from cloud_network_benchmark.contracts.execution import BOUNDED_COPY_EOF_MARKER
+    from cloud_network_benchmark.contracts.common import Evidence, StringEvidence, StructuredEvidence
+    from cloud_network_benchmark.contracts.measurements import ClockMapping, DiagnosticSample, VmMetadata
+    from cloud_network_benchmark.diagnostics import _declarations as diagnostics_declarations
+    from cloud_network_benchmark.lifecycle_adapters import inventory_remote_workspace, stop_vm_b_listeners
+    from cloud_network_benchmark.lifecycle_bundle import (build_remote_closed_inventory,
+        lifecycle_declarations, remote_inventory_paths_by_role, retrieve_closed_bundle, seal_bundle)
+    from cloud_network_benchmark.lifecycle_guest import GuestRequest, execute_request, package_tree_sha256
+    from tests.fixtures.f02r.support import connection as fixture_connection, deadline as make_deadline
+    from tests.fixtures.f02r.support import result as command_result
+
+    resolved = observation(repository_root, "acceptance")
+    remote = fixture_connection(tmp_path)
+    identity = remote.identity.model_copy(update={
+        "experiment_id": resolved.experiment_id, "config_id": resolved.config_id,
+        "run_id": "close-inventory-copy-aws", "deployment_id": "close-inventory-copy-aws-deployment"})
+    remote = remote.model_copy(update={"identity": identity, "run_id": identity.run_id,
+        "deployment_id": identity.deployment_id})
+    builds = tuple(BuildObservation.model_validate(vars(_build(tool, role,
+        f"f02r-{role.value}-{tool}-build")))
+        for role in (VmRole.VM_A, VmRole.VM_B) for tool in ("sockperf", "iperf3"))
+
+    vm_a_root = tmp_path / "remote-vm-a-results"
+    vm_b_root = tmp_path / "remote-vm-b-results"
+    vm_a_root.mkdir()
+    vm_b_root.mkdir()
+    package = tmp_path / "guest-package"
+    package.mkdir()
+    (package / "sample.py").write_text("# staged\n")
+    clock = FakeClock()
+    request = GuestRequest(schema_version=2, identity=identity, observation=resolved,
+        b_private_ipv4=remote.private_ipv4_b, output_root=vm_a_root,
+        effective_deadline_utc=clock.utc_now() + timedelta(seconds=400),
+        safe_remaining_seconds=400, clock_uncertainty_seconds=1, source_revision="a" * 40,
+        expected_source_revision="a" * 40, package_root=package,
+        package_sha256=package_tree_sha256(package), shutdown_grace_seconds=1,
+        build_observations=[build.model_dump(mode="json") for build in builds])
+    guest = execute_request(request, processes=_fixture_processes(clock), clock=clock)
+    rtt_csvs = list(vm_a_root.rglob("sockperf.csv"))
+    assert guest.outcome == "succeeded" and len(rtt_csvs) == 3
+    assert all(path.stat().st_size > 0 for path in rtt_csvs)
+    assert not (vm_a_root / "metadata/build/vm_b-iperf3.identity").exists()
+
+    # Native-format receiver/listener outputs are already closed at the source root.
+    server_logs = vm_b_root / "server-logs"
+    server_logs.mkdir()
+    (server_logs / "sockperf.log").write_bytes((Path(__file__).parents[1] /
+        "fixtures/f08/native/sockperf.log").read_bytes())
+    (server_logs / "sockperf.err").write_bytes((ROOT / "sockperf-window.log").read_bytes())
+    receiver_bytes = _native_iperf_server_jsonl("native-cookie-1")
+    receiver_stderr = (ROOT / "iperf-receiver.log").read_bytes()
+    (server_logs / "iperf3-server.jsonl").write_bytes(receiver_bytes)
+    (server_logs / "iperf3-server.err").write_bytes(receiver_stderr)
+
+    # The acceptance layout also requires the normal per-role metadata and local
+    # diagnostics products. Serialize their strict native contracts as fixture data.
+    for role, root in (("vm_a", vm_a_root), ("vm_b", vm_b_root)):
+        metadata = VmMetadata(schema_version=2, deployment_id=remote.deployment_id, vm_role=role,
+            provider="aws", cpu_model=StringEvidence(unavailable_reason="fixture"),
+            nic_driver=StringEvidence(unavailable_reason="fixture"),
+            acceleration=StringEvidence(unavailable_reason="fixture"), image=StringEvidence(value="fixture-image"),
+            kernel=StringEvidence(unavailable_reason="fixture"),
+            congestion_control=StringEvidence(unavailable_reason="fixture"),
+            tool_versions=StructuredEvidence(unavailable_reason="fixture"),
+            source_builds=StructuredEvidence(value={build.tool: build.binary_version for build in builds
+                if build.role == role}),
+            documented_network_limit=StructuredEvidence(unavailable_reason="fixture"),
+            mtu=Evidence[int](unavailable_reason="fixture"),
+            observed_region=StringEvidence(unavailable_reason="fixture"),
+            observed_zone=StringEvidence(unavailable_reason="fixture"),
+            physical_zone_id=StringEvidence(unavailable_reason="fixture"),
+            actual_shape=StringEvidence(unavailable_reason="fixture"))
+        (root / "metadata").mkdir(exist_ok=True)
+        (root / "metadata" / f"{role}.json").write_text(metadata.model_dump_json() + "\n")
+        (root / "diagnostics").mkdir(exist_ok=True)
+        sample = DiagnosticSample(schema_version=2, deployment_id=remote.deployment_id,
+            vm_role=role, sampled_at=clock.utc_now(), monotonic_seconds=1, interval_seconds=1,
+            cpu_total_percent=Evidence[float](value=0), cpu_max_core_percent=Evidence[float](value=0),
+            cpu_steal_percent=Evidence[float](value=0), tcp_retransmissions=Evidence[int](value=0),
+            interface_rx_drops=Evidence[int](value=0), interface_tx_drops=Evidence[int](value=0),
+            interface_rx_errors=Evidence[int](value=0), interface_tx_errors=Evidence[int](value=0),
+            rx_bytes=Evidence[int](value=0), tx_bytes=Evidence[int](value=0))
+        mapping = ClockMapping(vm_role=role, monotonic_seconds=1, utc_timestamp=clock.utc_now(),
+            estimated_error_ms=Evidence[float](value=0),
+            synchronization_source=StringEvidence(value="chronyc tracking synchronized; fixture"))
+        (root / "diagnostics" / f"{role}.jsonl").write_text(sample.model_dump_json() + "\n")
+        (root / "diagnostics" / f"{role}-clock.jsonl").write_text(mapping.model_dump_json() + "\n")
+
+    # The selected PID/cgroup/log identities and privileged post-stop /proc proof
+    # are fixtures here; stop_vm_b_listeners itself emits and sequences real actions.
+    class ListenerRunner:
+        def __init__(self):
+            self.requests = []
+
+        def run(self, command):
+            self.requests.append(command)
+            aid = command.action_id
+            tool = "sockperf" if aid.endswith("-sockperf") else "iperf3"
+            unit = f"cnb-{remote.deployment_id}-{tool}"
+            stdout_name, stderr_name = (("sockperf.log", "sockperf.err") if tool == "sockperf"
+                else ("iperf3-server.jsonl", "iperf3-server.err"))
+            if aid.startswith("f09-listener-owner-process-"):
+                return command_result(aid, json.dumps({"pid": 4242, "start_ticks": 12345,
+                    "boot_id": "12345678-1234-1234-1234-123456789abc",
+                    "cgroup": f"/system.slice/{unit}.service", "log_ids": [[1, 2], [1, 3]]}))
+            if aid.startswith("f09-listener-closed-files-"):
+                closed_at = datetime.now(timezone.utc).isoformat()
+                return command_result(aid, json.dumps({"closed_at_utc": closed_at}))
+            if aid.startswith("f09-listener-config-"):
+                return command_result(aid, "# /run/systemd/transient/cnb.service\n[Service]\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout_name}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr_name}\n")
+            if aid.startswith("f09-listener-owner-"):
+                return command_result(aid, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\nStandardOutput=append\nStandardError=append\n")
+            return command_result(aid)
+
+    remote_deadline = make_deadline()
+    close_runner = ListenerRunner()
+    listener_close = stop_vm_b_listeners(remote, runner=close_runner, deadline=remote_deadline,
+        results_workspace="/var/lib/cnb/results", clock=lambda: 100)
+    assert listener_close.closed and listener_close.closed_at is not None, listener_close.failures
+    assert {request.action_id for request in close_runner.requests
+        if "systemctl stop" in " ".join(request.argv)} == {
+            f"f09-listener-stop-{remote.deployment_id}-sockperf",
+            f"f09-listener-stop-{remote.deployment_id}-iperf3"}
+
+    declarations = lifecycle_declarations(resolved.artifact_layout, mode=resolved.mode,
+        measurement_units=resolved.measurement_units, build_observations=builds)
+    for role in ("vm_a", "vm_b"):
+        declarations.extend(diagnostics_declarations(role))
+    unique_declarations = {}
+    for declaration in declarations:
+        previous = unique_declarations.get(declaration.artifact_id)
+        assert previous is None or previous == declaration
+        unique_declarations[declaration.artifact_id] = declaration
+    declarations = list(unique_declarations.values())
+    role_paths = remote_inventory_paths_by_role(declarations)
+    roots = {"vm_a": vm_a_root, "vm_b": vm_b_root}
+    inventory_requests = []
+
+    def localize_remote_paths(command, root):
+        workspace = Path("/var/lib/cnb/results")
+        mapping = {str(workspace): str(root), str(workspace.parent): str(root.parent),
+            str(workspace.parent.parent): str(root.parent.parent),
+            str(workspace.parent.parent.parent): str(root.parent.parent.parent)}
+        placeholders = {remote_path: f"__CNB_LOCAL_ROOT_{index}__"
+            for index, remote_path in enumerate(sorted(mapping, key=len, reverse=True))}
+        for remote_path, placeholder in placeholders.items():
+            command = command.replace(remote_path, placeholder)
+        for remote_path, placeholder in placeholders.items():
+            command = command.replace(placeholder, mapping[remote_path])
+        return command
+
+    class LocalInventoryRunner:
+        def run(self, command):
+            inventory_requests.append(command)
+            role = command.action_id.rsplit("-", 1)[-1]
+            rewritten = localize_remote_paths(command.argv[-1], roots[role])
+            completed = subprocess.run(["sh", "-c", rewritten], capture_output=True, text=True, check=False)
+            return command_result(command.action_id, completed.stdout,
+                completed.returncode == 0, completed.stderr)
+
+    inventory_runner = LocalInventoryRunner()
+
+    def inventory(role):
+        return inventory_remote_workspace(remote, role=role, workspace="/var/lib/cnb/results",
+            runner=inventory_runner, deadline=remote_deadline, clock=lambda: 100,
+            expected_paths=role_paths[role])
+
+    inventories = {role: inventory(role) for role in ("vm_a", "vm_b")}
+    assert all(not result.failures for result in inventories.values()), {
+        role: (result.failures, [(action.result.get("stdout"), action.result.get("stderr"),
+            action.result.get("exit_code")) for action in result.actions])
+        for role, result in inventories.items()}
+    assert any(item["path"] == "metadata/build/vm_a-sockperf.identity"
+        for item in inventories["vm_a"].files)
+    assert not any(item["path"].startswith("metadata/build/vm_b-")
+        for item in inventories["vm_a"].files)
+    assert {"server-logs/iperf3-server.jsonl", "server-logs/iperf3-server.err"} <= {
+        item["path"] for item in inventories["vm_b"].files}
+
+    # An otherwise well-shaped wrong-role sidecar and an unrelated file both
+    # fail through the emitted inventory command, then are removed before bundling.
+    wrong_role = vm_a_root / "metadata/build/vm_b-iperf3.identity"
+    wrong_role.write_text("wrong producer\n")
+    rejected_wrong_role = inventory("vm_a")
+    wrong_role.unlink()
+    unknown = vm_a_root / "metadata/build/unknown.identity"
+    unknown.write_text("unknown\n")
+    rejected_unknown = inventory("vm_a")
+    unknown.unlink()
+    assert any("undeclared file found" in failure for failure in rejected_wrong_role.failures)
+    assert any("undeclared file found" in failure for failure in rejected_unknown.failures)
+    assert len(inventory_requests) == 4
+    assert all("python3 -c" in command.argv[-1] for command in inventory_requests)
+
+    bundle = tmp_path / "retrieved-bundle"
+    bundle.mkdir()
+    controller_records = materialize_build_identity_artifacts(bundle, remote.deployment_id, builds)
+    manifest = build_remote_closed_inventory(identity=identity.model_dump(mode="json"),
+        deployment_id=remote.deployment_id, remote_workspace="/var/lib/cnb/results",
+        declarations=declarations,
+        remote_files={role: inventories[role].files for role in ("vm_a", "vm_b")},
+        source_vm_ids={"vm_a": remote.vm_a.host, "vm_b": remote.vm_b.host},
+        measurement_ended_at=guest.guest_finished_at,
+        closure={"vm_a": datetime.now(timezone.utc), "vm_b": listener_close.closed_at},
+        controller_materialized_ids=[item.artifact_id for item in controller_records])
+    items_by_id = {item.artifact_id: item for item in manifest.items}
+
+    class BoundedLocalTransferRunner:
+        def run(self, command):
+            artifact_id = command.action_id.removeprefix("f02r-retrieve-observe-")
+            item = items_by_id[artifact_id]
+            rewritten = localize_remote_paths(command.argv[-1], roots[item.source_role])
+            completed = subprocess.run(["sh", "-c", rewritten], capture_output=True, text=True, check=False)
+            return command_result(command.action_id, completed.stdout,
+                completed.returncode == 0, completed.stderr)
+
+        def run_bounded_copy(self, command, destination, maximum_bytes):
+            artifact_id = command.action_id.removeprefix("f02r-retrieve-").rsplit("-", 1)[0]
+            item = items_by_id[artifact_id]
+            assert maximum_bytes == item.expected_size_bytes
+            assert f"count={maximum_bytes}" in command.argv[-1]
+            assert BOUNDED_COPY_EOF_MARKER in command.argv[-1]
+            source = roots[item.source_role] / Path(item.source_path).relative_to("/var/lib/cnb/results")
+            payload = source.read_bytes()
+            if len(payload) > maximum_bytes:
+                return command_result(command.action_id, success=False, stderr="source exceeds bounded copy")
+            destination.write_bytes(payload)
+            return command_result(command.action_id, stderr=BOUNDED_COPY_EOF_MARKER)
+
+    retrieved = retrieve_closed_bundle(connection=remote, manifest=manifest,
+        runner=BoundedLocalTransferRunner(), filesystem=bundle, deadline=remote_deadline,
+        retry_admission=lambda _item: False, transfer_admission=lambda _item, _attempt: True,
+        consume_retry=lambda _artifact_id: False, reservation_id="offline-composition-fixture",
+        provider_trigger=remote_deadline.cap_started_at, retry_seconds=1,
+        now_utc=lambda: datetime.now(timezone.utc), clock=lambda: 100)
+    assert retrieved.complete and not retrieved.failures, json.dumps({
+        "failure": retrieved.failure.model_dump(mode="json") if retrieved.failure else None,
+        "failures": retrieved.failures,
+        "actions": [{"id": item.action_id, "stdout": item.result.get("stdout"),
+            "stderr": item.result.get("stderr")} for item in retrieved.actions[:3]],
+        "attempts": [item.model_dump(mode="json") for item in retrieved.attempts]}, indent=2)
+    assert len(retrieved.records) == len(manifest.items)
+    for record in retrieved.records:
+        record.verify_materialized_file(bundle)
+    receiver_record = next(item for item in retrieved.records
+        if item.artifact_id == "iperf3_server_log")
+    receiver_record.verify_materialized_file(bundle)
+    assert (bundle / receiver_record.path).read_bytes() == receiver_bytes
+    _bundle_digest, bundle_hashes = seal_bundle(bundle)
+    assert bundle_hashes[receiver_record.path] == hashlib.sha256(receiver_bytes).hexdigest()
+    assert (bundle / "checksums.sha256").is_file()
+
+
 def test_f03_source_binder_replays_closed_sockperf_and_persistent_iperf_sources(tmp_path):
     sock_log = (ROOT / "sockperf-window.log").read_bytes()
     iperf_log = (ROOT / "iperf-receiver.log").read_bytes()
