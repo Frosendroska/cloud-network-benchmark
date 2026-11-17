@@ -761,6 +761,13 @@ def test_vm_b_listener_closure_stops_selected_systemd_units_and_observes_closed_
                 stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
                 return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
                     f"ControlGroup=/system.slice/{unit}.service\n"
+                    "StandardOutput=append\nStandardError=append\n")
+            if request.action_id.startswith("f09-listener-config-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                return result(request.action_id,
+                    "# /run/systemd/transient/cnb.service\n[Service]\n"
                     f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
                     f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
             return result(request.action_id)
@@ -797,6 +804,44 @@ def test_vm_b_listener_closure_fails_closed_when_unit_is_still_active(tmp_path):
     closure = stop_vm_b_listeners(connected, runner=Runner(), deadline=deadline(), clock=lambda:100)
     assert not closure.closed and closure.closed_at is None
     assert len(closure.failures) == 2
+
+
+@pytest.mark.parametrize("case", ["wrong-path", "cat-denied", "override"])
+def test_vm_b_listener_closure_requires_effective_exact_cat_log_paths(tmp_path, case):
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+    connected = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    "StandardOutput=append\nStandardError=append\n")
+            if request.action_id.startswith("f09-listener-config-"):
+                if case == "cat-denied":
+                    return result(request.action_id, "", success=False, stderr="permission denied")
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                config = ("# /run/systemd/transient/cnb.service\n[Service]\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
+                if case == "wrong-path":
+                    config = config.replace(f"{stdout}", "foreign.log")
+                if case == "override":
+                    config += ("# /etc/systemd/system/cnb.service.d/override.conf\n[Service]\n"
+                        "StandardError=append:/var/lib/cnb/results/server-logs/foreign.err\n")
+                return result(request.action_id, config)
+            raise AssertionError("closure must reject before process inspection or stop")
+    runner = Runner()
+    closure = stop_vm_b_listeners(connected, runner=runner, deadline=deadline(), clock=lambda:100)
+    assert not closure.closed and closure.closed_at is None
+    assert len([request for request in runner.requests if "systemctl stop" in request.argv[-1]]) == 0
+    assert not any(request.action_id.startswith("f09-listener-owner-process-") for request in runner.requests)
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists() or os.geteuid() != 0,
@@ -837,6 +882,9 @@ def test_emitted_listener_closure_script_checks_live_writer_and_closed_process(t
                 if aid.startswith("f09-listener-owner-"):
                     return result(aid, "LoadState=loaded\nActiveState=active\nMainPID="+str(process.pid)+"\n"
                         f"ControlGroup=/system.slice/{unit}.service\n"
+                        "StandardOutput=append\nStandardError=append\n")
+                if aid.startswith("f09-listener-config-"):
+                    return result(aid, "# /run/systemd/transient/cnb.service\n[Service]\n"
                         f"StandardOutput=append:{paths[0]}\nStandardError=append:{paths[1]}\n")
                 if aid.startswith("f09-listener-owner-process-"):
                     return result(aid, json.dumps({"pid":process.pid,"start_ticks":ticks,

@@ -793,11 +793,24 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
         fields = dict(line.split("=", 1) for line in inspected.stdout.splitlines() if "=" in line)
         observations[tool] = fields
         raw_pid = fields.get("MainPID", "")
+        # systemctl show omits the destination for file-backed output modes;
+        # bind the generic append mode to systemd's effective unit definition.
+        from .bootstrap import _unit_log_destinations_match
+        remaining = deadline.remaining(clock, cleanup=True)
+        if remaining <= 0:
+            failures.append(f"{tool} listener configuration observation exceeded the cleanup allowance")
+            continue
+        config_request = _request(f"f09-listener-config-{connection.deployment_id}-{tool}", vm,
+            ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, remaining))
+        config_result = _execute(runner, config_request)
+        actions.append(_action(config_request.action_id, config_request.action_type, vm, config_request, config_result))
         if (fields.get("LoadState") != "loaded" or fields.get("ActiveState") != "active"
                 or not raw_pid.isdigit() or int(raw_pid) <= 0
                 or not fields.get("ControlGroup", "").rstrip("/").endswith("/" + unit + ".service")
-                or fields.get("StandardOutput") != "append:" + stdout_path
-                or fields.get("StandardError") != "append:" + stderr_path):
+                or fields.get("StandardOutput") != "append"
+                or fields.get("StandardError") != "append"
+                or config_result.outcome != CommandOutcome.SUCCEEDED
+                or not _unit_log_destinations_match(config_result.stdout, stdout_path, stderr_path)):
             failures.append(f"{tool} listener unit identity or native log association is unavailable")
             continue
         owner_source = "\n".join((

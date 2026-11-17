@@ -38,6 +38,7 @@ class MeasurementContext:
     clock_mappings: tuple[ClockMapping, ...] = ()
     tool_identity: Mapping[str, StringEvidence] = field(default_factory=dict)
     build_observations: tuple[BuildObservation, ...] = ()
+    local_vm_role: str | None = None
     receiver_command_evidence: tuple[CommandEvidence, ...] = ()
     source_artifact_records: tuple[ArtifactRecord, ...] = ()
 
@@ -935,8 +936,13 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
     validated = ResolvedObservation.model_validate(observation.model_dump(mode="python"))
     result = _Runner(validated, context, processes, clock).run()
     from .bootstrap import materialize_build_identity_artifacts
+    materialized_builds = context.build_observations
+    if context.local_vm_role is not None:
+        if context.local_vm_role != VmRole.VM_A.value:
+            raise ValueError("short-run measurement can materialize build identities only for VM A")
+        materialized_builds = tuple(build for build in materialized_builds if build.role == context.local_vm_role)
     build_records = materialize_build_identity_artifacts(Path(context.root), context.identity.deployment_id,
-        context.build_observations)
+        materialized_builds)
     if build_records:
         result = replace(result, artifact_records=build_records)
     if not context.source_artifact_records or not context.build_observations:

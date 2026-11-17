@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import timedelta
 from types import SimpleNamespace
 from dataclasses import replace as dataclass_replace
 import hashlib
@@ -241,6 +242,57 @@ def _build(tool: str, producer: VmRole, artifact_id: str):
 def _build_records(root, deployment, builds):
     from cloud_network_benchmark.bootstrap import materialize_build_identity_artifacts
     return list(materialize_build_identity_artifacts(root, deployment, builds))
+
+
+def test_vm_a_measurement_and_actual_inventory_exclude_prepared_vm_b_identity(repository_root, tmp_path):
+    import subprocess
+    from cloud_network_benchmark.bootstrap import BuildObservation
+    from cloud_network_benchmark.lifecycle_adapters import inventory_remote_workspace
+    from cloud_network_benchmark.lifecycle_bundle import lifecycle_declarations, remote_inventory_paths_by_role
+    from cloud_network_benchmark.lifecycle_guest import GuestRequest, execute_request, package_tree_sha256
+    from fixtures.f02r.support import connection, deadline, result as command_result
+
+    resolved = observation(repository_root, "acceptance")
+    builds = tuple(BuildObservation.model_validate(vars(_build(tool, role, f"{role}-{tool}")))
+        for role in (VmRole.VM_A, VmRole.VM_B) for tool in ("sockperf", "iperf3"))
+    guest_a = tmp_path / "guest-vm-a"
+    guest_a.mkdir()
+    runtime = context(resolved, guest_a)
+    identity = runtime.identity.model_copy(update={"run_id": "producer-a-aws", "deployment_id": "producer-a-aws-deployment"})
+    package = tmp_path / "guest-package"
+    package.mkdir()
+    (package / "sample.py").write_text("# staged\n")
+    clock = FakeClock()
+    request = GuestRequest(schema_version=2, identity=identity, observation=resolved,
+        b_private_ipv4="10.20.30.40", output_root=guest_a,
+        effective_deadline_utc=clock.utc_now() + timedelta(seconds=400),
+        safe_remaining_seconds=400, clock_uncertainty_seconds=1,
+        source_revision="a" * 40, expected_source_revision="a" * 40,
+        package_root=package, package_sha256=package_tree_sha256(package), shutdown_grace_seconds=1,
+        build_observations=[build.model_dump(mode="json") for build in builds])
+    measured = execute_request(request, processes=_fixture_processes(clock), clock=clock)
+    assert measured.outcome == "succeeded", measured.failures
+    assert (guest_a / "metadata/build/vm_a-sockperf.identity").is_file()
+    assert (guest_a / "metadata/build/vm_a-iperf3.identity").is_file()
+    assert not (guest_a / "metadata/build/vm_b-iperf3.identity").exists()
+    assert not (guest_a / "metadata/build/vm_b-sockperf.identity").exists()
+    native_rtt = sorted(guest_a.rglob("sockperf.csv"))
+    assert len(native_rtt) == 3 and all(path.stat().st_size > 0 for path in native_rtt)
+
+    declarations = lifecycle_declarations(resolved.artifact_layout, mode=resolved.mode,
+        measurement_units=resolved.measurement_units, build_observations=builds)
+    role_paths = remote_inventory_paths_by_role(declarations)
+    class LocalRemoteRunner:
+        def run(self, request):
+            completed = subprocess.run(["sh", "-c", request.argv[-1]], capture_output=True, text=True, check=False)
+            return command_result(request.action_id, completed.stdout, completed.returncode == 0, completed.stderr)
+    inventory = inventory_remote_workspace(connection(tmp_path), role="vm_a", workspace=str(guest_a),
+        runner=LocalRemoteRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert not inventory.failures, inventory.failures
+    inventoried_paths = {row["path"] for row in inventory.files}
+    assert {"metadata/build/vm_a-sockperf.identity", "metadata/build/vm_a-iperf3.identity"} <= inventoried_paths
+    assert not any(path.startswith("metadata/build/vm_b-") for path in inventoried_paths)
 
 
 def test_f03_source_binder_replays_closed_sockperf_and_persistent_iperf_sources(tmp_path):

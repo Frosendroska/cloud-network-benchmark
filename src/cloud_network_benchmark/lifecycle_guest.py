@@ -109,6 +109,7 @@ def execute_request(request: GuestRequest, *, processes=None, clock=None) -> Gue
         identity=request.identity, b_private_ipv4=request.b_private_ipv4,
         root=request.output_root, deadline_monotonic=clock.monotonic() + safe,
         shutdown_grace_seconds=request.shutdown_grace_seconds,
+        local_vm_role="vm_a",
         tool_identity=request.tool_identity,
         build_observations=tuple(_validated_build(item) for item in request.build_observations),
         receiver_command_evidence=tuple(_validated_command(item) for item in request.receiver_command_evidence),
