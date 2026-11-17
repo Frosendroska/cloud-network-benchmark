@@ -418,17 +418,20 @@ def test_f03_dash_status_probe_tracks_running_terminal_and_rejects_absent_or_mal
 def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
         repository_root, tmp_path):
     """Run the generated wrapper and real guest module with local fake tools."""
+    import json
     import os
     import shlex
     import shutil
     import subprocess
     import sys
+    import time
     from datetime import datetime, timedelta, timezone
     from cloud_network_benchmark.lifecycle_adapters import (
-        GuestRuntimeEvidence, run_remote_f03,
+        GuestRuntimeEvidence, _stop_remote_f03, run_remote_f03,
     )
+    from cloud_network_benchmark.access import RemoteDeadline
     from cloud_network_benchmark.lifecycle_guest import package_tree_sha256
-    from tests.fixtures.f02r.support import connection, deadline, result
+    from tests.fixtures.f02r.support import connection, result
 
     if not Path("/proc/self/stat").is_file() or shutil.which("setsid") is None:
         pytest.skip("the generated F03 launcher requires Linux /proc and setsid")
@@ -452,7 +455,8 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
         "identity": connected.identity.model_dump(mode="python"),
         "observation": base.observation.model_dump(mode="python"),
         "output_root": str(remote_root / "results"), "package_root": str(package_root),
-        "effective_deadline_utc": datetime.now(timezone.utc) + timedelta(seconds=400),
+        "effective_deadline_utc": datetime.now(timezone.utc) + timedelta(seconds=45),
+        "safe_remaining_seconds": 45,
         "source_revision": "a" * 40, "expected_source_revision": "a" * 40,
         "package_sha256": digest})
     runtime = GuestRuntimeEvidence("a" * 40, digest, "b" * 64,
@@ -460,9 +464,12 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
 
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
+    # The valid acceptance fixture has 10 measured seconds, 5 seconds warmup,
+    # and uses 15-second idle / 20-second loaded Sockperf probes. Fail its
+    # first controlled probe so this transport test closes before later units.
     (fake_bin / "sockperf").write_text(
-        "#!/usr/bin/env python3\nimport time\n"
-        "print('Starting test...', flush=True)\ntime.sleep(3)\n")
+        "#!/usr/bin/env python3\nimport sys, time\n"
+        "print('Starting test...', flush=True)\ntime.sleep(.5)\nsys.exit(7)\n")
     (fake_bin / "iperf3").write_text(
         "#!/usr/bin/env python3\nimport json\n"
         "print(json.dumps({'start': {'test_start': {'omit': 5}}, "
@@ -489,7 +496,8 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
                 return result(action)
-            if action.startswith("f09-guest-run-") or action.startswith("f09-guest-status-"):
+            if (action.startswith("f09-guest-run-") or action.startswith("f09-guest-status-")
+                    or action.startswith("f09-guest-cancel-")):
                 completed = subprocess.run(["/bin/sh", "-c", command.argv[-1]],
                     capture_output=True, text=True, env=local_env, timeout=8)
                 return result(action, completed.stdout, completed.returncode == 0, completed.stderr)
@@ -500,20 +508,52 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
             raise AssertionError(f"unexpected local guest command: {action}")
 
     runner = LocalGuestRunner()
-    report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
-        deadline=deadline(), clock=lambda: 100)
+    start_monotonic = time.monotonic()
+    start_utc = datetime.now(timezone.utc)
+    controller_deadline = RemoteDeadline(
+        readiness_deadline_monotonic=start_monotonic + 45,
+        overall_deadline_monotonic=start_monotonic + 45,
+        cleanup_reserve_seconds=5, cap_started_at=start_utc,
+        cap_expires_at=start_utc + timedelta(seconds=45))
+    try:
+        report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+            deadline=controller_deadline, clock=time.monotonic)
 
-    assert report.failure is None, report.failure
-    assert report.outcome is not None and report.outcome.outcome == "failed"
-    assert report.outcome.identity == request.identity
-    assert report.outcome_source_bytes
-    status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
-    assert any(item.result["stdout"].strip() == "running" for item in status_actions)
-    assert status_actions[-1].result["stdout"].strip() == "exited 0"
-    assert any("f09-guest-outcome-" in item.action_id for item in report.actions)
-    assert report.outcome.commands and report.outcome.failures
-    status_file = next(remote_root.glob("control/*.status"))
-    assert status_file.read_text().strip() == "0"
+        assert report.failure is None, report.failure
+        assert report.outcome is not None and report.outcome.outcome == "failed"
+        assert report.outcome.identity == request.identity
+        assert report.outcome_source_bytes
+        assert request.observation.benchmark.measured_seconds == 10
+        assert request.observation.benchmark.warmup_seconds == 5
+        assert [(unit.phase.value, unit.measured_seconds)
+                for unit in request.observation.measurement_units] == [
+                    ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
+        assert report.outcome.commands and report.outcome.failures
+        assert report.outcome.commands[0].request["argv"][-2:] == ["-t", "15"]
+        status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
+        assert any(item.result["stdout"].strip() == "running" for item in status_actions)
+        assert status_actions[-1].result["stdout"].strip() == "exited 0"
+        assert any("f09-guest-outcome-" in item.action_id for item in report.actions)
+        status_file = next(remote_root.glob("control/*.status"))
+        assert status_file.read_text().strip() == "0"
+    finally:
+        process_files = list(remote_root.glob("control/*.process.json"))
+        if process_files:
+            process_path = process_files[0]
+            process_record = json.loads(process_path.read_text(encoding="utf-8"))
+            cleanup_actions = []
+            cleanup_started = time.monotonic()
+            cleanup_utc = datetime.now(timezone.utc)
+            cleanup_deadline = RemoteDeadline(
+                readiness_deadline_monotonic=cleanup_started + 10,
+                overall_deadline_monotonic=cleanup_started + 10,
+                cleanup_reserve_seconds=1, cap_started_at=cleanup_utc,
+                cap_expires_at=cleanup_utc + timedelta(seconds=10))
+            stopped = _stop_remote_f03(connected, process_record,
+                process_record["invocation_id"], process_path=str(process_path),
+                runner=runner, deadline=cleanup_deadline,
+                clock=time.monotonic, actions=cleanup_actions)
+            assert stopped == "process_group_stopped", cleanup_actions[-1].result
 
 
 def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
