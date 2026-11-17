@@ -871,7 +871,7 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
     ("failure_check", True, True, "valid", "eu-north-1"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail, expected_validity, region):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -910,6 +910,13 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         full_native=full_native, region=region)
     clock = FakeClock()
     runtime["sleep"] = clock.sleep
+    from cloud_network_benchmark import lifecycle_adapters
+    original_remote_f03 = lifecycle_adapters.run_remote_f03
+    handoff = {}
+    def capture_remote_f03(connection, guest_request, **kwargs):
+        handoff.update(request=guest_request, called_at=clock.monotonic(), kwargs=kwargs)
+        return original_remote_f03(connection, guest_request, **kwargs)
+    monkeypatch.setattr(lifecycle_adapters, "run_remote_f03", capture_remote_f03)
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
@@ -934,6 +941,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["prepare"].succeeded is True, provider_result.values["prepare"].evidence
     assert provider_result.values["measure"].succeeded is True, (runner.guest_exception, provider_result.values["measure"].evidence,
         clock.elapsed, built["ledger"].inspect()["reservations"])
+    assert handoff["kwargs"]["active_deadline_monotonic"] - handoff["called_at"] <= runtime["allowance"].measurement_seconds
+    assert handoff["kwargs"]["shutdown_deadline_monotonic"] - handoff["kwargs"]["active_deadline_monotonic"] == runtime["allowance"].measurement_shutdown_seconds
+    assert 0 < handoff["request"].safe_remaining_seconds <= (
+        runtime["allowance"].measurement_seconds + runtime["allowance"].measurement_shutdown_seconds)
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
     from cloud_network_benchmark.contracts.measurements import CommandEvidence
     for raw_command in provider_result.values["measure"].evidence.outcome.commands:
