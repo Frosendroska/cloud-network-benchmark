@@ -7,7 +7,29 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from fixtures.f02r.support import BootstrapRunner, bootstrap_config, connection, deadline, result
 from cloud_network_benchmark.bootstrap import SourceBuild, run_bootstrap, _required_capabilities, _tcp_congestion_probe_script
-from cloud_network_benchmark.bootstrap import _build_config_prelude, _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe
+from cloud_network_benchmark.bootstrap import _build_config_prelude, _capabilities_observed, _compiler_identity_observed, _identity_preflight_script, _recipe, _unit_environment_matches
+
+
+def test_systemd_listener_identity_accepts_only_exact_balanced_environment_quotes():
+    expected = "CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3"
+    show = f"Environment={expected}\n"
+
+    def matches(value):
+        return _unit_environment_matches(show, f"[Service]\nEnvironment={value}\n", "f02r-vm_b-listener-iperf3")
+
+    assert matches(expected)
+    assert matches(f'"{expected}"')
+    for value in (
+        '"CNB_ACQUISITION_ID=wrong"',
+        '"CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3-extra"',
+        f'{expected} trailing',
+        f'"{expected}',
+        f'{expected}"',
+    ):
+        assert not matches(value)
+    assert not _unit_environment_matches("Environment=CNB_ACQUISITION_ID=wrong\n",
+                                        f"[Service]\nEnvironment=\"{expected}\"\n",
+                                        "f02r-vm_b-listener-iperf3")
 
 
 def test_preparation_observes_both_tools_on_both_vms_and_private_servers(tmp_path):

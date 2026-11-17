@@ -319,7 +319,10 @@ def _unit_environment_matches(show_text: str, config_text: str, observation_id: 
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
         elif section == "Service" and line.startswith("Environment="):
-            effective = line.split("=", 1)[1]
+            value = line.split("=", 1)[1]
+            # systemctl cat retains the balanced quotes around this exact
+            # systemd Environment assignment.
+            effective = expected if value in {expected, f'"{expected}"'} else value
     return expected in fields.get("Environment", "") and effective == expected
 
 
