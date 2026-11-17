@@ -430,14 +430,29 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
         GuestRuntimeEvidence, _stop_remote_f03, run_remote_f03,
     )
     from cloud_network_benchmark.access import RemoteDeadline
-    from cloud_network_benchmark.lifecycle_guest import package_tree_sha256
+    from cloud_network_benchmark.lifecycle_guest import GuestOutcome, package_tree_sha256
     from tests.fixtures.f02r.support import connection, result
+
+    base, _clock = _request(repository_root, tmp_path)
+    assert base.observation.benchmark.measured_seconds == 10
+    assert base.observation.benchmark.warmup_seconds == 5
+    assert [(unit.phase, unit.measured_seconds)
+            for unit in base.observation.measurement_units] == [
+                ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
+    now_utc = datetime.now(timezone.utc)
+    command_shape = GuestOutcome(identity=base.identity, outcome="failed",
+        executed_unit_ids=[],
+        unexecuted_unit_ids=[unit.unit_id for unit in base.observation.measurement_units],
+        commands=[{"request": {"argv": ["sockperf", "under-load", "-t", "15"]}}],
+        timings=[], artifact_paths=[], source_revision=base.source_revision,
+        package_sha256=base.package_sha256, guest_started_at=now_utc,
+        guest_finished_at=now_utc)
+    assert command_shape.commands[0]["request"]["argv"][-2:] == ["-t", "15"]
 
     if not Path("/proc/self/stat").is_file() or shutil.which("setsid") is None:
         pytest.skip("the generated F03 launcher requires Linux /proc and setsid")
 
     connected = connection(tmp_path)
-    base, _clock = _request(repository_root, tmp_path)
     connected = connected.model_copy(update={
         "identity": base.identity, "run_id": base.identity.run_id,
         "deployment_id": base.identity.deployment_id,
@@ -523,13 +538,11 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
         assert report.outcome is not None and report.outcome.outcome == "failed"
         assert report.outcome.identity == request.identity
         assert report.outcome_source_bytes
-        assert request.observation.benchmark.measured_seconds == 10
-        assert request.observation.benchmark.warmup_seconds == 5
-        assert [(unit.phase.value, unit.measured_seconds)
+        assert [(unit.phase, unit.measured_seconds)
                 for unit in request.observation.measurement_units] == [
                     ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
         assert report.outcome.commands and report.outcome.failures
-        assert report.outcome.commands[0].request["argv"][-2:] == ["-t", "15"]
+        assert report.outcome.commands[0]["request"]["argv"][-2:] == ["-t", "15"]
         status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
         assert any(item.result["stdout"].strip() == "running" for item in status_actions)
         assert status_actions[-1].result["stdout"].strip() == "exited 0"
