@@ -227,7 +227,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             clock_mappings=[mapping_a, mapping_b] if not idle_phase else [mapping_a])
         timings.append(timing)
         if not day_unit and not chunk_unit:
-            sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t",str(duration+5 if idle_phase else duration+10 if not chunk_unit else duration),"--full-log"]
+            sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t",str(duration+6 if idle_phase else duration+10 if not chunk_unit else duration),"--full-log"]
             commands.append(command(unit.unit_id,"vm_a",sockperf_argv,start_offset))
             if builds:
                 sock_build=next(b for b in builds if b.tool=="sockperf")

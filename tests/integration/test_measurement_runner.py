@@ -33,8 +33,10 @@ def test_materialized_short_run_preserves_native_and_projects_shared_contract_sh
         b"packet, txTime(sec), rxTime(sec), Round trip(usec)\n"
         b"0, 1000.000000000, 1000.000010000, 10.000\n"
         b"------------------------------\n"
-        b"[Total Run] RunTime=15.000 sec; Warm up time=400 msec; SentMessages=100; ReceivedMessages=99\n"
-        b"[Valid Duration] RunTime=14.550 sec; SentMessages=100; ReceivedMessages=99\n")
+        b"[Total Run] RunTime=16.000 sec; Warm up time=400 msec; SentMessages=100; ReceivedMessages=99\n"
+        b"[Valid Duration] RunTime=15.550 sec; SentMessages=100; ReceivedMessages=99\n")
+    assert processes.handles[0].request.argv[processes.handles[0].request.argv.index("-t") + 1] == "16"
+    assert processes.handles[2].request.argv[processes.handles[2].request.argv.index("-t") + 1] == "20"
     iperf = tmp_path / item.artifact_layout.unit_paths(item.measurement_units[1].unit_id)["iperf3"]
     native = json.loads(iperf.read_text())
     assert native["server_output_json"]["end"]["sum_received"]["seconds"] == 10
@@ -77,6 +79,18 @@ def test_unknown_iperf_source_keeps_native_receiver_duration_but_withholds_bound
     assert note["conservative_tcp_start_bounds_monotonic"] is None
     assert note["sockperf_native_total_run_seconds"] == 20
     assert note["sockperf_test_start_bounds_monotonic"] is None
+
+
+def test_idle_tail_admission_rejects_insufficient_usable_runtime(repository_root, tmp_path):
+    item = observation(repository_root, "acceptance")
+    clock = FakeClock()
+    processes = FakeProcesses(clock)
+    # 16 seconds remain, but the one-second shutdown reserve leaves only 15 usable.
+    runtime = replace(context(item, tmp_path), deadline_monotonic=clock.monotonic() + 16)
+    result = run_measurement(item, runtime, processes=processes, clock=clock)
+    assert result.outcome == "failed"
+    assert not processes.handles
+    assert result.failures and "deadline" in result.failures[0].message.lower()
 
 
 def test_truncated_receiver_json_is_preserved_with_unavailable_timing(repository_root, tmp_path):

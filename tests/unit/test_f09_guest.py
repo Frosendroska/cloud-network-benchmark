@@ -530,11 +530,11 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
     command_shape = GuestOutcome(identity=base.identity, outcome="failed",
         executed_unit_ids=[],
         unexecuted_unit_ids=[unit.unit_id for unit in base.observation.measurement_units],
-        commands=[{"request": {"argv": ["sockperf", "under-load", "-t", "15"]}}],
+        commands=[{"request": {"argv": ["sockperf", "under-load", "-t", "16"]}}],
         timings=[], artifact_paths=[], source_revision=base.source_revision,
         package_sha256=base.package_sha256, guest_started_at=now_utc,
         guest_finished_at=now_utc)
-    assert command_shape.commands[0]["request"]["argv"][-2:] == ["-t", "15"]
+    assert command_shape.commands[0]["request"]["argv"][-2:] == ["-t", "16"]
 
     if not Path("/proc/self/stat").is_file() or shutil.which("setsid") is None:
         pytest.skip("the generated F03 launcher requires Linux /proc and setsid")
@@ -629,7 +629,7 @@ def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
                 for unit in request.observation.measurement_units] == [
                     ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
         assert report.outcome.commands and report.outcome.failures
-        assert report.outcome.commands[0]["request"]["argv"][-2:] == ["-t", "15"]
+        assert report.outcome.commands[0]["request"]["argv"][-2:] == ["-t", "16"]
         status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
         assert any(item.result["stdout"].strip() == "running" for item in status_actions)
         assert status_actions[-1].result["stdout"].strip() == "exited 0"

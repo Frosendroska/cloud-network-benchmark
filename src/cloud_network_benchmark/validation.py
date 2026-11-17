@@ -24,6 +24,7 @@ from .contracts.campaign import BenchmarkPlan, ResolvedCampaign, ResolvedObserva
 from .contracts.validation import ValidationFinding, ValidationResult, ValidatorInput
 from .contracts.measurements import DiagnosticSample, VmMetadata, CommandEvidence, MeasurementTiming
 from .manifests import CampaignManifest, ChildRunManifest
+from .measurement import sockperf_idle_probe_seconds
 from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
 
 
@@ -1134,7 +1135,8 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             if any(len(_option_values(argv, flag)) != 1 for flag in ("-p", "--mps", "--reply-every", "-m", "-t")):
                 findings.append(_finding("command.duplicate_option", "error", "Sockperf resolved options must each occur once", unit=command.unit_id))
             unit = next((u for u in value.measurement_units if u.unit_id == command.unit_id), None)
-            expected_duration = unit.measured_seconds + (5 if unit and unit.phase == "idle_latency" else 10) if unit else None
+            expected_duration = (sockperf_idle_probe_seconds(unit.measured_seconds)
+                if unit and unit.phase == "idle_latency" else unit.measured_seconds + 10 if unit else None)
             if expected_duration is not None and _option(argv, "-t") != str(expected_duration) and unit.kind not in {"probe_chunk", "continuous_day"}:
                 findings.append(_finding("command.duration", "error", f"Sockperf duration must be {expected_duration} seconds including warm-up/coordination", unit=unit.unit_id))
             if unit and unit.kind == "probe_chunk":
