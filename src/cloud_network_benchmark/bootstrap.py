@@ -462,9 +462,14 @@ def _identity_preflight_script(source: SourceBuild, config: BootstrapConfig) -> 
     source_dir = shlex.quote(f"{config.workspace}/{source.source_reference}")
     archive = shlex.quote(f"{config.workspace}/{source.archive_name}")
     patch = shlex.quote(f"{config.workspace}/{source.tool}.acquisition.patch")
+    results = shlex.quote(config.results_workspace)
     reference, digest = shlex.quote(source.source_reference), shlex.quote(source.source_sha256)
     patch_digest = shlex.quote(source.observation_patch_sha256 or "legacy")
-    return (f"if [ ! -e {marker} ] && [ ! -L {marker} ] && [ ! -e {binary} ] && [ ! -L {binary} ] && "
+    return (f"if [ -L {results} ]; then exit 44; fi; "
+            f"if [ -e {results} ]; then [ -d {results} ] || exit 44; "
+            f"for entry in {results}/* {results}/.[!.]* {results}/..?*; do "
+            "[ -e \"$entry\" ] || [ -L \"$entry\" ] || continue; exit 44; done; fi; "
+            f"if [ ! -e {marker} ] && [ ! -L {marker} ] && [ ! -e {binary} ] && [ ! -L {binary} ] && "
             f"[ ! -e {build_identity} ] && [ ! -L {build_identity} ] && [ ! -e {source_dir} ] && [ ! -L {source_dir} ] && "
             f"[ ! -e {archive} ] && [ ! -L {archive} ] && [ ! -e {patch} ] && [ ! -L {patch} ]; then "
             "printf 'missing\\n'; exit 0; fi; "

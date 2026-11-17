@@ -441,7 +441,7 @@ def test_fresh_host_identity_preflight_does_not_need_compiler_and_state_fails_cl
 
     config = bootstrap_config().model_copy(update={
         "remote_root": str(tmp_path), "workspace": str(tmp_path / "work"),
-        "install_prefix": str(tmp_path / "install"),
+        "results_workspace": str(tmp_path / "results"), "install_prefix": str(tmp_path / "install"),
     })
     source = next(item for item in config.sources if item.tool == "sockperf")
     empty_path = tmp_path / "empty-path"
@@ -457,6 +457,7 @@ def test_fresh_host_identity_preflight_does_not_need_compiler_and_state_fails_cl
         state_root = tmp_path / state_kind
         state_config = config.model_copy(update={
             "workspace": str(state_root / "work"),
+            "results_workspace": str(state_root / "results"),
             "install_prefix": str(state_root / "install"),
         })
         state_source = next(item for item in state_config.sources if item.tool == "sockperf")
@@ -529,6 +530,35 @@ def test_fresh_host_identity_preflight_does_not_need_compiler_and_state_fails_cl
     partial_actions = [request.action_id for request in partial_runner.requests]
     assert "f02r-vm_a-sockperf-identity-preflight" in partial_actions
     assert not any(action.endswith("-workspace") or action.endswith("-0") for action in partial_actions)
+
+
+def test_identity_preflight_rejects_foreign_or_symlinked_results_workspace(tmp_path):
+    from cloud_network_benchmark.bootstrap import _identity_preflight_script
+
+    config = bootstrap_config().model_copy(update={
+        "remote_root": str(tmp_path), "workspace": str(tmp_path / "work"),
+        "results_workspace": str(tmp_path / "results"), "install_prefix": str(tmp_path / "install")})
+    source = next(item for item in config.sources if item.tool == "sockperf")
+    script = _identity_preflight_script(source, config)
+    results = Path(config.results_workspace)
+
+    def observe():
+        return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+
+    pristine = observe()
+    assert pristine.returncode == 0 and pristine.stdout == "missing\n"
+    foreign = tmp_path / "foreign-results"
+    foreign.mkdir(); (foreign / "native.csv").write_text("outside deployment")
+    results.symlink_to(foreign, target_is_directory=True)
+    linked = observe()
+    assert linked.returncode == 44
+    results.unlink()
+    results.mkdir(); (results / ".foreign-marker").write_text("previous output")
+    populated = observe()
+    assert populated.returncode == 44
+    (results / ".foreign-marker").unlink()
+    empty = observe()
+    assert empty.returncode == 0 and empty.stdout == "missing\n"
 
 
 def test_shell_unsafe_build_values_are_rejected_and_help_is_token_based():
