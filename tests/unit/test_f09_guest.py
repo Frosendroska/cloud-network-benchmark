@@ -484,8 +484,14 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
 
     # Compile the exact identity reporter placed in the generated remote argv.
     generated_argv = shlex.split(shlex.split(runner.start_request.argv[-1])[2])
-    reporter_index = generated_argv.index("python3")
+    reporter_indexes = [index for index in range(len(generated_argv) - 1)
+        if generated_argv[index:index + 2] == ["python3", "-c"]]
+    assert len(reporter_indexes) == 1
+    reporter_index = reporter_indexes[0]
     identity_reporter = generated_argv[reporter_index + 2]
+    assert "process_group" in identity_reporter
+    assert "/proc/sys/kernel/random/boot_id" in identity_reporter
+    assert "start_ticks" in identity_reporter
     compile(identity_reporter, "generated-f04-process-identity", "exec")
     if sys.platform == "linux":
         # Exercise that exact generated reporter against a short-lived local process.
@@ -496,9 +502,11 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
                 str(local.pid), str(identity_path)], capture_output=True, text=True,
                 check=True, timeout=3)
             actual = json.loads(observed.stdout)
-            written = json.loads(identity_path.read_text(encoding="utf-8"))
+            written_text = identity_path.read_text(encoding="utf-8")
+            written = json.loads(written_text)
             stat_tail = Path(f"/proc/{local.pid}/stat").read_text().split(")", 1)[1].split()
             assert actual == written
+            assert written_text.endswith("\n")
             assert actual == {"pid": local.pid, "process_group": local.pid,
                 "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "start_ticks": int(stat_tail[19])}
