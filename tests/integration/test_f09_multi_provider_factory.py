@@ -66,6 +66,16 @@ class Clock:
             self._offsets[ident] = self._offsets.get(ident, max(self._offsets.values())) + seconds
 
 
+class SharedTimelineClock(Clock):
+    """Use one monotonic test timeline when a single-provider workflow changes workers."""
+    def _offset(self):
+        with self._lock:
+            return max(self._offsets.values())
+    def sleep(self, seconds):
+        with self._lock:
+            self._offsets[self._owner] = max(self._offsets.values()) + seconds
+
+
 class FailedExternalCommands:
     def __init__(self): self.actions = []
     def run(self, request):
@@ -206,7 +216,7 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
             "sources": {"workflow_cost_handoff_path": handoff,
                 "support_cost_path": repository_root / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                 "primary_review_path": None}}}}
-    clock, runner = Clock(), GcpSourceRunner()
+    clock, runner = SharedTimelineClock(), GcpSourceRunner()
     runner.clock = clock
     runtime["sleep"] = clock.sleep
     diagnostic_actions = []
