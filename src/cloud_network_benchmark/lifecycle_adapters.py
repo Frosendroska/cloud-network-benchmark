@@ -985,7 +985,8 @@ def inventory_remote_workspace(connection: Any, *, role: str, workspace: str, ru
         exit_reason = {2: "results root is absent or not a real directory", 3: "symlink found in native results",
             5: "native result file-count bound exceeded", 6: "undeclared file found in native results",
             7: "native result byte bound exceeded", 8: "unsupported non-regular entry in native results"}.get(result.exit_code, "remote command failed or exceeded its bound")
-        if result.exit_code == 6 and result.stderr.startswith("undeclared:") and len(result.stderr) <= 256:
+        if result.stderr.startswith("undeclared:") and len(result.stderr) <= 256:
+            exit_reason = "undeclared file found in native results"
             exit_reason += f" ({result.stderr.removeprefix('undeclared:').strip()})"
         return RemoteFileInventory(connection.deployment_id, role, workspace, (), (action,),
             (f"remote actual-file inventory failed: {exit_reason}",))

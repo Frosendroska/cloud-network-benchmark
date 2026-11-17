@@ -33,6 +33,12 @@ def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied
                 path=f"metadata/build/{role}-{tool}.identity", kind="build-identity",
                 producer=role, unit_id=None, expectation="required"))
             seen.add(artifact_id)
+    sockperf_server_error_id = "sockperf_server_error"
+    if sockperf_server_error_id not in seen:
+        additions.append(ArtifactInput(artifact_id=sockperf_server_error_id,
+            path="server-logs/sockperf.err", kind="sockperf-server-stderr",
+            producer="vm_b", unit_id=None, expectation="required"))
+        seen.add(sockperf_server_error_id)
     if str(getattr(mode, "value", mode)) != "diagnostic_day":
         for unit in measurement_units:
             unit_id = unit.unit_id
@@ -43,6 +49,21 @@ def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied
                     producer="vm_a", unit_id=unit_id, expectation="required"))
                 seen.add(artifact_id)
     return [*declarations, *additions]
+
+
+def remote_inventory_paths_by_role(declarations: Sequence[ArtifactInput]) -> dict[str, tuple[str, ...]]:
+    """Bind native inventory allowlists to the declaration's actual producer VM."""
+    paths: dict[str, list[str]] = {"vm_a": [], "vm_b": []}
+    for declaration in declarations:
+        role = str(getattr(declaration.producer, "value", declaration.producer))
+        if role == "controller":
+            continue
+        if role not in paths:
+            raise ValueError(f"unsupported remote artifact producer {role}")
+        path = declaration.path or declaration.path_template
+        if path is not None and path not in paths[role]:
+            paths[role].append(path)
+    return {role: tuple(values) for role, values in paths.items()}
 
 
 def _sha256(path: Path) -> tuple[int, str]:

@@ -71,7 +71,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         run_remote_f03, start_remote_diagnostics, stop_remote_diagnostics,
         stop_vm_b_listeners)
     from .lifecycle_bundle import (build_remote_closed_inventory, lifecycle_declarations,
-        retrieve_closed_bundle_with_ledger)
+        remote_inventory_paths_by_role, retrieve_closed_bundle_with_ledger)
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
 
@@ -402,13 +402,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     raise ValueError("artifact declaration identity is contradictory")
                 unique[declaration.artifact_id] = declaration
             declarations = list(unique.values())
-            expected_paths = tuple(dict.fromkeys(
-                declaration.path or declaration.path_template
-                for declaration in declarations
-                if declaration.producer != "controller" and (declaration.path or declaration.path_template)))
-            # Bootstrap explicitly configures this scoped stderr sink, even
-            # though the F02 result contract does not currently materialize it.
-            expected_paths = (*expected_paths, "server-logs/sockperf.err")
+            expected_paths = remote_inventory_paths_by_role(declarations)
             transfer = rec.get("result_transfer", {}).get(provider)
             inventory_byte_budget = None
             if rec.get("execution_scope") == "paid_request":
@@ -427,7 +421,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             for role in ("vm_a", "vm_b"):
                 item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
                     workspace=runtime["access"]["bootstrap"].results_workspace, runner=runner,
-                    deadline=item.deadline, clock=clock.monotonic, expected_paths=expected_paths,
+                    deadline=item.deadline, clock=clock.monotonic, expected_paths=expected_paths[role],
                     maximum_bytes=(inventory_byte_budget - inventoried_bytes
                         if inventory_byte_budget is not None else None))
                 inventoried_bytes += sum(int(row["size_bytes"]) for row in item.inventories[role].files)

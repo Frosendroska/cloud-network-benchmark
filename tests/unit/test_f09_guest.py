@@ -695,6 +695,9 @@ def test_actual_staged_workspace_is_separate_from_strict_declared_native_invento
     from tests.fixtures.f02r.support import connection, deadline, result
 
     connected = connection(tmp_path)
+    from cloud_network_benchmark.contracts.artifacts import ArtifactInput
+    from cloud_network_benchmark.lifecycle_bundle import remote_inventory_paths_by_role
+    from cloud_network_benchmark.contracts.common import ArtifactExpectation
     guest = tmp_path / "guest"
     work = guest / "work"
     results = guest / "results"
@@ -709,6 +712,12 @@ def test_actual_staged_workspace_is_separate_from_strict_declared_native_invento
     native = results / "measurements/unit/sockperf.csv"
     native.write_bytes(b"native closed result\n")
     assert any(path.is_symlink() for path in work.rglob("*")), "fixture must reproduce staged runtime/build symlinks"
+    role_paths = remote_inventory_paths_by_role([
+        ArtifactInput(artifact_id="vm-a-native", path="measurements/unit/sockperf.csv",
+            kind="sockperf-csv", producer="vm_a", expectation=ArtifactExpectation.REQUIRED),
+        ArtifactInput(artifact_id="vm-b-server-stderr", path="server-logs/sockperf.err",
+            kind="sockperf-server-stderr", producer="vm_b", expectation=ArtifactExpectation.REQUIRED),
+    ])
 
     class LocalGuestRunner:
         def __init__(self): self.requests=[]
@@ -722,25 +731,32 @@ def test_actual_staged_workspace_is_separate_from_strict_declared_native_invento
     runner = LocalGuestRunner()
     inventory = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
         runner=runner, deadline=deadline(), clock=lambda:100,
-        expected_paths=["measurements/unit/sockperf.csv"])
+        expected_paths=role_paths["vm_a"])
     assert inventory.failures == (), (runner.requests[0].argv, inventory.actions[0].result.get("stderr"))
     assert [row["path"] for row in inventory.files] == ["measurements/unit/sockperf.csv"]
     assert inventory.files[0]["size_bytes"] == len(native.read_bytes())
+    wrong_role = results / "server-logs/sockperf.err"
+    wrong_role.parent.mkdir(parents=True); wrong_role.write_bytes(b"wrong VM's declaration")
+    rejected_role_file = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert rejected_role_file.files == () and any("undeclared" in item for item in rejected_role_file.failures), (rejected_role_file.failures,rejected_role_file.actions[0].result.get("stderr"))
+    wrong_role.unlink()
     oversized = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
         runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100, maximum_bytes=4,
-        expected_paths=["measurements/unit/sockperf.csv"])
+        expected_paths=role_paths["vm_a"])
     assert oversized.files == () and oversized.failures
 
     (results / "measurements/unit/foreign.txt").write_text("not declared")
     unknown = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
         runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
-        expected_paths=["measurements/unit/sockperf.csv"])
+        expected_paths=role_paths["vm_a"])
     assert unknown.files == () and unknown.failures
     (results / "measurements/unit/foreign.txt").unlink()
     (results / "measurements/unit/escape").symlink_to(native)
     symlink = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
         runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
-        expected_paths=["measurements/unit/sockperf.csv"])
+        expected_paths=role_paths["vm_a"])
     assert symlink.files == () and symlink.failures
 
 

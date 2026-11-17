@@ -631,7 +631,10 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             identities = []
             for path in files:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch(exist_ok=True)
+                if path.name == "sockperf.err":
+                    path.write_bytes(b"captured Sockperf server stderr fixture\n")
+                else:
+                    path.touch(exist_ok=True)
                 identities.append([path.stat().st_dev, path.stat().st_ino])
             unit = f"cnb-{self.deployment_id}-{tool}"
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
@@ -688,7 +691,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             relative = PurePosixPath(source).relative_to("/var/lib/cnb/results").as_posix()
             artifact_id = action.removeprefix("f02r-retrieve-observe-")
             role = "vm_b" if artifact_id.startswith("vm_b_") or artifact_id in {
-                "sockperf_server_log", "iperf3_server_log", "iperf3_server_error"} else "vm_a"
+                "sockperf_server_log", "sockperf_server_error", "iperf3_server_log", "iperf3_server_error"} else "vm_a"
             local = self.results_roots[role] / relative
             data = local.read_bytes()
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
@@ -948,6 +951,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
     assert any(action.startswith("f02r-retrieve-") for action in runner.actions)
+    assert any("sockperf_server_error" in action for action in runner.actions)
     assert any(action.startswith("f02r-") for action in runner.actions)
     assert f"aws-expiry-start-{region}" in runner.actions
     assert "aws-pair-apply" in runner.actions
