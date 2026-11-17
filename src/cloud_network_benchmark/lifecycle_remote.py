@@ -196,6 +196,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 {"failure": f"{type(exc).__name__}: stabilization failed"})
 
     def measure(deployment: Any, provision: Any):
+        item = None
         try:
             if cancel_event.is_set():
                 return ProviderStageOutcome("measure", False, {"failure": "controller cancellation was requested"})
@@ -315,14 +316,13 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at
             item.guest = __import__("dataclasses").replace(item.guest,
-                receiver_command_evidence=tuple(receiver_commands))
+                receiver_command_evidence=tuple(receiver_commands), diagnostics=dict(item.diagnostics))
             item.measurement_ended_at = (item.guest.outcome.guest_finished_at
                 if item.guest.outcome is not None else after_utc)
             return ProviderStageOutcome("measure", item.guest.outcome is not None
                 and item.guest.outcome.outcome == "succeeded", item.guest)
         except Exception as exc:
-            return ProviderStageOutcome("measure", False,
-                {"failure": f"{type(exc).__name__}: remote measurement handoff failed ({exc})"})
+            return _measurement_handoff_failure(item, exc)
 
     def close(deployment: Any, provision: Any):
         try:
@@ -448,6 +448,14 @@ def _record_f03_process(record: dict[str, Any], control: dict[str, Any], lock: A
     with lock:
         control["process_record"] = dict(record)
         attempt.f03_process_record = dict(record)
+
+
+def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException) -> Any:
+    """Retain diagnostic handles while keeping exception text out of durable evidence."""
+    from .orchestration import ProviderStageOutcome
+    return ProviderStageOutcome("measure", False,
+        {"failure": f"{type(error).__name__}: remote measurement handoff failed",
+         "diagnostics": attempt.diagnostics if attempt is not None else {}})
 
 
 def build_aws_remote_stages(**kwargs: Any):

@@ -164,6 +164,155 @@ def _preparation_failure_declaration(result: Any) -> Any | None:
         producer="controller", unit_id=None, expectation="required")
 
 
+def _bounded_failure_text(value: Any, *, limit: int = 4096) -> str:
+    import re
+    text = str(value)
+    text = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[REDACTED_KEY]", text, flags=re.S)
+    text = re.sub(r"(?i)([\"']?(?:password|token|secret|private[_ -]?key|authorization)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+",
+        r"\1[REDACTED]", text)
+    if len(text) > limit:
+        marker = "\n...[truncated; retained final diagnostic characters]...\n"
+        text = marker + text[-(limit - len(marker)):]
+    return text
+
+
+def _remote_action_diagnostic(action: Any) -> dict[str, Any]:
+    row = action.model_dump(mode="json") if hasattr(action, "model_dump") else action
+    if not isinstance(row, Mapping):
+        return {}
+    request, response = row.get("request", {}), row.get("result", {})
+    request = request if isinstance(request, Mapping) else {}
+    response = response if isinstance(response, Mapping) else {}
+    argv = request.get("argv")
+    safe_argv = ([_bounded_failure_text(value, limit=256) for value in argv[:32]
+                  if isinstance(value, (str, int, float, bool))] if isinstance(argv, list) else None)
+    return {"action_id": _bounded_failure_text(row.get("action_id", ""), limit=256),
+        "action_type": _bounded_failure_text(row.get("action_type", ""), limit=128),
+        "vm_id": _bounded_failure_text(row.get("vm_id", ""), limit=256),
+        "role": _bounded_failure_text(row.get("role", ""), limit=32),
+        "request": {key: (_bounded_failure_text(request[key], limit=256)
+                           if isinstance(request[key], str) else request[key])
+                    for key in ("action_id", "action_type", "timeout_seconds") if key in request}
+            | ({"argv": safe_argv} if safe_argv is not None else {}),
+        "result": {key: (_bounded_failure_text(response[key], limit=2048 if key in {"stdout", "stderr"} else 256)
+                          if isinstance(response[key], str) else response[key])
+                   for key in ("outcome", "exit_code", "started_at", "finished_at",
+                          "duration_seconds", "stdout", "stderr", "redactions_applied") if key in response}}
+
+
+def _measurement_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None, None]:
+    """Capture bounded controller diagnostics for failed measure/close/retrieve stages."""
+    failed = _failed_stage(result, getattr(result, "stage_times", {}))
+    if failed not in {"measure", "close", "retrieve"}:
+        return None, None
+
+    def actions(value: Any) -> list[Any]:
+        candidates = list(getattr(value, "actions", ()) or ())
+        diagnostics = getattr(value, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            for process in diagnostics.values():
+                candidates.extend(getattr(process, "actions", ()) or ())
+        closures = getattr(value, "closures", None)
+        if isinstance(closures, Mapping):
+            for closure in closures.values():
+                candidates.extend(getattr(closure, "actions", ()) or ())
+        listeners = getattr(value, "listener_closure", None)
+        candidates.extend(getattr(listeners, "actions", ()) or ())
+        seen = set()
+        selected = []
+        for action in candidates:
+            row = action.model_dump(mode="json") if hasattr(action, "model_dump") else action
+            key = (row.get("action_id"), row.get("role")) if isinstance(row, Mapping) else None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            selected.append(_remote_action_diagnostic(action))
+        return selected[-12:]
+
+    def failures(value: Any) -> list[str]:
+        observed = getattr(value, "failures", ()) or ()
+        output = []
+        for failure in list(observed)[-16:]:
+            if isinstance(failure, Mapping):
+                fields = [failure[key] for key in ("category", "message") if isinstance(failure.get(key), str)]
+                text = ": ".join(fields)
+            else:
+                text = failure if isinstance(failure, str) else ""
+            if text:
+                output.append(_bounded_failure_text(text, limit=1000))
+        return output
+
+    stages = []
+    for name in ("measure", "close", "retrieve"):
+        outcome = _outcome(result, name)
+        if outcome is None:
+            continue
+        evidence = getattr(outcome, "evidence", None)
+        row: dict[str, Any] = {"stage": name, "succeeded": bool(outcome.succeeded)}
+        if isinstance(evidence, Mapping):
+            failure = evidence.get("failure")
+            if failure is not None:
+                row["failure"] = _bounded_failure_text(failure, limit=1000)
+            if evidence.get("failure_type") is not None:
+                row["failure_type"] = _bounded_failure_text(evidence["failure_type"], limit=128)
+            row["actions"] = actions(evidence)
+            diagnostics = evidence.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                observed_failures = []
+                for process in list(diagnostics.values())[:2]:
+                    row["actions"].extend(actions(process))
+                    observed_failures.extend(failures(process))
+                row["actions"] = row["actions"][-12:]
+                if observed_failures:
+                    row["failures"] = observed_failures[-16:]
+            listeners = evidence.get("listeners")
+            if listeners is not None:
+                row["actions"].extend(actions(listeners))
+                row["actions"] = row["actions"][-12:]
+                row["failures"] = [*row.get("failures", []), *failures(listeners)][-16:]
+            inventories = evidence.get("inventories")
+            if isinstance(inventories, Mapping):
+                observed_failures = []
+                for inventory in list(inventories.values())[:2]:
+                    row["actions"].extend(actions(inventory))
+                    observed_failures.extend(failures(inventory))
+                row["actions"] = row["actions"][-12:]
+                row["failures"] = [*row.get("failures", []), *observed_failures][-16:]
+        else:
+            if getattr(evidence, "failure", None) is not None:
+                row["failure"] = _bounded_failure_text(evidence.failure, limit=1000)
+            guest = getattr(evidence, "outcome", None)
+            if guest is not None:
+                row["guest_outcome"] = {"outcome": _bounded_failure_text(getattr(guest, "outcome", ""), limit=64),
+                    "executed_unit_ids": list(getattr(guest, "executed_unit_ids", ()) or ())[:32],
+                    "unexecuted_unit_ids": list(getattr(guest, "unexecuted_unit_ids", ()) or ())[:32],
+                    "guest_started_at": str(getattr(guest, "guest_started_at", "")),
+                    "guest_finished_at": str(getattr(guest, "guest_finished_at", "")),
+                    "failure_count": len(getattr(guest, "failures", ()) or ())}
+                guest_failures = failures(guest)
+                if guest_failures:
+                    row["guest_failures"] = guest_failures
+            row["actions"] = actions(evidence)
+            observed_failures = failures(evidence)
+            if observed_failures:
+                row["failures"] = observed_failures
+        stages.append(row)
+    if not stages:
+        return None, None
+    return failed, {"schema_version": 1, "stage": failed, "stages": stages}
+
+
+def _measurement_failure_declaration(result: Any) -> Any | None:
+    _failed, payload = _measurement_failure(result)
+    if payload is None:
+        return None
+    from .contracts.artifacts import ArtifactInput
+    return ArtifactInput(artifact_id="f09-measurement-failure",
+        path="metadata/measurement-failure.json", kind="lifecycle_failure_diagnostics",
+        producer="controller", unit_id=None, expectation="required")
+
+
 def _controller_record(root: Path, deployment_id: str, declaration: Any, payload: bytes | None = None) -> Any:
     from .contracts.artifacts import ArtifactRecord, resolve_artifact_path
     from .contracts.common import Evidence, StringEvidence
@@ -369,6 +518,14 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         record = _controller_record(root, child.deployment_id, declaration, payload)
         if record is not None:
             records.append(record)
+    _measurement_failed_stage, measurement_payload = _measurement_failure(result)
+    if measurement_payload is not None:
+        declaration = _measurement_failure_declaration(result)
+        declarations.append(declaration)
+        payload = (json.dumps(measurement_payload, sort_keys=True, indent=2) + "\n").encode()
+        record = _controller_record(root, child.deployment_id, declaration, payload)
+        if record is not None:
+            records.append(record)
     records.extend(_materialize_controller_evidence(root, child, result, declarations))
     if _value(child.mode) == "diagnostic_day":
         parent_units = {unit.unit_id for unit in child.measurement_units}
@@ -438,6 +595,9 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     preparation_declaration = _preparation_failure_declaration(result)
     if preparation_declaration is not None:
         declarations.append(preparation_declaration)
+    measurement_declaration = _measurement_failure_declaration(result)
+    if measurement_declaration is not None:
+        declarations.append(measurement_declaration)
     for role in ("vm_a", "vm_b"):
         declarations.extend(_declarations(role))
     artifacts = {}

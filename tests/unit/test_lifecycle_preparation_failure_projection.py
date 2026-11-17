@@ -95,6 +95,125 @@ def test_successful_prepare_has_no_failure_artifact():
     assert _preparation_failure(SimpleNamespace(values={"prepare": outcome})) == (None, None)
 
 
+def test_failed_measurement_handoff_keeps_only_bounded_redacted_diagnostics():
+    import json
+    from datetime import timedelta
+    from cloud_network_benchmark.access import _action
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
+    from cloud_network_benchmark.lifecycle_adapters import RemoteGuestExecution
+    from cloud_network_benchmark.lifecycle_projection import _measurement_failure
+    from cloud_network_benchmark.orchestration import ProviderStageOutcome
+
+    secret = "/private/identity/known-host-secret"
+    vm = SimpleNamespace(host="192.0.2.2", role="vm_a", authentication_reference=secret,
+        host_key_reference=secret)
+    started = datetime(2026, 11, 17, tzinfo=timezone.utc)
+    request = CommandRequest(action_id="f09-diagnostics-start", action_type="ssh",
+        argv=["ssh", "-i", secret, "diagnostics"], cwd=".", timeout_seconds=3,
+        redactions=[secret])
+    response = CommandResult(action_id="f09-diagnostics-start", outcome="failed", started_at=started,
+        finished_at=started + timedelta(seconds=1), duration_seconds=1, exit_code=1,
+        stdout="private " + secret, stderr=("token=secret-value " + secret + " ") * 500,
+        redactions=[secret])
+    action = _action("f09-diagnostics-start", "ssh", vm, request, response)
+    process = SimpleNamespace(actions=[action])
+    guest = SimpleNamespace(outcome="failed", executed_unit_ids=["idle_latency"],
+        unexecuted_unit_ids=["single_flow"], guest_started_at=started,
+        guest_finished_at=started + timedelta(seconds=1),
+        failures=[{"category": "measurement", "message": "token=paid-secret"}])
+    remote = RemoteGuestExecution(outcome=guest, failure="password=hunter2; diagnostic launch failed",
+        actions=(action,), diagnostics={"vm_a": process})
+    measure = ProviderStageOutcome("measure", False, remote)
+    result = SimpleNamespace(primary_failure="gcp measure failed (adapter reported measure unsuccessful)",
+        stage_times={"measure": {"started_at": started, "finished_at": started + timedelta(seconds=2)}},
+        values={"measure": measure})
+
+    failed_stage, payload = _measurement_failure(result)
+    serialized = json.dumps(payload)
+    assert failed_stage == "measure"
+    assert payload["stages"][0]["failure"] == "password=[REDACTED]; diagnostic launch failed"
+    assert payload["stages"][0]["guest_failures"] == ["measurement: token=[REDACTED]"]
+    assert secret not in serialized and "hunter2" not in serialized and "secret-value" not in serialized
+    assert "paid-secret" not in serialized
+    assert len(payload["stages"][0]["actions"][0]["result"]["stderr"]) <= 4096
+    assert payload["stages"][0]["actions"][0]["request"]["argv"][2] == "[REDACTED]"
+    assert "environment" not in serialized and "stdin" not in serialized
+    assert "native" not in serialized and "commands" not in serialized
+
+
+def test_measurement_callback_failure_retains_diagnostic_handles_without_exception_text():
+    from cloud_network_benchmark.lifecycle_remote import _measurement_handoff_failure
+
+    process = SimpleNamespace(actions=[{"action_id": "f09-diagnostics-start"}])
+    attempt = SimpleNamespace(diagnostics={"vm_a": process})
+    outcome = _measurement_handoff_failure(attempt, RuntimeError("token=paid-secret"))
+    serialized = str(outcome.evidence)
+    assert outcome.stage == "measure" and outcome.succeeded is False
+    assert outcome.evidence["failure"] == "RuntimeError: remote measurement handoff failed"
+    assert outcome.evidence["diagnostics"]["vm_a"] is process
+    assert "paid-secret" not in serialized
+
+
+def test_measurement_failure_projection_materializes_verified_declared_artifact(
+        tmp_path, repository_root, frozen_clock, deterministic_token, fake_git_commits):
+    import hashlib
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence
+    from cloud_network_benchmark.contracts.common import Evidence, StringEvidence
+    from cloud_network_benchmark.lifecycle_projection import _sync_manifest, _measurement_failure, _validator_input
+    from cloud_network_benchmark.manifests import (CampaignManifest, ChildRunManifest,
+        StaticGitProvenance, initialize_campaign)
+
+    config = repository_root / "configs/experiments/exp-001-multi-provider.yaml"
+    initialized = initialize_campaign(config, repository_root, tmp_path / "results", frozen_clock,
+        deterministic_token, StaticGitProvenance(fake_git_commits["implementation"]),
+        StaticGitProvenance(fake_git_commits["design"]))
+    ref = initialized.children[0]
+    child = ChildRunManifest.model_validate_json(Path(ref.manifest_path).read_text())
+    started = frozen_clock()
+    remote = SimpleNamespace(failure="diagnostic start failed", diagnostics={}, actions=[], outcome=None)
+    result = SimpleNamespace(execution_state="failed", cleanup_state="succeeded", interrupted=False,
+        primary_failure=f"{child.provider} measure failed (adapter reported measure unsuccessful)",
+        secondary_failures=[], values={
+            "measure": SimpleNamespace(stage="measure", succeeded=False, evidence=remote),
+            "close": SimpleNamespace(stage="close", succeeded=False, evidence={
+                "diagnostics": {"vm_a": SimpleNamespace(actions=[], failures=("diagnostic close failed",))},
+                "listeners": SimpleNamespace(actions=[], failures=("listener close failed",))})},
+        stage_times={"measure": {"started_at": started, "finished_at": started + timedelta(seconds=2)},
+            "cleanup": {"started_at": started + timedelta(seconds=3),
+                "finished_at": started + timedelta(seconds=4)}})
+    reservation = ReservationEvidence(schema_version=2, campaign_id=child.campaign_id,
+        reservation_id=Evidence[str](value="projection-reservation"), state="reserved",
+        reserved_cost_usd=Evidence[float](value=0.0), cap_started_at=Evidence(value=started),
+        expires_at=Evidence(value=started + timedelta(minutes=20)), cap_start_policy_id=StringEvidence(value="offline"),
+        source_path="fixture.json", source_sha256="a" * 64)
+
+    updated = _sync_manifest(parent_path=Path(initialized.parent_manifest_path),
+        child_path=Path(ref.manifest_path), root=Path(ref.result_path), child=child, result=result,
+        reservation=reservation, evaluated_at=started + timedelta(seconds=4))
+
+    path = Path(ref.result_path) / "metadata/measurement-failure.json"
+    record = next(row for row in updated.artifact_records if row.artifact_id == "f09-measurement-failure")
+    assert record.sha256.value == hashlib.sha256(path.read_bytes()).hexdigest()
+    record.verify_materialized_file(Path(ref.result_path))
+    payload = json.loads(path.read_text())
+    assert payload["stage"] == "measure"
+    assert payload["stages"][1]["failures"] == ["diagnostic close failed", "listener close failed"]
+    parent = CampaignManifest.model_validate_json(Path(initialized.parent_manifest_path).read_text())
+    validator_input, _builds, _receiver_commands, _clock_mappings = _validator_input(
+        parent=parent, parent_path=Path(initialized.parent_manifest_path),
+        child=updated, child_path=Path(ref.manifest_path), root=Path(ref.result_path), result=result,
+        reservation=reservation)
+    declaration = validator_input.artifacts["f09-measurement-failure"]
+    assert (declaration.path, declaration.kind, declaration.producer, declaration.unit_id) == (
+        "metadata/measurement-failure.json", "lifecycle_failure_diagnostics", "controller", None)
+    assert _measurement_failure(SimpleNamespace(primary_failure=None, stage_times={}, values={})) == (None, None)
+    assert updated.failure.category == "lifecycle_failure"
+    assert updated.execution_state == "failed" and updated.cleanup_state == "succeeded"
+
+
 @pytest.mark.parametrize("stage", ["bootstrap", "readiness"])
 def test_failed_prepare_persists_checksummed_child_diagnostic(tmp_path, repository_root, frozen_clock,
         deterministic_token, fake_git_commits, stage):

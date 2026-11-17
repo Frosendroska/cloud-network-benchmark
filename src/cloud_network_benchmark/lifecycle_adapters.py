@@ -8,7 +8,7 @@ import re
 import shlex
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
@@ -39,6 +39,7 @@ class RemoteGuestExecution:
     failure: str | None = None
     receiver_command_evidence: tuple[Any, ...] = ()
     outcome_source_bytes: bytes | None = None
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
