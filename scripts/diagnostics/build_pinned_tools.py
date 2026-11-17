@@ -144,7 +144,7 @@ def main() -> int:
                         source_cache_sha256_observed=observed_cache_sha)
                     summary["tools"].append(row)
                     continue
-                shutil.copyfile(cached_archive, workspace / source.archive_name)
+                shutil.copyfile(cached_archive, Path(config.workspace) / source.archive_name)
                 row["source_cache_used"] = True
             # Recipe[0] is the production apt install action, explicitly omitted on this host.
             for index, argv in enumerate(commands[1:], start=1):
@@ -170,7 +170,7 @@ def main() -> int:
                         failure="command_timed_out" if timed_out else "command_failed")
                     break
                 if index == 2:
-                    observed = _sha256sum_output(out, str(workspace / source.archive_name))
+                    observed = _sha256sum_output(out, str(Path(config.workspace) / source.archive_name))
                     if observed != source.source_sha256:
                         row.update(status="failed", failed_command="archive_digest_mismatch", observed_source_sha256=observed)
                         break
@@ -180,7 +180,7 @@ def main() -> int:
                 if index == 6:
                     row["binary_version"] = out.strip()
                 if index == 7:
-                    row["binary_sha256"] = _sha256sum_output(out, str(prefix / "bin" / source.tool))
+                    row["binary_sha256"] = _sha256sum_output(out, str(Path(config.install_prefix) / "bin" / source.tool))
                     if not row["binary_sha256"]:
                         row.update(status="failed", failed_command="binary_digest_missing")
                         break
