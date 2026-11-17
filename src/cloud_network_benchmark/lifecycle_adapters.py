@@ -610,7 +610,7 @@ def start_remote_diagnostics(connection: Any, context: Mapping[str, Any], *, run
                     "import json,os,pathlib,sys; p=int(sys.argv[1]); "
                     "s=pathlib.Path(f'/proc/{p}/stat').read_text(); f=s[s.rfind(')')+2:].split(); "
                     "r={'pid':p,'process_group':os.getpgid(p),'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'start_ticks':int(f[19])}; "
-                    "pathlib.Path(sys.argv[2]).write_text(json.dumps(r,sort_keys=True)+'\\n'); print(json.dumps(r,sort_keys=True)"
+                    "pathlib.Path(sys.argv[2]).write_text(json.dumps(r,sort_keys=True)+'\\n'); print(json.dumps(r,sort_keys=True))"
                     ) + " \"$pid\" " + shlex.quote(process_path))
             start = _request(f"f09-diagnostics-start-{invocation}", vm,
                 ["sh", "-c", script], min(connection.timeouts.command_seconds, remaining))

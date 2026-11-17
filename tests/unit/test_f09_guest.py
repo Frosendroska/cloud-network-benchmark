@@ -428,6 +428,11 @@ def test_guest_sigterm_bridge_raises_interrupt_and_restores_original_handler(
 
 def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(tmp_path):
     import json
+    import os
+    import shlex
+    import signal
+    import subprocess
+    import sys
     from datetime import datetime, timezone
     from cloud_network_benchmark.lifecycle_adapters import start_remote_diagnostics, stop_remote_diagnostics
     from tests.fixtures.f02r.support import connection, deadline, result
@@ -442,10 +447,11 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
     boot_id = "12345678-1234-1234-1234-123456789abc"
 
     class Runner:
-        def __init__(self): self.requests = []
+        def __init__(self): self.requests = []; self.start_request = None
         def run(self, request):
             self.requests.append(request)
             if request.action_id.startswith("f09-diagnostics-start-"):
+                self.start_request = request
                 assert "setsid python3" in request.argv[-1]
                 assert "process_group" in request.argv[-1] and "/proc/sys/kernel/random/boot_id" in request.argv[-1]
                 return result(request.action_id, json.dumps({"pid": 4321, "process_group": 4321,
@@ -475,6 +481,34 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
         remote_root=f"/var/lib/cnb/control/{connected.deployment_id}", deadline=deadline(), clock=lambda:100)
     assert process.role == "vm_b" and process.pid == process.process_group == 4321
     assert process.boot_id == boot_id and process.start_ticks == 7654
+
+    # Compile the exact identity reporter placed in the generated remote argv.
+    generated_argv = shlex.split(shlex.split(runner.start_request.argv[-1])[2])
+    reporter_index = generated_argv.index("python3")
+    identity_reporter = generated_argv[reporter_index + 2]
+    compile(identity_reporter, "generated-f04-process-identity", "exec")
+    if sys.platform == "linux":
+        # Exercise that exact generated reporter against a short-lived local process.
+        local = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            identity_path = tmp_path / "local-process-identity.json"
+            observed = subprocess.run([sys.executable, "-c", identity_reporter,
+                str(local.pid), str(identity_path)], capture_output=True, text=True,
+                check=True, timeout=3)
+            actual = json.loads(observed.stdout)
+            written = json.loads(identity_path.read_text(encoding="utf-8"))
+            stat_tail = Path(f"/proc/{local.pid}/stat").read_text().split(")", 1)[1].split()
+            assert actual == written
+            assert actual == {"pid": local.pid, "process_group": local.pid,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "start_ticks": int(stat_tail[19])}
+        finally:
+            try:
+                os.killpg(local.pid, signal.SIGTERM)
+                local.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(local.pid, signal.SIGKILL)
+                local.wait(timeout=2)
     closure = stop_remote_diagnostics(connected, process, runner=runner,
         deadline=deadline(), clock=lambda:100)
     assert closure.state == "closed" and closure.closed_at is not None
