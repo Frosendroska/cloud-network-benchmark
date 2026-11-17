@@ -864,14 +864,15 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region"), [
-    ("failure_check", False, False, "partial", "eu-central-1"),
-    ("failure_check", True, False, "partial", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-north-1"),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only"), [
+    ("failure_check", False, False, "partial", "eu-central-1", False),
+    ("failure_check", True, False, "partial", "eu-central-1", False),
+    ("failure_check", True, True, "valid", "eu-central-1", False),
+    ("failure_check", True, True, "valid", "eu-north-1", False),
+    ("failure_check", False, False, "partial", "eu-central-1", True),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -917,6 +918,11 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         handoff.update(request=guest_request, called_at=clock.monotonic(), kwargs=kwargs)
         return original_remote_f03(connection, guest_request, **kwargs)
     monkeypatch.setattr(lifecycle_adapters, "run_remote_f03", capture_remote_f03)
+    if handoff_only:
+        from cloud_network_benchmark.lifecycle_adapters import RemoteListenerClosure
+        monkeypatch.setattr(lifecycle_adapters, "stop_vm_b_listeners", lambda connection, **kwargs:
+            RemoteListenerClosure(deployment_id=connection.deployment_id, role="vm_b", closed=True,
+                closed_at=clock.utc_now(), observations={}, actions=(), failures=()))
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
@@ -945,6 +951,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert handoff["kwargs"]["shutdown_deadline_monotonic"] - handoff["kwargs"]["active_deadline_monotonic"] == runtime["allowance"].measurement_shutdown_seconds
     assert 0 < handoff["request"].safe_remaining_seconds <= (
         runtime["allowance"].measurement_seconds + runtime["allowance"].measurement_shutdown_seconds)
+    if handoff_only:
+        return
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
     from cloud_network_benchmark.contracts.measurements import CommandEvidence
     for raw_command in provider_result.values["measure"].evidence.outcome.commands:
