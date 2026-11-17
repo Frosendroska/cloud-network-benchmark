@@ -405,30 +405,21 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                     return interrupted_execution(f"F03 active cap expired; {cancellation_status}",
                         retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                 poll = _request(f"f09-guest-status-{invocation}", vm,
-                    ["sh", "-c", "if test -s " + shlex.quote(str(status_path))
-                     + "; then printf 'exited '; cat " + shlex.quote(str(status_path))
-                     + "; elif kill -0 -- -" + str(process_record["process_group"])
-                     + " 2>/dev/null; then printf 'running\\n'; else printf 'absent\\n'; fi"],
+                    ["sh", "-c", _f03_guest_status_command(
+                        str(status_path), process_record["process_group"])],
                     min(connection.timeouts.command_seconds, remaining))
                 poll_result = _execute(runner, poll)
                 actions.append(_action(poll.action_id, poll.action_type, vm, poll, poll_result))
                 if poll_result.outcome != CommandOutcome.SUCCEEDED:
                     raise RuntimeError("VM-A F03 authenticated status poll failed")
-                line = poll_result.stdout.strip()
-                if line.startswith("exited "):
-                    code = line.removeprefix("exited ").strip()
-                    if not code.isdigit():
-                        raise ValueError("VM-A F03 guest exit status is malformed")
-                    status = int(code)
-                elif line == "running":
+                status = _parse_f03_guest_status(poll_result.stdout.strip())
+                if status is None:
                     if cancel_event is not None and cancel_event.is_set():
                         cancellation_status = _stop_remote_f03(connection, process_record, invocation,
                             process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
                         return interrupted_execution(f"controller cancellation; {cancellation_status}",
                             retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                     sleep(min(0.25, remaining))
-                else:
-                    raise RuntimeError("VM-A F03 process disappeared without an authenticated terminal status")
             if status != 0:
                 cancellation_status = _stop_remote_f03(connection, process_record, invocation,
                     process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
@@ -449,6 +440,30 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     except BaseException as exc:
         return RemoteGuestExecution(None, tuple(actions),
             f"{type(exc).__name__}: F03 {stage} failed ({exc}); cancellation={cancellation_status}")
+
+
+def _f03_guest_status_command(status_path: str, process_group: int) -> str:
+    """Build the POSIX-shell status probe for the already validated process group."""
+    if isinstance(process_group, bool) or not isinstance(process_group, int) or process_group <= 0:
+        raise ValueError("F03 process group must be a positive validated integer")
+    quoted_status = shlex.quote(status_path)
+    # dash (Ubuntu's /bin/sh) rejects `kill -0 -- -PGID`; the negative PID
+    # itself is the process-group operand and works in dash and bash.
+    return ("if test -s " + quoted_status + "; then printf 'exited '; cat " + quoted_status
+            + "; elif kill -0 -" + str(process_group)
+            + " 2>/dev/null; then printf 'running\\n'; else printf 'absent\\n'; fi")
+
+
+def _parse_f03_guest_status(line: str) -> int | None:
+    """Accept only a live process or an explicit numeric wrapper exit status."""
+    if line == "running":
+        return None
+    if line.startswith("exited "):
+        code = line.removeprefix("exited ").strip()
+        if code.isdigit():
+            return int(code)
+        raise ValueError("VM-A F03 guest exit status is malformed")
+    raise RuntimeError("VM-A F03 process disappeared without an authenticated terminal status")
 
 
 def _stop_remote_f03(connection: Any, process_record: Mapping[str, Any], invocation: str, *,
