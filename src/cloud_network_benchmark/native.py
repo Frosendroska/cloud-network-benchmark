@@ -347,9 +347,15 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
             if event in {"end", "server_output", "server_output_json"}:
                 payload = obj.get("data", obj)
                 if event == "end":
-                    totals.extend(_extract_totals(payload, actual_source, line_no, str(max(1, current))))
-                    if session_details and session_details[-1]["session_id"] == str(max(1, current)):
-                        session_details[-1]["end"] = payload
+                    active = (current > 0 and len(session_details) == current
+                              and "end" not in session_details[-1])
+                    if not active:
+                        findings.append(_finding("native.iperf3.event",
+                            f"line {line_no}: end event has no active, unclosed session",
+                            actual_source))
+                        continue
+                    totals.extend(_extract_totals(payload, actual_source, line_no, str(current)))
+                    session_details[-1]["end"] = payload
                 elif event.startswith("server_output"):
                     embedded = payload
                     if isinstance(embedded, str):

@@ -99,6 +99,32 @@ def test_iperf3_multiple_sessions_are_kept_separate_and_not_silently_combined(tm
     assert any(item.code == "native.iperf3.multiple_sessions" for item in parsed.findings)
 
 
+def test_iperf3_orphan_end_events_do_not_create_or_overwrite_sessions(tmp_path):
+    path = tmp_path / "orphan-ends.jsonl"
+    interval = {"sum": {"start": 5, "end": 6, "seconds": 1, "bytes": 125000000, "sender": False}}
+    actual_end = {"sum_received": {"bytes": 125000000, "seconds": 1}}
+    path.write_text("\n".join(json.dumps(item) for item in [
+        {"event": "error", "data": "error - unable to receive cookie at server: "},
+        {"event": "end", "data": {}},
+        {"event": "start", "data": {"cookie": "measured-session"}},
+        {"event": "interval", "data": interval},
+        {"event": "end", "data": actual_end},
+        {"event": "error", "data": "interrupt - the server has terminated"},
+        {"event": "end", "data": {}},
+    ]) + "\n", encoding="utf-8")
+
+    parsed = parse_iperf3(path, source=source(path), format="jsonl")
+
+    assert parsed.sessions == ("1",)
+    assert [item.session_id for item in parsed.receiver_intervals] == ["1"]
+    assert parsed.session_details == ({"session_id": "1", "start": {"cookie": "measured-session"},
+        "end": actual_end},)
+    orphan_events = [item for item in parsed.findings if item.code == "native.iperf3.event"]
+    assert len(orphan_events) == 2
+    assert all(item.severity == "error" for item in orphan_events)
+    assert sum(item.code == "native.iperf3.error" for item in parsed.findings) == 2
+
+
 @pytest.mark.parametrize(("filename", "finding", "intervals"), [
     ("iperf3-malformed-tail.jsonl", "native.iperf3.jsonl", 1),
     ("iperf3-duplicate.jsonl", "native.iperf3.interval_duplicate", 1),
