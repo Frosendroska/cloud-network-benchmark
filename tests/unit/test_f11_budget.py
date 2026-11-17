@@ -203,15 +203,42 @@ def test_post_provision_stage_fit_uses_exact_550_second_remainder_and_rejects_ba
     now["monotonic"] = 390.0  # 550s remain to the sourced 840s provider trigger.
 
     post_provision = _remaining_f11_allowance(allowance, "post_provision")
+    stabilization = _remaining_f11_allowance(allowance, "stabilization")
     assert post_provision.total_seconds == 550
     assert not book.check_stage_fit(reservation_id, stage="preparation",
         remaining=_remaining_f11_allowance(allowance, "preparation")).eligible
     assert book.check_stage_fit(reservation_id, stage="post_provision", remaining=post_provision).eligible
+    assert stabilization.total_seconds == 340
+    assert book.check_stage_fit(reservation_id, stage="stabilization", remaining=stabilization).eligible
 
     now["monotonic"] += 4.0  # 546s remain; the 550s remainder must not fit.
     insufficient = book.check_stage_fit(reservation_id, stage="post_provision", remaining=post_provision)
     assert not insufficient.eligible
     assert "workflow_time_insufficient" in insufficient.reason_codes
+
+    now["monotonic"] = 601.0  # 339s to the original provider trigger.
+    measurement = _remaining_f11_allowance(allowance, "measurement")
+    assert measurement.total_seconds == 280
+    assert book.check_stage_fit(reservation_id, stage="measurement", remaining=measurement).eligible
+    stabilization_insufficient = book.check_stage_fit(reservation_id, stage="stabilization",
+        remaining=stabilization)
+    assert not stabilization_insufficient.eligible
+    assert "workflow_time_insufficient" in stabilization_insufficient.reason_codes
+
+    now["monotonic"] = 390.0
+    for invalid in (
+        WorkflowAllowance(0, 0, 0, 59, 100, 15, 45, 120, "post-provision-policy",
+            {"aws": 360}, ("registration", "provision", "readiness")),
+        WorkflowAllowance(0, 0, 0, 61, 100, 15, 45, 120, "post-provision-policy",
+            {"aws": 360}, ("registration", "provision", "readiness")),
+        WorkflowAllowance(0, 0, 1, 60, 100, 15, 45, 120, "post-provision-policy",
+            {"aws": 360}, ("registration", "provision", "readiness")),
+        WorkflowAllowance(0, 0, 0, 60, 100, 15, 45, 120, "post-provision-policy",
+            {"aws": 360}, ("registration", "provision")),
+    ):
+        denied = book.check_stage_fit(reservation_id, stage="stabilization", remaining=invalid)
+        assert not denied.eligible
+        assert "workflow_time_insufficient" in denied.reason_codes
 
     now["monotonic"] = 390.0
     wrong_marker = WorkflowAllowance(0, 0, 210, 60, 100, 15, 45, 120,

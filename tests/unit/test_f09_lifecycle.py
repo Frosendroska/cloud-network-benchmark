@@ -216,6 +216,7 @@ def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
     post_provision = _remaining_f11_allowance(full, "post_provision")
     measurement = _remaining_f11_allowance(full, "measurement")
     retrieval = _remaining_f11_allowance(full, "retrieval")
+    stabilization = _remaining_f11_allowance(full, "stabilization")
     assert registration == full
     assert claim_phase == "preparation"
     assert claim_remainder == preparation
@@ -225,6 +226,11 @@ def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
     assert post_provision.completed_stages == ("registration", "provision")
     assert (post_provision.registration_seconds, post_provision.provision_seconds,
             post_provision.readiness_seconds, post_provision.stabilization_seconds) == (0, 0, 30, 40)
+    assert _stage_budget_name("stabilize") == "stabilization"
+    assert stabilization.completed_stages == ("registration", "provision", "readiness")
+    assert (stabilization.registration_seconds, stabilization.provision_seconds,
+            stabilization.readiness_seconds, stabilization.stabilization_seconds) == (0, 0, 0, 40)
+    assert stabilization.total_seconds == 40 + 60 + 5 + 12 + 8
     assert measurement.completed_stages == ("registration", "preparation")
     assert (measurement.registration_seconds, measurement.provision_seconds,
             measurement.readiness_seconds, measurement.stabilization_seconds) == (0, 0, 0, 0)
@@ -346,7 +352,7 @@ def test_run_lifecycle_uses_real_f11_post_provision_stage_fit(
         protect=outcome("protect", advance=protect_seconds),
         claim=outcome("claim"),
         create=outcome("create", advance=create_seconds, succeeded=create_succeeds),
-        prepare=outcome("prepare"), stabilize=outcome("stabilize"), measure=outcome("measure"),
+        prepare=outcome("prepare"), stabilize=outcome("stabilize", advance=60), measure=outcome("measure"),
         close=outcome("close"), retrieve=outcome("retrieve"), cleanup=outcome("cleanup"))
 
     def recovery_factory(evidence, _workflows):
@@ -380,7 +386,9 @@ def test_run_lifecycle_uses_real_f11_post_provision_stage_fit(
         assert result.completed
         assert "prepare" in stages
         assert [remaining.total_seconds for stage, remaining in ledger.stage_checks
-            if stage == "post_provision"] == [550, 550]
+            if stage == "post_provision"] == [550]
+        assert [remaining.total_seconds for stage, remaining in ledger.stage_checks
+            if stage == "stabilization"] == [340]
         assert [remaining.total_seconds for stage, remaining in ledger.stage_checks
             if stage == "preparation"] == [730, 730]
     assert ("prepare" in stages) is prepare_expected

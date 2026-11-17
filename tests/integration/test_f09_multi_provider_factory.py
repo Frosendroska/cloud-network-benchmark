@@ -184,8 +184,8 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "gcp-source-shaped", "initialize_if_missing": True},
-        "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10,
-                "synthetic-test-policy", {"gcp": 30}), "copy_retry_seconds": 1,
+        "allowance": WorkflowAllowance(90, 180, 540, 60, 100, 15, 45, 120,
+                "synthetic-stabilization-boundary", {"gcp": 30}), "copy_retry_seconds": 1,
         "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
                 cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
@@ -204,6 +204,12 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
                 "primary_review_path": None}}}}
     clock, runner = Clock(), GcpSourceRunner()
     runner.clock = clock
+    runtime["sleep"] = clock.sleep
+    def prepared_after_readiness_window(*args, **kwargs):
+        clock.sleep(471.625364)  # Protection already consumed two seconds.
+        from cloud_network_benchmark.orchestration import ProviderStageOutcome
+        return ProviderStageOutcome("prepare", True, {"synthetic": True})
+    monkeypatch.setattr(adapters, "prepare_remote_pair", prepared_after_readiness_window)
     original_gcp_hooks = adapters.gcp_hooks
     def observe_gcp_hooks(driver, deployment, expiry_request, **kwargs):
         runner.driver = driver
@@ -222,6 +228,14 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert result.admission_status == "reserved", result.admission_reasons
     assert set(result.provider_results) == {"gcp"}, (result.primary_failure, result.admission_status, result.provider_results)
     provider = result.provider_results["gcp"]
+    assert provider.values["stabilize"].succeeded is True, provider.values.get("stabilize")
+    assert provider.values["stabilize"].evidence["elapsed_seconds"] >= 60
+    assert clock._offset() >= 533.625364
+    stage_started = provider.stage_times["stabilize"]["started_at"]
+    assert (stage_started - NOW).total_seconds() == pytest.approx(473.625364)
+    reservation = built["ledger"].inspect()["reservations"][result.reservation_evidence.reservation_id.value]
+    stage_monotonic = 100.0 + 473.625364
+    assert reservation["provider_trigger_monotonic"] - stage_monotonic == pytest.approx(696.374636)
     assert provider.values.get("protect") is not None, (provider.primary_failure, runner.actions)
     assert provider.values["protect"].state == "registered", (provider.values["protect"].failure, runner.actions)
     assert provider.values["claim"].eligible is True

@@ -1013,7 +1013,7 @@ class BudgetLedger:
             fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
     def check_stage_fit(self, reservation_id: str, *, stage: str, remaining: WorkflowAllowance) -> StageDecision:
-        if stage not in {"registration", "preparation", "post_provision", "measurement", "retrieval", "cleanup"}:
+        if stage not in {"registration", "preparation", "post_provision", "stabilization", "measurement", "retrieval", "cleanup"}:
             raise ValueError("unknown stage")
         state = self.inspect()
         rec = state["reservations"].get(reservation_id)
@@ -1034,6 +1034,7 @@ class BudgetLedger:
             reasons.append("workflow_time_insufficient")
         stage_prefixes = {"registration": (), "preparation": ("registration",),
             "post_provision": ("registration", "provision"),
+            "stabilization": ("registration", "provision", "readiness"),
             "measurement": ("registration", "preparation"),
             "retrieval": ("registration", "preparation", "measurement"),
             "cleanup": ("registration", "preparation", "measurement", "retrieval")}
@@ -1042,6 +1043,7 @@ class BudgetLedger:
             reasons.append("workflow_time_insufficient")
         completed = {"preparation": ("registration_seconds",),
             "post_provision": ("registration_seconds", "provision_seconds"),
+            "stabilization": ("registration_seconds", "provision_seconds", "readiness_seconds"),
             "measurement": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds"),
             "retrieval": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds","measurement_seconds","measurement_shutdown_seconds"),
             "cleanup": ("registration_seconds","provision_seconds","readiness_seconds","stabilization_seconds","measurement_seconds","measurement_shutdown_seconds","retrieval_seconds")}.get(stage, ())
@@ -1049,11 +1051,13 @@ class BudgetLedger:
         current = {"registration": {"registration_seconds"},
             "preparation": {"provision_seconds", "readiness_seconds", "stabilization_seconds"},
             "post_provision": {"readiness_seconds", "stabilization_seconds"},
+            "stabilization": {"stabilization_seconds"},
             "measurement": {"measurement_seconds", "measurement_shutdown_seconds"},
             "retrieval": {"retrieval_seconds"}, "cleanup": {"cleanup_seconds"}}[stage]
         future_by_stage = {"registration": {"provision_seconds", "readiness_seconds", "stabilization_seconds", "measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
             "preparation": {"measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
             "post_provision": {"measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
+            "stabilization": {"measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"},
             "measurement": {"retrieval_seconds", "cleanup_seconds"}, "retrieval": {"cleanup_seconds"}, "cleanup": set()}[stage]
         if any(remain_fields[name] != originals[name] for name in future_by_stage):
             reasons.append("workflow_time_insufficient")
@@ -1061,6 +1065,8 @@ class BudgetLedger:
             reasons.append("workflow_time_insufficient")
         if stage == "post_provision" and any(
                 remain_fields[name] != originals[name] for name in current):
+            reasons.append("workflow_time_insufficient")
+        if stage == "stabilization" and remain_fields["stabilization_seconds"] != originals["stabilization_seconds"]:
             reasons.append("workflow_time_insufficient")
         if stage == "cleanup" and remaining.cleanup_seconds <= 0: reasons.append("workflow_time_insufficient")
         evidence = ReservationEvidence.model_validate(rec["evidence"])
@@ -1075,12 +1081,12 @@ class BudgetLedger:
         if elapsed < 0:
             reasons.append("controller_session_changed")
         minimum_measurement = minimum_protocol_seconds(ExperimentMode(rec["request"]["mode"]))
-        if stage in {"registration", "preparation", "post_provision", "measurement"} and remaining.measurement_seconds < minimum_measurement + remaining.measurement_shutdown_seconds:
+        if stage in {"registration", "preparation", "post_provision", "stabilization", "measurement"} and remaining.measurement_seconds < minimum_measurement + remaining.measurement_shutdown_seconds:
             reasons.append("workflow_time_insufficient")
         schedule_start = datetime.fromisoformat(rec["plan"].get("scheduled_start")) if rec["plan"].get("scheduled_start") else None
         wait_remaining = max(0.0, rec["scheduled_start_monotonic"] - monotonic_now) if rec.get("scheduled_start_monotonic") is not None else 0.0
-        remaining_total = remaining.fit_seconds(now=now, preparation_can_overlap=stage in {"registration", "preparation", "post_provision", "measurement"})
-        if stage in {"registration", "preparation", "post_provision", "measurement"}:
+        remaining_total = remaining.fit_seconds(now=now, preparation_can_overlap=stage in {"registration", "preparation", "post_provision", "stabilization", "measurement"})
+        if stage in {"registration", "preparation", "post_provision", "stabilization", "measurement"}:
             remaining_total += max(0.0, wait_remaining - remaining.preparation_seconds)
         if live <= 0 or remaining_total > live: reasons.append("workflow_time_insufficient")
         return StageDecision(not reasons, tuple(reasons), deadline)

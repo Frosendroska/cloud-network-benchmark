@@ -570,7 +570,7 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
 
 def _stage_budget_name(stage: str) -> str:
     return {"protect":"registration", "claim":"preparation", "create":"preparation",
-        "prepare":"post_provision", "stabilize":"post_provision", "measure":"measurement",
+        "prepare":"post_provision", "stabilize":"stabilization", "measure":"measurement",
         "close":"retrieval", "retrieve":"retrieval", "cleanup":"cleanup"}[stage]
 
 
@@ -581,6 +581,7 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
         "registration": (),
         "preparation": ("registration",),
         "post_provision": ("registration", "provision"),
+        "stabilization": ("registration", "provision", "readiness"),
         "measurement": ("registration", "preparation"),
         "retrieval": ("registration", "preparation", "measurement"),
     }
@@ -590,6 +591,7 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
         "registration": (),
         "preparation": ("registration_seconds",),
         "post_provision": ("registration_seconds", "provision_seconds"),
+        "stabilization": ("registration_seconds", "provision_seconds", "readiness_seconds"),
         "measurement": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"),
         "retrieval": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
                       "measurement_seconds", "measurement_shutdown_seconds"),
@@ -914,6 +916,7 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                     "registration": allowance.registration_seconds,
                     "preparation": allowance.preparation_seconds,
                     "post_provision": _remaining_f11_allowance(allowance, "post_provision").total_seconds,
+                    "stabilization": _remaining_f11_allowance(allowance, "stabilization").total_seconds,
                     "measurement": allowance.measurement_seconds+allowance.measurement_shutdown_seconds,
                     "retrieval": allowance.retrieval_seconds,
                     "cleanup": allowance.cleanup_seconds,
@@ -929,6 +932,8 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                                                 allowance.preparation_seconds)
         stage_remainders["post_provision"] = max(stage_remainders.get("post_provision", 0.0),
             _remaining_f11_allowance(allowance, "post_provision").total_seconds)
+        stage_remainders["stabilization"] = max(stage_remainders.get("stabilization", 0.0),
+            _remaining_f11_allowance(allowance, "stabilization").total_seconds)
         context = __import__("dataclasses").replace(context, provider_trigger_monotonic=provider_trigger,
                                                      stage_remainders=stage_remainders)
     except (KeyError, TypeError, ValueError) as exc:
