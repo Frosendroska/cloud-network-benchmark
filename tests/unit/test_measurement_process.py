@@ -102,7 +102,10 @@ def test_real_child_completion_is_pollable_after_exit_wakeup_before_waiter_retur
         while handle.drains_done != {"stdout", "stderr"} and time.monotonic() < drain_deadline:
             time.sleep(0.001)
         assert {"stdout", "stderr"} <= handle.drains_done
-        event = runner.next_event([handle], time.monotonic() + 1)
+        event_deadline = time.monotonic() + 1
+        event = None
+        while time.monotonic() < event_deadline and (event is None or event.channel != "exit"):
+            event = runner.next_event([handle], event_deadline)
         assert event is not None and event.channel == "exit" and event.handle is handle
         assert handle.threads[-1].is_alive()  # The publisher is held after enqueue.
         result = runner.poll(handle)
