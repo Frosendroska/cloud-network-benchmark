@@ -88,6 +88,16 @@ def test_control_evidence_wrong_readiness_action_identity_remains_unavailable(tm
     assert _read(tmp_path, [_record(tmp_path, payload)]) is None
 
 
+@pytest.mark.parametrize("location", ["stop_started", "stop_finished", "owner_closed"])
+def test_control_evidence_non_string_close_timestamps_remain_unavailable(tmp_path, location):
+    payload = _payload()
+    if location == "owner_closed":
+        payload["listener"]["iperf3_owner_and_log_identity"]["closed_at_utc"] = None
+    else:
+        payload["listener"]["actions"][0]["started_at" if location == "stop_started" else "finished_at"] = None
+    assert _read(tmp_path, [_record(tmp_path, payload)]) is None
+
+
 def test_control_evidence_is_declared_as_controller_materialization_not_remote_inventory():
     from cloud_network_benchmark.lifecycle_bundle import lifecycle_declarations, remote_inventory_paths_by_role
     declarations = lifecycle_declarations(ArtifactLayout(), mode="acceptance", measurement_units=[])

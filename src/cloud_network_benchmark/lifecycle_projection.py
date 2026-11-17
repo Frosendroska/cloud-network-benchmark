@@ -563,6 +563,8 @@ def _verified_iperf3_control_evidence(root: Path, child: Any, records: list[Any]
 
 
 def _ordered_utc(start: str, finish: str) -> bool:
+    if not isinstance(start, str) or not isinstance(finish, str):
+        return False
     try:
         left, right = datetime.fromisoformat(start.replace("Z", "+00:00")), datetime.fromisoformat(finish.replace("Z", "+00:00"))
         return left.tzinfo is not None and right.tzinfo is not None and left.utcoffset() is not None and right.utcoffset() is not None and right >= left
