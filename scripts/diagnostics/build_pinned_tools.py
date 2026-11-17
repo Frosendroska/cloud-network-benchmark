@@ -8,6 +8,7 @@ All command output and a hash manifest stay in the selected evidence directory.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -42,6 +43,29 @@ SOURCES = (
 REQUIRED = ("cc", "make", "autoconf", "automake", "libtoolize", "pkg-config", "curl", "sha256sum",
             "tar", "patch", "base64", "grep", "cmp")
 COMMAND_TIMEOUT_SECONDS = 300
+
+
+def build_config(root: Path) -> BootstrapConfig:
+    workspace, prefix = root / "work", root / "install"
+    return BootstrapConfig(sources=[SourceBuild(**item) for item in SOURCES], remote_root=str(root),
+        workspace=str(workspace), results_workspace=str(root / "results"), install_prefix=str(prefix))
+
+
+def workspace_context(requested: Path | None, parser: argparse.ArgumentParser):
+    if requested is None:
+        return tempfile.TemporaryDirectory(prefix="cnb-source-build-")
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if not requested.is_absolute() or requested.exists() or requested.is_symlink():
+        parser.error("--workspace must be an absolute path to a new directory")
+    try:
+        parent = requested.parent.resolve(strict=True)
+        if not parent.is_relative_to(temporary_root) or requested != parent / requested.name:
+            raise ValueError
+    except (OSError, ValueError):
+        parser.error("--workspace must be a normalized path beneath the system temporary directory")
+    retained = parent / requested.name
+    retained.mkdir(mode=0o700)
+    return nullcontext(str(retained))
 
 
 def digest(path: Path) -> str:
@@ -81,6 +105,8 @@ def main() -> int:
     parser.add_argument("--prepared-host", action="store_true", help="acknowledge dependency installation is intentionally skipped")
     parser.add_argument("--evidence-dir", type=Path, required=True, help="new or empty local directory for full logs and evidence")
     parser.add_argument("--source-cache", type=Path, help="optional directory containing previously hash-verified pinned archives")
+    parser.add_argument("--workspace", type=Path,
+        help="new private directory under the system temporary directory; retain exact source and binaries for bounded loopback checks")
     args = parser.parse_args()
     if not args.prepared_host:
         parser.error("pass --prepared-host only after confirming this host already has the build dependencies")
@@ -99,12 +125,10 @@ def main() -> int:
         (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(f"missing required commands: {', '.join(missing)}", file=sys.stderr)
         return 2
-    with tempfile.TemporaryDirectory(prefix="cnb-source-build-") as temp:
+    with workspace_context(args.workspace, parser) as temp:
         root = Path(temp)
-        workspace, prefix = root / "work", root / "install"
-        workspace.mkdir(); prefix.mkdir()
-        config = BootstrapConfig(sources=[SourceBuild(**item) for item in SOURCES], remote_root=str(root),
-            workspace=str(workspace), install_prefix=str(prefix))
+        config = build_config(root)
+        Path(config.workspace).mkdir(); Path(config.install_prefix).mkdir()
         env = {"PATH": "/usr/bin:/bin", "HOME": str(root), "LC_ALL": "C", "LANG": "C"}
         for source in config.sources:
             row = {"tool": source.tool, "source_url": source.source_url, "source_reference": source.source_reference,
@@ -203,6 +227,8 @@ def main() -> int:
                 row.update(status="failed", failed_command="identity_validation", error=str(exc))
             summary["tools"].append(row)
     summary["status"] = "passed" if len(summary["tools"]) == 2 and all(row["status"] == "passed" for row in summary["tools"]) else "failed"
+    if args.workspace is not None:
+        summary["retained_workspace"] = str(root)
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"status": summary["status"], "evidence_dir": str(evidence),
         "tools": [{"tool": row["tool"], "status": row["status"], "failed_command": row.get("failed_command")} for row in summary["tools"]]}, indent=2))
