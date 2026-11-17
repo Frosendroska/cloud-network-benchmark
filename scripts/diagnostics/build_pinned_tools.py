@@ -42,7 +42,9 @@ SOURCES = (
 )
 REQUIRED = ("cc", "make", "autoconf", "automake", "libtoolize", "pkg-config", "curl", "sha256sum",
             "tar", "patch", "base64", "grep", "cmp")
-COMMAND_TIMEOUT_SECONDS = 300
+# Match the existing 450-second pinned-source build command allowance used by
+# the production bootstrap. This offline diagnostic has no provider side effects.
+COMMAND_TIMEOUT_SECONDS = 450
 
 
 def build_config(root: Path) -> BootstrapConfig:

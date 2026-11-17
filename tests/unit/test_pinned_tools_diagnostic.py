@@ -91,5 +91,7 @@ def test_pinned_tool_diagnostic_main_runs_through_archive_and_identity_checks(mo
     assert summary["retained_workspace"] == str(workspace)
     assert [row["status"] for row in summary["tools"]] == ["passed", "passed"]
     assert [row.get("source_cache_used", False) for row in summary["tools"]] == [use_cache, use_cache]
+    assert all(command["timeout_seconds"] == 450 for row in summary["tools"]
+        for command in row["commands"])
     assert (workspace / "work" / "sockperf.tar.gz").is_file()
     assert (workspace / "work" / "iperf3.tar.gz").is_file()
