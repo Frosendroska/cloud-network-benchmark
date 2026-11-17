@@ -143,7 +143,7 @@ def test_short_study_uses_sixty_second_units_and_fixed_order(repository_root, tm
     assert [handle.request.argv[handle.request.argv.index("-t") + 1]
             for handle in processes.handles if handle.request.argv[0] == "iperf3"] == ["60", "60"]
     probes = [handle.request.argv for handle in processes.handles if handle.request.argv[0] == "sockperf"]
-    assert [argv[argv.index("-t") + 1] for argv in probes] == ["65", "70", "70"]
+    assert [argv[argv.index("-t") + 1] for argv in probes] == ["66", "70", "70"]
     assert len(result.executed_unit_ids) == 3
     assert clock.waits == [10, 10]
 

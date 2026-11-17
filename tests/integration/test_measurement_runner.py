@@ -36,7 +36,10 @@ def test_materialized_short_run_preserves_native_and_projects_shared_contract_sh
         b"[Total Run] RunTime=16.000 sec; Warm up time=400 msec; SentMessages=100; ReceivedMessages=99\n"
         b"[Valid Duration] RunTime=15.550 sec; SentMessages=100; ReceivedMessages=99\n")
     assert processes.handles[0].request.argv[processes.handles[0].request.argv.index("-t") + 1] == "16"
-    assert processes.handles[2].request.argv[processes.handles[2].request.argv.index("-t") + 1] == "20"
+    multi_flow_id = item.measurement_units[2].unit_id
+    loaded_sockperf = next(handle for handle in processes.handles
+        if handle.request.argv[0] == "sockperf" and handle.request.action_id == f"sockperf-{multi_flow_id}")
+    assert loaded_sockperf.request.argv[loaded_sockperf.request.argv.index("-t") + 1] == "20"
     iperf = tmp_path / item.artifact_layout.unit_paths(item.measurement_units[1].unit_id)["iperf3"]
     native = json.loads(iperf.read_text())
     assert native["server_output_json"]["end"]["sum_received"]["seconds"] == 10

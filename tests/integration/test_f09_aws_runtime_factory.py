@@ -922,7 +922,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         from cloud_network_benchmark.lifecycle_adapters import RemoteListenerClosure
         def fake_listener_close(connection, **kwargs):
             workspace = kwargs["results_workspace"]
-            closed_at = clock.utc_now() + timedelta(seconds=15)
+            reported_end = datetime.fromisoformat(json.loads(runner.guest_outcome)["guest_finished_at"])
+            closed_at = reported_end + timedelta(microseconds=1)
             stdout_path, stderr_path = (f"{workspace}/server-logs/iperf3-server.jsonl",
                 f"{workspace}/server-logs/iperf3-server.err")
             actions = tuple({"action_id": f"f09-listener-{action}-{connection.deployment_id}-iperf3",
