@@ -34,6 +34,21 @@ class _Attempt:
     f03_process_absent_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class _MeasurementStageWindow:
+    execution_deadline_monotonic: float
+    shutdown_deadline_monotonic: float
+
+
+def _measurement_stage_window(*, overall_deadline: float, measurement_started: float,
+        allowance: Any) -> _MeasurementStageWindow:
+    """Bound measurement and shutdown while preserving retrieval and cleanup reserves."""
+    workflow_end = overall_deadline - float(allowance.retrieval_seconds) - float(allowance.cleanup_seconds)
+    shutdown = float(allowance.measurement_shutdown_seconds)
+    execution_end = min(measurement_started + float(allowance.measurement_seconds), workflow_end - shutdown)
+    return _MeasurementStageWindow(execution_end, execution_end + shutdown)
+
+
 def _wait_for_stabilization(*, wait_until: float, deadline: Any,
         clock: Callable[[], float], cancelled: Callable[[], bool],
         sleep: Callable[[float], None]) -> None:
@@ -231,22 +246,28 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     deadline=item.deadline, clock=clock.monotonic)
 
             # Bracket a trusted guest UTC observation over the authenticated VM-A
-            # control channel. Full round-trip time is charged as uncertainty.
+            # control channel. Charge setup time to the reserved measurement
+            # stage, and reserve shutdown before retrieval and cleanup.
             vm = connection.vm_a
             before_mono, before_utc = clock.monotonic(), clock.utc_now()
+            measurement_allowance = _remaining_f11_allowance(runtime["allowance"], "measurement")
+            measurement_window = _measurement_stage_window(
+                overall_deadline=item.deadline.overall_deadline_monotonic,
+                measurement_started=before_mono, allowance=measurement_allowance)
+            clock_remaining = min(item.deadline.remaining(clock.monotonic),
+                max(0.0, measurement_window.execution_deadline_monotonic - before_mono))
             request = _request(f"f09-control-clock-{deployment.deployment_id}", vm,
                 ["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"],
-                min(connection.timeouts.command_seconds, item.deadline.remaining(clock.monotonic)))
+                min(connection.timeouts.command_seconds, clock_remaining))
             response = _execute(runner, request)
             after_mono, after_utc = clock.monotonic(), clock.utc_now()
             if response.outcome != CommandOutcome.SUCCEEDED:
                 raise RuntimeError("authenticated guest UTC control observation failed")
             guest_now = datetime.fromisoformat(response.stdout.strip().replace("Z", "+00:00"))
             roundtrip = after_mono - before_mono
-            active_end = item.deadline.overall_deadline_monotonic - float(runtime["allowance"].retrieval_seconds) - float(runtime["allowance"].cleanup_seconds)
-            controller_remaining = active_end - after_mono
+            controller_remaining = measurement_window.shutdown_deadline_monotonic - after_mono
             effective_deadline = min(item.deadline.cap_expires_at,
-                after_utc + __import__("datetime").timedelta(seconds=active_end-after_mono))
+                after_utc + __import__("datetime").timedelta(seconds=controller_remaining))
             safe = guest_duration(effective_deadline_utc=effective_deadline,
                 guest_now_utc=guest_now, controller_observed_remaining=controller_remaining,
                 transport_elapsed_seconds=roundtrip, clock_uncertainty_seconds=roundtrip)
@@ -310,6 +331,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 source_artifact_records=[])
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
+                active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
+                shutdown_deadline_monotonic=measurement_window.shutdown_deadline_monotonic,
                 cancel_event=cancel_event, sleep=sleep,
                 on_process_record=lambda record: _record_f03_process(record, control, control_lock, item))
             if item.guest.failure and "process_group_stopped" in item.guest.failure:

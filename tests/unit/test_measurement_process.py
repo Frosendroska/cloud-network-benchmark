@@ -495,6 +495,35 @@ def test_production_adapter_uses_monotonic_elapsed_and_projects_real_utc_jumps(
     assert projection.finished_at.value == result.finished_at
 
 
+@pytest.mark.parametrize(("elapsed", "timeout", "expected"), [
+    (1.0, 1.5, "succeeded"),
+    (2.0, 1.5, "timed_out"),
+])
+def test_success_exit_after_request_timeout_is_still_recorded_as_timed_out(
+        tmp_path, monkeypatch, elapsed, timeout, expected):
+    from cloud_network_benchmark.contracts import CommandOutcome
+
+    clock = AdjustableProcessClock()
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", BlockingFakePopen)
+    runner = LocalMeasurementProcesses(clock)
+    request = CommandRequest(action_id="timeout-status", action_type="measurement", argv=["fake-tool"],
+        cwd=str(tmp_path), timeout_seconds=timeout)
+    handle = runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    clock.value += elapsed
+    handle.process.returncode = 0
+    handle.process.exited.set()
+    for thread in handle.threads:
+        thread.join(timeout=1)
+
+    result = runner.poll(handle)
+    assert result is not None
+    assert result.exit_code == (None if expected == "timed_out" else 0)
+    assert result.outcome == CommandOutcome(expected)
+    assert result.duration_seconds == elapsed
+    if expected == "timed_out":
+        assert "process exited with code 0 after request timeout" in result.stderr
+
+
 def test_production_adapter_preserves_monotonic_duration_on_kill_cancellation(
         tmp_path, monkeypatch, repository_root):
     clock = AdjustableProcessClock()

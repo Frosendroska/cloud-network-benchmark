@@ -56,6 +56,7 @@ class LocalProcess:
     stream_errors: list[str] = field(default_factory=list)
     threads: list[threading.Thread] = field(default_factory=list)
     result: Optional[CommandResult] = None
+    process_exit_monotonic: Optional[float] = None
     finished_at: Optional[datetime] = None
     finished_monotonic: Optional[float] = None
 
@@ -114,7 +115,9 @@ class LocalMeasurementProcesses:
 
     def _watch_exit(self, handle: LocalProcess) -> None:
         handle.process.wait()
-        event = ProcessEvent(handle, "exit", "", self.clock.monotonic(), self.clock.utc_now())
+        exited_monotonic, exited_at = self.clock.monotonic(), self.clock.utc_now()
+        handle.process_exit_monotonic = exited_monotonic
+        event = ProcessEvent(handle, "exit", "", exited_monotonic, exited_at)
         while True:
             try:
                 handle.events.put(event, timeout=0.1)
@@ -258,9 +261,17 @@ class LocalMeasurementProcesses:
         finished_at = self.clock.utc_now()
         finished_monotonic = self.clock.monotonic()
         duration = finished_monotonic - item.started_monotonic
+        process_duration = ((item.process_exit_monotonic - item.started_monotonic)
+                            if item.process_exit_monotonic is not None else duration)
+        timed_out_exit_code = None
+        if outcome == CommandOutcome.SUCCEEDED and process_duration > item.request.timeout_seconds:
+            timed_out_exit_code = code
+            outcome = CommandOutcome.TIMED_OUT
         utc_elapsed = (finished_at - item.started_at).total_seconds()
         stdout = bytes(item.preview["stdout"]).decode("utf-8", errors="replace")
         stderr = bytes(item.preview["stderr"]).decode("utf-8", errors="replace")
+        if timed_out_exit_code is not None:
+            stderr = (stderr + f"\nprocess exited with code {timed_out_exit_code} after request timeout")[-self.preview_bytes:]
         item.finished_at = finished_at
         item.finished_monotonic = finished_monotonic
         if item.stream_errors:
@@ -274,7 +285,8 @@ class LocalMeasurementProcesses:
             action_id=item.request.action_id, outcome=outcome, started_at=item.started_at,
             finished_at=finished_at, duration_seconds=duration, duration_basis="monotonic",
             monotonic_started=item.started_monotonic, monotonic_finished=finished_monotonic,
-            utc_elapsed_discrepancy_seconds=utc_elapsed - duration, exit_code=code,
+            utc_elapsed_discrepancy_seconds=utc_elapsed - duration,
+            exit_code=None if outcome == CommandOutcome.TIMED_OUT else code,
             stdout=stdout, stderr=stderr, redactions=item.request.redactions,
         )
         return item.result

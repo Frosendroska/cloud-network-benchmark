@@ -252,6 +252,8 @@ def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_con
 
 def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: GuestRuntimeEvidence,
                    deadline: Any, clock: Callable[[], float] = __import__("time").monotonic,
+                   active_deadline_monotonic: float | None = None,
+                   shutdown_deadline_monotonic: float | None = None,
                    cancel_event: Any = None, sleep: Callable[[float], None] = __import__("time").sleep,
                    on_process_record: Callable[[dict[str, Any]], None] | None = None) -> RemoteGuestExecution:
     """Run the existing F03 entry on VM A and strictly retrieve its outcome.
@@ -282,6 +284,13 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     cancellation_status = "not_needed"
     stage = "request staging"
     vm = connection.vm_a
+    active_end = min(deadline.overall_deadline_monotonic,
+        deadline.overall_deadline_monotonic if active_deadline_monotonic is None else active_deadline_monotonic)
+    shutdown_end = min(deadline.overall_deadline_monotonic,
+        deadline.overall_deadline_monotonic if shutdown_deadline_monotonic is None else shutdown_deadline_monotonic)
+
+    def active_remaining() -> float:
+        return min(deadline.remaining(clock), max(0.0, active_end - clock()))
 
     def retrieve_outcome(*, preserve_cleanup: bool):
         """Retrieve the closed guest outcome under the original F03 deadline."""
@@ -321,7 +330,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             local_request = Path(temp_dir) / "request.json"
             local_outcome = Path(temp_dir) / "outcome.json"
             local_request.write_text(request.model_dump_json(indent=2), encoding="utf-8")
-            remaining = deadline.remaining(clock)
+            remaining = active_remaining()
             if remaining <= 0:
                 raise TimeoutError("F03 request staging is outside the active cap")
             mkdir = _request(f"f09-guest-control-mkdir-{invocation}", vm,
@@ -331,7 +340,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             actions.append(_action(mkdir.action_id, mkdir.action_type, vm, mkdir, mkdir_result))
             if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
                 raise RuntimeError("F03 control directory creation failed")
-            remaining = deadline.remaining(clock)
+            remaining = active_remaining()
             if remaining <= 0:
                 raise TimeoutError("F03 request transfer is outside the active cap")
             upload = _request(f"f09-guest-request-{invocation}", vm,
@@ -342,7 +351,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             if upload_result.outcome != CommandOutcome.SUCCEEDED:
                 raise RuntimeError("F03 request transfer failed")
             stage = "guest execution request"
-            remaining = deadline.remaining(clock)
+            remaining = active_remaining()
             if remaining <= 0:
                 raise TimeoutError("F03 execution is outside the active cap")
             stage = "guest command construction"
@@ -398,10 +407,11 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             status = None
             stage = "guest status polling"
             while status is None:
-                remaining = deadline.remaining(clock)
+                remaining = active_remaining()
                 if remaining <= 0:
                     cancellation_status = _stop_remote_f03(connection, process_record, invocation,
-                        process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                        process_path=str(process_path), runner=runner, deadline=deadline,
+                        stop_deadline_monotonic=shutdown_end, clock=clock, actions=actions)
                     return interrupted_execution(f"F03 active cap expired; {cancellation_status}",
                         retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                 poll = _request(f"f09-guest-status-{invocation}", vm,
@@ -416,13 +426,15 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 if status is None:
                     if cancel_event is not None and cancel_event.is_set():
                         cancellation_status = _stop_remote_f03(connection, process_record, invocation,
-                            process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                            process_path=str(process_path), runner=runner, deadline=deadline,
+                            stop_deadline_monotonic=shutdown_end, clock=clock, actions=actions)
                         return interrupted_execution(f"controller cancellation; {cancellation_status}",
                             retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
                     sleep(min(0.25, remaining))
             if status != 0:
                 cancellation_status = _stop_remote_f03(connection, process_record, invocation,
-                    process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
+                    process_path=str(process_path), runner=runner, deadline=deadline,
+                    stop_deadline_monotonic=shutdown_end, clock=clock, actions=actions)
                 return interrupted_execution(f"VM-A F03 lifecycle guest exited with status {status}; {cancellation_status}",
                     retrieve=cancellation_status == "process_group_stopped",
                     preserve_cleanup=True)
@@ -468,13 +480,16 @@ def _parse_f03_guest_status(line: str) -> int | None:
 
 def _stop_remote_f03(connection: Any, process_record: Mapping[str, Any], invocation: str, *,
                      process_path: str, runner: Any, deadline: Any,
-                     clock: Callable[[], float], actions: list[Any]) -> str:
+                     clock: Callable[[], float], actions: list[Any],
+                     stop_deadline_monotonic: float | None = None) -> str:
     """Stop only the observed F03 session after checking its complete identity."""
     import json
     from .access import _action, _execute, _request
     from .contracts.common import CommandOutcome
 
-    remaining = min(deadline.remaining(clock, cleanup=True), connection.timeouts.command_seconds)
+    stop_remaining = (deadline.remaining(clock, cleanup=True) if stop_deadline_monotonic is None
+        else max(0.0, stop_deadline_monotonic - clock()))
+    remaining = min(stop_remaining, connection.timeouts.command_seconds)
     if remaining <= 0:
         return "cancellation_unverified_cleanup_allowance_exhausted"
     # The published record is passed as canonical expected values; the guest
@@ -733,12 +748,19 @@ def stop_remote_diagnostics(connection: Any, process: RemoteDiagnosticsProcess, 
         if read_result.outcome == CommandOutcome.SUCCEEDED:
             try:
                 outcome = json.loads(read_result.stdout.strip().splitlines()[-1])
+                expected_paths = {
+                    str(Path(process.context["output_root"]) / f"metadata/{process.role}.json"),
+                    str(Path(process.context["output_root"]) / f"diagnostics/{process.role}.jsonl"),
+                    str(Path(process.context["output_root"]) / f"diagnostics/{process.role}-clock.jsonl"),
+                }
+                closed_paths = outcome.get("closed_paths")
                 if (outcome.get("deployment_id") != process.deployment_id
-                        or outcome.get("vm_role") != process.role or outcome.get("state") != "interrupted"
-                        or set(outcome.get("closed_paths", ())) != {
-                            str(Path(process.context["output_root"]) / f"metadata/{process.role}.json"),
-                            str(Path(process.context["output_root"]) / f"diagnostics/{process.role}.jsonl"),
-                            str(Path(process.context["output_root"]) / f"diagnostics/{process.role}-clock.jsonl")}):
+                        or outcome.get("vm_role") != process.role
+                        or outcome.get("state") not in {"completed", "interrupted"}
+                        or outcome.get("failures") != []
+                        or not isinstance(closed_paths, list)
+                        or len(closed_paths) != len(expected_paths)
+                        or set(closed_paths) != expected_paths):
                     raise ValueError("diagnostics outcome does not prove the selected collector closed its files")
             except (ValueError, KeyError, IndexError, TypeError) as exc:
                 failures.append(f"diagnostics outcome is unavailable or invalid ({type(exc).__name__})")

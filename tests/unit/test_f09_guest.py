@@ -77,6 +77,24 @@ def test_guest_duration_uses_utc_and_subtracts_transport_and_clock_uncertainty()
             clock_uncertainty_seconds=2)
 
 
+def test_remote_measurement_deadline_enforces_stage_allowance_and_later_stage_reserves():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_remote import _measurement_stage_window
+
+    allowance = SimpleNamespace(measurement_seconds=100, measurement_shutdown_seconds=15,
+        retrieval_seconds=45, cleanup_seconds=120)
+    # The stage window is tighter than the remaining whole-workflow cap.
+    window = _measurement_stage_window(overall_deadline=1000, measurement_started=50,
+        allowance=allowance)
+    assert window.execution_deadline_monotonic == 150
+    assert window.shutdown_deadline_monotonic == 165
+    # A near cap still reserves retrieval and cleanup even when it is tighter.
+    window = _measurement_stage_window(overall_deadline=220, measurement_started=50,
+        allowance=allowance)
+    assert window.execution_deadline_monotonic == 40
+    assert window.shutdown_deadline_monotonic == 55
+
+
 def test_remote_pair_preparation_composes_bootstrap_readiness_and_guest_staging(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from cloud_network_benchmark import access
@@ -163,6 +181,73 @@ def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity
     assert report.outcome.identity == request.identity
     from cloud_network_benchmark.orchestration import _typed_outcome
     assert _typed_outcome("aws", "measure", report)[0] is False
+
+
+def test_remote_f03_handoff_bounds_staging_polling_and_owned_stop_to_measurement_window(repository_root, tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
+    from cloud_network_benchmark.lifecycle_guest import package_tree_sha256
+    from cloud_network_benchmark.lifecycle_remote import _measurement_stage_window
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    base, _ = _request(repository_root, tmp_path)
+    runtime_root = f"/var/lib/cnb/runtime/{connected.deployment_id}/runtime"
+    digest = package_tree_sha256(repository_root / "src/cloud_network_benchmark")
+    now = datetime.now(timezone.utc)
+    window = _measurement_stage_window(overall_deadline=300, measurement_started=100,
+        allowance=type("Allowance", (), {"measurement_seconds": 1.5,
+            "measurement_shutdown_seconds": 1.0, "retrieval_seconds": 45.0,
+            "cleanup_seconds": 120.0})())
+    request = type(base).model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": {**base.observation.model_dump(mode="python"), "provider": "aws"},
+        "output_root": f"{runtime_root}/results",
+        "package_root": f"{runtime_root}/source/cloud_network_benchmark",
+        "source_revision": "a"*40, "expected_source_revision": "a"*40,
+        "package_sha256": digest,
+        "effective_deadline_utc": now + timedelta(seconds=window.shutdown_deadline_monotonic - 100),
+        "safe_remaining_seconds": window.shutdown_deadline_monotonic - 100,
+        "clock_uncertainty_seconds": 0.0})
+    runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
+        "3.12.3", "2.14.0", "6.0.2", ())
+    current = [100.0]
+
+    class Runner:
+        def __init__(self): self.requests=[]; self.request_payload=None
+        def run(self, command):
+            self.requests.append(command)
+            if command.action_id.startswith("f09-guest-request-"):
+                self.request_payload = json.loads(Path(command.argv[-2]).read_text())
+            if command.action_id.startswith("f09-guest-run-"):
+                assert command.timeout_seconds <= 1.5
+                invocation = command.action_id.removeprefix("f09-guest-run-")
+                return result(command.action_id, json.dumps({"deployment_id":connected.deployment_id,
+                    "invocation_id":invocation,"pid":25001,"process_group":25001,
+                    "session_id":25001,"boot_id":"synthetic-boot","start_ticks":12345}))
+            if command.action_id.startswith("f09-guest-status-"):
+                assert command.timeout_seconds <= max(0.0, window.execution_deadline_monotonic-current[0])
+                return result(command.action_id, "running")
+            if command.action_id.startswith("f09-guest-cancel-"):
+                assert command.timeout_seconds <= 1.0
+                return result(command.action_id, "process_group_stopped")
+            if command.action_id.startswith("f09-guest-outcome-"):
+                return result(command.action_id, success=False, stderr="outcome not returned")
+            return result(command.action_id)
+
+    runner = Runner()
+    report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+        deadline=deadline(), clock=lambda:current[0],
+        active_deadline_monotonic=window.execution_deadline_monotonic,
+        shutdown_deadline_monotonic=window.shutdown_deadline_monotonic,
+        sleep=lambda seconds: current.__setitem__(0, current[0] + seconds))
+    assert runner.request_payload["safe_remaining_seconds"] == 2.5
+    assert runner.request_payload["effective_deadline_utc"] == request.effective_deadline_utc.isoformat().replace("+00:00", "Z")
+    assert any(item.action_id.startswith("f09-guest-cancel-") for item in runner.requests)
+    assert "F03 active cap expired; process_group_stopped" in report.failure
+    assert all(item.timeout_seconds <= 1.5 for item in runner.requests
+        if item.action_id.startswith(("f09-guest-control-mkdir-", "f09-guest-request-", "f09-guest-run-", "f09-guest-status-")))
 
 
 @pytest.mark.parametrize(("source_case", "verified_stop"), [
@@ -638,7 +723,15 @@ def test_guest_sigterm_bridge_raises_interrupt_and_restores_original_handler(
     assert signal.getsignal(signal.SIGTERM) == prior
 
 
-def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(tmp_path):
+@pytest.mark.parametrize(("collector_state", "collector_failures", "paths_complete", "expected_state"), [
+    ("interrupted", [], True, "closed"),
+    ("completed", [], True, "closed"),
+    ("failed", [], True, "failed"),
+    ("completed", [{"category": "snapshot", "message": "failed"}], True, "failed"),
+    ("completed", [], False, "failed"),
+])
+def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(
+        tmp_path, collector_state, collector_failures, paths_complete, expected_state):
     import json
     import os
     import shlex
@@ -682,10 +775,16 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
                     "closed_at_utc":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}))
             if request.action_id.startswith("f09-diagnostics-outcome-"):
                 return result(request.action_id, json.dumps({"deployment_id":connected.deployment_id,
-                    "vm_role":"vm_b", "state":"interrupted", "closed_paths":[
+                    "vm_role":"vm_b", "state":collector_state, "failures":collector_failures,
+                    "sample_count":114, "mapping_count":115,
+                    "artifacts":{"metadata":"/var/lib/cnb/work/metadata/vm_b.json",
+                        "diagnostics":"/var/lib/cnb/work/diagnostics/vm_b.jsonl",
+                        "clock":"/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"},
+                    "closed_paths":[
                         "/var/lib/cnb/work/metadata/vm_b.json",
                         "/var/lib/cnb/work/diagnostics/vm_b.jsonl",
-                        "/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"]}))
+                        "/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"] if paths_complete else
+                        ["/var/lib/cnb/work/metadata/vm_b.json"]}))
             return result(request.action_id)
 
     runner = Runner()
@@ -731,8 +830,10 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
                 local.wait(timeout=2)
     closure = stop_remote_diagnostics(connected, process, runner=runner,
         deadline=deadline(), clock=lambda:100)
-    assert closure.state == "closed" and closure.closed_at is not None
-    assert closure.outcome["state"] == "interrupted" and len(closure.outcome["closed_paths"]) == 3
+    assert closure.state == expected_state
+    assert closure.closed_at is not None
+    assert closure.outcome["state"] == collector_state and len(closure.outcome["closed_paths"]) == (3 if paths_complete else 1)
+    assert bool(closure.failures) == (expected_state == "failed")
     assert [item.action_id.split("-")[2] for item in runner.requests if item.action_id.startswith("f09-diagnostics-")] == [
         "mkdir", "helper", "context", "start", "stop", "outcome"]
 
