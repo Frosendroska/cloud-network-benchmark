@@ -22,6 +22,11 @@ def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied
     declarations = layout.declarations_for_mode(mode, measurement_units, schedule_supplied=schedule_supplied)
     seen = {item.artifact_id for item in declarations}
     additions: list[ArtifactInput] = []
+    if "iperf3_control_evidence" not in seen:
+        additions.append(ArtifactInput(artifact_id="iperf3_control_evidence",
+            path="metadata/iperf3-control-evidence.json", kind="iperf3-control-evidence",
+            producer="controller", unit_id=None, expectation="required"))
+        seen.add("iperf3_control_evidence")
     identities = ({(item.role, item.tool) for item in build_observations
                   if item.identity_bytes is not None and item.artifact_id is not None}
         if build_observations is not None else

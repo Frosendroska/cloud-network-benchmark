@@ -920,9 +920,27 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     monkeypatch.setattr(lifecycle_adapters, "run_remote_f03", capture_remote_f03)
     if handoff_only:
         from cloud_network_benchmark.lifecycle_adapters import RemoteListenerClosure
-        monkeypatch.setattr(lifecycle_adapters, "stop_vm_b_listeners", lambda connection, **kwargs:
-            RemoteListenerClosure(deployment_id=connection.deployment_id, role="vm_b", closed=True,
-                closed_at=clock.utc_now(), observations={}, actions=(), failures=()))
+        def fake_listener_close(connection, **kwargs):
+            workspace = kwargs["results_workspace"]
+            closed_at = clock.utc_now() + timedelta(seconds=15)
+            stdout_path, stderr_path = (f"{workspace}/server-logs/iperf3-server.jsonl",
+                f"{workspace}/server-logs/iperf3-server.err")
+            actions = tuple({"action_id": f"f09-listener-{action}-{connection.deployment_id}-iperf3",
+                "action_type": "ssh", "vm_id": connection.vm_b.host, "role": "vm_b",
+                "request": {"argv": ["ssh", connection.vm_b.host,
+                    ("sudo systemctl stop " if action == "stop" else "sudo python3 -c "
+                        ) + (f"cnb-{connection.deployment_id}-iperf3" if action == "stop" else
+                            f"{stdout_path} {stderr_path}")]},
+                "result": {"outcome": "succeeded", "exit_code": 0,
+                    "started_at": closed_at.isoformat(), "finished_at": closed_at.isoformat()}}
+                for action in ("stop", "owner-process", "closed-files"))
+            owner = {"pid": 22, "start_ticks": 33, "boot_id": "12345678-1234-1234-1234-123456789abc",
+                "cgroup": f"/system.slice/cnb-{connection.deployment_id}-iperf3.service",
+                "log_ids": [[1, 2], [1, 3]], "closed_at_utc": closed_at.isoformat()}
+            return RemoteListenerClosure(deployment_id=connection.deployment_id, role="vm_b", closed=True,
+                closed_at=closed_at, observations={"iperf3": owner, "sockperf": owner},
+                actions=actions, failures=())
+        monkeypatch.setattr(lifecycle_adapters, "stop_vm_b_listeners", fake_listener_close)
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
@@ -952,6 +970,24 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert 0 < handoff["request"].safe_remaining_seconds <= (
         runtime["allowance"].measurement_seconds + runtime["allowance"].measurement_shutdown_seconds)
     if handoff_only:
+        from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
+        from cloud_network_benchmark.contracts.validation import ValidatorInput
+        from cloud_network_benchmark.validation import validate_bundle
+        finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
+            parent=parent, lifecycle=result, repository_root=repository_root,
+            evaluated_at=NOW + timedelta(minutes=1))
+        result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+        result_root = (repository_root / result_ref.result_path).resolve()
+        saved = ValidatorInput.model_validate_json((result_root / "validation/input.json").read_text())
+        record = next(item for item in saved.artifact_records if item.artifact_id == "iperf3_control_evidence")
+        record.verify_materialized_file(result_root)
+        evidence = saved.iperf3_control_evidence.value
+        assert evidence["run_id"] == child.run_id and evidence["deployment_id"] == child.deployment_id
+        assert evidence["readiness"]["ready"] is True
+        assert evidence["listener"]["closed"] is True
+        assert "unavailable" in evidence["readiness"]["event_association"]
+        replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
+        assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
         return
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
     from cloud_network_benchmark.contracts.measurements import CommandEvidence

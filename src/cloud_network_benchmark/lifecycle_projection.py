@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from threading import Lock
 from typing import Any, Mapping
@@ -381,6 +382,71 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
             raise ValueError(f"initialized {artifact_id} bytes do not match their source digest")
         records.append(record)
 
+    control_declaration = by_id.get("iperf3_control_evidence")
+    if control_declaration is not None:
+        prepared = getattr(_outcome(result, "prepare"), "evidence", None)
+        close = getattr(_outcome(result, "close"), "evidence", None)
+        deployment = getattr(result, "values", {}).get("create")
+        readiness = prepared.get("readiness") if isinstance(prepared, Mapping) else None
+        bootstrap = prepared.get("bootstrap") if isinstance(prepared, Mapping) else None
+        listeners = close.get("listeners") if isinstance(close, Mapping) else None
+        vm_a = getattr(deployment, "vm_a", None)
+        vm_b = getattr(deployment, "vm_b", None)
+        vm_a_host = getattr(getattr(vm_a, "connection", None), "host", None)
+        vm_b_host = getattr(getattr(vm_b, "connection", None), "host", None)
+        private_ipv4_b = getattr(vm_b, "private_ipv4", None)
+        declared_listener = next((item for item in (getattr(bootstrap, "listeners", ()) or ())
+            if getattr(item, "tool", None) == "iperf3"), None)
+
+        def action_row(action: Any) -> dict[str, Any]:
+            row = action.model_dump(mode="json") if hasattr(action, "model_dump") else dict(action)
+            request, response = row.get("request", {}), row.get("result", {})
+            raw_argv = request.get("argv", []) if isinstance(request, Mapping) else []
+            remote_command = (str(raw_argv[-1])[:8192]
+                if isinstance(raw_argv, list) and raw_argv and str(raw_argv[0]).endswith("ssh") else None)
+            # Keep only bounded, redacted command metadata; never copy arbitrary output.
+            argv = [str(part)[:512] for part in raw_argv[:32]] if isinstance(raw_argv, list) else []
+            return {"action_id": str(row.get("action_id", ""))[:256],
+                "action_type": str(row.get("action_type", ""))[:64],
+                "vm_id": str(row.get("vm_id", ""))[:256],
+                "role": str(row.get("role", ""))[:16], "argv": argv,
+                "outcome": str(response.get("outcome", ""))[:32],
+                "exit_code": response.get("exit_code"),
+                "started_at": response.get("started_at"),
+                "finished_at": response.get("finished_at"),
+                "remote_command": remote_command}
+
+        def action_id(item: Any) -> str:
+            return str(item.get("action_id", "") if isinstance(item, Mapping)
+                else getattr(item, "action_id", ""))
+        ready_actions = [action_row(item) for item in (getattr(readiness, "actions", ()) or ())
+            if "private-tcp" in action_id(item)]
+        listener_actions = [action_row(item) for item in (getattr(listeners, "actions", ()) or ())
+            if "iperf3" in action_id(item)]
+        observations = getattr(listeners, "observations", {}) or {}
+        iperf_observation = observations.get("iperf3") if isinstance(observations, Mapping) else None
+        evidence = {"schema_version": 1, "run_id": child.run_id,
+            "deployment_id": child.deployment_id, "vm_role": "vm_b",
+            "vm_a_host_id": vm_a_host, "vm_b_host_id": vm_b_host,
+            "private_ipv4_b": private_ipv4_b,
+            "iperf3_stdout_path": getattr(declared_listener, "stdout_path", None),
+            "iperf3_stderr_path": getattr(declared_listener, "stderr_path", None),
+            "readiness": {"ready": getattr(readiness, "ready", None), "actions": ready_actions,
+                "deployment_id": getattr(bootstrap, "deployment_id", None),
+                "event_association": "unavailable: native log boundary offsets were not captured"},
+            "listener": {"closed": getattr(listeners, "closed", None),
+                "closed_at": getattr(listeners, "closed_at", None).isoformat()
+                    if getattr(listeners, "closed_at", None) else None,
+                "measurement_ended_at": (close.get("measurement_ended_at").isoformat()
+                    if isinstance(close, Mapping) and isinstance(close.get("measurement_ended_at"), datetime) else None),
+                "failures": list(getattr(listeners, "failures", ()) or ()),
+                "iperf3_owner_and_log_identity": iperf_observation,
+                "actions": listener_actions}}
+        payload = (json.dumps(evidence, sort_keys=True, indent=2, default=str) + "\n").encode()
+        record = _controller_record(root, child.deployment_id, control_declaration, payload)
+        if record is not None:
+            records.append(record)
+
     guest = _guest_from(result)
     remote = _guest_execution_from(result)
     source_bytes = getattr(remote, "outcome_source_bytes", None)
@@ -423,6 +489,99 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
                         if sidecar:
                             records.append(sidecar)
     return records
+
+
+def _verified_iperf3_control_evidence(root: Path, child: Any, records: list[Any], *,
+        vm_a_host_id: str | None, vm_b_host_id: str | None, private_ipv4_b: str | None,
+        stdout_path: str | None, stderr_path: str | None) -> dict[str, Any] | None:
+    """Return only identity-bound, checksum-verified next-capture control evidence."""
+    record = next((item for item in records if item.artifact_id == "iperf3_control_evidence"), None)
+    if (record is None or record.producer != "controller" or record.unit_id is not None
+            or record.path != "metadata/iperf3-control-evidence.json"
+            or record.kind != "iperf3-control-evidence"
+            or record.deployment_id != child.deployment_id):
+        return None
+    try:
+        record.verify_materialized_file(root)
+        payload = json.loads((root / record.path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+            or payload.get("run_id") != child.run_id
+            or payload.get("deployment_id") != child.deployment_id
+            or payload.get("vm_role") != "vm_b"):
+        return None
+    expected = {"vm_a_host_id": vm_a_host_id, "vm_b_host_id": vm_b_host_id,
+        "private_ipv4_b": private_ipv4_b, "iperf3_stdout_path": stdout_path,
+        "iperf3_stderr_path": stderr_path}
+    if any(value is None or payload.get(key) != value for key, value in expected.items()):
+        return None
+    readiness, listener = payload.get("readiness"), payload.get("listener")
+    if (not isinstance(readiness, dict) or readiness.get("ready") is not True
+            or readiness.get("deployment_id") != child.deployment_id
+            or not isinstance(readiness.get("actions"), list)):
+        return None
+    ready = [item for item in readiness["actions"] if isinstance(item, dict)
+        and item.get("action_id", "").startswith("f02r-ready-private-tcp-")
+        and item.get("role") == "vm_a" and item.get("vm_id") == vm_a_host_id
+        and item.get("action_type") == "ssh"
+        and item.get("outcome") == "succeeded"
+        and item.get("exit_code") == 0
+        and isinstance(item.get("remote_command"), str)
+        and item["remote_command"] == f"nc -z -w 1 {private_ipv4_b} 5201"
+        and isinstance(item.get("started_at"), str) and isinstance(item.get("finished_at"), str)
+        and _ordered_utc(item["started_at"], item["finished_at"])]
+    owner = listener.get("iperf3_owner_and_log_identity") if isinstance(listener, dict) else None
+    close_actions = listener.get("actions") if isinstance(listener, dict) else None
+    required_actions = {f"f09-listener-stop-{child.deployment_id}-iperf3",
+        f"f09-listener-owner-process-{child.deployment_id}-iperf3",
+        f"f09-listener-closed-files-{child.deployment_id}-iperf3"}
+    successful_rows = {item.get("action_id"): item for item in close_actions if isinstance(item, dict)
+        and item.get("role") == "vm_b" and item.get("vm_id") == vm_b_host_id
+        and item.get("action_type") == "ssh"
+        and item.get("outcome") == "succeeded" and item.get("exit_code") == 0} if isinstance(close_actions, list) else {}
+    owner_row = successful_rows.get(f"f09-listener-owner-process-{child.deployment_id}-iperf3", {})
+    close_row = successful_rows.get(f"f09-listener-closed-files-{child.deployment_id}-iperf3", {})
+    stop_row = successful_rows.get(f"f09-listener-stop-{child.deployment_id}-iperf3", {})
+    closed_at = listener.get("closed_at") if isinstance(listener, dict) else None
+    measurement_ended_at = listener.get("measurement_ended_at") if isinstance(listener, dict) else None
+    if (len(ready) != 1 or not isinstance(listener, dict) or listener.get("closed") is not True
+            or listener.get("failures") != [] or not isinstance(owner, dict)
+            or not all(key in owner for key in ("pid", "start_ticks", "boot_id", "cgroup", "log_ids", "closed_at_utc"))
+            or not required_actions.issubset(successful_rows)
+            or stop_row.get("remote_command") != f"sudo systemctl stop cnb-{child.deployment_id}-iperf3"
+            or not isinstance(closed_at, str) or not isinstance(measurement_ended_at, str)
+            or not _ordered_utc(measurement_ended_at, closed_at)
+            or not _ordered_utc(stop_row.get("started_at"), stop_row.get("finished_at"))
+            or not _ordered_utc(stop_row.get("finished_at"), closed_at)
+            or not _ordered_utc(owner.get("closed_at_utc"), closed_at)
+            or any(path not in str(row.get("remote_command", ""))
+                for row in (owner_row, close_row) for path in (stdout_path, stderr_path))
+            or not _valid_owned_log_identity(owner, child.deployment_id)):
+        return None
+    return payload
+
+
+def _ordered_utc(start: str, finish: str) -> bool:
+    try:
+        left, right = datetime.fromisoformat(start.replace("Z", "+00:00")), datetime.fromisoformat(finish.replace("Z", "+00:00"))
+        return left.tzinfo is not None and right.tzinfo is not None and left.utcoffset() is not None and right.utcoffset() is not None and right >= left
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_owned_log_identity(owner: Mapping[str, Any], deployment_id: str) -> bool:
+    unit = f"cnb-{deployment_id}-iperf3.service"
+    ids = owner.get("log_ids")
+    return (isinstance(owner.get("pid"), int) and not isinstance(owner.get("pid"), bool) and owner["pid"] > 0
+        and isinstance(owner.get("start_ticks"), int) and not isinstance(owner.get("start_ticks"), bool)
+        and owner["start_ticks"] >= 0 and isinstance(owner.get("boot_id"), str)
+        and re.fullmatch(r"[0-9a-fA-F-]{36}", owner["boot_id"]) is not None
+        and isinstance(owner.get("cgroup"), str) and owner["cgroup"].rstrip("/").endswith("/" + unit)
+        and isinstance(ids, list) and len(ids) == 2 and all(isinstance(row, list) and len(row) == 2
+            and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in row)
+            for row in ids) and ids[0] != ids[1]
+        and isinstance(owner.get("closed_at_utc"), str))
 
 
 def _include_guest_outcome_source(declarations: list[Any], remote: Any) -> list[Any]:
@@ -599,7 +758,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
 
 def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: Path,
                      root: Path, result: Any, reservation: Any) -> Any:
-    from .contracts.common import Evidence, IdentityContext, VmRole
+    from .contracts.common import Evidence, IdentityContext, StructuredEvidence, VmRole
     from .contracts.measurements import CommandEvidence, DiagnosticSample, MeasurementTiming, VmMetadata
     from .contracts.validation import ValidatorInput
     from .lifecycle_bundle import lifecycle_declarations
@@ -663,6 +822,19 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
             raise ValueError("duplicate source records conflict during strict projection")
         record_map[key] = record
     records = list(record_map.values())
+    create_evidence = getattr(result, "values", {}).get("create")
+    vm_a = getattr(create_evidence, "vm_a", None)
+    vm_b = getattr(create_evidence, "vm_b", None)
+    prep_evidence = getattr(_outcome(result, "prepare"), "evidence", None)
+    bootstrap_evidence = prep_evidence.get("bootstrap") if isinstance(prep_evidence, Mapping) else None
+    iperf_listener = next((item for item in (getattr(bootstrap_evidence, "listeners", ()) or ())
+        if getattr(item, "tool", None) == "iperf3"), None)
+    control_evidence = _verified_iperf3_control_evidence(root, child, records,
+        vm_a_host_id=getattr(getattr(vm_a, "connection", None), "host", None),
+        vm_b_host_id=getattr(getattr(vm_b, "connection", None), "host", None),
+        private_ipv4_b=getattr(vm_b, "private_ipv4", None),
+        stdout_path=getattr(iperf_listener, "stdout_path", None),
+        stderr_path=getattr(iperf_listener, "stderr_path", None))
     verified = {}
     for record in records:
         if record.retrieval_state == "verified":
@@ -713,6 +885,8 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
         failure=child.failure, cleanup_failure=child.cleanup_failure,
         retrieval_failure=child.retrieval_failure, vm_metadata=child.vm_metadata,
         provider_metadata=child.provider_metadata, tool_versions=child.tool_versions,
+        iperf3_control_evidence=(StructuredEvidence(value=control_evidence) if control_evidence is not None
+            else StructuredEvidence(unavailable_reason="verified identity-bound control evidence is unavailable")),
         implementation_git_commit=child.config_provenance.implementation_git_commit,
         design_git_commit=child.config_provenance.design_git_commit,
         implementation_git=child.config_provenance.implementation_git,
