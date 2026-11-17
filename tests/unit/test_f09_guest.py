@@ -285,7 +285,6 @@ def test_remote_f03_preserves_partial_outcome_only_after_verified_stop(
 
 def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp_path):
     """Exercise the production stop script against a real local session, offline."""
-    import json
     import os
     import shlex
     import subprocess
@@ -413,6 +412,105 @@ def test_f03_dash_status_probe_tracks_running_terminal_and_rejects_absent_or_mal
         if process.poll() is None:
             os.killpg(process.pid, 9)
             process.wait(timeout=3)
+
+
+def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
+        repository_root, tmp_path):
+    """Run the generated wrapper and real guest module with local fake tools."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.lifecycle_adapters import (
+        GuestRuntimeEvidence, run_remote_f03,
+    )
+    from cloud_network_benchmark.lifecycle_guest import package_tree_sha256
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    if not Path("/proc/self/stat").is_file() or shutil.which("setsid") is None:
+        pytest.skip("the generated F03 launcher requires Linux /proc and setsid")
+
+    connected = connection(tmp_path)
+    base, _clock = _request(repository_root, tmp_path)
+    connected = connected.model_copy(update={
+        "identity": base.identity, "run_id": base.identity.run_id,
+        "deployment_id": base.identity.deployment_id,
+    })
+    remote_root = tmp_path / "guest-root"
+    package_root = remote_root / "source" / "cloud_network_benchmark"
+    package_root.parent.mkdir(parents=True)
+    shutil.copytree(repository_root / "src/cloud_network_benchmark", package_root)
+    python = remote_root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    digest = package_tree_sha256(package_root)
+    request = GuestRequest.model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": base.observation.model_dump(mode="python"),
+        "output_root": str(remote_root / "results"), "package_root": str(package_root),
+        "effective_deadline_utc": datetime.now(timezone.utc) + timedelta(seconds=400),
+        "source_revision": "a" * 40, "expected_source_revision": "a" * 40,
+        "package_sha256": digest})
+    runtime = GuestRuntimeEvidence("a" * 40, digest, "b" * 64,
+        str(remote_root), "3.12.3", "2.14.0", "6.0.2", ())
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "sockperf").write_text(
+        "#!/usr/bin/env python3\nimport time\n"
+        "print('Starting test...', flush=True)\ntime.sleep(3)\n")
+    (fake_bin / "iperf3").write_text(
+        "#!/usr/bin/env python3\nimport json\n"
+        "print(json.dumps({'start': {'test_start': {'omit': 5}}, "
+        "'server_output_json': {'end': {'sum_received': {'seconds': 15, 'bytes': 1}}}}))\n")
+    for binary in (fake_bin / "sockperf", fake_bin / "iperf3"):
+        binary.chmod(0o755)
+    local_env = os.environ | {"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+    request.output_root.mkdir(parents=True)
+
+    class LocalGuestRunner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, command):
+            self.actions.append(command)
+            action = command.action_id
+            if action.startswith("f09-guest-control-mkdir-"):
+                completed = subprocess.run(["/bin/sh", "-c", command.argv[-1]],
+                    capture_output=True, text=True, env=local_env, timeout=5)
+                return result(action, completed.stdout, completed.returncode == 0, completed.stderr)
+            if action.startswith("f09-guest-request-"):
+                source = Path(command.argv[-2])
+                destination = Path(command.argv[-1].split(":", 1)[1])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                return result(action)
+            if action.startswith("f09-guest-run-") or action.startswith("f09-guest-status-"):
+                completed = subprocess.run(["/bin/sh", "-c", command.argv[-1]],
+                    capture_output=True, text=True, env=local_env, timeout=8)
+                return result(action, completed.stdout, completed.returncode == 0, completed.stderr)
+            if action.startswith("f09-guest-outcome-"):
+                source = Path(command.argv[-2].split(":", 1)[1])
+                shutil.copyfile(source, Path(command.argv[-1]))
+                return result(action)
+            raise AssertionError(f"unexpected local guest command: {action}")
+
+    runner = LocalGuestRunner()
+    report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+        deadline=deadline(), clock=lambda: 100)
+
+    assert report.failure is None, report.failure
+    assert report.outcome is not None and report.outcome.outcome == "failed"
+    assert report.outcome.identity == request.identity
+    assert report.outcome_source_bytes
+    status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
+    assert any(item.result.stdout.strip() == "running" for item in status_actions)
+    assert status_actions[-1].result.stdout.strip() == "exited 0"
+    assert any("f09-guest-outcome-" in item.action_id for item in report.actions)
+    assert report.outcome.commands and report.outcome.failures
+    status_file = next(remote_root.glob("control/*.status"))
+    assert status_file.read_text().strip() == "0"
 
 
 def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
