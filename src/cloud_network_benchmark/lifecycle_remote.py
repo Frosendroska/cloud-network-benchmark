@@ -452,10 +452,14 @@ def _record_f03_process(record: dict[str, Any], control: dict[str, Any], lock: A
 
 def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException) -> Any:
     """Retain diagnostic handles while keeping exception text out of durable evidence."""
+    from .lifecycle_adapters import RemoteDiagnosticsStartError
     from .orchestration import ProviderStageOutcome
-    return ProviderStageOutcome("measure", False,
-        {"failure": f"{type(error).__name__}: remote measurement handoff failed",
-         "diagnostics": attempt.diagnostics if attempt is not None else {}})
+    evidence = {"failure": f"{type(error).__name__}: remote measurement handoff failed",
+        "diagnostics": attempt.diagnostics if attempt is not None else {}}
+    if isinstance(error, RemoteDiagnosticsStartError):
+        evidence["startup_failure"] = error.safe_reason
+        evidence["actions"] = error.actions
+    return ProviderStageOutcome("measure", False, evidence)
 
 
 def build_aws_remote_stages(**kwargs: Any):

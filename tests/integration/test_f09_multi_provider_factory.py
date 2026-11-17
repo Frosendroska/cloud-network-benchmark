@@ -154,7 +154,11 @@ class GcpSourceRunner:
 def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shaped_commands(
         tmp_path, repository_root, monkeypatch, north):
     """Use real F11, GCP provider hooks and F09 finalizer with only command replies faked."""
+    from types import SimpleNamespace
     import cloud_network_benchmark.lifecycle_adapters as adapters
+    import cloud_network_benchmark.access as access
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
+    from cloud_network_benchmark.orchestration import ProviderStageOutcome
 
     config = repository_root / "configs/tests" / (
         "exp-902-gcp-single-provider-north.yaml" if north else "exp-902-gcp-single-provider.yaml")
@@ -205,11 +209,31 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     clock, runner = Clock(), GcpSourceRunner()
     runner.clock = clock
     runtime["sleep"] = clock.sleep
+    diagnostic_actions = []
     def prepared_after_readiness_window(*args, **kwargs):
         clock.sleep(471.625364)  # Protection already consumed two seconds.
-        from cloud_network_benchmark.orchestration import ProviderStageOutcome
-        return ProviderStageOutcome("prepare", True, {"synthetic": True})
+        connection = args[0]
+        bootstrap_evidence = SimpleNamespace(deployment_id=connection.deployment_id,
+            identity=connection.identity, builds=[], listeners=[], actions=[])
+        guest_runtime = SimpleNamespace(remote_root="/var/lib/cnb/runtime",
+            source_revision=kwargs["source_revision"], package_sha256="a" * 64)
+        return ProviderStageOutcome("prepare", True,
+            {"bootstrap": bootstrap_evidence, "guest_runtime": guest_runtime})
     monkeypatch.setattr(adapters, "prepare_remote_pair", prepared_after_readiness_window)
+    def fake_request(action_id, vm, _argv, timeout, action_type="ssh"):
+        return CommandRequest(action_id=action_id, action_type=action_type,
+            argv=["ssh", "--token", "split-token-value", "--password=inline-password",
+                "Bearer argv-bearer-value"], cwd=".", timeout_seconds=max(float(timeout), .001),
+            environment_classification="contains_secret_references",
+            redactions=[vm.authentication_reference, vm.host_key_reference])
+    monkeypatch.setattr(access, "_request", fake_request)
+    def fail_first_diagnostic_action(_runner, request):
+        diagnostic_actions.append(request.action_id)
+        at = clock.utc_now()
+        return CommandResult(action_id=request.action_id, outcome="failed", started_at=at,
+            finished_at=at, duration_seconds=0, exit_code=1, stdout="",
+            stderr="Bearer transport-bearer-value password=transport-password-value")
+    monkeypatch.setattr(access, "_execute", fail_first_diagnostic_action)
     original_gcp_hooks = adapters.gcp_hooks
     def observe_gcp_hooks(driver, deployment, expiry_request, **kwargs):
         runner.driver = driver
@@ -242,6 +266,39 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert provider.values["claim"].creation_granted is True
     assert provider.values.get("create") is not None, (provider.primary_failure, provider.values, runner.actions)
     assert provider.values["create"].run_id == children["gcp"].run_id
+    measure = provider.values["measure"]
+    assert measure.succeeded is False
+    assert measure.evidence["failure"] == "RemoteDiagnosticsStartError: remote measurement handoff failed"
+    assert measure.evidence["startup_failure"] == "remote diagnostics control directory creation failed"
+    assert measure.evidence["diagnostics"] == {}  # No process handle returned for the first role.
+    assert len(measure.evidence["actions"]) == 1
+    failed_action = measure.evidence["actions"][0]
+    assert failed_action.action_id.startswith("f09-diagnostics-mkdir-")
+    assert failed_action.role == "vm_a"
+    assert diagnostic_actions[0] == failed_action.action_id
+    from cloud_network_benchmark.lifecycle_projection import _measurement_failure
+    failed_stage, failure_payload = _measurement_failure(provider)
+    assert failed_stage == "measure"
+    serialized_failure = json.dumps(failure_payload)
+    assert "remote diagnostics control directory creation failed" in serialized_failure
+    assert failed_action.action_id in serialized_failure
+    assert all(secret not in serialized_failure for secret in ("split-token-value", "inline-password",
+        "argv-bearer-value", "transport-bearer-value", "transport-password-value"))
+    from cloud_network_benchmark.lifecycle_projection import _sync_manifest
+    from cloud_network_benchmark.manifests import ChildRunManifest
+    child_ref = next(row for row in parent.child_runs if str(row.provider) == "gcp")
+    child_path, result_root = Path(child_ref.manifest_path), Path(child_ref.result_path)
+    projected = _sync_manifest(parent_path=parent_path, child_path=child_path, root=result_root,
+        child=ChildRunManifest.model_validate_json(child_path.read_text()), result=provider,
+        reservation=result.reservation_evidence, evaluated_at=clock.utc_now())
+    failure_path = result_root / "metadata/measurement-failure.json"
+    failure_record = next(row for row in projected.artifact_records
+        if row.artifact_id == "f09-measurement-failure")
+    failure_record.verify_materialized_file(result_root)
+    projected_failure = json.loads(failure_path.read_text())
+    assert projected_failure["stages"][0]["startup_failure"] == measure.evidence["startup_failure"]
+    assert projected_failure["stages"][0]["actions"][0]["action_id"] == failed_action.action_id
+    assert projected.execution_state == "failed" and projected.cleanup_state == "succeeded"
     assert provider.values["cleanup"] is not None
     assert provider.values["cleanup"].cleanup_state == "succeeded"
     assert provider.values["cleanup"].inventory.value["pages_complete"] is True

@@ -109,11 +109,14 @@ def test_failed_measurement_handoff_keeps_only_bounded_redacted_diagnostics():
         host_key_reference=secret)
     started = datetime(2026, 11, 17, tzinfo=timezone.utc)
     request = CommandRequest(action_id="f09-diagnostics-start", action_type="ssh",
-        argv=["ssh", "-i", secret, "diagnostics"], cwd=".", timeout_seconds=3,
+        argv=["ssh", "-i", secret, "--token", "paid-token", "--client-secret", "client-secret-value",
+            "--password=inline-password",
+            "Bearer paid-bearer", "diagnostics"], cwd=".", timeout_seconds=3,
         redactions=[secret])
     response = CommandResult(action_id="f09-diagnostics-start", outcome="failed", started_at=started,
         finished_at=started + timedelta(seconds=1), duration_seconds=1, exit_code=1,
-        stdout="private " + secret, stderr=("token=secret-value " + secret + " ") * 500,
+        stdout="private " + secret + "\n-----BEGIN PRIVATE KEY-----\nPEM-DATA\n-----END PRIVATE KEY-----",
+        stderr=("token=secret-value Bearer raw-bearer " + secret + " ") * 500,
         redactions=[secret])
     action = _action("f09-diagnostics-start", "ssh", vm, request, response)
     process = SimpleNamespace(actions=[action])
@@ -133,10 +136,14 @@ def test_failed_measurement_handoff_keeps_only_bounded_redacted_diagnostics():
     assert failed_stage == "measure"
     assert payload["stages"][0]["failure"] == "password=[REDACTED]; diagnostic launch failed"
     assert payload["stages"][0]["guest_failures"] == ["measurement: token=[REDACTED]"]
-    assert secret not in serialized and "hunter2" not in serialized and "secret-value" not in serialized
+    assert all(value not in serialized for value in (secret, "hunter2", "secret-value", "paid-token", "client-secret-value",
+        "inline-password", "paid-bearer", "raw-bearer", "PEM-DATA"))
     assert "paid-secret" not in serialized
     assert len(payload["stages"][0]["actions"][0]["result"]["stderr"]) <= 4096
     assert payload["stages"][0]["actions"][0]["request"]["argv"][2] == "[REDACTED]"
+    argv = payload["stages"][0]["actions"][0]["request"]["argv"]
+    assert argv[4] == "[REDACTED]" and argv[5] == "--client-secret" and argv[6] == "[REDACTED]"
+    assert argv[7] == "--password=[REDACTED]"
     assert "environment" not in serialized and "stdin" not in serialized
     assert "native" not in serialized and "commands" not in serialized
 
@@ -173,7 +180,12 @@ def test_measurement_failure_projection_materializes_verified_declared_artifact(
     ref = initialized.children[0]
     child = ChildRunManifest.model_validate_json(Path(ref.manifest_path).read_text())
     started = frozen_clock()
-    remote = SimpleNamespace(failure="diagnostic start failed", diagnostics={}, actions=[], outcome=None)
+    remote = {"failure": "diagnostic start failed", "startup_failure": "remote diagnostics start failed",
+        "diagnostics": {}, "actions": [{"action_id": "f09-diagnostics-mkdir-attempt",
+            "action_type": "ssh", "vm_id": "192.0.2.2", "role": "vm_a",
+            "request": {"argv": ["ssh", "mkdir"]},
+            "result": {"outcome": "failed", "exit_code": 1, "stderr": "permission denied",
+                "redactions_applied": True}}]}
     result = SimpleNamespace(execution_state="failed", cleanup_state="succeeded", interrupted=False,
         primary_failure=f"{child.provider} measure failed (adapter reported measure unsuccessful)",
         secondary_failures=[], values={
@@ -200,6 +212,8 @@ def test_measurement_failure_projection_materializes_verified_declared_artifact(
     record.verify_materialized_file(Path(ref.result_path))
     payload = json.loads(path.read_text())
     assert payload["stage"] == "measure"
+    assert payload["stages"][0]["startup_failure"] == "remote diagnostics start failed"
+    assert payload["stages"][0]["actions"][0]["action_id"] == "f09-diagnostics-mkdir-attempt"
     assert payload["stages"][1]["failures"] == ["diagnostic close failed", "listener close failed"]
     parent = CampaignManifest.model_validate_json(Path(initialized.parent_manifest_path).read_text())
     validator_input, _builds, _receiver_commands, _clock_mappings = _validator_input(

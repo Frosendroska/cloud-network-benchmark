@@ -168,7 +168,10 @@ def _bounded_failure_text(value: Any, *, limit: int = 4096) -> str:
     import re
     text = str(value)
     text = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[REDACTED_KEY]", text, flags=re.S)
-    text = re.sub(r"(?i)([\"']?(?:password|token|secret|private[_ -]?key|authorization)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+",
+    text = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", text)
+    text = re.sub(r"(?i)(--?(?:token|password|secret|secret[-_]?key|client[-_]?secret|session[-_]?token|authorization|api[-_]?key|access[-_]?(?:token|key))(?:=|\s+))([^\s,;]+)",
+        r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)([\"']?(?:password|token|secret|secret[-_ ]?key|client[-_ ]?secret|session[-_ ]?token|access[-_ ]?(?:token|key)|private[_ -]?key|authorization)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+",
         r"\1[REDACTED]", text)
     if len(text) > limit:
         marker = "\n...[truncated; retained final diagnostic characters]...\n"
@@ -184,8 +187,23 @@ def _remote_action_diagnostic(action: Any) -> dict[str, Any]:
     request = request if isinstance(request, Mapping) else {}
     response = response if isinstance(response, Mapping) else {}
     argv = request.get("argv")
-    safe_argv = ([_bounded_failure_text(value, limit=256) for value in argv[:32]
-                  if isinstance(value, (str, int, float, bool))] if isinstance(argv, list) else None)
+    safe_argv = None
+    if isinstance(argv, list):
+        safe_argv, redact_next = [], False
+        sensitive_flags = {"--token", "--password", "--secret", "--secret-key", "--secret_key",
+            "--client-secret", "--client_secret", "--session-token", "--session_token",
+            "--authorization", "--api-key", "--api_key", "--access-token", "--access_token",
+            "--access-key", "--access_key"}
+        for value in argv[:32]:
+            if not isinstance(value, (str, int, float, bool)):
+                continue
+            rendered = str(value)
+            if redact_next:
+                safe_argv.append("[REDACTED]")
+                redact_next = False
+            else:
+                safe_argv.append(_bounded_failure_text(rendered, limit=256))
+                redact_next = rendered.lower() in sensitive_flags
     return {"action_id": _bounded_failure_text(row.get("action_id", ""), limit=256),
         "action_type": _bounded_failure_text(row.get("action_type", ""), limit=128),
         "vm_id": _bounded_failure_text(row.get("vm_id", ""), limit=256),
@@ -208,6 +226,8 @@ def _measurement_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None
 
     def actions(value: Any) -> list[Any]:
         candidates = list(getattr(value, "actions", ()) or ())
+        if isinstance(value, Mapping):
+            candidates.extend(value.get("actions", ()) or ())
         diagnostics = getattr(value, "diagnostics", None)
         if isinstance(diagnostics, Mapping):
             for process in diagnostics.values():
@@ -256,6 +276,8 @@ def _measurement_failure(result: Any) -> tuple[Any, dict[str, Any]] | tuple[None
                 row["failure"] = _bounded_failure_text(failure, limit=1000)
             if evidence.get("failure_type") is not None:
                 row["failure_type"] = _bounded_failure_text(evidence["failure_type"], limit=128)
+            if evidence.get("startup_failure") is not None:
+                row["startup_failure"] = _bounded_failure_text(evidence["startup_failure"], limit=1000)
             row["actions"] = actions(evidence)
             diagnostics = evidence.get("diagnostics")
             if isinstance(diagnostics, Mapping):

@@ -58,6 +58,15 @@ class RemoteDiagnosticsProcess:
     actions: tuple[Any, ...]
 
 
+class RemoteDiagnosticsStartError(RuntimeError):
+    """Safe startup reason plus redacted action evidence collected before failure."""
+
+    def __init__(self, safe_reason: str, actions: tuple[Any, ...]):
+        self.safe_reason = safe_reason
+        self.actions = actions
+        super().__init__(safe_reason)
+
+
 @dataclass(frozen=True)
 class RemoteDiagnosticsClosure:
     deployment_id: str
@@ -622,8 +631,24 @@ def start_remote_diagnostics(connection: Any, context: Mapping[str, Any], *, run
             return RemoteDiagnosticsProcess(connection.deployment_id, role, invocation,
                 pid, pgid, boot_id, start_ticks, str(root), context_path, outcome_path,
                 context, tuple(actions))
-    except BaseException:
-        raise
+    except Exception as exc:
+        safe_messages = {
+            "diagnostics control directory creation failed": "remote diagnostics control directory creation failed",
+            "diagnostics helper transfer failed": "remote diagnostics helper transfer failed",
+            "diagnostics context transfer failed": "remote diagnostics context transfer failed",
+            "diagnostics collector start failed": "remote diagnostics collector start command failed",
+            "diagnostics process identity evidence is malformed": "remote diagnostics process identity response was malformed",
+            "diagnostics process identity evidence is incomplete": "remote diagnostics process identity response was incomplete",
+            "diagnostics staging is outside the active cap": "diagnostics staging deadline expired",
+            "diagnostics input transfer is outside the active cap": "diagnostics input transfer deadline expired",
+            "diagnostics collector start is outside the active cap": "diagnostics collector start deadline expired",
+        }
+        first_arg = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else None
+        safe_reason = safe_messages.get(first_arg)
+        if safe_reason is None:
+            safe_reason = ("remote diagnostics startup timed out" if isinstance(exc, TimeoutError)
+                else f"{type(exc).__name__} during remote diagnostics startup")
+        raise RemoteDiagnosticsStartError(safe_reason, tuple(actions)) from exc
 
 
 def stop_remote_diagnostics(connection: Any, process: RemoteDiagnosticsProcess, *, runner: Any,
