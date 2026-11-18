@@ -1099,7 +1099,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     close_evidence = provider_result.values["close"].evidence
     terminal_times = [clock.utc_now(), close_evidence["measurement_ended_at"],
         close_evidence["listeners"].closed_at,
-        *(closure.closed_at for closure in close_evidence["diagnostics"].values())]
+        *(close_evidence["diagnostics"][role].closed_at for role in ("vm_a", "vm_b"))]
     evaluated_at = max(timestamp for timestamp in terminal_times if timestamp is not None)
     finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
         parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=evaluated_at)
