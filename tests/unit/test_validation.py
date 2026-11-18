@@ -166,6 +166,102 @@ def test_receiver_total_mismatch_stays_warning_without_each_required_proof(chang
     assert qualified.severity == "warning"
 
 
+def _paired_build_fixture(tmp_path, mutation=None):
+    import base64
+    from cloud_network_benchmark.acquisition import _expected_build_identity
+
+    commit, patch_path, patch_sha, source_sha = _expected_build_identity("iperf3")
+    source = f"iperf-{commit}"
+    records, metadata, commands = [], [], []
+    for role in ("vm_a", "vm_b"):
+        # P730 banner structure: the sole cross-host difference is uname's hostname.
+        banner = ("iperf 3.17.1 (cJSON 1.7.15)\nLinux gcp-p730-" + role[-1] +
+            " 7.0.0-1017-gcp #19~24.04.1-Ubuntu SMP PREEMPT Thu Oct 29 22:34:06 UTC 2026 x86_64\n"
+            "Optional features available: CPU affinity setting, IPv6 flow label, POSIX threads")
+        if role == "vm_a":
+            if mutation == "version": banner = banner.replace("3.17.1", "3.17.2")
+            if mutation == "kernel": banner = banner.replace("7.0.0-1017", "7.0.0-1018")
+            if mutation == "features": banner += ", changed"
+            if mutation == "missing_uname": banner = banner.replace("Linux ", "Other ")
+            if mutation == "duplicate_uname": banner += "\nLinux extra kernel"
+        identity = dict(tool="iperf3", source_reference=source, source_sha256=source_sha,
+            upstream_commit=commit, patch_path=patch_path, patch_sha256=patch_sha,
+            compiler_version_b64=base64.b64encode(b"cc 13.3").decode(),
+            build_configuration_b64=base64.b64encode(b"configure pinned").decode(),
+            binary_path="/var/lib/cnb/install/bin/iperf3",
+            binary_version_b64=base64.b64encode(banner.encode()).decode(), binary_sha256="a" * 64,
+            observation_capability="CNB_ACQ_V1", observation_semantics="iperf-3.17.1-stats-v1",
+            capabilities="CNB_ACQ_V1")
+        if role == "vm_a" and mutation in {"patch", "source", "binary_hash", "capability"}:
+            field = {"patch": "patch_sha256", "source": "source_sha256", "binary_hash": "binary_sha256",
+                     "capability": "observation_capability"}[mutation]
+            identity[field] = "b" * 64 if mutation != "capability" else "other"
+        raw = ("CNB_BUILD_V1\n" + "".join(f"{key}={value}\n" for key, value in identity.items())).encode()
+        path = tmp_path / f"{role}.identity"
+        path.write_bytes(raw)
+        records.append(ArtifactRecord(artifact_id=f"f02r-{role}-iperf3-build", path=path.name,
+            kind="build-identity", producer=role, unit_id=None, deployment_id="deployment",
+            closed=True, size_bytes={"value": len(raw)}, sha256={"value": hashlib.sha256(raw).hexdigest()},
+            retrieval_state="verified"))
+        supplied = dict(source_reference=source, source_sha256=source_sha,
+            binary_version=banner, binary_sha256="a" * 64)
+        versions = {"iperf3": {"version": {"value": None}, "binary_sha256": {"value": None}}}
+        if role == "vm_a" and mutation == "observed_version": versions["iperf3"]["version"]["value"] = "other"
+        if role == "vm_a" and mutation == "current_hash": versions["iperf3"]["binary_sha256"]["value"] = "b" * 64
+        metadata.append(SimpleNamespace(vm_role=role, deployment_id="deployment",
+            source_builds=SimpleNamespace(value={"iperf3": {"supplied": supplied}}),
+            tool_versions=SimpleNamespace(value=versions)))
+        action = "f02r-vm_b-listener-iperf3" if role == "vm_b" else "iperf3-u1"
+        argv = (["/var/lib/cnb/install/bin/iperf3", "-c", "10.0.0.2"] if role == "vm_a" else
+            ["sudo", "systemd-run", f"--property=Environment=CNB_ACQUISITION_ID={action}",
+             "/var/lib/cnb/install/bin/iperf3", "-s", "-B", "10.0.0.2", "-p", "5201", "--json-stream", "--forceflush"])
+        commands.append(SimpleNamespace(producer=role, deployment_id="deployment", unit_id="u1",
+            request={"argv": argv, "action_id": action, "acquisition_invocation_id": action},
+            result={"action_id": action, "outcome": "succeeded", "exit_code": 0},
+            binary_version=SimpleNamespace(value=banner), source_identity=SimpleNamespace(value=source)))
+    if mutation == "missing_receipt": records.pop()
+    if mutation == "duplicate_receipt": records.append(records[0])
+    if mutation == "altered_bytes": (tmp_path / records[0].path).write_bytes(b"altered")
+    if mutation == "wrong_role": records[0] = records[0].model_copy(update={"producer": "vm_b"})
+    if mutation == "wrong_deployment": records[0] = records[0].model_copy(update={"deployment_id": "other"})
+    if mutation == "command_banner": commands[0].binary_version.value = "other"
+    if mutation == "command_source": commands[0].source_identity.value = "other"
+    if mutation == "command_path": commands[0].request["argv"][0] = "/other/iperf3"
+    if mutation == "command_failure": commands[0].result["exit_code"] = 1
+    if mutation == "supplied_banner": metadata[0].source_builds.value["iperf3"]["supplied"]["binary_version"] = "other"
+    if mutation == "supplied_hash": metadata[0].source_builds.value["iperf3"]["supplied"]["binary_sha256"] = "b" * 64
+    if mutation == "current_build_hash": metadata[0].source_builds.value["iperf3"]["current_binary_sha256"] = {"value": "b" * 64}
+    if mutation == "current_match_false": metadata[0].source_builds.value["iperf3"]["matches_bootstrap_version"] = {"value": False}
+    supplied_mutations = {"supplied_patch": "patch_sha256", "supplied_upstream": "upstream_commit",
+        "supplied_config": "build_configuration", "supplied_capabilities": "capabilities",
+        "supplied_identity_bytes": "identity_bytes"}
+    if mutation in supplied_mutations:
+        metadata[0].source_builds.value["iperf3"]["supplied"][supplied_mutations[mutation]] = "contradiction"
+    value = SimpleNamespace(artifact_records=records, vm_metadata_records=metadata, commands=commands,
+        child_result_root=str(tmp_path), identity=SimpleNamespace(deployment_id="deployment"))
+    native_source = SimpleNamespace(source_identity=source, binary_version=None)
+    return value, SimpleNamespace(unit_id="u1"), native_source
+
+
+def test_paired_build_receipts_qualify_without_inventing_postmeasurement_diagnostics(tmp_path):
+    from cloud_network_benchmark.validation import _paired_iperf_build_compatible
+    value, unit, source = _paired_build_fixture(tmp_path)
+    assert _paired_iperf_build_compatible(value, unit, source, source)
+    assert source.binary_version is None
+    assert value.vm_metadata_records[0].tool_versions.value["iperf3"]["version"]["value"] is None
+
+
+@pytest.mark.parametrize("mutation", ["missing_receipt", "duplicate_receipt", "altered_bytes", "wrong_role",
+    "wrong_deployment", "patch", "source", "binary_hash", "capability", "command_banner", "command_source",
+    "command_path", "command_failure", "observed_version", "current_hash", "version", "kernel", "features",
+    "missing_uname", "duplicate_uname", "supplied_banner", "supplied_hash", "current_build_hash", "current_match_false",
+    "supplied_patch", "supplied_upstream", "supplied_config", "supplied_capabilities", "supplied_identity_bytes"])
+def test_paired_build_receipts_reject_independent_trust_failures(tmp_path, mutation):
+    from cloud_network_benchmark.validation import _paired_iperf_build_compatible
+    value, unit, source = _paired_build_fixture(tmp_path, mutation)
+    assert not _paired_iperf_build_compatible(value, unit, source, source)
+
+
 def test_reset_crossing_cutoff_uses_latest_independent_stream_end():
     origins = {"1": 10_000_000, "2": 10_000_200, "3": 10_000_400, "4": 10_000_600}
     rows = [(stream, origins[stream] - 500_000, origins[stream] + end, 100)

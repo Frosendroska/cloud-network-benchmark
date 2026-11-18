@@ -1309,6 +1309,104 @@ def _verified_reset_crossing_lines(origin: dict[str, Any] | None, source: Source
     return lines
 
 
+def _paired_iperf_build_compatible(value: ValidatorInput, unit: Any,
+        receiver: SourceRef, client: SourceRef) -> bool:
+    """Use closed bootstrap receipts and actual commands without inventing diagnostics."""
+    from .acquisition import _expected_build_identity, _parse_build_identity
+
+    commit, patch_path, patch_sha, source_sha = _expected_build_identity("iperf3")
+    expected_source = f"iperf-{commit}"
+    if receiver.source_identity != expected_source or client.source_identity != expected_source:
+        return False
+    identities = []
+    try:
+        for role, source in (("vm_a", client), ("vm_b", receiver)):
+            records = [record for record in value.artifact_records
+                if record.artifact_id == f"f02r-{role}-iperf3-build"]
+            metadata = [item for item in value.vm_metadata_records if str(item.vm_role) == role]
+            if len(records) != 1 or len(metadata) != 1:
+                return False
+            record = records[0]
+            if (str(record.producer) != role or record.kind != "build-identity"
+                    or record.deployment_id != value.identity.deployment_id or record.unit_id is not None
+                    or record.closed is not True or str(record.retrieval_state) != "verified"):
+                return False
+            record.verify_materialized_file(Path(value.child_result_root))
+            identity_bytes = _artifact_path(value, record).read_bytes()
+            identity = _parse_build_identity(identity_bytes)
+            pinned = {"tool": "iperf3", "source_reference": expected_source,
+                "source_sha256": source_sha, "upstream_commit": commit, "patch_path": patch_path,
+                "patch_sha256": patch_sha, "observation_capability": "CNB_ACQ_V1",
+                "observation_semantics": "iperf-3.17.1-stats-v1"}
+            if any(identity.get(key) != expected for key, expected in pinned.items()):
+                return False
+            banner, binary_hash = identity["binary_version"], identity["binary_sha256"]
+            if (not isinstance(banner, str) or not re.fullmatch(r"[a-f0-9]{64}", str(binary_hash))
+                    or not identity.get("compiler_version") or not identity.get("build_configuration")
+                    or not identity.get("capabilities") or identity.get("binary_path") != "/var/lib/cnb/install/bin/iperf3"):
+                return False
+            provenance = _provenance_evidence(metadata[0], "iperf3")
+            metadata_build = metadata[0].source_builds.value.get("iperf3", {})
+            supplied = metadata_build.get("supplied", {})
+            # F04 may retain a subset of the bootstrap observation. Every retained
+            # field must agree with this role's independent receipt, including A
+            # whose client JSON is associated through B's acquisition source.
+            for field, expected in (*identity.items(), ("identity_bytes", identity_bytes.decode("utf-8"))):
+                actual = supplied.get(field)
+                actual = actual.get("value") if isinstance(actual, dict) else actual
+                if actual is not None and actual != expected:
+                    return False
+            current_build_hash = metadata_build.get("current_binary_sha256", {})
+            current_build_hash = current_build_hash.get("value") if isinstance(current_build_hash, dict) else current_build_hash
+            match_flags = [metadata_build.get(key, {}) for key in
+                ("matches_bootstrap_binary", "matches_bootstrap_version")]
+            if (current_build_hash is not None and current_build_hash != binary_hash
+                    or any((flag.get("value") if isinstance(flag, dict) else flag) is False for flag in match_flags)):
+                return False
+            if (metadata[0].deployment_id != record.deployment_id
+                    or supplied.get("source_sha256") != source_sha
+                    or provenance["source_reference"] != expected_source
+                    or provenance["supplied_version"] != banner or provenance["supplied_hash"] != binary_hash
+                    or (provenance["observed_version"] is not None and provenance["observed_version"] != banner)
+                    or (provenance["current_hash"] is not None and provenance["current_hash"] != binary_hash)
+                    or (source.binary_version is not None and source.binary_version != banner)):
+                return False
+            commands = []
+            for command in value.commands:
+                argv = command.request.get("argv", [])
+                if (str(command.producer) != role or command.deployment_id != record.deployment_id
+                        or not isinstance(argv, list) or not argv):
+                    continue
+                matches = (command.unit_id == unit.unit_id and argv[0] == identity["binary_path"]
+                    and _option(argv, "-c") is not None) if role == "vm_a" else (
+                        _f02r_iperf_listener(command, argv) and identity["binary_path"] in argv)
+                if matches:
+                    commands.append(command)
+            if len(commands) != 1:
+                return False
+            command = commands[0]
+            if (command.binary_version.value != banner or command.source_identity.value != expected_source
+                    or str(command.result.get("outcome")) != "succeeded"
+                    or isinstance(command.result.get("exit_code"), bool) or command.result.get("exit_code") != 0):
+                return False
+            identities.append(identity)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    left, right = identities
+    equal_fields = ("binary_sha256", "compiler_version", "build_configuration", "binary_path", "capabilities")
+    if any(left[field] != right[field] for field in equal_fields):
+        return False
+    if left["binary_version"] == right["binary_version"]:
+        return True
+    banners = [identity["binary_version"].split("\n") for identity in identities]
+    if any(len(lines) != 3 or re.fullmatch(r"iperf 3\.17\.1 \(cJSON [0-9.]+\)", lines[0]) is None
+            or not lines[2].startswith("Optional features available: ") for lines in banners):
+        return False
+    uname = [re.fullmatch(r"Linux ([A-Za-z0-9][A-Za-z0-9.-]*) (\S.*)", lines[1]) for lines in banners]
+    return (all(uname) and banners[0][0] == banners[1][0] and banners[0][2] == banners[1][2]
+            and uname[0].group(2) == uname[1].group(2))
+
+
 def _qualify_receiver_total_mismatch(value: ValidatorInput, unit: Any, tcp: NativeParse | None,
         coverage: dict[str, Any], acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]],
         verified_origins: dict[str, dict[str, Any]]) -> NativeParse | None:
@@ -1341,12 +1439,14 @@ def _qualify_receiver_total_mismatch(value: ValidatorInput, unit: Any, tcp: Nati
             or origin.get("receiver_artifact_sha256") != source.sha256
             or not re.fullmatch(r"[a-f0-9]{64}", str(origin.get("build_sha256", "")))
             or not origin.get("build_artifact_id")
-            or not source.binary_version or source.binary_version != client_source.binary_version
             or not source.source_identity or source.source_identity != client_source.source_identity
             or origin.get("stream_count") != (unit.streams or 1)
             or not origin.get("receiver_support_by_native_line")
             or not origin.get("receiver_line_by_signature")
             or acquisition.get(unit.unit_id, ([], ["missing replay"]))[1]):
+        return tcp
+    receipt_compatibility = not (source.binary_version and source.binary_version == client_source.binary_version)
+    if receipt_compatibility and not _paired_iperf_build_compatible(value, unit, source, client_source):
         return tcp
     if len(client.session_details) != 1:
         return tcp
@@ -1407,6 +1507,12 @@ def _qualify_receiver_total_mismatch(value: ValidatorInput, unit: Any, tcp: Nati
                 "receiver intervals cross the verified reset; native rows before the source-derived boundary are excluded"):
             finding = finding.model_copy(update={"severity": "info"})
         updated.append(finding)
+    if receipt_compatibility and any(before.severity == "warning" and after.severity == "info"
+            for before, after in zip(tcp.findings, updated)):
+        updated.append(_finding("native.iperf3.paired_build_identity", "info",
+            "qualification identity is established by independently verified supplied build sidecars and actual commands; "
+            "postmeasurement version and binary-hash diagnostics retain their recorded availability",
+            unit=unit.unit_id, artifact=source.artifact_id))
     return replace(tcp, findings=tuple(updated))
 
 
