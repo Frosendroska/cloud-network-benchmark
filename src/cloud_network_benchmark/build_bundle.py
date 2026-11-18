@@ -502,7 +502,7 @@ with tarfile.open(BUNDLE,"r:gz") as t:
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     try:
      s.setsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,b"cubic")
-     if s.getsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,16).rstrip(b"\\0")!=b"cubic": raise RuntimeError("CUBIC congestion control readback mismatch")
+     if s.getsockopt(socket.IPPROTO_TCP,socket.TCP_CONGESTION,16).rstrip(b"\0")!=b"cubic": raise RuntimeError("CUBIC congestion control readback mismatch")
     finally:s.close()
    results[tool]={"binary_version":version,"binary_sha256":h.hexdigest(),"binary_path":str(PREFIX/"bin"/tool),"elf_header":hdr,"elf_program_headers":ph,"elf_version_info":ver,"guest_glibc":libc,"guest_dependencies":deps,"capabilities":required,"help_outputs":{"main":helptext,"modes":mode_outputs}}
   for p in (FSROOT,BUNDLE.parent,PREFIX.parent):

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import ast
+import base64
 import json
 import os
 from pathlib import Path
 import sys
 import subprocess
+import re
 import tarfile
 import io
 
@@ -145,6 +148,38 @@ def test_emitted_installer_is_fixed_and_test_root_requires_explicit_opt_in(tmp_p
     shell_digest=hashlib.sha256(shell_bytes).hexdigest()
     python_digest=hashlib.sha256(("cc\n"+compiler+"\n"+spec+"\n").encode()).hexdigest()
     assert shell_digest==python_digest
+    tree=ast.parse(installer)
+    regexes={ast.literal_eval(node.args[0]) for node in ast.walk(tree)
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)
+        and node.func.attr in {"search","findall"} and node.args and isinstance(node.args[0],ast.Constant)}
+    os_pattern=next(pattern for pattern in regexes if "VERSION_ID" in pattern)
+    glibc_pattern=next(pattern for pattern in regexes if pattern.startswith("GLIBC_"))
+    stable_pattern=next(pattern for pattern in regexes if "no\\.git" in pattern)
+    assert re.search(os_pattern,'ID=ubuntu\nVERSION_ID="24.04"\n')
+    assert re.findall(glibc_pattern,"Name: GLIBC_2.38") == ["2.38"]
+    assert re.search(stable_pattern,"sockperf, version 3.10-no.git").group(1)=="3.10"
+    assert re.search(stable_pattern,"iperf 3.17.1 (cJSON 1.7.15)").group(1)=="3.17.1"
+    rstrip=next(node for node in ast.walk(tree) if isinstance(node,ast.Call)
+        and isinstance(node.func,ast.Attribute) and node.func.attr=="rstrip")
+    nul=ast.literal_eval(rstrip.args[0])
+    assert nul==b"\0" and b"cubic\0".rstrip(nul)==b"cubic"
+    assignments={target.id:node for node in ast.walk(tree) if isinstance(node,ast.Assign)
+        for target in node.targets if isinstance(target,ast.Name)}
+    ns={"hashlib":hashlib,"base64":base64,"b64":base64,"json":json,"compiler":compiler,"spec":spec,
+        "tool":"sockperf","row":{"source_reference":"sockperf-pin","source_sha256":"a"*64,
+            "upstream_commit":"b"*40,"patch_path":"patch.diff","patch_sha256":"c"*64,
+            "c_compiler_version":compiler,"configure_flags":["./configure","--prefix=/var/lib/cnb/install"],
+            "binary_version":"sockperf, version 3.10-no.git","binary_sha256":"d"*64,
+            "capabilities":["server","under-load"]},"r":{"binary_version":"sockperf, version 3.10-no.git",
+            "binary_sha256":"d"*64},"target":Path("/var/lib/cnb/install/bin/sockperf"),
+        "cache_config":python_digest,"cfg":"CC=${CC:-cc}; compiler="+compiler+"; "+spec,
+        "semantics":"sockperf-3.10-enabled-v1","caps":"server,under-load",
+        "origin":{"schema":"CNB_PREBUILT_V1"}}
+    exec(compile(ast.Module(body=[assignments["identity"]],type_ignores=[]),"<emitted-receipt-fragment>","exec"),ns)
+    assert ns["identity"].startswith("CNB_BUILD_V1\n") and ns["identity"].endswith("\n")
+    assert ns["identity"].splitlines()[0]=="CNB_BUILD_V1"
+    exec(compile(ast.Module(body=[assignments["origin_text"]],type_ignores=[]),"<emitted-origin-fragment>","exec"),ns)
+    assert ns["origin_text"].endswith("\n") and json.loads(ns["origin_text"])["schema"]=="CNB_PREBUILT_V1"
     assert "CNB_ACQ_V1" in installer and "readelf" in installer and "ldd" in installer
     with pytest.raises(ValueError):
         linux_installer_script("/var/lib/cnb/work/prebuilt.tar.gz", digest,
