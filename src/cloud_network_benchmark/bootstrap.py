@@ -716,6 +716,12 @@ def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock
         actions.append(_action(req.action_id, "ssh", vm, req, failed))
         return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_local_changed",
             "bundle failed its immediate pre-upload hash and provenance recheck", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle validation consumed the remaining upload allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
     req = _request(f"f02r-{role}-prebuilt-transfer", vm,
         [bundle.path, f"{vm.user}@{vm.host}:{bundle_path}"],
         min(connection.timeouts.command_seconds, remaining), action_type="scp")

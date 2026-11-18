@@ -290,6 +290,36 @@ def test_changed_bundle_fails_immediate_role_upload_recheck(tmp_path):
     assert not any(r.action_type=="scp" for r in runner.requests)
 
 
+def test_local_bundle_revalidation_consuming_readiness_deadline_prevents_upload(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.access import RemoteDeadline
+    from cloud_network_benchmark.bootstrap import _prepare_prebuilt_role
+    from tests.fixtures.f02r.support import connection, result
+    sources,path,declared=make_bundle(tmp_path)
+    config=BootstrapConfig(sources=sources,remote_root="/var/lib/cnb",workspace="/var/lib/cnb/work",
+        results_workspace="/var/lib/cnb/results",install_prefix="/var/lib/cnb/install",
+        prebuilt_bundle={"path":str(path),"sha256":declared["sha256"]})
+    now=datetime.now(timezone.utc)
+    deadline=RemoteDeadline(readiness_deadline_monotonic=200,overall_deadline_monotonic=300,
+        cleanup_reserve_seconds=10,cap_started_at=now,cap_expires_at=now+timedelta(minutes=5))
+    monotonic={"now":100}
+    def consume_local_time(*_args,**_kwargs):
+        monotonic["now"]=201
+        return declared["manifest"]
+    from cloud_network_benchmark import build_bundle as bundle_module
+    monkeypatch.setattr(bundle_module,"validate_bundle",consume_local_time)
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            return result(request.action_id,"missing" if request.action_id.endswith("bundle-identity-preflight") else "ok")
+    runner=Runner(); c=connection(tmp_path)
+    failure=_prepare_prebuilt_role(c,c.vm_a,"vm_a",config,runner,deadline,
+        lambda:monotonic["now"],[],[],[])
+    assert failure is not None and failure.failure.category=="readiness_deadline_exhausted"
+    assert not any(r.action_type=="scp" for r in runner.requests)
+
+
 @pytest.mark.parametrize("role", ["vm_a", "vm_b"])
 @pytest.mark.parametrize("tool", ["sockperf", "iperf3"])
 def test_nested_partial_origin_signal_fails_closed_for_each_tool_and_role(repository_root, role, tool):
