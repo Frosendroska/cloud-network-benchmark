@@ -599,7 +599,6 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 (logs / "sockperf.log").write_text("Sockperf listener captured by offline source fixture\n", encoding="utf-8")
                 initial_events = ([{"event":"error","data":"error - unable to receive cookie at server: "},
                     {"event":"end","data":{}}] if self.full_native else [])
-                initial_events.append({"event":"server_listening","data":{}})
                 (logs / "iperf3-server.jsonl").write_text(
                     "".join(json.dumps(event)+"\n" for event in initial_events), encoding="utf-8")
                 (logs / "iperf3-server.err").write_text("No server stderr bytes in offline fixture.\n", encoding="utf-8")
@@ -954,7 +953,7 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
 
 @pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "capture_fault", "unknown_server_error"), [
     ("failure_check", False, False, "partial", "eu-central-1", "none", False),
-    ("failure_check", True, False, "partial", "eu-central-1", "none", False),
+    ("failure_check", True, False, "valid", "eu-central-1", "none", False),
     ("failure_check", True, True, "valid", "eu-central-1", "none", False),
     ("failure_check", True, True, "valid", "eu-north-1", "none", False),
     ("failure_check", True, True, "invalid", "eu-central-1", "none", True),
@@ -989,6 +988,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.zone = "eu-north-1a" if region == "eu-north-1" else "eu-central-1a"
     runner.complete_cleanup = region == "eu-north-1"
     runner.full_native = full_native
+    runner.analysis_fixture_interior_rtt = full_native
     runner.control_capture_fault = capture_fault
     runner.unknown_server_error = unknown_server_error
     runner.late_tail = late_tail
@@ -1143,6 +1143,12 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert not [item for item in replay.findings if item.code.startswith("native.iperf3.interval_")], replay.findings
         if expected_validity == "valid":
             assert not [item for item in replay.findings if item.code == "timing.coverage_unavailable"], replay.findings
+            phases = {item["phase"]: item for item in replay.metrics.value["units"]}
+            assert {"idle_latency", "single_flow", "multi_flow"} <= set(phases)
+            assert all(phases[phase]["data_validity"] == "valid"
+                for phase in ("idle_latency", "single_flow", "multi_flow")), phases
+            assert all(phases[phase]["sample_count"] > 0 for phase in
+                ("idle_latency", "single_flow", "multi_flow")), phases
         elif expected_validity == "partial":
             assert any(item.unit_id == "idle_latency" and item.code == "timing.coverage_unavailable"
                 for item in replay.findings), replay.findings

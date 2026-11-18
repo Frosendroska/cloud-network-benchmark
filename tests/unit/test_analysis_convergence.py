@@ -58,13 +58,18 @@ def test_native_receiver_origin_requires_verified_same_cookie_post_omit_reset():
         "test_start": {"omit": 2}}}
     tcp = NativeParse(session_details=(detail,))
     observed = {"origin_utc": 1792540911.125, "uncertainty_seconds": 0.003001,
-        "crossing_reset": False, "stream_count": 2}
+        "crossing_start_cutoff_us": 0, "stream_count": 2}
     verified = {"verified-cookie": observed}
     assert _iperf_receiver_origin(tcp, verified_origins=verified) == (1792540911.125, 0.003001)
     assert _iperf_receiver_origin(tcp, verified_origins={}) is None
     assert _iperf_receiver_origin(tcp, verified_origins={"another-cookie": observed}) is None
     assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
-        **observed, "crossing_reset": True}}) is None
+        **observed, "crossing_start_cutoff_us": 2_000_000}}) == (1792540911.125, 0.003001)
+    assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
+        "origin_utc": observed["origin_utc"], "uncertainty_seconds": observed["uncertainty_seconds"],
+        "crossing_reset": False, "stream_count": 2}}) is None
+    assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
+        **observed, "crossing_start_cutoff_us": "unknown"}}) is None
     assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {
         **observed, "uncertainty_seconds": float("nan")}}) is None
     assert _iperf_receiver_origin(tcp, verified_origins={"verified-cookie": {

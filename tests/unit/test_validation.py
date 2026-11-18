@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import hashlib
 import json
 import pytest
@@ -14,9 +15,63 @@ from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
+
+
+def test_info_findings_are_retained_without_degrading_validity():
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    info = ValidationFinding(code="control.event", severity="info", message="recognized native event")
+    warning = ValidationFinding(code="control.event", severity="warning", message="unsupported native event")
+    error = ValidationFinding(code="control.event", severity="error", message="unknown server error")
+    assert not _has_degrading_findings([info])
+    assert _has_degrading_findings([info, warning])
+    assert _has_degrading_findings([info, error])
+
+
+def test_whole_phase_tcp_prefers_unique_receiver_final_aggregate():
+    intervals = (ReceiverInterval("session", 0, 1, 1, 100, False, False, None, 1),)
+    parsed = NativeParse(receiver_intervals=intervals,
+        receiver_totals=({"session_id":"session", "bytes":250, "seconds":9.999802},))
+    stats = _tcp_statistics(parsed)
+    assert stats["received_bytes"].value == 250
+    assert stats["measured_seconds"].value == 9.999802
+
+
+def test_reset_crossing_cutoff_uses_latest_independent_stream_end():
+    origins = {"1": 10_000_000, "2": 10_000_200, "3": 10_000_400, "4": 10_000_600}
+    rows = [(stream, origins[stream] - 500_000, origins[stream] + end, 100)
+        for stream, end in (("1", 1_000_000), ("2", 1_000_002),
+                            ("3", 1_000_001), ("4", 1_000_003))]
+    cutoff = _iperf_crossing_start_cutoff(origins, rows)
+    assert cutoff == 1_000_003
+    assert 500_000 < cutoff
+    assert 1_000_003 >= cutoff
+    assert _iperf_crossing_start_cutoff(origins, [("1", origins["1"], origins["1"] + 10, 1)]) == 0
+
+
+def test_nominal_completion_requires_successful_exact_command_and_receiver_span():
+    from cloud_network_benchmark.native import NativeParse
+
+    unit = SimpleNamespace(phase="single_flow", measured_seconds=10, streams=1)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a",
+        request={"argv":["iperf3", "-c", "10.0.0.2", "-t", "10", "-O", "5", "-P", "1"]},
+        result={"outcome":"succeeded", "exit_code":0})
+    value = SimpleNamespace(mode=ExperimentMode.SHORT_STUDY, commands=[command])
+    tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"session", "bytes":123, "seconds":9.999802},))
+    origins = {"cookie":{"nominal_required_seconds":15, "nominal_receiver_span_seconds":15.000988}}
+    acquisition = {"u1":([],[])}
+    assert _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["nominal_receiver_span_seconds"] = 14.999999
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["nominal_receiver_span_seconds"] = 15.000988
+    command.result["exit_code"] = 1
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
 
 
 def make_input(repository_root, provider="aws", campaign="camp", *, config_name="exp-001-multi-provider.yaml", mode_override=None, config_path=None):
@@ -901,7 +956,7 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
     assert any(item.code == "native.iperf3.window_unavailable" for item in selected.findings)
     assert not any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
     verified = {"captured-session": {"origin_utc": (NOW+timedelta(seconds=10)).timestamp(),
-        "uncertainty_seconds": .000001, "crossing_reset": False, "stream_count": 1}}
+        "uncertainty_seconds": .000001, "crossing_start_cutoff_us": 0, "stream_count": 1}}
     selected = _receiver_session_for_unit(value,unit,parsed,verified)
     assert selected.receiver_intervals == (good, omitted_warmup)
     assert any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
@@ -910,6 +965,17 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
         session_details=details,receiver_intervals=(partial,)),verified)
     assert partial_result.receiver_intervals == (partial,)
     assert not any(item.code == "native.iperf3.interval_outside_window" for item in partial_result.findings)
+    crossing = ReceiverInterval("1",0,2,2,25,False,False,source,5)
+    later = ReceiverInterval("1",2,60,58,975,False,False,source,6)
+    crossing_verified = {"captured-session": {**verified["captured-session"],
+        "crossing_start_cutoff_us": 2_000_000}}
+    crossing_result = _receiver_session_for_unit(value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(crossing,later)),crossing_verified)
+    assert crossing_result.receiver_intervals == (later,)
+    assert (crossing_result.receiver_intervals[0].line, crossing_result.receiver_intervals[0].bytes) == (6, 975)
+    positive_result = _receiver_session_for_unit(value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(good, omitted_warmup)),verified)
+    assert positive_result.receiver_intervals == (good, omitted_warmup)
     shifted_timing = timing.model_copy(update={
         "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=20)),
         "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=80))})

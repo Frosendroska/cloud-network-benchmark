@@ -88,11 +88,6 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
             mapping = mappings[0]
             uncertainty = mapping.estimated_error_ms.value / 1000
             replayed_windows = list(iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings))
-            for window in replayed_windows:
-                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
-                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
-                if window.has_positive_inner_support and end > start:
-                    windows.append((source.tool, start, end))
             if source.tool == "iperf3" and verified_iperf_origins is not None:
                 origin_record = next((item for item in candidates
                     if item.artifact_id == source.log_artifact_id and item.path == source.log_path), None)
@@ -102,9 +97,11 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 origin_record.verify_materialized_file(root)
                 from .acquisition import parse_observation_stream
                 by_stream: dict[str, int] = {}
+                initial_by_stream: dict[str, int] = {}
                 expected_streams: int | None = None
-                crossing = False
-                measured_starts: dict[str, list[int]] = {}
+                measured_rows: list[tuple[str, int, int, int]] = []
+                duration_seconds: int | None = None
+                omit_seconds: int | None = None
                 with _artifact_path(value, origin_record).open("rb") as stream:
                     for parsed_record in parse_observation_stream(stream):
                         row = parsed_record.value
@@ -123,33 +120,50 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                             if expected_streams is not None and expected_streams != count:
                                 raise ValueError("verified receiver stream count conflicts within one session")
                             expected_streams = count
+                            duration_seconds, omit_seconds = row.get("duration"), row.get("omit")
+                            if any(isinstance(item, bool) or not isinstance(item, int) or item < 0
+                                    for item in (duration_seconds, omit_seconds)):
+                                raise ValueError("verified receiver settings lack integer duration and omit")
                             continue
                         if row.get("record_kind") == "receiver_interval":
                             if row.get("omitted") is False:
                                 stream_id = row.get("stream_id")
-                                start_us = row.get("interval_start_us")
-                                if isinstance(stream_id, str) and isinstance(start_us, int) and not isinstance(start_us, bool):
-                                    measured_starts.setdefault(stream_id, []).append(start_us)
-                            continue
-                        if row.get("phase") != "post_omit":
+                                start_us, end_us, byte_count = (row.get("interval_start_us"),
+                                    row.get("interval_end_us"), row.get("bytes"))
+                                if (isinstance(stream_id, str) and all(isinstance(item, int) and not isinstance(item, bool)
+                                        for item in (start_us, end_us, byte_count))):
+                                    measured_rows.append((stream_id, start_us, end_us, byte_count))
                             continue
                         stream_id = row.get("stream_id")
                         origin_us = row.get("origin_us")
                         if (not isinstance(stream_id, str) or not stream_id.isdecimal()
                                 or isinstance(origin_us, bool) or not isinstance(origin_us, int) or origin_us < 0):
                             raise ValueError("post-omit origin has invalid stream or monotonic identity")
-                        previous = by_stream.get(stream_id)
+                        phase = row.get("phase")
+                        target = by_stream if phase == "post_omit" else initial_by_stream if phase == "initial" else None
+                        if target is None:
+                            raise ValueError("receiver statistic origin has an unsupported phase")
+                        previous = target.get(stream_id)
                         if previous is not None and previous != origin_us:
-                            raise ValueError("post-omit origin conflicts within one receiver stream")
-                        by_stream[stream_id] = origin_us
+                            raise ValueError(f"{phase} origin conflicts within one receiver stream")
+                        target[stream_id] = origin_us
                 if not by_stream:
                     raise ValueError("verified receiver post-omit origin is absent")
                 if expected_streams is None or len(by_stream) != expected_streams:
                     raise ValueError("verified post-omit origins do not cover every declared receiver stream")
-                if set(measured_starts) - set(by_stream):
+                if len(initial_by_stream) != expected_streams:
+                    raise ValueError("verified initial origins do not cover every declared receiver stream")
+                if {row[0] for row in measured_rows} - set(by_stream):
                     raise ValueError("receiver interval stream lacks its verified post-omit origin")
-                crossing = any(start_us < by_stream[stream_id]
-                    for stream_id, starts in measured_starts.items() for start_us in starts)
+                crossing_cutoff = _iperf_crossing_start_cutoff(by_stream, measured_rows)
+                last_end_by_stream = {stream: max(end for row_stream, _start, end, _bytes in measured_rows
+                    if row_stream == stream) for stream in by_stream if any(row[0] == stream for row in measured_rows)}
+                nominal_span = None
+                if (duration_seconds is not None and omit_seconds is not None
+                        and set(initial_by_stream) == set(by_stream) == set(last_end_by_stream)):
+                    spans = [last_end_by_stream[stream] - initial_by_stream[stream] for stream in by_stream]
+                    if spans and min(spans) >= 0:
+                        nominal_span = min(spans) / 1_000_000
                 origins = [mapping.utc_timestamp.timestamp() + value_us / 1_000_000
                     - mapping.monotonic_seconds for value_us in by_stream.values()]
                 if max(origins) - min(origins) > 0.000002:
@@ -157,19 +171,40 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 origin_utc = sum(origins) / len(origins)
                 previous_origin = verified_iperf_origins.get(source.session_id)
                 observed = {"origin_utc": origin_utc, "uncertainty_seconds": uncertainty + 0.000001,
-                    "crossing_reset": crossing, "stream_count": len(by_stream)}
+                    "crossing_start_cutoff_us": crossing_cutoff,
+                    "stream_count": len(by_stream), "nominal_required_seconds": duration_seconds + omit_seconds,
+                    "nominal_receiver_span_seconds": nominal_span}
                 if previous_origin is not None and previous_origin != observed:
                     raise ValueError("receiver cookie has contradictory verified post-omit origins")
                 verified_iperf_origins[source.session_id] = observed
+            for window in replayed_windows:
+                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
+                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
+                if window.has_positive_inner_support and end > start:
+                    windows.append((source.tool, start, end))
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
             errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
     return windows, errors
+
+
+def _iperf_crossing_start_cutoff(origins: dict[str, int],
+        rows: Sequence[tuple[str, int, int, int]]) -> int:
+    """Return the conservative native JSON start boundary after reset crossings."""
+    crossing_ends = [end_us - origins[stream_id] for stream_id, start_us, end_us, _bytes in rows
+        if start_us < origins[stream_id]]
+    if any(end < 0 for end in crossing_ends):
+        raise ValueError("receiver reset-crossing row ends before its post-omit origin")
+    return max(crossing_ends, default=0)
 
 
 def _finding(code: str, severity: str, message: str, *, unit: str | None = None,
              artifact: str | None = None) -> ValidationFinding:
     return ValidationFinding(code=code, severity=severity, message=message,
                              unit_id=unit, artifact_id=artifact)
+
+
+def _has_degrading_findings(findings: Sequence[ValidationFinding]) -> bool:
+    return any(item.severity in {"warning", "error"} for item in findings)
 
 
 def _replayed_iperf3_control_association(value: ValidatorInput
@@ -187,6 +222,8 @@ def _replayed_iperf3_control_association(value: ValidatorInput
             or record.path != declaration.path or record.kind != declaration.kind
             or record.retrieval_state != "verified" or record.closed is not True):
         return None, set()
+    if any(isinstance(settings.get(key), bool) for key in ("duration", "omit", "num_streams")):
+        return False
     try:
         root = Path(value.child_result_root)
         record.verify_materialized_file(root)
@@ -988,6 +1025,10 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     verified_origins = verified_iperf_origins or {}
     cookie = detail.get("start", {}).get("cookie") if isinstance(detail.get("start"), dict) else None
     verified_origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
+    crossing_cutoff = verified_origin.get("crossing_start_cutoff_us") if isinstance(verified_origin, dict) else None
+    if (isinstance(crossing_cutoff, bool) or not isinstance(crossing_cutoff, int)
+            or crossing_cutoff < 0):
+        verified_origin = None
     if measured_start is not None and measured_finish is not None and session_stamp is not None:
         kept = []
         if verified_origin is None:
@@ -995,20 +1036,20 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
                 "verified same-session post-omit receiver origin is unavailable; native offsets were not re-anchored",
                 unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
             kept.extend(intervals)
-        elif verified_origin.get("crossing_reset"):
-            additions.append(_finding("native.iperf3.window_unavailable", "warning",
-                "a receiver interval crosses the verified reset; source-clipped containment is retained without re-anchoring aggregate offsets",
-                unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
-            kept.extend(intervals)
         else:
+            crossing_cutoff = verified_origin["crossing_start_cutoff_us"]
+            if crossing_cutoff:
+                additions.append(_finding("native.iperf3.window_unavailable", "warning",
+                    "receiver intervals cross the verified reset; native rows before the source-derived boundary are excluded",
+                    unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
             origin_utc = float(verified_origin["origin_utc"])
             uncertainty = float(verified_origin["uncertainty_seconds"])
             tolerance = max(.002, uncertainty)
             for interval in intervals:
-                # Keep omitted warm-up as native evidence, but exclude it from
-                # measured containment and every measured denominator.
                 if interval.omitted:
                     kept.append(interval)
+                    continue
+                if round(interval.start_seconds * 1_000_000) < crossing_cutoff:
                     continue
                 absolute_start = origin_utc + interval.start_seconds
                 absolute_end = origin_utc + interval.end_seconds
@@ -1032,13 +1073,13 @@ def _tcp_statistics(tcp: NativeParse | None) -> dict[str, Any]:
         return {"received_bytes": Evidence[int](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "measured_seconds": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "throughput_gbps": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable")}
-    if tcp.receiver_intervals:
-        return receiver_statistics(tcp.receiver_intervals)
     if len(tcp.receiver_totals) == 1:
         total = tcp.receiver_totals[0]
         return {"received_bytes": Evidence[int](value=total["bytes"]),
                 "measured_seconds": Evidence[float](value=total["seconds"]),
                 "throughput_gbps": Evidence[float](value=8 * total["bytes"] / total["seconds"] / 1e9)}
+    if tcp.receiver_intervals:
+        return receiver_statistics(tcp.receiver_intervals)
     return {"received_bytes": Evidence[int](unavailable_reason="no receiver-side measured intervals or unique receiver total"),
             "measured_seconds": Evidence[float](unavailable_reason="receiver measured duration unavailable"),
             "throughput_gbps": Evidence[float](unavailable_reason="receiver throughput unavailable")}
@@ -1367,8 +1408,65 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
     return findings
 
 
+def _iperf_nominal_completion_proven(value: ValidatorInput, unit: Any, tcp: NativeParse | None,
+        acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]],
+        verified_origins: dict[str, dict[str, Any]]) -> bool:
+    """Prove nominal short-run completion from the verified same-VM receiver lifecycle."""
+    phase = str(getattr(unit.phase, "value", unit.phase))
+    if (value.mode != ExperimentMode.SHORT_STUDY or phase not in {"single_flow", "multi_flow"}
+            or tcp is None or len(tcp.sessions) != 1 or len(tcp.session_details) != 1
+            or len(tcp.receiver_totals) != 1):
+        return False
+    detail = tcp.session_details[0]
+    start = detail.get("start") if isinstance(detail, dict) else None
+    settings = start.get("test_start") if isinstance(start, dict) else None
+    if not isinstance(settings, dict):
+        return False
+    client_commands = [command for command in value.commands if command.unit_id == unit.unit_id
+        and command.producer == "vm_a" and isinstance(command.request.get("argv"), list)
+        and command.request["argv"] and "iperf3" in str(command.request["argv"][0]).lower()
+        and _option(command.request["argv"], "-c") is not None]
+    if len(client_commands) != 1:
+        return False
+    command = client_commands[0]
+    argv = command.request["argv"]
+    outcome = str(getattr(command.result.get("outcome"), "value", command.result.get("outcome", ""))).lower()
+    exit_code = command.result.get("exit_code")
+    duration, omit = _option(argv, "-t"), _option(argv, "-O")
+    try:
+        duration_value = int(duration) if duration is not None and duration.isdecimal() else None
+        omit_value = int(omit) if omit is not None and omit.isdecimal() else None
+        native_duration = int(settings["duration"])
+        native_omit = int(settings["omit"])
+        native_streams = int(settings["num_streams"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (outcome != "succeeded" or isinstance(exit_code, bool) or exit_code != 0
+            or duration_value != unit.measured_seconds or omit_value is None
+            or native_duration != duration_value or native_omit != omit_value
+            or str(settings.get("protocol", "")).upper() != "TCP"
+            or _option(argv, "-P") != str(unit.streams or 1)
+            or native_streams != (unit.streams or 1)):
+        return False
+    if acquisition.get(unit.unit_id, ([], []))[1]:
+        return False
+    cookie = start.get("cookie")
+    observed = verified_origins.get(cookie) if isinstance(cookie, str) else None
+    if not isinstance(observed, dict):
+        return False
+    required = observed.get("nominal_required_seconds")
+    span = observed.get("nominal_receiver_span_seconds")
+    if (isinstance(required, bool) or not isinstance(required, int)
+            or required != duration_value + omit_value
+            or isinstance(span, bool) or not isinstance(span, (int, float))
+            or not math.isfinite(span) or span < required):
+        return False
+    return True
+
+
 def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativeParse | None,
-              acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None) -> dict[str, Any]:
+              acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None,
+              verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     requested = unit.measured_seconds
     unit_timings = [t for t in value.timings if t.unit_id == unit.unit_id]
     timing = unit_timings[0] if len(unit_timings) == 1 else None
@@ -1377,6 +1475,9 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
     tcp_stats = _tcp_statistics(tcp) if tcp else None
     observed = tcp_stats["measured_seconds"].value if tcp_stats else None
     full_duration = observed is not None and observed >= requested
+    if not full_duration and _iperf_nominal_completion_proven(value, unit, tcp, acquisition or {},
+            verified_iperf_origins or {}):
+        full_duration = True
     if unit.kind == "continuous_day":
         measured = sorted((item for item in (tcp.receiver_intervals if tcp else ()) if not item.omitted),
                           key=lambda item: (item.session_id, item.start_seconds, item.line))
@@ -1611,7 +1712,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
             for item in sock.probe_counts
         ):
             findings.append(_finding("generation.unavailable", "warning", "valid-duration sent/runtime evidence is unavailable", unit=unit.unit_id))
-        coverage = _coverage(value, unit, sock, tcp, acquisition)
+        coverage = _coverage(value, unit, sock, tcp, acquisition, verified_origins)
         if sock.samples or (tcp and (tcp.receiver_intervals or tcp.receiver_totals)):
             any_measurement = True
         if not coverage["complete"]:
@@ -1674,12 +1775,13 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     idle_unit = next((unit for unit in units_payload if unit["phase"] == "idle_latency"), None)
     idle_id = idle_unit["unit_id"] if idle_unit else None
     idle_findings = [finding for finding in findings if finding.unit_id in {None, idle_id}]
-    idle_valid = bool(idle_unit and idle_unit["coverage"]["complete"] and not idle_findings)
+    idle_valid = bool(idle_unit and idle_unit["coverage"]["complete"]
+                      and not _has_degrading_findings(idle_findings))
     idle_median = idle_unit["rtt"]["median_us"].value if idle_valid else None
     for unit in units_payload:
         unit_findings = [finding for finding in findings if finding.unit_id in {None, unit["unit_id"]}]
         unit["data_validity"] = ("invalid" if any(f.severity == "error" for f in unit_findings)
-                                 else "partial" if unit_findings or not unit["coverage"]["complete"]
+                                 else "partial" if _has_degrading_findings(unit_findings) or not unit["coverage"]["complete"]
                                  else "valid" if unit["sample_count"] or unit["receiver_interval_count"]
                                  else "unavailable")
         phase = unit["phase"]

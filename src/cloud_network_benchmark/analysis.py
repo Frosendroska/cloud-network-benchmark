@@ -378,7 +378,9 @@ def _iperf_receiver_origin(tcp: Any, *, verified_origins: dict[str, dict[str, An
     if not isinstance(cookie, str) or not cookie.strip():
         return None
     observed = verified_origins.get(cookie)
-    if not isinstance(observed, dict) or observed.get("crossing_reset") is not False:
+    crossing_cutoff = observed.get("crossing_start_cutoff_us") if isinstance(observed, dict) else None
+    if (not isinstance(observed, dict) or isinstance(crossing_cutoff, bool)
+            or not isinstance(crossing_cutoff, int) or crossing_cutoff < 0):
         return None
     origin = observed.get("origin_utc")
     uncertainty = observed.get("uncertainty_seconds")
@@ -709,13 +711,16 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             start_data = detail.get("start", {}) if isinstance(detail, dict) else {}
             cookie = start_data.get("cookie") if isinstance(start_data, dict) else None
             observed_origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
-            if isinstance(observed_origin, dict) and observed_origin.get("crossing_reset") is True:
-                receiver_reason = "verified receiver interval crosses its post-omit reset; mapped intervals are unavailable"
+            crossing_cutoff = observed_origin.get("crossing_start_cutoff_us") if isinstance(observed_origin, dict) else 0
+            if crossing_cutoff:
+                receiver_reason = "a receiver interval crosses its post-omit reset and is excluded"
         if receiver_origin is not None and receiver_windows:
             session_origin, uncertainty = receiver_origin
             selected_receiver = []
             for interval in receiver_intervals:
                 if interval.omitted or interval.sender:
+                    continue
+                if round(interval.start_seconds * 1_000_000) < crossing_cutoff:
                     continue
                 absolute_start = session_origin + interval.start_seconds
                 absolute_end = session_origin + interval.end_seconds
@@ -739,7 +744,14 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         elif utc_window is not None:
             tcp_summary = receiver_statistics(selected_receiver)
         else:
-            tcp_summary = receiver_statistics(receiver_intervals)
+            totals = tcp.receiver_totals if tcp else ()
+            if len(totals) == 1:
+                total = totals[0]
+                tcp_summary = {"received_bytes": Evidence[int](value=total["bytes"]),
+                    "measured_seconds": Evidence[float](value=total["seconds"]),
+                    "throughput_gbps": Evidence[float](value=8 * total["bytes"] / total["seconds"] / 1e9)}
+            else:
+                tcp_summary = receiver_statistics(receiver_intervals)
         schedule = value.schedule_entry.value
         study_start = timing.measured_started_at.value if timing else None
         study_date = study_start.date().isoformat() if study_start else None
