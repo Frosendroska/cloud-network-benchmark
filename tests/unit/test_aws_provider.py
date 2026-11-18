@@ -514,6 +514,66 @@ def test_console_rejects_wrong_instance_or_missing_current_boot(response, match,
         driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0", "public_ipv4": "8.8.8.8"})
 
 
+def test_empty_console_failure_retains_only_redacted_parser_diagnostic(tmp_path):
+    instance_id = "i-0123456789abcdef0"
+    response = {"InstanceId": instance_id, "Timestamp": "2026-11-18T15:12:54Z", "Output": ""}
+    launch_time = datetime.fromisoformat("2026-11-18T15:10:00+00:00")
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._aws_json = lambda *_args: response
+
+    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8", "launch_time": launch_time})
+
+    diagnostics = list(driver._active_attempt.glob("host-console-*.json"))
+    assert len(diagnostics) == 1
+    saved = json.loads(diagnostics[0].read_text())
+    assert saved["instance_id"] == instance_id
+    assert saved["response_instance_id"] == instance_id
+    assert saved["timestamp"] == response["Timestamp"]
+    assert saved["expected_launch_time"] == launch_time.isoformat()
+    assert saved["output_characters"] == 0
+    assert saved["output_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert saved["boot_marker_count"] == saved["fingerprint_marker_count"] == 0
+    assert "Output" not in saved and "CNB_HOSTKEY" not in diagnostics[0].read_text()
+
+
+def test_console_diagnostic_does_not_persist_raw_output(tmp_path):
+    instance_id = "i-0123456789abcdef0"
+    sentinel = "SENSITIVE-SERIAL-OUTPUT-DO-NOT-PERSIST"
+    response = {"InstanceId": instance_id, "Timestamp": "2026-11-18T15:12:54Z", "Output": sentinel}
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._aws_json = lambda *_args: response
+
+    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8"})
+
+    saved = next(driver._active_attempt.glob("host-console-*.json")).read_text()
+    assert sentinel not in saved
+    assert json.loads(saved)["output_characters"] == len(sentinel)
+    assert json.loads(saved)["output_sha256"] == hashlib.sha256(sentinel.encode()).hexdigest()
+
+
+def test_console_diagnostic_write_error_preserves_trust_error(tmp_path):
+    instance_id = "i-0123456789abcdef0"
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._aws_json = lambda *_args: {"InstanceId": instance_id, "Timestamp": "2026-11-18T15:12:54Z", "Output": ""}
+
+    def fail_write(*_args):
+        raise OSError("diagnostic storage unavailable")
+
+    driver._write_private = fail_write
+    with pytest.raises(AwsProviderError) as raised:
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8"})
+    assert raised.value.category == "host_identity_unavailable"
+    assert str(raised.value) == "authenticated console lacks one current boot and ED25519 host fingerprint"
+
+
 @pytest.mark.parametrize("timestamp,boots", [
     ("2026-10-22T11:57:00Z", ["f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a"]),
     ("2026-10-22T11:59:00Z", ["f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a", "a429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a"]),

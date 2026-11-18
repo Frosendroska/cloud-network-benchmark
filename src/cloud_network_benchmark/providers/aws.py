@@ -1058,9 +1058,11 @@ class AwsProviderDriver:
         region, instance_id = detail["region"], detail["instance_id"]
         response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region, "--output", "json")
         if response.get("InstanceId") != instance_id:
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
         console = response.get("Output")
         if not isinstance(console, str):
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("console output is malformed", category="host_identity_unavailable")
         boots = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
         fingerprints = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", console)
@@ -1072,6 +1074,7 @@ class AwsProviderDriver:
         except (TypeError, ValueError):
             timestamp_value = launch_value = None
         if timestamp_value is None or launch_value is None or timestamp_value < launch_value or len(boots) != 1 or len(fingerprints) != 1:
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("authenticated console lacks one current boot and ED25519 host fingerprint", category="host_identity_unavailable")
         keyscan = self._run(
             f"aws-host-keyscan-{instance_id}",
@@ -1079,6 +1082,7 @@ class AwsProviderDriver:
             15,
         )
         if not _succeeded(keyscan):
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("host keyscan failed", category="host_keyscan", action_id=keyscan.action_id)
         parsed = self._run(
             f"aws-host-key-fingerprint-{instance_id}",
@@ -1087,19 +1091,54 @@ class AwsProviderDriver:
             stdin=keyscan.stdout,
         )
         if not _succeeded(parsed):
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("candidate host key fingerprint could not be parsed", category="host_keyscan", action_id=parsed.action_id)
         candidates = re.findall(r"SHA256:[A-Za-z0-9+/]+", parsed.stdout)
         if len(candidates) != 1 or candidates[0] != fingerprints[0]:
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("candidate host key does not match authenticated EC2 console fingerprint", category="host_key_mismatch")
         private_dir = self._attempt_dir_for_details(detail)
         known_hosts = private_dir / f"{instance_id}.known_hosts"
         host_lines = [line.strip() for line in keyscan.stdout.splitlines() if line.strip() and not line.startswith("#")]
         if not host_lines:
+            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
             raise AwsProviderError("keyscan produced no host key", category="host_keyscan")
         self._write_private(known_hosts, ("\n".join(host_lines) + "\n").encode())
         trust = {"known_hosts_path": str(known_hosts), "boot_id": boots[0], "fingerprint": fingerprints[0], "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(timestamp)}
         self._write_private(private_dir / f"{instance_id}.host-trust.json", json.dumps(trust, sort_keys=True).encode())
         return trust
+
+    def _record_host_console_diagnostic(self, instance_id: str, response: dict[str, Any], launch_time: Any) -> None:
+        """Retain parser-relevant console metadata without persisting raw boot output."""
+        output = response.get("Output")
+        expected_launch_time = launch_time.isoformat() if isinstance(launch_time, datetime) else launch_time if isinstance(launch_time, str) else None
+        diagnostic: dict[str, Any] = {
+            "schema_version": 1,
+            "instance_id": instance_id,
+            "response_instance_id": response.get("InstanceId") if isinstance(response.get("InstanceId"), str) else None,
+            "timestamp": response.get("Timestamp") if isinstance(response.get("Timestamp"), str) else None,
+            "expected_launch_time": expected_launch_time,
+            "output_type": type(output).__name__,
+        }
+        if isinstance(output, str):
+            boot_markers = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", output)
+            fingerprint_markers = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", output)
+            diagnostic.update({
+                "output_characters": len(output),
+                "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                "boot_marker_count": len(boot_markers),
+                "fingerprint_marker_count": len(fingerprint_markers),
+            })
+        else:
+            diagnostic.update({"output_characters": None, "output_sha256": None,
+                "boot_marker_count": None, "fingerprint_marker_count": None})
+        safe_id = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:16]
+        try:
+            self._write_private(self._attempt_dir_for_details({}) / f"host-console-{safe_id}.json",
+                json.dumps(diagnostic, sort_keys=True).encode("utf-8"))
+        except (OSError, AwsProviderError):
+            # Diagnostic retention must never replace the primary trust failure.
+            return
 
     def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str, *, catalog_cache: dict[tuple[str, ...], dict[str, Any]] | None = None) -> dict[str, Any]:
         region = expected["region"]
