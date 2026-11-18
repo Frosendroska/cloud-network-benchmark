@@ -101,6 +101,17 @@ def _records_from(result: Any) -> list[Any]:
     return list(getattr(evidence, "records", ()) or ())
 
 
+def _merge_artifact_records(records: list[Any]) -> list[Any]:
+    """Collapse identical artifact identities while rejecting conflicting captures."""
+    merged = {}
+    for record in records:
+        key = (record.artifact_id, record.path, record.unit_id)
+        if key in merged and merged[key] != record:
+            raise ValueError("duplicate source records conflict during strict projection")
+        merged[key] = record
+    return list(merged.values())
+
+
 def _builds_from(result: Any) -> list[Any]:
     prepared = _outcome(result, "prepare")
     evidence = getattr(prepared, "evidence", None)
@@ -366,7 +377,8 @@ def _controller_record(root: Path, deployment_id: str, declaration: Any, payload
 
 
 def _materialize_controller_evidence(root: Path, child: Any, result: Any,
-                                     declarations: list[Any]) -> list[Any]:
+                                     declarations: list[Any], *,
+                                     source_records: list[Any] | None = None) -> list[Any]:
     from .contracts.measurements import CommandEvidence, MeasurementTiming
     by_id = {item.artifact_id: item for item in declarations}
     records = []
@@ -472,8 +484,10 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
                 "pre_stop_prefix": (iperf_observation.get("pre_stop_prefix")
                     if isinstance(iperf_observation, Mapping) else None),
                 "actions": listener_actions}}
+        association_records = _merge_artifact_records(list(child.artifact_records)
+            + (list(source_records) if source_records is not None else _records_from(result)))
         association, _ = _iperf3_control_event_association(root,
-            list(child.artifact_records) + _records_from(result), evidence,
+            association_records, evidence,
             vm_a_host_id=vm_a_host, vm_b_host_id=vm_b_host,
             private_ipv4_b=private_ipv4_b, stdout_path=evidence["iperf3_stdout_path"])
         evidence["readiness"]["event_association"] = association
@@ -999,15 +1013,17 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
         record = _controller_record(root, child.deployment_id, declaration, payload)
         if record is not None:
             records.append(record)
-    records.extend(_materialize_controller_evidence(root, child, result, declarations))
+    if builds:
+        from .bootstrap import materialize_build_identity_artifacts
+        records.extend(materialize_build_identity_artifacts(root, child.deployment_id, builds))
+    records = _merge_artifact_records(records)
+    records.extend(_materialize_controller_evidence(root, child, result, declarations,
+        source_records=records))
     if _value(child.mode) == "diagnostic_day":
         parent_units = {unit.unit_id for unit in child.measurement_units}
         commands = [item for item in commands if item.unit_id in parent_units]
         timings = [item for item in timings if item.unit_id in parent_units]
         records = [item for item in records if item.unit_id is None or item.unit_id in parent_units]
-    if builds:
-        from .bootstrap import materialize_build_identity_artifacts
-        records.extend(materialize_build_identity_artifacts(root, child.deployment_id, builds))
     retrieval = _outcome(result, "retrieve")
     retrieval_failure = None
     if retrieval is not None and not retrieval.succeeded:
@@ -1105,15 +1121,10 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     # The child manifest intentionally omits concrete DAY probe chunks. Their
     # controller-owned command/timing sidecars still belong in the complete
     # ValidatorInput and are rematerialized from the captured guest outcome.
-    records = (list(child.artifact_records) + _records_from(result)
-        + _materialize_controller_evidence(root, child, result, declarations))
-    record_map = {}
-    for record in records:
-        key = (record.artifact_id, record.path, record.unit_id)
-        if key in record_map and record_map[key] != record:
-            raise ValueError("duplicate source records conflict during strict projection")
-        record_map[key] = record
-    records = list(record_map.values())
+    source_records = _merge_artifact_records(list(child.artifact_records) + _records_from(result))
+    controller_records = _materialize_controller_evidence(root, child, result, declarations,
+        source_records=source_records)
+    records = _merge_artifact_records(source_records + controller_records)
     create_evidence = getattr(result, "values", {}).get("create")
     vm_a = getattr(create_evidence, "vm_a", None)
     vm_b = getattr(create_evidence, "vm_b", None)

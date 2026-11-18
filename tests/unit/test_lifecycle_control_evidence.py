@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from cloud_network_benchmark.lifecycle_projection import (_controller_record,
-    _iperf3_control_event_association, _verified_iperf3_control_evidence)
+    _iperf3_control_event_association, _merge_artifact_records, _verified_iperf3_control_evidence)
 from cloud_network_benchmark.contracts.artifacts import ArtifactInput, ArtifactRecord, Evidence, StringEvidence
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout
 
@@ -137,6 +137,15 @@ def _association_fixture(tmp_path):
     payload["readiness"]["event_association"] = association
     records.append(_record(tmp_path,payload))
     return payload, records, raw_log
+
+
+def test_strict_artifact_record_merge_collapses_identical_and_rejects_conflicts(tmp_path):
+    _payload_value, records, _raw = _association_fixture(tmp_path)
+    assert _merge_artifact_records(records + [records[0]]) == records
+
+    conflict = records[0].model_copy(update={"sha256": StringEvidence(value="f" * 64)})
+    with pytest.raises(ValueError, match="duplicate source records conflict during strict projection"):
+        _merge_artifact_records(records + [conflict])
 
 
 def test_legacy_control_evidence_without_prefix_proof_remains_unavailable(tmp_path):

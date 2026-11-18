@@ -1114,7 +1114,11 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
             (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
     if full_native:
         evidence = saved.iperf3_control_evidence.value
+        assert evidence is not None
         assert evidence["readiness"]["event_association"]["status"] == "verified"
+        control_records = [item for item in saved.artifact_records
+            if item.artifact_id == "iperf3_control_evidence"]
+        assert len(control_records) == 1 and control_records[0].retrieval_state == "verified"
         control_codes = {
             "control.iperf3.readiness_cookie", "control.iperf3.server_interrupt"}
         assert control_codes <= {item.code for item in finalized["aws"][0].findings}
