@@ -135,6 +135,39 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
          lambda axis: deployment(axis, "throughput_gbps"), all_deployment_runs, deployment_sources)
 
     def receiver_timeline(axis):
+        whole_intervals: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for run in runs:
+            for interval in run.get("receiver_plot_intervals", []):
+                key = (run.get("run_id", ""), run.get("unit_id", ""), run.get("phase", ""),
+                       run.get("schedule_window_label") or "unresolved")
+                whole_intervals.setdefault(key, []).append(interval)
+        if whole_intervals:
+            for key, intervals in sorted(whole_intervals.items()):
+                label = "/".join(part for part in key if part)
+                ordered = sorted(intervals,
+                    key=lambda row: (row["start_seconds"], row["end_seconds"], row["line"]))
+                x_values: list[float] = []
+                y_values: list[float] = []
+                for interval in ordered:
+                    value = interval.get("throughput_gbps")
+                    if value is not None:
+                        x_values.extend([interval["start_seconds"], interval["end_seconds"], float("nan")])
+                        y_values.extend([value, value, float("nan")])
+                if x_values:
+                    axis.plot(x_values, y_values, marker=".", label=label)
+            if len(whole_intervals) <= 8 and any(axis.lines):
+                axis.legend(loc="best")
+            axis.set_xlim(left=0)
+            axis.set_xlabel("Seconds after verified VM B post-omit reset")
+            axis.set_ylabel("Receiver throughput (Gb/s)")
+            return
+        if any(run.get("mode") in {"short_study", "acceptance", "calibration"}
+                and run.get("kind") not in {"continuous_day", "probe_chunk"} for run in runs):
+            axis.text(.5, .5, "No source-verified VM B receiver intervals", ha="center", va="center",
+                transform=axis.transAxes)
+            axis.set_xlabel("Seconds after verified VM B post-omit reset")
+            axis.set_ylabel("Receiver throughput (Gb/s)")
+            return
         groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
         for row in bins:
             receiver = row.get("receiver", {})
@@ -173,8 +206,10 @@ def _make_plots(payload: dict[str, Any], output_dir: Path) -> list[dict[str, Any
         axis.set_xlabel("Source-supported elapsed seconds")
         axis.set_ylabel("Receiver throughput (Gb/s)")
     save("receiver-time-series", "Supported receiver throughput over time",
-         "Whole receiver intervals only; unsupported gaps are not connected.", receiver_timeline,
-         [row.get("unit_id", "") for row in bins], [source for row in bins for source in row.get("source_refs", [])])
+         "Whole source-replayed VM B receiver intervals; unsupported gaps are not connected.", receiver_timeline,
+         [row.get("unit_id", "") for row in runs] + [row.get("unit_id", "") for row in bins],
+         [interval.get("path", "") for run in runs for interval in run.get("receiver_plot_intervals", [])]
+         + [source for row in bins for source in row.get("source_refs", [])])
 
     placement_rows = payload.get("placement_comparisons", [])
     rtt_placement_rows = [row for row in placement_rows if row.get("metric") == "median_rtt_us"]

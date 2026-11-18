@@ -74,6 +74,7 @@ def test_materialized_four_mode_inputs_are_revalidated_and_reported(repository_r
         assert (output / "figures" / "receiver-time-series.svg").is_file()
         assert all("receiver" in row and "source_refs" in row for row in report["bins"])
         if mode == "diagnostic_day":
+            assert all(not row.get("receiver_plot_intervals") for row in report["runs"])
             assert len(released_before_next_parse) > 1
             assert all(live == 0 for _chunk, live in released_before_next_parse), released_before_next_parse[:5]
             context = report["day_load_context"][0]

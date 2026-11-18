@@ -80,6 +80,47 @@ def test_native_receiver_origin_requires_verified_same_cookie_post_omit_reset():
     assert _iperf_receiver_origin(missing_cookie, verified_origins=verified) is None
 
 
+def test_receiver_native_plot_support_uses_exact_replayed_line_and_relative_bounds():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.analysis import (_receiver_interval_native_source_line,
+        _receiver_interval_inside_utc_selection)
+    from cloud_network_benchmark.validation import _receiver_sum_signature_index
+
+    # The client pretty-JSON line is unrelated to the VM B JSONL event line.
+    interval = SimpleNamespace(line=1, start_seconds=1.000890, end_seconds=2.000919,
+        seconds=1.000029, bytes=100)
+    observed = {"receiver_line_by_signature": {
+        (1.000890, 2.000919, 1.000029, 100):10}}
+    assert _receiver_interval_native_source_line(interval, observed) == 10
+    assert _receiver_interval_native_source_line(interval, {
+        "receiver_line_by_signature": {(1.000891, 2.000919, 1.000028, 100):10}}) is None
+    four_stream_interval = SimpleNamespace(line=1, start_seconds=2.000968, end_seconds=3.000985,
+        seconds=1.0000170469, bytes=1_236_008_960)
+    four_stream_components = {
+        "5":{"start_us":2_000_968,"end_us":3_000_985,"bytes":358_744_064},
+        "8":{"start_us":2_001_036,"end_us":3_001_099,"bytes":259_260_416},
+        "10":{"start_us":2_001_082,"end_us":3_001_138,"bytes":358_744_064},
+        "12":{"start_us":2_001_094,"end_us":3_001_171,"bytes":259_260_416}}
+    four_stream_line = {stream:[{**row, "sum_start_seconds":2.000968,
+        "sum_end_seconds":3.000985, "sum_seconds":1.0000170469,
+        "sum_bytes":1_236_008_960}] for stream, row in four_stream_components.items()}
+    four_stream_index = _receiver_sum_signature_index({27:four_stream_line}, 4)
+    four_stream_proof = {"receiver_line_by_signature":four_stream_index}
+    assert _receiver_interval_native_source_line(four_stream_interval, four_stream_proof) == 27
+    # This changed client aggregate is still within the stream envelope, but it
+    # must not pass without the exact native B SUM signature.
+    changed_client_bounds = SimpleNamespace(**{**four_stream_interval.__dict__,
+        "start_seconds":2.001000, "end_seconds":3.001017, "seconds":1.000017})
+    assert _receiver_interval_native_source_line(changed_client_bounds, four_stream_proof) is None
+    bad_component_envelope = {stream:[{**rows[0], "start_us":rows[0]["start_us"] + 100}]
+        for stream, rows in four_stream_line.items()}
+    assert not _receiver_sum_signature_index({27:bad_component_envelope}, 4)
+    mismatched_sum = SimpleNamespace(**{**four_stream_interval.__dict__, "bytes":1_236_008_959})
+    assert _receiver_interval_native_source_line(mismatched_sum, four_stream_proof) is None
+    assert _receiver_interval_inside_utc_selection(2.0, 3.0, .001, 1.999, 3.001)
+    assert not _receiver_interval_inside_utc_selection(2.0, 3.0, .001, 2.0005, 3.001)
+
+
 def test_receiver_interval_straddle_invalidates_every_touched_bin():
     whole_index, whole_bins = _receiver_interval_bin(0.0, .5, 0.0, 1.0, 0.0)
     straddle_index, straddle_bins = _receiver_interval_bin(.5, 1.5, 0.0, 1.0, 0.0)

@@ -30,6 +30,48 @@ from .native import (NativeParse, SourceRef, parse_iperf3, parse_sockperf, recei
                      rtt_statistics, unique_receiver_total)
 
 
+def _receiver_sum_signature_index(
+        support_by_line: dict[int, dict[str, list[dict[str, Any]]]], stream_count: int
+        ) -> dict[tuple[float, float, float, int], int]:
+    """Index exact B SUM signatures after validating every stream's bytes and envelope."""
+    candidates: dict[tuple[float, float, float, int], list[int]] = {}
+    for line, streams in support_by_line.items():
+        if isinstance(line, bool) or not isinstance(line, int) or len(streams) != stream_count:
+            continue
+        rows = [stream_rows[0] for stream_rows in streams.values()
+            if isinstance(stream_rows, list) and len(stream_rows) == 1]
+        if len(rows) != stream_count:
+            continue
+        sums = {(row.get("sum_start_seconds"), row.get("sum_end_seconds"),
+            row.get("sum_seconds"), row.get("sum_bytes")) for row in rows}
+        if len(sums) != 1:
+            continue
+        sum_start, sum_end, sum_seconds, sum_bytes = next(iter(sums))
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) for value in (sum_start, sum_end, sum_seconds))
+                or sum_end <= sum_start or sum_seconds <= 0
+                or isinstance(sum_bytes, bool) or not isinstance(sum_bytes, int) or sum_bytes < 0):
+            continue
+        bounds: list[tuple[int, int]] = []
+        component_bytes: list[int] = []
+        valid = True
+        for row in rows:
+            left, right, amount = row.get("start_us"), row.get("end_us"), row.get("bytes")
+            if (any(isinstance(value, bool) or not isinstance(value, int) for value in (left, right, amount))
+                    or left < 0 or right <= left or amount < 0):
+                valid = False
+                break
+            bounds.append((left, right))
+            component_bytes.append(amount)
+        if (not valid or sum(component_bytes) != sum_bytes
+                or min(left for left, _right in bounds) > round(sum_start * 1_000_000)
+                or round(sum_end * 1_000_000) > max(right for _left, right in bounds)):
+            continue
+        signature = (float(sum_start), float(sum_end), float(sum_seconds), sum_bytes)
+        candidates.setdefault(signature, []).append(line)
+    return {signature: lines[0] for signature, lines in candidates.items() if len(lines) == 1}
+
+
 def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                          verified_iperf_origins: dict[str, dict[str, Any]] | None = None
                          ) -> tuple[list[Any], list[str]]:
@@ -88,7 +130,23 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 raise ValueError("source clock domain lacks one bounded clock mapping")
             mapping = mappings[0]
             uncertainty = mapping.estimated_error_ms.value / 1000
-            replayed_windows = list(iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings))
+            source_unit = next((item for item in value.measurement_units if item.unit_id == timing.unit_id), None)
+            mode_name = str(getattr(value.mode, "value", value.mode))
+            capture_receiver_plot = (source_unit is not None
+                and mode_name in {"short_study", "acceptance", "calibration"}
+                and source_unit.kind not in {"probe_chunk", "continuous_day"})
+            receiver_records = [record for record in value.artifact_records
+                if record.artifact_id == "iperf3_server_log"] if capture_receiver_plot and source.tool == "iperf3" else []
+            if capture_receiver_plot and source.tool == "iperf3" and len(receiver_records) != 1:
+                raise ValueError("receiver plot source lacks one deployment-scoped VM B server log")
+            receiver_record = receiver_records[0] if receiver_records else None
+            replay_records = list(candidates)
+            if receiver_record is not None and all(record.artifact_id != receiver_record.artifact_id
+                    for record in replay_records):
+                replay_records.append(receiver_record)
+            replayed_windows = list(iter_source_windows(root, source, replay_records, value.commands,
+                [build], timing.clock_mappings, capture_native_lines=capture_receiver_plot,
+                receiver_artifact=receiver_record))
             if source.tool == "iperf3" and verified_iperf_origins is not None:
                 origin_record = next((item for item in candidates
                     if item.artifact_id == source.log_artifact_id and item.path == source.log_path), None)
@@ -158,6 +216,24 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                     raise ValueError("receiver interval stream lacks its verified post-omit origin")
                 crossing_cutoff = _iperf_crossing_start_cutoff(by_stream, measured_rows)
                 native_terminal_by_stream = _iperf_native_terminal_ends(replayed_windows, source.session_id)
+                receiver_support_by_line: dict[int, dict[str, list[dict[str, Any]]]] = {}
+                for window in replayed_windows if capture_receiver_plot else ():
+                    if (window.tool != "iperf3" or window.kind != "receiver_measured"
+                            or window.session_id != source.session_id or window.omitted is not False
+                            or window.stream_id not in by_stream or window.native_line is None
+                            or not window.has_positive_inner_support):
+                        continue
+                    receiver_support_by_line.setdefault(window.native_line, {}).setdefault(
+                        window.stream_id, []).append({
+                            "start_us": window.start_earliest_ns // 1000 - by_stream[window.stream_id],
+                            "end_us": window.end_earliest_ns // 1000 - by_stream[window.stream_id],
+                            "bytes": window.native_bytes,
+                            "sum_start_seconds": window.native_sum_start_seconds,
+                            "sum_end_seconds": window.native_sum_end_seconds,
+                            "sum_seconds": window.native_sum_seconds,
+                            "sum_bytes": window.native_sum_bytes})
+                unique_receiver_line_by_signature = _receiver_sum_signature_index(
+                    receiver_support_by_line, len(by_stream))
                 nominal_span = None
                 if (duration_seconds is not None and omit_seconds is not None
                         and set(initial_by_stream) == set(by_stream) == set(native_terminal_by_stream)):
@@ -173,7 +249,19 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 observed = {"origin_utc": origin_utc, "uncertainty_seconds": uncertainty + 0.000001,
                     "crossing_start_cutoff_us": crossing_cutoff,
                     "stream_count": len(by_stream), "nominal_required_seconds": duration_seconds + omit_seconds,
-                    "nominal_receiver_span_seconds": nominal_span}
+                    "nominal_receiver_span_seconds": nominal_span,
+                    "receiver_support_by_native_line": receiver_support_by_line,
+                    "receiver_line_by_signature": unique_receiver_line_by_signature}
+                if capture_receiver_plot:
+                    build_record = next((record for record in value.artifact_records
+                        if record.artifact_id == source.build_artifact_id), None)
+                    if receiver_record is None or build_record is None:
+                        raise ValueError("receiver plot provenance lacks its B log or build artifact")
+                    observed.update({"receiver_artifact_id": receiver_record.artifact_id,
+                        "receiver_artifact_path": receiver_record.path,
+                        "receiver_artifact_sha256": receiver_record.sha256.value,
+                        "build_artifact_id": build_record.artifact_id,
+                        "build_path": build_record.path, "build_sha256": build_record.sha256.value})
                 if previous_origin is not None and previous_origin != observed:
                     raise ValueError("receiver cookie has contradictory verified post-omit origins")
                 verified_iperf_origins[source.session_id] = observed

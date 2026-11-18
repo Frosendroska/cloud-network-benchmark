@@ -50,6 +50,12 @@ class SourceWindow:
     omitted: bool | None
     source_byte_offset: int
     source_byte_length: int
+    native_line: int | None = None
+    native_bytes: int | None = None
+    native_sum_start_seconds: float | None = None
+    native_sum_end_seconds: float | None = None
+    native_sum_seconds: float | None = None
+    native_sum_bytes: int | None = None
 
     def __post_init__(self) -> None:
         vals = (self.start_earliest_ns, self.start_latest_ns, self.end_earliest_ns, self.end_latest_ns)
@@ -116,6 +122,19 @@ def _native_int(value: object, name: str) -> int:
     return value
 
 
+def _native_receiver_sum(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping) or value.get("sender") is not False:
+        return None
+    try:
+        start = _finite_number(value.get("start"), "native sum start")
+        end = _finite_number(value.get("end"), "native sum end")
+        seconds = _finite_number(value.get("seconds"), "native sum seconds")
+        _native_int(value.get("bytes"), "native sum bytes")
+    except ValueError:
+        return None
+    return value if end > start and seconds > 0 else None
+
+
 def _same_common(record: Mapping[str, object], source: AcquisitionSource) -> None:
     expected = {"tool": source.tool, "semantics_id": source.semantics_id,
                 "invocation_id": source.invocation_id, "boot_id": source.boot_id,
@@ -151,6 +170,8 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
     interval_count = 0
     native_streams = (native["stream_factory"]() if native is not None
                       and not native.get("_preflight_complete") else None)
+    preflight_lines = (native.get("_native_proof_by_source_record", {})
+                       if native is not None and native.get("_preflight_complete") else {})
     for record in records:
         value = record.value
         _same_common(value, source)
@@ -249,9 +270,20 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
         # preserve the native interval end and byte count without prorating.
         start_ns, end_ns = max(start_us, origin_us) * 1000, end_us * 1000
         interval_count += 1
+        proof = (native_row if native_streams is not None else
+            preflight_lines.get((record.byte_offset, record.byte_length)))
+        native_line = proof.get("_native_line") if isinstance(proof, Mapping) else None
+        native_sum = proof.get("_native_sum") if isinstance(proof, Mapping) else None
+        sum_start = _finite_number(native_sum.get("start"), "native sum start") if isinstance(native_sum, Mapping) else None
+        sum_end = _finite_number(native_sum.get("end"), "native sum end") if isinstance(native_sum, Mapping) else None
+        sum_seconds = _finite_number(native_sum.get("seconds"), "native sum seconds") if isinstance(native_sum, Mapping) else None
+        sum_bytes = _native_int(native_sum.get("bytes"), "native sum bytes") if isinstance(native_sum, Mapping) else None
+        native_bytes = _native_int(value.get("bytes"), "bytes")
         yield SourceWindow("receiver_measured", "iperf3", str(source.producer), source.boot_id,
             source.clock_domain, source.session_id, stream, start_ns, start_ns + 1000,
-            end_ns, end_ns + 1000, omitted, record.byte_offset, record.byte_length)
+            end_ns, end_ns + 1000, omitted, record.byte_offset, record.byte_length,
+            native_line if isinstance(native_line, int) and not isinstance(native_line, bool) else None,
+            native_bytes, sum_start, sum_end, sum_seconds, sum_bytes)
     if settings is None:
         raise ValueError("iperf native session settings are missing")
     if len({stream for phase, stream in origins if phase == "initial"}) != settings["num_streams"]:
@@ -342,7 +374,8 @@ def _check_iperf_settings(settings: Mapping[str, object], native: Mapping[str, o
 
 
 def _preflight_iperf_source(records_factory, source: AcquisitionSource,
-                            native: Mapping[str, object], outcome: object) -> None:
+                            native: Mapping[str, object], outcome: object,
+                            *, capture_native_lines: bool = False) -> None:
     """Check shared session proof and interval/native correspondence before any yield."""
     settings: Mapping[str, object] | None = None
     origins: dict[tuple[str, str], int] = {}
@@ -357,6 +390,7 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     settings_checked = False
     missing_native_row = False
     filtered_streams: dict[str, dict[str, int]] = {}
+    native_proof_by_source_record: dict[tuple[int, int], Mapping[str, object]] = {}
     try:
         for record in records_factory():
             value = record.value
@@ -435,6 +469,13 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                         else:
                             _corroborate_iperf_interval(value, stream, origin, native_row,
                                                         native["server_output"])
+                            native_line = native_row.get("_native_line")
+                            if (capture_native_lines and isinstance(native_line, int)
+                                    and not isinstance(native_line, bool)):
+                                native_sum = native_row.get("_native_sum")
+                                if isinstance(native_sum, Mapping):
+                                    native_proof_by_source_record[(record.byte_offset, record.byte_length)] = {
+                                        "_native_line": native_line, "_native_sum": native_sum}
                             matched_count += 1
                 if missing_native_row:
                     outcome_value = getattr(outcome, "value", outcome)
@@ -496,6 +537,8 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     native["validated_interval_count"] = matched_count
     native["native_tail"] = native_tail
     native["filtered_tail"] = ({"streams": filtered_streams} if filtered_tail else None)
+    if capture_native_lines:
+        native["_native_proof_by_source_record"] = native_proof_by_source_record
     native["_preflight_complete"] = True
 
 
@@ -542,7 +585,9 @@ def _parse_build_identity(raw: bytes) -> dict[str, object]:
 
 def iter_source_windows(child_root: Path, source: AcquisitionSource,
                         artifact_records: Sequence[ArtifactRecord], commands: Sequence[CommandEvidence],
-                        build_evidence: Sequence[object], clock_mappings: Sequence[ClockMapping] = ()) -> Iterator[SourceWindow]:
+                        build_evidence: Sequence[object], clock_mappings: Sequence[ClockMapping] = (),
+                        *, capture_native_lines: bool = False,
+                        receiver_artifact: ArtifactRecord | None = None) -> Iterator[SourceWindow]:
     """Verify source references and stream raw-derived windows; never trust declared totals."""
     by_id: dict[str, list[ArtifactRecord]] = {}
     for item in artifact_records:
@@ -596,6 +641,16 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
         if source.tool == "sockperf" and item.unit_id not in {None, command[0].unit_id}:
             raise ValueError("Sockperf native artifact must match its producing measurement unit")
         item.verify_materialized_file(child_root)
+    if receiver_artifact is not None:
+        if (source.tool != "iperf3" or receiver_artifact.deployment_id != log.deployment_id
+                or receiver_artifact.producer != VmRole.VM_B or receiver_artifact.unit_id is not None
+                or receiver_artifact.kind != "iperf3-server-jsonl"
+                or receiver_artifact.retrieval_state != "verified" or receiver_artifact.closed is not True):
+            raise ValueError("supplemental VM B receiver artifact lacks closed same-deployment identity")
+        receiver_artifact.verify_materialized_file(child_root)
+        if native_receiver is not None and native_receiver != receiver_artifact:
+            raise ValueError("supplemental receiver artifact conflicts with the declared source artifact")
+        native_receiver = receiver_artifact
     native_metadata: Mapping[str, object] | None = None
     if source.tool == "iperf3":
         if native_client is None:
@@ -727,7 +782,8 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
         if not found_session_anchor:
             raise ValueError("iperf session clock anchor is missing")
     if native_metadata is not None:
-        _preflight_iperf_source(iperf_records, source, native_metadata, outcome)
+        _preflight_iperf_source(iperf_records, source, native_metadata, outcome,
+            capture_native_lines=capture_native_lines)
     yield from _iperf_windows(iperf_records(), source, native_metadata)
     if outcome not in {None, "succeeded"}:
         raise ValueError(f"acquisition producer command outcome {outcome!r} leaves an unknown tail")
@@ -1051,7 +1107,7 @@ def _iter_server_streams(path: Path, expected_cookie: str) -> Iterator[Mapping[s
     active = False
     starts = 0
     with path.open("r", encoding="utf-8") as stream:
-        for line in stream:
+        for line_no, line in enumerate(stream, 1):
             if not line.strip():
                 continue
             if not line.endswith("\n"):
@@ -1076,8 +1132,10 @@ def _iter_server_streams(path: Path, expected_cookie: str) -> Iterator[Mapping[s
                 data = value.get("data")
                 streams = data.get("streams") if isinstance(data, Mapping) else None
                 if isinstance(streams, list):
-                    yield from (row for row in streams if isinstance(row, Mapping)
-                                and row.get("sender") is False)
+                    sum_row = data.get("sum") if isinstance(data, Mapping) else None
+                    native_sum = _native_receiver_sum(sum_row)
+                    yield from ({**row, "_native_line": line_no, "_native_sum": native_sum} for row in streams
+                                if isinstance(row, Mapping) and row.get("sender") is False)
             elif event == "end" and active:
                 active = False
     if starts != 1:
@@ -1113,6 +1171,22 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
             receiver_settings = _native_settings(receiver_start) if isinstance(receiver_start, Mapping) else None
             if receiver_settings is None or not isinstance(server_output.get("intervals"), list):
                 return None
+            if receiver_path is not None:
+                receiver = _native_server_metadata(receiver_path, expected_cookie)
+                b_settings = receiver.get("receiver_settings") if isinstance(receiver, Mapping) else None
+                embedded_cookie = receiver_start.get("cookie") if isinstance(receiver_start, Mapping) else None
+                setting_keys = ("protocol", "num_streams", "omit", "duration", "blksize", "reverse", "interval")
+                if (receiver is None or not isinstance(b_settings, Mapping) or embedded_cookie != expected_cookie
+                        or any(key not in receiver_settings or key not in b_settings for key in setting_keys)
+                        or any(_normalized_native_settings({key: receiver_settings.get(key)})
+                            != _normalized_native_settings({key: b_settings.get(key)}) for key in setting_keys)
+                        or not isinstance(receiver.get("server_output"), Mapping)):
+                    return None
+                return {"cookie": expected_cookie, "client_settings": settings,
+                    "receiver_settings": b_settings, "server_output": receiver["server_output"],
+                    "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie),
+                    "receiver_complete": receiver.get("receiver_complete") is True,
+                    "client_complete": isinstance(value.get("end"), Mapping), "client_tail": False}
             streams = tuple(row for interval in server_output["intervals"]
                 if isinstance(interval, Mapping) and isinstance(interval.get("streams"), list)
                 for row in interval["streams"] if isinstance(row, Mapping))

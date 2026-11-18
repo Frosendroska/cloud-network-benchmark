@@ -396,6 +396,22 @@ def _iperf_receiver_origin(tcp: Any, *, verified_origins: dict[str, dict[str, An
     return origin, uncertainty
 
 
+def _receiver_interval_native_source_line(interval: Any, observed: dict[str, Any]) -> int | None:
+    """Return the unique VM B JSONL line that proves this receiver sum."""
+    support = observed.get("receiver_line_by_signature")
+    if not isinstance(support, dict):
+        return None
+    signature = (interval.start_seconds, interval.end_seconds, interval.seconds, interval.bytes)
+    line = support.get(signature)
+    return line if isinstance(line, int) and not isinstance(line, bool) else None
+
+
+def _receiver_interval_inside_utc_selection(start: float, end: float, uncertainty: float,
+        window_start: float | None, window_end: float | None) -> bool:
+    return ((window_start is None or start - uncertainty >= window_start)
+            and (window_end is None or end + uncertainty <= window_end))
+
+
 def _receiver_interval_bin(start: float, end: float, origin: float,
                            width: float, uncertainty: float) -> tuple[int | None, list[int]]:
     """Map a whole receiver interval to one bin, or identify every touched bin."""
@@ -704,7 +720,10 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
         receiver_uncertainty = receiver_origin[1] if receiver_origin is not None else None
         receiver_intervals = tuple(tcp.receiver_intervals) if tcp else ()
         selected_receiver = [] if utc_window is not None else list(receiver_intervals)
+        receiver_plot_intervals: list[dict[str, Any]] = []
         mapped_receiver: list[tuple[float, float, Any]] = []
+        receiver_plot_mode = (str(value.mode) in {"short_study", "acceptance", "calibration"}
+            and unit.kind not in {"continuous_day", "probe_chunk"})
         receiver_reason = "verified same-cookie post-omit receiver origin is unavailable"
         if tcp is not None:
             detail = tcp.session_details[0] if len(tcp.session_details) == 1 else {}
@@ -714,7 +733,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             crossing_cutoff = observed_origin.get("crossing_start_cutoff_us") if isinstance(observed_origin, dict) else 0
             if crossing_cutoff:
                 receiver_reason = "a receiver interval crosses its post-omit reset and is excluded"
-        if receiver_origin is not None and receiver_windows:
+        if receiver_origin is not None and receiver_windows and isinstance(observed_origin, dict):
             session_origin, uncertainty = receiver_origin
             selected_receiver = []
             for interval in receiver_intervals:
@@ -724,14 +743,39 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
                     continue
                 absolute_start = session_origin + interval.start_seconds
                 absolute_end = session_origin + interval.end_seconds
-                supported = _containing_window(receiver_windows, receiver_window_starts,
-                    absolute_start - uncertainty, absolute_end + uncertainty)
-                selected = ((window_start is None or absolute_start - uncertainty >= window_start)
-                            and (window_end is None or absolute_end + uncertainty <= window_end))
-                if supported and selected:
-                    selected_receiver.append(interval)
-                    if axis_origin is not None:
-                        mapped_receiver.append((absolute_start, absolute_end, interval))
+                selected = _receiver_interval_inside_utc_selection(absolute_start, absolute_end,
+                    uncertainty, window_start, window_end)
+                if receiver_plot_mode:
+                    native_line = _receiver_interval_native_source_line(interval, observed_origin)
+                    if native_line is None:
+                        continue
+                    # Acquisition windows already carry the B clock's inner error
+                    # bounds, so do not expand the interval by that error again.
+                    cross_vm_supported = _containing_window(receiver_windows, receiver_window_starts,
+                        absolute_start, absolute_end)
+                    if selected and (utc_window is None or cross_vm_supported):
+                        selected_receiver.append(interval)
+                        receiver_plot_intervals.append({
+                            "start_seconds": interval.start_seconds,
+                            "end_seconds": interval.end_seconds,
+                            "bytes": interval.bytes, "measured_seconds": interval.seconds,
+                            "throughput_gbps": (8 * interval.bytes / interval.seconds / 1e9
+                                if interval.seconds > 0 else None),
+                            "artifact_id": observed_origin["receiver_artifact_id"],
+                            "path": observed_origin["receiver_artifact_path"],
+                            "sha256": observed_origin["receiver_artifact_sha256"],
+                            "line": native_line, "cookie": cookie,
+                            "build_artifact_id": observed_origin["build_artifact_id"],
+                            "build_path": observed_origin["build_path"],
+                            "build_sha256": observed_origin["build_sha256"]})
+                else:
+                    # Continuous-day keeps its prior conservative UTC inner-window path.
+                    cross_vm_supported = _containing_window(receiver_windows, receiver_window_starts,
+                        absolute_start - uncertainty, absolute_end + uncertainty)
+                    if selected and cross_vm_supported:
+                        selected_receiver.append(interval)
+                if selected and cross_vm_supported and axis_origin is not None:
+                    mapped_receiver.append((absolute_start, absolute_end, interval))
             receiver_reason = "no whole receiver intervals are supported inside the selected UTC acquisition window"
         if utc_window is not None and receiver_origin is None:
             tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=receiver_reason),
@@ -782,6 +826,7 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             "rtt": rtt_statistics([sample.rtt_us for sample in selected_samples]),
             "rtt_histogram": _histogram_data([sample.rtt_us for sample in selected_samples]),
             "receiver": tcp_summary,
+            "receiver_plot_intervals": receiver_plot_intervals,
             "metadata": [item.model_dump(mode="json") for item in value.vm_metadata_records],
             "original_unit": metrics_by_unit.get(unit_id, {}),
             "source_refs": sorted({sample.source.path for sample in selected_samples} |
