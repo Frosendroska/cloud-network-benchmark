@@ -573,9 +573,12 @@ class AwsProviderDriver:
                     trigger = datetime.fromisoformat(journal["expiry_trigger"])
                     params = self._automation_parameters(deployment, region, trigger, safety["role_arn"])
                     lookup = self._lookup_automation(region, safety, params)
-                    if lookup is not None and len(lookup[0]) == 1:
+                    if lookup is not None and len(lookup[0]) == 1 and lookup[1] == 1:
                         execution_id = lookup[0][0]
                         journal.setdefault("executions", {})[region] = execution_id
+                        journal["registration_uncertain_regions"] = [
+                            item for item in journal.get("registration_uncertain_regions", []) if item != region
+                        ]
                         journal.setdefault("regional_parameters", {})[region] = params
                         journal.setdefault("regional_expiry_outcomes", {})[region] = {
                             "execution_id": execution_id, "state": "recovered_for_cleanup",

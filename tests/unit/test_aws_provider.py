@@ -965,6 +965,7 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
 
 @pytest.mark.parametrize("lookup, recovered", [
     ((["exact-execution"], 1), True),
+    ((["exact-execution"], 2), False),
     (([], 0), False),
     ((["one", "two"], 2), False),
     (None, False),
@@ -984,7 +985,8 @@ def test_cleanup_recovers_only_one_exact_lost_start_execution(tmp_path, lookup, 
         "primary_failure": primary.model_dump(mode="json"),
     })
     driver._aws_json = lambda *_args: {"Account": "123456789012"}
-    driver._lookup_automation = lambda *_args: lookup
+    lookup_calls = []
+    driver._lookup_automation = lambda *_args: lookup_calls.append(_args) or lookup
     driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
     cancelled = []
     driver._cancel_or_confirm_terminal = lambda region, execution_id, actual_safety, params: (
@@ -1001,11 +1003,106 @@ def test_cleanup_recovers_only_one_exact_lost_start_execution(tmp_path, lookup, 
         assert cancelled[0][3] == driver._automation_parameters(
             deployment, "eu-central-1", datetime.fromisoformat(journal["expiry_trigger"]), safety["role_arn"])
         assert journal["primary_failure"]["category"] == "expiry_uncertain"
+        assert journal["registration_uncertain_regions"] == []
+        second = driver.cleanup(deployment)
+        assert second.cleanup_state == "succeeded"
+        assert len(lookup_calls) == 1
     else:
         assert result.cleanup_state == "failed"
         assert result.cleanup_failure.category == "expiry_uncertain"
         assert not cancelled
         assert journal.get("executions", {}) == {}
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_version", "wrong_role", "wrong_run", "wrong_deployment", "wrong_region", "wrong_trigger",
+    "wrong_document", "prefix_neighbor", "same_document_extra_candidate", "malformed", "truncated",
+    "next_token", "failed_lookup", "stderr", "failed_readback",
+])
+def test_cleanup_actual_lookup_keeps_uncertain_when_scope_is_not_unique_and_exact(tmp_path, case):
+    class Runner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                self.actions.append(request.action_id)
+                return identity
+            self.actions.append(request.action_id)
+            operation = request.argv[1:3]
+            if operation == ["ssm", "describe-automation-executions"]:
+                if case == "malformed":
+                    stdout = json.dumps({"AutomationExecutionMetadataList": "not-a-list"})
+                elif case == "truncated":
+                    stdout = '{"AutomationExecutionMetadataList":['
+                elif case == "next_token":
+                    stdout = json.dumps({"AutomationExecutionMetadataList": [], "NextToken": "more"})
+                elif case == "failed_lookup":
+                    return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
+                        finished_at=NOW, duration_seconds=0, exit_code=1, stdout="", stderr="access denied")
+                else:
+                    ids = ["exact", "other"] if case == "same_document_extra_candidate" else ["candidate"]
+                    metadata = [{"AutomationExecutionId": item, "DocumentName": "expiry-original"} for item in ids]
+                    if case == "prefix_neighbor":
+                        metadata = [{"AutomationExecutionId": "neighbor", "DocumentName": "expiry-original-neighbor"}]
+                    stdout = json.dumps({"AutomationExecutionMetadataList": metadata})
+                stderr = "warning" if case == "stderr" else ""
+                return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr=stderr)
+            if operation == ["ssm", "get-automation-execution"]:
+                if case == "failed_readback":
+                    return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
+                        finished_at=NOW, duration_seconds=0, exit_code=1, stdout="", stderr="read failed")
+                params = driver._automation_parameters(deployment, "eu-central-1", trigger, safety["role_arn"])
+                changed = {"wrong_role": ("AutomationAssumeRole", ["foreign-role"]),
+                    "wrong_run": ("RunId", ["foreign-run"]),
+                    "wrong_deployment": ("DeploymentId", ["foreign-deployment"]),
+                    "wrong_region": ("Region", ["eu-west-2"]),
+                    "wrong_trigger": ("ExpiryTriggerUtc", ["2026-10-22T12:09:59Z"])}.get(case)
+                if case == "same_document_extra_candidate" and request.argv[request.argv.index("--automation-execution-id") + 1] == "other":
+                    params["RunId"] = ["different-run"]
+                if changed:
+                    params[changed[0]] = changed[1]
+                document_name = "other-document" if case == "wrong_document" else "expiry-original"
+                version = "8" if case == "wrong_version" else "7"
+                payload = {"AutomationExecutionId": request.argv[request.argv.index("--automation-execution-id") + 1],
+                    "DocumentName": document_name, "DocumentVersion": version, "Parameters": params}
+                if case == "malformed":
+                    stdout = "{}"
+                else:
+                    stdout = json.dumps({"AutomationExecution": payload})
+                return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            raise AssertionError(f"unexpected command: {request.action_id}")
+
+    deployment = make_deployment()
+    trigger = NOW + timedelta(minutes=10)
+    safety = {"document_name": "expiry-original", "document_version": "7",
+        "role_arn": "arn:aws:iam::123456789012:role/original-role"}
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "regions": ["eu-central-1"], "executions": {},
+        "creation_may_have_started": False, "registration_attempted_regions": ["eu-central-1"],
+        "registration_uncertain_regions": ["eu-central-1"], "expiry_trigger": trigger.isoformat(),
+        "safety": {"eu-central-1": safety},
+        "primary_failure": FailureEvidence(category="expiry_uncertain", message="lost start response",
+            occurred_at=NOW).model_dump(mode="json")})
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    cancelled = []
+    driver._cancel_or_confirm_terminal = lambda *args: cancelled.append(args) or {"state": "Cancelled"}
+    driver._verify_safety_absent = lambda *_args: True
+    driver._expiry_from_journal = lambda *_args: None
+
+    result = driver.cleanup(deployment)
+    journal = driver._load_journal(attempt, deployment)
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category == "expiry_uncertain"
+    assert journal["executions"] == {}
+    assert not cancelled
+    assert any(action.startswith("aws-expiry-recover-") for action in runner.actions)
 
 
 def test_cleanup_returns_failed_evidence_when_final_journal_write_raises(tmp_path):
