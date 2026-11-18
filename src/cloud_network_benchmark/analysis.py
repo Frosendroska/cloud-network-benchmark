@@ -1279,7 +1279,7 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
         numpy_version = None
     try:
         from matplotlib import get_backend
-        backend = get_backend()
+        backend = get_backend().lower()
     except ImportError:
         backend = None
     metadata = {"format_version": 1, "selection_fingerprint": fingerprint,
