@@ -375,9 +375,13 @@ def test_f08_intersects_materialized_loaded_sockperf_and_receiver_sources(reposi
     write(valid_server_path,valid_server_bytes)
     valid_server_record = record("iperf3_server_log",valid_server_path,"iperf3-server-jsonl",
         VmRole.VM_B,None,valid_server_bytes)
+    valid_pair = prepared.model_copy(update={"artifact_records":[*records,valid_server_record]})
+    _valid_pair_windows,valid_pair_errors = _acquisition_windows(valid_pair,timing)
+    assert not valid_pair_errors
     changed_client = json.loads(client_json)
     changed_client["server_output_json"]["intervals"][0]["streams"][0]["bytes"] += 1
     changed_client_bytes = json.dumps(changed_client).encode()
+    write(client_path,changed_client_bytes)
     changed_client_record = record(client_id,client_path,"iperf3-json",VmRole.VM_A,unit.unit_id,
         changed_client_bytes)
     contradictory = prepared.model_copy(update={"artifact_records":[

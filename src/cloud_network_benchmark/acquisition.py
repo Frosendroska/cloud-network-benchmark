@@ -1183,6 +1183,11 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
             receiver_settings = _native_settings(receiver_start) if isinstance(receiver_start, Mapping) else None
             if receiver_settings is None or not isinstance(server_output.get("intervals"), list):
                 return None
+            streams = tuple(row for interval in server_output["intervals"]
+                if isinstance(interval, Mapping) and isinstance(interval.get("streams"), list)
+                for row in interval["streams"] if isinstance(row, Mapping))
+            if not streams:
+                return None
             if receiver_path is not None:
                 receiver = _native_server_metadata(receiver_path, expected_cookie)
                 b_settings = receiver.get("receiver_settings") if isinstance(receiver, Mapping) else None
@@ -1201,11 +1206,6 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
                     "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie),
                     "receiver_complete": receiver.get("receiver_complete") is True,
                     "client_complete": isinstance(value.get("end"), Mapping), "client_tail": False}
-            streams = tuple(row for interval in server_output["intervals"]
-                if isinstance(interval, Mapping) and isinstance(interval.get("streams"), list)
-                for row in interval["streams"] if isinstance(row, Mapping))
-            if not streams:
-                return None
             return {"cookie": expected_cookie, "client_settings": settings,
                 "receiver_settings": receiver_settings, "server_output": server_output,
                 "streams": streams, "stream_factory": lambda: iter(streams),
