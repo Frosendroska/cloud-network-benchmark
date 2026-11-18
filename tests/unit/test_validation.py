@@ -15,7 +15,7 @@ from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_native_terminal_ends, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
@@ -50,6 +50,18 @@ def test_reset_crossing_cutoff_uses_latest_independent_stream_end():
     assert 500_000 < cutoff
     assert 1_000_003 >= cutoff
     assert _iperf_crossing_start_cutoff(origins, [("1", origins["1"], origins["1"] + 10, 1)]) == 0
+
+
+def test_nominal_terminal_lower_bound_uses_only_replayed_native_windows():
+    windows = [
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="cookie",
+            stream_id="1", omitted=False, end_earliest_ns=15_000_988_000),
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="cookie",
+            stream_id="1", omitted=True, end_earliest_ns=25_000_000_000),
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="other",
+            stream_id="2", omitted=False, end_earliest_ns=30_000_000_000),
+    ]
+    assert _iperf_native_terminal_ends(windows, "cookie") == {"1":15_000_988}
 
 
 def test_nominal_completion_requires_successful_exact_command_and_receiver_span():

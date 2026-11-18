@@ -156,12 +156,11 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 if {row[0] for row in measured_rows} - set(by_stream):
                     raise ValueError("receiver interval stream lacks its verified post-omit origin")
                 crossing_cutoff = _iperf_crossing_start_cutoff(by_stream, measured_rows)
-                last_end_by_stream = {stream: max(end for row_stream, _start, end, _bytes in measured_rows
-                    if row_stream == stream) for stream in by_stream if any(row[0] == stream for row in measured_rows)}
+                native_terminal_by_stream = _iperf_native_terminal_ends(replayed_windows, source.session_id)
                 nominal_span = None
                 if (duration_seconds is not None and omit_seconds is not None
-                        and set(initial_by_stream) == set(by_stream) == set(last_end_by_stream)):
-                    spans = [last_end_by_stream[stream] - initial_by_stream[stream] for stream in by_stream]
+                        and set(initial_by_stream) == set(by_stream) == set(native_terminal_by_stream)):
+                    spans = [native_terminal_by_stream[stream] - initial_by_stream[stream] for stream in by_stream]
                     if spans and min(spans) >= 0:
                         nominal_span = min(spans) / 1_000_000
                 origins = [mapping.utc_timestamp.timestamp() + value_us / 1_000_000
@@ -195,6 +194,21 @@ def _iperf_crossing_start_cutoff(origins: dict[str, int],
     if any(end < 0 for end in crossing_ends):
         raise ValueError("receiver reset-crossing row ends before its post-omit origin")
     return max(crossing_ends, default=0)
+
+
+def _iperf_native_terminal_ends(windows: Sequence[Any], session_id: str | None) -> dict[str, int]:
+    """Use only native-correlated replay windows as receiver terminal lower bounds."""
+    terminal: dict[str, int] = {}
+    for window in windows:
+        if (window.tool != "iperf3" or window.kind != "receiver_measured"
+                or window.session_id != session_id or window.omitted is not False
+                or not isinstance(window.stream_id, str) or not window.stream_id.isdecimal()):
+            continue
+        end_ns = window.end_earliest_ns
+        if isinstance(end_ns, bool) or not isinstance(end_ns, int) or end_ns < 0:
+            raise ValueError("replayed receiver window has an invalid native terminal bound")
+        terminal[window.stream_id] = max(terminal.get(window.stream_id, 0), end_ns // 1000)
+    return terminal
 
 
 def _finding(code: str, severity: str, message: str, *, unit: str | None = None,
