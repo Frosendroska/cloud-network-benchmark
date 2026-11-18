@@ -550,8 +550,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 raise
             self.guest_outcome = outcome.model_dump_json()
             if self.full_native and getattr(self, "clock", None) is not None:
-                self.clock.elapsed = max(self.clock.elapsed,
-                    (outcome.guest_finished_at - NOW).total_seconds())
+                clock_advance = (outcome.guest_finished_at - self._now()).total_seconds()
+                if clock_advance > 0:
+                    self.clock.sleep(clock_advance)
             if self.full_native:
                 self._write_source_observed_receiver_logs(outcome)
             invocation = action.removeprefix("f09-guest-run-")
