@@ -747,7 +747,6 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             match = re.search(r"\[ -f (.+?) \] &&", request.argv[-1])
             assert match is not None, request.argv[-1]
             source = __import__("shlex").split(match.group(1))[0]
-            from pathlib import PurePosixPath
             relative = PurePosixPath(source).relative_to("/var/lib/cnb/results").as_posix()
             artifact_id = action.removeprefix("f02r-retrieve-observe-")
             role = "vm_b" if artifact_id.startswith("vm_b_") or artifact_id in {
@@ -759,7 +758,6 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         if action.startswith("f02r-retrieve-") and request.action_type == "scp":
             self.actions.append(action)
             remote = next(value for value in request.argv if ":/var/lib/cnb/results/" in value)
-            from pathlib import PurePosixPath
             role = "vm_a" if f"{self.public_a}:" in remote else "vm_b"
             local = self.results_roots[role] / PurePosixPath(remote.split(":",1)[1]).relative_to("/var/lib/cnb/results")
             Path(request.argv[-1]).write_bytes(local.read_bytes())
@@ -867,6 +865,38 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         with (root / "iperf3-server.jsonl").open("ab") as handle:
             handle.write(("\n".join(event_lines) + "\n").encode())
         (root / "iperf3-server.err").write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+
+
+
+@pytest.mark.parametrize(("relative", "allowed", "expected_exit"), [
+    ("metadata/vm_a.json", ["metadata/vm_a.json"], 0),
+    ("day/probe-chunk-000001.csv", ["day/{chunk_id}.csv"], 0),
+    ("day/probe-chunk-000001.txt", ["day/{chunk_id}.csv"], 6),
+])
+def test_fake_remote_inventory_preserves_literal_and_chunk_allowlist(
+        tmp_path, relative, allowed, expected_exit):
+    """The source-shaped responder applies chunk rules and still rejects undeclared files."""
+    from cloud_network_benchmark.contracts.execution import CommandRequest
+
+    runner = FakePreparedAwsRunner()
+    runner.results_roots = {"vm_a": tmp_path}
+    artifact = tmp_path / relative
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("synthetic native bytes\n", encoding="utf-8")
+    inventory = shlex.join(["python3", "-c", "pass", "/var/lib/cnb/results", "10000",
+        json.dumps(allowed), "900000000"])
+    request = CommandRequest(action_id="f09-inventory-fixture-vm_a", action_type="ssh",
+        argv=["ssh", shlex.join(["sh", "-c", inventory])], cwd=".", timeout_seconds=10)
+
+    result = runner.run(request)
+
+    assert result.exit_code == expected_exit
+    if expected_exit:
+        assert result.stderr == f"undeclared:{relative}"
+    else:
+        assert json.loads(result.stdout)["files"] == [{"path": relative,
+            "size_bytes": artifact.stat().st_size,
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}]
 
 
 def _cost_source(path: Path, run_id: str, cost_input_id: str, *, region: str = "eu-central-1") -> None:

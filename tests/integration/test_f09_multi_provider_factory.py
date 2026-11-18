@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -517,6 +518,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         from cloud_network_benchmark.contracts.admission import ScheduleEntry
         source_config = config
         config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
+        # Match the admitted five-second provision stage of this command-only fixture.
+        config_data["options"]["provisioning_timeout_seconds"] = 5
         base_campaign, _ = resolve_campaign(source_config, ROOT)
         if is_short_study or is_diagnostic_day:
             config_data["benchmark"]["common_n"] = _source_bound_test_common_n(
@@ -602,10 +605,14 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         SourceBuild(tool="iperf3", source_url="https://example.invalid/iperf3.tar.gz",
             source_reference="iperf3-src", archive_name="iperf3.tar.gz", source_sha256="b"*64)],
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
+    # Twelve 70-second probes include 1.1s receiver startup and 0.1s late
+    # signal delivery each, plus eleven protocol pauses: 964.4s, rounded up.
+    calibration_fixture_seconds = math.ceil(12 * (70 + 1.1 + .1) + 11 * 10)
+    assert calibration_fixture_seconds == 965
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
         "allowance": WorkflowAllowance(5, 5, 300, 60,
-            960 if is_calibration else 230 if is_short_study else 86412 if is_diagnostic_day else 80, 5, 10, 10,
+            calibration_fixture_seconds if is_calibration else 230 if is_short_study else 86412 if is_diagnostic_day else 80, 5, 10, 10,
             "synthetic-test-policy", {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
