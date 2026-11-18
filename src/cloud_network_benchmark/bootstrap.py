@@ -724,7 +724,7 @@ def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock
                 occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
     req = _request(f"f02r-{role}-prebuilt-transfer", vm,
         [bundle.path, f"{vm.user}@{vm.host}:{bundle_path}"],
-        min(connection.timeouts.command_seconds, remaining), action_type="scp")
+        min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
     result = _execute(runner, req); actions.append(_action(req.action_id, "scp", vm, req, result))
     if result.outcome != CommandOutcome.SUCCEEDED:
         return _failure_result(connection, actions, vm, req, result, "prebuilt_bundle_transfer_failed",

@@ -264,6 +264,7 @@ def test_actual_optional_bootstrap_request_has_typed_success_or_failure_without_
             return result(request.action_id)
 
     runner=Runner(); c=connection(tmp_path); now=datetime.now(timezone.utc)
+    c=c.model_copy(update={"timeouts":c.timeouts.model_copy(update={"command_seconds":9,"transfer_seconds":7})})
     deadline=RemoteDeadline(readiness_deadline_monotonic=200,overall_deadline_monotonic=300,
         cleanup_reserve_seconds=10,cap_started_at=now,cap_expires_at=now+timedelta(minutes=5))
     builds=[]; actions=[]; listeners=[]
@@ -299,6 +300,9 @@ def test_actual_optional_bootstrap_request_has_typed_success_or_failure_without_
         assert failure is not None and failure.failure.category=="prebuilt_bundle_verification_failed" and not builds
     installer=next(r for r in runner.requests if r.action_id.endswith("prebuilt-verify-install"))
     assert "python3 -c" in " ".join(installer.argv)
+    transfer=next(r for r in runner.requests if r.action_id.endswith("prebuilt-transfer"))
+    assert transfer.action_type=="scp" and transfer.timeout_seconds==7
+    assert installer.timeout_seconds==9
     assert not any("sockperf-0" in r.action_id or "iperf3-0" in r.action_id for r in runner.requests)
 
 
