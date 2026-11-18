@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import re
 from dataclasses import replace
 from copy import deepcopy
 from datetime import datetime, timezone
