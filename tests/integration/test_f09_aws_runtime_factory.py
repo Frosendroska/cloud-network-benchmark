@@ -349,8 +349,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.2.0")
                 archive_path = f"/var/lib/cnb/work/{tool}.tar.gz"
                 binary_path = f"/var/lib/cnb/install/bin/{tool}"
+                configure_options = " --disable-shared" if tool == "iperf3" else ""
                 build_configuration = (f"CC=${{CC:-cc}}; compiler={observed.compiler_version}; "
-                    "./configure --prefix=/var/lib/cnb/install; make -j2")
+                    f"./configure --prefix=/var/lib/cnb/install{configure_options}; make -j2")
                 identity = "\n".join(("CNB_BUILD_V1", f"tool={tool}",
                     f"source_reference={observed.source_reference}", f"source_sha256={observed.source_sha256}",
                     f"upstream_commit={observed.upstream_commit}", f"patch_path={observed.patch_path}",
