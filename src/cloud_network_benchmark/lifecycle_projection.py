@@ -10,6 +10,8 @@ from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Mapping
 
+from .contracts.artifacts import resolve_artifact_path
+
 
 def _failure(message: str, occurred_at: datetime, category: str) -> Any:
     from .contracts.common import FailureEvidence
