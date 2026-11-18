@@ -171,6 +171,64 @@ def _finding(code: str, severity: str, message: str, *, unit: str | None = None,
                              unit_id=unit, artifact_id=artifact)
 
 
+def _replayed_iperf3_control_association(value: ValidatorInput
+        ) -> tuple[dict[str, Any] | None, set[tuple[int, str]]]:
+    """Trust event association only when its declared controller bytes replay exactly."""
+    declaration = value.artifacts.get("iperf3_control_evidence")
+    controls = [item for item in value.artifact_records if item.artifact_id == "iperf3_control_evidence"]
+    if (declaration is None or declaration.path != "metadata/iperf3-control-evidence.json"
+            or declaration.kind != "iperf3-control-evidence" or declaration.producer != "controller"
+            or len(controls) != 1):
+        return None, set()
+    record = controls[0]
+    if (record.producer != "controller" or record.unit_id is not None
+            or record.deployment_id != value.identity.deployment_id
+            or record.path != declaration.path or record.kind != declaration.kind
+            or record.retrieval_state != "verified" or record.closed is not True):
+        return None, set()
+    try:
+        root = Path(value.child_result_root)
+        record.verify_materialized_file(root)
+        raw_control = _artifact_path(value, record).read_bytes()
+        payload = json.loads(raw_control)
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None, set()
+    structured = value.iperf3_control_evidence.value
+    if (not isinstance(payload, dict) or not isinstance(structured, dict) or payload != structured
+            or payload.get("schema_version") != 1 or payload.get("run_id") != value.identity.run_id
+            or payload.get("deployment_id") != value.identity.deployment_id or payload.get("vm_role") != "vm_b"):
+        return None, set()
+    vm_a_host, vm_b_host, private_b = (payload.get("vm_a_host_id"), payload.get("vm_b_host_id"),
+        payload.get("private_ipv4_b"))
+    if not all(isinstance(item, str) and item for item in (vm_a_host, vm_b_host, private_b)):
+        return None, set()
+    listeners = [command for command in value.commands
+        if command.request.get("action_id") == "f02r-vm_b-listener-iperf3"
+        and command.producer == "vm_b"]
+    if len(listeners) != 1 or not _f02r_iperf_listener(listeners[0],
+            [str(item) for item in listeners[0].request.get("argv", [])]):
+        return None, set()
+    argv = [str(item) for item in listeners[0].request.get("argv", [])]
+    offset = 1 if argv[:1] == ["sudo"] else 0
+    binary_indexes = [index for index, item in enumerate(argv) if item.endswith("/bin/iperf3")]
+    if (len(binary_indexes) != 1 or _option(argv[binary_indexes[0] + 1:], "-B") != private_b
+            or listeners[0].source_identity.value != payload.get("source", {}).get("source_reference")):
+        return None, set()
+    try:
+        from .lifecycle_projection import _iperf3_control_event_association
+        association, suppressions = _iperf3_control_event_association(root,
+            value.artifact_records, payload, vm_a_host_id=vm_a_host,
+            vm_b_host_id=vm_b_host, private_ipv4_b=private_b,
+            stdout_path=payload.get("iperf3_stdout_path"))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None, set()
+    if payload.get("readiness", {}).get("event_association") != association:
+        return None, set()
+    if association.get("status") != "verified":
+        return association, set()
+    return association, suppressions
+
+
 def _sha(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -641,7 +699,8 @@ def _option_values(argv: list[str], name: str) -> list[str]:
 
 
 def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str | None], Any],
-                verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> tuple[NativeParse, NativeParse | None]:
+                verified_iperf_origins: dict[str, dict[str, Any]] | None = None,
+                control_suppressions: set[tuple[int, str]] | None = None) -> tuple[NativeParse, NativeParse | None]:
     csv_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-csv"), None)
     log_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-log"), None)
     tcp_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "iperf3-json"), None)
@@ -681,6 +740,13 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
     if server_record:
         try:
             receiver = parse_iperf3(_artifact_path(value, server_record), source=_source(server_record, value), format="jsonl")
+            if control_suppressions:
+                def source_control_finding(item: Any) -> bool:
+                    match = re.match(r"line ([0-9]+):", item.message)
+                    return (item.artifact_id == server_record.artifact_id and match is not None
+                        and (int(match.group(1)), item.code) in control_suppressions)
+                receiver = replace(receiver, findings=tuple(item for item in receiver.findings
+                    if not source_control_finding(item)))
             receiver = _receiver_session_for_unit(value, unit, receiver, verified_iperf_origins or {})
             if tcp is not None:
                 client_stats, receiver_stats = _tcp_statistics(tcp), _tcp_statistics(receiver)
@@ -1482,6 +1548,14 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     findings, records, provenance = _validate_artifacts(value)
     findings.extend(_validate_materialized_records(value, records))
     findings.extend(_validate_manifests(value))
+    control_association, control_suppressions = _replayed_iperf3_control_association(value)
+    if control_association is not None and control_association.get("status") == "verified":
+        for name in ("readiness_cookie", "server_interrupt"):
+            row = control_association[name]
+            findings.append(_finding(f"control.iperf3.{name}", "info",
+                f"{row['classification']} in closed VM B log bytes {row['byte_start']}:{row['byte_end']} "
+                f"(lines {row['error_line']}-{row['end_line']}); source SHA-256 {control_association['raw_sha256']}",
+                artifact=control_association["artifact_id"]))
     resolved_findings, resolved_obj = _resolved_snapshot_findings(value)
     findings.extend(resolved_findings)
     findings.extend(_command_findings(value))
@@ -1503,9 +1577,9 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     for unit in value.measurement_units:
         unit_origins = verified_origins_by_unit.get(unit.unit_id, {})
         if unit_origins:
-            sock, tcp = _parse_unit(value, unit, records, unit_origins)
+            sock, tcp = _parse_unit(value, unit, records, unit_origins, control_suppressions)
         else:
-            sock, tcp = _parse_unit(value, unit, records)
+            sock, tcp = _parse_unit(value, unit, records, control_suppressions=control_suppressions)
         if value.mode in {ExperimentMode.ACCEPTANCE, ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION}:
             parsed_sock[unit.unit_id] = NativeParse(probe_counts=sock.probe_counts, findings=sock.findings,
                 source=sock.source, sessions=sock.sessions)

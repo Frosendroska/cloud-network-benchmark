@@ -574,7 +574,10 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 logs = root / "server-logs"
                 logs.mkdir(parents=True, exist_ok=True)
                 (logs / "sockperf.log").write_text("Sockperf listener captured by offline source fixture\n", encoding="utf-8")
-                (logs / "iperf3-server.jsonl").write_text(json.dumps({"event":"server_listening","data":{}})+"\n", encoding="utf-8")
+                (logs / "iperf3-server.jsonl").write_text(
+                    json.dumps({"event":"error","data":"error - unable to receive cookie at server: "})+"\n"+
+                    json.dumps({"event":"end","data":{}})+"\n"+
+                    json.dumps({"event":"server_listening","data":{}})+"\n", encoding="utf-8")
                 (logs / "iperf3-server.err").write_text("No server stderr bytes in offline fixture.\n", encoding="utf-8")
             from cloud_network_benchmark.contracts.measurements import VmMetadata, DiagnosticSample, ClockMapping
             metadata_path = root / "metadata" / f"{role}.json"
@@ -637,10 +640,30 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     path.touch(exist_ok=True)
                 identities.append([path.stat().st_dev, path.stat().st_ino])
             unit = f"cnb-{self.deployment_id}-{tool}"
+            identity = {"pid":32000,"start_ticks":1234,
+                "boot_id":"12345678-1234-4234-8234-123456789abc",
+                "cgroup":f"/system.slice/{unit}.service","log_ids":identities}
+            if tool == "iperf3" and self.full_native:
+                data = files[0].read_bytes()
+                identity["pre_stop_prefix"] = {"available":True,"boundary":"pre_stop",
+                    "deployment_id":self.deployment_id,"controller_session_id":"fake-session",
+                    "listener_invocation_id":"f02r-vm_b-listener-iperf3","unit":unit,
+                    "pid":32000,"start_ticks":1234,"boot_id":identity["boot_id"],
+                    "cgroup":identity["cgroup"],
+                    "log_path":"/var/lib/cnb/results/server-logs/iperf3-server.jsonl",
+                    "log_ids":identities,"prefix_bytes":len(data),
+                    "prefix_sha256":hashlib.sha256(data).hexdigest(),"captured_at_utc":self._now().isoformat()}
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"pid":32000,"start_ticks":1234,
-                    "boot_id":"12345678-1234-4234-8234-123456789abc",
-                    "cgroup":f"/system.slice/{unit}.service","log_ids":identities}),stderr="")
+                    **{key:value for key,value in identity.items() if key != "pid"}}),stderr="")
+        if action.startswith("f09-listener-stop-") and action.endswith("-iperf3"):
+            self.actions.append(action)
+            log = self.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
+            with log.open("ab") as handle:
+                handle.write((json.dumps({"event":"error","data":"interrupt - the server has terminated"})+"\n"+
+                    json.dumps({"event":"end","data":{}})+"\n").encode())
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
+                duration_seconds=0,exit_code=0,stdout="",stderr="")
         if action.startswith("f09-listener-closed-files-"):
             self.actions.append(action)
             closed = self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)
@@ -710,6 +733,23 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             timestamp = (self._now() + timedelta(seconds=self.current_elapsed)).isoformat(timespec="microseconds").replace("+00:00", "Z")
             return CommandResult(action_id=action, outcome="succeeded", started_at=self._now(),
                 finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
+        if action.startswith("f09-iperf3-control-prefix-measure-"):
+            self.actions.append(action)
+            log = self.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
+            err = log.parent / "iperf3-server.err"
+            data = log.read_bytes()
+            unit = f"cnb-{self.deployment_id}-iperf3"
+            snapshot = {"boundary":"pre_measure","deployment_id":self.deployment_id,
+                "controller_session_id":"fake-session","listener_invocation_id":"f02r-vm_b-listener-iperf3",
+                "unit":unit,"pid":32000,"start_ticks":1234,
+                "boot_id":"12345678-1234-4234-8234-123456789abc",
+                "cgroup":f"/system.slice/{unit}.service",
+                "log_path":"/var/lib/cnb/results/server-logs/iperf3-server.jsonl",
+                "log_ids":[[log.stat().st_dev,log.stat().st_ino],[err.stat().st_dev,err.stat().st_ino]],
+                "prefix_bytes":len(data),"prefix_sha256":hashlib.sha256(data).hexdigest(),
+                "captured_at_utc":self._now().isoformat()}
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
+                duration_seconds=0,exit_code=0,stdout=json.dumps({"snapshot":snapshot}),stderr="")
         return super().run(request)
 
     def _write_source_observed_receiver_logs(self, outcome):
@@ -778,7 +818,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                         "remote_host": self.private_a, "remote_port": str(50100 + i),
                         "interval_start_us": start, "interval_end_us": end, "bytes": count,
                         "omitted": omitted}, separators=(",", ":")))
-        (root / "iperf3-server.jsonl").write_text("\n".join(event_lines) + "\n", encoding="utf-8")
+        with (root / "iperf3-server.jsonl").open("ab") as handle:
+            handle.write(("\n".join(event_lines) + "\n").encode())
         (root / "iperf3-server.err").write_text("\n".join(source_lines) + "\n", encoding="utf-8")
 
 

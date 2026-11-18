@@ -54,10 +54,12 @@ def _read(tmp_path, records):
         stderr_path="/var/lib/cnb/results/server-logs/iperf3-server.err")
 
 
-def test_verified_control_evidence_requires_bound_identity_readiness_and_owned_closure(tmp_path):
+def test_legacy_control_evidence_without_prefix_proof_remains_unavailable(tmp_path):
     payload = _payload()
     record = _record(tmp_path, payload)
-    assert _read(tmp_path, [record]) == payload
+    # Older controller snapshots describe readiness and closure but cannot
+    # associate native error/end pairs with those boundaries.
+    assert _read(tmp_path, [record]) is None
     assert _read(tmp_path, []) is None
     assert _read(tmp_path,
         [record.model_copy(update={"deployment_id": "other-deployment"})]) is None

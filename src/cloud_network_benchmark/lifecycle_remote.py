@@ -32,6 +32,7 @@ class _Attempt:
     retrieval: Any = None
     f03_process_record: dict[str, Any] | None = None
     f03_process_absent_at: datetime | None = None
+    iperf3_control_pre_measure: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     from .diagnostics import _declarations
     from .diagnostics import build_collection_context
     from .lifecycle_adapters import (RemoteStages,
-        guest_duration, inventory_remote_workspace, prepare_remote_pair,
+        capture_iperf3_control_prefix, guest_duration, inventory_remote_workspace, prepare_remote_pair,
         run_remote_f03, start_remote_diagnostics, stop_remote_diagnostics,
         stop_vm_b_listeners)
     from .lifecycle_bundle import (build_remote_closed_inventory, lifecycle_declarations,
@@ -329,6 +330,17 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 build_observations=[build.model_dump(mode="json") for build in builds],
                 receiver_command_evidence=[command.model_dump(mode="json") for command in receiver_commands],
                 source_artifact_records=[])
+            iperf_listener = next((listener for listener in bootstrap.listeners
+                if listener.tool == "iperf3" and listener.state == "active"), None)
+            if iperf_listener is not None:
+                item.iperf3_control_pre_measure = capture_iperf3_control_prefix(connection,
+                    iperf_listener, controller_session_id=ledger.controller_session_id,
+                    runner=runner, deadline=item.deadline,
+                    active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
+                    clock=clock.monotonic)
+            else:
+                item.iperf3_control_pre_measure = {"available": False,
+                    "reason": "prepared iperf3 listener identity is unavailable"}
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
                 active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
@@ -339,7 +351,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at
             item.guest = __import__("dataclasses").replace(item.guest,
-                receiver_command_evidence=tuple(receiver_commands), diagnostics=dict(item.diagnostics))
+                receiver_command_evidence=tuple(receiver_commands), diagnostics=dict(item.diagnostics),
+                iperf3_control_pre_measure=item.iperf3_control_pre_measure or {})
             item.measurement_ended_at = (item.guest.outcome.guest_finished_at
                 if item.guest.outcome is not None else after_utc)
             return ProviderStageOutcome("measure", item.guest.outcome is not None
@@ -373,6 +386,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if item.listener_closure is None or not item.listener_closure.closed or item.listener_closure.failures:
                 item.listener_closure = stop_vm_b_listeners(item.connection, runner=runner,
                     results_workspace=runtime["access"]["bootstrap"].results_workspace,
+                    controller_session_id=ledger.controller_session_id,
                     deadline=item.deadline, clock=clock.monotonic)
             closures = item.closures or {}
             measurement_closed_at = (item.guest.outcome.guest_finished_at if item.guest and item.guest.outcome
@@ -499,7 +513,10 @@ def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException)
     from .lifecycle_adapters import RemoteDiagnosticsStartError
     from .orchestration import ProviderStageOutcome
     evidence = {"failure": f"{type(error).__name__}: remote measurement handoff failed",
-        "diagnostics": attempt.diagnostics if attempt is not None else {}}
+        "diagnostics": attempt.diagnostics if attempt is not None else {},
+        "iperf3_control_pre_measure": (attempt.iperf3_control_pre_measure
+            if attempt is not None and attempt.iperf3_control_pre_measure is not None
+            else {"available": False, "reason": "measurement boundary was not captured"})}
     if isinstance(error, RemoteDiagnosticsStartError):
         evidence["startup_failure"] = error.safe_reason
         evidence["actions"] = error.actions

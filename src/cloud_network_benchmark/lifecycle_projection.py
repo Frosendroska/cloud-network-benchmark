@@ -385,6 +385,7 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
     control_declaration = by_id.get("iperf3_control_evidence")
     if control_declaration is not None:
         prepared = getattr(_outcome(result, "prepare"), "evidence", None)
+        measured = getattr(_outcome(result, "measure"), "evidence", None)
         close = getattr(_outcome(result, "close"), "evidence", None)
         deployment = getattr(result, "values", {}).get("create")
         readiness = prepared.get("readiness") if isinstance(prepared, Mapping) else None
@@ -423,6 +424,15 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
             if "private-tcp" in action_id(item)]
         listener_actions = [action_row(item) for item in (getattr(listeners, "actions", ()) or ())
             if "iperf3" in action_id(item)]
+        measure_actions = [action_row(item) for item in (getattr(measured, "actions", ()) or ())
+            if "guest-run" in action_id(item) or "guest-outcome" in action_id(item)]
+        pre_measure = (getattr(measured, "iperf3_control_pre_measure", None)
+            if not isinstance(measured, Mapping) else measured.get("iperf3_control_pre_measure"))
+        pre_measure = pre_measure if isinstance(pre_measure, Mapping) else {}
+        pre_measure_snapshot = pre_measure.get("snapshot") if isinstance(pre_measure.get("snapshot"), Mapping) else None
+        pre_measure_action = pre_measure.get("action")
+        source_build = next((item for item in (getattr(bootstrap, "builds", ()) or ())
+            if getattr(item, "role", None) == "vm_b" and getattr(item, "tool", None) == "iperf3"), None)
         observations = getattr(listeners, "observations", {}) or {}
         iperf_observation = observations.get("iperf3") if isinstance(observations, Mapping) else None
         evidence = {"schema_version": 1, "run_id": child.run_id,
@@ -434,6 +444,22 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
             "readiness": {"ready": getattr(readiness, "ready", None), "actions": ready_actions,
                 "deployment_id": getattr(bootstrap, "deployment_id", None),
                 "event_association": "unavailable: native log boundary offsets were not captured"},
+            "controller_session_id": (pre_measure_snapshot.get("controller_session_id")
+                if pre_measure_snapshot else None),
+            "source": ({"tool": "iperf3", "binary_version": source_build.binary_version,
+                "source_reference": source_build.source_reference,
+                "source_sha256": source_build.source_sha256,
+                "binary_sha256": source_build.binary_sha256,
+                "upstream_commit": source_build.upstream_commit,
+                "patch_path": source_build.patch_path,
+                "patch_sha256": source_build.patch_sha256,
+                "observation_semantics": source_build.observation_semantics,
+                "observation_capability": source_build.observation_capability}
+                if source_build is not None else None),
+            "pre_measure": {"available": pre_measure.get("available") is True,
+                "snapshot": pre_measure_snapshot,
+                "action": action_row(pre_measure_action) if pre_measure_action is not None else None},
+            "measure_actions": measure_actions,
             "listener": {"closed": getattr(listeners, "closed", None),
                 "closed_at": getattr(listeners, "closed_at", None).isoformat()
                     if getattr(listeners, "closed_at", None) else None,
@@ -441,7 +467,14 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
                     if isinstance(close, Mapping) and isinstance(close.get("measurement_ended_at"), datetime) else None),
                 "failures": list(getattr(listeners, "failures", ()) or ()),
                 "iperf3_owner_and_log_identity": iperf_observation,
+                "pre_stop_prefix": (iperf_observation.get("pre_stop_prefix")
+                    if isinstance(iperf_observation, Mapping) else None),
                 "actions": listener_actions}}
+        association, _ = _iperf3_control_event_association(root,
+            list(child.artifact_records) + _records_from(result), evidence,
+            vm_a_host_id=vm_a_host, vm_b_host_id=vm_b_host,
+            private_ipv4_b=private_ipv4_b, stdout_path=evidence["iperf3_stdout_path"])
+        evidence["readiness"]["event_association"] = association
         payload = (json.dumps(evidence, sort_keys=True, indent=2, default=str) + "\n").encode()
         record = _controller_record(root, child.deployment_id, control_declaration, payload)
         if record is not None:
@@ -551,13 +584,16 @@ def _verified_iperf3_control_evidence(root: Path, child: Any, records: list[Any]
             or not required_actions.issubset(successful_rows)
             or stop_row.get("remote_command") != f"sudo systemctl stop cnb-{child.deployment_id}-iperf3"
             or not isinstance(closed_at, str) or not isinstance(measurement_ended_at, str)
-            or not _ordered_utc(measurement_ended_at, closed_at)
             or not _ordered_utc(stop_row.get("started_at"), stop_row.get("finished_at"))
-            or not _ordered_utc(stop_row.get("finished_at"), closed_at)
             or not _ordered_utc(owner.get("closed_at_utc"), closed_at)
             or any(path not in str(row.get("remote_command", ""))
                 for row in (owner_row, close_row) for path in (stdout_path, stderr_path))
             or not _valid_owned_log_identity(owner, child.deployment_id)):
+        return None
+    association, _ = _iperf3_control_event_association(root, records, payload,
+        vm_a_host_id=vm_a_host_id, vm_b_host_id=vm_b_host_id,
+        private_ipv4_b=private_ipv4_b, stdout_path=stdout_path)
+    if readiness.get("event_association") != association:
         return None
     return payload
 
@@ -584,6 +620,203 @@ def _valid_owned_log_identity(owner: Mapping[str, Any], deployment_id: str) -> b
             and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in row)
             for row in ids) and ids[0] != ids[1]
         and isinstance(owner.get("closed_at_utc"), str))
+
+
+def _iperf3_control_event_association(root: Path, records: list[Any], payload: Mapping[str, Any],
+        *, vm_a_host_id: str | None = None, vm_b_host_id: str | None = None,
+        private_ipv4_b: str | None = None, stdout_path: str | None = None
+        ) -> tuple[dict[str, Any], set[tuple[int, str]]]:
+    """Replay exact listener-prefix snapshots against the closed raw server log."""
+    unavailable = lambda: ({"status": "unavailable",
+        "reason": "closed-log, owner, source, or boundary proof is incomplete"}, set())
+    try:
+        ready = payload["readiness"]
+        listener = payload["listener"]
+        pre_measure = payload["pre_measure"]
+        pre = pre_measure["snapshot"]
+        owner = listener["iperf3_owner_and_log_identity"]
+        post = listener["pre_stop_prefix"]
+        session = payload["controller_session_id"]
+        deployment = payload["deployment_id"]
+        source = payload["source"]
+        if (pre_measure.get("available") is not True or not isinstance(pre, Mapping)
+                or not isinstance(post, Mapping) or post.get("available") is not True
+                or not isinstance(owner, Mapping) or not isinstance(source, Mapping)
+                or not isinstance(session, str) or not session or not deployment):
+            return unavailable()
+        if (source.get("tool") != "iperf3" or source.get("binary_version") != "3.17.1"
+                or source.get("observation_capability") != "CNB_ACQ_V1"
+                or source.get("observation_semantics") != "iperf-3.17.1-stats-v1"):
+            return unavailable()
+        fields = ("deployment_id", "controller_session_id", "listener_invocation_id", "unit",
+            "pid", "start_ticks", "boot_id", "cgroup", "log_path", "log_ids")
+        if any(pre.get(key) != post.get(key) for key in fields):
+            return unavailable()
+        if (pre.get("deployment_id") != deployment or pre.get("controller_session_id") != session
+                or pre.get("listener_invocation_id") != f"f02r-vm_b-listener-iperf3"
+                or pre.get("unit") != f"cnb-{deployment}-iperf3"
+                or pre.get("log_path") != stdout_path or pre.get("log_path") != post.get("log_path")
+                or (vm_a_host_id is not None and payload.get("vm_a_host_id") != vm_a_host_id)
+                or (vm_b_host_id is not None and payload.get("vm_b_host_id") != vm_b_host_id)
+                or (private_ipv4_b is not None and payload.get("private_ipv4_b") != private_ipv4_b)):
+            return unavailable()
+        for snap in (pre, post):
+            count, digest = snap.get("prefix_bytes"), snap.get("prefix_sha256")
+            ids = snap.get("log_ids")
+            if (isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 65536
+                    or not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+                    or not isinstance(ids, list) or len(ids) != 2):
+                return unavailable()
+            if any(not isinstance(pair, list) or len(pair) != 2
+                    or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in pair)
+                    for pair in ids):
+                return unavailable()
+        if pre["prefix_bytes"] > post["prefix_bytes"]:
+            return unavailable()
+        if (owner.get("pid") != pre.get("pid") or owner.get("start_ticks") != pre.get("start_ticks")
+                or owner.get("boot_id") != pre.get("boot_id") or owner.get("cgroup") != pre.get("cgroup")
+                or owner.get("log_ids") != pre.get("log_ids")):
+            return unavailable()
+
+        log_rows = [item for item in records if item.artifact_id == "iperf3_server_log"]
+        build_rows = [item for item in records if item.artifact_id == "f02r-vm_b-iperf3-build"]
+        if len(log_rows) != 1 or len(build_rows) != 1:
+            return unavailable()
+        log_record, build_record = log_rows[0], build_rows[0]
+        if (log_record.path != stdout_path or log_record.producer != "vm_b"
+                or log_record.kind != "iperf3-server-jsonl" or log_record.unit_id is not None
+                or log_record.retrieval_state != "verified" or log_record.closed is not True
+                or build_record.producer != "vm_b" or build_record.kind != "build-identity"
+                or build_record.retrieval_state != "verified" or build_record.closed is not True):
+            return unavailable()
+        log_record.verify_materialized_file(root)
+        build_record.verify_materialized_file(root)
+        raw = resolve_artifact_path(root, log_record.path).read_bytes()
+        from .acquisition import _parse_build_identity
+        build = _parse_build_identity(resolve_artifact_path(root, build_record.path).read_bytes())
+        source_fields = ("source_reference", "source_sha256", "upstream_commit", "patch_path",
+            "patch_sha256", "observation_capability", "observation_semantics")
+        if any(source.get(key) != build.get(key) for key in source_fields):
+            return unavailable()
+        if (build.get("tool") != "iperf3" or build.get("binary_version") != "3.17.1"
+                or source.get("binary_version") != build.get("binary_version")
+                or source.get("binary_sha256") != build.get("binary_sha256")
+                or build.get("observation_semantics") != "iperf-3.17.1-stats-v1"):
+            return unavailable()
+        for snap in (pre, post):
+            size = snap["prefix_bytes"]
+            prefix = raw[:size]
+            if (len(prefix) != size or (prefix and not prefix.endswith(b"\\n"))
+                    or hashlib.sha256(prefix).hexdigest() != snap["prefix_sha256"]):
+                return unavailable()
+        if post["prefix_bytes"] > len(raw):
+            return unavailable()
+
+        by_line: list[tuple[int, int, int, Mapping[str, Any]]] = []
+        offset = 0
+        for line_number, line in enumerate(raw.splitlines(keepends=True), 1):
+            end = offset + len(line)
+            try:
+                item = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                item = None
+            if isinstance(item, Mapping):
+                by_line.append((line_number, offset, end, item))
+            offset = end
+        def pairs(message: str) -> list[tuple[int, int, int, int]]:
+            found = []
+            for index, row in enumerate(by_line[:-1]):
+                line, start, _end, event = row
+                next_line, _next_start, pair_end, ending = by_line[index + 1]
+                if (next_line == line + 1 and event.get("event") == "error"
+                        and event.get("data") == message and ending.get("event") == "end"
+                        and ending.get("data") == {}):
+                    found.append((line, start, next_line, pair_end))
+            return found
+        readiness_pairs = pairs("error - unable to receive cookie at server: ")
+        stop_pairs = pairs("interrupt - the server has terminated")
+        error_counts = {message: sum(item.get("event") == "error" and item.get("data") == message
+            for _line, _start, _end, item in by_line)
+            for message in ("error - unable to receive cookie at server: ",
+                "interrupt - the server has terminated")}
+        empty_end_count = sum(item.get("event") == "end" and item.get("data") == {}
+            for _line, _start, _end, item in by_line)
+        if (len(readiness_pairs) != 1 or len(stop_pairs) != 1
+                or any(count != 1 for count in error_counts.values()) or empty_end_count != 2
+                or readiness_pairs[0][3] > pre["prefix_bytes"]
+                or stop_pairs[0][1] < post["prefix_bytes"]):
+            return unavailable()
+
+        pre_action = pre_measure.get("action")
+        measure_actions = payload.get("measure_actions")
+        dispatch = [item for item in measure_actions if isinstance(item, Mapping)
+            and item.get("action_id", "").startswith("f09-guest-run-")]
+        measurement_receipts = [item for item in measure_actions if isinstance(item, Mapping)
+            and item.get("action_id", "").startswith("f09-guest-outcome-")]
+        ready_actions = [item for item in ready.get("actions", ()) if isinstance(item, Mapping)
+            and item.get("action_id", "").startswith("f02r-ready-private-tcp-")
+            and item.get("role") == "vm_a" and item.get("vm_id") == payload.get("vm_a_host_id")
+            and item.get("action_type") == "ssh" and item.get("outcome") == "succeeded"
+            and item.get("exit_code") == 0
+            and item.get("remote_command") == f"nc -z -w 1 {payload.get('private_ipv4_b')} 5201"]
+        close_actions = listener.get("actions", ())
+        action_map = {item.get("action_id"): item for item in close_actions if isinstance(item, Mapping)}
+        ready_row = ready_actions[0] if len(ready_actions) == 1 else {}
+        stop_row = action_map.get(f"f09-listener-stop-{deployment}-iperf3", {})
+        owner_row = action_map.get(f"f09-listener-owner-process-{deployment}-iperf3", {})
+        closed_row = action_map.get(f"f09-listener-closed-files-{deployment}-iperf3", {})
+        snapshot_action = pre_action if isinstance(pre_action, Mapping) else {}
+        owner_close_command = str(closed_row.get("remote_command", ""))
+        same_owner_tokens = [str(pre["pid"]), str(pre["start_ticks"]), str(pre["boot_id"]),
+            str(pre["cgroup"]), *(str(value) for pair in pre["log_ids"] for value in pair),
+            str(pre["log_path"]), str(payload.get("iperf3_stderr_path"))]
+        if (len(dispatch) != 1 or len(measurement_receipts) != 1 or len(ready_actions) != 1
+                or snapshot_action.get("action_id") != f"f09-iperf3-control-prefix-measure-{deployment}"
+                or snapshot_action.get("role") != "vm_b" or snapshot_action.get("vm_id") != payload.get("vm_b_host_id")
+                or snapshot_action.get("outcome") != "succeeded" or snapshot_action.get("exit_code") != 0
+                or snapshot_action.get("action_type") != "ssh"
+                or payload.get("iperf3_stdout_path") not in str(snapshot_action.get("remote_command", ""))
+                or payload.get("iperf3_stderr_path") not in str(snapshot_action.get("remote_command", ""))
+                or str(pre.get("controller_session_id")) not in str(snapshot_action.get("remote_command", ""))
+                or str(pre.get("unit")) not in str(snapshot_action.get("remote_command", ""))
+                or dispatch[0].get("role") != "vm_a" or dispatch[0].get("vm_id") != payload.get("vm_a_host_id")
+                or dispatch[0].get("action_type") != "ssh" or dispatch[0].get("outcome") != "succeeded"
+                or dispatch[0].get("exit_code") != 0
+                or measurement_receipts[0].get("role") != "vm_a"
+                or measurement_receipts[0].get("vm_id") != payload.get("vm_a_host_id")
+                or measurement_receipts[0].get("action_type") != "scp"
+                or measurement_receipts[0].get("outcome") != "succeeded"
+                or measurement_receipts[0].get("exit_code") != 0
+                or any(token not in owner_close_command for token in same_owner_tokens)):
+            return unavailable()
+        for row in (ready_row, snapshot_action, dispatch[0], measurement_receipts[0], owner_row, stop_row, closed_row):
+            if row.get("outcome") != "succeeded" or row.get("exit_code") != 0:
+                return unavailable()
+        if (not _ordered_utc(ready_row.get("finished_at"), snapshot_action.get("started_at"))
+                or not _ordered_utc(snapshot_action.get("finished_at"), dispatch[0].get("started_at"))
+                or not _ordered_utc(dispatch[0].get("finished_at"), measurement_receipts[0].get("started_at"))
+                or not _ordered_utc(measurement_receipts[0].get("finished_at"), owner_row.get("started_at"))
+                or not _ordered_utc(owner_row.get("finished_at"), stop_row.get("started_at"))
+                or not _ordered_utc(stop_row.get("finished_at"), closed_row.get("started_at"))
+                or not _ordered_utc(closed_row.get("started_at"), closed_row.get("finished_at"))):
+            return unavailable()
+        association = {"status": "verified", "artifact_id": log_record.artifact_id,
+            "path": log_record.path, "raw_sha256": log_record.sha256.value,
+            "readiness_cookie": {"classification": "readiness probe rejected by listener",
+                "error_line": readiness_pairs[0][0], "end_line": readiness_pairs[0][2],
+                "byte_start": readiness_pairs[0][1], "byte_end": readiness_pairs[0][3],
+                "prefix_bytes": pre["prefix_bytes"], "prefix_sha256": pre["prefix_sha256"]},
+            "server_interrupt": {"classification": "owned listener stop",
+                "error_line": stop_pairs[0][0], "end_line": stop_pairs[0][2],
+                "byte_start": stop_pairs[0][1], "byte_end": stop_pairs[0][3],
+                "prefix_bytes": post["prefix_bytes"], "prefix_sha256": post["prefix_sha256"]}}
+        suppressions = {(readiness_pairs[0][0], "native.iperf3.error"),
+            (readiness_pairs[0][2], "native.iperf3.event"),
+            (stop_pairs[0][0], "native.iperf3.error"),
+            (stop_pairs[0][2], "native.iperf3.event")}
+        return association, suppressions
+    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
+        return unavailable()
 
 
 def _include_guest_outcome_source(declarations: list[Any], remote: Any) -> list[Any]:

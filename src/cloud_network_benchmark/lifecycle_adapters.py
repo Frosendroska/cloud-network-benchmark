@@ -40,6 +40,7 @@ class RemoteGuestExecution:
     receiver_command_evidence: tuple[Any, ...] = ()
     outcome_source_bytes: bytes | None = None
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    iperf3_control_pre_measure: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class RemoteListenerClosure:
     role: str
     closed: bool
     closed_at: datetime | None
-    observations: Mapping[str, Mapping[str, str]]
+    observations: Mapping[str, Mapping[str, Any]]
     actions: tuple[Any, ...]
     failures: tuple[str, ...] = ()
 
@@ -97,6 +98,98 @@ class RemoteFileInventory:
     files: tuple[Mapping[str, Any], ...]
     actions: tuple[Any, ...]
     failures: tuple[str, ...] = ()
+
+
+def capture_iperf3_control_prefix(connection: Any, listener: Any, *, controller_session_id: str,
+        runner: Any, deadline: Any, active_deadline_monotonic: float | None = None,
+        clock: Callable[[], float] = __import__("time").monotonic
+        ) -> dict[str, Any]:
+    """Capture one bounded, owner-bound prefix of VM B's iperf3 server log."""
+    from .access import _action, _execute, _request
+    from .contracts.common import CommandOutcome
+
+    action_id = f"f09-iperf3-control-prefix-measure-{connection.deployment_id}"
+    remaining = deadline.remaining(clock)
+    if active_deadline_monotonic is not None:
+        remaining = min(remaining, active_deadline_monotonic - clock())
+    if remaining <= 0:
+        return {"available": False, "reason": "measurement deadline exhausted before log-prefix snapshot"}
+    source = "\n".join((
+        "import datetime,hashlib,json,os,pathlib,re,shlex,stat,subprocess,sys",
+        "unit,binary,address,out_path,err_path,session,deployment,invocation=sys.argv[1:9]",
+        "limit=65536",
+        "def run(args):",
+        " r=subprocess.run(args,check=True,capture_output=True,text=True,timeout=8)",
+        " return r.stdout",
+        "show=run(['systemctl','show',unit,'--property=LoadState,ActiveState,MainPID,ControlGroup,StandardOutput,StandardError,ExecStart,Environment'])",
+        "fields=dict(line.split('=',1) for line in show.splitlines() if '=' in line)",
+        "config=run(['systemctl','cat',unit])",
+        "expected_env='CNB_ACQUISITION_ID='+invocation",
+        "fields.get('LoadState')=='loaded' and fields.get('ActiveState')=='active' or sys.exit(2)",
+        "fields.get('StandardOutput')=='append' and fields.get('StandardError')=='append' or sys.exit(3)",
+        "expected_env in fields.get('Environment','') or sys.exit(4)",
+        "exec_match=re.search(r'argv\\[\\]=(.*?);',fields.get('ExecStart',''))",
+        "exec_match is not None and shlex.split(exec_match.group(1))==[binary,'-s','-B',address,'-p','5201','--json-stream','--forceflush'] or sys.exit(5)",
+        "effective={'StandardOutput':None,'StandardError':None}; section=None; effective_env=None",
+        "for raw in config.splitlines():",
+        " line=raw.strip()",
+        " if line.startswith('[') and line.endswith(']'): section=line[1:-1]; continue",
+        " if section!='Service' or '=' not in line: continue",
+        " key,val=line.split('=',1)",
+        " if key in effective: effective[key]=val or None",
+        " if key=='Environment': effective_env=val.strip('\\\"')",
+        "effective=={'StandardOutput':'append:'+out_path,'StandardError':'append:'+err_path} or sys.exit(6)",
+        "effective_env==expected_env or sys.exit(7)",
+        "pid_text=fields.get('MainPID',''); pid_text.isdigit() and int(pid_text)>0 or sys.exit(8); pid=int(pid_text)",
+        "base=pathlib.Path('/proc')/str(pid); st=(base/'stat').read_text(); tail=st[st.rfind(')')+2:].split(); start=int(tail[19])",
+        "cgroup=fields.get('ControlGroup',''); cgroup.rstrip('/').endswith('/'+unit+'.service') or sys.exit(9)",
+        "cg=(base/'cgroup').read_text().splitlines(); [row.rsplit(':',1)[-1].rstrip('/') for row in cg].count(cgroup.rstrip('/'))==1 or sys.exit(10)",
+        "os.readlink(base/'exe')==binary or sys.exit(11)",
+        "boot=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()",
+        "paths=[pathlib.Path(out_path),pathlib.Path(err_path)]",
+        "all(p.is_file() and not p.is_symlink() for p in paths) or sys.exit(12)",
+        "ids=[]",
+        "for p in paths:",
+        " st=p.stat(); ids.append([st.st_dev,st.st_ino])",
+        "for index,identity in ((1,ids[0]),(2,ids[1])):",
+        " fdstat=os.stat(base/'fd'/str(index)); [fdstat.st_dev,fdstat.st_ino]==identity or sys.exit(17)",
+        "fd=os.open(out_path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)",
+        "try:",
+        " before=os.fstat(fd); stat.S_ISREG(before.st_mode) and [before.st_dev,before.st_ino]==ids[0] or sys.exit(13)",
+        " before.st_size<=limit or sys.exit(14)",
+        " data=os.pread(fd,before.st_size,0)",
+        " after=os.fstat(fd); (len(data)==before.st_size and after.st_dev==before.st_dev and after.st_ino==before.st_ino and after.st_size>=before.st_size) or sys.exit(15)",
+        " (not data or data.endswith(b'\\n')) or sys.exit(16)",
+        "finally: os.close(fd)",
+        "st2=(base/'stat').read_text(); tail2=st2[st2.rfind(')')+2:].split(); int(tail2[19])==start or sys.exit(18)",
+        "pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()==boot or sys.exit(19)",
+        "for index,identity in ((1,ids[0]),(2,ids[1])):",
+        " fdstat=os.stat(base/'fd'/str(index)); [fdstat.st_dev,fdstat.st_ino]==identity or sys.exit(20)",
+        "snapshot={'boundary':'pre_measure','deployment_id':deployment,'controller_session_id':session,'listener_invocation_id':invocation,'unit':unit,'pid':pid,'start_ticks':start,'boot_id':boot,'cgroup':cgroup,'log_path':out_path,'log_ids':ids,'prefix_bytes':len(data),'prefix_sha256':hashlib.sha256(data).hexdigest(),'captured_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+        "print(json.dumps({'snapshot':snapshot},sort_keys=True,separators=(',',':')))",
+    ))
+    request = _request(action_id, connection.vm_b,
+        ["sudo", "python3", "-c", "exec(" + repr(source) + ")", listener.unit,
+         listener.binary_path, listener.address, listener.stdout_path, listener.stderr_path,
+         controller_session_id, connection.deployment_id, "f02r-vm_b-listener-iperf3"],
+        min(connection.timeouts.server_seconds, remaining))
+    result = _execute(runner, request)
+    action = _action(request.action_id, request.action_type, connection.vm_b, request, result)
+    try:
+        if result.outcome != CommandOutcome.SUCCEEDED or result.exit_code != 0:
+            raise ValueError("owner-bound remote snapshot command failed")
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        snapshot = payload.get("snapshot")
+        if (not isinstance(snapshot, dict) or snapshot.get("boundary") != "pre_measure"
+                or snapshot.get("deployment_id") != connection.deployment_id
+                or snapshot.get("controller_session_id") != controller_session_id
+                or snapshot.get("listener_invocation_id") != "f02r-vm_b-listener-iperf3"
+                or snapshot.get("log_path") != listener.stdout_path):
+            raise ValueError("snapshot identity is incomplete")
+        return {"available": True, "snapshot": snapshot, "action": action}
+    except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return {"available": False, "reason": "owner-bound remote log-prefix snapshot is unavailable",
+            "action": action}
 
 
 def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: str,
@@ -775,6 +868,7 @@ def stop_remote_diagnostics(connection: Any, process: RemoteDiagnosticsProcess, 
 
 def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
         results_workspace: str = "/var/lib/cnb/results",
+        controller_session_id: str = "",
         clock: Callable[[], float] = __import__("time").monotonic) -> RemoteListenerClosure:
     """Stop only this deployment's B-side units and prove process/log closure.
 
@@ -792,7 +886,7 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
             or ".." in workspace.parts):
         raise ValueError("results workspace must be normalized absolute POSIX")
     actions = []
-    observations: dict[str, dict[str, str]] = {}
+    observations: dict[str, dict[str, Any]] = {}
     failures = []
     for tool in ("sockperf", "iperf3"):
         unit = f"cnb-{connection.deployment_id}-{tool}"
@@ -836,7 +930,7 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
             failures.append(f"{tool} listener unit identity or native log association is unavailable")
             continue
         owner_source = "\n".join((
-            "import json,pathlib,sys",
+            "import datetime,hashlib,json,os,pathlib,stat,sys",
             "pid=int(sys.argv[1]); unit=sys.argv[2]",
             "base=pathlib.Path('/proc')/str(pid); stat=(base/'stat').read_text()",
             "tail=stat[stat.rfind(')')+2:].split(); start=int(tail[19])",
@@ -845,8 +939,31 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
             "len(owned)==1 or sys.exit(2)",
             "paths=[pathlib.Path(sys.argv[i]) for i in (3,4)]",
             "all(p.is_file() and not p.is_symlink() for p in paths) or sys.exit(3)",
-            "ids=[(p.stat().st_dev,p.stat().st_ino) for p in paths]",
-            "print(json.dumps({'pid':pid,'start_ticks':start,'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'cgroup':owned[0],'log_ids':ids}))",
+            "ids=[[p.stat().st_dev,p.stat().st_ino] for p in paths]",
+            "for index,expected in ((1,ids[0]),(2,ids[1])):",
+            " stfd=os.stat(base/'fd'/str(index)); [stfd.st_dev,stfd.st_ino]==expected or sys.exit(4)",
+            "identity={'pid':pid,'start_ticks':start,'boot_id':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),'cgroup':owned[0],'log_ids':ids}",
+            "snapshot={'available':False,'reason':'bounded pre-stop log-prefix snapshot unavailable'}",
+            "if unit.endswith('-iperf3'):",
+            " try:",
+            "  p=paths[0]; fd=os.open(str(p),os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC); limit=65536",
+            "  try:",
+            "   before=os.fstat(fd)",
+            "   if not stat.S_ISREG(before.st_mode) or [before.st_dev,before.st_ino]!=identity['log_ids'][0] or before.st_size>limit: raise ValueError()",
+            "   data=os.pread(fd,before.st_size,0); after=os.fstat(fd)",
+            "   if len(data)!=before.st_size or (data and not data.endswith(b'\\n')): raise ValueError()",
+            "   if after.st_dev!=before.st_dev or after.st_ino!=before.st_ino or after.st_size<before.st_size: raise ValueError()",
+            "   stat2=(base/'stat').read_text(); tail2=stat2[stat2.rfind(')')+2:].split()",
+            "   if int(tail2[19])!=start: raise ValueError()",
+            "   if pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=identity['boot_id']: raise ValueError()",
+            "   for index,expected in ((1,identity['log_ids'][0]),(2,identity['log_ids'][1])):",
+            "    stfd=os.stat(base/'fd'/str(index))",
+            "    if [stfd.st_dev,stfd.st_ino]!=expected: raise ValueError()",
+            "   snapshot={'available':True,'boundary':'pre_stop','deployment_id':sys.argv[6],'controller_session_id':sys.argv[5],'listener_invocation_id':'f02r-vm_b-listener-iperf3','unit':unit,'pid':pid,'start_ticks':start,'boot_id':identity['boot_id'],'cgroup':owned[0],'log_path':str(p),'log_ids':identity['log_ids'],'prefix_bytes':len(data),'prefix_sha256':hashlib.sha256(data).hexdigest(),'captured_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            "  finally: os.close(fd)",
+            " except Exception: pass",
+            "identity['pre_stop_prefix']=snapshot",
+            "print(json.dumps(identity))",
         ))
         owner_code = "exec(" + repr(owner_source) + ")"
         remaining = deadline.remaining(clock, cleanup=True)
@@ -854,7 +971,8 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
             failures.append(f"{tool} listener owner capture exceeded the cleanup allowance")
             continue
         owner = _request(f"f09-listener-owner-process-{connection.deployment_id}-{tool}", vm,
-            ["sudo", "python3", "-c", owner_code, raw_pid, unit, stdout_path, stderr_path], min(connection.timeouts.command_seconds, remaining))
+            ["sudo", "python3", "-c", owner_code, raw_pid, unit, stdout_path, stderr_path,
+             controller_session_id, connection.deployment_id], min(connection.timeouts.command_seconds, remaining))
         owner_result = _execute(runner, owner)
         actions.append(_action(owner.action_id, owner.action_type, vm, owner, owner_result))
         if owner_result.outcome != CommandOutcome.SUCCEEDED:
@@ -875,6 +993,9 @@ def stop_vm_b_listeners(connection: Any, *, runner: Any, deadline: Any,
                         or any(isinstance(value, bool) or not isinstance(value, int) for value in row)
                         for row in owner_identity["log_ids"])):
                 raise ValueError("owner identity is incomplete")
+            if tool == "iperf3":
+                observations[tool].update(owner_identity)
+                observations[tool]["pre_stop_prefix"] = owner_identity.get("pre_stop_prefix")
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             failures.append(f"{tool} listener owner identity is malformed ({type(exc).__name__})")
             continue
