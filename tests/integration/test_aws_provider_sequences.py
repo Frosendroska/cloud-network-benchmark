@@ -217,7 +217,7 @@ def test_lost_expiry_start_recovers_only_one_exact_inprogress_match(tmp_path):
         "StepExecutionsTruncated": False,
         "StepExecutions": [{"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress", "Inputs": {"Timestamp": "2026-10-22T12:14:00Z"}}],
     }
-    described = {"AutomationExecutionMetadataList": [{"AutomationExecutionId": "exec-1"}]}
+    described = {"AutomationExecutionMetadataList": [{"AutomationExecutionId": "exec-1", "DocumentName": "cnb-expiry"}]}
     runner = QueueRunner([
         (1, "", "response lost"),
         (0, json.dumps(described), ""),
@@ -242,7 +242,7 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
     params = {"RunId": ["campaign-aws"], "DeploymentId": ["campaign-aws-deployment"]}
     runner = QueueRunner([
         (1, "", "lost"),
-        (0, json.dumps({"AutomationExecutionMetadataList": [{"AutomationExecutionId": "one"}, {"AutomationExecutionId": "two"}]}), ""),
+        (0, json.dumps({"AutomationExecutionMetadataList": [{"AutomationExecutionId": "one", "DocumentName": "cnb-expiry"}, {"AutomationExecutionId": "two", "DocumentName": "cnb-expiry"}]}), ""),
         (0, "{}", ""),
         (0, "{}", ""),
     ])

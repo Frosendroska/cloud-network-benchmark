@@ -242,9 +242,9 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
         assert runner.driver.settings.images == runtime["providers"]["gcp"]["options"]["images"]
         assert all("europe-west3" not in request.argv and "europe-west2" not in request.argv
             for request in runner.requests if request.action_id.startswith("gcp-"))
-        assert all("--regions=europe-north1" in request.argv
+        assert all(not any(arg.startswith(("--regions", "--global")) for arg in request.argv)
             for request in runner.requests if request.action_id.startswith((
-                "gcp-address-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-")))
+                "gcp-addresses-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-")))
     # Reopen only the cleanup obligation to model a process loss after the
     # provider journal was written. The default CLI must reload the original
     # saved provider settings and reconcile without creating a new attempt.

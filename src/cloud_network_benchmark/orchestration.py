@@ -133,6 +133,7 @@ class SavedLifecycleRecovery(StrictModel):
     ledger_scope_id: str | None = None
     providers: list[SavedProviderRecovery] = Field(min_length=1, max_length=3)
     retry_consumed_ids: list[str] = Field(default_factory=list)
+    initialization_failure: str | None = None
 
     @classmethod
     def validate_unique(cls, value):
@@ -324,7 +325,7 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
             from .lifecycle_cleanup import replay_saved_cleanup_receipt
             try:
                 receipt_reconciled = replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError, OSError) as exc:
                 outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
                     "errors": [str(exc)], "launch_blocked": True}
                 continue
@@ -856,6 +857,48 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
         return LifecycleResult({}, False, "reserved attempt is absent from the F11 ledger",
                                admission_status="reserved_but_unavailable",
                                reservation_evidence=decision.evidence)
+    selected = {str(getattr(p, "value", p)) for p in reservation_request.selected_providers}
+    recovery_initialized = False
+
+    def initialization_failed(reason: str, detail: str) -> LifecycleResult:
+        # Reservation is already a durable cleanup liability. Neither an empty
+        # provider state nor a factory exception establishes resource absence.
+        secondary = []
+        if recovery_initialized:
+            try:
+                def save_failure(saved):
+                    if saved.reservation_id != reservation_id:
+                        raise ValueError("failure journal belongs to another reservation")
+                    return saved.model_copy(update={"initialization_failure": detail}), None
+                _mutate_recovery_journal(recovery_path, save_failure)
+            except BaseException as exc:
+                secondary.append(f"failure journal update failed ({type(exc).__name__})")
+        return LifecycleResult({p: ProviderLifecycleResult(provider=p,
+            execution_state="failed", cleanup_state="unknown", primary_failure=detail,
+            secondary_failures=list(secondary)) for p in selected}, False, detail,
+            admission_status="reserved", admission_reasons=(reason,),
+            reservation_evidence=decision.evidence)
+
+    # Establish the selected identities, original settings references and open
+    # cleanup obligation before a factory or timing check can throw. Factories
+    # are local composition only; they cannot dispatch provider operations.
+    if recovery_path is None or recovery_factory is None:
+        return initialization_failed("recovery_initialization_failed",
+            "private lifecycle recovery was not initialized")
+    try:
+        recovery = SavedLifecycleRecovery.validate_unique(
+            recovery_factory(decision.evidence, {}).model_dump(mode="python"))
+        if (recovery.controller_session_id != ledger.controller_session_id
+                or recovery.reservation_id != reservation_id
+                or {row.provider for row in recovery.providers} != selected):
+            raise ValueError("recovery identity does not match the reserved selected providers")
+        recovery = recovery.model_copy(update={"providers": [row.model_copy(
+            update={"cleanup_open": True}) for row in recovery.providers]})
+        write_recovery_journal(recovery_path, recovery)
+        recovery_initialized = True
+    except BaseException as exc:
+        return initialization_failed("recovery_initialization_failed",
+            f"private lifecycle recovery initialization failed ({type(exc).__name__}: {exc})")
     try:
         cap_start = float(reservation["cap_start_monotonic"])
         cap_seconds = float(reservation["cap_seconds"])
@@ -885,37 +928,19 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
             raise ValueError("caller lifecycle context does not match the original F11 reservation")
         context = __import__("dataclasses").replace(context, provider_trigger_monotonic=provider_trigger)
     except (KeyError, TypeError, ValueError) as exc:
-        return LifecycleResult({}, False, f"reserved attempt timing is unavailable or inconsistent ({type(exc).__name__})",
-                               admission_status="reserved_but_unavailable",
-                               reservation_evidence=decision.evidence)
+        return initialization_failed("reserved_timing_invalid",
+            f"reserved attempt timing is unavailable or inconsistent ({type(exc).__name__})")
     fit = ledger.check_stage_fit(reservation_id, stage="registration", remaining=allowance)
     if not fit.eligible:
-        return LifecycleResult({}, False, "complete workflow does not fit", admission_status="reserved_but_not_fit",
-                               admission_reasons=tuple(fit.reason_codes), reservation_evidence=decision.evidence)
+        return initialization_failed("workflow_time_insufficient", "complete workflow does not fit")
     from dataclasses import replace
-    workflows = workflow_factory(decision.evidence)
-    if not workflows:
-        return LifecycleResult({}, False, "selected provider workflow factory returned no provider hooks",
-                               admission_status="reserved_but_not_dispatched",
-                               reservation_evidence=decision.evidence)
-    # A production attempt cannot enter provider code until a private crash
-    # journal for the exact selected deployment set is durably established.
-    if recovery_path is None or recovery_factory is None:
-        return LifecycleResult({}, False, "private lifecycle recovery was not initialized",
-                               admission_status="reserved_but_not_dispatched",
-                               reservation_evidence=decision.evidence)
     try:
-        recovery = SavedLifecycleRecovery.validate_unique(
-            recovery_factory(decision.evidence, workflows).model_dump(mode="python"))
-        if (recovery.controller_session_id != context.controller_session_id
-                or recovery.reservation_id != reservation_id
-                or {row.provider for row in recovery.providers} != set(workflows)):
-            raise ValueError("recovery identity does not match the reserved selected providers")
-        write_recovery_journal(recovery_path, recovery)
+        workflows = workflow_factory(decision.evidence)
+        if set(workflows) != selected:
+            raise ValueError("selected provider workflow factory returned a different provider set")
     except BaseException as exc:
-        return LifecycleResult({}, False, f"private lifecycle recovery initialization failed ({type(exc).__name__})",
-                               admission_status="reserved_but_not_dispatched",
-                               reservation_evidence=decision.evidence)
+        return initialization_failed("workflow_factory_failed",
+            f"workflow_factory_failed ({type(exc).__name__}: {exc})")
     def f11_stage_fit(stage: str):
         if stage == "cleanup":
             return None

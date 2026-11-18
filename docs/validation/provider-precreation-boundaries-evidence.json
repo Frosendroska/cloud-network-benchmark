@@ -1,0 +1,349 @@
+{
+  "implementation_revision": "aae091871490f9754132f0641d4b2c42cb468274",
+  "scope": "credential-free affected provider precreation/recovery delta only; no cloud calls",
+  "local": {
+    "pytest": {
+      "tests": 461,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "deselected": 3,
+    "environment": "macOS-10.16-x86_64-i386-64bit",
+    "pytest_log_sha256": "239c6d793054e29d81c62b46ec1e506a25090815b6fca6614138c1b12a47a760",
+    "final_gcp_diagnostic_refactor": {
+      "passed": 86,
+      "deselected": 57,
+      "log_sha256": "71f9c1d62eebd60cf7b225516c629244bc24ac2ca57e28a5681450a6e703beb6"
+    },
+    "final_aws_addendum": {
+      "passed": 117,
+      "deselected": 75,
+      "log_sha256": "c9d13bd9eebe6d154c29db20c551b2ed21991ea2b76ac4f109b8339cc5a60cc3"
+    }
+  },
+  "native_root": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/provider-precreation-hZ2QYOes",
+  "regression_root": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/provider-precreation-regression-e92dzmp2",
+  "bundle_sha256": "1e0d4b97144771b7bbb4081da8467b1ad5da51df96d3082b590ed073b5c53f6d",
+  "verification": {
+    "native": {
+      "archive_sha256": "29af1b18c286e6804cf1152c40219a2048152371f8bf8ebff1a4976c7d340cb5",
+      "archive_bytes": 16668,
+      "crc_verified": true,
+      "verified_payload_hashes": 18,
+      "junit_verified": true,
+      "summary": {
+        "revision": "2cb096a65a0b18b208c7ba3431f44a76eca0f2a3",
+        "checks": [
+          {
+            "name": "revision",
+            "exit_code": 0,
+            "seconds": 0.008,
+            "sha256": "a6c333e41bf420d4f9ff68c54cd205a61b2b4b25b0803db14c1381160e2db7fa"
+          },
+          {
+            "name": "source-before",
+            "exit_code": 0,
+            "seconds": 0.12,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "python-version",
+            "exit_code": 0,
+            "seconds": 0.004,
+            "sha256": "5b3e43dc38ca01e3f5a7854ba50d4330864b0c1e0f646650b2c78cf072acc366"
+          },
+          {
+            "name": "affected-pytest",
+            "exit_code": 0,
+            "seconds": 122.15,
+            "sha256": "d93cd9956a6d9c9bcb4cb7fd6ac206fabe25a87cdb34c9d4bb3cf1a7058dd5d4"
+          },
+          {
+            "name": "expiry-fmt",
+            "exit_code": 0,
+            "seconds": 0.061,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "expiry-init",
+            "exit_code": 0,
+            "seconds": 0.481,
+            "sha256": "fb5cdc7018ac41d13d3ecf290d63b27bb38a9dd62c0851374b257c81fd71406e"
+          },
+          {
+            "name": "expiry-validate",
+            "exit_code": 0,
+            "seconds": 0.893,
+            "sha256": "f7997225125835fdd14060ac776d273f394b874f9a481b9e2122c83dc8adc5c1"
+          },
+          {
+            "name": "expiry-mock-plan",
+            "exit_code": 0,
+            "seconds": 0.722,
+            "sha256": "a38804b1a19dd8065d678804f11832eac3fe9550fb084c21cf3bb211fbe6fa7a"
+          },
+          {
+            "name": "pair-fmt",
+            "exit_code": 0,
+            "seconds": 0.078,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "pair-init",
+            "exit_code": 0,
+            "seconds": 0.496,
+            "sha256": "fb5cdc7018ac41d13d3ecf290d63b27bb38a9dd62c0851374b257c81fd71406e"
+          },
+          {
+            "name": "pair-validate",
+            "exit_code": 0,
+            "seconds": 0.909,
+            "sha256": "f7997225125835fdd14060ac776d273f394b874f9a481b9e2122c83dc8adc5c1"
+          },
+          {
+            "name": "pair-mock-plan",
+            "exit_code": 0,
+            "seconds": 0.937,
+            "sha256": "e644f60d6778f6b7d1d7abec9bc8b19b4da3956918b1bae14ed64ac6ceeafe42"
+          },
+          {
+            "name": "diff-check",
+            "exit_code": 0,
+            "seconds": 0.021,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "source-after",
+            "exit_code": 0,
+            "seconds": 0.076,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "terraform-version",
+            "exit_code": 0,
+            "seconds": 0.047,
+            "sha256": "0675fa39d0f82715cf8435eb117e9127b9d5a0c6b2254052f58495b3502151ad"
+          }
+        ],
+        "pytest": {
+          "tests": 461,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "source_clean_before_after": true,
+        "source_sha256": {
+          "src/cloud_network_benchmark/providers/aws.py": "2d9f7d72de4ba6667758bdd52e5227f15747d8707013fa456fd5b606967cf6d2",
+          "src/cloud_network_benchmark/providers/gcp.py": "821ad2367433a745f13c9c25aa5ed5aef4f81879078f0b96297b1331f0435998",
+          "src/cloud_network_benchmark/azure_provider.py": "38f530ad784801bf5e6dbc9a6f90b331eb464ebeda6b47f7bbff063cc5d44e0b",
+          "src/cloud_network_benchmark/azure_plan_scope.py": "8912978f169afbe557a8a90b52f0a7f0eeb368cd6784ec8ff877f9c8c05d17f9",
+          "tests/integration/test_provider_precreation_boundaries.py": "40e401c5621539e611b041603b37b6323f5bd408be04af7b5fbf8a68c088a8b8",
+          "docs/validation/check-provider-precreation-boundaries.py": "fb1b6f184390a14f0f99af6d5ed84014e395c8a9e69a739a6cd4d83fe08f7263",
+          "terraform/azure/expiry/versions.tf": "f230d9ddf50b80d8c8783b97cba87a1bbcf219fb265118b668b72162c855b0c8",
+          "terraform/azure/expiry/.terraform.lock.hcl": "868203ac1bf8a44158d785ff4b3b1aa197b31765f1af734e3c68d10937dd7dae",
+          "terraform/azure/pair/versions.tf": "7a0ca1a991cb2dfaf3f32b599b09b15aa5befd93d8654f68e7e8d53d610c26b8",
+          "terraform/azure/pair/.terraform.lock.hcl": "868203ac1bf8a44158d785ff4b3b1aa197b31765f1af734e3c68d10937dd7dae"
+        },
+        "environment_keys": [
+          "AWS_EC2_METADATA_DISABLED",
+          "CHECKPOINT_DISABLE",
+          "HOME",
+          "MPLBACKEND",
+          "PATH",
+          "PYTHONDONTWRITEBYTECODE",
+          "PYTHONPATH",
+          "TF_CLI_CONFIG_FILE",
+          "TF_DATA_DIR",
+          "TF_IN_AUTOMATION",
+          "THESIS_ROOT",
+          "TMPDIR"
+        ],
+        "scope": "affected provider precreation/recovery Python delta and eight Azure native mocked plans only",
+        "terraform": [
+          {
+            "root": "expiry",
+            "summary": [
+              {
+                "status": "pass",
+                "passed": 2,
+                "failed": 0,
+                "errored": 0,
+                "skipped": 0
+              }
+            ],
+            "complete": true,
+            "lock_unchanged": true
+          },
+          {
+            "root": "pair",
+            "summary": [
+              {
+                "status": "pass",
+                "passed": 6,
+                "failed": 0,
+                "errored": 0,
+                "skipped": 0
+              }
+            ],
+            "complete": true,
+            "lock_unchanged": true
+          }
+        ],
+        "terraform_version": "{\n  \"terraform_version\": \"1.16.6\",\n  \"platform\": \"linux_amd64\",\n  \"provider_selections\": {},\n  \"terraform_outdated\": false\n}\n",
+        "mirror": "/u/halle/brek/home_at/cnb/tools/provider-mirror-AwkH5Pia",
+        "complete": true
+      }
+    },
+    "regression": {
+      "archive_sha256": "9564f35d5cc31c0bd318abf435b58201eb1dc28def68722f6cf58a99d2107bad",
+      "archive_bytes": 2854,
+      "crc_verified": true,
+      "verified_payload_hashes": 3,
+      "junit_verified": true,
+      "summary": {
+        "revision": "a46593d6abceeaee31a098e46cdd48a5b4480ff4",
+        "test_revision": "2cb096a65a0b18b208c7ba3431f44a76eca0f2a3",
+        "pytest": {
+          "tests": 9,
+          "failures": 9,
+          "errors": 0,
+          "skipped": 0
+        },
+        "exit_code": 1,
+        "executable_sources_unchanged": true,
+        "source_sha256": {
+          "src/cloud_network_benchmark/providers/aws.py": "ca4314da868aecd0fd1b6e4629fb3601ddaa08772d5454b0ffdf46a4afd8b1d3",
+          "src/cloud_network_benchmark/providers/gcp.py": "7aa9b8fb5f09fd473e4bfe4343eb826f64015621e29bc55011d62d4ef612d071",
+          "src/cloud_network_benchmark/azure_provider.py": "989b543e288aae2bd149b421d59e8d402161a09170319652a70f4766b75c69d4",
+          "src/cloud_network_benchmark/azure_plan_scope.py": "bac081537c48053c79e4d58ec49420158732ffe4fa865bd6bc085d68e4023271",
+          "terraform/azure/expiry/versions.tf": "e17e87b325f42919948b3bc1c516bf2058fc90489a223ba3b3cf10ba5d1e1819",
+          "terraform/azure/pair/versions.tf": "cc80c9a621e356e0d8e8e210c0192dc5363d97a03122500278f893a3ce35bc0b"
+        },
+        "expected_red": true
+      }
+    },
+    "aws_addendum": {
+      "archive_sha256": "25dc7c3bf83436c54fc1665a41b91ee84c09be3679f7870a1d83e13a913b0794",
+      "archive_bytes": 6412,
+      "crc_verified": true,
+      "verified_payload_hashes": 10,
+      "junit_verified": true,
+      "summary": {
+        "revision": "aae091871490f9754132f0641d4b2c42cb468274",
+        "checks": [
+          {
+            "name": "revision",
+            "exit_code": 0,
+            "seconds": 0.006,
+            "sha256": "55f64e6958650394805e0bceed78cd185e8d7147d9526cdd1274e25acb8a2584"
+          },
+          {
+            "name": "source-before",
+            "exit_code": 0,
+            "seconds": 0.094,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "python-version",
+            "exit_code": 0,
+            "seconds": 0.009,
+            "sha256": "5b3e43dc38ca01e3f5a7854ba50d4330864b0c1e0f646650b2c78cf072acc366"
+          },
+          {
+            "name": "affected-pytest",
+            "exit_code": 0,
+            "seconds": 8.712,
+            "sha256": "d5c7b3dd38bc7359555075ff7e5576d537a2ed26848b24f3d3209763ebd9bdae"
+          },
+          {
+            "name": "diff-check",
+            "exit_code": 0,
+            "seconds": 0.095,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "source-after",
+            "exit_code": 0,
+            "seconds": 0.053,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "terraform-version",
+            "exit_code": 0,
+            "seconds": 0.309,
+            "sha256": "47e99061c3f5c770e72c994754fa4c352c07966389f8578bcd337fa798bb93fc"
+          }
+        ],
+        "pytest": {
+          "tests": 117,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "source_clean_before_after": true,
+        "source_sha256": {
+          "src/cloud_network_benchmark/providers/aws.py": "8490a375422261a33ccacd8bdfffe1f9fba21044c5ea5b4f79daf7143aa7bd40",
+          "src/cloud_network_benchmark/providers/gcp.py": "821ad2367433a745f13c9c25aa5ed5aef4f81879078f0b96297b1331f0435998",
+          "src/cloud_network_benchmark/azure_provider.py": "38f530ad784801bf5e6dbc9a6f90b331eb464ebeda6b47f7bbff063cc5d44e0b",
+          "src/cloud_network_benchmark/azure_plan_scope.py": "8912978f169afbe557a8a90b52f0a7f0eeb368cd6784ec8ff877f9c8c05d17f9",
+          "tests/integration/test_provider_precreation_boundaries.py": "ec21e724cc0b460380166bbe88c758557bdd7bf7262cc305c87699230fc23166",
+          "docs/validation/check-provider-precreation-boundaries.py": "29f7ab3e93d097d27ac3429ad36f4f33e4be98d29fc57a47d9cbbd51dd2b3140",
+          "terraform/azure/expiry/versions.tf": "f230d9ddf50b80d8c8783b97cba87a1bbcf219fb265118b668b72162c855b0c8",
+          "terraform/azure/expiry/.terraform.lock.hcl": "868203ac1bf8a44158d785ff4b3b1aa197b31765f1af734e3c68d10937dd7dae",
+          "terraform/azure/pair/versions.tf": "7a0ca1a991cb2dfaf3f32b599b09b15aa5befd93d8654f68e7e8d53d610c26b8",
+          "terraform/azure/pair/.terraform.lock.hcl": "868203ac1bf8a44158d785ff4b3b1aa197b31765f1af734e3c68d10937dd7dae"
+        },
+        "environment_keys": [
+          "AWS_EC2_METADATA_DISABLED",
+          "HOME",
+          "MPLBACKEND",
+          "PATH",
+          "PYTHONDONTWRITEBYTECODE",
+          "PYTHONPATH",
+          "THESIS_ROOT",
+          "TMPDIR"
+        ],
+        "scope": "final AWS rejection/completeness delta only",
+        "terraform": [],
+        "terraform_version": "{\n  \"terraform_version\": \"1.16.6\",\n  \"platform\": \"linux_amd64\",\n  \"provider_selections\": {},\n  \"terraform_outdated\": true\n}\n",
+        "mirror": "/u/halle/brek/home_at/cnb/tools/provider-mirror-AwkH5Pia",
+        "complete": true
+      },
+      "unchanged_original_native_hashes": [
+        "src/cloud_network_benchmark/providers/gcp.py",
+        "src/cloud_network_benchmark/azure_provider.py",
+        "src/cloud_network_benchmark/azure_plan_scope.py",
+        "terraform/azure/expiry/versions.tf",
+        "terraform/azure/expiry/.terraform.lock.hcl",
+        "terraform/azure/pair/versions.tf",
+        "terraform/azure/pair/.terraform.lock.hcl"
+      ],
+      "bundle_sha256": "aaa8b02c4e2547c0ffb118ef8f0c10e79a4d41615980cebdd69afc4226efc6a4"
+    }
+  },
+  "unchanged_boundaries": [
+    "Terraform versions, constraints and all lock hashes",
+    "original expiry and reservation deadlines",
+    "180-second original Azure plan boundary",
+    "original private paid inputs/state/ledger/authority",
+    "financial liability and bounded-transfer guards"
+  ],
+  "unresolved": [
+    "AWS StartAutomationExecution assume-role rejection cause (trust versus propagation) remains unknown; no trust broadening or Start retry",
+    "Exact cause of original Azure 180-second expiry saved-plan timeout remains unknown; no timeout increase",
+    "GCP provider-added label is retained-state evidence; missing original API body prevents proof of the exact rejected field"
+  ],
+  "live_authority": "none; prior EUR8 fixed-attempt approval consumed; implementation and offline evidence do not authorize another attempt",
+  "aws_addendum_root": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/provider-precreation-aws-qle01QtP",
+  "azure_schema_inspection": {
+    "root": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/provider-boundary-inspect-83xj6e4b",
+    "provider_version": "4.81.0",
+    "schema_sha256": "db80d61f332ddd1028f724ba7722c464aeaa6461cffe755b04b848f40e8445af",
+    "schema_attributes": [
+      "resource_provider_registrations",
+      "resource_providers_to_register",
+      "skip_provider_registration"
+    ]
+  }
+}

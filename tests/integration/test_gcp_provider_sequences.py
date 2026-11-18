@@ -374,8 +374,8 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     if north:
         assert cleaned.inventory.value["regions_scanned"] == ["europe-north1"]
         regional_requests = [request for request in runner.requests if request.action_id.startswith((
-            "gcp-address-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-"))]
-        assert regional_requests and all("--regions=europe-north1" in request.argv for request in regional_requests)
+            "gcp-addresses-inventory-", "gcp-subnet-inventory-", "gcp-policy-inventory-"))]
+        assert regional_requests and all(not any(arg.startswith(("--regions", "--global")) for arg in request.argv) for request in regional_requests)
 
 
 def test_registration_observes_both_absolute_stop_templates_before_any_pair(tmp_path, monkeypatch):
@@ -563,7 +563,7 @@ def test_cleanup_blocks_protection_removal_when_compute_remains_or_inventory_is_
     monkeypatch.setattr(driver,"_terraform",lambda _attempt,root,action,_deployment,_extra: commands.append((root,action)) or {})
     import hashlib
     labels={"cnb-run":hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20],"cnb-deploy":hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
-    monkeypatch.setattr(driver,"_gcloud_json",lambda args,_action: [{"id":"42","status":"TERMINATED","labels":labels}] if "instances" in args and "list" in args else [])
+    monkeypatch.setattr(driver,"_gcloud_json",lambda args,_action: [{"id":"42","name":"owned-terminated","status":"TERMINATED","labels":labels}] if "instances" in args and "list" in args else [])
     result=driver.cleanup(deployment)
     assert result.cleanup_state == "failed"
     assert result.cleanup_failure.category == "residual_compute"
@@ -986,8 +986,8 @@ def test_s4_inventory_scans_both_regions_global_addresses_and_exact_known_ids(tm
     assert inventory["pages_complete"] is True
     assert inventory["zone_scope"] == "all_project_zones"
     assert "gcp-inventory-all-zones" in actions and "gcp-disk-inventory-all-zones" in actions
-    assert "gcp-global-address-inventory" in actions
-    assert "gcp-routes-inventory" in actions
+    assert "gcp-addresses-inventory-all-scopes" in actions
+    assert "gcp-routes-inventory-all-scopes" in actions
     assert [item["id"] for item in inventory["instances"]] == ["101"]
     assert [item["id"] for item in inventory["disks"]] == ["201"]
     assert {item["name"] for item in inventory["support_resources"]} == {"known-template", f"{namespace}-net"}
@@ -1065,9 +1065,9 @@ def test_residual_billable_or_protection_resource_keeps_cleanup_open(tmp_path,mo
     commands=[]
     monkeypatch.setattr(driver,"_terraform",lambda _attempt,root,action,_deployment,_extra:commands.append((root,action)) or {})
     def fake(args,action):
-        if action=="gcp-instance_templates-inventory" and collection=="instance_templates": return [owned]
+        if action=="gcp-instance_templates-inventory-all-scopes" and collection=="instance_templates": return [owned]
         if action=="gcp-disk-inventory-all-zones" and collection=="disks": return [owned]
-        if action=="gcp-address-inventory-europe-west3" and collection=="addresses": return [owned]
+        if action=="gcp-addresses-inventory-all-scopes" and collection=="addresses": return [owned]
         return []
     monkeypatch.setattr(driver,"_gcloud_json",fake)
     result=driver.cleanup(deployment)

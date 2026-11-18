@@ -251,3 +251,22 @@ def test_maximum_legal_identity_components_fit_new_state_path(tmp_path):
     assert len(_legacy_namespace(d))>255
     path=driver._attempt_dir(d)
     assert len(path.parent.parent.name)<=80 and path.name==d.deployment_id
+
+
+@pytest.mark.parametrize('tamper',[False,True])
+def test_pre_vm_cleanup_receipt_replays_only_original_support_targets(tmp_path,isolated_legacy_provider_financial_boundary,tamper):
+    from cloud_network_benchmark.lifecycle_cleanup import replay_saved_cleanup_receipt
+    from cloud_network_benchmark.orchestration import SavedLifecycleRecovery
+    _,_,_,_,built,result=execute_failure(tmp_path)
+    recovery=SavedLifecycleRecovery.model_validate_json(built['recovery_path'].read_text())
+    record=recovery.providers[0]
+    journal=Path(record.journal_reference)
+    original=journal.read_bytes();state=json.loads(original)
+    assert state['cleanup_safety_targets']
+    if tamper:
+        region=next(iter(state['cleanup_safety_targets']))
+        state['cleanup_safety_targets'][region]['role']['arn']+='-foreign'
+        journal.write_text(json.dumps(state))
+    before=built['ledger'].path.read_bytes()
+    assert replay_saved_cleanup_receipt(record,recovery=recovery,ledger=built['ledger']) is (not tamper)
+    assert built['ledger'].path.read_bytes()==before

@@ -1,0 +1,83 @@
+{
+  "implementation_revision": "a46593d6abceeaee31a098e46cdd48a5b4480ff4",
+  "platform": "macOS-15.2-x86_64-i386-64bit-Mach-O",
+  "machine": "x86_64",
+  "local_scope": "affected native macOS Python delta; separate exact-source Linux evidence is recorded under native_halle",
+  "pytest": {
+    "tests": 246,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "new_admission_factory_cases": 21,
+  "source_sha256": {
+    "src/cloud_network_benchmark/admission.py": "4d9756b9659050214a5b90fadcfa1a2f698809d8d6e84e67112b96f8874636e7",
+    "src/cloud_network_benchmark/azure_provider.py": "989b543e288aae2bd149b421d59e8d402161a09170319652a70f4766b75c69d4",
+    "src/cloud_network_benchmark/lifecycle_runtime.py": "a50b3c6daadb0c9e0365ee65c24e19738f61a126827d9a9dd1c91c2b7273316b",
+    "src/cloud_network_benchmark/orchestration.py": "9d853bc3f44fbfe83de1e1a3945ec9c81badced0804ebb372df9984910d75fca",
+    "src/cloud_network_benchmark/lifecycle_cleanup.py": "9b798ed26d13e874527e77d626a6baef3a8cd6f9005f7cb02f6461ddb2d379c8"
+  },
+  "files": {
+    "/private/tmp/cnb-admission-factory-a46593d-exact-local.zip": "6a2bb8354ca0db4c8a22ec270aa8d516adc92a9fb1598604ef471655e2451cd5",
+    "/private/tmp/cnb-admission-factory-a46593d-exact-local/summary.json": "4f8824df958a78c6900babf02f5e2c0baef26dd698b1542930d8904948695ebe",
+    "/private/tmp/cnb-admission-factory-a46593d-exact-local/pytest.xml": "b9ae5e8d3cae0de462f3764400c22f9ace19bc1fcde5c821e49f1a128cbbe0a2",
+    "/private/tmp/cnb-admission-factory-a46593d-exact-local/affected-pytest.log": "5b94506c2a8dc293ae171213a2589d221208f830e3434e7d58bf6a2875cf5b55",
+    "/private/tmp/cnb-admission-factory-a46593d-source.tar.gz": "cae68c3b294efeccd969d05eb1d15cb8e588f5e841d40b2aee5552e50b0746b4",
+    "/private/tmp/cnb-admission-factory-a46593d.bundle": "b47fe4b4977bd13f855905a3897cc539ee43ed68a4528cdcc0299ffcbe5f45d2"
+  },
+  "archive_members_verified": 9,
+  "archive_crc_verified": true,
+  "native_halle_status": "246/246 passed; downloaded archive CRC, eight listed payload hashes, JUnit counts and five current executable hashes independently verified",
+  "boundary": "no original private batch/input/state/ledger/authority mutation; no cloud commands or paid retry",
+  "python": "3.13.7",
+  "transfer_bundle_prerequisite": "eb91626507d0419003a739ecc314dbbf9549fc14",
+  "native_halle": {
+    "revision": "a46593d6abceeaee31a098e46cdd48a5b4480ff4",
+    "pytest": {
+      "tests": 246,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "source_sha256": {
+      "src/cloud_network_benchmark/admission.py": "4d9756b9659050214a5b90fadcfa1a2f698809d8d6e84e67112b96f8874636e7",
+      "src/cloud_network_benchmark/azure_provider.py": "989b543e288aae2bd149b421d59e8d402161a09170319652a70f4766b75c69d4",
+      "src/cloud_network_benchmark/lifecycle_runtime.py": "a50b3c6daadb0c9e0365ee65c24e19738f61a126827d9a9dd1c91c2b7273316b",
+      "src/cloud_network_benchmark/orchestration.py": "9d853bc3f44fbfe83de1e1a3945ec9c81badced0804ebb372df9984910d75fca",
+      "src/cloud_network_benchmark/lifecycle_cleanup.py": "9b798ed26d13e874527e77d626a6baef3a8cd6f9005f7cb02f6461ddb2d379c8"
+    },
+    "archive": "/private/tmp/cnb-admission-factory-a46593d-native-evidence.zip",
+    "archive_sha256": "656db277914deef0c7abfdd0737036b76a5029779e51d271dc8b4eb6c51f49a4",
+    "archive_crc_verified": true,
+    "archive_members_verified": 8,
+    "summary_sha256": "a1a8f89e7bc22c76df8f9ee0792c509d289fea4508da108fe155c0310e0c0f92",
+    "pytest_log_sha256": "7fb17bb0bcd137e785bca0e672c8bddce83711a34ba93198105370af459693cd",
+    "junit_sha256": "1646453e7be4bce5e4e2a99e95d592832a8b9dd3ecd29da19943a0933631242a",
+    "python": "Python 3.12.3",
+    "source_clean_before_after": true,
+    "driver_checks": 6,
+    "remote_root": "/u/halle/brek/home_at/cnb/saved-plan-native-wsJSS7/admission-factory-rFyY5Aqb",
+    "platform": "Linux x86_64"
+  },
+  "native_baseline_reproduction": {
+    "baseline_revision": "eb91626507d0419003a739ecc314dbbf9549fc14",
+    "purpose": "six new regressions fail on original executable source; only the new test file is overlaid",
+    "pytest": {
+      "tests": 6,
+      "failures": 6,
+      "errors": 0,
+      "skipped": 0
+    },
+    "exit_code": 1,
+    "tracked_executable_source_unchanged": true,
+    "expected_red": true,
+    "archive": "/private/tmp/cnb-admission-factory-eb91626-regressions.zip",
+    "archive_sha256": "5659e01d003693c4de7d97ee54ffa6a99968526aa44583407eaa513615f2a237",
+    "member_sha256": {
+      "summary.json": "f7ea9cac26420818213fa41e81b349b3df151f71a7885c30c64cf677cfef0837",
+      "pytest.log": "ebdf9f0d67965237ab4dbdc720904a2e94fdac77ab38ac6bbc8ee4e8688559b0",
+      "pytest.xml": "3df1145ae764017b0029e5e07d3b4c04d8a431ddb56869a1c96dbda03389e18c"
+    },
+    "archive_crc_verified": true
+  }
+}

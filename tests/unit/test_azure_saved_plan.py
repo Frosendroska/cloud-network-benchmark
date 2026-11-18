@@ -55,7 +55,7 @@ def azure_scope(root="pair", scenario="same_zone", region="swedencentral"):
 def azure_document(v,r):
     p=plan_document(v,r,"azure")
     for item in p["resource_changes"]: item["provider_name"]="registry.terraform.io/hashicorp/azurerm"
-    p["configuration"]={"provider_config":{"azurerm":{"full_name":"registry.terraform.io/hashicorp/azurerm","expressions":{"subscription_id":{"references":["var.subscription_id"]}}}},"root_module":{"resources":[{"address":a,"provider_config_key":"azurerm","expressions":{}} for a in sorted({a.split("[",1)[0] for a in r})]}}
+    p["configuration"]={"provider_config":{"azurerm":{"full_name":"registry.terraform.io/hashicorp/azurerm","expressions":{"subscription_id":{"references":["var.subscription_id"]},"resource_provider_registrations":{"constant_value":"none"}}}},"root_module":{"resources":[{"address":a,"provider_config_key":"azurerm","expressions":{}} for a in sorted({a.split("[",1)[0] for a in r})]}}
     return p
 
 
