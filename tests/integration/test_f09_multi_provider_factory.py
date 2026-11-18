@@ -1075,9 +1075,34 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
         from cloud_network_benchmark.contracts.validation import ValidatorInput
         from cloud_network_benchmark.validation import evaluate_comparison, validate_bundle
+        # Compare both shapes during the original projection, before acquisition
+        # binding rewrites timing evidence and seals the finalized bundle.
+        from cloud_network_benchmark import lifecycle_projection
+        from types import SimpleNamespace
+        original_validator_input = lifecycle_projection._validator_input
+        projected_azure_controls = []
+        def compare_azure_projection(**kwargs):
+            projected = original_validator_input(**kwargs)
+            if str(kwargs["child"].provider) == "azure":
+                wrapped_result = kwargs["result"]
+                wrapped = wrapped_result.values["create"]
+                direct_result = SimpleNamespace(**vars(wrapped_result))
+                direct_result.values = {**wrapped_result.values, "create": wrapped.deployment}
+                direct, *_ = original_validator_input(**{**kwargs, "result": direct_result})
+                control = projected[0].iperf3_control_evidence.value
+                assert control is not None
+                assert direct.iperf3_control_evidence.value == control
+                assert control["vm_a_host_id"] == wrapped.deployment.vm_a.connection.host
+                assert control["vm_b_host_id"] == wrapped.deployment.vm_b.connection.host
+                assert control["private_ipv4_b"] == wrapped.deployment.vm_b.private_ipv4
+                assert json.loads((kwargs["root"] / "metadata/iperf3-control-evidence.json").read_text()) == control
+                projected_azure_controls.append(control)
+            return projected
+        monkeypatch.setattr(lifecycle_projection, "_validator_input", compare_azure_projection)
         evaluated_at = max(clock.utc_now(), datetime.now(timezone.utc)) + timedelta(minutes=1)
         finalized = finalize_production_batch(parent_path=parent_path, children=children,
             parent=parent, lifecycle=result, repository_root=ROOT, evaluated_at=evaluated_at)
+        assert len(projected_azure_controls) == 1
         assert set(finalized) == {"aws", "azure", "gcp"}
         projected_parent = json.loads(parent_path.read_text(encoding="utf-8"))
         saved_inputs, roots = {}, {}
@@ -1086,28 +1111,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             roots[provider] = Path(ref["result_path"]).resolve()
             saved_inputs[provider] = ValidatorInput.model_validate_json(
                 (roots[provider] / "validation" / "input.json").read_text(encoding="utf-8"))
-        # Azure wraps its typed pair; both projection sites must bind the same
-        # hosts and proof as projecting that exact pair directly.
-        from cloud_network_benchmark.lifecycle_projection import _validator_input
-        from cloud_network_benchmark.manifests import ChildRunManifest
-        from types import SimpleNamespace
-        azure_result = result.provider_results["azure"]
-        azure_ref = next(row for row in projected_parent["child_runs"] if row["provider"] == "azure")
-        azure_child_path = Path(azure_ref["manifest_path"])
-        azure_child = ChildRunManifest.model_validate_json(azure_child_path.read_text())
-        wrapped = azure_result.values["create"]
-        direct_result = SimpleNamespace(**vars(azure_result))
-        direct_result.values = {**azure_result.values, "create": wrapped.deployment}
-        direct, *_ = _validator_input(parent=parent, parent_path=parent_path, child=azure_child,
-            child_path=azure_child_path, root=roots["azure"], result=direct_result,
-            reservation=result.reservation_evidence)
-        control = saved_inputs["azure"].iperf3_control_evidence.value
-        assert control is not None
-        assert direct.iperf3_control_evidence.value == control
-        assert control["vm_a_host_id"] == wrapped.deployment.vm_a.connection.host
-        assert control["vm_b_host_id"] == wrapped.deployment.vm_b.connection.host
-        assert control["private_ipv4_b"] == wrapped.deployment.vm_b.private_ipv4
-        assert json.loads((roots["azure"] / "metadata/iperf3-control-evidence.json").read_text()) == control
+        saved_control = saved_inputs["azure"].iperf3_control_evidence.value
+        assert saved_control == projected_azure_controls[0]
+        assert json.loads((roots["azure"] / "metadata/iperf3-control-evidence.json").read_text()) == saved_control
         preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
             for provider, value in saved_inputs.items()}
         replays = evaluate_comparison(list(saved_inputs.values()), list(preliminary.values()))
