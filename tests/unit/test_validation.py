@@ -71,12 +71,13 @@ def test_nominal_completion_requires_successful_exact_command_and_receiver_span(
     command = SimpleNamespace(unit_id="u1", producer="vm_a",
         request={"argv":["iperf3", "-c", "10.0.0.2", "-t", "10", "-O", "5", "-P", "1"]},
         result={"outcome":"succeeded", "exit_code":0})
-    value = SimpleNamespace(mode=ExperimentMode.SHORT_STUDY, commands=[command])
+    value = SimpleNamespace(mode=ExperimentMode.ACCEPTANCE, context="failure_check", commands=[command])
     tcp = NativeParse(sessions=("session",),
         session_details=({"start":{"cookie":"cookie", "test_start":{"duration":10,"omit":5,
             "protocol":"TCP", "num_streams":1}}},),
         receiver_totals=({"session_id":"session", "bytes":123, "seconds":9.999802},))
-    origins = {"cookie":{"nominal_required_seconds":15, "nominal_receiver_span_seconds":15.000988}}
+    origins = {"cookie":{"nominal_required_seconds":15, "nominal_receiver_span_seconds":15.000988,
+        "stream_count":1, "origin_utc":100.0, "crossing_start_cutoff_us":0}}
     acquisition = {"u1":([],[])}
     assert _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
     origins["cookie"]["nominal_receiver_span_seconds"] = 14.999999
@@ -84,6 +85,25 @@ def test_nominal_completion_requires_successful_exact_command_and_receiver_span(
     origins["cookie"]["nominal_receiver_span_seconds"] = 15.000988
     command.result["exit_code"] = 1
     assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    command.result["exit_code"] = 0
+    wrong_cookie_tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"wrong-cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"session", "bytes":123, "seconds":9.999802},))
+    assert not _iperf_nominal_completion_proven(value, unit, wrong_cookie_tcp, acquisition, origins)
+    wrong_total_tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"other", "bytes":123, "seconds":9.999802},))
+    assert not _iperf_nominal_completion_proven(value, unit, wrong_total_tcp, acquisition, origins)
+    origins["cookie"]["stream_count"] = 2
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["stream_count"] = 1
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, {"u1":([], ["native end missing"])}, origins)
+    value.mode = ExperimentMode.SHORT_STUDY
+    value.context = "standard"
+    day_unit = SimpleNamespace(phase="continuous_day", measured_seconds=86400, streams=1)
+    assert not _iperf_nominal_completion_proven(value, day_unit, tcp, acquisition, origins)
 
 
 def make_input(repository_root, provider="aws", campaign="camp", *, config_name="exp-001-multi-provider.yaml", mode_override=None, config_path=None):

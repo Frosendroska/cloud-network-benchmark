@@ -236,8 +236,6 @@ def _replayed_iperf3_control_association(value: ValidatorInput
             or record.path != declaration.path or record.kind != declaration.kind
             or record.retrieval_state != "verified" or record.closed is not True):
         return None, set()
-    if any(isinstance(settings.get(key), bool) for key in ("duration", "omit", "num_streams")):
-        return False
     try:
         root = Path(value.child_result_root)
         record.verify_materialized_file(root)
@@ -1427,14 +1425,22 @@ def _iperf_nominal_completion_proven(value: ValidatorInput, unit: Any, tcp: Nati
         verified_origins: dict[str, dict[str, Any]]) -> bool:
     """Prove nominal short-run completion from the verified same-VM receiver lifecycle."""
     phase = str(getattr(unit.phase, "value", unit.phase))
-    if (value.mode != ExperimentMode.SHORT_STUDY or phase not in {"single_flow", "multi_flow"}
+    mode = str(getattr(value.mode, "value", value.mode))
+    context = str(getattr(value.context, "value", value.context))
+    allowed_mode = (mode == ExperimentMode.SHORT_STUDY.value
+        or (mode == ExperimentMode.ACCEPTANCE.value and context == "failure_check"))
+    if (not allowed_mode or phase not in {"single_flow", "multi_flow"}
             or tcp is None or len(tcp.sessions) != 1 or len(tcp.session_details) != 1
             or len(tcp.receiver_totals) != 1):
+        return False
+    if tcp.receiver_totals[0].get("session_id") != tcp.sessions[0]:
         return False
     detail = tcp.session_details[0]
     start = detail.get("start") if isinstance(detail, dict) else None
     settings = start.get("test_start") if isinstance(start, dict) else None
     if not isinstance(settings, dict):
+        return False
+    if any(isinstance(settings.get(key), bool) for key in ("duration", "omit", "num_streams")):
         return False
     client_commands = [command for command in value.commands if command.unit_id == unit.unit_id
         and command.producer == "vm_a" and isinstance(command.request.get("argv"), list)
@@ -1470,10 +1476,18 @@ def _iperf_nominal_completion_proven(value: ValidatorInput, unit: Any, tcp: Nati
         return False
     required = observed.get("nominal_required_seconds")
     span = observed.get("nominal_receiver_span_seconds")
+    stream_count = observed.get("stream_count")
+    origin_utc = observed.get("origin_utc")
+    crossing_cutoff = observed.get("crossing_start_cutoff_us")
     if (isinstance(required, bool) or not isinstance(required, int)
             or required != duration_value + omit_value
             or isinstance(span, bool) or not isinstance(span, (int, float))
-            or not math.isfinite(span) or span < required):
+            or not math.isfinite(span) or span < required
+            or isinstance(stream_count, bool) or stream_count != native_streams
+            or isinstance(origin_utc, bool) or not isinstance(origin_utc, (int, float))
+            or not math.isfinite(origin_utc)
+            or isinstance(crossing_cutoff, bool) or not isinstance(crossing_cutoff, int)
+            or crossing_cutoff < 0):
         return False
     return True
 
@@ -1726,7 +1740,7 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
             for item in sock.probe_counts
         ):
             findings.append(_finding("generation.unavailable", "warning", "valid-duration sent/runtime evidence is unavailable", unit=unit.unit_id))
-        coverage = _coverage(value, unit, sock, tcp, acquisition, verified_origins)
+        coverage = _coverage(value, unit, sock, tcp, acquisition, unit_origins)
         if sock.samples or (tcp and (tcp.receiver_intervals or tcp.receiver_totals)):
             any_measurement = True
         if not coverage["complete"]:
