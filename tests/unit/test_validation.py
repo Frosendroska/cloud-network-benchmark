@@ -67,7 +67,7 @@ def test_nominal_terminal_lower_bound_uses_only_replayed_native_windows():
 def test_nominal_completion_requires_successful_exact_command_and_receiver_span():
     from cloud_network_benchmark.native import NativeParse
 
-    unit = SimpleNamespace(phase="single_flow", measured_seconds=10, streams=1)
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", measured_seconds=10, streams=1)
     command = SimpleNamespace(unit_id="u1", producer="vm_a",
         request={"argv":["iperf3", "-c", "10.0.0.2", "-t", "10", "-O", "5", "-P", "1"]},
         result={"outcome":"succeeded", "exit_code":0})
