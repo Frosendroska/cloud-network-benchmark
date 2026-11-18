@@ -132,14 +132,18 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
             uncertainty = mapping.estimated_error_ms.value / 1000
             source_unit = next((item for item in value.measurement_units if item.unit_id == timing.unit_id), None)
             mode_name = str(getattr(value.mode, "value", value.mode))
-            capture_receiver_plot = (source_unit is not None
+            wants_receiver_plot = (source_unit is not None
                 and mode_name in {"short_study", "acceptance", "calibration"}
                 and source_unit.kind not in {"probe_chunk", "continuous_day"})
             receiver_records = [record for record in value.artifact_records
-                if record.artifact_id == "iperf3_server_log"] if capture_receiver_plot and source.tool == "iperf3" else []
-            if capture_receiver_plot and source.tool == "iperf3" and len(receiver_records) != 1:
-                raise ValueError("receiver plot source lacks one deployment-scoped VM B server log")
+                if record.artifact_id == "iperf3_server_log"] if wants_receiver_plot and source.tool == "iperf3" else []
+            if len(receiver_records) > 1:
+                raise ValueError("receiver plot source has ambiguous deployment-scoped VM B server logs")
             receiver_record = receiver_records[0] if receiver_records else None
+            # Supplemental B-native line proof is additive. When legacy materialized
+            # input has no persistent server log, retain client/acquisition replay
+            # for temporal support and leave the new native-line plot unavailable.
+            capture_receiver_plot = wants_receiver_plot and receiver_record is not None
             replay_records = list(candidates)
             if receiver_record is not None and all(record.artifact_id != receiver_record.artifact_id
                     for record in replay_records):

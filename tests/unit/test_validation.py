@@ -344,6 +344,47 @@ def test_f08_intersects_materialized_loaded_sockperf_and_receiver_sources(reposi
     assert coverage["complete"] is True
     assert [sample.packet_index for sample in _measured_samples(prepared,unit,sock,{unit.unit_id:(windows,errors)})] == [0,1]
 
+    # Missing supplemental B JSONL keeps existing temporal source support, while
+    # a present but unrelated B session must fail closed.
+    bad_server_path = "server-logs/unrelated-iperf-session.jsonl"
+    bad_server_bytes = (json.dumps({"event":"start","data":{"cookie":"different-cookie",
+        "test_start":{"protocol":"TCP","num_streams":1,"omit":5,"duration":60,
+            "interval":1,"blksize":131072,"reverse":False}}}) + "\n"
+        + json.dumps({"event":"interval","data":{"streams":[{"socket":17,"start":0,
+            "end":60,"seconds":60,"bytes":125_000_000,"sender":False,"omitted":False}]}}) + "\n"
+        + json.dumps({"event":"end","data":{"sum_received":{"bytes":125_000_000,"seconds":60}}}) + "\n").encode()
+    write(bad_server_path,bad_server_bytes)
+    bad_server_record = record("iperf3_server_log",bad_server_path,"iperf3-server-jsonl",
+        VmRole.VM_B,None,bad_server_bytes)
+    wrong_cookie = prepared.model_copy(update={"artifact_records":[*records,bad_server_record]})
+    _bad_windows,bad_errors = _acquisition_windows(wrong_cookie,timing)
+    assert any("client/receiver JSON lacks a unique session" in error for error in bad_errors)
+    wrong_role_record = bad_server_record.model_copy(update={"producer":VmRole.VM_A})
+    wrong_role = prepared.model_copy(update={"artifact_records":[*records,wrong_role_record]})
+    _bad_windows,identity_errors = _acquisition_windows(wrong_role,timing)
+    assert any("supplemental VM B receiver artifact lacks" in error for error in identity_errors)
+
+    # B-native and client-embedded receiver evidence are both checked against
+    # acquisition rows; a matching B log cannot mask a client-only contradiction.
+    receiver_output = native_client["server_output_json"]
+    valid_server_path = "server-logs/iperf3-server-valid.jsonl"
+    valid_server_bytes = (json.dumps({"event":"start","data":receiver_output["start"]}) + "\n"
+        + "\n".join(json.dumps({"event":"interval","data":item})
+            for item in receiver_output["intervals"]) + "\n"
+        + json.dumps({"event":"end","data":receiver_output["end"]}) + "\n").encode()
+    write(valid_server_path,valid_server_bytes)
+    valid_server_record = record("iperf3_server_log",valid_server_path,"iperf3-server-jsonl",
+        VmRole.VM_B,None,valid_server_bytes)
+    changed_client = json.loads(client_json)
+    changed_client["server_output_json"]["intervals"][0]["streams"][0]["bytes"] += 1
+    changed_client_bytes = json.dumps(changed_client).encode()
+    changed_client_record = record(client_id,client_path,"iperf3-json",VmRole.VM_A,unit.unit_id,
+        changed_client_bytes)
+    contradictory = prepared.model_copy(update={"artifact_records":[
+        changed_client_record if item.artifact_id == client_id else item for item in [*records,valid_server_record]]})
+    _contradictory_windows,contradictory_errors = _acquisition_windows(contradictory,timing)
+    assert any("native iperf interval offsets, bytes" in error for error in contradictory_errors)
+
 
 def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_source(repository_root, tmp_path):
     from cloud_network_benchmark.acquisition import bind_acquisition_sources

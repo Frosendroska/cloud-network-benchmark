@@ -528,7 +528,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                                 for i in range(streams)]
                             rows = []
                             for i in range(streams):
-                                rows.extend([{"socket": 17 + i, "start": 0, "end": 4, "seconds": 4,
+                                rows.extend([{"socket": 17 + i, "start": 0, "end": 5, "seconds": 5,
                                     "bytes": 250, "omitted": True, "sender": False},
                                     {"socket": 17 + i, "start": 0, "end": duration, "seconds": duration,
                                     "bytes": 125000000 // streams, "omitted": False, "sender": False}])
@@ -855,7 +855,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             # records must preserve that native order rather than interleave phases.
             for omitted in (True, False):
                 for i, stream, initial, post in origins:
-                    start, end = ((initial, initial + 4_000_000) if omitted else
+                    start, end = ((initial, initial + 5_000_000) if omitted else
                         (post, post + duration * 1_000_000))
                     count = 250 if omitted else 125000000 // streams
                     source_lines.append("CNB_ACQ_V1 " + json.dumps({**common, "record_kind": "receiver_interval",

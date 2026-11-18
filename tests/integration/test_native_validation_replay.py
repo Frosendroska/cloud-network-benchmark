@@ -329,9 +329,10 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                     "result":{**commands[-1].result,"action_id":action},
                     "binary_version":Evidence[str](value=iperf_build.binary_version),
                     "source_identity":Evidence[str](value=iperf_build.source_reference)})
-            streams=[{"socket":17+i,"start":0,"end":duration,"bytes":125000000//n,
+            streams=[{"socket":17+i,"start":0,"end":duration,"seconds":duration,
+                "bytes":125000000//n,
                 "omitted":False,"sender":False} for i in range(n)]
-            connections=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201+i,
+            connections=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201,
                 "remote_host":"10.0.0.1","remote_port":50100+i} for i in range(n)]
             settings={"protocol":"TCP","num_streams":n,"omit":5,"duration":duration,
                 "interval":1,"blksize":131072,"reverse":False}
@@ -353,7 +354,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                     rows.extend([
                         {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"initial","origin_us":left//1000,"start_time_fixed_us":left//1000},
                         {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"post_omit","origin_us":left//1000,"start_time_fixed_us":left//1000},
-                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":str(5201+i),"remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
+                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":"5201","remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
                 receiver_source_rows.extend(rows)
         if day_unit:
             cookie=f"f08-{unit.unit_id}-session"
@@ -457,8 +458,12 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 "start":second,"end":second+1,"seconds":1,"bytes":125000000,"sender":False,"omitted":False}]}}
                 for second in range(86_400))
         else:
-            receiver_events.append({"event":"interval","data":{"sum":{"start":interval_start,"end":interval_start+receiver_seconds,
-                "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
+            native_streams=[{"socket":17+i,"start":interval_start,"end":interval_start+receiver_seconds,
+                "seconds":receiver_seconds,"bytes":received_bytes//(unit.streams or 1),
+                "sender":False,"omitted":False} for i in range(unit.streams or 1)]
+            receiver_events.append({"event":"interval","data":{"streams":native_streams,
+                "sum":{"start":interval_start,"end":interval_start+receiver_seconds,
+                    "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
         receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
     materialize("iperf3_server_log",None,"\n".join(json.dumps(event) for event in receiver_events)+"\n")
     from cloud_network_benchmark.acquisition import bind_acquisition_sources

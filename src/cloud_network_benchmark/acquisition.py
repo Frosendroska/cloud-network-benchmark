@@ -387,6 +387,8 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     native_tail = False
     matched_count = 0
     stream_rows = native["stream_factory"]()
+    client_stream_factory = native.get("client_stream_factory")
+    client_stream_rows = client_stream_factory() if callable(client_stream_factory) else None
     settings_checked = False
     missing_native_row = False
     filtered_streams: dict[str, dict[str, int]] = {}
@@ -467,6 +469,12 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
                         if native_row is None:
                             missing_native_row = True
                         else:
+                            if client_stream_rows is not None:
+                                client_row = next(client_stream_rows, None)
+                                if client_row is None:
+                                    raise ValueError("native iperf client intervals do not match the source count")
+                                _corroborate_iperf_interval(value, stream, origin, client_row,
+                                                            native["client_server_output"])
                             _corroborate_iperf_interval(value, stream, origin, native_row,
                                                         native["server_output"])
                             native_line = native_row.get("_native_line")
@@ -531,6 +539,10 @@ def _preflight_iperf_source(records_factory, source: AcquisitionSource,
     partial_allowed = partial_allowed or native_tail
     if extra is not None and not partial_allowed:
         raise ValueError("native iperf receiver intervals do not match the source count")
+    if client_stream_rows is not None:
+        client_extra = next(client_stream_rows, None)
+        if client_extra is not None and not partial_allowed:
+            raise ValueError("native iperf client intervals do not match the source count")
     if matched_count == 0:
         raise ValueError("native iperf receiver has no independently corroborated interval")
     native["partial_allowed"] = partial_allowed
@@ -1183,7 +1195,9 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
                         or not isinstance(receiver.get("server_output"), Mapping)):
                     return None
                 return {"cookie": expected_cookie, "client_settings": settings,
-                    "receiver_settings": b_settings, "server_output": receiver["server_output"],
+                    "receiver_settings": b_settings, "client_server_output": server_output,
+                    "server_output": receiver["server_output"],
+                    "client_stream_factory": lambda: iter(streams),
                     "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie),
                     "receiver_complete": receiver.get("receiver_complete") is True,
                     "client_complete": isinstance(value.get("end"), Mapping), "client_tail": False}
@@ -1205,8 +1219,8 @@ def _native_iperf_metadata(path: Path, expected_cookie: str,
         receiver = _native_server_metadata(receiver_path, expected_cookie)
         if receiver is None:
             return None
-        return {**client,
-                **receiver, "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie)}
+        return {**client, **receiver,
+                "stream_factory": lambda: _iter_server_streams(receiver_path, expected_cookie)}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
 
