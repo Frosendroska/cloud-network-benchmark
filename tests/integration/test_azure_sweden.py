@@ -15,7 +15,17 @@ IMAGE = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
 def sweden(root,tmp_path):
     d=deployment(root)
     d=d.model_copy(update={"vm_a":d.vm_a.model_copy(update={"region":"swedencentral"}),"vm_b":d.vm_b.model_copy(update={"region":"swedencentral"})})
-    now=datetime.now(timezone.utc)
+    # Use one minute-aligned fake instant for the provider clock and reservation.
+    # A real wall clock here made the +15 minute requested trigger floor up to
+    # 59 seconds earlier while this fixture allowed only a 30 second workflow
+    # margin, so unrelated Sweden success/recovery cases failed before reaching
+    # their intended assertions.
+    now=datetime.now(timezone.utc).replace(second=0,microsecond=0)
+    reservation=d.reservation.value.model_copy(update={
+        "cap_started_at":d.reservation.value.cap_started_at.model_copy(update={"value":now-timedelta(seconds=30)}),
+        "expires_at":d.reservation.value.expires_at.model_copy(update={"value":now+timedelta(seconds=1170)}),
+    })
+    d=d.model_copy(update={"reservation":d.reservation.model_copy(update={"value":reservation})})
     o=options(tmp_path).model_copy(update={"selected_image":IMAGE,"retry_end_at":now+timedelta(minutes=16)})
     return d,o,now
 
@@ -47,6 +57,18 @@ def test_deployment_exception_is_bounded_even_for_direct_calls(repository_root,t
     else: d=d.model_copy(update={"vm_b":d.vm_b.model_copy(update={"region":"germanywestcentral"})})
     with pytest.raises(ValueError,match="scenario locality"):
         az.build_pair_inputs(d,o)
+    assert not o.attempt_root.exists()
+
+
+def test_minute_floor_that_breaks_complete_workflow_is_rejected_before_runner(repository_root,tmp_path):
+    d,o,now=sweden(repository_root,tmp_path)
+    runner=SwedenRunner(d,o,now)
+    # Request is just before the next minute: flooring takes it from +14:59
+    # to +14:00, while the original 900-second workflow bound ends at +14:30.
+    request=expiry_request(d,o,now+timedelta(minutes=14,seconds=59))
+    with pytest.raises(ValueError,match="complete workflow bound exceeds actual expiry trigger"):
+        az.register_expiry(d,request,o,runner,clock=lambda:1.,utc_now=lambda:now)
+    assert not runner.requests
     assert not o.attempt_root.exists()
 
 
