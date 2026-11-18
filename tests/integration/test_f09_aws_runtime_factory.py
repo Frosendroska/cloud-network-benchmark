@@ -1096,13 +1096,18 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
     from cloud_network_benchmark.contracts.validation import ValidatorInput
     from cloud_network_benchmark.validation import validate_bundle
+    close_evidence = provider_result.values["close"].evidence
+    terminal_times = [clock.utc_now(), close_evidence["measurement_ended_at"],
+        close_evidence["listeners"].closed_at,
+        *(closure.closed_at for closure in close_evidence["diagnostics"].values())]
+    evaluated_at = max(timestamp for timestamp in terminal_times if timestamp is not None)
     finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
-        parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=NOW + timedelta(minutes=1))
+        parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=evaluated_at)
     result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
     result_root = (repository_root / result_ref.result_path).resolve()
     result_file = result_root / "validation" / "input.json"
     saved = ValidatorInput.model_validate_json(result_file.read_text(encoding="utf-8"))
-    replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
+    replay = validate_bundle(saved, evaluated_at=evaluated_at)
     assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
     if expected_validity is not None:
         assert replay.validation_status.data_validity == expected_validity, [
