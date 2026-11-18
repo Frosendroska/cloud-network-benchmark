@@ -93,8 +93,10 @@ def _source_inner_unions(windows: Sequence[Any]) -> list[tuple[str, int, int]]:
                       row.end_earliest_ns, row.end_latest_ns]
             if merged and (bounds[:2] == merged[-1][2:]
                            or bounds[1] <= merged[-1][2]):
-                merged[-1][2] = max(merged[-1][2], bounds[2])
-                merged[-1][3] = max(merged[-1][3], bounds[3])
+                # Keep an actually observed endpoint bracket. Coordinatewise
+                # maxima could invent a bracket and falsely prove later adjacency.
+                if bounds[2] > merged[-1][2]:
+                    merged[-1][2:] = bounds[2:]
             else:
                 merged.append(bounds)
         result.extend((key[0], bounds[1], bounds[2]) for bounds in merged)

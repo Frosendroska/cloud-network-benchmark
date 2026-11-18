@@ -217,6 +217,11 @@ def test_source_union_shares_exact_native_boundary_before_clock_projection():
             **{field: changed})])) == 2
     # Invocation and mapping contexts are separated by the caller, never accumulated.
     assert len(_source_inner_unions([first]) + _source_inner_unions([second])) == 2
+    nested = [window(0, 10, start_latest_ns=1, end_latest_ns=12),
+        window(1, 9, start_latest_ns=2, end_latest_ns=15),
+        window(10, 20, start_latest_ns=15, end_latest_ns=21)]
+    # The first two overlapping rows must not manufacture endpoint bracket [10,15].
+    assert len(_source_inner_unions(nested)) == 2
 
 
 def test_p730_single_flow_source_union_keeps_outer_precision_and_clock_bounds():
