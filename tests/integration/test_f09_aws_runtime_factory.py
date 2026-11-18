@@ -492,7 +492,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                                         native_filter_start_ns=timer_start_ns + 400_000_000,
                                         native_filter_end_ns=termination_ns - 50_000_000)
                                 if record["record_kind"] == "receiver_interval" and record["omitted"]:
-                                    record["interval_end_us"] = base_ns // 1000 + 4_000_000
+                                    record["interval_end_us"] = base_ns // 1000 + 5_000_000
                                 rows.append("CNB_ACQ_V1 " + json.dumps(record, separators=(",", ":")))
                             stderr_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
                             csv_path = Path(native_request.argv[native_request.argv.index("--full-log") + 1])
