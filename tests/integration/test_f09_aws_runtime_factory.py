@@ -914,18 +914,19 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only", "capture_fault"), [
-    ("failure_check", False, False, "partial", "eu-central-1", False, "none"),
-    ("failure_check", True, False, "partial", "eu-central-1", False, "none"),
-    ("failure_check", True, True, "valid", "eu-central-1", False, "none"),
-    ("failure_check", True, True, "valid", "eu-north-1", False, "none"),
-    ("failure_check", False, False, "partial", "eu-central-1", True, "none"),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "missing"),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "failed"),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "foreign"),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only", "capture_fault", "unknown_server_error"), [
+    ("failure_check", False, False, "partial", "eu-central-1", False, "none", False),
+    ("failure_check", True, False, "partial", "eu-central-1", False, "none", False),
+    ("failure_check", True, True, "valid", "eu-central-1", False, "none", False),
+    ("failure_check", True, True, "valid", "eu-north-1", False, "none", False),
+    ("failure_check", True, True, "partial", "eu-central-1", True, "none", False),
+    ("failure_check", True, True, "partial", "eu-central-1", True, "none", True),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "missing", False),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "failed", False),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "foreign", False),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only, capture_fault):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only, capture_fault, unknown_server_error):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -977,21 +978,50 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         def fake_listener_close(connection, **kwargs):
             workspace = kwargs["results_workspace"]
             reported_end = datetime.fromisoformat(json.loads(runner.guest_outcome)["guest_finished_at"])
-            closed_at = reported_end + timedelta(microseconds=1)
+            owner_started = reported_end + timedelta(microseconds=1)
+            owner_finished = owner_started + timedelta(microseconds=1)
+            stop_started = owner_finished + timedelta(microseconds=1)
+            stop_finished = stop_started + timedelta(microseconds=1)
+            close_started = stop_finished + timedelta(microseconds=1)
+            closed_at = close_started + timedelta(microseconds=1)
             stdout_path, stderr_path = (f"{workspace}/server-logs/iperf3-server.jsonl",
                 f"{workspace}/server-logs/iperf3-server.err")
-            actions = tuple({"action_id": f"f09-listener-{action}-{connection.deployment_id}-iperf3",
-                "action_type": "ssh", "vm_id": connection.vm_b.host, "role": "vm_b",
-                "request": {"argv": ["ssh", connection.vm_b.host,
-                    ("sudo systemctl stop " if action == "stop" else "sudo python3 -c "
-                        ) + (f"cnb-{connection.deployment_id}-iperf3" if action == "stop" else
-                            f"{stdout_path} {stderr_path}")]},
-                "result": {"outcome": "succeeded", "exit_code": 0,
-                    "started_at": closed_at.isoformat(), "finished_at": closed_at.isoformat()}}
-                for action in ("stop", "owner-process", "closed-files"))
-            owner = {"pid": 22, "start_ticks": 33, "boot_id": "12345678-1234-1234-1234-123456789abc",
-                "cgroup": f"/system.slice/cnb-{connection.deployment_id}-iperf3.service",
-                "log_ids": [[1, 2], [1, 3]], "closed_at_utc": closed_at.isoformat()}
+            log = runner.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
+            err = runner.results_roots["vm_b"] / "server-logs" / "iperf3-server.err"
+            if unknown_server_error:
+                with log.open("ab") as stream:
+                    stream.write((json.dumps({"event":"error","data":"unrecognized server diagnostic"})+"\n").encode())
+            prefix = log.read_bytes()
+            unit = f"cnb-{connection.deployment_id}-iperf3"
+            log_ids = [[log.stat().st_dev,log.stat().st_ino],[err.stat().st_dev,err.stat().st_ino]]
+            owner = {"pid": 32000, "start_ticks": 1234, "boot_id": "12345678-1234-1234-8234-123456789abc",
+                "cgroup": f"/system.slice/{unit}.service", "log_ids": log_ids,
+                "closed_at_utc": closed_at.isoformat()}
+            pre_stop = {"available":True,"boundary":"pre_stop","deployment_id":connection.deployment_id,
+                "controller_session_id":"fake-session","listener_invocation_id":"f02r-vm_b-listener-iperf3",
+                "unit":unit,"pid":owner["pid"],"start_ticks":owner["start_ticks"],"boot_id":owner["boot_id"],
+                "cgroup":owner["cgroup"],"log_path":stdout_path,"log_ids":log_ids,
+                "prefix_bytes":len(prefix),"prefix_sha256":hashlib.sha256(prefix).hexdigest(),
+                "captured_at_utc":owner_started.isoformat()}
+            # The owned stop pair is appended only after the bounded pre-stop snapshot.
+            with log.open("ab") as stream:
+                stream.write((json.dumps({"event":"error","data":"interrupt - the server has terminated"})+"\n"+
+                    json.dumps({"event":"end","data":{}})+"\n").encode())
+            def close_action(action, started, finished, command):
+                return {"action_id":f"f09-listener-{action}-{connection.deployment_id}-iperf3",
+                    "action_type":"ssh","vm_id":connection.vm_b.host,"role":"vm_b",
+                    "request":{"argv":["ssh",connection.vm_b.host,command]},
+                    "result":{"outcome":"succeeded","exit_code":0,
+                        "started_at":started.isoformat(),"finished_at":finished.isoformat()}}
+            actions = (
+                close_action("owner-process",owner_started,owner_finished,
+                    f"sudo python3 -c owner {stdout_path} {stderr_path}"),
+                close_action("stop",stop_started,stop_finished,f"sudo systemctl stop {unit}"),
+                close_action("closed-files",close_started,closed_at,
+                    "sudo python3 -c closure " + " ".join([str(owner["pid"]),str(owner["start_ticks"]),
+                        owner["boot_id"],owner["cgroup"],*(str(value) for pair in log_ids for value in pair),
+                        stdout_path,stderr_path])))
+            owner["pre_stop_prefix"] = pre_stop
             return RemoteListenerClosure(deployment_id=connection.deployment_id, role="vm_b", closed=True,
                 closed_at=closed_at, observations={"iperf3": owner, "sockperf": owner},
                 actions=actions, failures=())
@@ -1052,9 +1082,16 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert evidence["run_id"] == child.run_id and evidence["deployment_id"] == child.deployment_id
         assert evidence["readiness"]["ready"] is True
         assert evidence["listener"]["closed"] is True
-        assert "unavailable" in evidence["readiness"]["event_association"]
+        assert evidence["readiness"]["event_association"]["status"] == "verified"
         replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
         assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
+        expected_controls = {"control.iperf3.readiness_cookie", "control.iperf3.server_interrupt"}
+        assert expected_controls <= {item.code for item in finalized["aws"][0].findings}
+        assert expected_controls <= {item.code for item in replay.findings}
+        if unknown_server_error:
+            for result_bundle in (finalized["aws"][0], replay):
+                assert any(item.code == "native.iperf3.error" and item.severity == "error"
+                    and item.artifact_id == "iperf3_server_log" for item in result_bundle.findings)
         return
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
     from cloud_network_benchmark.contracts.measurements import CommandEvidence
