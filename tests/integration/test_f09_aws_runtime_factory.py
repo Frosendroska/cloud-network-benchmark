@@ -1053,10 +1053,13 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert measure.succeeded is False, measure.evidence
         assert "boundary_failure" in measure.evidence
         assert not any(action.startswith("f09-guest-run-") for action in runner.actions)
-        assert any(action.startswith(f"f09-listener-stop-{child.deployment_id}-iperf3")
+        assert any(action.startswith(f"f09-listener-owner-{child.deployment_id}-iperf3")
             for action in runner.actions)
-        assert any(action.startswith(f"f09-listener-closed-files-{child.deployment_id}-iperf3")
+        assert any(action.startswith(f"f09-listener-owner-process-{child.deployment_id}-iperf3")
             for action in runner.actions)
+        assert not any(action.startswith(f"f09-listener-stop-{child.deployment_id}-iperf3")
+            for action in runner.actions), "stop must remain withheld when owner/FD proof is incomplete"
+        assert "aws-pair-destroy" in runner.actions, "provider cleanup must still be attempted"
         assert provider_result.values["close"] is not None
         assert provider_result.values["cleanup"] is not None
         return
