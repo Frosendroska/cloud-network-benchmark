@@ -1086,6 +1086,28 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             roots[provider] = Path(ref["result_path"]).resolve()
             saved_inputs[provider] = ValidatorInput.model_validate_json(
                 (roots[provider] / "validation" / "input.json").read_text(encoding="utf-8"))
+        # Azure wraps its typed pair; both projection sites must bind the same
+        # hosts and proof as projecting that exact pair directly.
+        from cloud_network_benchmark.lifecycle_projection import _validator_input
+        from cloud_network_benchmark.manifests import ChildRunManifest
+        from types import SimpleNamespace
+        azure_result = result.provider_results["azure"]
+        azure_ref = next(row for row in projected_parent["child_runs"] if row["provider"] == "azure")
+        azure_child_path = Path(azure_ref["manifest_path"])
+        azure_child = ChildRunManifest.model_validate_json(azure_child_path.read_text())
+        wrapped = azure_result.values["create"]
+        direct_result = SimpleNamespace(**vars(azure_result))
+        direct_result.values = {**azure_result.values, "create": wrapped.deployment}
+        direct, *_ = _validator_input(parent=parent, parent_path=parent_path, child=azure_child,
+            child_path=azure_child_path, root=roots["azure"], result=direct_result,
+            reservation=result.reservation_evidence)
+        control = saved_inputs["azure"].iperf3_control_evidence.value
+        assert control is not None
+        assert direct.iperf3_control_evidence.value == control
+        assert control["vm_a_host_id"] == wrapped.deployment.vm_a.connection.host
+        assert control["vm_b_host_id"] == wrapped.deployment.vm_b.connection.host
+        assert control["private_ipv4_b"] == wrapped.deployment.vm_b.private_ipv4
+        assert json.loads((roots["azure"] / "metadata/iperf3-control-evidence.json").read_text()) == control
         preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
             for provider, value in saved_inputs.items()}
         replays = evaluate_comparison(list(saved_inputs.values()), list(preliminary.values()))

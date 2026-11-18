@@ -376,6 +376,29 @@ def _controller_record(root: Path, deployment_id: str, declaration: Any, payload
     return record
 
 
+def _created_deployment(child: Any, result: Any) -> Any:
+    """Resolve only supported, child-bound provider outputs for control proof."""
+    from .azure_provider import AzureProviderResult
+    from .contracts.deployment import ProviderDeploymentOutput
+
+    value = getattr(result, "values", {}).get("create")
+    if isinstance(value, AzureProviderResult):
+        if value.failures or _value(child.provider) != "azure":
+            return None
+        value = value.deployment
+    if not isinstance(value, ProviderDeploymentOutput):
+        return None
+    for identity in (value, value.identity):
+        if (identity.run_id != child.run_id
+                or identity.deployment_id != child.deployment_id
+                or _value(identity.provider) != _value(child.provider)):
+            return None
+    if (value.vm_a is None or value.vm_b is None
+            or _value(value.vm_a.role) != "vm_a" or _value(value.vm_b.role) != "vm_b"):
+        return None
+    return value
+
+
 def _materialize_controller_evidence(root: Path, child: Any, result: Any,
                                      declarations: list[Any], *,
                                      source_records: list[Any] | None = None) -> list[Any]:
@@ -401,7 +424,7 @@ def _materialize_controller_evidence(root: Path, child: Any, result: Any,
         prepared = getattr(_outcome(result, "prepare"), "evidence", None)
         measured = getattr(_outcome(result, "measure"), "evidence", None)
         close = getattr(_outcome(result, "close"), "evidence", None)
-        deployment = getattr(result, "values", {}).get("create")
+        deployment = _created_deployment(child, result)
         readiness = prepared.get("readiness") if isinstance(prepared, Mapping) else None
         bootstrap = prepared.get("bootstrap") if isinstance(prepared, Mapping) else None
         listeners = close.get("listeners") if isinstance(close, Mapping) else None
@@ -1125,7 +1148,7 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
     controller_records = _materialize_controller_evidence(root, child, result, declarations,
         source_records=source_records)
     records = _merge_artifact_records(source_records + controller_records)
-    create_evidence = getattr(result, "values", {}).get("create")
+    create_evidence = _created_deployment(child, result)
     vm_a = getattr(create_evidence, "vm_a", None)
     vm_b = getattr(create_evidence, "vm_b", None)
     prep_evidence = getattr(_outcome(result, "prepare"), "evidence", None)
