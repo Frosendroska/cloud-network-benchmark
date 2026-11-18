@@ -623,7 +623,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             (root / "diagnostics" / f"{role}-clock.jsonl").write_text(mapping.model_dump_json()+"\n", encoding="utf-8")
             output_root = context["output_root"]
             self.diagnostics_outcomes[invocation] = {"deployment_id":context["deployment_id"],"vm_role":role,
-                "state":"interrupted","closed_paths":[f"{output_root}/metadata/{role}.json",
+                "state":"interrupted","failures":[],"closed_paths":[f"{output_root}/metadata/{role}.json",
                     f"{output_root}/diagnostics/{role}.jsonl",f"{output_root}/diagnostics/{role}-clock.jsonl"]}
             stdout = json.dumps({"pid":501,"process_group":501,
                 "boot_id":"12345678-1234-4234-8234-123456789abc","start_ticks":1234})
@@ -945,7 +945,7 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
     ("failure_check", True, False, "partial", "eu-central-1", "none", False),
     ("failure_check", True, True, "valid", "eu-central-1", "none", False),
     ("failure_check", True, True, "valid", "eu-north-1", "none", False),
-    ("failure_check", True, True, None, "eu-central-1", "none", True),
+    ("failure_check", True, True, "invalid", "eu-central-1", "none", True),
     ("failure_check", False, False, "partial", "eu-central-1", "missing", False),
     ("failure_check", False, False, "partial", "eu-central-1", "failed", False),
     ("failure_check", False, False, "partial", "eu-central-1", "foreign", False),
