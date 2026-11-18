@@ -371,7 +371,7 @@ def test_f08_intersects_materialized_loaded_sockperf_and_receiver_sources(reposi
     valid_server_bytes = (json.dumps({"event":"start","data":receiver_output["start"]}) + "\n"
         + "\n".join(json.dumps({"event":"interval","data":item})
             for item in receiver_output["intervals"]) + "\n"
-        + json.dumps({"event":"end","data":receiver_output["end"]}) + "\n").encode()
+        + json.dumps({"event":"end","data":native_client["end"]}) + "\n").encode()
     write(valid_server_path,valid_server_bytes)
     valid_server_record = record("iperf3_server_log",valid_server_path,"iperf3-server-jsonl",
         VmRole.VM_B,None,valid_server_bytes)
