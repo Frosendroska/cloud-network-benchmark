@@ -152,12 +152,13 @@ def test_measurement_callback_failure_retains_diagnostic_handles_without_excepti
     from cloud_network_benchmark.lifecycle_remote import _measurement_handoff_failure
 
     process = SimpleNamespace(actions=[{"action_id": "f09-diagnostics-start"}])
-    attempt = SimpleNamespace(diagnostics={"vm_a": process})
+    attempt = SimpleNamespace(diagnostics={"vm_a": process}, iperf3_control_pre_measure=None)
     outcome = _measurement_handoff_failure(attempt, RuntimeError("token=paid-secret"))
     serialized = str(outcome.evidence)
     assert outcome.stage == "measure" and outcome.succeeded is False
     assert outcome.evidence["failure"] == "RuntimeError: remote measurement handoff failed"
     assert outcome.evidence["diagnostics"]["vm_a"] is process
+    assert outcome.evidence["iperf3_control_pre_measure"]["available"] is False
     assert "paid-secret" not in serialized
 
 

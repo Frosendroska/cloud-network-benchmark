@@ -542,7 +542,7 @@ def test_day_requires_one_continuous_receiver_span_and_unions_chunk_tails(reposi
         chunk_parses[unit_id]=NativeParse(samples=samples, probe_counts=(count,))
     full=value.model_copy(update={"measurement_units":[day,*chunks], "timings":timings})
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (chunk_parses.get(unit.unit_id, NativeParse()), None))
     receiver=ReceiverInterval("1", 0, 86400, 86400, 1_000_000, False, False,
                               SourceRef("iperf3_server_log", "server.jsonl", "a"*64), 1)
@@ -624,7 +624,7 @@ def test_frozen_common_n_consistency_and_inflation_rejects_incomplete_idle_basel
         timed.append(timing.model_copy(update={"clock_mappings": mappings}))
     value = value.model_copy(update={"timings":timed})
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (parses.get(unit.unit_id, NativeParse()),
                          NativeParse(receiver_intervals=(ReceiverInterval("1", 10, 70, 60, 1000, False, False,
                              SourceRef("iperf3", "receiver.json", "e"*64), 1),)) if unit.unit_id == loaded else None))
@@ -699,7 +699,7 @@ def test_generation_ratio_uses_native_sent_and_runtime(repository_root, monkeypa
         skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=1),
         reporting_scope="one Sockperf invocation", source=SourceRef("sockperf-log", "sockperf.log", "f" * 64))
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda *_: (NativeParse(probe_counts=(counts,)), None))
+    monkeypatch.setattr(module, "_parse_unit", lambda *_args, **_kwargs: (NativeParse(probe_counts=(counts,)), None))
     result = module.validate_bundle(value, evaluated_at=NOW)
     generation = result.metrics.value["units"][0]["probe_counts"][0]["generation_ratio"]["value"]
     assert generation == pytest.approx(sent / 1000)
@@ -982,7 +982,7 @@ def test_missing_generation_and_end_only_receiver_totals_remain_partial_not_unav
         reporting_scope="[Valid Duration]", source=SourceRef("sockperf-log", "sockperf.log", "d"*64))
     total = {"session_id":"1", "bytes":1000, "seconds":60, "source":SourceRef("iperf3", "receiver.json", "e"*64), "line":1}
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (NativeParse(probe_counts=(missing,)) if unit.phase == "idle_latency" else NativeParse(),
                          NativeParse(receiver_totals=(total,)) if unit.phase == "single_flow" else None))
     failed = value.model_copy(update={"retrieval_failure":FailureEvidence(category="retrieval", message="copy failed", occurred_at=NOW)})

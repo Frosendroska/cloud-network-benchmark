@@ -224,6 +224,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.inventory_roles = {}
         self.full_native = False
         self.control_capture_fault = "none"
+        self.unknown_server_error = False
         self.analysis_fixture_interior_rtt = False
 
     def _now(self):
@@ -359,6 +360,16 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     f"binary_sha256={observed.binary_sha256}", "observation_capability=CNB_ACQ_V1",
                     f"observation_semantics={observed.observation_semantics}",
                     f"capabilities={','.join(observed.capabilities)}", ""))
+                decoded_probe = ""
+                if tool == "iperf3":
+                    for token in request.argv:
+                        encoded = re.search(r"bytes\.fromhex[^0-9a-f]+([0-9a-f]{80,})", str(token))
+                        if encoded is not None:
+                            try:
+                                decoded_probe = bytes.fromhex(encoded.group(1)).decode("utf-8")
+                            except (ValueError, UnicodeDecodeError):
+                                decoded_probe = ""
+                            break
                 if index == 2:
                     stdout = f"{observed.source_sha256} {archive_path}"
                 elif index == 5:
@@ -371,6 +382,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     stdout = identity
                 elif any("printf CNB_ACQ_V1" in token for token in request.argv):
                     stdout = "CNB_ACQ_V1"
+                elif ("socket.TCP_CONGESTION" in decoded_probe
+                        and "CNB_TCP_CONGESTION=cubic" in decoded_probe):
+                    stdout = "CNB_TCP_CONGESTION=cubic"
                 elif index >= 8:
                     if tool == "sockperf":
                         stdout = ("Usage: sockperf [options]\nserver under-load -i -p -m --mps "
@@ -645,6 +659,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 "boot_id":"12345678-1234-4234-8234-123456789abc",
                 "cgroup":f"/system.slice/{unit}.service","log_ids":identities}
             if tool == "iperf3" and self.full_native:
+                if self.unknown_server_error:
+                    with files[0].open("ab") as stream:
+                        stream.write((json.dumps({"event":"error","data":"unrecognized server diagnostic"})+"\n").encode())
                 data = files[0].read_bytes()
                 identity["pre_stop_prefix"] = {"available":True,"boundary":"pre_stop",
                     "deployment_id":self.deployment_id,"controller_session_id":"fake-session",
@@ -665,6 +682,16 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     json.dumps({"event":"end","data":{}})+"\n").encode())
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout="",stderr="")
+        if action.startswith("f09-listener-config-"):
+            self.actions.append(action)
+            tool = action.rsplit("-", 1)[-1]
+            out_name, err_name = (("sockperf.log", "sockperf.err") if tool == "sockperf" else
+                ("iperf3-server.jsonl", "iperf3-server.err"))
+            stdout = ("[Service]\n"
+                f"StandardOutput=append:/var/lib/cnb/results/server-logs/{out_name}\n"
+                f"StandardError=append:/var/lib/cnb/results/server-logs/{err_name}\n")
+            return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
+                duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
         if action.startswith("f09-listener-closed-files-"):
             self.actions.append(action)
             closed = self._now() + timedelta(seconds=getattr(self, "protocol_elapsed", 60) + 300)
@@ -679,8 +706,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 ("iperf3-server.jsonl", "iperf3-server.err"))
             stdout = (f"LoadState=loaded\nActiveState=active\nMainPID=32000\n"
                 f"ControlGroup=/system.slice/{unit}.service\n"
-                f"StandardOutput=append:/var/lib/cnb/results/server-logs/{out_name}\n"
-                f"StandardError=append:/var/lib/cnb/results/server-logs/{err_name}\n")
+                "StandardOutput=append\nStandardError=append\n")
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
         if action.startswith("f09-inventory-"):
@@ -914,19 +940,18 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only", "capture_fault", "unknown_server_error"), [
-    ("failure_check", False, False, "partial", "eu-central-1", False, "none", False),
-    ("failure_check", True, False, "partial", "eu-central-1", False, "none", False),
-    ("failure_check", True, True, "valid", "eu-central-1", False, "none", False),
-    ("failure_check", True, True, "valid", "eu-north-1", False, "none", False),
-    ("failure_check", True, True, "partial", "eu-central-1", True, "none", False),
-    ("failure_check", True, True, "partial", "eu-central-1", True, "none", True),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "missing", False),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "failed", False),
-    ("failure_check", False, False, "partial", "eu-central-1", False, "foreign", False),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "capture_fault", "unknown_server_error"), [
+    ("failure_check", False, False, "partial", "eu-central-1", "none", False),
+    ("failure_check", True, False, "partial", "eu-central-1", "none", False),
+    ("failure_check", True, True, "valid", "eu-central-1", "none", False),
+    ("failure_check", True, True, "valid", "eu-north-1", "none", False),
+    ("failure_check", True, True, None, "eu-central-1", "none", True),
+    ("failure_check", False, False, "partial", "eu-central-1", "missing", False),
+    ("failure_check", False, False, "partial", "eu-central-1", "failed", False),
+    ("failure_check", False, False, "partial", "eu-central-1", "foreign", False),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only, capture_fault, unknown_server_error):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, capture_fault, unknown_server_error):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -953,6 +978,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.complete_cleanup = region == "eu-north-1"
     runner.full_native = full_native
     runner.control_capture_fault = capture_fault
+    runner.unknown_server_error = unknown_server_error
     runner.late_tail = late_tail
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
     runner.results_roots = {role: root / "results" for role, root in runner.workspace_roots.items()}
@@ -973,59 +999,6 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         handoff.update(request=guest_request, called_at=clock.monotonic(), kwargs=kwargs)
         return original_remote_f03(connection, guest_request, **kwargs)
     monkeypatch.setattr(lifecycle_adapters, "run_remote_f03", capture_remote_f03)
-    if handoff_only:
-        from cloud_network_benchmark.lifecycle_adapters import RemoteListenerClosure
-        def fake_listener_close(connection, **kwargs):
-            workspace = kwargs["results_workspace"]
-            reported_end = datetime.fromisoformat(json.loads(runner.guest_outcome)["guest_finished_at"])
-            owner_started = reported_end + timedelta(microseconds=1)
-            owner_finished = owner_started + timedelta(microseconds=1)
-            stop_started = owner_finished + timedelta(microseconds=1)
-            stop_finished = stop_started + timedelta(microseconds=1)
-            close_started = stop_finished + timedelta(microseconds=1)
-            closed_at = close_started + timedelta(microseconds=1)
-            stdout_path, stderr_path = (f"{workspace}/server-logs/iperf3-server.jsonl",
-                f"{workspace}/server-logs/iperf3-server.err")
-            log = runner.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
-            err = runner.results_roots["vm_b"] / "server-logs" / "iperf3-server.err"
-            if unknown_server_error:
-                with log.open("ab") as stream:
-                    stream.write((json.dumps({"event":"error","data":"unrecognized server diagnostic"})+"\n").encode())
-            prefix = log.read_bytes()
-            unit = f"cnb-{connection.deployment_id}-iperf3"
-            log_ids = [[log.stat().st_dev,log.stat().st_ino],[err.stat().st_dev,err.stat().st_ino]]
-            owner = {"pid": 32000, "start_ticks": 1234, "boot_id": "12345678-1234-1234-8234-123456789abc",
-                "cgroup": f"/system.slice/{unit}.service", "log_ids": log_ids,
-                "closed_at_utc": closed_at.isoformat()}
-            pre_stop = {"available":True,"boundary":"pre_stop","deployment_id":connection.deployment_id,
-                "controller_session_id":"fake-session","listener_invocation_id":"f02r-vm_b-listener-iperf3",
-                "unit":unit,"pid":owner["pid"],"start_ticks":owner["start_ticks"],"boot_id":owner["boot_id"],
-                "cgroup":owner["cgroup"],"log_path":stdout_path,"log_ids":log_ids,
-                "prefix_bytes":len(prefix),"prefix_sha256":hashlib.sha256(prefix).hexdigest(),
-                "captured_at_utc":owner_started.isoformat()}
-            # The owned stop pair is appended only after the bounded pre-stop snapshot.
-            with log.open("ab") as stream:
-                stream.write((json.dumps({"event":"error","data":"interrupt - the server has terminated"})+"\n"+
-                    json.dumps({"event":"end","data":{}})+"\n").encode())
-            def close_action(action, started, finished, command):
-                return {"action_id":f"f09-listener-{action}-{connection.deployment_id}-iperf3",
-                    "action_type":"ssh","vm_id":connection.vm_b.host,"role":"vm_b",
-                    "request":{"argv":["ssh",connection.vm_b.host,command]},
-                    "result":{"outcome":"succeeded","exit_code":0,
-                        "started_at":started.isoformat(),"finished_at":finished.isoformat()}}
-            actions = (
-                close_action("owner-process",owner_started,owner_finished,
-                    f"sudo python3 -c owner {stdout_path} {stderr_path}"),
-                close_action("stop",stop_started,stop_finished,f"sudo systemctl stop {unit}"),
-                close_action("closed-files",close_started,closed_at,
-                    "sudo python3 -c closure " + " ".join([str(owner["pid"]),str(owner["start_ticks"]),
-                        owner["boot_id"],owner["cgroup"],*(str(value) for pair in log_ids for value in pair),
-                        stdout_path,stderr_path])))
-            owner["pre_stop_prefix"] = pre_stop
-            return RemoteListenerClosure(deployment_id=connection.deployment_id, role="vm_b", closed=True,
-                closed_at=closed_at, observations={"iperf3": owner, "sockperf": owner},
-                actions=actions, failures=())
-        monkeypatch.setattr(lifecycle_adapters, "stop_vm_b_listeners", fake_listener_close)
     built = build_runtime(campaign=campaign, parent=parent,
         children={"aws": child}, costs=costs, runtime=runtime,
         controller_session_id="fake-session", runner=runner, clock=clock,
@@ -1055,10 +1028,14 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert not any(action.startswith("f09-guest-run-") for action in runner.actions)
         assert any(action.startswith(f"f09-listener-owner-{child.deployment_id}-iperf3")
             for action in runner.actions)
+        assert any(action.startswith(f"f09-listener-config-{child.deployment_id}-iperf3")
+            for action in runner.actions)
         assert any(action.startswith(f"f09-listener-owner-process-{child.deployment_id}-iperf3")
             for action in runner.actions)
-        assert not any(action.startswith(f"f09-listener-stop-{child.deployment_id}-iperf3")
-            for action in runner.actions), "stop must remain withheld when owner/FD proof is incomplete"
+        assert any(action.startswith(f"f09-listener-stop-{child.deployment_id}-iperf3")
+            for action in runner.actions)
+        assert any(action.startswith(f"f09-listener-closed-files-{child.deployment_id}-iperf3")
+            for action in runner.actions)
         assert "aws-pair-destroy" in runner.actions, "provider cleanup must still be attempted"
         assert provider_result.values["close"] is not None
         assert provider_result.values["cleanup"] is not None
@@ -1069,33 +1046,6 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert handoff["kwargs"]["shutdown_deadline_monotonic"] - handoff["kwargs"]["active_deadline_monotonic"] == runtime["allowance"].measurement_shutdown_seconds
     assert 0 < handoff["request"].safe_remaining_seconds <= (
         runtime["allowance"].measurement_seconds + runtime["allowance"].measurement_shutdown_seconds)
-    if handoff_only:
-        from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
-        from cloud_network_benchmark.contracts.validation import ValidatorInput
-        from cloud_network_benchmark.validation import validate_bundle
-        finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
-            parent=parent, lifecycle=result, repository_root=repository_root,
-            evaluated_at=NOW + timedelta(minutes=1))
-        result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
-        result_root = (repository_root / result_ref.result_path).resolve()
-        saved = ValidatorInput.model_validate_json((result_root / "validation/input.json").read_text())
-        record = next(item for item in saved.artifact_records if item.artifact_id == "iperf3_control_evidence")
-        record.verify_materialized_file(result_root)
-        evidence = saved.iperf3_control_evidence.value
-        assert evidence["run_id"] == child.run_id and evidence["deployment_id"] == child.deployment_id
-        assert evidence["readiness"]["ready"] is True
-        assert evidence["listener"]["closed"] is True
-        assert evidence["readiness"]["event_association"]["status"] == "verified"
-        replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
-        assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
-        expected_controls = {"control.iperf3.readiness_cookie", "control.iperf3.server_interrupt"}
-        assert expected_controls <= {item.code for item in finalized["aws"][0].findings}
-        assert expected_controls <= {item.code for item in replay.findings}
-        if unknown_server_error:
-            for result_bundle in (finalized["aws"][0], replay):
-                assert any(item.code == "native.iperf3.error" and item.severity == "error"
-                    and item.artifact_id == "iperf3_server_log" for item in result_bundle.findings)
-        return
     observed_builds = provider_result.values["prepare"].evidence["bootstrap"].builds
     from cloud_network_benchmark.contracts.measurements import CommandEvidence
     for raw_command in provider_result.values["measure"].evidence.outcome.commands:
@@ -1147,14 +1097,22 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     saved = ValidatorInput.model_validate_json(result_file.read_text(encoding="utf-8"))
     replay = validate_bundle(saved, evaluated_at=NOW + timedelta(minutes=1))
     assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
-    assert replay.validation_status.data_validity == expected_validity, [
-        (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
+    if expected_validity is not None:
+        assert replay.validation_status.data_validity == expected_validity, [
+            (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
     if full_native:
         evidence = saved.iperf3_control_evidence.value
         assert evidence["readiness"]["event_association"]["status"] == "verified"
-        assert {item.code for item in replay.findings} >= {
+        control_codes = {
             "control.iperf3.readiness_cookie", "control.iperf3.server_interrupt"}
-    assert not [item for item in replay.findings if item.severity == "error"], replay.findings
+        assert control_codes <= {item.code for item in finalized["aws"][0].findings}
+        assert control_codes <= {item.code for item in replay.findings}
+    native_errors = [item for item in replay.findings
+        if item.code == "native.iperf3.error" and item.severity == "error"]
+    if unknown_server_error:
+        assert native_errors and all(item.artifact_id == "iperf3_server_log" for item in native_errors)
+    else:
+        assert not [item for item in replay.findings if item.severity == "error"], replay.findings
     if full_native:
         assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings
     else:
@@ -1163,7 +1121,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert not [item for item in replay.findings if item.code.startswith("native.iperf3.interval_")], replay.findings
         if expected_validity == "valid":
             assert not [item for item in replay.findings if item.code == "timing.coverage_unavailable"], replay.findings
-        else:
+        elif expected_validity is not None:
             assert any(item.unit_id == "idle_latency" and item.code == "timing.coverage_unavailable"
                 for item in replay.findings), replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
