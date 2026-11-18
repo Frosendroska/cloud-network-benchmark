@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 import shlex
+import re
 import time
 import threading
 from dataclasses import dataclass
@@ -341,6 +342,13 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             else:
                 item.iperf3_control_pre_measure = {"available": False,
                     "reason": "prepared iperf3 listener identity is unavailable"}
+            boundary_failure = _pre_measure_capture_failure(item.iperf3_control_pre_measure,
+                connection=connection, listener=iperf_listener,
+                controller_session_id=ledger.controller_session_id)
+            if boundary_failure is not None:
+                return _measurement_handoff_failure(item,
+                    RuntimeError("VM B owner-bound pre-measure log-prefix proof is unavailable"),
+                    boundary_failure=boundary_failure)
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
                 active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
@@ -508,7 +516,55 @@ def _record_f03_process(record: dict[str, Any], control: dict[str, Any], lock: A
         attempt.f03_process_record = dict(record)
 
 
-def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException) -> Any:
+def _pre_measure_capture_failure(capture: Any, *, connection: Any, listener: Any,
+        controller_session_id: str) -> str | None:
+    """Fail closed before F03 unless the same prepared VM B listener was captured."""
+    if not isinstance(capture, Mapping) or capture.get("available") is not True:
+        return "pre-measure listener prefix snapshot is missing or unavailable"
+    snapshot, action = capture.get("snapshot"), capture.get("action")
+    if not isinstance(snapshot, Mapping) or action is None:
+        return "pre-measure listener prefix snapshot has no owned action evidence"
+    action_payload = action.model_dump(mode="json") if hasattr(action, "model_dump") else action
+    if not isinstance(action_payload, Mapping):
+        return "pre-measure listener prefix action evidence is malformed"
+    result = action_payload.get("result")
+    request = action_payload.get("request")
+    argv = request.get("argv", []) if isinstance(request, Mapping) else []
+    remote_command = " ".join(str(item) for item in argv)
+    if (action_payload.get("action_id") != f"f09-iperf3-control-prefix-measure-{connection.deployment_id}"
+            or action_payload.get("action_type") != "ssh"
+            or action_payload.get("role") != "vm_b"
+            or action_payload.get("vm_id") != connection.vm_b.host
+            or not isinstance(result, Mapping) or result.get("outcome") != "succeeded"
+            or result.get("exit_code") != 0
+            or any(token not in remote_command for token in
+                (listener.stdout_path, listener.stderr_path, controller_session_id, listener.unit))):
+        return "pre-measure listener prefix action is not bound to the selected VM B listener"
+    count, digest, ids = snapshot.get("prefix_bytes"), snapshot.get("prefix_sha256"), snapshot.get("log_ids")
+    valid_ids = (isinstance(ids, list) and len(ids) == 2 and all(isinstance(pair, list) and len(pair) == 2
+        and all(isinstance(number, int) and not isinstance(number, bool) and number >= 0 for number in pair)
+        for pair in ids) and ids[0] != ids[1])
+    if (snapshot.get("boundary") != "pre_measure"
+            or snapshot.get("deployment_id") != connection.deployment_id
+            or snapshot.get("controller_session_id") != controller_session_id
+            or snapshot.get("listener_invocation_id") != "f02r-vm_b-listener-iperf3"
+            or snapshot.get("unit") != listener.unit
+            or snapshot.get("log_path") != listener.stdout_path
+            or isinstance(snapshot.get("pid"), bool) or not isinstance(snapshot.get("pid"), int) or snapshot["pid"] <= 0
+            or isinstance(snapshot.get("start_ticks"), bool) or not isinstance(snapshot.get("start_ticks"), int)
+            or snapshot["start_ticks"] < 0
+            or not isinstance(snapshot.get("boot_id"), str)
+            or re.fullmatch(r"[0-9a-fA-F-]{36}", snapshot["boot_id"]) is None
+            or snapshot.get("cgroup") != f"/system.slice/{listener.unit}.service"
+            or not valid_ids
+            or isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 65536
+            or not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+        return "pre-measure listener prefix snapshot has foreign or incomplete owner/boundary identity"
+    return None
+
+
+def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException,
+        *, boundary_failure: str | None = None) -> Any:
     """Retain diagnostic handles while keeping exception text out of durable evidence."""
     from .lifecycle_adapters import RemoteDiagnosticsStartError
     from .orchestration import ProviderStageOutcome
@@ -517,6 +573,8 @@ def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException)
         "iperf3_control_pre_measure": (attempt.iperf3_control_pre_measure
             if attempt is not None and attempt.iperf3_control_pre_measure is not None
             else {"available": False, "reason": "measurement boundary was not captured"})}
+    if boundary_failure is not None:
+        evidence["boundary_failure"] = boundary_failure
     if isinstance(error, RemoteDiagnosticsStartError):
         evidence["startup_failure"] = error.safe_reason
         evidence["actions"] = error.actions

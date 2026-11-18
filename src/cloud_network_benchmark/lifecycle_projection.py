@@ -649,7 +649,7 @@ def _iperf3_control_event_association(root: Path, records: list[Any], payload: M
                 or not _ordered_utc(owner.get("closed_at_utc"), listener.get("closed_at"))
                 or not isinstance(session, str) or not session or not deployment):
             return unavailable()
-        if (source.get("tool") != "iperf3" or source.get("binary_version") != "3.17.1"
+        if (source.get("tool") != "iperf3"
                 or source.get("observation_capability") != "CNB_ACQ_V1"
                 or source.get("observation_semantics") != "iperf-3.17.1-stats-v1"):
             return unavailable()

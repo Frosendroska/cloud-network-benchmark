@@ -145,6 +145,7 @@ def test_legacy_control_evidence_without_prefix_proof_remains_unavailable(tmp_pa
     # Older controller snapshots describe readiness and closure but cannot
     # associate native error/end pairs with those boundaries.
     assert _read(tmp_path, [record]) is None
+    assert _read(tmp_path, []) is None
 
 
 def test_native_shape_control_association_is_replayed_from_lf_bytes_and_pinned_banner(tmp_path):
@@ -158,6 +159,12 @@ def test_native_shape_control_association_is_replayed_from_lf_bytes_and_pinned_b
     assert association["readiness_cookie"]["byte_end"] == payload["pre_measure"]["snapshot"]["prefix_bytes"]
     assert len(suppressions) == 4
     assert _read(tmp_path, records) == payload
+    control = next(item for item in records if item.artifact_id == "iperf3_control_evidence")
+    for changed in (control.model_copy(update={"deployment_id":"other-deployment"}),
+            control.model_copy(update={"producer":"vm_a"}),
+            control.model_copy(update={"path":"metadata/other.json"})):
+        changed_records = [changed if item.artifact_id == "iperf3_control_evidence" else item for item in records]
+        assert _read(tmp_path, changed_records) is None
 
 
 @pytest.mark.parametrize("mutation", [
@@ -258,13 +265,6 @@ def test_unknown_native_error_is_never_in_the_control_suppression_set(tmp_path):
         stdout_path="/var/lib/cnb/results/server-logs/iperf3-server.jsonl")
     assert association["status"] == "verified"
     assert all(line != unknown_line for line, _code in suppressions)
-    assert _read(tmp_path, []) is None
-    assert _read(tmp_path,
-        [record.model_copy(update={"deployment_id": "other-deployment"})]) is None
-    assert _read(tmp_path,
-        [record.model_copy(update={"producer": "vm_a"})]) is None
-    assert _read(tmp_path,
-        [record.model_copy(update={"path": "metadata/other.json"})]) is None
 
 
 @pytest.mark.parametrize("change", [

@@ -223,6 +223,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.diagnostics_outcomes = {}
         self.inventory_roles = {}
         self.full_native = False
+        self.control_capture_fault = "none"
         self.analysis_fixture_interior_rtt = False
 
     def _now(self):
@@ -735,6 +736,12 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 finished_at=self._now(), duration_seconds=0, exit_code=0, stdout=timestamp, stderr="")
         if action.startswith("f09-iperf3-control-prefix-measure-"):
             self.actions.append(action)
+            if self.control_capture_fault == "failed":
+                return CommandResult(action_id=action,outcome="failed",started_at=self._now(),finished_at=self._now(),
+                    duration_seconds=0,exit_code=6,stdout="",stderr="snapshot failed")
+            if self.control_capture_fault == "missing":
+                return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
+                    duration_seconds=0,exit_code=0,stdout="{}",stderr="")
             log = self.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
             err = log.parent / "iperf3-server.err"
             data = log.read_bytes()
@@ -748,6 +755,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 "log_ids":[[log.stat().st_dev,log.stat().st_ino],[err.stat().st_dev,err.stat().st_ino]],
                 "prefix_bytes":len(data),"prefix_sha256":hashlib.sha256(data).hexdigest(),
                 "captured_at_utc":self._now().isoformat()}
+            if self.control_capture_fault == "foreign":
+                snapshot["controller_session_id"] = "foreign-controller-session"
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout=json.dumps({"snapshot":snapshot}),stderr="")
         return super().run(request)
@@ -905,15 +914,18 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only"), [
-    ("failure_check", False, False, "partial", "eu-central-1", False),
-    ("failure_check", True, False, "partial", "eu-central-1", False),
-    ("failure_check", True, True, "valid", "eu-central-1", False),
-    ("failure_check", True, True, "valid", "eu-north-1", False),
-    ("failure_check", False, False, "partial", "eu-central-1", True),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "handoff_only", "capture_fault"), [
+    ("failure_check", False, False, "partial", "eu-central-1", False, "none"),
+    ("failure_check", True, False, "partial", "eu-central-1", False, "none"),
+    ("failure_check", True, True, "valid", "eu-central-1", False, "none"),
+    ("failure_check", True, True, "valid", "eu-north-1", False, "none"),
+    ("failure_check", False, False, "partial", "eu-central-1", True, "none"),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "missing"),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "failed"),
+    ("failure_check", False, False, "partial", "eu-central-1", False, "foreign"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, handoff_only, capture_fault):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -939,6 +951,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.zone = "eu-north-1a" if region == "eu-north-1" else "eu-central-1a"
     runner.complete_cleanup = region == "eu-north-1"
     runner.full_native = full_native
+    runner.control_capture_fault = capture_fault
     runner.late_tail = late_tail
     runner.workspace_roots = {"vm_a":tmp_path / "remote-vm-a", "vm_b":tmp_path / "remote-vm-b"}
     runner.results_roots = {role: root / "results" for role, root in runner.workspace_roots.items()}
@@ -1005,6 +1018,18 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["cleanup"] is not None
     assert provider_result.values["prepare"].stage == "prepare"
     assert provider_result.values["prepare"].succeeded is True, provider_result.values["prepare"].evidence
+    if capture_fault != "none":
+        measure = provider_result.values["measure"]
+        assert measure.succeeded is False, measure.evidence
+        assert "boundary_failure" in measure.evidence
+        assert not any(action.startswith("f09-guest-run-") for action in runner.actions)
+        assert any(action.startswith(f"f09-listener-stop-{child.deployment_id}-iperf3")
+            for action in runner.actions)
+        assert any(action.startswith(f"f09-listener-closed-files-{child.deployment_id}-iperf3")
+            for action in runner.actions)
+        assert provider_result.values["close"] is not None
+        assert provider_result.values["cleanup"] is not None
+        return
     assert provider_result.values["measure"].succeeded is True, (runner.guest_exception, provider_result.values["measure"].evidence,
         clock.elapsed, built["ledger"].inspect()["reservations"])
     assert handoff["kwargs"]["active_deadline_monotonic"] - handoff["called_at"] <= runtime["allowance"].measurement_seconds

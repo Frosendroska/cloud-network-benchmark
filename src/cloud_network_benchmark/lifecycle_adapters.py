@@ -176,6 +176,7 @@ def capture_iperf3_control_prefix(connection: Any, listener: Any, *, controller_
     result = _execute(runner, request)
     action = _action(request.action_id, request.action_type, connection.vm_b, request, result)
     try:
+        snapshot = None
         if result.outcome != CommandOutcome.SUCCEEDED or result.exit_code != 0:
             raise ValueError("owner-bound remote snapshot command failed")
         payload = json.loads(result.stdout.strip().splitlines()[-1])
@@ -188,8 +189,14 @@ def capture_iperf3_control_prefix(connection: Any, listener: Any, *, controller_
             raise ValueError("snapshot identity is incomplete")
         return {"available": True, "snapshot": snapshot, "action": action}
     except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError):
-        return {"available": False, "reason": "owner-bound remote log-prefix snapshot is unavailable",
+        failed = {"available": False, "reason": "owner-bound remote log-prefix snapshot is unavailable",
             "action": action}
+        if isinstance(snapshot, dict):
+            fields = ("boundary", "deployment_id", "controller_session_id", "listener_invocation_id",
+                "unit", "pid", "start_ticks", "boot_id", "cgroup", "log_path", "log_ids",
+                "prefix_bytes", "prefix_sha256", "captured_at_utc")
+            failed["snapshot"] = {key: snapshot[key] for key in fields if key in snapshot}
+        return failed
 
 
 def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: str,
