@@ -224,6 +224,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         self.inventory_roles = {}
         self.full_native = False
         self.control_capture_fault = "none"
+        self.controller_session_id = "fake-session"
         self.unknown_server_error = False
         self.analysis_fixture_interior_rtt = False
 
@@ -669,7 +670,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                         stream.write((json.dumps({"event":"error","data":"unrecognized server diagnostic"})+"\n").encode())
                 data = files[0].read_bytes()
                 identity["pre_stop_prefix"] = {"available":True,"boundary":"pre_stop",
-                    "deployment_id":self.deployment_id,"controller_session_id":"fake-session",
+                    "deployment_id":self.deployment_id,
+                    "controller_session_id":self.controller_session_id,
                     "listener_invocation_id":"f02r-vm_b-listener-iperf3","unit":unit,
                     "pid":32000,"start_ticks":1234,"boot_id":identity["boot_id"],
                     "cgroup":identity["cgroup"],
@@ -779,7 +781,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             data = log.read_bytes()
             unit = f"cnb-{self.deployment_id}-iperf3"
             snapshot = {"boundary":"pre_measure","deployment_id":self.deployment_id,
-                "controller_session_id":"fake-session","listener_invocation_id":"f02r-vm_b-listener-iperf3",
+                "controller_session_id":self.controller_session_id,
+                "listener_invocation_id":"f02r-vm_b-listener-iperf3",
                 "unit":unit,"pid":32000,"start_ticks":1234,
                 "boot_id":"12345678-1234-4234-8234-123456789abc",
                 "cgroup":f"/system.slice/{unit}.service",

@@ -666,6 +666,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 self.identity_provider = {str(value): name for name, value in identities.items()}
                 for name, responder in self.remote.items():
                     responder.full_native = True
+                    responder.controller_session_id = "synthetic-session"
                     responder.partial_after_first_unit = interrupt_controller
                     responder.cancel_verified = interrupt_stop_verified
                     responder.clock = clock
