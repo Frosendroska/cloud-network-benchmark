@@ -344,7 +344,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 from cloud_network_benchmark.contracts.common import VmRole
                 observed = _build(tool, VmRole(role), f"f02r-{role}-{tool}-build")
                 binary_version = ("sockperf, version 3.10\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.2.0"
-                    if tool == "sockperf" else observed.binary_version)
+                    if tool == "sockperf" else
+                    "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.2.0")
                 archive_path = f"/var/lib/cnb/work/{tool}.tar.gz"
                 binary_path = f"/var/lib/cnb/install/bin/{tool}"
                 build_configuration = (f"CC=${{CC:-cc}}; compiler={observed.compiler_version}; "
@@ -545,6 +546,9 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 self.guest_exception = f"{type(exc).__name__}: {exc}"
                 raise
             self.guest_outcome = outcome.model_dump_json()
+            if self.full_native and getattr(self, "clock", None) is not None:
+                self.clock.elapsed = max(self.clock.elapsed,
+                    (outcome.guest_finished_at - NOW).total_seconds())
             if self.full_native:
                 self._write_source_observed_receiver_logs(outcome)
             invocation = action.removeprefix("f09-guest-run-")
@@ -589,10 +593,11 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 logs = root / "server-logs"
                 logs.mkdir(parents=True, exist_ok=True)
                 (logs / "sockperf.log").write_text("Sockperf listener captured by offline source fixture\n", encoding="utf-8")
+                initial_events = ([{"event":"error","data":"error - unable to receive cookie at server: "},
+                    {"event":"end","data":{}}] if self.full_native else [])
+                initial_events.append({"event":"server_listening","data":{}})
                 (logs / "iperf3-server.jsonl").write_text(
-                    json.dumps({"event":"error","data":"error - unable to receive cookie at server: "})+"\n"+
-                    json.dumps({"event":"end","data":{}})+"\n"+
-                    json.dumps({"event":"server_listening","data":{}})+"\n", encoding="utf-8")
+                    "".join(json.dumps(event)+"\n" for event in initial_events), encoding="utf-8")
                 (logs / "iperf3-server.err").write_text("No server stderr bytes in offline fixture.\n", encoding="utf-8")
             from cloud_network_benchmark.contracts.measurements import VmMetadata, DiagnosticSample, ClockMapping
             metadata_path = root / "metadata" / f"{role}.json"
@@ -676,10 +681,11 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                     **{key:value for key,value in identity.items() if key != "pid"}}),stderr="")
         if action.startswith("f09-listener-stop-") and action.endswith("-iperf3"):
             self.actions.append(action)
-            log = self.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
-            with log.open("ab") as handle:
-                handle.write((json.dumps({"event":"error","data":"interrupt - the server has terminated"})+"\n"+
-                    json.dumps({"event":"end","data":{}})+"\n").encode())
+            if self.full_native:
+                log = self.results_roots["vm_b"] / "server-logs" / "iperf3-server.jsonl"
+                with log.open("ab") as handle:
+                    handle.write((json.dumps({"event":"error","data":"interrupt - the server has terminated"})+"\n"+
+                        json.dumps({"event":"end","data":{}})+"\n").encode())
             return CommandResult(action_id=action,outcome="succeeded",started_at=self._now(),finished_at=self._now(),
                 duration_seconds=0,exit_code=0,stdout="",stderr="")
         if action.startswith("f09-listener-config-"):
@@ -822,7 +828,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             event_lines.extend(json.dumps(event, separators=(",", ":")) for event in events)
             common = {"format": 1, "tool": "iperf3", "semantics_id": "iperf-3.17.1-stats-v1",
                 "invocation_id": "f02r-vm_b-listener-iperf3", "pid": 32000,
-                "boot_id": "12345678-1234-1234-8234-123456789abc", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
+                "boot_id": "12345678-1234-4234-8234-123456789abc", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
             anchor = {**common, "record_kind": "clock_anchor", "mono_before_ns": 1_000_000_000_000,
                 "realtime_ns": int(self.native_base_time.timestamp() * 1_000_000_000), "mono_after_ns": 1_000_000_001_000}
             source_lines.append("CNB_ACQ_V1 " + json.dumps(anchor, separators=(",", ":")))
@@ -991,6 +997,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256,
         full_native=full_native, region=region)
     clock = FakeClock()
+    runner.clock = clock
     runtime["sleep"] = clock.sleep
     from cloud_network_benchmark import lifecycle_adapters
     original_remote_f03 = lifecycle_adapters.run_remote_f03
