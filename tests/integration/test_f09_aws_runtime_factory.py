@@ -446,6 +446,7 @@ class FakePreparedAwsRunner(FakeAwsRunner):
             guest_clock = GuestClock()
             native_base_time = getattr(self, "native_base_time", self._now())
             self.native_base_time = native_base_time
+            guest_clock.value = 1000 + (self._now() - native_base_time).total_seconds()
             guest_clock.utc_adjustment = native_base_time - guest_clock.origin
             guest_request = GuestRequest.model_validate_json(self.guest_request).model_copy(update={
                 "output_root": self.native_root,
