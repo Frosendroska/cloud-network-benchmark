@@ -179,6 +179,7 @@ def test_native_shape_control_association_is_replayed_from_lf_bytes_and_pinned_b
 @pytest.mark.parametrize("mutation", [
     "source_reference", "source_patch", "version", "vm_binding", "owner_pid", "owner_boot",
     "foreign_fd", "action_order", "prefix_offset", "prefix_hash", "missing_snapshot",
+    "missing_stop_snapshot", "unavailable_stop_snapshot",
 ])
 def test_native_control_association_rejects_independent_identity_and_boundary_failures(tmp_path, mutation):
     payload, records, _raw = _association_fixture(tmp_path)
@@ -202,6 +203,12 @@ def test_native_control_association_rejects_independent_identity_and_boundary_fa
         payload["pre_measure"]["snapshot"]["prefix_bytes"] -= 1
     elif mutation == "prefix_hash":
         payload["listener"]["pre_stop_prefix"]["prefix_sha256"] = "f" * 64
+    elif mutation == "missing_stop_snapshot":
+        payload["listener"].pop("pre_stop_prefix")
+    elif mutation == "unavailable_stop_snapshot":
+        # A successful owner/closure receipt cannot reconstruct absent prefix bytes.
+        payload["listener"]["pre_stop_prefix"] = {"available": False,
+            "reason": "bounded pre-stop log-prefix snapshot unavailable"}
     else:
         payload["pre_measure"]["snapshot"] = None
     association, suppressions = _iperf3_control_event_association(tmp_path,
