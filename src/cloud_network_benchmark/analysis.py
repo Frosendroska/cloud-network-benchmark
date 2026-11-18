@@ -1084,8 +1084,10 @@ def analyze_selection(selection_path: Path, *, analysis_git: GitSnapshot) -> Ana
             "path": str(cost_path), "resolved_path": str(cost_path), "sha256": cost["sha256"], "unit_id": None})
     for value, recorded, descriptor_sources, _key in loaded:
         current = validate_bundle(value, evaluated_at=recorded.evaluated_at)
-        recorded_metrics = recorded.metrics.value or {}
-        current_metrics = current.metrics.value or {}
+        # Saved JSON contains nested dictionaries where replay may retain Evidence
+        # models. Compare the same serialized projection on both sides.
+        recorded_metrics = recorded.model_dump(mode="json")["metrics"]["value"] or {}
+        current_metrics = current.model_dump(mode="json")["metrics"]["value"] or {}
         differing_metric_fields = sorted(key for key in set(recorded_metrics) | set(current_metrics)
             if recorded_metrics.get(key) != current_metrics.get(key))
         saved_metric_checks[value.identity.run_id] = {"consistent": not differing_metric_fields,
