@@ -21,7 +21,7 @@ from pydantic import Field, model_validator
 from .contracts.common import StrictModel
 if TYPE_CHECKING:
     from .bootstrap import SourceBuild
-    
+
 MAX_TOOL_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 TARGET_OS = "ubuntu-24.04"
