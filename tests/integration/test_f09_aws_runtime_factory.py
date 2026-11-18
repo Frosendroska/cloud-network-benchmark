@@ -786,8 +786,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                 {"event": "end", "data": {"sum_received": {"bytes": 125000000, "seconds": duration}}}]
             event_lines.extend(json.dumps(event, separators=(",", ":")) for event in events)
             common = {"format": 1, "tool": "iperf3", "semantics_id": "iperf-3.17.1-stats-v1",
-                "invocation_id": "f02r-vm_b-listener-iperf3", "pid": 51,
-                "boot_id": "12345678-1234-4234-8234-123456789def", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
+                "invocation_id": "f02r-vm_b-listener-iperf3", "pid": 32000,
+                "boot_id": "12345678-1234-1234-8234-123456789abc", "clock": "CLOCK_MONOTONIC", "cookie": cookie}
             anchor = {**common, "record_kind": "clock_anchor", "mono_before_ns": 1_000_000_000_000,
                 "realtime_ns": int(self.native_base_time.timestamp() * 1_000_000_000), "mono_after_ns": 1_000_000_001_000}
             source_lines.append("CNB_ACQ_V1 " + json.dumps(anchor, separators=(",", ":")))
@@ -1084,6 +1084,11 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert replay.model_dump(mode="json") == finalized["aws"][0].model_dump(mode="json")
     assert replay.validation_status.data_validity == expected_validity, [
         (item.code, item.severity, item.message, item.unit_id, item.artifact_id) for item in replay.findings]
+    if full_native:
+        evidence = saved.iperf3_control_evidence.value
+        assert evidence["readiness"]["event_association"]["status"] == "verified"
+        assert {item.code for item in replay.findings} >= {
+            "control.iperf3.readiness_cookie", "control.iperf3.server_interrupt"}
     assert not [item for item in replay.findings if item.severity == "error"], replay.findings
     if full_native:
         assert not [item for item in replay.findings if item.code == "command.listener_evidence_missing"], replay.findings

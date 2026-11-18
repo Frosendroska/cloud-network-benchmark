@@ -202,22 +202,18 @@ def _replayed_iperf3_control_association(value: ValidatorInput
         payload.get("private_ipv4_b"))
     if not all(isinstance(item, str) and item for item in (vm_a_host, vm_b_host, private_b)):
         return None, set()
-    listeners = [command for command in value.commands
-        if command.request.get("action_id") == "f02r-vm_b-listener-iperf3"
-        and command.producer == "vm_b"]
-    if len(listeners) != 1 or not _f02r_iperf_listener(listeners[0],
-            [str(item) for item in listeners[0].request.get("argv", [])]):
-        return None, set()
-    argv = [str(item) for item in listeners[0].request.get("argv", [])]
-    offset = 1 if argv[:1] == ["sudo"] else 0
-    binary_indexes = [index for index, item in enumerate(argv) if item.endswith("/bin/iperf3")]
-    if (len(binary_indexes) != 1 or _option(argv[binary_indexes[0] + 1:], "-B") != private_b
-            or listeners[0].source_identity.value != payload.get("source", {}).get("source_reference")):
-        return None, set()
     try:
-        from .lifecycle_projection import _iperf3_control_event_association
+        from types import SimpleNamespace
+        from .lifecycle_projection import _iperf3_control_event_association, _verified_iperf3_control_evidence
+        verified = _verified_iperf3_control_evidence(root,
+            SimpleNamespace(run_id=value.identity.run_id, deployment_id=value.identity.deployment_id),
+            value.artifact_records, vm_a_host_id=vm_a_host, vm_b_host_id=vm_b_host,
+            private_ipv4_b=private_b, stdout_path=payload.get("iperf3_stdout_path"),
+            stderr_path=payload.get("iperf3_stderr_path"))
+        if verified != payload:
+            return None, set()
         association, suppressions = _iperf3_control_event_association(root,
-            value.artifact_records, payload, vm_a_host_id=vm_a_host,
+            value.artifact_records, verified, vm_a_host_id=vm_a_host,
             vm_b_host_id=vm_b_host, private_ipv4_b=private_b,
             stdout_path=payload.get("iperf3_stdout_path"))
     except (OSError, ValueError, TypeError, KeyError, AttributeError):

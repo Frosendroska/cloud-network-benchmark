@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Mapping
 
@@ -642,6 +642,11 @@ def _iperf3_control_event_association(root: Path, records: list[Any], payload: M
         if (pre_measure.get("available") is not True or not isinstance(pre, Mapping)
                 or not isinstance(post, Mapping) or post.get("available") is not True
                 or not isinstance(owner, Mapping) or not isinstance(source, Mapping)
+                or ready.get("ready") is not True or ready.get("deployment_id") != deployment
+                or listener.get("closed") is not True or listener.get("failures") != []
+                or not _valid_owned_log_identity(owner, deployment)
+                or not isinstance(listener.get("closed_at"), str)
+                or not _ordered_utc(owner.get("closed_at_utc"), listener.get("closed_at"))
                 or not isinstance(session, str) or not session or not deployment):
             return unavailable()
         if (source.get("tool") != "iperf3" or source.get("binary_version") != "3.17.1"
@@ -680,33 +685,74 @@ def _iperf3_control_event_association(root: Path, records: list[Any], payload: M
 
         log_rows = [item for item in records if item.artifact_id == "iperf3_server_log"]
         build_rows = [item for item in records if item.artifact_id == "f02r-vm_b-iperf3-build"]
-        if len(log_rows) != 1 or len(build_rows) != 1:
+        acquisition_rows = [item for item in records if item.artifact_id == "iperf3_server_error"]
+        if len(log_rows) != 1 or len(build_rows) != 1 or len(acquisition_rows) != 1:
             return unavailable()
-        log_record, build_record = log_rows[0], build_rows[0]
-        if (log_record.path != stdout_path or log_record.producer != "vm_b"
+        log_record, build_record, acquisition_record = log_rows[0], build_rows[0], acquisition_rows[0]
+        try:
+            expected_relative_log_path = str(PurePosixPath(stdout_path).relative_to("/var/lib/cnb/results"))
+            expected_relative_error_path = str(PurePosixPath(payload["iperf3_stderr_path"]).relative_to("/var/lib/cnb/results"))
+        except (TypeError, ValueError):
+            return unavailable()
+        if (log_record.path != expected_relative_log_path or log_record.producer != "vm_b"
                 or log_record.kind != "iperf3-server-jsonl" or log_record.unit_id is not None
                 or log_record.retrieval_state != "verified" or log_record.closed is not True
+                or acquisition_record.path != expected_relative_error_path or acquisition_record.producer != "vm_b"
+                or acquisition_record.kind != "iperf3-observation-stderr" or acquisition_record.unit_id is not None
+                or acquisition_record.retrieval_state != "verified" or acquisition_record.closed is not True
                 or build_record.producer != "vm_b" or build_record.kind != "build-identity"
                 or build_record.retrieval_state != "verified" or build_record.closed is not True):
             return unavailable()
         log_record.verify_materialized_file(root)
         build_record.verify_materialized_file(root)
+        acquisition_record.verify_materialized_file(root)
         raw = resolve_artifact_path(root, log_record.path).read_bytes()
+        acquisition_raw = resolve_artifact_path(root, acquisition_record.path).read_bytes()
         from .acquisition import _parse_build_identity
         build = _parse_build_identity(resolve_artifact_path(root, build_record.path).read_bytes())
         source_fields = ("source_reference", "source_sha256", "upstream_commit", "patch_path",
             "patch_sha256", "observation_capability", "observation_semantics")
         if any(source.get(key) != build.get(key) for key in source_fields):
             return unavailable()
-        if (build.get("tool") != "iperf3" or build.get("binary_version") != "3.17.1"
-                or source.get("binary_version") != build.get("binary_version")
+        from .acquisition import _canonical_version_text, _expected_build_identity
+        pinned_commit, pinned_patch_path, pinned_patch_sha256, pinned_source_sha256 = _expected_build_identity("iperf3")
+        expected_reference = f"iperf-{pinned_commit}"
+        version = build.get("binary_version")
+        if (build.get("tool") != "iperf3" or build.get("upstream_commit") != pinned_commit
+                or build.get("source_reference") != expected_reference
+                or build.get("source_sha256") != pinned_source_sha256
+                or build.get("patch_path") != pinned_patch_path
+                or build.get("patch_sha256") != pinned_patch_sha256
+                or not isinstance(version, str)
+                or re.match(r"^iperf 3\.17\.1(?:\s|\()", _canonical_version_text(version)) is None
+                or _canonical_version_text(source.get("binary_version", "")) != _canonical_version_text(version)
                 or source.get("binary_sha256") != build.get("binary_sha256")
                 or build.get("observation_semantics") != "iperf-3.17.1-stats-v1"):
+            return unavailable()
+        source_pids: set[int] = set()
+        source_boot_ids: set[str] = set()
+        for line in acquisition_raw.splitlines():
+            if not line.startswith(b"CNB_ACQ_V1 "):
+                continue
+            try:
+                row = json.loads(line[len(b"CNB_ACQ_V1 "):])
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return unavailable()
+            if (not isinstance(row, Mapping) or row.get("tool") != "iperf3"
+                    or row.get("semantics_id") != "iperf-3.17.1-stats-v1"
+                    or row.get("invocation_id") != "f02r-vm_b-listener-iperf3"
+                    or isinstance(row.get("pid"), bool) or not isinstance(row.get("pid"), int)
+                    or not isinstance(row.get("boot_id"), str)):
+                return unavailable()
+            source_pids.add(row["pid"])
+            source_boot_ids.add(row["boot_id"])
+        if (not source_pids or source_pids != {pre["pid"]}
+                or source_boot_ids != {pre["boot_id"]}):
             return unavailable()
         for snap in (pre, post):
             size = snap["prefix_bytes"]
             prefix = raw[:size]
-            if (len(prefix) != size or (prefix and not prefix.endswith(b"\\n"))
+            if (len(prefix) != size or (prefix and not prefix.endswith(b"\n"))
                     or hashlib.sha256(prefix).hexdigest() != snap["prefix_sha256"]):
                 return unavailable()
         if post["prefix_bytes"] > len(raw):
@@ -787,10 +833,19 @@ def _iperf3_control_event_association(root: Path, records: list[Any], payload: M
                 or measurement_receipts[0].get("action_type") != "scp"
                 or measurement_receipts[0].get("outcome") != "succeeded"
                 or measurement_receipts[0].get("exit_code") != 0
+                or stop_row.get("remote_command") != f"sudo systemctl stop cnb-{deployment}-iperf3"
                 or any(token not in owner_close_command for token in same_owner_tokens)):
             return unavailable()
         for row in (ready_row, snapshot_action, dispatch[0], measurement_receipts[0], owner_row, stop_row, closed_row):
-            if row.get("outcome") != "succeeded" or row.get("exit_code") != 0:
+            expected_role = "vm_a" if row in (ready_row, dispatch[0], measurement_receipts[0]) else "vm_b"
+            if (row.get("outcome") != "succeeded" or row.get("exit_code") != 0
+                    or row.get("role") != expected_role):
+                return unavailable()
+            if (row in (snapshot_action, owner_row, stop_row, closed_row)
+                    and (row.get("vm_id") != payload.get("vm_b_host_id") or row.get("action_type") != "ssh")):
+                return unavailable()
+            if (row in (ready_row, dispatch[0], measurement_receipts[0])
+                    and row.get("vm_id") != payload.get("vm_a_host_id")):
                 return unavailable()
         if (not _ordered_utc(ready_row.get("finished_at"), snapshot_action.get("started_at"))
                 or not _ordered_utc(snapshot_action.get("finished_at"), dispatch[0].get("started_at"))
