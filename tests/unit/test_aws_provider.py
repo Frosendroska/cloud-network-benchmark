@@ -963,6 +963,51 @@ def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
     assert journal["cleanup_failure"]["details"]["exception_type"] == "OSError"
 
 
+@pytest.mark.parametrize("lookup, recovered", [
+    ((["exact-execution"], 1), True),
+    (([], 0), False),
+    ((["one", "two"], 2), False),
+    (None, False),
+])
+def test_cleanup_recovers_only_one_exact_lost_start_execution(tmp_path, lookup, recovered):
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    safety = {"document_name": "cnb-expiry-test", "document_version": "7",
+        "role_arn": "arn:aws:iam::123456789012:role/cnb-expiry-test"}
+    primary = FailureEvidence(category="expiry_uncertain", message="start response was lost", occurred_at=NOW)
+    driver._save_journal(attempt, {
+        "schema_version": 1, "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": False, "regions": ["eu-central-1"], "executions": {},
+        "registration_attempted_regions": ["eu-central-1"], "registration_uncertain_regions": ["eu-central-1"],
+        "expiry_trigger": (NOW + timedelta(minutes=10)).isoformat(), "safety": {"eu-central-1": safety},
+        "primary_failure": primary.model_dump(mode="json"),
+    })
+    driver._aws_json = lambda *_args: {"Account": "123456789012"}
+    driver._lookup_automation = lambda *_args: lookup
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    cancelled = []
+    driver._cancel_or_confirm_terminal = lambda region, execution_id, actual_safety, params: (
+        cancelled.append((region, execution_id, actual_safety, params)) or {"state": "Cancelled"})
+    driver._verify_safety_absent = lambda *_args: True
+    driver._expiry_from_journal = lambda *_args: None
+
+    result = driver.cleanup(deployment)
+    journal = driver._load_journal(attempt, deployment)
+    if recovered:
+        assert result.cleanup_state == "succeeded"
+        assert journal["executions"]["eu-central-1"] == "exact-execution"
+        assert cancelled[0][1] == "exact-execution"
+        assert cancelled[0][3] == driver._automation_parameters(
+            deployment, "eu-central-1", datetime.fromisoformat(journal["expiry_trigger"]), safety["role_arn"])
+        assert journal["primary_failure"]["category"] == "expiry_uncertain"
+    else:
+        assert result.cleanup_state == "failed"
+        assert result.cleanup_failure.category == "expiry_uncertain"
+        assert not cancelled
+        assert journal.get("executions", {}) == {}
+
+
 def test_cleanup_returns_failed_evidence_when_final_journal_write_raises(tmp_path):
     class Runner:
         def run(self, request):

@@ -560,6 +560,31 @@ class AwsProviderDriver:
         uncertain = set(journal.get("registration_uncertain_regions", [])) | (
             set(journal.get("registration_attempted_regions", [])) - set(journal.get("executions", {})))
         for region in list(uncertain):
+            # A timed-out StartAutomationExecution may have been accepted even
+            # though its response was lost. During cleanup only, recover its
+            # identity from the original deployment scope and exact parameters.
+            # This never retries StartAutomationExecution or grants launch authority.
+            if (region in journal.get("registration_attempted_regions", [])
+                    and region not in journal.get("executions", {})):
+                safety = journal.get("safety", {}).get(region)
+                try:
+                    if not safety:
+                        continue
+                    trigger = datetime.fromisoformat(journal["expiry_trigger"])
+                    params = self._automation_parameters(deployment, region, trigger, safety["role_arn"])
+                    lookup = self._lookup_automation(region, safety, params)
+                    if lookup is not None and len(lookup[0]) == 1:
+                        execution_id = lookup[0][0]
+                        journal.setdefault("executions", {})[region] = execution_id
+                        journal.setdefault("regional_parameters", {})[region] = params
+                        journal.setdefault("regional_expiry_outcomes", {})[region] = {
+                            "execution_id": execution_id, "state": "recovered_for_cleanup",
+                        }
+                        self._save_journal(attempt, journal)
+                        uncertain.discard(region)
+                        continue
+                except (KeyError, ValueError, TypeError, AwsProviderError):
+                    pass
             rejection = journal.get("registration_rejections", {}).get(region, {})
             safety = journal.get("safety", {}).get(region)
             if not safety or not rejection:
