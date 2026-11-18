@@ -103,7 +103,7 @@ def test_receiver_reset_diagnostics_need_exact_crossing_source_line(streams):
 
 
 def _total_mismatch_qualification_fixture(*, client_bytes=250, complete=True, exit_code=0,
-                                          client_total=True, unknown_error=False):
+                                          client_total=True, unknown_error=False, client_final=True, embedded_final=True):
     from cloud_network_benchmark.contracts.validation import ValidationFinding
 
     unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=1, measured_seconds=10)
@@ -129,7 +129,8 @@ def _total_mismatch_qualification_fixture(*, client_bytes=250, complete=True, ex
                      if client_total else ())
     client_native = NativeParse(source=client_source, sessions=("client-session",),
         session_details=({"start": {"cookie": "cookie"}, "embedded_receiver_start": {"cookie": "cookie"},
-            "client_final": client_totals, "embedded_receiver_final": client_totals},),
+            "client_final": client_totals if client_final else (),
+            "embedded_receiver_final": client_totals if embedded_final else ()},),
         receiver_totals=client_totals,
         findings=((ValidationFinding(code="native.iperf3.error", severity="error",
             message="unknown client native error"),) if unknown_error else ()))
@@ -157,7 +158,7 @@ def test_receiver_total_mismatch_is_info_only_with_complete_paired_final_proof()
 
 @pytest.mark.parametrize("changes", [
     {"client_bytes": 251}, {"complete": False}, {"exit_code": 1},
-    {"client_total": False}, {"unknown_error": True},
+    {"client_total": False}, {"unknown_error": True}, {"client_final": False}, {"embedded_final": False},
 ])
 def test_receiver_total_mismatch_stays_warning_without_each_required_proof(changes):
     result, _finding = _total_mismatch_qualification_fixture(**changes)
@@ -1383,3 +1384,28 @@ def test_sequence_requires_actual_sockperf_runtime_and_ten_second_pause(reposito
     value = value.model_copy(update={"timings":[value.timings[0], too_early, *value.timings[2:]]})
     findings = _sequence_timing_findings(value, {first.unit_id:NativeParse(probe_counts=(counts,))})
     assert any(item.code == "timing.phase_pause" and item.unit_id == second.unit_id for item in findings)
+
+
+def test_receiver_session_keeps_orphan_and_global_diagnostics():
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+    source = SourceRef("iperf3_server_log", "receiver.jsonl", "a"*64)
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=1)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a", started_at=SimpleNamespace(value=NOW),
+        request={"argv":["iperf3","-c","10.0.0.2","-P","1"]})
+    timing = SimpleNamespace(unit_id="u1", tcp_started_at=SimpleNamespace(value=NOW),
+        measured_started_at=SimpleNamespace(value=None), measured_finished_at=SimpleNamespace(value=None))
+    value = SimpleNamespace(measurement_units=[unit], commands=[command], timings=[timing])
+    orphan = ValidationFinding(code="native.iperf3.interval_duration", severity="warning",
+        message="line 20: end-start disagrees with native seconds", artifact_id=source.artifact_id)
+    unknown = ValidationFinding(code="native.iperf3.error", severity="error",
+        message="line 21: iperf3 error event", artifact_id=source.artifact_id)
+    multiple = ValidationFinding(code="native.iperf3.multiple_sessions", severity="warning",
+        message="multiple persistent-server sessions require external unit association", artifact_id=source.artifact_id)
+    details = tuple({"session_id":session, "start":{"cookie":cookie,
+        "test_start":{"protocol":"TCP","num_streams":1}, "timestamp":{"timesecs":stamp}}}
+        for session,cookie,stamp in (("1","owned",NOW.timestamp()), ("2","orphan",NOW.timestamp()+100)))
+    parsed = NativeParse(source=source, sessions=("1","2"), session_details=details,
+        findings=(orphan,unknown,multiple), receiver_finding_evidence=((orphan.code,orphan.message,"2",20,{}),))
+    selected = _receiver_session_for_unit(value, unit, parsed)
+    assert selected.sessions == ("1",)
+    assert orphan in selected.findings and unknown in selected.findings and multiple in selected.findings
