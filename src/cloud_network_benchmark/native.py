@@ -112,6 +112,10 @@ class NativeParse:
     sessions: tuple[str, ...] = ()
     receiver_totals: tuple[dict[str, Any], ...] = ()
     session_details: tuple[dict[str, Any], ...] = ()
+    # Parser-local provenance for the two receiver warnings that can be
+    # qualified only after the caller associates a persistent-server session.
+    receiver_finding_evidence: tuple[tuple[str, str, str, int, dict[str, Any]], ...] = ()
+    client_native: Optional["NativeParse"] = None
 
 
 def _finding(code: str, message: str, source: Optional[SourceRef] = None, severity: str = "error") -> ValidationFinding:
@@ -300,6 +304,7 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
     totals: list[dict[str, Any]] = []
     sessions: list[str] = []
     session_details: list[dict[str, Any]] = []
+    receiver_finding_evidence: list[tuple[str, str, str, int, dict[str, Any]]] = []
     actual_source = source
     try:
         actual_source = SourceRef(**{**source.__dict__, "sha256": _sha(path)})
@@ -365,7 +370,7 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
                             findings.append(_finding("native.iperf3.server_output", f"line {line_no}: {exc}", actual_source, "warning"))
                             continue
                     if isinstance(embedded, dict):
-                        intervals.extend(_extract_intervals(embedded, actual_source, line_no, str(max(1, current)), findings))
+                        intervals.extend(_extract_intervals(embedded, actual_source, line_no, str(max(1, current)), findings, receiver_finding_evidence))
                         totals.extend(_extract_totals(embedded, actual_source, line_no, str(max(1, current))))
                 continue
             if event != "interval":
@@ -373,11 +378,11 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
                 continue
             current = max(1, current)
             data = obj.get("data", obj)
-            intervals.extend(_extract_interval_data(data, actual_source, line_no, str(current), findings))
+            intervals.extend(_extract_interval_data(data, actual_source, line_no, str(current), findings, receiver_finding_evidence))
             continue
         sessions.append("1")
         session_details.append({"session_id": "1", "start": obj.get("start", {}), "end": obj.get("end", {})})
-        intervals.extend(_extract_intervals(obj, actual_source, line_no, "1", findings))
+        intervals.extend(_extract_intervals(obj, actual_source, line_no, "1", findings, receiver_finding_evidence))
         server = obj.get("server_output_json")
         if isinstance(server, str):
             try:
@@ -385,9 +390,16 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
             except ValueError as exc:
                 findings.append(_finding("native.iperf3.server_output", str(exc), actual_source, "warning"))
         if isinstance(server, dict):
-            intervals.extend(_extract_intervals(server, actual_source, line_no, "1", findings))
+            intervals.extend(_extract_intervals(server, actual_source, line_no, "1", findings, receiver_finding_evidence))
             totals.extend(_extract_totals(server, actual_source, line_no, "1"))
         totals.extend(_extract_totals(obj, actual_source, line_no, "1"))
+        # Retain independently present final aliases before aggregate deduplication.
+        # Contextual qualification must never infer a missing final from another.
+        session_details[-1].update({
+            "client_final": tuple(_extract_totals(obj.get("end"), actual_source, line_no, "1")),
+            "embedded_receiver_final": tuple(_extract_totals(server.get("end"), actual_source, line_no, "1"))
+                if isinstance(server, dict) else (),
+            "embedded_receiver_start": server.get("start") if isinstance(server, dict) else None})
     intervals = _dedupe_intervals(intervals, findings)
     totals = _dedupe_receiver_totals(totals)
     conflict_sessions = _receiver_total_conflict_sessions(totals)
@@ -399,38 +411,42 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
         if session_intervals:
             interval_bytes = sum(item.bytes for item in session_intervals)
             if interval_bytes != total["bytes"]:
-                findings.append(_finding("native.iperf3.total_mismatch",
-                    f"session {total['session_id']}: receiver final bytes contradict interval sum", actual_source, "warning"))
+                message = f"session {total['session_id']}: receiver final bytes contradict interval sum"
+                findings.append(_finding("native.iperf3.total_mismatch", message, actual_source, "warning"))
+                receiver_finding_evidence.append(("native.iperf3.total_mismatch", message,
+                    total["session_id"], int(total.get("line", 1)),
+                    {"final_bytes": total["bytes"], "interval_bytes": interval_bytes}))
     if len(set(sessions)) > 1:
         findings.append(_finding("native.iperf3.multiple_sessions", "multiple persistent-server sessions require external unit association", actual_source, "warning"))
     if not intervals:
         findings.append(_finding("native.iperf3.receiver_unavailable", "no receiver-side measured intervals were found", actual_source, "warning"))
     return NativeParse(receiver_intervals=tuple(intervals), findings=tuple(findings), source=actual_source,
                        sessions=tuple(dict.fromkeys(sessions)), receiver_totals=tuple(totals),
-                       session_details=tuple(session_details))
+                       session_details=tuple(session_details),
+                       receiver_finding_evidence=tuple(receiver_finding_evidence))
 
 
 def _extract_interval_data(data: Any, source: SourceRef, line: int, session: str,
-                           findings: list[ValidationFinding]) -> list[ReceiverInterval]:
+                           findings: list[ValidationFinding], evidence: list[tuple[str, str, str, int, dict[str, Any]]]) -> list[ReceiverInterval]:
     if not isinstance(data, dict):
         findings.append(_finding("native.iperf3.interval", f"line {line}: interval data must be an object", source, "warning"))
         return []
-    return _interval_items(data, source, line, session, findings)
+    return _interval_items(data, source, line, session, findings, evidence)
 
 
 def _extract_intervals(root: dict[str, Any], source: SourceRef, line: int, session: str,
-                       findings: list[ValidationFinding]) -> list[ReceiverInterval]:
+                       findings: list[ValidationFinding], evidence: list[tuple[str, str, str, int, dict[str, Any]]]) -> list[ReceiverInterval]:
     output: list[ReceiverInterval] = []
     for item in root.get("intervals", []) if isinstance(root.get("intervals", []), list) else []:
         if isinstance(item, dict):
-            output.extend(_interval_items(item, source, line, session, findings))
+            output.extend(_interval_items(item, source, line, session, findings, evidence))
     if root.get("event") == "interval":
-        output.extend(_interval_items(root.get("data", root), source, line, session, findings))
+        output.extend(_interval_items(root.get("data", root), source, line, session, findings, evidence))
     return output
 
 
 def _interval_items(obj: dict[str, Any], source: SourceRef, line: int, session: str,
-                    findings: list[ValidationFinding]) -> list[ReceiverInterval]:
+                    findings: list[ValidationFinding], evidence: list[tuple[str, str, str, int, dict[str, Any]]]) -> list[ReceiverInterval]:
     interval = obj.get("sum")
     streams = obj.get("streams")
     candidates: list[dict[str, Any]] = []
@@ -464,7 +480,11 @@ def _interval_items(obj: dict[str, Any], source: SourceRef, line: int, session: 
     else:
         amount = byte_values[0]
     if not math.isclose(end - start, elapsed, rel_tol=0, abs_tol=0.002):
-        findings.append(_finding("native.iperf3.interval_duration", f"line {line}: end-start disagrees with native seconds", source, "warning"))
+        message = f"line {line}: end-start disagrees with native seconds"
+        findings.append(_finding("native.iperf3.interval_duration", message, source, "warning"))
+        evidence.append(("native.iperf3.interval_duration", message, session, line,
+            {"start": start, "end": end, "seconds": elapsed, "bytes": int(amount),
+             "omitted": bool(first.get("omitted", False))}))
         return []
     omitted = bool(first.get("omitted", False))
     return [ReceiverInterval(session, start, end, elapsed, int(amount), omitted, False, source, line)]

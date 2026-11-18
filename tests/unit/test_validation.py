@@ -15,7 +15,7 @@ from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_native_terminal_ends, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _qualify_receiver_total_mismatch, _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_native_terminal_ends, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
@@ -48,6 +48,121 @@ def test_conflicting_receiver_totals_do_not_fall_back_to_interval_sum():
     assert stats["received_bytes"].value is None
     assert stats["measured_seconds"].value is None
     assert stats["received_bytes"].unavailable_reason
+
+
+@pytest.mark.parametrize("streams", [1, 4])
+def test_receiver_reset_diagnostics_need_exact_crossing_source_line(streams):
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    source = SourceRef("iperf3_server_log", "receiver.jsonl", "a" * 64)
+    stream_rows = {str(stream): [{"start_us": 0, "end_us": 100, "original_start_us": -100, "original_end_us": 100,
+        "bytes": 100, "sum_start_seconds": 0.0, "sum_end_seconds": 2.0,
+        "sum_seconds": 2.001003, "sum_bytes": streams * 100}]
+        for stream in range(1, streams + 1)}
+    origin = {"origin_utc": NOW.timestamp(), "uncertainty_seconds": .000001,
+        "crossing_start_cutoff_us": 2_000_000, "stream_count": streams,
+        "receiver_artifact_sha256": source.sha256,
+        "receiver_support_by_native_line": {"10": stream_rows},
+        "receiver_line_by_signature": {(0.0, 2.0, 2.001003, streams * 100): 10}}
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=streams,
+        measured_seconds=10)
+    details = ({"session_id": "1", "start": {"cookie": "cookie",
+        "test_start": {"protocol": "TCP", "num_streams": streams},
+        "timestamp": {"timesecs": NOW.timestamp()}}},)
+    finding = ValidationFinding(code="native.iperf3.interval_duration", severity="warning",
+        message="line 10: end-start disagrees with native seconds", artifact_id=source.artifact_id)
+    parsed = NativeParse(source=source, sessions=("1",), session_details=details,
+        findings=(finding,), receiver_finding_evidence=((finding.code, finding.message, "1", 10,
+            {"start": 0.0, "end": 2.0, "seconds": 2.001003, "bytes": streams * 100,
+             "omitted": False}),))
+    command = SimpleNamespace(unit_id="u1", producer="vm_a", started_at=SimpleNamespace(value=NOW),
+        request={"argv": ["iperf3", "-c", "10.0.0.2", "-P", str(streams)]})
+    timing = SimpleNamespace(unit_id="u1", tcp_started_at=SimpleNamespace(value=NOW),
+        measured_started_at=SimpleNamespace(value=NOW),
+        measured_finished_at=SimpleNamespace(value=NOW + timedelta(seconds=10)))
+    value = SimpleNamespace(measurement_units=[unit], timings=[timing], commands=[command])
+    selected = _receiver_session_for_unit(value, unit, parsed, {"cookie": origin})
+    diagnostics = [item for item in selected.findings if item.code in {
+        "native.iperf3.interval_duration", "native.iperf3.window_unavailable"}]
+    assert len(diagnostics) == 2
+    assert all(item.severity == "warning" and item.unit_id == "u1" for item in diagnostics)
+    assert selected.receiver_intervals == ()
+
+    zero_start_support = {"cookie": {**origin, "receiver_support_by_native_line": {
+        "10": {str(stream): [{**items[0], "original_start_us": 0}]
+               for stream, items in stream_rows.items()}}}}
+    rejected = _receiver_session_for_unit(value, unit, parsed, zero_start_support)
+    assert any(item.code == "native.iperf3.interval_duration" and item.severity == "warning"
+        for item in rejected.findings)
+    assert any(item.code == "native.iperf3.window_unavailable" and item.severity == "warning"
+        for item in rejected.findings)
+    wrong_hash = {"cookie": {**origin, "receiver_artifact_sha256": "b" * 64}}
+    rejected_hash = _receiver_session_for_unit(value, unit, parsed, wrong_hash)
+    assert any(item.code == "native.iperf3.interval_duration" and item.severity == "warning"
+        for item in rejected_hash.findings)
+
+
+def _total_mismatch_qualification_fixture(*, client_bytes=250, complete=True, exit_code=0,
+                                          client_total=True, unknown_error=False):
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=1, measured_seconds=10)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a",
+        request={"argv": ["iperf3", "-c", "10.0.0.2", "-P", "1", "-t", "10", "-O", "5"]},
+        result={"outcome": "succeeded", "exit_code": exit_code})
+    value = SimpleNamespace(mode=ExperimentMode.SHORT_STUDY, context="standard", commands=[command])
+    b_source = SourceRef("iperf3_server_log", "receiver.jsonl", "a" * 64,
+        binary_version="3.17.1", source_identity="pinned-build")
+    client_source = SourceRef("iperf3-json", "client.json", "b" * 64,
+        binary_version="3.17.1", source_identity="pinned-build")
+    detail = {"session_id": "b-session", "start": {"cookie": "cookie",
+        "test_start": {"protocol": "TCP", "num_streams": 1, "duration": 10, "omit": 5},
+        "timestamp": {"timesecs": NOW.timestamp()}}}
+    message = "session b-session: receiver final bytes contradict interval sum"
+    finding = ValidationFinding(code="native.iperf3.total_mismatch", severity="warning",
+        message=message, unit_id="u1", artifact_id=b_source.artifact_id)
+    b_native = NativeParse(source=b_source, sessions=("b-session",), session_details=(detail,),
+        receiver_totals=({"session_id": "b-session", "bytes": 250, "seconds": 9.999802},),
+        findings=(finding,), receiver_finding_evidence=((finding.code, finding.message,
+            "b-session", 8, {"final_bytes": 250, "interval_bytes": 100}),))
+    client_totals = (({"session_id": "client-session", "bytes": client_bytes, "seconds": 9.999802},)
+                     if client_total else ())
+    client_native = NativeParse(source=client_source, sessions=("client-session",),
+        session_details=({"start": {"cookie": "cookie"}, "embedded_receiver_start": {"cookie": "cookie"},
+            "client_final": client_totals, "embedded_receiver_final": client_totals},),
+        receiver_totals=client_totals,
+        findings=((ValidationFinding(code="native.iperf3.error", severity="error",
+            message="unknown client native error"),) if unknown_error else ()))
+    b_native = NativeParse(**{**b_native.__dict__, "client_native": client_native})
+    origin = {"origin_utc": NOW.timestamp(), "uncertainty_seconds": .000001,
+        "crossing_start_cutoff_us": 0, "stream_count": 1, "nominal_required_seconds": 15,
+        "nominal_receiver_span_seconds": 15.001, "receiver_artifact_id": b_source.artifact_id,
+        "receiver_artifact_sha256": b_source.sha256, "build_artifact_id": "iperf3-build",
+        "build_sha256": "c" * 64, "receiver_support_by_native_line": {8: {"1": [{"bytes": 100}]}},
+        "receiver_line_by_signature": {(0.0, 1.0, 1.0, 100): 8}}
+    result = _qualify_receiver_total_mismatch(value, unit, b_native,
+        {"complete": complete}, {"u1": ([], [])}, {"cookie": origin})
+    return result, finding
+
+
+def test_receiver_total_mismatch_is_info_only_with_complete_paired_final_proof():
+    result, _finding = _total_mismatch_qualification_fixture()
+    qualified = next(item for item in result.findings if item.code == "native.iperf3.total_mismatch")
+    assert qualified.severity == "info"
+    assert "final bytes=250" in qualified.message
+    assert "interval sum=100" in qualified.message
+    assert "cause is unknown" in qualified.message
+    assert _tcp_statistics(result)["received_bytes"].value == 250
+
+
+@pytest.mark.parametrize("changes", [
+    {"client_bytes": 251}, {"complete": False}, {"exit_code": 1},
+    {"client_total": False}, {"unknown_error": True},
+])
+def test_receiver_total_mismatch_stays_warning_without_each_required_proof(changes):
+    result, _finding = _total_mismatch_qualification_fixture(**changes)
+    qualified = next(item for item in result.findings if item.code == "native.iperf3.total_mismatch")
+    assert qualified.severity == "warning"
 
 
 def test_reset_crossing_cutoff_uses_latest_independent_stream_end():

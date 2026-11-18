@@ -56,6 +56,9 @@ class SourceWindow:
     native_sum_end_seconds: float | None = None
     native_sum_seconds: float | None = None
     native_sum_bytes: int | None = None
+    # Original monotonic source bounds, before reset clipping of temporal support.
+    original_start_us: int | None = None
+    original_end_us: int | None = None
 
     def __post_init__(self) -> None:
         vals = (self.start_earliest_ns, self.start_latest_ns, self.end_earliest_ns, self.end_latest_ns)
@@ -283,7 +286,7 @@ def _iperf_windows(records: Iterator[ParsedRecord], source: AcquisitionSource,
             source.clock_domain, source.session_id, stream, start_ns, start_ns + 1000,
             end_ns, end_ns + 1000, omitted, record.byte_offset, record.byte_length,
             native_line if isinstance(native_line, int) and not isinstance(native_line, bool) else None,
-            native_bytes, sum_start, sum_end, sum_seconds, sum_bytes)
+            native_bytes, sum_start, sum_end, sum_seconds, sum_bytes, start_us, end_us)
     if settings is None:
         raise ValueError("iperf native session settings are missing")
     if len({stream for phase, stream in origins if phase == "initial"}) != settings["num_streams"]:
