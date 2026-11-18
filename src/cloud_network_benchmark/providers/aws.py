@@ -174,16 +174,21 @@ class AwsProviderDriver:
         settings: AwsRuntimeSettings,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         sleeper: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.runner = runner
         self.settings = settings
         self.clock = clock
         self.sleeper = sleeper
+        self.monotonic = monotonic
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
         self._cleanup_deadline: float | None = None
         self._precreate_deadline: float | None = None
+        self._precreate_wall_deadline: datetime | None = None
+        self._provisioning_active = False
+        self._last_command_result: CommandResult | None = None
         self._active_primary_failure: FailureEvidence | None = None
         self._initialized_terraform: set[str] = set()
 
@@ -416,18 +421,25 @@ class AwsProviderDriver:
             raise AwsProviderError("complete remaining workflow no longer fits after expiry readback", category="cap_insufficient")
         # Bound pair apply by reserving all source-declared work after provisioning.
         # This leaves the full provision allowance available to apply itself.
-        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.post_provision_workflow_seconds)
+        phase_start = self.monotonic()
+        wall_remaining = (trigger - now).total_seconds() - self.settings.post_provision_workflow_seconds
+        self._precreate_deadline = min(
+            phase_start + provision_phase_seconds,
+            phase_start + max(0.0, wall_remaining),
+        )
+        self._precreate_wall_deadline = trigger - timedelta(seconds=self.settings.post_provision_workflow_seconds)
+        self._provisioning_active = True
 
-        variables = self._pair_variables(deployment)
         vars_path = attempt / "pair.tfvars.json"
-        self._write_private(vars_path, json.dumps(variables, sort_keys=True, indent=2).encode())
         state_path = attempt / "pair.tfstate"
-        journal["creation_may_have_started"] = True
-        journal["pair_state_path"] = str(state_path)
-        journal["apply_started_at"] = now.isoformat()
-        self._save_journal(attempt, journal)
         apply_result: CommandResult | None = None
         try:
+            variables = self._pair_variables(deployment)
+            self._write_private(vars_path, json.dumps(variables, sort_keys=True, indent=2).encode())
+            journal["creation_may_have_started"] = True
+            journal["pair_state_path"] = str(state_path)
+            journal["apply_started_at"] = now.isoformat()
+            self._save_journal(attempt, journal)
             apply_result = self._run(
                 "aws-pair-apply",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
@@ -453,7 +465,9 @@ class AwsProviderDriver:
                 raise AwsProviderError("Terraform output is missing deployment.value", category="output_invalid")
             journal["known_resource_ids"] = _known_resource_ids(output)
             self._save_journal(attempt, journal)
+            self._require_provision_time("pair output normalization")
             normalized = self._normalize_output(deployment, output, apply_result.started_at, apply_result.finished_at)
+            self._require_provision_time("pair trust completion")
             self._write_private(attempt / "terraform-outputs.redacted.json", json.dumps(_redacted_output(output), indent=2, sort_keys=True).encode())
             journal["provisioned"] = True
             journal["deployment_output"] = normalized.model_dump(mode="json")
@@ -485,8 +499,16 @@ class AwsProviderDriver:
                 except Exception:
                     pass
             raise
+        finally:
+            self._provisioning_active = False
+            self._precreate_deadline = None
+            self._precreate_wall_deadline = None
 
     def cleanup(self, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
+        self._registration_deadline = None
+        self._precreate_deadline = None
+        self._precreate_wall_deadline = None
+        self._provisioning_active = False
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         self._active_commands = []
@@ -500,7 +522,6 @@ class AwsProviderDriver:
         if scope and (scope.get("account_id") != self.settings.account_id or regions != list(dict.fromkeys(scope.get("regions", [])))):
             failure = _failure(AwsProviderError("cleanup account or regions differ from registered AWS scope", category="scope_mismatch"), self.clock())
             return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
-        self._registration_deadline = None
         self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
 
         try:
@@ -965,6 +986,7 @@ class AwsProviderDriver:
         }
 
     def _normalize_output(self, deployment: ProviderDeploymentInput, raw: dict[str, Any], started: datetime, finished: datetime) -> ProviderDeploymentOutput:
+        self._require_provision_time("pair output normalization")
         vm_values = raw.get("vms")
         if not isinstance(vm_values, dict) or set(vm_values) != {"vm_a", "vm_b"}:
             raise AwsProviderError("Terraform output must contain exactly vm_a and vm_b", category="output_invalid")
@@ -1056,33 +1078,57 @@ class AwsProviderDriver:
 
     def _verify_host_key(self, detail: dict[str, Any]) -> dict[str, str]:
         region, instance_id = detail["region"], detail["instance_id"]
-        response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region, "--output", "json")
-        if response.get("InstanceId") != instance_id:
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
-            raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
-        console = response.get("Output")
-        if not isinstance(console, str):
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
-            raise AwsProviderError("console output is malformed", category="host_identity_unavailable")
-        boots = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
-        fingerprints = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", console)
-        timestamp = response.get("Timestamp")
         launch_time = detail.get("launch_time")
-        try:
-            timestamp_value = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-            launch_value = launch_time if isinstance(launch_time, datetime) else datetime.fromisoformat(str(launch_time).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            timestamp_value = launch_value = None
-        if timestamp_value is None or launch_value is None or timestamp_value < launch_value or len(boots) != 1 or len(fingerprints) != 1:
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
-            raise AwsProviderError("authenticated console lacks one current boot and ED25519 host fingerprint", category="host_identity_unavailable")
+        launch_value = _parse_utc_datetime(launch_time)
+        if launch_value is None:
+            raise AwsProviderError("instance launch time is malformed", category="host_identity_unavailable")
+        while True:
+            self._require_provision_time("console identity read")
+            try:
+                response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region, "--output", "json")
+            except AwsProviderError:
+                overdue = self._last_command_result
+                if overdue is not None and overdue.action_id.startswith("aws-get-console-output"):
+                    try:
+                        captured = json.loads(overdue.stdout)
+                    except (ValueError, TypeError):
+                        captured = None
+                    if isinstance(captured, dict):
+                        self._record_host_console_diagnostic(instance_id, captured, launch_time)
+                raise
+            if response.get("InstanceId") != instance_id:
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
+            console, timestamp = response.get("Output"), response.get("Timestamp")
+            if not isinstance(console, str) or not isinstance(timestamp, str):
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                raise AwsProviderError("console response is malformed", category="host_identity_unavailable")
+            boots, boot_count, boot_bad = _console_marker_values(console, "CNB_HOSTKEY_BOOT_ID")
+            fingerprints, fingerprint_count, fingerprint_bad = _console_marker_values(console, "CNB_ED25519_HOST_FINGERPRINT")
+            if boot_bad or fingerprint_bad or boot_count > 1 or fingerprint_count > 1:
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                raise AwsProviderError("authenticated console contains malformed or ambiguous host identity markers", category="host_identity_unavailable")
+            if not boots or not fingerprints:
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                self._wait_for_console_retry()
+                continue
+            timestamp_value = _parse_utc_datetime(timestamp)
+            if timestamp_value is None:
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                raise AwsProviderError("authenticated console timestamp is malformed", category="host_identity_unavailable")
+            if timestamp_value < launch_value:
+                self._record_host_console_diagnostic(instance_id, response, launch_time)
+                self._wait_for_console_retry()
+                continue
+            break
+        boot_id, fingerprint = boots[0], fingerprints[0]
         keyscan = self._run(
             f"aws-host-keyscan-{instance_id}",
             ["ssh-keyscan", "-T", "10", "-t", "ed25519", detail["public_ipv4"]],
             15,
         )
         if not _succeeded(keyscan):
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
+            self._record_host_console_diagnostic(instance_id, response, launch_time)
             raise AwsProviderError("host keyscan failed", category="host_keyscan", action_id=keyscan.action_id)
         parsed = self._run(
             f"aws-host-key-fingerprint-{instance_id}",
@@ -1091,20 +1137,23 @@ class AwsProviderDriver:
             stdin=keyscan.stdout,
         )
         if not _succeeded(parsed):
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
+            self._record_host_console_diagnostic(instance_id, response, launch_time)
             raise AwsProviderError("candidate host key fingerprint could not be parsed", category="host_keyscan", action_id=parsed.action_id)
         candidates = re.findall(r"SHA256:[A-Za-z0-9+/]+", parsed.stdout)
-        if len(candidates) != 1 or candidates[0] != fingerprints[0]:
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
+        self._require_provision_time("host-key verification")
+        if len(candidates) != 1 or candidates[0] != fingerprint:
+            self._record_host_console_diagnostic(instance_id, response, launch_time)
             raise AwsProviderError("candidate host key does not match authenticated EC2 console fingerprint", category="host_key_mismatch")
         private_dir = self._attempt_dir_for_details(detail)
         known_hosts = private_dir / f"{instance_id}.known_hosts"
         host_lines = [line.strip() for line in keyscan.stdout.splitlines() if line.strip() and not line.startswith("#")]
         if not host_lines:
-            self._record_host_console_diagnostic(instance_id, response, detail.get("launch_time"))
+            self._record_host_console_diagnostic(instance_id, response, launch_time)
             raise AwsProviderError("keyscan produced no host key", category="host_keyscan")
+        self._require_provision_time("known_hosts installation")
         self._write_private(known_hosts, ("\n".join(host_lines) + "\n").encode())
-        trust = {"known_hosts_path": str(known_hosts), "boot_id": boots[0], "fingerprint": fingerprints[0], "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(timestamp)}
+        trust = {"known_hosts_path": str(known_hosts), "boot_id": boot_id, "fingerprint": fingerprint, "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(timestamp)}
+        self._require_provision_time("host-trust installation")
         self._write_private(private_dir / f"{instance_id}.host-trust.json", json.dumps(trust, sort_keys=True).encode())
         return trust
 
@@ -1139,6 +1188,22 @@ class AwsProviderDriver:
         except (OSError, AwsProviderError):
             # Diagnostic retention must never replace the primary trust failure.
             return
+
+    def _require_provision_time(self, operation: str, *, action_id: str | None = None) -> float:
+        if self._precreate_deadline is None or self._precreate_wall_deadline is None:
+            raise AwsProviderError(f"original AWS provisioning deadline is unavailable before {operation}", category="cap_insufficient", action_id=action_id)
+        remaining = self._precreate_deadline - self.monotonic()
+        wall_now = self.clock().astimezone(timezone.utc)
+        wall_remaining = (self._precreate_wall_deadline - wall_now).total_seconds()
+        remaining = min(remaining, wall_remaining)
+        if remaining <= 0:
+            raise AwsProviderError(f"original AWS provisioning deadline elapsed before {operation}", category="cap_insufficient", action_id=action_id)
+        return remaining
+
+    def _wait_for_console_retry(self) -> None:
+        remaining = self._require_provision_time("console readiness retry")
+        self.sleeper(min(2.0, remaining))
+        self._require_provision_time("console readiness retry")
 
     def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str, *, catalog_cache: dict[tuple[str, ...], dict[str, Any]] | None = None) -> dict[str, Any]:
         region = expected["region"]
@@ -1527,13 +1592,11 @@ class AwsProviderDriver:
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry cleanup exceeded its bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
-        if self._precreate_deadline is not None and action_id == "aws-pair-apply":
-            remaining = int(self._precreate_deadline - time.monotonic())
-            if remaining <= 0:
-                raise AwsProviderError("pair apply admission budget expired immediately before creation", category="cap_insufficient", action_id=action_id)
-            timeout = min(timeout, remaining)
+        provisioning_action = self._provisioning_active
+        if provisioning_action:
+            timeout = min(timeout, self._require_provision_time(action_id, action_id=action_id))
         from ..terraform_work import private_terraform_environment, initialize_terraform
-        command_deadline = time.monotonic() + timeout
+        command_deadline = self.monotonic() + timeout
         request = CommandRequest(
             action_id=action_id,
             action_type="aws_provider_control",
@@ -1544,17 +1607,29 @@ class AwsProviderDriver:
             stdin=stdin,
             environment_classification="contains_secret_references" if self.settings.authentication_reference else "none",
         )
+        if provisioning_action:
+            self._require_provision_time(action_id + " initialization", action_id=action_id)
         initialize_terraform(self.runner, request, self._initialized_terraform)
-        remaining_after_init = command_deadline - time.monotonic()
+        if provisioning_action:
+            self._require_provision_time(action_id + " initialization", action_id=action_id)
+        remaining_after_init = command_deadline - self.monotonic()
         if remaining_after_init <= 0:
             raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
         request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
         def execute(request):
-            result = self.runner.run(request)
+            self._last_command_result = None
+            run_request = request
+            if provisioning_action:
+                remaining = min(self._require_provision_time(request.action_id, action_id=request.action_id), command_deadline - self.monotonic())
+                if remaining <= 0:
+                    raise AwsProviderError("original AWS provisioning deadline elapsed before command dispatch", category="cap_insufficient", action_id=request.action_id)
+                run_request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining)})
+            result = self.runner.run(run_request)
+            self._last_command_result = result
             # Persist only redacted command identity/outcome/timing, never provider stdout.
             record = {
                 "action_id": result.action_id,
-                "argv": request.durable_view()["argv"],
+                "argv": run_request.durable_view()["argv"],
                 "outcome": str(result.outcome),
                 "started_at": result.started_at.isoformat(),
                 "finished_at": result.finished_at.isoformat(),
@@ -1584,6 +1659,8 @@ class AwsProviderDriver:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.chmod(command_log, 0o600)
+            if provisioning_action:
+                self._require_provision_time(action_id + " completion", action_id=action_id)
             return result
         if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
             from ..terraform_plan import reviewed_apply
@@ -1621,6 +1698,49 @@ def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         raise AwsProviderError("AWS attempt requires exactly vm_a and vm_b roles", category="role_mismatch")
     if deployment.provider_options != {"instance_market_type": "on_demand"}:
         raise AwsProviderError("AWS attempt must use the frozen On-Demand provider option", category="shape_mismatch")
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _console_marker_values(console: str, name: str) -> tuple[list[str], int, bool]:
+    """Read one marker while rejecting malformed and prefix-only lookalikes."""
+    # cloud-init/xtrace prints the printf format used to emit markers before it
+    # prints the actual marker values. That command line is not identity evidence.
+    printf_template = re.compile(
+        r"^\s*\+\s*printf\s+'CNB_HOSTKEY_BOOT_ID=%s\\n"
+        r"CNB_ED25519_HOST_FINGERPRINT=%s\\n'\s+\"\$boot_id\"\s+\"\$fingerprint\"\s*$"
+    )
+    evidence = "\n".join(line for line in console.splitlines()
+        if printf_template.fullmatch(line) is None)
+    matches = list(re.finditer(re.escape(name) + r"=([^\r\n]*)", evidence))
+    values: list[str] = []
+    malformed = False
+    pattern = (r"[0-9a-f-]{36}" if name == "CNB_HOSTKEY_BOOT_ID"
+        else r"SHA256:[A-Za-z0-9+/]+")
+    for match in matches:
+        raw = match.group(1).strip()
+        if re.fullmatch(pattern, raw) is None:
+            malformed = True
+            continue
+        if name == "CNB_HOSTKEY_BOOT_ID":
+            try:
+                parsed = uuid.UUID(raw)
+            except (ValueError, AttributeError):
+                malformed = True
+                continue
+            if str(parsed) != raw:
+                malformed = True
+                continue
+        values.append(raw)
+    return values, len(matches), malformed
 
 
 def _validate_expiry_price_fixture(root: Path, settings: AwsRuntimeSettings) -> None:

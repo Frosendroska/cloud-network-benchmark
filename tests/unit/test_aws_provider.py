@@ -23,6 +23,7 @@ from cloud_network_benchmark.providers.aws import (
     EXPIRY_INPUT_PATH,
     EXPIRY_INPUT_SHA256,
     EXPIRY_COST_PER_REGION,
+    _console_marker_values,
     _ssm_scalar,
     SAFETY_LEAD_SECONDS,
     AwsProviderDriver,
@@ -39,6 +40,33 @@ from cloud_network_benchmark.providers.aws import (
 
 ROOT = Path(__file__).parents[2]
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+
+
+class FakeProvisionClock:
+    def __init__(self):
+        self.seconds = 0.0
+        self.wall_adjustment = 0.0
+        self.sleep_overshoot = 0.0
+
+    def __call__(self):
+        return self.seconds
+
+    def utc_now(self):
+        return NOW + timedelta(seconds=self.seconds + self.wall_adjustment)
+
+    def sleep(self, seconds):
+        self.seconds += seconds + self.sleep_overshoot
+
+
+def set_provision_context(driver, clock=None, seconds=10):
+    clock = clock or FakeProvisionClock()
+    driver.monotonic = clock
+    driver.sleeper = clock.sleep
+    driver.clock = clock.utc_now
+    driver._precreate_deadline = seconds
+    driver._precreate_wall_deadline = NOW + timedelta(seconds=seconds)
+    driver._provisioning_active = True
+    return clock
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fake-key"
 
 
@@ -317,6 +345,7 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     runner = Runner()
     deployment = make_deployment()
     driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver)
     driver._active_attempt = driver._attempt_dir(deployment)
     detail = {"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]}
     if expected_error:
@@ -331,6 +360,272 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     if not expected_error:
         trust = json.loads(Path(observed["known_hosts_path"]).with_name(f"{fixture['instance_id']}.host-trust.json").read_text())
         assert trust["account_id"] == "123456789012" and trust["region"] == fixture["region"]
+
+
+def test_console_marker_parser_accepts_cloud_init_prefixes_and_rejects_truncated_values():
+    boot = "f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a"
+    fingerprint = "SHA256:6vY5WQn8o6vthzV3rnmaHhNHw0pYp9aF9Vw5c9y1QwA"
+    console = (f"#cloud-config\n+ printf 'CNB_HOSTKEY_BOOT_ID=%s\\n"
+        "CNB_ED25519_HOST_FINGERPRINT=%s\\n' \"$boot_id\" \"$fingerprint\"\n"
+        f"+ CNB_HOSTKEY_BOOT_ID={boot}\n+ CNB_ED25519_HOST_FINGERPRINT={fingerprint}\n")
+    assert _console_marker_values(console, "CNB_HOSTKEY_BOOT_ID") == ([boot], 1, False)
+    assert _console_marker_values(console, "CNB_ED25519_HOST_FINGERPRINT") == ([fingerprint], 1, False)
+    assert _console_marker_values(console.replace(boot, boot + "junk"), "CNB_HOSTKEY_BOOT_ID")[2]
+    malformed_printf = console.replace("%s\\n' \"$boot_id\"", "{boot}\\n' \"$boot_id\"")
+    assert _console_marker_values(malformed_printf, "CNB_HOSTKEY_BOOT_ID")[2]
+
+
+def test_console_empty_then_valid_uses_real_cli_action_and_shared_deadline(tmp_path):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self):
+            self.actions = []
+            self.console_reads = 0
+
+        def run(self, request):
+            self.actions.append((request.action_id, request.argv))
+            if "get-console-output" in request.argv:
+                self.console_reads += 1
+                output = "" if self.console_reads == 1 else (
+                    f"CNB_HOSTKEY_BOOT_ID={fixture['boot_id']}\n"
+                    f"CNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}\n")
+                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Output": output,
+                    "Timestamp": fixture["console_timestamp"]})
+            elif request.argv[0] == "ssh-keyscan":
+                stdout = "8.8.8.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey\n"
+            else:
+                stdout = f"256 {fixture['console_fingerprint']} host (ED25519)\n"
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    clock = set_provision_context(driver, seconds=10)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    result = driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+        "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+    assert result["boot_id"] == fixture["boot_id"]
+    assert runner.console_reads == 2 and clock.seconds == 2
+    assert [action for action, _ in runner.actions if "get-console-output" in action] == [
+        "aws-get-console-output---instance-id", "aws-get-console-output---instance-id"]
+    assert all(KEY not in " ".join(argv) for _, argv in runner.actions)
+
+
+def test_console_command_returning_after_deadline_is_diagnostic_only(tmp_path):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self, clock):
+            self.clock = clock
+            self.actions = []
+
+        def run(self, request):
+            self.actions.append(request.action_id)
+            self.clock.sleep(3)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW + timedelta(seconds=3), duration_seconds=3, exit_code=0,
+                stdout=json.dumps({"InstanceId": fixture["instance_id"], "Timestamp": fixture["console_timestamp"], "Output": "late response"}), stderr="")
+
+    deployment = make_deployment()
+    clock = FakeProvisionClock()
+    runner = Runner(clock)
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), monotonic=clock)
+    set_provision_context(driver, clock, seconds=2)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
+        driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+            "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+    assert runner.actions == ["aws-get-console-output---instance-id"]
+    diagnostic = next(driver._active_attempt.glob("host-console-*.json"))
+    saved = json.loads(diagnostic.read_text())
+    assert saved["output_characters"] == len("late response")
+    assert "late response" not in diagnostic.read_text()
+
+
+def test_forward_wall_clock_jump_expires_shared_provision_deadline_before_dispatch(tmp_path):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self): self.actions = []
+        def run(self, request):
+            self.actions.append(request.action_id)
+            raise AssertionError("command dispatched after UTC STOP-minus-reserve boundary")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    clock = set_provision_context(driver, seconds=10)
+    clock.wall_adjustment = 10
+    driver._active_attempt = driver._attempt_dir(deployment)
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
+        driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+            "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+    assert runner.actions == []
+
+
+@pytest.mark.parametrize("clock_jump", ["utc", "monotonic"])
+def test_remaining_command_timeout_is_clipped_by_both_deadline_clocks(tmp_path, clock_jump):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self): self.timeouts = []
+        def run(self, request):
+            self.timeouts.append(request.timeout_seconds)
+            if "get-console-output" in request.argv:
+                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Output":
+                    f"CNB_HOSTKEY_BOOT_ID={fixture['boot_id']}\nCNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}\n",
+                    "Timestamp": fixture["console_timestamp"]})
+            elif request.argv[0] == "ssh-keyscan":
+                stdout = "8.8.8.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey\n"
+            else:
+                stdout = f"256 {fixture['console_fingerprint']} host (ED25519)\n"
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    clock = set_provision_context(driver, seconds=100)
+    if clock_jump == "utc":
+        clock.wall_adjustment = 99
+    else:
+        clock.seconds = 99
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+        "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+    assert runner.timeouts[0] <= 1
+
+
+def test_sleep_overshoot_does_not_dispatch_another_console_poll(tmp_path):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self): self.reads = 0
+        def run(self, request):
+            if "get-console-output" in request.argv:
+                self.reads += 1
+                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Timestamp": fixture["console_timestamp"], "Output": ""})
+                return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+            raise AssertionError("host-key command dispatched after sleep overshoot")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    clock = set_provision_context(driver, seconds=2)
+    clock.sleep_overshoot = 3
+    driver._active_attempt = driver._attempt_dir(deployment)
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
+        driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+            "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+    assert runner.reads == 1
+
+
+def test_both_role_host_trust_checks_consume_the_same_absolute_deadline(tmp_path):
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    class Runner:
+        def __init__(self): self.console_reads = 0
+        def run(self, request):
+            if "get-console-output" in request.argv:
+                self.console_reads += 1
+                output = "" if self.console_reads in {1, 3} else (
+                    f"CNB_HOSTKEY_BOOT_ID={fixture['boot_id']}\nCNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}\n")
+                stdout = json.dumps({"InstanceId": fixture["instance_id"], "Timestamp": fixture["console_timestamp"], "Output": output})
+            elif request.argv[0] == "ssh-keyscan":
+                stdout = "8.8.8.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey\n"
+            else:
+                stdout = f"256 {fixture['console_fingerprint']} host (ED25519)\n"
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+
+    deployment = make_deployment()
+    clock = FakeProvisionClock()
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), monotonic=clock)
+    set_provision_context(driver, clock, seconds=4)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    detail = {"region": fixture["region"], "instance_id": fixture["instance_id"],
+        "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]}
+    driver._verify_host_key(detail)
+    assert clock.seconds == 2
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
+        driver._verify_host_key(detail)
+    assert clock.seconds == 4
+
+
+def test_saved_plan_review_cannot_dispatch_apply_after_shared_deadline(tmp_path, monkeypatch):
+    from cloud_network_benchmark import terraform_plan, terraform_work
+    class Runner:
+        def __init__(self): self.actions = []
+        def run(self, request):
+            self.actions.append(request.action_id)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="", stderr="")
+
+    deployment = make_deployment()
+    clock = FakeProvisionClock()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), monotonic=clock)
+    set_provision_context(driver, clock, seconds=5)
+    monkeypatch.setattr(terraform_work, "initialize_terraform", lambda *_args: None)
+
+    def review_then_apply(request, execute, *, review_seconds):
+        execute(request.model_copy(update={"action_id": "review-plan"}))
+        clock.sleep(5)
+        execute(request.model_copy(update={"action_id": "apply"}))
+
+    monkeypatch.setattr(terraform_plan, "reviewed_apply", review_then_apply)
+    with pytest.raises(AwsProviderError) as raised:
+        driver._run("aws-pair-apply", ["terraform", "-chdir=/tmp/pair", "apply"], 30)
+    assert raised.value.action_id == "apply"
+    assert runner.actions == ["review-plan"]
+
+
+def test_cleanup_clears_expired_provisioning_context_before_inventory(tmp_path):
+    class Runner:
+        def __init__(self): self.actions = []
+        def run(self, request):
+            self.actions.append(request.action_id)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0,
+                stdout=json.dumps({"Account": "000000000000"}), stderr="")
+
+    deployment = make_deployment()
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=1)
+    driver.monotonic = lambda: 2
+    result = driver.cleanup(deployment)
+    assert runner.actions and runner.actions[0].startswith("aws-get-caller-identity")
+    assert result.cleanup_state == "failed"
+    assert driver._provisioning_active is False
+    assert driver._precreate_deadline is None and driver._precreate_wall_deadline is None
+
+
+def test_missing_provision_deadline_fails_closed_before_console_api(tmp_path):
+    class Runner:
+        def run(self, request):
+            raise AssertionError("console API must not run without a bounded provisioning context")
+
+    fixture = json.loads((ROOT / "tests/fixtures/aws/console/verified-host.json").read_text())
+    deployment = make_deployment()
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    with pytest.raises(AwsProviderError, match="deadline is unavailable"):
+        driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"],
+            "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
+
+
+def test_runtime_clock_without_sleep_uses_production_sleeper_and_fake_clock_uses_its_wait():
+    import time as time_module
+    from cloud_network_benchmark.lifecycle_runtime import _clock_sleeper
+
+    class ProductionClock:
+        def monotonic(self): return 0.0
+        def utc_now(self): return NOW
+
+    class FakeWaitClock(ProductionClock):
+        def wait(self, seconds): return seconds
+
+    assert _clock_sleeper(ProductionClock()) is time_module.sleep
+    fake = FakeWaitClock()
+    assert _clock_sleeper(fake).__self__ is fake
 
 
 @pytest.mark.parametrize("mutation,match", [
@@ -449,6 +744,7 @@ def test_pair_catalog_observations_are_reused_only_within_one_verification_call(
                 duration_seconds=0, exit_code=0, stdout=json.dumps(data), stderr="")
 
     driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=60)
     expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
         provider="aws", action="stop", state="registered", registration_id=Evidence[str](value="aws-ssm:test"),
         registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)), expires_at=Evidence[datetime](value=NOW + timedelta(seconds=900)),
@@ -490,6 +786,7 @@ def test_pair_catalog_observations_are_reused_only_within_one_verification_call(
 def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_path):
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=60)
     def detail(instance_id, private_ip, public_ip, region, zone):
         return {"instance_id": instance_id, "private_ipv4": private_ip, "public_ipv4": public_ip,
             "region": region, "zone": zone, "zone_id": "test-zone", "image_id": "ami-test",
@@ -504,14 +801,15 @@ def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_pa
 
 @pytest.mark.parametrize("response,match", [
     ({"InstanceId": "i-foreign", "Output": ""}, "not bound to the expected instance"),
-    ({"InstanceId": "i-0123456789abcdef0", "Output": base64.b64encode(b"CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n").decode()}, "lacks one current boot"),
+    ({"InstanceId": "i-0123456789abcdef0", "Timestamp": "2026-10-22T11:59:00Z", "Output": base64.b64encode(b"CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n").decode()}, "provisioning deadline elapsed"),
 ])
 def test_console_rejects_wrong_instance_or_missing_current_boot(response, match, tmp_path):
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=4)
     driver._aws_json = lambda *_args: response
     with pytest.raises(AwsProviderError, match=match):
-        driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0", "public_ipv4": "8.8.8.8"})
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0", "public_ipv4": "8.8.8.8", "launch_time": NOW - timedelta(seconds=1)})
 
 
 def test_empty_console_failure_retains_only_redacted_parser_diagnostic(tmp_path):
@@ -520,10 +818,11 @@ def test_empty_console_failure_retains_only_redacted_parser_diagnostic(tmp_path)
     launch_time = datetime.fromisoformat("2026-11-18T15:10:00+00:00")
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=6)
     driver._active_attempt = driver._attempt_dir(deployment)
     driver._aws_json = lambda *_args: response
 
-    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
         driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8", "launch_time": launch_time})
 
     diagnostics = list(driver._active_attempt.glob("host-console-*.json"))
@@ -545,11 +844,12 @@ def test_console_diagnostic_does_not_persist_raw_output(tmp_path):
     response = {"InstanceId": instance_id, "Timestamp": "2026-11-18T15:12:54Z", "Output": sentinel}
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=4)
     driver._active_attempt = driver._attempt_dir(deployment)
     driver._aws_json = lambda *_args: response
 
-    with pytest.raises(AwsProviderError, match="lacks one current boot"):
-        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8"})
+    with pytest.raises(AwsProviderError, match="provisioning deadline elapsed"):
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8", "launch_time": NOW - timedelta(seconds=1)})
 
     saved = next(driver._active_attempt.glob("host-console-*.json")).read_text()
     assert sentinel not in saved
@@ -561,6 +861,7 @@ def test_console_diagnostic_write_error_preserves_trust_error(tmp_path):
     instance_id = "i-0123456789abcdef0"
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=6)
     driver._active_attempt = driver._attempt_dir(deployment)
     driver._aws_json = lambda *_args: {"InstanceId": instance_id, "Timestamp": "2026-11-18T15:12:54Z", "Output": ""}
 
@@ -569,9 +870,9 @@ def test_console_diagnostic_write_error_preserves_trust_error(tmp_path):
 
     driver._write_private = fail_write
     with pytest.raises(AwsProviderError) as raised:
-        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8"})
-    assert raised.value.category == "host_identity_unavailable"
-    assert str(raised.value) == "authenticated console lacks one current boot and ED25519 host fingerprint"
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": instance_id, "public_ipv4": "8.8.8.8", "launch_time": NOW - timedelta(seconds=1)})
+    assert raised.value.category == "cap_insufficient"
+    assert "provisioning deadline elapsed" in str(raised.value)
 
 
 @pytest.mark.parametrize("timestamp,boots", [
@@ -583,9 +884,11 @@ def test_console_rejects_stale_timestamp_and_replayed_boot_markers(tmp_path, tim
     console = "\n".join([*(f"CNB_HOSTKEY_BOOT_ID={boot}" for boot in boots), f"CNB_ED25519_HOST_FINGERPRINT={fixture['console_fingerprint']}"])
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    set_provision_context(driver, seconds=6)
     driver._active_attempt = driver._attempt_dir(deployment)
     driver._aws_json = lambda *_args: {"InstanceId": fixture["instance_id"], "Output": console, "Timestamp": timestamp}
-    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+    expected_message = "provisioning deadline elapsed" if timestamp == "2026-10-22T11:57:00Z" else "malformed or ambiguous"
+    with pytest.raises(AwsProviderError, match=expected_message):
         driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
 
 

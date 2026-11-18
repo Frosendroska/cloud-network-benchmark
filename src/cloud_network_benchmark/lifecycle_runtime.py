@@ -5,6 +5,7 @@ import json
 import hashlib
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 
@@ -15,6 +16,11 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate runtime configuration key: {key}")
         result[key] = value
     return result
+
+
+def _clock_sleeper(clock: Any):
+    """Use a clock-provided fake wait when available; production Clock has no sleeper."""
+    return getattr(clock, "sleep", None) or getattr(clock, "wait", None) or time.sleep
 
 
 def _constant(value: str) -> None:
@@ -497,7 +503,8 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
     settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0),
         iam_settle_seconds=options.get("iam_settle_seconds", 0))
-    driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
+    driver = AwsProviderDriver(runner, settings, clock=clock.utc_now,
+        sleeper=_clock_sleeper(clock), monotonic=clock.monotonic)
     trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
         deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
@@ -724,7 +731,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
             settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0),
                 iam_settle_seconds=config.get("iam_settle_seconds", 0))
-            driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
+            driver = AwsProviderDriver(runner, settings, clock=clock.utc_now,
+                sleeper=_clock_sleeper(clock), monotonic=clock.monotonic)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,

@@ -198,7 +198,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
             raise ValueError("original AWS recovery journal is unavailable")
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
         result = AwsProviderDriver(runner, _aws_cleanup_settings(saved.settings),
-            clock=utc_now).cleanup(d)
+            clock=utc_now, monotonic=monotonic_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _known_resource_ids(journal)
         try:
