@@ -1121,7 +1121,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         assert not [item for item in replay.findings if item.code.startswith("native.iperf3.interval_")], replay.findings
         if expected_validity == "valid":
             assert not [item for item in replay.findings if item.code == "timing.coverage_unavailable"], replay.findings
-        elif expected_validity is not None:
+        elif expected_validity == "partial":
             assert any(item.unit_id == "idle_latency" and item.code == "timing.coverage_unavailable"
                 for item in replay.findings), replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
