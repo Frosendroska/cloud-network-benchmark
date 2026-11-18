@@ -837,7 +837,7 @@ import pytest
 @pytest.mark.parametrize("mutation", ["missing_cookie", "ambiguous_cookie", "client_final_missing",
     "embedded_final_missing", "b_final_missing", "client_final_contradiction", "embedded_final_contradiction",
     "b_final_contradiction", "nonzero", "early", "incomplete", "malformed", "overlap", "duplicate",
-    "missing_origin", "unrelated_badrow", "unknown_error", "wrong_build", "wrong_hash"])
+    "missing_origin", "unrelated_badrow", "client_badrow", "unknown_error", "wrong_build", "wrong_hash"])
 def test_contextual_receiver_diagnostics_do_not_hide_independent_failure(repository_root, tmp_path,
         frozen_clock, deterministic_token, fake_git_commits, request, mutation):
     value, _ = _materialize_complete_bundle(repository_root, tmp_path, frozen_clock,
@@ -894,6 +894,9 @@ def test_contextual_receiver_diagnostics_do_not_hide_independent_failure(reposit
         # its warning must survive while the real reset row qualifies.
         events.insert(first_end, {"event":"interval", "data":{"sum":{
             "start":2., "end":3., "seconds":1.1, "bytes":123, "sender":False, "omitted":False}}})
+    elif mutation == "client_badrow":
+        client["server_output_json"]["intervals"].append({"sum":{
+            "start":2., "end":3., "seconds":1.1, "bytes":123, "sender":False, "omitted":False}})
     elif mutation == "unknown_error":
         events.insert(first_end, {"event":"error", "data":"unrecognized native failure"})
     elif mutation == "wrong_build":

@@ -1331,6 +1331,22 @@ def _qualify_receiver_total_mismatch(value: ValidatorInput, unit: Any, tcp: Nati
                 or not math.isclose(final["seconds"], b_total["seconds"], rel_tol=0, abs_tol=.002)):
             return tcp
     crossing_lines = _verified_reset_crossing_lines(origin, source)
+    crossing_signatures = {signature for signature, line in origin["receiver_line_by_signature"].items()
+        if line in crossing_lines}
+    # A client-only bad SUM cannot inherit the B reset exemption. Its own
+    # exact parser diagnostic must independently describe a proved crossing.
+    for finding in client.findings:
+        if finding.severity != "warning" or finding.code != "native.iperf3.interval_duration":
+            continue
+        matches = [item for item in client.receiver_finding_evidence
+            if item[0] == finding.code and item[1] == finding.message and item[2] in client.sessions]
+        if len(matches) != 1:
+            return tcp
+        detail = matches[0][4]
+        if (detail.get("omitted") is not False or
+                (detail.get("start"), detail.get("end"), detail.get("seconds"), detail.get("bytes"))
+                not in crossing_signatures):
+            return tcp
     evidence: dict[tuple[str, str], list[tuple[str, int, dict[str, Any]]]] = {}
     for code, message, session, line, detail in tcp.receiver_finding_evidence:
         evidence.setdefault((code, message), []).append((session, line, detail))
