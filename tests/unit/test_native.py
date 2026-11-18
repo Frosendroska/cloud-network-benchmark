@@ -8,6 +8,7 @@ import pytest
 
 from cloud_network_benchmark.native import (
     ReceiverInterval, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics,
+    unique_receiver_total,
 )
 
 
@@ -64,6 +65,31 @@ def test_iperf3_receiver_is_authoritative_and_final_total_is_not_added():
     stats = receiver_statistics(parsed.receiver_intervals)
     assert stats["received_bytes"].value == 125000000
     assert stats["throughput_gbps"].value == 1.0
+
+
+def test_iperf3_collapses_exact_client_final_total_aliases(tmp_path):
+    path = tmp_path / "client-aliases.json"
+    final = {"sum_received":{"bytes":12_266_110_976,"seconds":9.999802,"sender":False}}
+    path.write_text(json.dumps({"end":final,"server_output_json":{"end":final}}))
+    parsed = parse_iperf3(path, source=source(path, "iperf3-client"), format="json")
+    assert len(parsed.receiver_totals) == 1
+    assert unique_receiver_total(parsed.receiver_totals)["bytes"] == 12_266_110_976
+    assert unique_receiver_total(parsed.receiver_totals)["seconds"] == 9.999802
+
+
+@pytest.mark.parametrize("second", [
+    {"sum_received":{"bytes":12_266_110_975,"seconds":9.999802,"sender":False}},
+    {"sum_received":{"bytes":12_266_110_976,"seconds":9.999803,"sender":False}},
+])
+def test_iperf3_conflicting_final_aliases_are_fatal_not_interval_fallback(tmp_path, second):
+    path = tmp_path / "client-conflict.json"
+    first = {"sum_received":{"bytes":12_266_110_976,"seconds":9.999802,"sender":False}}
+    path.write_text(json.dumps({"end":first,"server_output_json":{"end":second}}))
+    parsed = parse_iperf3(path, source=source(path, "iperf3-client"), format="json")
+    assert len(parsed.receiver_totals) == 2
+    assert unique_receiver_total(parsed.receiver_totals) is None
+    assert any(item.code == "native.iperf3.total_conflict" and item.severity == "error"
+        for item in parsed.findings)
 
 
 def test_iperf3_sender_only_is_not_receiver_evidence():

@@ -389,6 +389,11 @@ def parse_iperf3(path: Path, *, source: SourceRef, format: str) -> NativeParse:
             totals.extend(_extract_totals(server, actual_source, line_no, "1"))
         totals.extend(_extract_totals(obj, actual_source, line_no, "1"))
     intervals = _dedupe_intervals(intervals, findings)
+    totals = _dedupe_receiver_totals(totals)
+    conflict_sessions = _receiver_total_conflict_sessions(totals)
+    for session in sorted(conflict_sessions):
+        findings.append(_finding("native.iperf3.total_conflict",
+            f"session {session}: receiver final totals disagree in bytes or native seconds", actual_source, "error"))
     for total in totals:
         session_intervals = [item for item in intervals if item.session_id == total["session_id"] and not item.omitted]
         if session_intervals:
@@ -490,6 +495,43 @@ def _extract_totals(root: Any, source: SourceRef, line: int, session: str) -> li
                 return [{"session_id": session, "bytes": sum(amounts), "seconds": seconds,
                          "source": source, "line": line}]
     return []
+
+
+def _receiver_total_signature(item: dict[str, Any]) -> tuple[str, int, float] | None:
+    session, amount, seconds = item.get("session_id"), item.get("bytes"), item.get("seconds")
+    if (not isinstance(session, str) or isinstance(amount, bool) or not isinstance(amount, int)
+            or isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
+        return None
+    return session, amount, float(seconds)
+
+
+def _dedupe_receiver_totals(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, float]] = set()
+    for item in items:
+        signature = _receiver_total_signature(item)
+        if signature is None or signature in seen:
+            continue
+        seen.add(signature)
+        result.append(item)
+    return result
+
+
+def _receiver_total_conflict_sessions(items: Sequence[dict[str, Any]]) -> set[str]:
+    by_session: dict[str, set[tuple[int, float]]] = {}
+    for item in items:
+        signature = _receiver_total_signature(item)
+        if signature is not None:
+            session, amount, seconds = signature
+            by_session.setdefault(session, set()).add((amount, seconds))
+    return {session for session, signatures in by_session.items() if len(signatures) > 1}
+
+
+def unique_receiver_total(items: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return one exact receiver total after collapsing identical native aliases."""
+    deduped = _dedupe_receiver_totals(list(items))
+    return deduped[0] if len(deduped) == 1 else None
 
 
 def _dedupe_intervals(items: list[ReceiverInterval], findings: list[ValidationFinding]) -> list[ReceiverInterval]:

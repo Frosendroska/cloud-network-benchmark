@@ -40,6 +40,16 @@ def test_whole_phase_tcp_prefers_unique_receiver_final_aggregate():
     assert stats["measured_seconds"].value == 9.999802
 
 
+def test_conflicting_receiver_totals_do_not_fall_back_to_interval_sum():
+    intervals = (ReceiverInterval("session", 0, 10, 10, 500, False, False, None, 1),)
+    totals = ({"session_id":"session", "bytes":250, "seconds":9.999802},
+        {"session_id":"session", "bytes":251, "seconds":9.999802})
+    stats = _tcp_statistics(NativeParse(receiver_intervals=intervals, receiver_totals=totals))
+    assert stats["received_bytes"].value is None
+    assert stats["measured_seconds"].value is None
+    assert stats["received_bytes"].unavailable_reason
+
+
 def test_reset_crossing_cutoff_uses_latest_independent_stream_end():
     origins = {"1": 10_000_000, "2": 10_000_200, "3": 10_000_400, "4": 10_000_600}
     rows = [(stream, origins[stream] - 500_000, origins[stream] + end, 100)

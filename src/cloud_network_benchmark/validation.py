@@ -26,7 +26,8 @@ from .contracts.validation import ValidationFinding, ValidationResult, Validator
 from .contracts.measurements import DiagnosticSample, VmMetadata, CommandEvidence, MeasurementTiming
 from .manifests import CampaignManifest, ChildRunManifest
 from .measurement import sockperf_idle_probe_seconds
-from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
+from .native import (NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics,
+                     rtt_statistics, unique_receiver_total)
 
 
 def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
@@ -795,6 +796,14 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
                     if not source_control_finding(item)))
             receiver = _receiver_session_for_unit(value, unit, receiver, verified_iperf_origins or {})
             if tcp is not None:
+                client_total_errors = [item for item in tcp.findings
+                    if item.code == "native.iperf3.total_conflict" and item.severity == "error"]
+                if client_total_errors:
+                    receiver = replace(receiver, findings=(*receiver.findings,
+                        *(_finding("native.iperf3.client_total_conflict", "error",
+                            item.message, unit=unit.unit_id,
+                            artifact=tcp.source.artifact_id if tcp.source else None)
+                          for item in client_total_errors)))
                 client_stats, receiver_stats = _tcp_statistics(tcp), _tcp_statistics(receiver)
                 client_bytes = client_stats["received_bytes"].value
                 receiver_bytes = receiver_stats["received_bytes"].value
@@ -1085,11 +1094,15 @@ def _tcp_statistics(tcp: NativeParse | None) -> dict[str, Any]:
         return {"received_bytes": Evidence[int](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "measured_seconds": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "throughput_gbps": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable")}
-    if len(tcp.receiver_totals) == 1:
-        total = tcp.receiver_totals[0]
+    total = unique_receiver_total(tcp.receiver_totals)
+    if total is not None:
         return {"received_bytes": Evidence[int](value=total["bytes"]),
                 "measured_seconds": Evidence[float](value=total["seconds"]),
                 "throughput_gbps": Evidence[float](value=8 * total["bytes"] / total["seconds"] / 1e9)}
+    if tcp.receiver_totals:
+        return {"received_bytes": Evidence[int](unavailable_reason="receiver final totals conflict or have ambiguous session identity"),
+                "measured_seconds": Evidence[float](unavailable_reason="receiver final totals conflict or have ambiguous session identity"),
+                "throughput_gbps": Evidence[float](unavailable_reason="receiver final totals conflict or have ambiguous session identity")}
     if tcp.receiver_intervals:
         return receiver_statistics(tcp.receiver_intervals)
     return {"received_bytes": Evidence[int](unavailable_reason="no receiver-side measured intervals or unique receiver total"),
@@ -1430,10 +1443,10 @@ def _iperf_nominal_completion_proven(value: ValidatorInput, unit: Any, tcp: Nati
     allowed_mode = (mode == ExperimentMode.SHORT_STUDY.value
         or (mode == ExperimentMode.ACCEPTANCE.value and context == "failure_check"))
     if (not allowed_mode or phase not in {"single_flow", "multi_flow"}
-            or tcp is None or len(tcp.sessions) != 1 or len(tcp.session_details) != 1
-            or len(tcp.receiver_totals) != 1):
+            or tcp is None or len(tcp.sessions) != 1 or len(tcp.session_details) != 1):
         return False
-    if tcp.receiver_totals[0].get("session_id") != tcp.sessions[0]:
+    receiver_total = unique_receiver_total(tcp.receiver_totals)
+    if receiver_total is None or receiver_total.get("session_id") != tcp.sessions[0]:
         return False
     detail = tcp.session_details[0]
     start = detail.get("start") if isinstance(detail, dict) else None

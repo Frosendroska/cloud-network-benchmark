@@ -15,7 +15,7 @@ from typing import Any
 
 from .contracts.common import Evidence, GitSnapshot
 from .contracts.validation import ValidationResult, ValidatorInput
-from .native import receiver_statistics, rtt_statistics
+from .native import receiver_statistics, rtt_statistics, unique_receiver_total
 from .validation import (_acquisition_windows, _artifact_path, _measured_samples, _union_intervals,
                          _parse_unit, _source_supported_windows, _validate_artifacts, evaluate_comparison,
                          validate_bundle)
@@ -745,11 +745,16 @@ def _unit_rows(value: ValidatorInput, result: ValidationResult, recorded: Valida
             tcp_summary = receiver_statistics(selected_receiver)
         else:
             totals = tcp.receiver_totals if tcp else ()
-            if len(totals) == 1:
-                total = totals[0]
+            total = unique_receiver_total(totals)
+            if total is not None:
                 tcp_summary = {"received_bytes": Evidence[int](value=total["bytes"]),
                     "measured_seconds": Evidence[float](value=total["seconds"]),
                     "throughput_gbps": Evidence[float](value=8 * total["bytes"] / total["seconds"] / 1e9)}
+            elif totals:
+                reason = "receiver final totals conflict or have ambiguous session identity"
+                tcp_summary = {"received_bytes": Evidence[int](unavailable_reason=reason),
+                    "measured_seconds": Evidence[float](unavailable_reason=reason),
+                    "throughput_gbps": Evidence[float](unavailable_reason=reason)}
             else:
                 tcp_summary = receiver_statistics(receiver_intervals)
         schedule = value.schedule_entry.value
