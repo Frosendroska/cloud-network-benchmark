@@ -190,6 +190,55 @@ def test_nominal_terminal_lower_bound_uses_only_replayed_native_windows():
     assert _iperf_native_terminal_ends(windows, "cookie") == {"1":15_000_988}
 
 
+def test_source_union_shares_exact_native_boundary_before_clock_projection():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    from cloud_network_benchmark.validation import _source_inner_unions
+
+    def window(start, end, **changes):
+        values = dict(kind="receiver_measured", tool="iperf3", producer="vm_b",
+            boot_id="boot", clock_domain="CLOCK_MONOTONIC", session_id="cookie", stream_id="5",
+            start_earliest_ns=start, start_latest_ns=start + 1000,
+            end_earliest_ns=end, end_latest_ns=end + 1000, omitted=False,
+            source_byte_offset=0, source_byte_length=1)
+        return SourceWindow(**{**values, **changes})
+
+    first = window(543_485_489_000, 544_486_066_000)
+    second = window(544_486_066_000, 545_486_105_000)
+    assert _source_inner_unions([first, second]) == [
+        ("iperf3", 543_485_490_000, 545_486_105_000)]
+    # A real one-microsecond source gap must retain two independently eroded supports.
+    assert len(_source_inner_unions([first, window(544_486_067_000, 545_486_105_000)])) == 2
+    # Overlapping uncertainty brackets alone are not guaranteed temporal overlap.
+    assert len(_source_inner_unions([first, window(544_486_066_001, 545_486_105_000)])) == 2
+    for field, changed in (("session_id", "other"), ("stream_id", "8"),
+                           ("boot_id", "other"), ("clock_domain", "other"),
+                           ("producer", "vm_a"), ("kind", "other")):
+        assert len(_source_inner_unions([first, window(544_486_066_000, 545_486_105_000,
+            **{field: changed})])) == 2
+    # Invocation and mapping contexts are separated by the caller, never accumulated.
+    assert len(_source_inner_unions([first]) + _source_inner_unions([second])) == 2
+
+
+def test_p730_single_flow_source_union_keeps_outer_precision_and_clock_bounds():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    from cloud_network_benchmark.validation import _source_inner_unions
+
+    # Observed P730 source microseconds, retained here as arithmetic regression data.
+    boundaries = [543485489, 544486066, 545486105, 546486136, 547486139,
+                  548486144, 549486047, 550486112, 551486030, 552486163, 553486069]
+    rows = [SourceWindow("receiver_measured", "iperf3", "vm_b", "boot", "CLOCK_MONOTONIC",
+        "cookie", "5", left * 1000, left * 1000 + 1000, right * 1000, right * 1000 + 1000,
+        False, index, 1) for index, (left, right) in enumerate(zip(boundaries, boundaries[1:]))]
+    error = .006448399999989258
+    old = sum((row.end_earliest_ns - row.start_latest_ns) / 1e9 - 2 * error for row in rows)
+    merged = _source_inner_unions(rows)
+    assert len(merged) == 1
+    corrected = (merged[0][2] - merged[0][1]) / 1e9 - 2 * error
+    assert old == pytest.approx(9.871602, abs=1e-9)
+    assert corrected == pytest.approx(9.9876822, abs=1e-9)
+    assert corrected / 10.00058 >= .99
+
+
 def test_nominal_completion_requires_successful_exact_command_and_receiver_span():
     from cloud_network_benchmark.native import NativeParse
 

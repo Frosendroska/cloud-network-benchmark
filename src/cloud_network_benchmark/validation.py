@@ -72,6 +72,35 @@ def _receiver_sum_signature_index(
     return {signature: lines[0] for signature, lines in candidates.items() if len(lines) == 1}
 
 
+def _source_inner_unions(windows: Sequence[Any]) -> list[tuple[str, int, int]]:
+    """Join authenticated same-stream support before applying a shared clock error.
+
+    Equal endpoint brackets describe one shared native boundary, including its
+    precision uncertainty. Otherwise only guaranteed inner overlap joins rows.
+    Call separately for each verified source/invocation/mapping.
+    """
+    grouped: dict[tuple[Any, ...], list[Any]] = {}
+    for window in windows:
+        if window.has_positive_inner_support:
+            key = (window.tool, window.kind, window.producer, window.boot_id,
+                   window.clock_domain, window.session_id, window.stream_id, window.omitted)
+            grouped.setdefault(key, []).append(window)
+    result = []
+    for key, rows in grouped.items():
+        merged: list[list[int]] = []
+        for row in sorted(rows, key=lambda item: (item.start_earliest_ns, item.start_latest_ns)):
+            bounds = [row.start_earliest_ns, row.start_latest_ns,
+                      row.end_earliest_ns, row.end_latest_ns]
+            if merged and (bounds[:2] == merged[-1][2:]
+                           or bounds[1] <= merged[-1][2]):
+                merged[-1][2] = max(merged[-1][2], bounds[2])
+                merged[-1][3] = max(merged[-1][3], bounds[3])
+            else:
+                merged.append(bounds)
+        result.extend((key[0], bounds[1], bounds[2]) for bounds in merged)
+    return result
+
+
 def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                          verified_iperf_origins: dict[str, dict[str, Any]] | None = None
                          ) -> tuple[list[Any], list[str]]:
@@ -271,11 +300,11 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 if previous_origin is not None and previous_origin != observed:
                     raise ValueError("receiver cookie has contradictory verified post-omit origins")
                 verified_iperf_origins[source.session_id] = observed
-            for window in replayed_windows:
-                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
-                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
-                if window.has_positive_inner_support and end > start:
-                    windows.append((source.tool, start, end))
+            for tool, inner_start_ns, inner_end_ns in _source_inner_unions(replayed_windows):
+                start = mapping.utc_timestamp.timestamp() + inner_start_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
+                end = mapping.utc_timestamp.timestamp() + inner_end_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
+                if end > start:
+                    windows.append((tool, start, end))
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
             errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
     return windows, errors
