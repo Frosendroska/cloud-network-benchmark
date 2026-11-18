@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import base64
+import json
 import math
 import re
 import shlex
@@ -97,12 +98,28 @@ class SourceBuild(StrictModel):
         return self
 
 
+class PrebuiltBundle(StrictModel):
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("path")
+    @classmethod
+    def local_regular_path(cls, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts or any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError("prebuilt bundle path must be absolute and avoid symlinks and traversal")
+        if not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError("prebuilt bundle must be a regular file no larger than 64 MiB")
+        return str(path)
+
+
 class BootstrapConfig(StrictModel):
     sources: List[SourceBuild] = Field(min_length=2, max_length=2)
     remote_root: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
     results_workspace: str = "/var/lib/cnb/results"
     install_prefix: str = Field(min_length=1)
+    prebuilt_bundle: PrebuiltBundle | None = None
     bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables", "python3-venv"])
 
     @model_validator(mode="after")
@@ -124,7 +141,13 @@ class BootstrapConfig(StrictModel):
                 raise ValueError("bootstrap sources, native results and installed tools require separate roots")
         if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.-]{0,63}", p) for p in self.bootstrap_packages):
             raise ValueError("bootstrap package names must be simple package identifiers")
+        if self.prebuilt_bundle is not None:
+            if self.install_prefix != "/var/lib/cnb/install":
+                raise ValueError("prebuilt bundle requires the approved /var/lib/cnb/install prefix")
+            from .build_bundle import validate_bundle
+            validate_bundle(Path(self.prebuilt_bundle.path), self.prebuilt_bundle.sha256, self.sources)
         return self
+
 
 
 class BuildObservation(StrictModel):
@@ -145,6 +168,12 @@ class BuildObservation(StrictModel):
     observation_capability: str | None = None
     observation_semantics: str | None = None
     identity_bytes: str | None = None
+    build_origin: Literal["guest-source-build", "controller-prebuilt"] = "guest-source-build"
+    origin_artifact_id: str | None = None
+    origin_proof_bytes: str | None = None
+    prebuilt_bundle_path: str | None = None
+    prebuilt_bundle_sha256: str | None = None
+    bundle_artifact_id: str | None = None
 
     @model_validator(mode="after")
     def complete_observation(self):
@@ -166,6 +195,37 @@ class BuildObservation(StrictModel):
                 raise ValueError("observation build requires pinned upstream commit and patch digest")
             if not self.identity_bytes:
                 raise ValueError("observation build requires captured original build identity sidecar bytes")
+        if self.build_origin == "controller-prebuilt":
+            if (not self.origin_artifact_id or not self.origin_proof_bytes or not self.prebuilt_bundle_path
+                    or not self.bundle_artifact_id or not re.fullmatch(r"[a-f0-9]{64}", self.prebuilt_bundle_sha256 or "")):
+                raise ValueError("controller-prebuilt build requires origin proof and exact bundle artifact identity")
+            try:
+                proof = json.loads(self.origin_proof_bytes)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("controller-prebuilt origin proof must be valid JSON") from exc
+            controller = proof.get("controller_receipt", {})
+            guest = proof.get("guest_verification", {})
+            evidence_text = controller.get("operational_build_evidence_json")
+            if (proof.get("schema") != "CNB_PREBUILT_V1" or proof.get("tool") != self.tool
+                    or proof.get("role") != self.role or proof.get("binary_sha256") != self.binary_sha256
+                    or proof.get("origin") != "controller-prebuilt"
+                    or proof.get("bundle_sha256") != self.prebuilt_bundle_sha256
+                    or proof.get("bundle_artifact_id") != self.bundle_artifact_id
+                    or controller.get("tool") != self.tool or controller.get("source_reference") != self.source_reference
+                    or controller.get("source_sha256") != self.source_sha256
+                    or controller.get("binary_sha256") != self.binary_sha256
+                    or controller.get("upstream_commit") != self.upstream_commit
+                    or controller.get("patch_path") != self.patch_path
+                    or controller.get("patch_sha256") != self.patch_sha256
+                    or not isinstance(evidence_text, str)
+                    or hashlib.sha256(evidence_text.encode("utf-8")).hexdigest() != controller.get("build_evidence_sha256")
+                    or guest.get("binary_sha256") != self.binary_sha256
+                    or guest.get("binary_version") != self.binary_version
+                    or guest.get("binary_path") != self.binary_path):
+                raise ValueError("controller-prebuilt origin proof does not bind controller, guest and bundle evidence")
+        elif any(value is not None for value in (self.origin_artifact_id, self.origin_proof_bytes,
+                self.prebuilt_bundle_path, self.prebuilt_bundle_sha256, self.bundle_artifact_id)):
+            raise ValueError("guest source builds must not carry controller-prebuilt origin proof")
         return self
 
 
@@ -191,6 +251,42 @@ def materialize_build_identity_artifacts(root: Path, deployment_id: str,
             retrieval_state="verified")
         record.verify_materialized_file(root)
         records.append(record)
+        origin_proof_bytes = getattr(build, "origin_proof_bytes", None)
+        origin_artifact_id = getattr(build, "origin_artifact_id", None)
+        if origin_proof_bytes is not None and origin_artifact_id is not None:
+            proof_raw = origin_proof_bytes.encode("utf-8")
+            proof_path = f"metadata/build/{build.role}-{build.tool}.origin.json"
+            proof_target = root / proof_path
+            proof_target.parent.mkdir(parents=True, exist_ok=True)
+            if proof_target.exists() and proof_target.read_bytes() != proof_raw:
+                raise ValueError("build origin artifact conflicts with existing attempt evidence")
+            if not proof_target.exists():
+                proof_target.write_bytes(proof_raw)
+            proof_record = ArtifactRecord(artifact_id=origin_artifact_id, path=proof_path,
+                kind="build-origin", producer=role, unit_id=None, deployment_id=deployment_id,
+                closed=True, size_bytes=Evidence[int](value=len(proof_raw)),
+                sha256=StringEvidence(value=hashlib.sha256(proof_raw).hexdigest()), retrieval_state="verified")
+            proof_record.verify_materialized_file(root)
+            records.append(proof_record)
+    bundle = next((b for b in builds if getattr(b, "build_origin", "guest-source-build") == "controller-prebuilt"), None)
+    if bundle is not None:
+        source = Path(bundle.prebuilt_bundle_path or "")
+        if (not source.is_absolute() or any(p.is_symlink() for p in (source, *source.parents)) or not source.is_file()
+                or hashlib.sha256(source.read_bytes()).hexdigest() != bundle.prebuilt_bundle_sha256):
+            raise ValueError("prebuilt bundle changed before raw artifact materialization")
+        bundle_path = "metadata/build/controller-prebuilt-tools.tar.gz"
+        target = root / bundle_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = source.read_bytes()
+        if target.exists() and target.read_bytes() != raw:
+            raise ValueError("prebuilt bundle conflicts with existing attempt evidence")
+        if not target.exists():
+            target.write_bytes(raw)
+        record = ArtifactRecord(artifact_id=bundle.bundle_artifact_id or "", path=bundle_path,
+            kind="controller-prebuilt-bundle", producer="controller", unit_id=None,
+            deployment_id=deployment_id, closed=True, size_bytes=Evidence[int](value=len(raw)),
+            sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()), retrieval_state="verified")
+        record.verify_materialized_file(root); records.append(record)
     return tuple(records)
 
 
@@ -559,6 +655,138 @@ def _failure_result(connection, actions, vm, request, result, category, message,
                            actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
 
 
+def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock, actions, builds, listeners):
+    """Transfer once and verify both controller-built binaries on this VM."""
+    bundle = config.prebuilt_bundle
+    if bundle is None:
+        return None
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle setup exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    aid = f"f02r-{role}-prebuilt-packages"
+    argv = ["sudo", "sh", "-c", "apt-get update && apt-get install -y " +
+            " ".join(shlex.quote(package) for package in config.bootstrap_packages)]
+    req = _request(aid, vm, argv, min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, req); actions.append(_action(aid, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_package_setup_failed",
+            "approved guest runtime prerequisites could not be prepared", builds, listeners)
+    bundle_path = f"{config.workspace}/prebuilt-{bundle.sha256}.tar.gz"
+    parents = set()
+    for target in (config.workspace, config.results_workspace, config.install_prefix):
+        p = PurePosixPath(target)
+        while p.as_posix() != "/":
+            parents.add(p.as_posix()); p = p.parent
+    symlink_guard = " && ".join(f"test ! -L {shlex.quote(path)}" for path in sorted(parents, key=len))
+    setup = (f"{symlink_guard} && sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 "
+        f"{shlex.quote(config.workspace)} {shlex.quote(config.results_workspace)} {shlex.quote(config.install_prefix)} && "
+        f"test ! -e {shlex.quote(bundle_path)} && test ! -L {shlex.quote(bundle_path)}")
+    remaining = deadline.remaining(clock, readiness=True)
+    req = _request(f"f02r-{role}-prebuilt-workspace", vm, ["sh", "-c", setup],
+        min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_workspace_conflict",
+            "bundle workspace or target paths contain conflicting state", builds, listeners)
+    for source in config.sources:
+        remaining = deadline.remaining(clock, readiness=True)
+        req = _request(f"f02r-{role}-{source.tool}-bundle-identity-preflight", vm,
+            ["sh", "-c", _identity_preflight_script(source, config)],
+            min(connection.timeouts.command_seconds, remaining))
+        result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+        if result.outcome != CommandOutcome.SUCCEEDED or result.stdout.strip() != "missing":
+            return _failure_result(connection, actions, vm, req, result, "prebuilt_cache_conflict",
+                "pre-existing source/build/origin cache state conflicts with explicit bundle selection", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle transfer exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    try:
+        # Re-hash and re-parse the actual local input immediately before each role upload.
+        from .build_bundle import validate_bundle
+        validate_bundle(Path(bundle.path), bundle.sha256, config.sources)
+    except Exception as exc:
+        req, failed = _request_failure(f"f02r-{role}-prebuilt-local-recheck", vm,
+            connection.timeouts.command_seconds, exc)
+        actions.append(_action(req.action_id, "ssh", vm, req, failed))
+        return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_local_changed",
+            "bundle failed its immediate pre-upload hash and provenance recheck", builds, listeners)
+    req = _request(f"f02r-{role}-prebuilt-transfer", vm,
+        [bundle.path, f"{vm.user}@{vm.host}:{bundle_path}"],
+        min(connection.timeouts.command_seconds, remaining), action_type="scp")
+    result = _execute(runner, req); actions.append(_action(req.action_id, "scp", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_bundle_transfer_failed",
+            "approved bundle transfer failed", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle verification exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    from .build_bundle import linux_installer_script
+    caps = {source.tool: _required_capabilities(source.tool) for source in config.sources}
+    pins = {source.tool: {"source_reference": source.source_reference,
+        "source_sha256": source.source_sha256, "upstream_commit": source.upstream_commit,
+        "patch_path": source.observation_patch_path, "patch_sha256": source.observation_patch_sha256}
+        for source in config.sources}
+    script = linux_installer_script(bundle_path, bundle.sha256, config.install_prefix, role, caps, pins)
+    encoded_script = f"exec(bytes.fromhex('{script.encode().hex()}'))"
+    req = _request(f"f02r-{role}-prebuilt-verify-install", vm, ["python3", "-c", encoded_script],
+        min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_bundle_verification_failed",
+            "bundle bytes or guest tool compatibility failed independent verification", builds, listeners)
+    try:
+        output = json.loads(result.stdout)
+        if set(output) != {"sockperf", "iperf3"}:
+            raise ValueError("installer output did not include both tools")
+        for tool in ("sockperf", "iperf3"):
+            source, observed = next(s for s in config.sources if s.tool == tool), output[tool]
+            version = _canonical_version_text(observed["binary_version"])
+            help_outputs = observed.get("help_outputs", {})
+            capability_text = "\n".join([help_outputs.get("main", ""), *help_outputs.get("modes", {}).values()])
+            if not _capabilities_observed(capability_text, tool):
+                raise ValueError(f"{tool} installer capability receipt is incomplete")
+            identity = observed["identity_bytes"]
+            parsed = _parse_build_identity(identity, source)
+            if (parsed["binary_sha256"] != observed["binary_sha256"]
+                    or _canonical_version_text(parsed["binary_version_b64_decoded"]) != version):
+                raise ValueError(f"{tool} V1 identity does not match guest verification")
+            origin_bytes = observed["origin_proof_bytes"]
+            origin = json.loads(origin_bytes)
+            if (origin.get("schema") != "CNB_PREBUILT_V1" or origin.get("role") != role
+                    or origin.get("tool") != tool or origin.get("binary_sha256") != observed["binary_sha256"]
+                    or origin.get("bundle_sha256") != bundle.sha256):
+                raise ValueError(f"{tool} origin proof does not bind the role, bundle and installed bytes")
+            builds.append(BuildObservation(role=role, tool=tool, source_reference=source.source_reference,
+                source_sha256=source.source_sha256, compiler_version=parsed["compiler_version_b64_decoded"],
+                binary_path=observed["binary_path"], binary_version=version,
+                binary_sha256=observed["binary_sha256"], capabilities=_required_capabilities(tool),
+                artifact_id=f"f02r-{role}-{tool}-build", upstream_commit=source.upstream_commit,
+                patch_path=source.observation_patch_path, patch_sha256=source.observation_patch_sha256,
+                build_configuration=parsed["build_configuration_b64_decoded"],
+                observation_capability="CNB_ACQ_V1",
+                observation_semantics="sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1",
+                identity_bytes=identity, build_origin="controller-prebuilt",
+                origin_artifact_id=f"f02r-{role}-{tool}-origin", origin_proof_bytes=origin_bytes,
+                prebuilt_bundle_path=bundle.path, prebuilt_bundle_sha256=bundle.sha256,
+                bundle_artifact_id="f02r-controller-prebuilt-bundle"))
+    except Exception as exc:
+        req, failed = _request_failure(f"f02r-{role}-prebuilt-output", vm,
+            connection.timeouts.command_seconds, exc)
+        actions.append(_action(req.action_id, "ssh", vm, req, failed))
+        return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_receipt_invalid",
+            "guest bundle receipt could not be tied to the approved origin and installed binary", builds, listeners)
+    return None
+
+
 class _CancellationRunner:
     """Stop a peer before its next remote dispatch after another role fails."""
     def __init__(self, delegate, cancellation):
@@ -632,7 +860,12 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
-        for source in config.sources:
+        if config.prebuilt_bundle is not None:
+            failed = _prepare_prebuilt_role(connection, vm, role, config, command_runner, deadline,
+                clock, actions, builds, listeners)
+            if failed is not None:
+                return failed
+        for source in (() if config.prebuilt_bundle is not None else config.sources):
             remaining = deadline.remaining(clock, readiness=True)
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)

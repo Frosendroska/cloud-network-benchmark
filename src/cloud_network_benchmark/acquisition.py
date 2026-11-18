@@ -11,6 +11,7 @@ import itertools
 import json
 import math
 import base64
+import re
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -729,6 +730,42 @@ def iter_source_windows(child_root: Path, source: AcquisitionSource,
             expected = _canonical_version_text(expected)
         if actual != expected:
             raise ValueError(f"build sidecar {field} does not match the supplied BuildObservation")
+    if getattr(observed, "build_origin", "guest-source-build") == "controller-prebuilt":
+        origin_id = getattr(observed, "origin_artifact_id", None)
+        expected_origin_id = f"f02r-{observed.role}-{source.tool}-origin"
+        if origin_id != expected_origin_id or getattr(observed, "origin_proof_bytes", None) is None:
+            raise ValueError("controller-prebuilt acquisition requires its distinct origin proof")
+        origin_record = one(origin_id)
+        if (origin_record.kind != "build-origin" or origin_record.producer != source.producer
+                or origin_record.deployment_id != log.deployment_id or origin_record.unit_id is not None
+                or origin_record.closed is not True or str(origin_record.retrieval_state) != "verified"):
+            raise ValueError("controller-prebuilt origin artifact lacks closed same-deployment producer identity")
+        origin_record.verify_materialized_file(child_root)
+        origin_bytes = resolve_artifact_path(child_root, origin_record.path).read_bytes()
+        if origin_bytes != observed.origin_proof_bytes.encode("utf-8"):
+            raise ValueError("materialized origin proof bytes differ from captured bootstrap evidence")
+        proof = json.loads(origin_bytes)
+        guest = proof.get("guest_verification", {})
+        controller = proof.get("controller_receipt", {})
+        evidence_text = controller.get("operational_build_evidence_json")
+        if (proof.get("schema") != "CNB_PREBUILT_V1" or proof.get("origin") != "controller-prebuilt"
+                or proof.get("role") != observed.role or proof.get("tool") != source.tool
+                or proof.get("binary_sha256") != observed.binary_sha256
+                or proof.get("bundle_sha256") is None
+                or not re.fullmatch(r"[a-f0-9]{64}", str(proof.get("bundle_sha256")))
+                or proof.get("bundle_artifact_id") != getattr(observed, "bundle_artifact_id", None)
+                or guest.get("binary_sha256") != observed.binary_sha256
+                or guest.get("binary_version") != observed.binary_version
+                or controller.get("binary_sha256") != observed.binary_sha256
+                or not isinstance(evidence_text, str)
+                or hashlib.sha256(evidence_text.encode("utf-8")).hexdigest() != controller.get("build_evidence_sha256")):
+            raise ValueError("controller-prebuilt origin receipt does not bind build and guest observations")
+        if (controller.get("upstream_commit") != observed.upstream_commit
+                or controller.get("patch_sha256") != observed.patch_sha256
+                or controller.get("source_sha256") != observed.source_sha256):
+            raise ValueError("controller-prebuilt source receipt does not match the native build identity")
+    elif getattr(observed, "build_origin", "guest-source-build") != "guest-source-build":
+        raise ValueError("acquisition source has an unsupported build origin")
     request = command[0].request if isinstance(command[0].request, Mapping) else getattr(command[0].request, "model_dump", lambda **_: {})()
     argv = request.get("argv", []) if isinstance(request, Mapping) else []
     if source.tool == "sockperf" and request.get("acquisition_invocation_id") != source.invocation_id:

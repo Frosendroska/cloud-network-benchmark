@@ -64,6 +64,11 @@ def build_collection_context(deployment: ProviderDeploymentOutput, *, role: str,
                 "compiler_version": item.compiler_version, "binary_path": item.binary_path,
                 "binary_version": item.binary_version, "binary_sha256": item.binary_sha256,
             }
+            if item.build_origin == "controller-prebuilt":
+                builds[item.tool].update({"origin_artifact_id": item.origin_artifact_id,
+                    "build_origin": item.build_origin,
+                    "origin_proof_sha256": hashlib.sha256(item.origin_proof_bytes.encode("utf-8")).hexdigest()
+                        if item.origin_proof_bytes else None})
     metadata = VmMetadata(
         schema_version=2, deployment_id=deployment.deployment_id, vm_role=role, provider=provider,
         cpu_model=StringEvidence(unavailable_reason="guest observation pending"),
