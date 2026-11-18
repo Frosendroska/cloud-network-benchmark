@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +65,16 @@ class Clock:
         ident = threading.get_ident()
         with self._lock:
             self._offsets[ident] = self._offsets.get(ident, max(self._offsets.values())) + seconds
+
+
+class SharedTimelineClock(Clock):
+    """Use one monotonic test timeline when a single-provider workflow changes workers."""
+    def _offset(self):
+        with self._lock:
+            return max(self._offsets.values())
+    def sleep(self, seconds):
+        with self._lock:
+            self._offsets[self._owner] = max(self._offsets.values()) + seconds
 
 
 class FailedExternalCommands:
@@ -138,7 +149,7 @@ class GcpSourceRunner:
             return result(value)
         if action == "gcp-guest-hostkeys":
             blob = base64.b64encode(struct.pack(">I", 11)+b"ssh-ed25519"+struct.pack(">I", 32)+b"h"*32).decode()
-            return result({"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]}})
+            return result([{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}])
         if action.startswith("gcp-boot-disk"):
             return result({"id": "2001" if role == "vm_a" else "2002", "name": f"{namespace}-{suffix}-boot",
                 "zone": f"https://www.googleapis.com/compute/v1/projects/{settings.project_id}/zones/{intent.zone}",
@@ -154,7 +165,11 @@ class GcpSourceRunner:
 def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shaped_commands(
         tmp_path, repository_root, monkeypatch, north):
     """Use real F11, GCP provider hooks and F09 finalizer with only command replies faked."""
+    from types import SimpleNamespace
     import cloud_network_benchmark.lifecycle_adapters as adapters
+    import cloud_network_benchmark.access as access
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
+    from cloud_network_benchmark.orchestration import ProviderStageOutcome
 
     config = repository_root / "configs/tests" / (
         "exp-902-gcp-single-provider-north.yaml" if north else "exp-902-gcp-single-provider.yaml")
@@ -184,8 +199,8 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "gcp-source-shaped", "initialize_if_missing": True},
-        "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10,
-                "synthetic-test-policy", {"gcp": 30}), "copy_retry_seconds": 1,
+        "allowance": WorkflowAllowance(90, 180, 540, 60, 100, 15, 45, 120,
+                "synthetic-stabilization-boundary", {"gcp": 30}), "copy_retry_seconds": 1,
         "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
                 cloud_init_seconds=10, private_path_seconds=5, server_seconds=5, transfer_seconds=10),
@@ -202,8 +217,34 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
             "sources": {"workflow_cost_handoff_path": handoff,
                 "support_cost_path": repository_root / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                 "primary_review_path": None}}}}
-    clock, runner = Clock(), GcpSourceRunner()
+    clock, runner = SharedTimelineClock(), GcpSourceRunner()
     runner.clock = clock
+    runtime["sleep"] = clock.sleep
+    diagnostic_actions = []
+    def prepared_after_readiness_window(*args, **kwargs):
+        clock.sleep(471.625364)  # Protection already consumed two seconds.
+        connection = args[0]
+        bootstrap_evidence = SimpleNamespace(deployment_id=connection.deployment_id,
+            identity=connection.identity, builds=[], listeners=[], actions=[])
+        guest_runtime = SimpleNamespace(remote_root="/var/lib/cnb/runtime",
+            source_revision=kwargs["source_revision"], package_sha256="a" * 64)
+        return ProviderStageOutcome("prepare", True,
+            {"bootstrap": bootstrap_evidence, "guest_runtime": guest_runtime})
+    monkeypatch.setattr(adapters, "prepare_remote_pair", prepared_after_readiness_window)
+    def fake_request(action_id, vm, _argv, timeout, action_type="ssh"):
+        return CommandRequest(action_id=action_id, action_type=action_type,
+            argv=["ssh", "--token", "split-token-value", "--password=inline-password",
+                "Bearer argv-bearer-value"], cwd=".", timeout_seconds=max(float(timeout), .001),
+            environment_classification="contains_secret_references",
+            redactions=[vm.authentication_reference, vm.host_key_reference])
+    monkeypatch.setattr(access, "_request", fake_request)
+    def fail_first_diagnostic_action(_runner, request):
+        diagnostic_actions.append(request.action_id)
+        at = clock.utc_now()
+        return CommandResult(action_id=request.action_id, outcome="failed", started_at=at,
+            finished_at=at, duration_seconds=0, exit_code=1, stdout="",
+            stderr="Bearer transport-bearer-value password=transport-password-value")
+    monkeypatch.setattr(access, "_execute", fail_first_diagnostic_action)
     original_gcp_hooks = adapters.gcp_hooks
     def observe_gcp_hooks(driver, deployment, expiry_request, **kwargs):
         runner.driver = driver
@@ -222,12 +263,53 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert result.admission_status == "reserved", result.admission_reasons
     assert set(result.provider_results) == {"gcp"}, (result.primary_failure, result.admission_status, result.provider_results)
     provider = result.provider_results["gcp"]
+    assert provider.values["stabilize"].succeeded is True, provider.values.get("stabilize")
+    assert provider.values["stabilize"].evidence["elapsed_seconds"] >= 60
+    assert clock._offset() >= 533.625364
+    stage_started = provider.stage_times["stabilize"]["started_at"]
+    assert (stage_started - NOW).total_seconds() == pytest.approx(473.625364)
+    reservation = built["ledger"].inspect()["reservations"][result.reservation_evidence.reservation_id.value]
+    stage_monotonic = 100.0 + 473.625364
+    assert reservation["provider_trigger_monotonic"] - stage_monotonic == pytest.approx(696.374636)
     assert provider.values.get("protect") is not None, (provider.primary_failure, runner.actions)
     assert provider.values["protect"].state == "registered", (provider.values["protect"].failure, runner.actions)
     assert provider.values["claim"].eligible is True
     assert provider.values["claim"].creation_granted is True
     assert provider.values.get("create") is not None, (provider.primary_failure, provider.values, runner.actions)
     assert provider.values["create"].run_id == children["gcp"].run_id
+    measure = provider.values["measure"]
+    assert measure.succeeded is False
+    assert measure.evidence["failure"] == "RemoteDiagnosticsStartError: remote measurement handoff failed"
+    assert measure.evidence["startup_failure"] == "remote diagnostics control directory creation failed"
+    assert measure.evidence["diagnostics"] == {}  # No process handle returned for the first role.
+    assert len(measure.evidence["actions"]) == 1
+    failed_action = measure.evidence["actions"][0]
+    assert failed_action.action_id.startswith("f09-diagnostics-mkdir-")
+    assert failed_action.role == "vm_a"
+    assert diagnostic_actions[0] == failed_action.action_id
+    from cloud_network_benchmark.lifecycle_projection import _measurement_failure
+    failed_stage, failure_payload = _measurement_failure(provider)
+    assert failed_stage == "measure"
+    serialized_failure = json.dumps(failure_payload)
+    assert "remote diagnostics control directory creation failed" in serialized_failure
+    assert failed_action.action_id in serialized_failure
+    assert all(secret not in serialized_failure for secret in ("split-token-value", "inline-password",
+        "argv-bearer-value", "transport-bearer-value", "transport-password-value"))
+    from cloud_network_benchmark.lifecycle_projection import _sync_manifest
+    from cloud_network_benchmark.manifests import ChildRunManifest
+    child_ref = next(row for row in parent.child_runs if str(row.provider) == "gcp")
+    child_path, result_root = Path(child_ref.manifest_path), Path(child_ref.result_path)
+    projected = _sync_manifest(parent_path=parent_path, child_path=child_path, root=result_root,
+        child=ChildRunManifest.model_validate_json(child_path.read_text()), result=provider,
+        reservation=result.reservation_evidence, evaluated_at=clock.utc_now())
+    failure_path = result_root / "metadata/measurement-failure.json"
+    failure_record = next(row for row in projected.artifact_records
+        if row.artifact_id == "f09-measurement-failure")
+    failure_record.verify_materialized_file(result_root)
+    projected_failure = json.loads(failure_path.read_text())
+    assert projected_failure["stages"][0]["startup_failure"] == measure.evidence["startup_failure"]
+    assert projected_failure["stages"][0]["actions"][0]["action_id"] == failed_action.action_id
+    assert projected.execution_state == "failed" and projected.cleanup_state == "succeeded"
     assert provider.values["cleanup"] is not None
     assert provider.values["cleanup"].cleanup_state == "succeeded"
     assert provider.values["cleanup"].inventory.value["pages_complete"] is True
@@ -436,6 +518,8 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         from cloud_network_benchmark.contracts.admission import ScheduleEntry
         source_config = config
         config_data = yaml.safe_load(source_config.read_text(encoding="utf-8"))
+        # Match the admitted five-second provision stage of this command-only fixture.
+        config_data["options"]["provisioning_timeout_seconds"] = 5
         base_campaign, _ = resolve_campaign(source_config, ROOT)
         if is_short_study or is_diagnostic_day:
             config_data["benchmark"]["common_n"] = _source_bound_test_common_n(
@@ -521,10 +605,14 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         SourceBuild(tool="iperf3", source_url="https://example.invalid/iperf3.tar.gz",
             source_reference="iperf3-src", archive_name="iperf3.tar.gz", source_sha256="b"*64)],
         remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work", install_prefix="/var/lib/cnb/install")
+    # Twelve 70-second probes include 1.1s receiver startup and 0.1s late
+    # signal delivery each, plus eleven protocol pauses: 964.4s, rounded up.
+    calibration_fixture_seconds = math.ceil(12 * (70 + 1.1 + .1) + 11 * 10)
+    assert calibration_fixture_seconds == 965
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "three-provider", "initialize_if_missing": True},
         "allowance": WorkflowAllowance(5, 5, 300, 60,
-            960 if is_calibration else 230 if is_short_study else 86412 if is_diagnostic_day else 80, 5, 10, 10,
+            calibration_fixture_seconds if is_calibration else 230 if is_short_study else 86412 if is_diagnostic_day else 80, 5, 10, 10,
             "synthetic-test-policy", {"aws": 360, "azure": 360, "gcp": 30}),
         "copy_retry_seconds": 1, "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
@@ -585,15 +673,18 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 self.identity_provider = {str(value): name for name, value in identities.items()}
                 for name, responder in self.remote.items():
                     responder.full_native = True
+                    responder.controller_session_id = "synthetic-session"
                     responder.partial_after_first_unit = interrupt_controller
                     responder.cancel_verified = interrupt_stop_verified
                     responder.clock = clock
                     responder.late_tail = True
+                    responder.analysis_fixture_interior_rtt = is_short_study
                     mode_value = getattr(campaign.mode, "value", campaign.mode)
                     responder.protocol_elapsed = (12 * 60 if mode_value == "calibration" else
                         86_407 if mode_value == "diagnostic_day" else 60)
                     responder.workspace_roots = {role: root / name / role for role in ("vm_a", "vm_b")}
-                    responder.native_root = responder.workspace_roots["vm_a"]
+                    responder.results_roots = {role: path / "results" for role, path in responder.workspace_roots.items()}
+                    responder.native_root = responder.results_roots["vm_a"]
                 self.requests = []
                 self.actions = []
                 self.ledger = None
@@ -984,9 +1075,34 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
         from cloud_network_benchmark.contracts.validation import ValidatorInput
         from cloud_network_benchmark.validation import evaluate_comparison, validate_bundle
+        # Compare both shapes during the original projection, before acquisition
+        # binding rewrites timing evidence and seals the finalized bundle.
+        from cloud_network_benchmark import lifecycle_projection
+        from types import SimpleNamespace
+        original_validator_input = lifecycle_projection._validator_input
+        projected_azure_controls = []
+        def compare_azure_projection(**kwargs):
+            projected = original_validator_input(**kwargs)
+            if str(kwargs["child"].provider) == "azure":
+                wrapped_result = kwargs["result"]
+                wrapped = wrapped_result.values["create"]
+                direct_result = SimpleNamespace(**vars(wrapped_result))
+                direct_result.values = {**wrapped_result.values, "create": wrapped.deployment}
+                direct, *_ = original_validator_input(**{**kwargs, "result": direct_result})
+                control = projected[0].iperf3_control_evidence.value
+                assert control is not None
+                assert direct.iperf3_control_evidence.value == control
+                assert control["vm_a_host_id"] == wrapped.deployment.vm_a.connection.host
+                assert control["vm_b_host_id"] == wrapped.deployment.vm_b.connection.host
+                assert control["private_ipv4_b"] == wrapped.deployment.vm_b.private_ipv4
+                assert json.loads((kwargs["root"] / "metadata/iperf3-control-evidence.json").read_text()) == control
+                projected_azure_controls.append(control)
+            return projected
+        monkeypatch.setattr(lifecycle_projection, "_validator_input", compare_azure_projection)
         evaluated_at = max(clock.utc_now(), datetime.now(timezone.utc)) + timedelta(minutes=1)
         finalized = finalize_production_batch(parent_path=parent_path, children=children,
             parent=parent, lifecycle=result, repository_root=ROOT, evaluated_at=evaluated_at)
+        assert len(projected_azure_controls) == 1
         assert set(finalized) == {"aws", "azure", "gcp"}
         projected_parent = json.loads(parent_path.read_text(encoding="utf-8"))
         saved_inputs, roots = {}, {}
@@ -995,6 +1111,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             roots[provider] = Path(ref["result_path"]).resolve()
             saved_inputs[provider] = ValidatorInput.model_validate_json(
                 (roots[provider] / "validation" / "input.json").read_text(encoding="utf-8"))
+        saved_control = saved_inputs["azure"].iperf3_control_evidence.value
+        assert saved_control == projected_azure_controls[0]
+        assert json.loads((roots["azure"] / "metadata/iperf3-control-evidence.json").read_text()) == saved_control
         preliminary = {provider: validate_bundle(value, evaluated_at=evaluated_at)
             for provider, value in saved_inputs.items()}
         replays = evaluate_comparison(list(saved_inputs.values()), list(preliminary.values()))
@@ -1082,6 +1201,22 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
         out_a, out_b = selection_root / "report-a", selection_root / "report-b"
         write_analysis(report_a, out_a)
         write_analysis(report_b, out_b)
+        # Exercise the public CLI using the finalizer's actual on-disk F09
+        # inputs and validation results, not a reconstructed ValidatorInput.
+        from cloud_network_benchmark.cli import main as analyze_main
+        out_cli = selection_root / "report-cli"
+        assert analyze_main(["analyze", "--selection", str(selection_a),
+            "--output", str(out_cli)]) == 0
+        cli_payload = json.loads((out_cli / "report.json").read_text(encoding="utf-8"))
+        assert {row["provider"] for row in cli_payload["runs"]} == {"aws", "azure", "gcp"}
+        assert all(row["recorded_data_validity"] == "valid" for row in cli_payload["runs"])
+        if is_short_study:
+            assert any(row["rtt"].get("valid_replies", 0) > 0 for row in cli_payload["bins"])
+            assert any(row["metric"] == "throughput_gbps" and row["points"]
+                and all(value > 0 for value in row["points"]) for row in cli_payload["deployments"])
+        assert (out_cli / "index.html").is_file()
+        assert (out_cli / "figures" / "time-series.png").is_file()
+        assert (out_cli / "figures" / "receiver-time-series.svg").is_file()
         files_a = {p.relative_to(out_a): p.read_bytes() for p in out_a.rglob("*") if p.is_file()}
         files_b = {p.relative_to(out_b): p.read_bytes() for p in out_b.rglob("*") if p.is_file()}
         assert files_a and files_a == files_b

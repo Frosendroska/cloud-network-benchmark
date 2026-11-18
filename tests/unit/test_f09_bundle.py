@@ -8,7 +8,7 @@ from cloud_network_benchmark.contracts.common import ArtifactExpectation, VmRole
 from cloud_network_benchmark.contracts.campaign import PhaseConfiguration
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout
 from cloud_network_benchmark.lifecycle_bundle import (build_closed_inventory, build_remote_closed_inventory,
-    finalize_validation, lifecycle_declarations, retry_failed_items, retry_manifest,
+    finalize_validation, lifecycle_declarations, remote_inventory_paths_by_role, retry_failed_items, retry_manifest,
     retrieve_closed_bundle, seal_bundle)
 from cloud_network_benchmark.retrieval import RetrievalResult
 
@@ -84,6 +84,36 @@ def test_remote_inventory_rejects_missing_required_artifacts():
             closure={"vm_a":ended+timedelta(seconds=1), "vm_b":ended+timedelta(seconds=2)})
 
 
+def test_remote_inventory_allowlists_follow_declared_producer_and_reject_wrong_role_file():
+    import pytest
+
+    declarations = [
+        ArtifactInput(artifact_id="a-native", path="measurements/a.csv", kind="sockperf-csv",
+            producer="vm_a", expectation="required"),
+        ArtifactInput(artifact_id="b-stderr", path="server-logs/sockperf.err", kind="sockperf-server-stderr",
+            producer="vm_b", expectation="required"),
+        ArtifactInput(artifact_id="controller-note", path="metadata/controller.json", kind="metadata",
+            producer="controller", expectation="optional"),
+    ]
+    by_role = remote_inventory_paths_by_role(declarations)
+    assert by_role == {"vm_a": ("measurements/a.csv",),
+        "vm_b": ("server-logs/sockperf.err",)}
+
+    ended = datetime(2026, 10, 23, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="required closed remote artifacts are unavailable"):
+        build_remote_closed_inventory(identity={"provider":"gcp"},
+            deployment_id="run-gcp-deployment", remote_workspace="/var/lib/cnb/results",
+            declarations=declarations, remote_files={
+                "vm_a":[],
+                "vm_b":[{"path":"measurements/a.csv", "size_bytes":1,
+                    "sha256":hashlib.sha256(b"a").hexdigest()},
+                    {"path":"server-logs/sockperf.err", "size_bytes":0,
+                     "sha256":hashlib.sha256(b"").hexdigest()}]},
+            source_vm_ids={"vm_a":"10.1.0.1", "vm_b":"10.1.0.2"},
+            measurement_ended_at=ended,
+            closure={"vm_a":ended+timedelta(seconds=1), "vm_b":ended+timedelta(seconds=2)})
+
+
 def test_retry_selects_only_failed_concrete_ids_and_drops_siblings():
     ended = datetime(2026, 10, 23, tzinfo=timezone.utc)
     declarations = [ArtifactInput(artifact_id="a", path="a.csv", kind="sockperf-csv", producer="vm_a", expectation="required"),
@@ -128,6 +158,10 @@ def test_supplemental_declarations_use_actual_f03_paths_and_day_family_ids():
     stdout = next(item for item in short if item.artifact_id == "phase-single-sockperf-stdout")
     assert stdout.path == "measurements/phase-single/sockperf.stdout.log"
     assert stdout.kind == "sockperf-log"
+    sockperf_server_error = next(item for item in short if item.artifact_id == "sockperf_server_error")
+    assert (sockperf_server_error.producer, sockperf_server_error.path,
+        sockperf_server_error.kind, sockperf_server_error.expectation) == (
+        "vm_b", "server-logs/sockperf.err", "sockperf-server-stderr", "required")
     day_units = [PhaseConfiguration(unit_id="study-day", kind="continuous_day", phase="multi_flow", measured_seconds=86400)]
     day = lifecycle_declarations(ArtifactLayout.for_mode("diagnostic_day", day_units), mode="diagnostic_day", measurement_units=day_units)
     assert next(item for item in day if item.artifact_id == "day-probe-csv").path_template.endswith("{chunk_id}.csv")

@@ -25,6 +25,9 @@ from .measurement_process import MeasurementClock, MeasurementProcesses, Process
 
 NOTIFICATION = "Starting test..."
 CALIBRATION_ORDER = (1, 4, 2, 8, 8, 2, 4, 1, 2, 8, 1, 4)
+SOCKPERF_FIXED_MPS = 1000
+SOCKPERF_TEST_END_COOLDOWN_MSEC = 50  # Sockperf 3.10 src/defs.h: TEST_END_COOLDOWN_MSEC
+SOCKPERF_IDLE_OMIT_SECONDS = 5
 _PREVIEW = 8192
 
 
@@ -38,6 +41,7 @@ class MeasurementContext:
     clock_mappings: tuple[ClockMapping, ...] = ()
     tool_identity: Mapping[str, StringEvidence] = field(default_factory=dict)
     build_observations: tuple[BuildObservation, ...] = ()
+    local_vm_role: str | None = None
     receiver_command_evidence: tuple[CommandEvidence, ...] = ()
     source_artifact_records: tuple[ArtifactRecord, ...] = ()
 
@@ -66,6 +70,22 @@ def sockperf_argv(address: str, csv_path: Path, seconds: int) -> list[str]:
     return ["sockperf", "under-load", "-i", address, "-p", "11111", "-m", "64",
             "--mps", "1000", "--reply-every", "1", "--full-rtt", "--no-rdtsc",
             "--full-log", str(csv_path), "-t", str(seconds)]
+
+
+def sockperf_idle_probe_seconds(measured_seconds: int) -> int:
+    """Integer -t needed to retain idle measured support after Sockperf's native tail.
+
+    Pinned Sockperf 3.10 uses a 50 ms end cooldown and a 400 ms filter warm-up.
+    The configured 5 s omit already covers that head. At fixed 1000 MPS, the
+    50 ms tail is 50 requests; since ``-t`` is whole seconds, the smallest
+    timer increment able to supply those requests is ceil(50 / 1000) = 1 s.
+    This source-derived minimum does not replace replay's observed-window gate.
+    """
+    if isinstance(measured_seconds, bool) or not isinstance(measured_seconds, int) or measured_seconds <= 0:
+        raise ValueError("idle measured duration must be a positive integer")
+    cooldown_requests = (SOCKPERF_TEST_END_COOLDOWN_MSEC * SOCKPERF_FIXED_MPS + 999) // 1000
+    integer_tail_seconds = (cooldown_requests + SOCKPERF_FIXED_MPS - 1) // SOCKPERF_FIXED_MPS
+    return measured_seconds + SOCKPERF_IDLE_OMIT_SECONDS + integer_tail_seconds
 
 
 def iperf3_argv(address: str, streams: int, seconds: int, *, day: bool = False) -> list[str]:
@@ -671,7 +691,8 @@ class _Runner:
             else:
                 measure = 60 if mode == ExperimentMode.SHORT_STUDY else 10
                 for index, unit in enumerate(units):
-                    probe = (65 if mode == ExperimentMode.SHORT_STUDY else 15) if unit.phase == BenchmarkPhase.IDLE_LATENCY else (70 if mode == ExperimentMode.SHORT_STUDY else 20)
+                    probe = (sockperf_idle_probe_seconds(measure) if unit.phase == BenchmarkPhase.IDLE_LATENCY
+                        else (70 if mode == ExperimentMode.SHORT_STUDY else 20))
                     self._run_unit(unit, seconds=measure, probe_seconds=probe, tcp=unit.phase != BenchmarkPhase.IDLE_LATENCY,
                                    streams=self._streams(unit))
                     if index < len(units) - 1:
@@ -935,8 +956,13 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
     validated = ResolvedObservation.model_validate(observation.model_dump(mode="python"))
     result = _Runner(validated, context, processes, clock).run()
     from .bootstrap import materialize_build_identity_artifacts
+    materialized_builds = context.build_observations
+    if context.local_vm_role is not None:
+        if context.local_vm_role != VmRole.VM_A.value:
+            raise ValueError("short-run measurement can materialize build identities only for VM A")
+        materialized_builds = tuple(build for build in materialized_builds if build.role == context.local_vm_role)
     build_records = materialize_build_identity_artifacts(Path(context.root), context.identity.deployment_id,
-        context.build_observations)
+        materialized_builds)
     if build_records:
         result = replace(result, artifact_records=build_records)
     if not context.source_artifact_records or not context.build_observations:

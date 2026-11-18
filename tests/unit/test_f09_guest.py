@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 import hashlib
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,24 @@ def test_guest_duration_uses_utc_and_subtracts_transport_and_clock_uncertainty()
         guest_duration(effective_deadline_utc=now+timedelta(seconds=5), guest_now_utc=now,
             controller_observed_remaining=5, transport_elapsed_seconds=4,
             clock_uncertainty_seconds=2)
+
+
+def test_remote_measurement_deadline_enforces_stage_allowance_and_later_stage_reserves():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_remote import _measurement_stage_window
+
+    allowance = SimpleNamespace(measurement_seconds=100, measurement_shutdown_seconds=15,
+        retrieval_seconds=45, cleanup_seconds=120)
+    # The stage window is tighter than the remaining whole-workflow cap.
+    window = _measurement_stage_window(overall_deadline=1000, measurement_started=50,
+        allowance=allowance)
+    assert window.execution_deadline_monotonic == 150
+    assert window.shutdown_deadline_monotonic == 165
+    # A near cap still reserves retrieval and cleanup even when it is tighter.
+    window = _measurement_stage_window(overall_deadline=220, measurement_started=50,
+        allowance=allowance)
+    assert window.execution_deadline_monotonic == 40
+    assert window.shutdown_deadline_monotonic == 55
 
 
 def test_remote_pair_preparation_composes_bootstrap_readiness_and_guest_staging(monkeypatch, tmp_path):
@@ -161,6 +181,73 @@ def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity
     assert report.outcome.identity == request.identity
     from cloud_network_benchmark.orchestration import _typed_outcome
     assert _typed_outcome("aws", "measure", report)[0] is False
+
+
+def test_remote_f03_handoff_bounds_staging_polling_and_owned_stop_to_measurement_window(repository_root, tmp_path):
+    import json
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.lifecycle_adapters import GuestRuntimeEvidence, run_remote_f03
+    from cloud_network_benchmark.lifecycle_guest import package_tree_sha256
+    from cloud_network_benchmark.lifecycle_remote import _measurement_stage_window
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    base, _ = _request(repository_root, tmp_path)
+    runtime_root = f"/var/lib/cnb/runtime/{connected.deployment_id}/runtime"
+    digest = package_tree_sha256(repository_root / "src/cloud_network_benchmark")
+    now = datetime.now(timezone.utc)
+    window = _measurement_stage_window(overall_deadline=300, measurement_started=100,
+        allowance=type("Allowance", (), {"measurement_seconds": 1.5,
+            "measurement_shutdown_seconds": 1.0, "retrieval_seconds": 45.0,
+            "cleanup_seconds": 120.0})())
+    request = type(base).model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": {**base.observation.model_dump(mode="python"), "provider": "aws"},
+        "output_root": f"{runtime_root}/results",
+        "package_root": f"{runtime_root}/source/cloud_network_benchmark",
+        "source_revision": "a"*40, "expected_source_revision": "a"*40,
+        "package_sha256": digest,
+        "effective_deadline_utc": now + timedelta(seconds=window.shutdown_deadline_monotonic - 100),
+        "safe_remaining_seconds": window.shutdown_deadline_monotonic - 100,
+        "clock_uncertainty_seconds": 0.0})
+    runtime = GuestRuntimeEvidence("a"*40, digest, "b"*64, runtime_root,
+        "3.12.3", "2.14.0", "6.0.2", ())
+    current = [100.0]
+
+    class Runner:
+        def __init__(self): self.requests=[]; self.request_payload=None
+        def run(self, command):
+            self.requests.append(command)
+            if command.action_id.startswith("f09-guest-request-"):
+                self.request_payload = json.loads(Path(command.argv[-2]).read_text())
+            if command.action_id.startswith("f09-guest-run-"):
+                assert command.timeout_seconds <= 1.5
+                invocation = command.action_id.removeprefix("f09-guest-run-")
+                return result(command.action_id, json.dumps({"deployment_id":connected.deployment_id,
+                    "invocation_id":invocation,"pid":25001,"process_group":25001,
+                    "session_id":25001,"boot_id":"synthetic-boot","start_ticks":12345}))
+            if command.action_id.startswith("f09-guest-status-"):
+                assert command.timeout_seconds <= max(0.0, window.execution_deadline_monotonic-current[0])
+                return result(command.action_id, "running")
+            if command.action_id.startswith("f09-guest-cancel-"):
+                assert command.timeout_seconds <= 1.0
+                return result(command.action_id, "process_group_stopped")
+            if command.action_id.startswith("f09-guest-outcome-"):
+                return result(command.action_id, success=False, stderr="outcome not returned")
+            return result(command.action_id)
+
+    runner = Runner()
+    report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+        deadline=deadline(), clock=lambda:current[0],
+        active_deadline_monotonic=window.execution_deadline_monotonic,
+        shutdown_deadline_monotonic=window.shutdown_deadline_monotonic,
+        sleep=lambda seconds: current.__setitem__(0, current[0] + seconds))
+    assert runner.request_payload["safe_remaining_seconds"] == 2.5
+    assert runner.request_payload["effective_deadline_utc"] == request.effective_deadline_utc.isoformat().replace("+00:00", "Z")
+    assert any(item.action_id.startswith("f09-guest-cancel-") for item in runner.requests)
+    assert "F03 active cap expired; process_group_stopped" in report.failure
+    assert all(item.timeout_seconds <= 1.5 for item in runner.requests
+        if item.action_id.startswith(("f09-guest-control-mkdir-", "f09-guest-request-", "f09-guest-run-", "f09-guest-status-")))
 
 
 @pytest.mark.parametrize(("source_case", "verified_stop"), [
@@ -359,6 +446,216 @@ def test_f03_scoped_stop_reaps_owned_session_when_original_leader_has_exited(tmp
             pass
 
 
+def test_f03_dash_status_probe_tracks_running_terminal_and_rejects_absent_or_malformed(
+        tmp_path):
+    """Run the production status probe through Ubuntu's /bin/sh (dash) semantics."""
+    import os
+    import shutil
+    import subprocess
+    from cloud_network_benchmark.lifecycle_adapters import (
+        _f03_guest_status_command, _parse_f03_guest_status,
+    )
+
+    shell = shutil.which("dash")
+    if shell is None:
+        pytest.skip("dash is unavailable on the local test host")
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    status_path = tmp_path / "f03.status"
+    command = _f03_guest_status_command(str(status_path), process.pid)
+
+    def poll():
+        completed = subprocess.run([shell, "-c", command], capture_output=True,
+            text=True, timeout=3)
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    try:
+        assert os.getpgid(process.pid) == process.pid
+        # Reproduce the former production spelling: dash hides its rejected
+        # `--` operand inside the conditional and misreports this live group.
+        former = subprocess.run([shell, "-c", command.replace("kill -0 -", "kill -0 -- -")],
+            capture_output=True, text=True, timeout=3)
+        assert former.returncode == 0 and former.stdout.strip() == "absent"
+        assert _parse_f03_guest_status(poll()) is None
+
+        # An explicit wrapper status remains terminal even after its process exits.
+        status_path.write_text("0\n")
+        os.killpg(process.pid, 15)
+        process.wait(timeout=3)
+        assert _parse_f03_guest_status(poll()) == 0
+
+        # A dead group without the wrapper's numeric status must remain a failure.
+        status_path.unlink()
+        absent = poll()
+        assert absent == "absent"
+        with pytest.raises(RuntimeError, match="without an authenticated terminal status"):
+            _parse_f03_guest_status(absent)
+
+        status_path.write_text("not-a-number\n")
+        malformed = poll()
+        assert malformed == "exited not-a-number"
+        with pytest.raises(ValueError, match="exit status is malformed"):
+            _parse_f03_guest_status(malformed)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=3)
+
+
+def test_remote_f03_runs_production_guest_wrapper_to_its_terminal_outcome(
+        repository_root, tmp_path):
+    """Run the generated wrapper and real guest module with local fake tools."""
+    import json
+    import os
+    import shlex
+    import shutil
+    import subprocess
+    import sys
+    import time
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.lifecycle_adapters import (
+        GuestRuntimeEvidence, _stop_remote_f03, run_remote_f03,
+    )
+    from cloud_network_benchmark.access import RemoteDeadline
+    from cloud_network_benchmark.lifecycle_guest import GuestOutcome, package_tree_sha256
+    from tests.fixtures.f02r.support import connection, result
+
+    base, _clock = _request(repository_root, tmp_path)
+    assert base.observation.benchmark.measured_seconds == 10
+    assert base.observation.benchmark.warmup_seconds == 5
+    assert [(unit.phase, unit.measured_seconds)
+            for unit in base.observation.measurement_units] == [
+                ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
+    now_utc = datetime.now(timezone.utc)
+    command_shape = GuestOutcome(identity=base.identity, outcome="failed",
+        executed_unit_ids=[],
+        unexecuted_unit_ids=[unit.unit_id for unit in base.observation.measurement_units],
+        commands=[{"request": {"argv": ["sockperf", "under-load", "-t", "16"]}}],
+        timings=[], artifact_paths=[], source_revision=base.source_revision,
+        package_sha256=base.package_sha256, guest_started_at=now_utc,
+        guest_finished_at=now_utc)
+    assert command_shape.commands[0]["request"]["argv"][-2:] == ["-t", "16"]
+
+    if not Path("/proc/self/stat").is_file() or shutil.which("setsid") is None:
+        pytest.skip("the generated F03 launcher requires Linux /proc and setsid")
+
+    connected = connection(tmp_path)
+    connected = connected.model_copy(update={
+        "identity": base.identity, "run_id": base.identity.run_id,
+        "deployment_id": base.identity.deployment_id,
+    })
+    remote_root = tmp_path / "guest-root"
+    package_root = remote_root / "source" / "cloud_network_benchmark"
+    package_root.parent.mkdir(parents=True)
+    shutil.copytree(repository_root / "src/cloud_network_benchmark", package_root)
+    python = remote_root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    python.chmod(0o755)
+    digest = package_tree_sha256(package_root)
+    request = GuestRequest.model_validate({**base.model_dump(mode="python"),
+        "identity": connected.identity.model_dump(mode="python"),
+        "observation": base.observation.model_dump(mode="python"),
+        "output_root": str(remote_root / "results"), "package_root": str(package_root),
+        "effective_deadline_utc": datetime.now(timezone.utc) + timedelta(seconds=45),
+        "safe_remaining_seconds": 45,
+        "source_revision": "a" * 40, "expected_source_revision": "a" * 40,
+        "package_sha256": digest})
+    runtime = GuestRuntimeEvidence("a" * 40, digest, "b" * 64,
+        str(remote_root), "3.12.3", "2.14.0", "6.0.2", ())
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    # The valid acceptance fixture has 10 measured seconds, 5 seconds warmup,
+    # and uses 15-second idle / 20-second loaded Sockperf probes. Fail its
+    # first controlled probe so this transport test closes before later units.
+    (fake_bin / "sockperf").write_text(
+        "#!/usr/bin/env python3\nimport sys, time\n"
+        "print('Starting test...', flush=True)\ntime.sleep(.5)\nsys.exit(7)\n")
+    (fake_bin / "iperf3").write_text(
+        "#!/usr/bin/env python3\nimport json\n"
+        "print(json.dumps({'start': {'test_start': {'omit': 5}}, "
+        "'server_output_json': {'end': {'sum_received': {'seconds': 15, 'bytes': 1}}}}))\n")
+    for binary in (fake_bin / "sockperf", fake_bin / "iperf3"):
+        binary.chmod(0o755)
+    local_env = os.environ | {"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+    request.output_root.mkdir(parents=True)
+
+    class LocalGuestRunner:
+        def __init__(self):
+            self.actions = []
+
+        def run(self, command):
+            self.actions.append(command)
+            action = command.action_id
+            if action.startswith("f09-guest-control-mkdir-"):
+                completed = subprocess.run(["/bin/sh", "-c", command.argv[-1]],
+                    capture_output=True, text=True, env=local_env, timeout=5)
+                return result(action, completed.stdout, completed.returncode == 0, completed.stderr)
+            if action.startswith("f09-guest-request-"):
+                source = Path(command.argv[-2])
+                destination = Path(command.argv[-1].split(":", 1)[1])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                return result(action)
+            if (action.startswith("f09-guest-run-") or action.startswith("f09-guest-status-")
+                    or action.startswith("f09-guest-cancel-")):
+                completed = subprocess.run(["/bin/sh", "-c", command.argv[-1]],
+                    capture_output=True, text=True, env=local_env, timeout=8)
+                return result(action, completed.stdout, completed.returncode == 0, completed.stderr)
+            if action.startswith("f09-guest-outcome-"):
+                source = Path(command.argv[-2].split(":", 1)[1])
+                shutil.copyfile(source, Path(command.argv[-1]))
+                return result(action)
+            raise AssertionError(f"unexpected local guest command: {action}")
+
+    runner = LocalGuestRunner()
+    start_monotonic = time.monotonic()
+    start_utc = datetime.now(timezone.utc)
+    controller_deadline = RemoteDeadline(
+        readiness_deadline_monotonic=start_monotonic + 45,
+        overall_deadline_monotonic=start_monotonic + 45,
+        cleanup_reserve_seconds=5, cap_started_at=start_utc,
+        cap_expires_at=start_utc + timedelta(seconds=45))
+    try:
+        report = run_remote_f03(connected, request, runner=runner, runtime=runtime,
+            deadline=controller_deadline, clock=time.monotonic)
+
+        assert report.failure is None, report.failure
+        assert report.outcome is not None and report.outcome.outcome == "failed"
+        assert report.outcome.identity == request.identity
+        assert report.outcome_source_bytes
+        assert [(unit.phase, unit.measured_seconds)
+                for unit in request.observation.measurement_units] == [
+                    ("idle_latency", 10), ("single_flow", 10), ("multi_flow", 10)]
+        assert report.outcome.commands and report.outcome.failures
+        assert report.outcome.commands[0]["request"]["argv"][-2:] == ["-t", "16"]
+        status_actions = [item for item in report.actions if "f09-guest-status-" in item.action_id]
+        assert any(item.result["stdout"].strip() == "running" for item in status_actions)
+        assert status_actions[-1].result["stdout"].strip() == "exited 0"
+        assert any("f09-guest-outcome-" in item.action_id for item in report.actions)
+        status_file = next(remote_root.glob("control/*.status"))
+        assert status_file.read_text().strip() == "0"
+    finally:
+        process_files = list(remote_root.glob("control/*.process.json"))
+        if process_files:
+            process_path = process_files[0]
+            process_record = json.loads(process_path.read_text(encoding="utf-8"))
+            cleanup_actions = []
+            cleanup_started = time.monotonic()
+            cleanup_utc = datetime.now(timezone.utc)
+            cleanup_deadline = RemoteDeadline(
+                readiness_deadline_monotonic=cleanup_started + 10,
+                overall_deadline_monotonic=cleanup_started + 10,
+                cleanup_reserve_seconds=1, cap_started_at=cleanup_utc,
+                cap_expires_at=cleanup_utc + timedelta(seconds=10))
+            stopped = _stop_remote_f03(connected, process_record,
+                process_record["invocation_id"], process_path=str(process_path),
+                runner=runner, deadline=cleanup_deadline,
+                clock=time.monotonic, actions=cleanup_actions)
+            assert stopped == "process_group_stopped", cleanup_actions[-1].result
+
+
 def test_f03_scoped_stop_refuses_reused_pid_start_ticks(tmp_path):
     import json
     import os
@@ -426,8 +723,21 @@ def test_guest_sigterm_bridge_raises_interrupt_and_restores_original_handler(
     assert signal.getsignal(signal.SIGTERM) == prior
 
 
-def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(tmp_path):
+@pytest.mark.parametrize(("collector_state", "collector_failures", "paths_complete", "expected_state"), [
+    ("interrupted", [], True, "closed"),
+    ("completed", [], True, "closed"),
+    ("failed", [], True, "failed"),
+    ("completed", [{"category": "snapshot", "message": "failed"}], True, "failed"),
+    ("completed", [], False, "failed"),
+])
+def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_identity(
+        tmp_path, collector_state, collector_failures, paths_complete, expected_state):
     import json
+    import os
+    import shlex
+    import signal
+    import subprocess
+    import sys
     from datetime import datetime, timezone
     from cloud_network_benchmark.lifecycle_adapters import start_remote_diagnostics, stop_remote_diagnostics
     from tests.fixtures.f02r.support import connection, deadline, result
@@ -442,10 +752,11 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
     boot_id = "12345678-1234-1234-1234-123456789abc"
 
     class Runner:
-        def __init__(self): self.requests = []
+        def __init__(self): self.requests = []; self.start_request = None
         def run(self, request):
             self.requests.append(request)
             if request.action_id.startswith("f09-diagnostics-start-"):
+                self.start_request = request
                 assert "setsid python3" in request.argv[-1]
                 assert "process_group" in request.argv[-1] and "/proc/sys/kernel/random/boot_id" in request.argv[-1]
                 return result(request.action_id, json.dumps({"pid": 4321, "process_group": 4321,
@@ -464,10 +775,16 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
                     "closed_at_utc":datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}))
             if request.action_id.startswith("f09-diagnostics-outcome-"):
                 return result(request.action_id, json.dumps({"deployment_id":connected.deployment_id,
-                    "vm_role":"vm_b", "state":"interrupted", "closed_paths":[
+                    "vm_role":"vm_b", "state":collector_state, "failures":collector_failures,
+                    "sample_count":114, "mapping_count":115,
+                    "artifacts":{"metadata":"/var/lib/cnb/work/metadata/vm_b.json",
+                        "diagnostics":"/var/lib/cnb/work/diagnostics/vm_b.jsonl",
+                        "clock":"/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"},
+                    "closed_paths":[
                         "/var/lib/cnb/work/metadata/vm_b.json",
                         "/var/lib/cnb/work/diagnostics/vm_b.jsonl",
-                        "/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"]}))
+                        "/var/lib/cnb/work/diagnostics/vm_b-clock.jsonl"] if paths_complete else
+                        ["/var/lib/cnb/work/metadata/vm_b.json"]}))
             return result(request.action_id)
 
     runner = Runner()
@@ -475,10 +792,48 @@ def test_remote_f04_collector_is_started_and_stopped_by_exact_guest_process_iden
         remote_root=f"/var/lib/cnb/control/{connected.deployment_id}", deadline=deadline(), clock=lambda:100)
     assert process.role == "vm_b" and process.pid == process.process_group == 4321
     assert process.boot_id == boot_id and process.start_ticks == 7654
+
+    # Compile the exact identity reporter placed in the generated remote argv.
+    generated_argv = shlex.split(shlex.split(runner.start_request.argv[-1])[2])
+    reporter_indexes = [index for index in range(len(generated_argv) - 1)
+        if generated_argv[index:index + 2] == ["python3", "-c"]]
+    assert len(reporter_indexes) == 1
+    reporter_index = reporter_indexes[0]
+    identity_reporter = generated_argv[reporter_index + 2]
+    assert "process_group" in identity_reporter
+    assert "/proc/sys/kernel/random/boot_id" in identity_reporter
+    assert "start_ticks" in identity_reporter
+    compile(identity_reporter, "generated-f04-process-identity", "exec")
+    if sys.platform == "linux":
+        # Exercise that exact generated reporter against a short-lived local process.
+        local = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            identity_path = tmp_path / "local-process-identity.json"
+            observed = subprocess.run([sys.executable, "-c", identity_reporter,
+                str(local.pid), str(identity_path)], capture_output=True, text=True,
+                check=True, timeout=3)
+            actual = json.loads(observed.stdout)
+            written_text = identity_path.read_text(encoding="utf-8")
+            written = json.loads(written_text)
+            stat_tail = Path(f"/proc/{local.pid}/stat").read_text().split(")", 1)[1].split()
+            assert actual == written
+            assert written_text.endswith("\n")
+            assert actual == {"pid": local.pid, "process_group": local.pid,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "start_ticks": int(stat_tail[19])}
+        finally:
+            try:
+                os.killpg(local.pid, signal.SIGTERM)
+                local.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(local.pid, signal.SIGKILL)
+                local.wait(timeout=2)
     closure = stop_remote_diagnostics(connected, process, runner=runner,
         deadline=deadline(), clock=lambda:100)
-    assert closure.state == "closed" and closure.closed_at is not None
-    assert closure.outcome["state"] == "interrupted" and len(closure.outcome["closed_paths"]) == 3
+    assert closure.state == expected_state
+    assert closure.closed_at is not None
+    assert closure.outcome["state"] == collector_state and len(closure.outcome["closed_paths"]) == (3 if paths_complete else 1)
+    assert bool(closure.failures) == (expected_state == "failed")
     assert [item.action_id.split("-")[2] for item in runner.requests if item.action_id.startswith("f09-diagnostics-")] == [
         "mkdir", "helper", "context", "start", "stop", "outcome"]
 
@@ -492,14 +847,35 @@ def test_vm_b_listener_closure_stops_selected_systemd_units_and_observes_closed_
         def __init__(self): self.requests = []
         def run(self, request):
             self.requests.append(request)
-            if request.action_id.startswith("f09-listener-exit-"):
+            if request.action_id.startswith("f09-listener-owner-process-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                return result(request.action_id, json.dumps({"pid":4242,"start_ticks":12345,
+                        "boot_id":"12345678-1234-1234-1234-123456789abc",
+                        "cgroup":f"/system.slice/cnb-{connected.deployment_id}-{tool}.service",
+                        "log_ids":[[1,2],[1,3]]}))
+            if request.action_id.startswith("f09-listener-closed-files-"):
+                return result(request.action_id, json.dumps({"closed_at_utc":"2026-11-17T15:00:00+00:00"}))
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    "StandardOutput=append\nStandardError=append\n")
+            if request.action_id.startswith("f09-listener-config-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
                 return result(request.action_id,
-                    "LoadState=loaded\nActiveState=inactive\nMainPID=0\n"
-                    "InactiveEnterTimestamp=Fri 2026-10-23 10:11:00 UTC\n")
+                    "# /run/systemd/transient/cnb.service\n[Service]\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
             return result(request.action_id)
     runner = Runner()
     closure = stop_vm_b_listeners(connected, runner=runner, deadline=deadline(), clock=lambda:100)
-    assert closure.closed and closure.closed_at is not None
+    assert closure.closed and closure.closed_at is not None, (closure.observations, closure.failures,
+        [(x.action_id, x.result.get("outcome"), x.result.get("stdout")) for x in closure.actions])
     assert set(closure.observations) == {"sockperf", "iperf3"}
     stops = [item.argv[-1] for item in runner.requests if "systemctl stop" in item.argv[-1]]
     assert len(stops) == 2
@@ -513,14 +889,133 @@ def test_vm_b_listener_closure_fails_closed_when_unit_is_still_active(tmp_path):
     connected = connection(tmp_path)
     class Runner:
         def run(self, request):
-            if request.action_id.startswith("f09-listener-exit-"):
-                return result(request.action_id,
-                    "LoadState=loaded\nActiveState=active\nMainPID=4321\n"
-                    "InactiveEnterTimestamp=n/a\n")
+            if request.action_id.startswith("f09-listener-owner-process-"):
+                return result(request.action_id, json.dumps({"pid":4242,"start_ticks":12345,
+                    "boot_id":"12345678-1234-1234-1234-123456789abc"}))
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
             return result(request.action_id)
     closure = stop_vm_b_listeners(connected, runner=Runner(), deadline=deadline(), clock=lambda:100)
     assert not closure.closed and closure.closed_at is None
     assert len(closure.failures) == 2
+
+
+@pytest.mark.parametrize("case", ["wrong-path", "cat-denied", "override"])
+def test_vm_b_listener_closure_requires_effective_exact_cat_log_paths(tmp_path, case):
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+    connected = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.startswith("f09-listener-owner-"):
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                unit = f"cnb-{connected.deployment_id}-{tool}"
+                return result(request.action_id, "LoadState=loaded\nActiveState=active\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}.service\n"
+                    "StandardOutput=append\nStandardError=append\n")
+            if request.action_id.startswith("f09-listener-config-"):
+                if case == "cat-denied":
+                    return result(request.action_id, "", success=False, stderr="permission denied")
+                tool = "sockperf" if request.action_id.endswith("-sockperf") else "iperf3"
+                stdout = "sockperf.log" if tool == "sockperf" else "iperf3-server.jsonl"
+                stderr = "sockperf.err" if tool == "sockperf" else "iperf3-server.err"
+                config = ("# /run/systemd/transient/cnb.service\n[Service]\n"
+                    f"StandardOutput=append:/var/lib/cnb/results/server-logs/{stdout}\n"
+                    f"StandardError=append:/var/lib/cnb/results/server-logs/{stderr}\n")
+                if case == "wrong-path":
+                    config = config.replace(f"{stdout}", "foreign.log")
+                if case == "override":
+                    config += ("# /etc/systemd/system/cnb.service.d/override.conf\n[Service]\n"
+                        "StandardError=append:/var/lib/cnb/results/server-logs/foreign.err\n")
+                return result(request.action_id, config)
+            raise AssertionError("closure must reject before process inspection or stop")
+    runner = Runner()
+    closure = stop_vm_b_listeners(connected, runner=runner, deadline=deadline(), clock=lambda:100)
+    assert not closure.closed and closure.closed_at is None
+    assert len([request for request in runner.requests if "systemctl stop" in request.argv[-1]]) == 0
+    assert not any(request.action_id.startswith("f09-listener-owner-process-") for request in runner.requests)
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists() or os.geteuid() != 0,
+    reason="emitted listener closure proof requires Linux /proc and privileged descriptor visibility")
+def test_emitted_listener_closure_script_checks_live_writer_and_closed_process(tmp_path):
+    import shlex
+    import subprocess
+    import sys
+    from cloud_network_benchmark.lifecycle_adapters import stop_vm_b_listeners
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    result_root = tmp_path / "results"
+    logs = result_root / "server-logs"
+    logs.mkdir(parents=True)
+    paths = [logs / "sockperf.log", logs / "sockperf.err"]
+    for path in paths: path.write_bytes(b"")
+
+    def run_case(*, leave_child):
+        source = "import os,sys,time; [open(p,'ab') for p in sys.argv[1:3]]; "
+        source += ("pid=os.fork(); "
+            "(time.sleep(30),os._exit(0)) if pid==0 else (print(pid,flush=True),time.sleep(30))"
+            if leave_child else "time.sleep(30)")
+        process = subprocess.Popen([sys.executable, "-c", source, *(str(path) for path in paths)],
+            stdout=subprocess.PIPE, text=True)
+        child_pid = int(process.stdout.readline()) if leave_child else None
+        stat = Path(f"/proc/{process.pid}/stat").read_text(); ticks = int(stat[stat.rfind(")")+2:].split()[19])
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        log_ids = [[path.stat().st_dev, path.stat().st_ino] for path in paths]
+        unit = f"cnb-{connected.deployment_id}-sockperf"
+        cgroup = f"/sys/fs/cgroup/cnb-closure-test-{process.pid}.service"
+
+        class Runner:
+            def __init__(self): self.requests=[]
+            def run(self, request):
+                self.requests.append(request)
+                aid = request.action_id
+                if aid.startswith("f09-listener-owner-"):
+                    return result(aid, "LoadState=loaded\nActiveState=active\nMainPID="+str(process.pid)+"\n"
+                        f"ControlGroup=/system.slice/{unit}.service\n"
+                        "StandardOutput=append\nStandardError=append\n")
+                if aid.startswith("f09-listener-config-"):
+                    return result(aid, "# /run/systemd/transient/cnb.service\n[Service]\n"
+                        f"StandardOutput=append:{paths[0]}\nStandardError=append:{paths[1]}\n")
+                if aid.startswith("f09-listener-owner-process-"):
+                    return result(aid, json.dumps({"pid":process.pid,"start_ticks":ticks,
+                        "boot_id":boot,"cgroup":f"/system.slice/{unit}.service","log_ids":log_ids}))
+                if aid.startswith("f09-listener-stop-"):
+                    process.terminate(); process.wait(timeout=3)
+                    if leave_child: return result(aid)
+                    return result(aid)
+                return result(aid)
+
+        # Run the generated guest closure program locally against controlled processes.
+        class ExecutingRunner(Runner):
+            def run(self, request):
+                aid=request.action_id
+                if aid.startswith("f09-listener-closed-files-"):
+                    remote=shlex.split(request.argv[-1])
+                    completed=subprocess.run([sys.executable,*remote[2:]],capture_output=True,text=True,check=False)
+                    return result(aid,completed.stdout,success=completed.returncode==0,stderr=completed.stderr)
+                return super().run(request)
+        closure = stop_vm_b_listeners(connected, runner=ExecutingRunner(), results_workspace=str(result_root),
+            deadline=deadline(), clock=lambda:100)
+        if child_pid is not None:
+            try: os.kill(child_pid, 9)
+            except ProcessLookupError: pass
+        return closure
+
+    rejected = run_case(leave_child=True)
+    assert not rejected.closed and any("descriptors remain open" in item for item in rejected.failures)
+    accepted = run_case(leave_child=False)
+    assert accepted.closed and accepted.closed_at is not None
 
 
 def test_remote_workspace_inventory_is_hash_bound_bounded_and_symlink_failing(tmp_path):
@@ -542,14 +1037,86 @@ def test_remote_workspace_inventory_is_hash_bound_bounded_and_symlink_failing(tm
             compile(ast.literal_eval(outer.body[0].value.args[0]), "remote-inventory", "exec")
             return result(request.action_id, json.dumps({"files":self.payload}))
     runner = Runner(rows)
-    inventory = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
-        runner=runner, deadline=deadline(), clock=lambda:100)
+    inventory = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/results",
+        runner=runner, deadline=deadline(), clock=lambda:100, expected_paths=["measurements/unit/native.log"])
     assert inventory.failures == () and inventory.files == tuple(rows)
     assert inventory.files[0]["sha256"] == hashlib.sha256(b"native\n").hexdigest()
     malformed = Runner([{**rows[0], "sha256":"bad"}])
-    rejected = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/work",
-        runner=malformed, deadline=deadline(), clock=lambda:100)
+    rejected = inventory_remote_workspace(connected, role="vm_a", workspace="/var/lib/cnb/results",
+        runner=malformed, deadline=deadline(), clock=lambda:100, expected_paths=["measurements/unit/native.log"])
     assert rejected.files == () and rejected.failures
+
+
+def test_actual_staged_workspace_is_separate_from_strict_declared_native_inventory(tmp_path):
+    import subprocess
+    import sys
+    from cloud_network_benchmark.lifecycle_adapters import inventory_remote_workspace
+    from tests.fixtures.f02r.support import connection, deadline, result
+
+    connected = connection(tmp_path)
+    from cloud_network_benchmark.contracts.artifacts import ArtifactInput
+    from cloud_network_benchmark.lifecycle_bundle import remote_inventory_paths_by_role
+    from cloud_network_benchmark.contracts.common import ArtifactExpectation
+    guest = tmp_path / "guest"
+    work = guest / "work"
+    results = guest / "results"
+    (work / "runtime").mkdir(parents=True)
+    subprocess.run([sys.executable, "-m", "venv", "--system-site-packages",
+        str(work / "runtime" / "venv")], check=True)
+    bootstrap_source = work / "sockperf-5ebd327da983225321818c0355db922515e026bd"
+    bootstrap_source.mkdir(parents=True)
+    (bootstrap_source / "generated-target").write_text("build artifact")
+    (bootstrap_source / "generated-link").symlink_to("generated-target")
+    (results / "measurements/unit").mkdir(parents=True)
+    native = results / "measurements/unit/sockperf.csv"
+    native.write_bytes(b"native closed result\n")
+    assert any(path.is_symlink() for path in work.rglob("*")), "fixture must reproduce staged runtime/build symlinks"
+    role_paths = remote_inventory_paths_by_role([
+        ArtifactInput(artifact_id="vm-a-native", path="measurements/unit/sockperf.csv",
+            kind="sockperf-csv", producer="vm_a", expectation=ArtifactExpectation.REQUIRED),
+        ArtifactInput(artifact_id="vm-b-server-stderr", path="server-logs/sockperf.err",
+            kind="sockperf-server-stderr", producer="vm_b", expectation=ArtifactExpectation.REQUIRED),
+    ])
+
+    class LocalGuestRunner:
+        def __init__(self): self.requests=[]
+        def run(self, request):
+            self.requests.append(request)
+            command = request.argv[-1]
+            completed = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+            return result(request.action_id, completed.stdout, success=completed.returncode == 0,
+                stderr=completed.stderr)
+
+    runner = LocalGuestRunner()
+    inventory = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=runner, deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert inventory.failures == (), (runner.requests[0].argv, inventory.actions[0].result.get("stderr"))
+    assert [row["path"] for row in inventory.files] == ["measurements/unit/sockperf.csv"]
+    assert inventory.files[0]["size_bytes"] == len(native.read_bytes())
+    wrong_role = results / "server-logs/sockperf.err"
+    wrong_role.parent.mkdir(parents=True); wrong_role.write_bytes(b"wrong VM's declaration")
+    rejected_role_file = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert rejected_role_file.files == () and any("undeclared" in item for item in rejected_role_file.failures), (rejected_role_file.failures,rejected_role_file.actions[0].result.get("stderr"))
+    wrong_role.unlink()
+    oversized = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100, maximum_bytes=4,
+        expected_paths=role_paths["vm_a"])
+    assert oversized.files == () and oversized.failures
+
+    (results / "measurements/unit/foreign.txt").write_text("not declared")
+    unknown = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert unknown.files == () and unknown.failures
+    (results / "measurements/unit/foreign.txt").unlink()
+    (results / "measurements/unit/escape").symlink_to(native)
+    symlink = inventory_remote_workspace(connected, role="vm_a", workspace=str(results),
+        runner=LocalGuestRunner(), deadline=deadline(), clock=lambda:100,
+        expected_paths=role_paths["vm_a"])
+    assert symlink.files == () and symlink.failures
 
 
 def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_dependencies(

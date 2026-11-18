@@ -74,7 +74,7 @@ def test_materialized_jsonl_records_are_consumed_incrementally(tmp_path):
 
 def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, deterministic_token,
                                 fake_git_commits, request, *, config_name="exp-001-multi-provider.yaml",
-                                mode_override=None, provider="aws", frozen_n=False, shared_slot=False):
+                                mode_override=None, provider="aws", frozen_n=False, shared_slot=False, receiver_diagnostics=False):
     from tests.unit.test_validation import NOW, make_input
 
     config_path=repository_root/"configs/experiments"/config_name
@@ -129,6 +129,21 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         measurement_units=units,schedule_supplied=True)
     records, commands, timings, samples = [], [], [], []
     receiver_source_rows=[]
+    diagnostic_receivers = {}
+
+    def diagnostic_receiver(start, duration, n):
+        # Native iperf_time_diff reports abs(pre-reset start - reset), while
+        # native seconds and the source row retain the actual crossing duration.
+        rows = []
+        for left, right, seconds, amount in ((.003, 1., 1.003, 400_000),
+                (1., float(duration), float(duration - 1), 123_600_000)):
+            streams = [{"socket": 17+i, "start": left, "end": right, "seconds": seconds,
+                "bytes": amount//n, "omitted": False, "sender": False} for i in range(n)]
+            rows.append({"streams": streams, "sum": {"start": left, "end": right,
+                "seconds": seconds, "bytes": amount, "omitted": False, "sender": False}})
+        return {"start": start, "intervals": rows,
+            "end": {"sum_received": {"bytes": 125_000_000, "seconds": duration - .0002}}}
+
 
     def materialize(artifact_id, unit_id, content, *, concrete_path=None, record_unit_id=None):
         declaration = declarations[artifact_id]
@@ -192,7 +207,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 runtime+=int(argv[argv.index("-O")+1])
         elif "-s" in argv or "server" in argv:
             runtime=86400
-        return CommandEvidence(schema_version=2, request={"argv":argv}, result={"outcome":"succeeded"},
+        return CommandEvidence(schema_version=2, request={"argv":argv}, result={"outcome":"succeeded", **({"exit_code":0} if receiver_diagnostics else {})},
             producer=producer, deployment_id=deployment_id, unit_id=unit_id,
             binary_version={"value":"3.10" if "sockperf" in argv[0] else "3.17.1"},
             source_identity={"value":"synthetic fixture build"}, monotonic_started={"value":stamp},
@@ -227,7 +242,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
             clock_mappings=[mapping_a, mapping_b] if not idle_phase else [mapping_a])
         timings.append(timing)
         if not day_unit and not chunk_unit:
-            sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t",str(duration+5 if idle_phase else duration+10 if not chunk_unit else duration),"--full-log"]
+            sockperf_argv=["sockperf","under-load","-i","10.0.0.2","--full-rtt","--no-rdtsc","-m","64","--mps","1000","--reply-every","1","-p","11111","-t",str(duration+6 if idle_phase else duration+10 if not chunk_unit else duration),"--full-log"]
             commands.append(command(unit.unit_id,"vm_a",sockperf_argv,start_offset))
             if builds:
                 sock_build=next(b for b in builds if b.tool=="sockperf")
@@ -329,9 +344,10 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                     "result":{**commands[-1].result,"action_id":action},
                     "binary_version":Evidence[str](value=iperf_build.binary_version),
                     "source_identity":Evidence[str](value=iperf_build.source_reference)})
-            streams=[{"socket":17+i,"start":0,"end":duration,"bytes":125000000//n,
+            streams=[{"socket":17+i,"start":0,"end":duration,"seconds":duration,
+                "bytes":125000000//n,
                 "omitted":False,"sender":False} for i in range(n)]
-            connections=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201+i,
+            connections=[{"socket":17+i,"local_host":"10.0.0.2","local_port":5201,
                 "remote_host":"10.0.0.1","remote_port":50100+i} for i in range(n)]
             settings={"protocol":"TCP","num_streams":n,"omit":5,"duration":duration,
                 "interval":1,"blksize":131072,"reverse":False}
@@ -339,6 +355,12 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 "intervals":[{"streams":streams}]}
             client={"start":{"cookie":cookie,"test_start":settings},"server_output_json":receiver,
                 "intervals":[{"streams":streams}],"end":{"sum_received":{"bytes":125000000,"seconds":duration}}}
+            if receiver_diagnostics:
+                receiver = diagnostic_receiver(receiver["start"], duration, n)
+                diagnostic_receivers[unit.unit_id] = receiver
+                client["server_output_json"] = receiver
+                client["intervals"] = []  # A's sender rows are not receiver aliases.
+                client["end"] = deepcopy(receiver["end"])
             materialize(f"{unit.unit_id}-iperf3",unit.unit_id,json.dumps(client))
             materialize(f"{unit.unit_id}-iperf3-observation",unit.unit_id,
                 "client acquisition stderr captured separately from receiver observations\n")
@@ -353,7 +375,25 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                     rows.extend([
                         {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"initial","origin_us":left//1000,"start_time_fixed_us":left//1000},
                         {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"stats_origin","cookie":cookie,"stream_id":stream,"phase":"post_omit","origin_us":left//1000,"start_time_fixed_us":left//1000},
-                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":str(5201+i),"remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
+                        {"format":1,"tool":"iperf3","semantics_id":"iperf-3.17.1-stats-v1","invocation_id":"f02r-vm_b-listener-iperf3","pid":51,"boot_id":boot,"clock":"CLOCK_MONOTONIC","record_kind":"receiver_interval","cookie":cookie,"stream_id":stream,"role":"receiver","protocol":"TCP","local_host":"10.0.0.2","local_port":"5201","remote_host":"10.0.0.1","remote_port":str(50100+i),"interval_start_us":left//1000,"interval_end_us":right//1000,"bytes":125000000//n,"omitted":False}])
+                if receiver_diagnostics:
+                    # Replace the synthetic all-duration receiver row with the
+                    # same two per-stream events emitted by the native producer.
+                    rows = [row for row in rows if row["record_kind"] != "receiver_interval"]
+                    for row in rows:
+                        if row["record_kind"] == "stats_origin":
+                            row["start_time_fixed_us"] = left//1000 - 5_000_000
+                            if row["phase"] == "initial":
+                                row["origin_us"] = left//1000 - 5_000_000
+                    common = {key: rows[0][key] for key in ("format", "tool", "semantics_id", "invocation_id", "pid", "boot_id", "clock", "cookie")}
+                    for index, interval in enumerate(receiver["intervals"]):
+                        for stream in interval["streams"]:
+                            rows.append({**common, "record_kind":"receiver_interval", "stream_id":str(stream["socket"]),
+                                "role":"receiver", "protocol":"TCP", "local_host":"10.0.0.2", "local_port":"5201",
+                                "remote_host":"10.0.0.1", "remote_port":str(50100+stream["socket"]-17),
+                                "interval_start_us":left//1000 + (-3000 if index == 0 else 1_000_000),
+                                "interval_end_us":left//1000 + round(stream["end"]*1_000_000),
+                                "bytes":stream["bytes"], "omitted":False})
                 receiver_source_rows.extend(rows)
         if day_unit:
             cookie=f"f08-{unit.unit_id}-session"
@@ -402,8 +442,8 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
         commands[-1]=commands[-1].model_copy(update={"request":{**commands[-1].request,
             "action_id":"f02r-vm_b-listener-iperf3","acquisition_invocation_id":"f02r-vm_b-listener-iperf3",
             "argv":["sudo","systemd-run","--unit",listener_unit,"--property=Restart=no","--property=UMask=0022",
-                "--property=StandardOutput=append:/var/lib/cnb/work/server-logs/iperf3-server.jsonl",
-                "--property=StandardError=append:/var/lib/cnb/work/server-logs/iperf3-server.err",
+                "--property=StandardOutput=append:/var/lib/cnb/results/server-logs/iperf3-server.jsonl",
+                "--property=StandardError=append:/var/lib/cnb/results/server-logs/iperf3-server.err",
                 "--property=Environment=CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3",iperf_build.binary_path,
                 "-s","-B","10.0.0.2","-p","5201","--json-stream","--forceflush"]},
             "result":{**commands[-1].result,"action_id":"f02r-vm_b-listener-iperf3"},
@@ -457,9 +497,21 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                 "start":second,"end":second+1,"seconds":1,"bytes":125000000,"sender":False,"omitted":False}]}}
                 for second in range(86_400))
         else:
-            receiver_events.append({"event":"interval","data":{"sum":{"start":interval_start,"end":interval_start+receiver_seconds,
-                "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
-        receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
+            native_streams=[{"socket":17+i,"start":interval_start,"end":interval_start+receiver_seconds,
+                "seconds":receiver_seconds,"bytes":received_bytes//(unit.streams or 1),
+                "sender":False,"omitted":False} for i in range(unit.streams or 1)]
+            receiver_events.append({"event":"interval","data":{"streams":native_streams,
+                "sum":{"start":interval_start,"end":interval_start+receiver_seconds,
+                    "seconds":receiver_seconds,"bytes":received_bytes,"sender":False,"omitted":False}}})
+        if receiver_diagnostics:
+            receiver = diagnostic_receivers[unit.unit_id]
+            # Replace this unit's preceding synthetic interval; retain its full
+            # start metadata (timestamp and connected endpoint identities).
+            receiver_events.pop()
+            receiver_events.extend({"event":"interval", "data":interval} for interval in receiver["intervals"])
+            receiver_events.append({"event":"end", "data":receiver["end"]})
+        else:
+            receiver_events.append({"event":"end","data":{"sum_received":{"bytes":received_bytes,"seconds":receiver_seconds}}})
     materialize("iperf3_server_log",None,"\n".join(json.dumps(event) for event in receiver_events)+"\n")
     from cloud_network_benchmark.acquisition import bind_acquisition_sources
     receiver_command=commands[-1]
@@ -701,3 +753,169 @@ def test_materialized_native_replay_keeps_mode_unit_deployment_and_status_inputs
             tcp=parse_iperf3(tcp_path,source=ref,format="json")
             assert tcp.receiver_intervals and all(item.source.unit_id==unit_ids[-1] for item in tcp.receiver_intervals)
     assert before=={path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (csv_path,log_path,tcp_path)}
+
+
+def _rewrite_receiver_fixture(value, *, client=None, events=None, source_rows=None, commands=None):
+    """Keep independent materialized records and manifest projections honest after a mutation."""
+    from tests.unit.test_validation import NOW
+    root = Path(value.child_result_root)
+    target_unit = next(unit for unit in value.measurement_units if unit.phase == "single_flow")
+    replacements = {}
+    if client is not None:
+        replacements[f"{target_unit.unit_id}-iperf3"] = json.dumps(client).encode()
+    if events is not None:
+        replacements["iperf3_server_log"] = ("\n".join(json.dumps(event) for event in events)+"\n").encode()
+    if source_rows is not None:
+        replacements["iperf3_server_error"] = b"".join(b"CNB_ACQ_V1 "+json.dumps(row).encode()+b"\n" for row in source_rows)
+    if commands is not None:
+        for unit in value.measurement_units:
+            replacements[f"{unit.unit_id}-commands"] = json.dumps([
+                command.model_dump(mode="json") for command in commands if command.unit_id == unit.unit_id]).encode()
+    records = []
+    for record in value.artifact_records:
+        if record.artifact_id in replacements:
+            raw = replacements[record.artifact_id]
+            (root/record.path).write_bytes(raw)
+            record = record.model_copy(update={"size_bytes":Evidence(value=len(raw)),
+                "sha256":StringEvidence(value=hashlib.sha256(raw).hexdigest())})
+        records.append(record)
+    changed = value.model_copy(update={"artifact_records":records,
+        **({"commands":commands} if commands is not None else {})})
+    path = Path(value.child_manifest_path)
+    child = json.loads(path.read_text())
+    child["artifact_records"] = [record.model_dump(mode="json") for record in records]
+    child["commands"] = [command.model_dump(mode="json") for command in changed.commands]
+    path.write_text(json.dumps(child, sort_keys=True))
+    return changed, validate_bundle(changed, evaluated_at=NOW)
+
+
+def _receiver_fixture_payloads(value):
+    root = Path(value.child_result_root)
+    unit = next(unit for unit in value.measurement_units if unit.phase == "single_flow")
+    def payload(artifact):
+        return (root/next(record.path for record in value.artifact_records if record.artifact_id == artifact)).read_text()
+    return (unit, json.loads(payload(f"{unit.unit_id}-iperf3")),
+        [json.loads(line) for line in payload("iperf3_server_log").splitlines()],
+        [json.loads(line.removeprefix("CNB_ACQ_V1 ")) for line in payload("iperf3_server_error").splitlines()])
+
+
+def test_contextual_receiver_diagnostics_compose_to_valid_p1_and_p4(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request):
+    from tests.unit.test_validation import NOW
+    from cloud_network_benchmark.validation import _acquisition_windows, _parse_unit, _validate_artifacts
+    value, result = _materialize_complete_bundle(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request, frozen_n=True, receiver_diagnostics=True)
+    assert result.validation_status.data_validity == "valid"
+    _, records, _ = _validate_artifacts(value)
+    for unit in (unit for unit in value.measurement_units if unit.phase != "idle_latency"):
+        origins = {}
+        timing = next(item for item in value.timings if item.unit_id == unit.unit_id)
+        windows, errors = _acquisition_windows(value, timing, verified_iperf_origins=origins)
+        assert windows and not errors
+        cookie = next(iter(origins))
+        support = origins[cookie]["receiver_support_by_native_line"]
+        crossing = [row for streams in support.values() for rows in streams.values() for row in rows
+            if row["original_start_us"] < 0]
+        assert len(crossing) == unit.streams
+        assert all(row["start_us"] == 0 for row in crossing)
+        # Generic parsing remains WARN; composed validation qualifies only after
+        # full command, final-alias, build, source and probe coverage proof.
+        _, native = _parse_unit(value, unit, records, origins)
+        assert any(f.code == "native.iperf3.interval_duration" and f.severity == "warning" for f in native.findings)
+        assert len(native.receiver_intervals) == 1
+        qualified = [f for f in result.findings if f.unit_id == unit.unit_id and f.code in {
+            "native.iperf3.total_mismatch", "native.iperf3.interval_duration", "native.iperf3.window_unavailable"}]
+        assert len(qualified) == 3
+        assert all(f.severity == "info" for f in qualified)
+        assert any("125000000" in f.message and "123600000" in f.message and "unknown" in f.message for f in qualified)
+    assert validate_bundle(value, evaluated_at=NOW).validation_status.data_validity == "valid"
+
+
+import pytest
+
+
+@pytest.mark.parametrize("mutation", ["missing_cookie", "ambiguous_cookie", "client_final_missing",
+    "embedded_final_missing", "b_final_missing", "client_final_contradiction", "embedded_final_contradiction",
+    "b_final_contradiction", "nonzero", "early", "incomplete", "malformed", "overlap", "duplicate",
+    "missing_origin", "unrelated_badrow", "client_badrow", "unknown_error", "wrong_build", "wrong_hash"])
+def test_contextual_receiver_diagnostics_do_not_hide_independent_failure(repository_root, tmp_path,
+        frozen_clock, deterministic_token, fake_git_commits, request, mutation):
+    value, _ = _materialize_complete_bundle(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request, frozen_n=True, receiver_diagnostics=True)
+    unit, client, events, source_rows = _receiver_fixture_payloads(value)
+    first_end = next(index for index, event in enumerate(events) if event["event"] == "end")
+    commands = None
+    if mutation == "missing_cookie":
+        del events[0]["data"]["cookie"]
+    elif mutation == "ambiguous_cookie":
+        events.extend(deepcopy(events[:first_end+1]))
+    elif mutation in {"client_final_missing", "embedded_final_missing"}:
+        target = client if mutation == "client_final_missing" else client["server_output_json"]
+        del target["end"]
+    elif mutation == "b_final_missing":
+        events.pop(first_end)
+    elif mutation in {"client_final_contradiction", "embedded_final_contradiction", "b_final_contradiction"}:
+        target = (client["end"] if mutation == "client_final_contradiction" else
+            client["server_output_json"]["end"] if mutation == "embedded_final_contradiction" else events[first_end]["data"])
+        target["sum_received"]["bytes"] += 1
+    elif mutation == "nonzero":
+        commands = [command.model_copy(update={"result":{**command.result,"exit_code":1}})
+            if command.unit_id == unit.unit_id and "-c" in command.request["argv"] else command for command in value.commands]
+    elif mutation == "early":
+        # The same shortened source/native interval is independently consistent,
+        # but cannot establish nominal completion or complete measured coverage.
+        for row in source_rows:
+            if row.get("cookie") == client["start"]["cookie"] and row.get("record_kind") == "receiver_interval" and row["interval_end_us"] > 108_000_000:
+                row["interval_end_us"] -= 2_000_000
+        for row in events[first_end-1]["data"]["streams"]:
+            row["end"] -= 2; row["seconds"] -= 2
+        events[first_end-1]["data"]["sum"]["end"] -= 2
+        events[first_end-1]["data"]["sum"]["seconds"] -= 2
+        client["server_output_json"]["intervals"][-1] = deepcopy(events[first_end-1]["data"])
+        for target in (client["end"], client["server_output_json"]["end"], events[first_end]["data"]):
+            target["sum_received"]["seconds"] -= 2
+    elif mutation == "incomplete":
+        events = events[:first_end]
+    elif mutation == "malformed":
+        events.insert(2, {"event":"interval", "data":[]})
+    elif mutation in {"overlap", "duplicate"}:
+        extra = deepcopy(events[first_end-1])
+        if mutation == "overlap":
+            extra["data"]["streams"][0]["start"] = .5
+            extra["data"]["streams"][0]["seconds"] = extra["data"]["streams"][0]["end"] - .5
+            extra["data"]["sum"]["start"] = .5
+            extra["data"]["sum"]["seconds"] = extra["data"]["sum"]["end"] - .5
+        events.insert(first_end, extra)
+    elif mutation == "missing_origin":
+        source_rows = [row for row in source_rows if not (row.get("cookie") == client["start"]["cookie"]
+            and row.get("record_kind") == "stats_origin" and row.get("phase") == "post_omit")]
+    elif mutation == "unrelated_badrow":
+        # An unrelated SUM-only bad row has no matching acquisition stream;
+        # its warning must survive while the real reset row qualifies.
+        events.insert(first_end, {"event":"interval", "data":{"sum":{
+            "start":2., "end":3., "seconds":1.1, "bytes":123, "sender":False, "omitted":False}}})
+    elif mutation == "client_badrow":
+        client["server_output_json"]["intervals"].append({"sum":{
+            "start":2., "end":3., "seconds":1.1, "bytes":123, "sender":False, "omitted":False}})
+    elif mutation == "unknown_error":
+        events.insert(first_end, {"event":"error", "data":"unrecognized native failure"})
+    elif mutation == "wrong_build":
+        commands = [command.model_copy(update={"source_identity":StringEvidence(value="wrong-build")})
+            if command.unit_id == unit.unit_id and "-c" in command.request["argv"] else command for command in value.commands]
+    elif mutation == "wrong_hash":
+        server = next(record for record in value.artifact_records if record.artifact_id == "iperf3_server_log")
+        (Path(value.child_result_root)/server.path).write_text("stale hash\n")
+        from tests.unit.test_validation import NOW
+        result = validate_bundle(value, evaluated_at=NOW)
+        assert result.validation_status.data_validity == "invalid"
+        return
+    changed, result = _rewrite_receiver_fixture(value, client=client, events=events,
+        source_rows=source_rows, commands=commands)
+    assert result.validation_status.data_validity != "valid", [(f.code,f.severity,f.message) for f in result.findings]
+    if mutation == "unknown_error":
+        assert result.validation_status.data_validity == "invalid"
+        assert any(f.code == "native.iperf3.error" and f.severity == "error" for f in result.findings)
+    if mutation == "unrelated_badrow":
+        durations = [f for f in result.findings if f.code == "native.iperf3.interval_duration" and f.unit_id == unit.unit_id]
+        assert any(f.severity == "info" and f.message.startswith("line 2:") for f in durations)
+        assert any(f.severity == "warning" and not f.message.startswith("line 2:") for f in durations)

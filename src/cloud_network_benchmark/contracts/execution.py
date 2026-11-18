@@ -127,11 +127,17 @@ class CommandResult(StrictModel):
 
 
 class CommandRunner(Protocol):
+    # Runners must opt in explicitly before bootstrap dispatches independent VM
+    # preparation commands concurrently. Unknown implementations stay serial.
+    supports_concurrent_commands: bool
+
     def run(self, request: CommandRequest) -> CommandResult:
         ...
 
 
 class SubprocessCommandRunner:
+    supports_concurrent_commands = True
+
     def run_bounded_copy(self, request: CommandRequest, destination: Path,
                          maximum_payload_bytes: int) -> CommandResult:
         """Stream binary SSH stdout to an exclusive file without reading past its cap.
@@ -272,6 +278,8 @@ class SubprocessCommandRunner:
 
 
 class ScriptedCommandRunner:
+    supports_concurrent_commands = False
+
     def __init__(self, script: Sequence[tuple[CommandRequest, CommandResult]]) -> None:
         self._script = list(script)
         self.requests: List[CommandRequest] = []

@@ -8,6 +8,7 @@ variables {
   zone_b     = "europe-west3-b"
   template_a = "projects/cnb-test-12345/global/instanceTemplates/template-a?uniqueId=111"
   template_b = "projects/cnb-test-12345/global/instanceTemplates/template-b?uniqueId=222"
+  scenario   = "same_zone"
 }
 
 run "exactly_two_inherited_roles" {
@@ -27,6 +28,23 @@ run "exactly_two_inherited_roles" {
   assert {
     condition     = length([google_compute_instance_from_template.vm_a.id, google_compute_instance_from_template.vm_b.id]) == 2
     error_message = "the pair root creates exactly two inherited VM resources"
+  }
+  assert {
+    condition     = google_compute_instance_from_template.vm_a.network_interface[0].network_ip == "10.80.1.10" && google_compute_instance_from_template.vm_b.network_interface[0].network_ip == "10.80.1.11"
+    error_message = "pair NIC overrides retain both role addresses from the registered templates"
+  }
+}
+
+run "inter_region_pair_uses_role_b_subnet_and_address" {
+  command = plan
+  variables {
+    scenario = "inter_region"
+    zone_a   = "europe-west3-a"
+    zone_b   = "europe-west2-a"
+  }
+  assert {
+    condition     = google_compute_instance_from_template.vm_b.network_interface[0].network_ip == "10.81.1.11" && google_compute_instance_from_template.vm_b.network_interface[0].subnetwork == "projects/cnb-test-12345/regions/europe-west2/subnetworks/gcp-campaign-run-abcdef12-b"
+    error_message = "inter-region VM B retains its dedicated role subnet and address"
   }
 }
 
@@ -52,6 +70,48 @@ run "reject_unreviewed_finland_zone" {
   variables {
     zone_a = "europe-north1-a"
     zone_b = "europe-north1-b"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}
+
+run "finland_zone_b_pair" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-b"
+    zone_b = "europe-north1-b"
+  }
+  assert {
+    condition     = google_compute_instance_from_template.vm_a.zone == "europe-north1-b" && google_compute_instance_from_template.vm_b.zone == "europe-north1-b"
+    error_message = "approved Finland B pair retains the exact requested zone"
+  }
+}
+
+run "finland_zone_c_pair" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-c"
+    zone_b = "europe-north1-c"
+  }
+  assert {
+    condition     = google_compute_instance_from_template.vm_a.zone == "europe-north1-c" && google_compute_instance_from_template.vm_b.zone == "europe-north1-c"
+    error_message = "approved Finland C pair retains the exact requested zone"
+  }
+}
+
+run "reject_unapproved_finland_zone" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-d"
+    zone_b = "europe-north1-d"
+  }
+  expect_failures = [terraform_data.scope_guard]
+}
+
+run "reject_other_mixed_finland_zones" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-b"
+    zone_b = "europe-north1-c"
   }
   expect_failures = [terraform_data.scope_guard]
 }

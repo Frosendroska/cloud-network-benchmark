@@ -74,6 +74,15 @@ ALLOWED_SCENARIO_LOCALITIES = {
 TERMINAL_AUTOMATION_STATES = {"Success", "Cancelled", "TimedOut", "Failed"}
 
 
+def _pair_apply_timeout_seconds(provision_seconds: int, command_timeout_seconds: int,
+        plan_review_seconds: int, trigger_remaining_seconds: float) -> int:
+    """Bound saved-plan review and apply by the sourced provisioning phase."""
+    if min(provision_seconds, command_timeout_seconds) <= 0 or plan_review_seconds < 0:
+        raise ValueError("AWS provisioning phase timeout inputs are invalid")
+    return max(1, min(provision_seconds,
+        command_timeout_seconds + plan_review_seconds, int(trigger_remaining_seconds)))
+
+
 class AwsRuntimeSettings(StrictModel):
     account_id: str = Field(pattern=r"^[0-9]{12}$")
     controller_cidr: str
@@ -88,10 +97,13 @@ class AwsRuntimeSettings(StrictModel):
     cost_source_path: str = Field(min_length=1)
     complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
+    post_registration_workflow_seconds: int = Field(gt=0)
+    post_provision_workflow_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=90, gt=0, le=600)
+    iam_settle_seconds: int = Field(default=0, ge=0, le=60)
 
     @field_validator("controller_cidr")
     @classmethod
@@ -161,10 +173,12 @@ class AwsProviderDriver:
         runner: CommandRunner,
         settings: AwsRuntimeSettings,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.runner = runner
         self.settings = settings
         self.clock = clock
+        self.sleeper = sleeper
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
@@ -212,6 +226,20 @@ class AwsProviderDriver:
                 outputs[region] = self._apply_safety_root(deployment, region, attempt)
                 # Save each role/document identity before external registration calls.
                 journal.setdefault("safety", {})[region] = outputs[region]
+                self._save_journal(attempt, journal)
+
+            settle_seconds = self.settings.iam_settle_seconds
+            if settle_seconds:
+                remaining = (self._registration_deadline or time.monotonic()) - time.monotonic()
+                if remaining < settle_seconds:
+                    journal["iam_settle"] = {"seconds": settle_seconds, "status": "insufficient_registration_time"}
+                    self._save_journal(attempt, journal)
+                    raise AwsProviderError("AWS IAM settle delay does not fit the original registration deadline",
+                        category="registration_deadline")
+                journal["iam_settle"] = {"seconds": settle_seconds, "status": "started"}
+                self._save_journal(attempt, journal)
+                self.sleeper(settle_seconds)
+                journal["iam_settle"]["status"] = "completed"
                 self._save_journal(attempt, journal)
 
             for region in regions:
@@ -366,18 +394,29 @@ class AwsProviderDriver:
         trigger = deployment.expiry.value.expires_at.value
         if trigger is None or now >= trigger:
             raise AwsProviderError("AWS expiry trigger has passed", category="cap_expired")
-        if self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
+        if self.settings.post_registration_workflow_seconds > self.settings.complete_workflow_remaining_seconds:
+            raise AwsProviderError("post-registration workflow allowance exceeds the complete workflow allowance", category="allowance_invalid")
+        if (self.settings.post_provision_workflow_seconds > self.settings.post_registration_workflow_seconds
+                or self.settings.post_provision_workflow_seconds > self.settings.complete_workflow_remaining_seconds):
+            raise AwsProviderError("post-provision workflow allowance exceeds an earlier workflow allowance", category="allowance_invalid")
+        provision_phase_seconds = (self.settings.post_registration_workflow_seconds
+            - self.settings.post_provision_workflow_seconds)
+        if provision_phase_seconds <= 0:
+            raise AwsProviderError("source-bound provision phase allowance is empty", category="allowance_invalid")
+        if self.settings.post_registration_workflow_seconds > (trigger - now).total_seconds():
             raise AwsProviderError("complete remaining workflow does not fit before the earlier expiry trigger", category="cap_insufficient")
-        slack = (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds
+        slack = (trigger - now).total_seconds() - self.settings.post_registration_workflow_seconds
         if slack <= 0:
             raise AwsProviderError("no command budget remains before reserving the complete workflow", category="cap_insufficient")
         self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
         for region, execution_id in journal["executions"].items():
             self._confirm_automation(region, execution_id, journal["safety"][region], self._automation_parameters(deployment, region, trigger, journal["safety"][region]["role_arn"]))
         now = self.clock().astimezone(timezone.utc)
-        if now >= trigger or self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
+        if now >= trigger or self.settings.post_registration_workflow_seconds > (trigger - now).total_seconds():
             raise AwsProviderError("complete remaining workflow no longer fits after expiry readback", category="cap_insufficient")
-        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds)
+        # Bound pair apply by reserving all source-declared work after provisioning.
+        # This leaves the full provision allowance available to apply itself.
+        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.post_provision_workflow_seconds)
 
         variables = self._pair_variables(deployment)
         vars_path = attempt / "pair.tfvars.json"
@@ -392,7 +431,9 @@ class AwsProviderDriver:
             apply_result = self._run(
                 "aws-pair-apply",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-                max(1, min(self.settings.command_timeout_seconds, int((trigger - self.clock().astimezone(timezone.utc)).total_seconds()))),
+                _pair_apply_timeout_seconds(provision_phase_seconds,
+                    self.settings.command_timeout_seconds, self.settings.plan_review_timeout_seconds,
+                    (trigger - self.clock().astimezone(timezone.utc)).total_seconds()),
                 cwd=attempt,
             )
             _restrict_private_file(Path(state_path))
@@ -637,6 +678,10 @@ class AwsProviderDriver:
 
     def _validate_registration(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> tuple[list[str], ReservationEvidence, datetime]:
         _validate_deployment(deployment)
+        if (self.settings.post_registration_workflow_seconds > self.settings.complete_workflow_remaining_seconds
+                or self.settings.post_provision_workflow_seconds > self.settings.post_registration_workflow_seconds
+                or self.settings.post_registration_workflow_seconds <= self.settings.post_provision_workflow_seconds):
+            raise AwsProviderError("AWS source-bound phase allowances are inconsistent", category="allowance_invalid")
         if request.provider != Provider.AWS or request.action != "stop":
             raise AwsProviderError("AWS expiry request must be stop", category="request_invalid")
         if (request.run_id, request.deployment_id) != (deployment.run_id, deployment.deployment_id):
@@ -812,7 +857,7 @@ class AwsProviderDriver:
         if lookup is not None and len(lookup[0]) == 1:
             return lookup[0][0]
         rejected = (start.outcome == "failed" and start.exit_code not in (None, 0) and not start.stdout.strip()
-            and re.match(r"\s*An error occurred \(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
+            and re.match(r"\s*(?:aws: \[ERROR\]:\s*)?An error occurred \(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
         if rejected and lookup is not None and lookup[1] == 0:
             exc = AwsProviderError("AWS rejected expiry start; complete lookup found no exact-document execution",
                 category="expiry_start_rejected", action_id=start.action_id)
@@ -954,11 +999,15 @@ class AwsProviderDriver:
                 unavailable=StructuredEvidence(value={"connection": "authenticated host trust not yet established"}),
             )
 
+        # Catalog data is immutable for the duration of this pair verification. Keep
+        # this cache local to one normalization/provision call; all per-VM live
+        # observations below remain independently authenticated.
+        catalog_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         # Authenticate provider observation and install strict known_hosts only after keyscan match.
         updated: dict[str, ProviderVmOutput] = {}
         for role, item in outputs.items():
             detail = vm_values[role]
-            detail.update(self._verify_observed_instance(detail, deployment.scenario, role, deployment.run_id, deployment.deployment_id))
+            detail.update(self._verify_observed_instance(detail, deployment.scenario, role, deployment.run_id, deployment.deployment_id, catalog_cache=catalog_cache))
             evidence = self._verify_host_key(detail)
             host_key_path = evidence["known_hosts_path"]
             connection = RemoteConnectionData(
@@ -1052,7 +1101,7 @@ class AwsProviderDriver:
         self._write_private(private_dir / f"{instance_id}.host-trust.json", json.dumps(trust, sort_keys=True).encode())
         return trust
 
-    def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str) -> dict[str, Any]:
+    def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str, *, catalog_cache: dict[tuple[str, ...], dict[str, Any]] | None = None) -> dict[str, Any]:
         region = expected["region"]
         caller = self._aws_json("sts", "get-caller-identity", "--region", region, "--output", "json")
         if caller.get("Account") != self.settings.account_id:
@@ -1076,17 +1125,20 @@ class AwsProviderDriver:
             raise AwsProviderError("observed AWS address differs from Terraform output", category="address_mismatch")
         if placement.get("AvailabilityZone") != expected["zone"] or len(networks) != 1:
             raise AwsProviderError("observed AWS zone or one-NIC shape differs", category="topology_mismatch")
+        actual_zone_id = placement.get("AvailabilityZoneId")
+        if not actual_zone_id or actual_zone_id != expected["zone_id"]:
+            raise AwsProviderError("physical AWS zone ID differs from observed instance placement", category="zone_identity_mismatch")
         expected_group = expected.get("placement_group")
         if placement.get("GroupName") != expected_group:
             raise AwsProviderError("observed placement group differs from the selected scenario", category="placement_mismatch")
         if any(network.get("InterfaceType") == "efa" for network in networks):
             raise AwsProviderError("EFA network interfaces are not part of the selected protocol", category="acceleration_mismatch")
-        zone = self._aws_json("ec2", "describe-instance-topology", "--instance-ids", expected["instance_id"], "--region", region, "--output", "json")
-        topology = zone.get("Instances") or []
-        if len(topology) != 1 or topology[0].get("ZoneId") != expected["zone_id"]:
-            raise AwsProviderError("physical AWS zone ID differs from observed instance topology", category="zone_identity_mismatch")
 
-        images = self._aws_json("ec2", "describe-images", "--image-ids", instance["ImageId"], "--region", region, "--output", "json").get("Images", [])
+        catalog_cache = {} if catalog_cache is None else catalog_cache
+        image_key = (self.settings.account_id, region, instance["ImageId"])
+        if image_key not in catalog_cache:
+            catalog_cache[image_key] = self._aws_json("ec2", "describe-images", "--image-ids", instance["ImageId"], "--region", region, "--output", "json")
+        images = catalog_cache[image_key].get("Images", [])
         if len(images) != 1:
             raise AwsProviderError("authenticated DescribeImages did not return exactly one selected image", category="image_identity_unavailable")
         image = images[0]
@@ -1114,7 +1166,10 @@ class AwsProviderDriver:
         if len(volumes) != 1 or volumes[0].get("Size") != 32 or volumes[0].get("VolumeType") != "gp3":
             raise AwsProviderError("root disk must be one 32 GiB gp3 volume", category="disk_mismatch")
 
-        types = self._aws_json("ec2", "describe-instance-types", "--instance-types", "m7i.xlarge", "--region", region, "--output", "json").get("InstanceTypes", [])
+        type_key = (self.settings.account_id, region, "m7i.xlarge")
+        if type_key not in catalog_cache:
+            catalog_cache[type_key] = self._aws_json("ec2", "describe-instance-types", "--instance-types", "m7i.xlarge", "--region", region, "--output", "json")
+        types = catalog_cache[type_key].get("InstanceTypes", [])
         if len(types) != 1:
             raise AwsProviderError("DescribeInstanceTypes did not return m7i.xlarge", category="shape_metadata_unavailable")
         type_data = types[0]
@@ -1123,7 +1178,6 @@ class AwsProviderDriver:
         if type_data.get("VCpuInfo", {}).get("DefaultVCpus") != 4 or type_data.get("MemoryInfo", {}).get("SizeInMiB") != 16384:
             raise AwsProviderError("authenticated instance-type vCPU/memory metadata differs from selected shape", category="shape_metadata_mismatch")
 
-        actual_zone_id = topology[0]["ZoneId"]
         return {
             "instance_id": instance["InstanceId"],
             "private_ipv4": instance["PrivateIpAddress"],
@@ -1644,7 +1698,15 @@ def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, r
     if status not in TERMINAL_AUTOMATION_STATES | {"Pending", "InProgress"} or step_status not in {"Pending", "InProgress", "Success", "Cancelled", "TimedOut", "Failed"}:
         raise AwsProviderError(f"terminal expiry status evidence is malformed in {region}", category="expiry_terminal_step")
     stop_status = stop[0].get("StepStatus") if stop else None
-    if stop and (stop[0].get("Action") != "aws:executeScript" or not _expiry_stop_inputs_match(stop[0], parameters, region)):
+    active_sleep = (status == "InProgress" and step_status == "InProgress"
+        and execution.get("CurrentStepName") == "waitUntilExpiry"
+        and execution.get("CurrentAction") == "aws:sleep")
+    cancelled_sleep = (status == "Cancelled" and step_status == "Cancelled")
+    pending_uninitialized_stop = ((active_sleep or cancelled_sleep) and stop_status == "Pending"
+        and stop[0].get("Inputs") == {}) if stop else False
+    if stop and (stop[0].get("Action") != "aws:executeScript"
+            or (not pending_uninitialized_stop
+                and not _expiry_stop_inputs_match(stop[0], parameters, region))):
         raise AwsProviderError(f"terminal expiry stop step identity differs in {region}", category="expiry_terminal_step")
     if stop and stop_status not in {"Pending", "InProgress", "Success", "Cancelled", "TimedOut", "Failed"}:
         raise AwsProviderError(f"terminal expiry stop status is malformed in {region}", category="expiry_terminal_step")
@@ -1656,7 +1718,8 @@ def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, r
         if step_status == "Success":
             if not stop or stop_status not in {"Pending", "InProgress"} or execution.get("CurrentStepName") != "discoverAndStopOwnedInstances" or execution.get("CurrentAction") != "aws:executeScript":
                 raise AwsProviderError(f"active expiry stop-step evidence conflicts in {region}", category="expiry_terminal_step")
-        elif step_status != "InProgress" or stop or execution.get("CurrentStepName") != "waitUntilExpiry" or execution.get("CurrentAction") != "aws:sleep":
+        elif step_status != "InProgress" or (stop and not pending_uninitialized_stop
+                and stop_status != "Pending") or execution.get("CurrentStepName") != "waitUntilExpiry" or execution.get("CurrentAction") != "aws:sleep":
             raise AwsProviderError(f"active expiry sleep-step evidence conflicts in {region}", category="expiry_terminal_step")
     elif status in {"Failed", "TimedOut"}:
         if not (step_status in {"Failed", "TimedOut"} or stop_status in {"Failed", "TimedOut"}):

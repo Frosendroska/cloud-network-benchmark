@@ -23,6 +23,8 @@ def settings(tmp_path, **changes):
         "complete_workflow_cost_handoff": StructuredEvidence(value={"source_path": "tracking/run-register-2026-10-23.csv", "source_sha256": "a" * 64, "prices_checked_on": "2026-10-23", "estimated_total_usd": 9.5, "units": {"boot_disk_gib": 32, "public_ipv4": "hour", "transfer": "GiB"}}),
         "support_cost_evidence": StructuredEvidence(value={"id": "gcp-template-placement-support-2026-10-23", "prices_checked_on": "2026-10-23", "source_path": "tests/fixtures/gcp/zero-support-cost-source.md", "source_sha256": "ec0caa3e3b553d14e1e4d60bdd0bd325e6cf8eaf583da3cd9c3884ce310bbcaf", "template_support_cost_usd": 0, "placement_policy_support_cost_usd": 0, "rationale": "No separate per-template or placement-policy support fee is charged."}),
         "complete_workflow_remaining_seconds": 600.0,
+        "registration_workflow_seconds": 90.0,
+        "post_registration_workflow_seconds": 510.0,
     }
     data.update(changes)
     return GcpRuntimeSettings(**data)
@@ -53,6 +55,24 @@ def test_runtime_rejects_invalid_complete_cost_total(tmp_path, estimate):
 def test_runtime_rejects_nonfinite_complete_workflow_estimate(tmp_path):
     with pytest.raises(ValidationError):
         settings(tmp_path, complete_workflow_remaining_seconds=float("inf"))
+
+
+@pytest.mark.parametrize("estimate", [0, -1, float("inf"), 600.0, 500.0])
+def test_runtime_rejects_malformed_post_registration_workflow_estimate(tmp_path, estimate):
+    with pytest.raises(ValidationError):
+        settings(tmp_path, post_registration_workflow_seconds=estimate)
+
+
+def test_legacy_gcp_cleanup_settings_keep_full_remainder_as_post_registration(tmp_path):
+    from cloud_network_benchmark.lifecycle_cleanup import _gcp_cleanup_settings
+
+    data = settings(tmp_path).model_dump(mode="python")
+    data.pop("registration_workflow_seconds")
+    data.pop("post_registration_workflow_seconds")
+    adapted = _gcp_cleanup_settings(data)
+
+    assert adapted.registration_workflow_seconds == 0
+    assert adapted.post_registration_workflow_seconds == adapted.complete_workflow_remaining_seconds == 600
 
 
 def test_runtime_rejects_malformed_dated_support_cost_source(tmp_path):
@@ -203,7 +223,7 @@ def test_guest_hostkey_requires_authenticated_identity_and_writes_private_known_
             started = datetime.now(timezone.utc)
             if "get-guest-attributes" in request.argv:
                 blob = base64.b64encode(struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + bytes([1 if self.changed else 0]) * 32).decode()
-                stdout = json.dumps({"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}]}})
+                stdout = json.dumps([{"namespace": "hostkeys", "key": "ssh-ed25519", "value": blob}])
             else:
                 stdout = json.dumps({"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]})
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=started, finished_at=started, duration_seconds=0.0, exit_code=0, stdout=stdout, stderr="")
@@ -221,6 +241,39 @@ def test_guest_hostkey_requires_authenticated_identity_and_writes_private_known_
     assert all(request.argv[0].endswith("gcloud") for request in runner.calls)
 
 
+def test_guest_hostkey_selects_valid_key_from_multiple_cli_algorithm_rows(tmp_path):
+    from datetime import datetime, timezone
+    import base64, struct, json
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    from cloud_network_benchmark.contracts.execution import CommandResult
+
+    def ssh_string(value):
+        return struct.pack(">I", len(value)) + value
+
+    rsa_blob = base64.b64encode(
+        ssh_string(b"ssh-rsa") + ssh_string(b"\x01\x00\x01") + ssh_string(b"\x80" + b"r" * 31)
+    ).decode()
+    ed25519_blob = base64.b64encode(
+        ssh_string(b"ssh-ed25519") + ssh_string(b"e" * 32)
+    ).decode()
+
+    class Runner:
+        def run(self, request):
+            now = datetime.now(timezone.utc)
+            if "get-guest-attributes" in request.argv:
+                payload = [
+                    {"namespace": "hostkeys", "key": "ssh-rsa", "value": rsa_blob},
+                    {"namespace": "hostkeys", "key": "ssh-ed25519", "value": ed25519_blob},
+                ]
+            else:
+                payload = {"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]}
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now, finished_at=now, duration_seconds=0.0, exit_code=0, stdout=json.dumps(payload), stderr="")
+
+    driver = GcpProviderDriver(Runner(), settings(tmp_path))
+    initial = {"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]}
+    assert driver._trusted_hostkey("attempt-a", "europe-west3-a", initial) == f"ssh-rsa {rsa_blob}"
+
+
 def test_guest_hostkey_rejects_changed_key_for_same_private_address(tmp_path):
     from datetime import datetime, timezone
     import base64, struct
@@ -236,7 +289,7 @@ def test_guest_hostkey_rejects_changed_key_for_same_private_address(tmp_path):
                 self.guest_reads += 1
                 raw = bytes([self.guest_reads]) * 32
                 value = base64.b64encode(struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + raw).decode()
-                stdout = json.dumps({"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": value}]}})
+                stdout = json.dumps([{"namespace": "hostkeys", "key": "ssh-ed25519", "value": value}])
             else:
                 stdout = json.dumps({"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]})
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=started, finished_at=started, duration_seconds=0.0, exit_code=0, stdout=stdout, stderr="")
@@ -263,7 +316,7 @@ def test_guest_hostkey_rejects_malformed_blob_and_changed_management_address(tmp
             self.calls+=1; now=datetime.now(timezone.utc)
             if "get-guest-attributes" in request.argv:
                 value="not-base64!" if self.malformed else blob
-                payload={"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":value}]}}
+                payload=[{"namespace":"hostkeys","key":"ssh-ed25519","value":value}]
             else:
                 payload=dict(base)
                 if self.changed and request.action_id=="gcp-hostkey-instance-after":
@@ -275,3 +328,31 @@ def test_guest_hostkey_rejects_malformed_blob_and_changed_management_address(tmp
     changed=GcpProviderDriver(Runner(changed=True),settings(tmp_path/"changed"))
     with pytest.raises(GcpProviderError,match="identity changed after"):
         changed._trusted_hostkey("attempt-a","europe-west3-a",base)
+
+
+@pytest.mark.parametrize("entries", [
+    [],
+    [{"namespace": "other", "key": "ssh-ed25519", "value": "not-a-key"}],
+    [{"namespace": "hostkeys", "key": "ssh-ed25519-cert-v01@openssh.com", "value": "not-a-key"}],
+    {"queryValue": {"items": [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": "not-a-key"}]}},
+    [
+        {"namespace": "hostkeys", "key": "ssh-ed25519", "value": "first"},
+        {"namespace": "hostkeys", "key": "ssh-ed25519", "value": "second"},
+    ],
+])
+def test_guest_hostkey_rejects_missing_or_invalid_cli_items(tmp_path, entries):
+    from datetime import datetime, timezone
+    import json
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver, GcpProviderError
+    from cloud_network_benchmark.contracts.execution import CommandResult
+
+    base = {"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]}
+    class Runner:
+        def run(self, request):
+            now = datetime.now(timezone.utc)
+            payload = entries if "get-guest-attributes" in request.argv else base
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now, finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
+
+    driver = GcpProviderDriver(Runner(), settings(tmp_path))
+    with pytest.raises(GcpProviderError, match="guest attributes|no valid OpenSSH"):
+        driver._trusted_hostkey("attempt-a", "europe-west3-a", base)

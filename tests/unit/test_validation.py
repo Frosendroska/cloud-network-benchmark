@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import hashlib
 import json
 import pytest
@@ -14,9 +15,371 @@ from cloud_network_benchmark.contracts.admission import ScheduleEntry
 from cloud_network_benchmark.contracts.artifacts import ArtifactLayout, ArtifactRecord
 from cloud_network_benchmark.contracts.validation import ValidationResult
 from cloud_network_benchmark.native import NativeParse, ProbeCounts, ReceiverInterval, RttSample, SourceRef, rtt_statistics
-from cloud_network_benchmark.validation import _command_findings, _coverage, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _validate_artifacts, evaluate_comparison, validate_bundle
+from cloud_network_benchmark.validation import _qualify_receiver_total_mismatch, _command_findings, _coverage, _has_degrading_findings, _iperf_crossing_start_cutoff, _iperf_native_terminal_ends, _iperf_nominal_completion_proven, _measured_samples, _receiver_session_for_unit, _resolved_snapshot_findings, _sequence_timing_findings, _tcp_statistics, _validate_artifacts, evaluate_comparison, validate_bundle
 
 NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
+
+
+def test_info_findings_are_retained_without_degrading_validity():
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    info = ValidationFinding(code="control.event", severity="info", message="recognized native event")
+    warning = ValidationFinding(code="control.event", severity="warning", message="unsupported native event")
+    error = ValidationFinding(code="control.event", severity="error", message="unknown server error")
+    assert not _has_degrading_findings([info])
+    assert _has_degrading_findings([info, warning])
+    assert _has_degrading_findings([info, error])
+
+
+def test_whole_phase_tcp_prefers_unique_receiver_final_aggregate():
+    intervals = (ReceiverInterval("session", 0, 1, 1, 100, False, False, None, 1),)
+    parsed = NativeParse(receiver_intervals=intervals,
+        receiver_totals=({"session_id":"session", "bytes":250, "seconds":9.999802},))
+    stats = _tcp_statistics(parsed)
+    assert stats["received_bytes"].value == 250
+    assert stats["measured_seconds"].value == 9.999802
+
+
+def test_conflicting_receiver_totals_do_not_fall_back_to_interval_sum():
+    intervals = (ReceiverInterval("session", 0, 10, 10, 500, False, False, None, 1),)
+    totals = ({"session_id":"session", "bytes":250, "seconds":9.999802},
+        {"session_id":"session", "bytes":251, "seconds":9.999802})
+    stats = _tcp_statistics(NativeParse(receiver_intervals=intervals, receiver_totals=totals))
+    assert stats["received_bytes"].value is None
+    assert stats["measured_seconds"].value is None
+    assert stats["received_bytes"].unavailable_reason
+
+
+@pytest.mark.parametrize("streams", [1, 4])
+def test_receiver_reset_diagnostics_need_exact_crossing_source_line(streams):
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    source = SourceRef("iperf3_server_log", "receiver.jsonl", "a" * 64)
+    stream_rows = {str(stream): [{"start_us": 0, "end_us": 100, "original_start_us": -100, "original_end_us": 100,
+        "bytes": 100, "sum_start_seconds": 0.0, "sum_end_seconds": 2.0,
+        "sum_seconds": 2.001003, "sum_bytes": streams * 100}]
+        for stream in range(1, streams + 1)}
+    origin = {"origin_utc": NOW.timestamp(), "uncertainty_seconds": .000001,
+        "crossing_start_cutoff_us": 2_000_000, "stream_count": streams,
+        "receiver_artifact_sha256": source.sha256,
+        "receiver_support_by_native_line": {"10": stream_rows},
+        "receiver_line_by_signature": {(0.0, 2.0, 2.001003, streams * 100): 10}}
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=streams,
+        measured_seconds=10)
+    details = ({"session_id": "1", "start": {"cookie": "cookie",
+        "test_start": {"protocol": "TCP", "num_streams": streams},
+        "timestamp": {"timesecs": NOW.timestamp()}}},)
+    finding = ValidationFinding(code="native.iperf3.interval_duration", severity="warning",
+        message="line 10: end-start disagrees with native seconds", artifact_id=source.artifact_id)
+    parsed = NativeParse(source=source, sessions=("1",), session_details=details,
+        findings=(finding,), receiver_finding_evidence=((finding.code, finding.message, "1", 10,
+            {"start": 0.0, "end": 2.0, "seconds": 2.001003, "bytes": streams * 100,
+             "omitted": False}),))
+    command = SimpleNamespace(unit_id="u1", producer="vm_a", started_at=SimpleNamespace(value=NOW),
+        request={"argv": ["iperf3", "-c", "10.0.0.2", "-P", str(streams)]})
+    timing = SimpleNamespace(unit_id="u1", tcp_started_at=SimpleNamespace(value=NOW),
+        measured_started_at=SimpleNamespace(value=NOW),
+        measured_finished_at=SimpleNamespace(value=NOW + timedelta(seconds=10)))
+    value = SimpleNamespace(measurement_units=[unit], timings=[timing], commands=[command])
+    selected = _receiver_session_for_unit(value, unit, parsed, {"cookie": origin})
+    diagnostics = [item for item in selected.findings if item.code in {
+        "native.iperf3.interval_duration", "native.iperf3.window_unavailable"}]
+    assert len(diagnostics) == 2
+    assert all(item.severity == "warning" and item.unit_id == "u1" for item in diagnostics)
+    assert selected.receiver_intervals == ()
+
+    zero_start_support = {"cookie": {**origin, "receiver_support_by_native_line": {
+        "10": {str(stream): [{**items[0], "original_start_us": 0}]
+               for stream, items in stream_rows.items()}}}}
+    rejected = _receiver_session_for_unit(value, unit, parsed, zero_start_support)
+    assert any(item.code == "native.iperf3.interval_duration" and item.severity == "warning"
+        for item in rejected.findings)
+    assert any(item.code == "native.iperf3.window_unavailable" and item.severity == "warning"
+        for item in rejected.findings)
+    wrong_hash = {"cookie": {**origin, "receiver_artifact_sha256": "b" * 64}}
+    rejected_hash = _receiver_session_for_unit(value, unit, parsed, wrong_hash)
+    assert any(item.code == "native.iperf3.interval_duration" and item.severity == "warning"
+        for item in rejected_hash.findings)
+
+
+def _total_mismatch_qualification_fixture(*, client_bytes=250, complete=True, exit_code=0,
+                                          client_total=True, unknown_error=False, client_final=True, embedded_final=True):
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=1, measured_seconds=10)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a",
+        request={"argv": ["iperf3", "-c", "10.0.0.2", "-P", "1", "-t", "10", "-O", "5"]},
+        result={"outcome": "succeeded", "exit_code": exit_code})
+    value = SimpleNamespace(mode=ExperimentMode.SHORT_STUDY, context="standard", commands=[command])
+    b_source = SourceRef("iperf3_server_log", "receiver.jsonl", "a" * 64,
+        binary_version="3.17.1", source_identity="pinned-build")
+    client_source = SourceRef("iperf3-json", "client.json", "b" * 64,
+        binary_version="3.17.1", source_identity="pinned-build")
+    detail = {"session_id": "b-session", "start": {"cookie": "cookie",
+        "test_start": {"protocol": "TCP", "num_streams": 1, "duration": 10, "omit": 5},
+        "timestamp": {"timesecs": NOW.timestamp()}}}
+    message = "session b-session: receiver final bytes contradict interval sum"
+    finding = ValidationFinding(code="native.iperf3.total_mismatch", severity="warning",
+        message=message, unit_id="u1", artifact_id=b_source.artifact_id)
+    b_native = NativeParse(source=b_source, sessions=("b-session",), session_details=(detail,),
+        receiver_totals=({"session_id": "b-session", "bytes": 250, "seconds": 9.999802},),
+        findings=(finding,), receiver_finding_evidence=((finding.code, finding.message,
+            "b-session", 8, {"final_bytes": 250, "interval_bytes": 100}),))
+    client_totals = (({"session_id": "client-session", "bytes": client_bytes, "seconds": 9.999802},)
+                     if client_total else ())
+    client_native = NativeParse(source=client_source, sessions=("client-session",),
+        session_details=({"start": {"cookie": "cookie"}, "embedded_receiver_start": {"cookie": "cookie"},
+            "client_final": client_totals if client_final else (),
+            "embedded_receiver_final": client_totals if embedded_final else ()},),
+        receiver_totals=client_totals,
+        findings=((ValidationFinding(code="native.iperf3.error", severity="error",
+            message="unknown client native error"),) if unknown_error else ()))
+    b_native = NativeParse(**{**b_native.__dict__, "client_native": client_native})
+    origin = {"origin_utc": NOW.timestamp(), "uncertainty_seconds": .000001,
+        "crossing_start_cutoff_us": 0, "stream_count": 1, "nominal_required_seconds": 15,
+        "nominal_receiver_span_seconds": 15.001, "receiver_artifact_id": b_source.artifact_id,
+        "receiver_artifact_sha256": b_source.sha256, "build_artifact_id": "iperf3-build",
+        "build_sha256": "c" * 64, "receiver_support_by_native_line": {8: {"1": [{"bytes": 100}]}},
+        "receiver_line_by_signature": {(0.0, 1.0, 1.0, 100): 8}}
+    result = _qualify_receiver_total_mismatch(value, unit, b_native,
+        {"complete": complete}, {"u1": ([], [])}, {"cookie": origin})
+    return result, finding
+
+
+def test_receiver_total_mismatch_is_info_only_with_complete_paired_final_proof():
+    result, _finding = _total_mismatch_qualification_fixture()
+    qualified = next(item for item in result.findings if item.code == "native.iperf3.total_mismatch")
+    assert qualified.severity == "info"
+    assert "final bytes=250" in qualified.message
+    assert "interval sum=100" in qualified.message
+    assert "cause is unknown" in qualified.message
+    assert _tcp_statistics(result)["received_bytes"].value == 250
+
+
+@pytest.mark.parametrize("changes", [
+    {"client_bytes": 251}, {"complete": False}, {"exit_code": 1},
+    {"client_total": False}, {"unknown_error": True}, {"client_final": False}, {"embedded_final": False},
+])
+def test_receiver_total_mismatch_stays_warning_without_each_required_proof(changes):
+    result, _finding = _total_mismatch_qualification_fixture(**changes)
+    qualified = next(item for item in result.findings if item.code == "native.iperf3.total_mismatch")
+    assert qualified.severity == "warning"
+
+
+def _paired_build_fixture(tmp_path, mutation=None):
+    import base64
+    from cloud_network_benchmark.acquisition import _expected_build_identity
+
+    commit, patch_path, patch_sha, source_sha = _expected_build_identity("iperf3")
+    source = f"iperf-{commit}"
+    records, metadata, commands = [], [], []
+    for role in ("vm_a", "vm_b"):
+        # P730 banner structure: the sole cross-host difference is uname's hostname.
+        banner = ("iperf 3.17.1 (cJSON 1.7.15)\nLinux gcp-p730-" + role[-1] +
+            " 7.0.0-1017-gcp #19~24.04.1-Ubuntu SMP PREEMPT Thu Oct 29 22:34:06 UTC 2026 x86_64\n"
+            "Optional features available: CPU affinity setting, IPv6 flow label, POSIX threads")
+        if role == "vm_a":
+            if mutation == "version": banner = banner.replace("3.17.1", "3.17.2")
+            if mutation == "kernel": banner = banner.replace("7.0.0-1017", "7.0.0-1018")
+            if mutation == "features": banner += ", changed"
+            if mutation == "missing_uname": banner = banner.replace("Linux ", "Other ")
+            if mutation == "duplicate_uname": banner += "\nLinux extra kernel"
+        identity = dict(tool="iperf3", source_reference=source, source_sha256=source_sha,
+            upstream_commit=commit, patch_path=patch_path, patch_sha256=patch_sha,
+            compiler_version_b64=base64.b64encode(b"cc 13.3").decode(),
+            build_configuration_b64=base64.b64encode(b"configure pinned").decode(),
+            binary_path="/var/lib/cnb/install/bin/iperf3",
+            binary_version_b64=base64.b64encode(banner.encode()).decode(), binary_sha256="a" * 64,
+            observation_capability="CNB_ACQ_V1", observation_semantics="iperf-3.17.1-stats-v1",
+            capabilities="CNB_ACQ_V1")
+        if role == "vm_a" and mutation in {"patch", "source", "binary_hash", "capability"}:
+            field = {"patch": "patch_sha256", "source": "source_sha256", "binary_hash": "binary_sha256",
+                     "capability": "observation_capability"}[mutation]
+            identity[field] = "b" * 64 if mutation != "capability" else "other"
+        raw = ("CNB_BUILD_V1\n" + "".join(f"{key}={value}\n" for key, value in identity.items())).encode()
+        path = tmp_path / f"{role}.identity"
+        path.write_bytes(raw)
+        records.append(ArtifactRecord(artifact_id=f"f02r-{role}-iperf3-build", path=path.name,
+            kind="build-identity", producer=role, unit_id=None, deployment_id="deployment",
+            closed=True, size_bytes={"value": len(raw)}, sha256={"value": hashlib.sha256(raw).hexdigest()},
+            retrieval_state="verified"))
+        supplied = dict(source_reference=source, source_sha256=source_sha,
+            binary_version=banner, binary_sha256="a" * 64)
+        versions = {"iperf3": {"version": {"value": None}, "binary_sha256": {"value": None}}}
+        if role == "vm_a" and mutation == "observed_version": versions["iperf3"]["version"]["value"] = "other"
+        if role == "vm_a" and mutation == "current_hash": versions["iperf3"]["binary_sha256"]["value"] = "b" * 64
+        metadata.append(SimpleNamespace(vm_role=role, deployment_id="deployment",
+            source_builds=SimpleNamespace(value={"iperf3": {"supplied": supplied}}),
+            tool_versions=SimpleNamespace(value=versions)))
+        action = "f02r-vm_b-listener-iperf3" if role == "vm_b" else "iperf3-u1"
+        argv = (["/var/lib/cnb/install/bin/iperf3", "-c", "10.0.0.2"] if role == "vm_a" else
+            ["sudo", "systemd-run", f"--property=Environment=CNB_ACQUISITION_ID={action}",
+             "/var/lib/cnb/install/bin/iperf3", "-s", "-B", "10.0.0.2", "-p", "5201", "--json-stream", "--forceflush"])
+        commands.append(SimpleNamespace(producer=role, deployment_id="deployment", unit_id="u1",
+            request={"argv": argv, "action_id": action, "acquisition_invocation_id": action},
+            result={"action_id": action, "outcome": "succeeded", "exit_code": 0},
+            binary_version=SimpleNamespace(value=banner), source_identity=SimpleNamespace(value=source)))
+    if mutation == "missing_receipt": records.pop()
+    if mutation == "duplicate_receipt": records.append(records[0])
+    if mutation == "altered_bytes": (tmp_path / records[0].path).write_bytes(b"altered")
+    if mutation == "wrong_role": records[0] = records[0].model_copy(update={"producer": "vm_b"})
+    if mutation == "wrong_deployment": records[0] = records[0].model_copy(update={"deployment_id": "other"})
+    if mutation == "command_banner": commands[0].binary_version.value = "other"
+    if mutation == "command_source": commands[0].source_identity.value = "other"
+    if mutation == "command_path": commands[0].request["argv"][0] = "/other/iperf3"
+    if mutation == "command_failure": commands[0].result["exit_code"] = 1
+    if mutation == "supplied_banner": metadata[0].source_builds.value["iperf3"]["supplied"]["binary_version"] = "other"
+    if mutation == "supplied_hash": metadata[0].source_builds.value["iperf3"]["supplied"]["binary_sha256"] = "b" * 64
+    if mutation == "current_build_hash": metadata[0].source_builds.value["iperf3"]["current_binary_sha256"] = {"value": "b" * 64}
+    if mutation == "current_match_false": metadata[0].source_builds.value["iperf3"]["matches_bootstrap_version"] = {"value": False}
+    supplied_mutations = {"supplied_patch": "patch_sha256", "supplied_upstream": "upstream_commit",
+        "supplied_config": "build_configuration", "supplied_capabilities": "capabilities",
+        "supplied_identity_bytes": "identity_bytes"}
+    if mutation in supplied_mutations:
+        metadata[0].source_builds.value["iperf3"]["supplied"][supplied_mutations[mutation]] = "contradiction"
+    value = SimpleNamespace(artifact_records=records, vm_metadata_records=metadata, commands=commands,
+        child_result_root=str(tmp_path), identity=SimpleNamespace(deployment_id="deployment"))
+    native_source = SimpleNamespace(source_identity=source, binary_version=None)
+    return value, SimpleNamespace(unit_id="u1"), native_source
+
+
+def test_paired_build_receipts_qualify_without_inventing_postmeasurement_diagnostics(tmp_path):
+    from cloud_network_benchmark.validation import _paired_iperf_build_compatible
+    value, unit, source = _paired_build_fixture(tmp_path)
+    assert _paired_iperf_build_compatible(value, unit, source, source)
+    assert source.binary_version is None
+    assert value.vm_metadata_records[0].tool_versions.value["iperf3"]["version"]["value"] is None
+
+
+@pytest.mark.parametrize("mutation", ["missing_receipt", "duplicate_receipt", "altered_bytes", "wrong_role",
+    "wrong_deployment", "patch", "source", "binary_hash", "capability", "command_banner", "command_source",
+    "command_path", "command_failure", "observed_version", "current_hash", "version", "kernel", "features",
+    "missing_uname", "duplicate_uname", "supplied_banner", "supplied_hash", "current_build_hash", "current_match_false",
+    "supplied_patch", "supplied_upstream", "supplied_config", "supplied_capabilities", "supplied_identity_bytes"])
+def test_paired_build_receipts_reject_independent_trust_failures(tmp_path, mutation):
+    from cloud_network_benchmark.validation import _paired_iperf_build_compatible
+    value, unit, source = _paired_build_fixture(tmp_path, mutation)
+    assert not _paired_iperf_build_compatible(value, unit, source, source)
+
+
+def test_reset_crossing_cutoff_uses_latest_independent_stream_end():
+    origins = {"1": 10_000_000, "2": 10_000_200, "3": 10_000_400, "4": 10_000_600}
+    rows = [(stream, origins[stream] - 500_000, origins[stream] + end, 100)
+        for stream, end in (("1", 1_000_000), ("2", 1_000_002),
+                            ("3", 1_000_001), ("4", 1_000_003))]
+    cutoff = _iperf_crossing_start_cutoff(origins, rows)
+    assert cutoff == 1_000_003
+    assert 500_000 < cutoff
+    assert 1_000_003 >= cutoff
+    assert _iperf_crossing_start_cutoff(origins, [("1", origins["1"], origins["1"] + 10, 1)]) == 0
+
+
+def test_nominal_terminal_lower_bound_uses_only_replayed_native_windows():
+    windows = [
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="cookie",
+            stream_id="1", omitted=False, end_earliest_ns=15_000_988_000),
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="cookie",
+            stream_id="1", omitted=True, end_earliest_ns=25_000_000_000),
+        SimpleNamespace(tool="iperf3", kind="receiver_measured", session_id="other",
+            stream_id="2", omitted=False, end_earliest_ns=30_000_000_000),
+    ]
+    assert _iperf_native_terminal_ends(windows, "cookie") == {"1":15_000_988}
+
+
+def test_source_union_shares_exact_native_boundary_before_clock_projection():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    from cloud_network_benchmark.validation import _source_inner_unions
+
+    def window(start, end, **changes):
+        values = dict(kind="receiver_measured", tool="iperf3", producer="vm_b",
+            boot_id="boot", clock_domain="CLOCK_MONOTONIC", session_id="cookie", stream_id="5",
+            start_earliest_ns=start, start_latest_ns=start + 1000,
+            end_earliest_ns=end, end_latest_ns=end + 1000, omitted=False,
+            source_byte_offset=0, source_byte_length=1)
+        return SourceWindow(**{**values, **changes})
+
+    first = window(543_485_489_000, 544_486_066_000)
+    second = window(544_486_066_000, 545_486_105_000)
+    assert _source_inner_unions([first, second]) == [
+        ("iperf3", 543_485_490_000, 545_486_105_000)]
+    # A real one-microsecond source gap must retain two independently eroded supports.
+    assert len(_source_inner_unions([first, window(544_486_067_000, 545_486_105_000)])) == 2
+    # Overlapping uncertainty brackets alone are not guaranteed temporal overlap.
+    assert len(_source_inner_unions([first, window(544_486_066_001, 545_486_105_000)])) == 2
+    for field, changed in (("session_id", "other"), ("stream_id", "8"),
+                           ("boot_id", "other"), ("clock_domain", "other"),
+                           ("producer", "vm_a"), ("kind", "other")):
+        assert len(_source_inner_unions([first, window(544_486_066_000, 545_486_105_000,
+            **{field: changed})])) == 2
+    # Invocation and mapping contexts are separated by the caller, never accumulated.
+    assert len(_source_inner_unions([first]) + _source_inner_unions([second])) == 2
+    nested = [window(0, 10, start_latest_ns=1, end_latest_ns=12),
+        window(1, 9, start_latest_ns=2, end_latest_ns=15),
+        window(10, 20, start_latest_ns=15, end_latest_ns=21)]
+    # The first two overlapping rows must not manufacture endpoint bracket [10,15].
+    assert len(_source_inner_unions(nested)) == 2
+
+
+def test_p730_single_flow_source_union_keeps_outer_precision_and_clock_bounds():
+    from cloud_network_benchmark.acquisition import SourceWindow
+    from cloud_network_benchmark.validation import _source_inner_unions
+
+    # Observed P730 source microseconds, retained here as arithmetic regression data.
+    boundaries = [543485489, 544486066, 545486105, 546486136, 547486139,
+                  548486144, 549486047, 550486112, 551486030, 552486163, 553486069]
+    rows = [SourceWindow("receiver_measured", "iperf3", "vm_b", "boot", "CLOCK_MONOTONIC",
+        "cookie", "5", left * 1000, left * 1000 + 1000, right * 1000, right * 1000 + 1000,
+        False, index, 1) for index, (left, right) in enumerate(zip(boundaries, boundaries[1:]))]
+    error = .006448399999989258
+    old = sum((row.end_earliest_ns - row.start_latest_ns) / 1e9 - 2 * error for row in rows)
+    merged = _source_inner_unions(rows)
+    assert len(merged) == 1
+    corrected = (merged[0][2] - merged[0][1]) / 1e9 - 2 * error
+    assert old == pytest.approx(9.871602, abs=1e-9)
+    assert corrected == pytest.approx(9.9876822, abs=1e-9)
+    assert corrected / 10.00058 >= .99
+
+
+def test_nominal_completion_requires_successful_exact_command_and_receiver_span():
+    from cloud_network_benchmark.native import NativeParse
+
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", measured_seconds=10, streams=1)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a",
+        request={"argv":["iperf3", "-c", "10.0.0.2", "-t", "10", "-O", "5", "-P", "1"]},
+        result={"outcome":"succeeded", "exit_code":0})
+    value = SimpleNamespace(mode=ExperimentMode.ACCEPTANCE, context="failure_check", commands=[command])
+    tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"session", "bytes":123, "seconds":9.999802},))
+    origins = {"cookie":{"nominal_required_seconds":15, "nominal_receiver_span_seconds":15.000988,
+        "stream_count":1, "origin_utc":100.0, "crossing_start_cutoff_us":0}}
+    acquisition = {"u1":([],[])}
+    assert _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["nominal_receiver_span_seconds"] = 14.999999
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["nominal_receiver_span_seconds"] = 15.000988
+    command.result["exit_code"] = 1
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    command.result["exit_code"] = 0
+    wrong_cookie_tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"wrong-cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"session", "bytes":123, "seconds":9.999802},))
+    assert not _iperf_nominal_completion_proven(value, unit, wrong_cookie_tcp, acquisition, origins)
+    wrong_total_tcp = NativeParse(sessions=("session",),
+        session_details=({"start":{"cookie":"cookie", "test_start":{"duration":10,"omit":5,
+            "protocol":"TCP", "num_streams":1}}},),
+        receiver_totals=({"session_id":"other", "bytes":123, "seconds":9.999802},))
+    assert not _iperf_nominal_completion_proven(value, unit, wrong_total_tcp, acquisition, origins)
+    origins["cookie"]["stream_count"] = 2
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, origins)
+    origins["cookie"]["stream_count"] = 1
+    assert not _iperf_nominal_completion_proven(value, unit, tcp, {"u1":([], ["native end missing"])}, origins)
+    value.mode = ExperimentMode.SHORT_STUDY
+    value.context = "standard"
+    day_unit = SimpleNamespace(phase="continuous_day", measured_seconds=86400, streams=1)
+    assert not _iperf_nominal_completion_proven(value, day_unit, tcp, acquisition, origins)
 
 
 def make_input(repository_root, provider="aws", campaign="camp", *, config_name="exp-001-multi-provider.yaml", mode_override=None, config_path=None):
@@ -246,6 +609,51 @@ def test_f08_intersects_materialized_loaded_sockperf_and_receiver_sources(reposi
     assert coverage["active_probe_seconds"]["value"] == pytest.approx(60,abs=1e-6)
     assert coverage["complete"] is True
     assert [sample.packet_index for sample in _measured_samples(prepared,unit,sock,{unit.unit_id:(windows,errors)})] == [0,1]
+
+    # Missing supplemental B JSONL keeps existing temporal source support, while
+    # a present but unrelated B session must fail closed.
+    bad_server_path = "server-logs/unrelated-iperf-session.jsonl"
+    bad_server_bytes = (json.dumps({"event":"start","data":{"cookie":"different-cookie",
+        "test_start":{"protocol":"TCP","num_streams":1,"omit":5,"duration":60,
+            "interval":1,"blksize":131072,"reverse":False}}}) + "\n"
+        + json.dumps({"event":"interval","data":{"streams":[{"socket":17,"start":0,
+            "end":60,"seconds":60,"bytes":125_000_000,"sender":False,"omitted":False}]}}) + "\n"
+        + json.dumps({"event":"end","data":{"sum_received":{"bytes":125_000_000,"seconds":60}}}) + "\n").encode()
+    write(bad_server_path,bad_server_bytes)
+    bad_server_record = record("iperf3_server_log",bad_server_path,"iperf3-server-jsonl",
+        VmRole.VM_B,None,bad_server_bytes)
+    wrong_cookie = prepared.model_copy(update={"artifact_records":[*records,bad_server_record]})
+    _bad_windows,bad_errors = _acquisition_windows(wrong_cookie,timing)
+    assert any("client/receiver JSON lacks a unique session" in error for error in bad_errors)
+    wrong_role_record = bad_server_record.model_copy(update={"producer":VmRole.VM_A})
+    wrong_role = prepared.model_copy(update={"artifact_records":[*records,wrong_role_record]})
+    _bad_windows,identity_errors = _acquisition_windows(wrong_role,timing)
+    assert any("supplemental VM B receiver artifact lacks" in error for error in identity_errors)
+
+    # B-native and client-embedded receiver evidence are both checked against
+    # acquisition rows; a matching B log cannot mask a client-only contradiction.
+    receiver_output = native_client["server_output_json"]
+    valid_server_path = "server-logs/iperf3-server-valid.jsonl"
+    valid_server_bytes = (json.dumps({"event":"start","data":receiver_output["start"]}) + "\n"
+        + "\n".join(json.dumps({"event":"interval","data":item})
+            for item in receiver_output["intervals"]) + "\n"
+        + json.dumps({"event":"end","data":native_client["end"]}) + "\n").encode()
+    write(valid_server_path,valid_server_bytes)
+    valid_server_record = record("iperf3_server_log",valid_server_path,"iperf3-server-jsonl",
+        VmRole.VM_B,None,valid_server_bytes)
+    valid_pair = prepared.model_copy(update={"artifact_records":[*records,valid_server_record]})
+    _valid_pair_windows,valid_pair_errors = _acquisition_windows(valid_pair,timing)
+    assert not valid_pair_errors
+    changed_client = json.loads(client_json)
+    changed_client["server_output_json"]["intervals"][0]["streams"][0]["bytes"] += 1
+    changed_client_bytes = json.dumps(changed_client).encode()
+    write(client_path,changed_client_bytes)
+    changed_client_record = record(client_id,client_path,"iperf3-json",VmRole.VM_A,unit.unit_id,
+        changed_client_bytes)
+    contradictory = prepared.model_copy(update={"artifact_records":[
+        changed_client_record if item.artifact_id == client_id else item for item in [*records,valid_server_record]]})
+    _contradictory_windows,contradictory_errors = _acquisition_windows(contradictory,timing)
+    assert any("native iperf interval offsets, bytes" in error for error in contradictory_errors)
 
 
 def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_source(repository_root, tmp_path):
@@ -542,7 +950,7 @@ def test_day_requires_one_continuous_receiver_span_and_unions_chunk_tails(reposi
         chunk_parses[unit_id]=NativeParse(samples=samples, probe_counts=(count,))
     full=value.model_copy(update={"measurement_units":[day,*chunks], "timings":timings})
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (chunk_parses.get(unit.unit_id, NativeParse()), None))
     receiver=ReceiverInterval("1", 0, 86400, 86400, 1_000_000, False, False,
                               SourceRef("iperf3_server_log", "server.jsonl", "a"*64), 1)
@@ -624,7 +1032,7 @@ def test_frozen_common_n_consistency_and_inflation_rejects_incomplete_idle_basel
         timed.append(timing.model_copy(update={"clock_mappings": mappings}))
     value = value.model_copy(update={"timings":timed})
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (parses.get(unit.unit_id, NativeParse()),
                          NativeParse(receiver_intervals=(ReceiverInterval("1", 10, 70, 60, 1000, False, False,
                              SourceRef("iperf3", "receiver.json", "e"*64), 1),)) if unit.unit_id == loaded else None))
@@ -699,7 +1107,7 @@ def test_generation_ratio_uses_native_sent_and_runtime(repository_root, monkeypa
         skipped=Evidence[int](value=0), runtime_seconds=Evidence[float](value=1),
         reporting_scope="one Sockperf invocation", source=SourceRef("sockperf-log", "sockperf.log", "f" * 64))
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda *_: (NativeParse(probe_counts=(counts,)), None))
+    monkeypatch.setattr(module, "_parse_unit", lambda *_args, **_kwargs: (NativeParse(probe_counts=(counts,)), None))
     result = module.validate_bundle(value, evaluated_at=NOW)
     generation = result.metrics.value["units"][0]["probe_counts"][0]["generation_ratio"]["value"]
     assert generation == pytest.approx(sent / 1000)
@@ -846,7 +1254,7 @@ def test_f02r_persistent_listener_without_process_times_is_retained(repository_r
     value = make_input(repository_root)
     unit = next(item for item in value.measurement_units if item.phase == "multi_flow")
     action = f"f02r-vm_b-listener-{tool}"
-    root = "/var/lib/cnb/work/server-logs"
+    root = "/var/lib/cnb/results/server-logs"
     argv = ["sudo", "systemd-run", "--unit", f"cnb-{value.identity.deployment_id}-{tool}",
         "--property=Restart=no", "--property=UMask=0022",
         f"--property=StandardOutput=append:{root}/{tool}{'.log' if tool == 'sockperf' else '-server.jsonl'}",
@@ -901,7 +1309,7 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
     assert any(item.code == "native.iperf3.window_unavailable" for item in selected.findings)
     assert not any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
     verified = {"captured-session": {"origin_utc": (NOW+timedelta(seconds=10)).timestamp(),
-        "uncertainty_seconds": .000001, "crossing_reset": False, "stream_count": 1}}
+        "uncertainty_seconds": .000001, "crossing_start_cutoff_us": 0, "stream_count": 1}}
     selected = _receiver_session_for_unit(value,unit,parsed,verified)
     assert selected.receiver_intervals == (good, omitted_warmup)
     assert any(item.code == "native.iperf3.interval_outside_window" for item in selected.findings)
@@ -910,6 +1318,17 @@ def test_receiver_session_settings_endpoint_and_window_are_corroborated(reposito
         session_details=details,receiver_intervals=(partial,)),verified)
     assert partial_result.receiver_intervals == (partial,)
     assert not any(item.code == "native.iperf3.interval_outside_window" for item in partial_result.findings)
+    crossing = ReceiverInterval("1",0,2,2,25,False,False,source,5)
+    later = ReceiverInterval("1",2,60,58,975,False,False,source,6)
+    crossing_verified = {"captured-session": {**verified["captured-session"],
+        "crossing_start_cutoff_us": 2_000_000}}
+    crossing_result = _receiver_session_for_unit(value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(crossing,later)),crossing_verified)
+    assert crossing_result.receiver_intervals == (later,)
+    assert (crossing_result.receiver_intervals[0].line, crossing_result.receiver_intervals[0].bytes) == (6, 975)
+    positive_result = _receiver_session_for_unit(value,unit,NativeParse(source=source,sessions=("1",),
+        session_details=details,receiver_intervals=(good, omitted_warmup)),verified)
+    assert positive_result.receiver_intervals == (good, omitted_warmup)
     shifted_timing = timing.model_copy(update={
         "measured_started_at":Evidence[datetime](value=NOW+timedelta(seconds=20)),
         "measured_finished_at":Evidence[datetime](value=NOW+timedelta(seconds=80))})
@@ -982,7 +1401,7 @@ def test_missing_generation_and_end_only_receiver_totals_remain_partial_not_unav
         reporting_scope="[Valid Duration]", source=SourceRef("sockperf-log", "sockperf.log", "d"*64))
     total = {"session_id":"1", "bytes":1000, "seconds":60, "source":SourceRef("iperf3", "receiver.json", "e"*64), "line":1}
     import cloud_network_benchmark.validation as module
-    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records:
+    monkeypatch.setattr(module, "_parse_unit", lambda _value, unit, _records, *_args, **_kwargs:
                         (NativeParse(probe_counts=(missing,)) if unit.phase == "idle_latency" else NativeParse(),
                          NativeParse(receiver_totals=(total,)) if unit.phase == "single_flow" else None))
     failed = value.model_copy(update={"retrieval_failure":FailureEvidence(category="retrieval", message="copy failed", occurred_at=NOW)})
@@ -1115,3 +1534,28 @@ def test_sequence_requires_actual_sockperf_runtime_and_ten_second_pause(reposito
     value = value.model_copy(update={"timings":[value.timings[0], too_early, *value.timings[2:]]})
     findings = _sequence_timing_findings(value, {first.unit_id:NativeParse(probe_counts=(counts,))})
     assert any(item.code == "timing.phase_pause" and item.unit_id == second.unit_id for item in findings)
+
+
+def test_receiver_session_keeps_orphan_and_global_diagnostics():
+    from cloud_network_benchmark.contracts.validation import ValidationFinding
+    source = SourceRef("iperf3_server_log", "receiver.jsonl", "a"*64)
+    unit = SimpleNamespace(unit_id="u1", phase="single_flow", streams=1)
+    command = SimpleNamespace(unit_id="u1", producer="vm_a", started_at=SimpleNamespace(value=NOW),
+        request={"argv":["iperf3","-c","10.0.0.2","-P","1"]})
+    timing = SimpleNamespace(unit_id="u1", tcp_started_at=SimpleNamespace(value=NOW),
+        measured_started_at=SimpleNamespace(value=None), measured_finished_at=SimpleNamespace(value=None))
+    value = SimpleNamespace(measurement_units=[unit], commands=[command], timings=[timing])
+    orphan = ValidationFinding(code="native.iperf3.interval_duration", severity="warning",
+        message="line 20: end-start disagrees with native seconds", artifact_id=source.artifact_id)
+    unknown = ValidationFinding(code="native.iperf3.error", severity="error",
+        message="line 21: iperf3 error event", artifact_id=source.artifact_id)
+    multiple = ValidationFinding(code="native.iperf3.multiple_sessions", severity="warning",
+        message="multiple persistent-server sessions require external unit association", artifact_id=source.artifact_id)
+    details = tuple({"session_id":session, "start":{"cookie":cookie,
+        "test_start":{"protocol":"TCP","num_streams":1}, "timestamp":{"timesecs":stamp}}}
+        for session,cookie,stamp in (("1","owned",NOW.timestamp()), ("2","orphan",NOW.timestamp()+100)))
+    parsed = NativeParse(source=source, sessions=("1","2"), session_details=details,
+        findings=(orphan,unknown,multiple), receiver_finding_evidence=((orphan.code,orphan.message,"2",20,{}),))
+    selected = _receiver_session_for_unit(value, unit, parsed)
+    assert selected.sessions == ("1",)
+    assert orphan in selected.findings and unknown in selected.findings and multiple in selected.findings

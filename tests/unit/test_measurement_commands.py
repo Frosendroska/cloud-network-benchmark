@@ -1,4 +1,14 @@
-from cloud_network_benchmark.measurement import iperf3_argv, sockperf_argv
+import pytest
+
+from cloud_network_benchmark.measurement import iperf3_argv, sockperf_argv, sockperf_idle_probe_seconds
+
+
+def test_idle_probe_tail_rounds_pinned_cooldown_to_smallest_integer_second():
+    assert sockperf_idle_probe_seconds(10) == 16
+    assert sockperf_idle_probe_seconds(60) == 66
+    for invalid in (True, 0, -1, 10.0):
+        with pytest.raises(ValueError):
+            sockperf_idle_probe_seconds(invalid)
 
 
 def test_sockperf_and_short_iperf3_argv_preserve_protocol(tmp_path):

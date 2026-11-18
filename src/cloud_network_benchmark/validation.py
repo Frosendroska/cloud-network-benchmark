@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import re
 from dataclasses import replace
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -24,7 +25,82 @@ from .contracts.campaign import BenchmarkPlan, ResolvedCampaign, ResolvedObserva
 from .contracts.validation import ValidationFinding, ValidationResult, ValidatorInput
 from .contracts.measurements import DiagnosticSample, VmMetadata, CommandEvidence, MeasurementTiming
 from .manifests import CampaignManifest, ChildRunManifest
-from .native import NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics
+from .measurement import sockperf_idle_probe_seconds
+from .native import (NativeParse, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics,
+                     rtt_statistics, unique_receiver_total)
+
+
+def _receiver_sum_signature_index(
+        support_by_line: dict[int, dict[str, list[dict[str, Any]]]], stream_count: int
+        ) -> dict[tuple[float, float, float, int], int]:
+    """Index exact B SUM signatures after validating every stream's bytes and envelope."""
+    candidates: dict[tuple[float, float, float, int], list[int]] = {}
+    for line, streams in support_by_line.items():
+        if isinstance(line, bool) or not isinstance(line, int) or len(streams) != stream_count:
+            continue
+        rows = [stream_rows[0] for stream_rows in streams.values()
+            if isinstance(stream_rows, list) and len(stream_rows) == 1]
+        if len(rows) != stream_count:
+            continue
+        sums = {(row.get("sum_start_seconds"), row.get("sum_end_seconds"),
+            row.get("sum_seconds"), row.get("sum_bytes")) for row in rows}
+        if len(sums) != 1:
+            continue
+        sum_start, sum_end, sum_seconds, sum_bytes = next(iter(sums))
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) for value in (sum_start, sum_end, sum_seconds))
+                or sum_end <= sum_start or sum_seconds <= 0
+                or isinstance(sum_bytes, bool) or not isinstance(sum_bytes, int) or sum_bytes < 0):
+            continue
+        bounds: list[tuple[int, int]] = []
+        component_bytes: list[int] = []
+        valid = True
+        for row in rows:
+            left, right, amount = row.get("start_us"), row.get("end_us"), row.get("bytes")
+            if (any(isinstance(value, bool) or not isinstance(value, int) for value in (left, right, amount))
+                    or left < 0 or right <= left or amount < 0):
+                valid = False
+                break
+            bounds.append((left, right))
+            component_bytes.append(amount)
+        if (not valid or sum(component_bytes) != sum_bytes
+                or min(left for left, _right in bounds) > round(sum_start * 1_000_000)
+                or round(sum_end * 1_000_000) > max(right for _left, right in bounds)):
+            continue
+        signature = (float(sum_start), float(sum_end), float(sum_seconds), sum_bytes)
+        candidates.setdefault(signature, []).append(line)
+    return {signature: lines[0] for signature, lines in candidates.items() if len(lines) == 1}
+
+
+def _source_inner_unions(windows: Sequence[Any]) -> list[tuple[str, int, int]]:
+    """Join authenticated same-stream support before applying a shared clock error.
+
+    Equal endpoint brackets describe one shared native boundary, including its
+    precision uncertainty. Otherwise only guaranteed inner overlap joins rows.
+    Call separately for each verified source/invocation/mapping.
+    """
+    grouped: dict[tuple[Any, ...], list[Any]] = {}
+    for window in windows:
+        if window.has_positive_inner_support:
+            key = (window.tool, window.kind, window.producer, window.boot_id,
+                   window.clock_domain, window.session_id, window.stream_id, window.omitted)
+            grouped.setdefault(key, []).append(window)
+    result = []
+    for key, rows in grouped.items():
+        merged: list[list[int]] = []
+        for row in sorted(rows, key=lambda item: (item.start_earliest_ns, item.start_latest_ns)):
+            bounds = [row.start_earliest_ns, row.start_latest_ns,
+                      row.end_earliest_ns, row.end_latest_ns]
+            if merged and (bounds[:2] == merged[-1][2:]
+                           or bounds[1] <= merged[-1][2]):
+                # Keep an actually observed endpoint bracket. Coordinatewise
+                # maxima could invent a bracket and falsely prove later adjacency.
+                if bounds[2] > merged[-1][2]:
+                    merged[-1][2:] = bounds[2:]
+            else:
+                merged.append(bounds)
+        result.extend((key[0], bounds[1], bounds[2]) for bounds in merged)
+    return result
 
 
 def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
@@ -85,12 +161,27 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 raise ValueError("source clock domain lacks one bounded clock mapping")
             mapping = mappings[0]
             uncertainty = mapping.estimated_error_ms.value / 1000
-            replayed_windows = list(iter_source_windows(root, source, candidates, value.commands, [build], timing.clock_mappings))
-            for window in replayed_windows:
-                start = mapping.utc_timestamp.timestamp() + window.start_latest_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
-                end = mapping.utc_timestamp.timestamp() + window.end_earliest_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
-                if window.has_positive_inner_support and end > start:
-                    windows.append((source.tool, start, end))
+            source_unit = next((item for item in value.measurement_units if item.unit_id == timing.unit_id), None)
+            mode_name = str(getattr(value.mode, "value", value.mode))
+            wants_receiver_plot = (source_unit is not None
+                and mode_name in {"short_study", "acceptance", "calibration"}
+                and source_unit.kind not in {"probe_chunk", "continuous_day"})
+            receiver_records = [record for record in value.artifact_records
+                if record.artifact_id == "iperf3_server_log"] if wants_receiver_plot and source.tool == "iperf3" else []
+            if len(receiver_records) > 1:
+                raise ValueError("receiver plot source has ambiguous deployment-scoped VM B server logs")
+            receiver_record = receiver_records[0] if receiver_records else None
+            # Supplemental B-native line proof is additive. When legacy materialized
+            # input has no persistent server log, retain client/acquisition replay
+            # for temporal support and leave the new native-line plot unavailable.
+            capture_receiver_plot = wants_receiver_plot and receiver_record is not None
+            replay_records = list(candidates)
+            if receiver_record is not None and all(record.artifact_id != receiver_record.artifact_id
+                    for record in replay_records):
+                replay_records.append(receiver_record)
+            replayed_windows = list(iter_source_windows(root, source, replay_records, value.commands,
+                [build], timing.clock_mappings, capture_native_lines=capture_receiver_plot,
+                receiver_artifact=receiver_record))
             if source.tool == "iperf3" and verified_iperf_origins is not None:
                 origin_record = next((item for item in candidates
                     if item.artifact_id == source.log_artifact_id and item.path == source.log_path), None)
@@ -100,9 +191,11 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 origin_record.verify_materialized_file(root)
                 from .acquisition import parse_observation_stream
                 by_stream: dict[str, int] = {}
+                initial_by_stream: dict[str, int] = {}
                 expected_streams: int | None = None
-                crossing = False
-                measured_starts: dict[str, list[int]] = {}
+                measured_rows: list[tuple[str, int, int, int]] = []
+                duration_seconds: int | None = None
+                omit_seconds: int | None = None
                 with _artifact_path(value, origin_record).open("rb") as stream:
                     for parsed_record in parse_observation_stream(stream):
                         row = parsed_record.value
@@ -121,33 +214,69 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                             if expected_streams is not None and expected_streams != count:
                                 raise ValueError("verified receiver stream count conflicts within one session")
                             expected_streams = count
+                            duration_seconds, omit_seconds = row.get("duration"), row.get("omit")
+                            if any(isinstance(item, bool) or not isinstance(item, int) or item < 0
+                                    for item in (duration_seconds, omit_seconds)):
+                                raise ValueError("verified receiver settings lack integer duration and omit")
                             continue
                         if row.get("record_kind") == "receiver_interval":
                             if row.get("omitted") is False:
                                 stream_id = row.get("stream_id")
-                                start_us = row.get("interval_start_us")
-                                if isinstance(stream_id, str) and isinstance(start_us, int) and not isinstance(start_us, bool):
-                                    measured_starts.setdefault(stream_id, []).append(start_us)
-                            continue
-                        if row.get("phase") != "post_omit":
+                                start_us, end_us, byte_count = (row.get("interval_start_us"),
+                                    row.get("interval_end_us"), row.get("bytes"))
+                                if (isinstance(stream_id, str) and all(isinstance(item, int) and not isinstance(item, bool)
+                                        for item in (start_us, end_us, byte_count))):
+                                    measured_rows.append((stream_id, start_us, end_us, byte_count))
                             continue
                         stream_id = row.get("stream_id")
                         origin_us = row.get("origin_us")
                         if (not isinstance(stream_id, str) or not stream_id.isdecimal()
                                 or isinstance(origin_us, bool) or not isinstance(origin_us, int) or origin_us < 0):
                             raise ValueError("post-omit origin has invalid stream or monotonic identity")
-                        previous = by_stream.get(stream_id)
+                        phase = row.get("phase")
+                        target = by_stream if phase == "post_omit" else initial_by_stream if phase == "initial" else None
+                        if target is None:
+                            raise ValueError("receiver statistic origin has an unsupported phase")
+                        previous = target.get(stream_id)
                         if previous is not None and previous != origin_us:
-                            raise ValueError("post-omit origin conflicts within one receiver stream")
-                        by_stream[stream_id] = origin_us
+                            raise ValueError(f"{phase} origin conflicts within one receiver stream")
+                        target[stream_id] = origin_us
                 if not by_stream:
                     raise ValueError("verified receiver post-omit origin is absent")
                 if expected_streams is None or len(by_stream) != expected_streams:
                     raise ValueError("verified post-omit origins do not cover every declared receiver stream")
-                if set(measured_starts) - set(by_stream):
+                if len(initial_by_stream) != expected_streams:
+                    raise ValueError("verified initial origins do not cover every declared receiver stream")
+                if {row[0] for row in measured_rows} - set(by_stream):
                     raise ValueError("receiver interval stream lacks its verified post-omit origin")
-                crossing = any(start_us < by_stream[stream_id]
-                    for stream_id, starts in measured_starts.items() for start_us in starts)
+                crossing_cutoff = _iperf_crossing_start_cutoff(by_stream, measured_rows)
+                native_terminal_by_stream = _iperf_native_terminal_ends(replayed_windows, source.session_id)
+                receiver_support_by_line: dict[int, dict[str, list[dict[str, Any]]]] = {}
+                for window in replayed_windows if capture_receiver_plot else ():
+                    if (window.tool != "iperf3" or window.kind != "receiver_measured"
+                            or window.session_id != source.session_id or window.omitted is not False
+                            or window.stream_id not in by_stream or window.native_line is None
+                            or not window.has_positive_inner_support):
+                        continue
+                    receiver_support_by_line.setdefault(window.native_line, {}).setdefault(
+                        window.stream_id, []).append({
+                            "start_us": window.start_earliest_ns // 1000 - by_stream[window.stream_id],
+                            "end_us": window.end_earliest_ns // 1000 - by_stream[window.stream_id],
+                            "original_start_us": window.original_start_us - by_stream[window.stream_id],
+                            "original_end_us": window.original_end_us - by_stream[window.stream_id],
+                            "bytes": window.native_bytes,
+                            "sum_start_seconds": window.native_sum_start_seconds,
+                            "sum_end_seconds": window.native_sum_end_seconds,
+                            "sum_seconds": window.native_sum_seconds,
+                            "sum_bytes": window.native_sum_bytes})
+                unique_receiver_line_by_signature = _receiver_sum_signature_index(
+                    receiver_support_by_line, len(by_stream))
+                nominal_span = None
+                if (duration_seconds is not None and omit_seconds is not None
+                        and set(initial_by_stream) == set(by_stream) == set(native_terminal_by_stream)):
+                    spans = [native_terminal_by_stream[stream] - initial_by_stream[stream] for stream in by_stream]
+                    if spans and min(spans) >= 0:
+                        nominal_span = min(spans) / 1_000_000
                 origins = [mapping.utc_timestamp.timestamp() + value_us / 1_000_000
                     - mapping.monotonic_seconds for value_us in by_stream.values()]
                 if max(origins) - min(origins) > 0.000002:
@@ -155,19 +284,121 @@ def _acquisition_windows(value: ValidatorInput, timing: MeasurementTiming, *,
                 origin_utc = sum(origins) / len(origins)
                 previous_origin = verified_iperf_origins.get(source.session_id)
                 observed = {"origin_utc": origin_utc, "uncertainty_seconds": uncertainty + 0.000001,
-                    "crossing_reset": crossing, "stream_count": len(by_stream)}
+                    "crossing_start_cutoff_us": crossing_cutoff,
+                    "stream_count": len(by_stream), "nominal_required_seconds": duration_seconds + omit_seconds,
+                    "nominal_receiver_span_seconds": nominal_span,
+                    "receiver_support_by_native_line": receiver_support_by_line,
+                    "receiver_line_by_signature": unique_receiver_line_by_signature}
+                if capture_receiver_plot:
+                    build_record = next((record for record in value.artifact_records
+                        if record.artifact_id == source.build_artifact_id), None)
+                    if receiver_record is None or build_record is None:
+                        raise ValueError("receiver plot provenance lacks its B log or build artifact")
+                    observed.update({"receiver_artifact_id": receiver_record.artifact_id,
+                        "receiver_artifact_path": receiver_record.path,
+                        "receiver_artifact_sha256": receiver_record.sha256.value,
+                        "build_artifact_id": build_record.artifact_id,
+                        "build_path": build_record.path, "build_sha256": build_record.sha256.value})
                 if previous_origin is not None and previous_origin != observed:
                     raise ValueError("receiver cookie has contradictory verified post-omit origins")
                 verified_iperf_origins[source.session_id] = observed
+            for tool, inner_start_ns, inner_end_ns in _source_inner_unions(replayed_windows):
+                start = mapping.utc_timestamp.timestamp() + inner_start_ns / 1_000_000_000 - mapping.monotonic_seconds + uncertainty
+                end = mapping.utc_timestamp.timestamp() + inner_end_ns / 1_000_000_000 - mapping.monotonic_seconds - uncertainty
+                if end > start:
+                    windows.append((tool, start, end))
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
             errors.append(f"{source.tool} acquisition replay failed: {type(exc).__name__}: {exc}")
     return windows, errors
+
+
+def _iperf_crossing_start_cutoff(origins: dict[str, int],
+        rows: Sequence[tuple[str, int, int, int]]) -> int:
+    """Return the conservative native JSON start boundary after reset crossings."""
+    crossing_ends = [end_us - origins[stream_id] for stream_id, start_us, end_us, _bytes in rows
+        if start_us < origins[stream_id]]
+    if any(end < 0 for end in crossing_ends):
+        raise ValueError("receiver reset-crossing row ends before its post-omit origin")
+    return max(crossing_ends, default=0)
+
+
+def _iperf_native_terminal_ends(windows: Sequence[Any], session_id: str | None) -> dict[str, int]:
+    """Use only native-correlated replay windows as receiver terminal lower bounds."""
+    terminal: dict[str, int] = {}
+    for window in windows:
+        if (window.tool != "iperf3" or window.kind != "receiver_measured"
+                or window.session_id != session_id or window.omitted is not False
+                or not isinstance(window.stream_id, str) or not window.stream_id.isdecimal()):
+            continue
+        end_ns = window.end_earliest_ns
+        if isinstance(end_ns, bool) or not isinstance(end_ns, int) or end_ns < 0:
+            raise ValueError("replayed receiver window has an invalid native terminal bound")
+        terminal[window.stream_id] = max(terminal.get(window.stream_id, 0), end_ns // 1000)
+    return terminal
 
 
 def _finding(code: str, severity: str, message: str, *, unit: str | None = None,
              artifact: str | None = None) -> ValidationFinding:
     return ValidationFinding(code=code, severity=severity, message=message,
                              unit_id=unit, artifact_id=artifact)
+
+
+def _has_degrading_findings(findings: Sequence[ValidationFinding]) -> bool:
+    return any(item.severity in {"warning", "error"} for item in findings)
+
+
+def _replayed_iperf3_control_association(value: ValidatorInput
+        ) -> tuple[dict[str, Any] | None, set[tuple[int, str]]]:
+    """Trust event association only when its declared controller bytes replay exactly."""
+    declaration = value.artifacts.get("iperf3_control_evidence")
+    controls = [item for item in value.artifact_records if item.artifact_id == "iperf3_control_evidence"]
+    if (declaration is None or declaration.path != "metadata/iperf3-control-evidence.json"
+            or declaration.kind != "iperf3-control-evidence" or declaration.producer != "controller"
+            or len(controls) != 1):
+        return None, set()
+    record = controls[0]
+    if (record.producer != "controller" or record.unit_id is not None
+            or record.deployment_id != value.identity.deployment_id
+            or record.path != declaration.path or record.kind != declaration.kind
+            or record.retrieval_state != "verified" or record.closed is not True):
+        return None, set()
+    try:
+        root = Path(value.child_result_root)
+        record.verify_materialized_file(root)
+        raw_control = _artifact_path(value, record).read_bytes()
+        payload = json.loads(raw_control)
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None, set()
+    structured = value.iperf3_control_evidence.value
+    if (not isinstance(payload, dict) or not isinstance(structured, dict) or payload != structured
+            or payload.get("schema_version") != 1 or payload.get("run_id") != value.identity.run_id
+            or payload.get("deployment_id") != value.identity.deployment_id or payload.get("vm_role") != "vm_b"):
+        return None, set()
+    vm_a_host, vm_b_host, private_b = (payload.get("vm_a_host_id"), payload.get("vm_b_host_id"),
+        payload.get("private_ipv4_b"))
+    if not all(isinstance(item, str) and item for item in (vm_a_host, vm_b_host, private_b)):
+        return None, set()
+    try:
+        from types import SimpleNamespace
+        from .lifecycle_projection import _iperf3_control_event_association, _verified_iperf3_control_evidence
+        verified = _verified_iperf3_control_evidence(root,
+            SimpleNamespace(run_id=value.identity.run_id, deployment_id=value.identity.deployment_id),
+            value.artifact_records, vm_a_host_id=vm_a_host, vm_b_host_id=vm_b_host,
+            private_ipv4_b=private_b, stdout_path=payload.get("iperf3_stdout_path"),
+            stderr_path=payload.get("iperf3_stderr_path"))
+        if verified != payload:
+            return None, set()
+        association, suppressions = _iperf3_control_event_association(root,
+            value.artifact_records, verified, vm_a_host_id=vm_a_host,
+            vm_b_host_id=vm_b_host, private_ipv4_b=private_b,
+            stdout_path=payload.get("iperf3_stdout_path"))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None, set()
+    if payload.get("readiness", {}).get("event_association") != association:
+        return None, set()
+    if association.get("status") != "verified":
+        return association, set()
+    return association, suppressions
 
 
 def _sha(path: Path) -> str:
@@ -640,7 +871,8 @@ def _option_values(argv: list[str], name: str) -> list[str]:
 
 
 def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str | None], Any],
-                verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> tuple[NativeParse, NativeParse | None]:
+                verified_iperf_origins: dict[str, dict[str, Any]] | None = None,
+                control_suppressions: set[tuple[int, str]] | None = None) -> tuple[NativeParse, NativeParse | None]:
     csv_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-csv"), None)
     log_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "sockperf-log"), None)
     tcp_record = next((r for r in value.artifact_records if r.unit_id == unit.unit_id and r.kind == "iperf3-json"), None)
@@ -677,11 +909,27 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
         except (OSError, ValueError) as exc:
             tcp = NativeParse(findings=(_finding("native.iperf3.read", "error", str(exc), unit=unit.unit_id,
                                                   artifact=tcp_record.artifact_id),))
+    client_native = tcp
     if server_record:
         try:
             receiver = parse_iperf3(_artifact_path(value, server_record), source=_source(server_record, value), format="jsonl")
+            if control_suppressions:
+                def source_control_finding(item: Any) -> bool:
+                    match = re.match(r"line ([0-9]+):", item.message)
+                    return (item.artifact_id == server_record.artifact_id and match is not None
+                        and (int(match.group(1)), item.code) in control_suppressions)
+                receiver = replace(receiver, findings=tuple(item for item in receiver.findings
+                    if not source_control_finding(item)))
             receiver = _receiver_session_for_unit(value, unit, receiver, verified_iperf_origins or {})
             if tcp is not None:
+                client_total_errors = [item for item in tcp.findings
+                    if item.severity == "error"]
+                if client_total_errors:
+                    receiver = replace(receiver, findings=(*receiver.findings,
+                        *(_finding("native.iperf3.client_total_conflict" if item.code == "native.iperf3.total_conflict" else item.code, "error",
+                            item.message, unit=unit.unit_id,
+                            artifact=tcp.source.artifact_id if tcp.source else None)
+                          for item in client_total_errors)))
                 client_stats, receiver_stats = _tcp_statistics(tcp), _tcp_statistics(receiver)
                 client_bytes = client_stats["received_bytes"].value
                 receiver_bytes = receiver_stats["received_bytes"].value
@@ -697,7 +945,7 @@ def _parse_unit(value: ValidatorInput, unit: Any, records: dict[tuple[str, str |
                         "native.iperf3.client_receiver_mismatch", "error",
                         "client-embedded receiver duration contradicts VM B receiver evidence", unit=unit.unit_id,
                         artifact=server_record.artifact_id)))
-            tcp = receiver
+            tcp = replace(receiver, client_native=client_native)
         except (OSError, ValueError) as exc:
             tcp = NativeParse(findings=(_finding("native.iperf3.server_read", "error", str(exc), unit=unit.unit_id,
                                                  artifact=server_record.artifact_id),))
@@ -823,6 +1071,34 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
             unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None)), source=parsed.source,
             sessions=parsed.sessions, session_details=parsed.session_details)
     selected = candidates[0]
+
+    # Determine whether each diagnostic session has exactly one measurement
+    # owner. A warning from another uniquely owned session is handled by that
+    # unit; orphan or ambiguous diagnostics stay global and degrading.
+    owner_by_session: dict[str, str | None] = {}
+    for session in parsed.sessions:
+        detail = details.get(session, {})
+        streams, stamp, protocol = test_config(detail)
+        owners = []
+        for candidate_unit in value.measurement_units:
+            expected = candidate_unit.streams or 1
+            if streams is not None and streams != expected:
+                continue
+            if protocol is not None and str(protocol).upper() != "TCP":
+                continue
+            candidate_timing = next((item for item in value.timings
+                                     if item.unit_id == candidate_unit.unit_id), None)
+            candidate_start = next((command.started_at.value for command in value.commands
+                if command.unit_id == candidate_unit.unit_id and command.producer == "vm_a"
+                and command.started_at.value is not None and command.request.get("argv")
+                and "iperf3" in str(command.request["argv"][0]).lower()
+                and _option(command.request["argv"], "-c") is not None), None)
+            candidate_start = candidate_start or (candidate_timing.tcp_started_at.value if candidate_timing else None)
+            if candidate_start is None or stamp is None:
+                continue
+            if abs(stamp - candidate_start.timestamp()) <= 2:
+                owners.append(candidate_unit.unit_id)
+        owner_by_session[session] = owners[0] if len(owners) == 1 else None
     detail = details.get(selected, {})
     streams, session_stamp, protocol = test_config(detail)
     additions = []
@@ -924,6 +1200,10 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
     verified_origins = verified_iperf_origins or {}
     cookie = detail.get("start", {}).get("cookie") if isinstance(detail.get("start"), dict) else None
     verified_origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
+    crossing_cutoff = verified_origin.get("crossing_start_cutoff_us") if isinstance(verified_origin, dict) else None
+    if (isinstance(crossing_cutoff, bool) or not isinstance(crossing_cutoff, int)
+            or crossing_cutoff < 0):
+        verified_origin = None
     if measured_start is not None and measured_finish is not None and session_stamp is not None:
         kept = []
         if verified_origin is None:
@@ -931,20 +1211,20 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
                 "verified same-session post-omit receiver origin is unavailable; native offsets were not re-anchored",
                 unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
             kept.extend(intervals)
-        elif verified_origin.get("crossing_reset"):
-            additions.append(_finding("native.iperf3.window_unavailable", "warning",
-                "a receiver interval crosses the verified reset; source-clipped containment is retained without re-anchoring aggregate offsets",
-                unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
-            kept.extend(intervals)
         else:
+            crossing_cutoff = verified_origin["crossing_start_cutoff_us"]
+            if crossing_cutoff:
+                additions.append(_finding("native.iperf3.window_unavailable", "warning",
+                    "receiver intervals cross the verified reset; native rows before the source-derived boundary are excluded",
+                    unit=unit.unit_id, artifact=parsed.source.artifact_id if parsed.source else None))
             origin_utc = float(verified_origin["origin_utc"])
             uncertainty = float(verified_origin["uncertainty_seconds"])
             tolerance = max(.002, uncertainty)
             for interval in intervals:
-                # Keep omitted warm-up as native evidence, but exclude it from
-                # measured containment and every measured denominator.
                 if interval.omitted:
                     kept.append(interval)
+                    continue
+                if round(interval.start_seconds * 1_000_000) < crossing_cutoff:
                     continue
                 absolute_start = origin_utc + interval.start_seconds
                 absolute_end = origin_utc + interval.end_seconds
@@ -956,11 +1236,284 @@ def _receiver_session_for_unit(value: ValidatorInput, unit: Any, parsed: NativeP
                 else:
                     kept.append(interval)
         intervals = tuple(kept)
+    evidence_by_finding: dict[tuple[str, str], list[tuple[str, int, dict[str, Any]]]] = {}
+    for code, message, session, line, evidence_detail in parsed.receiver_finding_evidence:
+        evidence_by_finding.setdefault((code, message), []).append((session, line, evidence_detail))
+    selected_findings = []
+    selected_evidence = []
+    for finding in parsed.findings:
+        matches = evidence_by_finding.get((finding.code, finding.message), [])
+        evidence = matches[0] if len(matches) == 1 else None
+        if evidence is None or finding.code not in {
+                "native.iperf3.total_mismatch", "native.iperf3.interval_duration"}:
+            selected_findings.append(finding)
+            continue
+        owner = owner_by_session.get(evidence[0])
+        if owner is not None and owner != unit.unit_id:
+            continue
+        if owner != unit.unit_id:
+            selected_findings.append(finding)
+            continue
+        selected_findings.append(finding.model_copy(update={"unit_id": unit.unit_id}))
+        selected_evidence.append((finding.code, finding.message, *evidence))
     return replace(parsed,
         receiver_intervals=intervals,
         receiver_totals=tuple(item for item in parsed.receiver_totals if item["session_id"] == selected),
-        findings=(*(item for item in parsed.findings if item.code != "native.iperf3.multiple_sessions"), *additions), sessions=(selected,),
-        session_details=tuple(item for item in parsed.session_details if item.get("session_id") == selected))
+        findings=(*(item for item in selected_findings if item.code != "native.iperf3.multiple_sessions"
+            or any(owner is None for owner in owner_by_session.values())), *additions), sessions=(selected,),
+        session_details=tuple(item for item in parsed.session_details if item.get("session_id") == selected),
+        receiver_finding_evidence=tuple(selected_evidence))
+
+
+def _verified_reset_crossing_lines(origin: dict[str, Any] | None, source: SourceRef | None) -> set[int]:
+    """Return native lines whose exact B SUM and source rows prove a reset crossing."""
+    if (not isinstance(origin, dict) or source is None
+            or origin.get("receiver_artifact_sha256") != source.sha256
+            or origin.get("crossing_start_cutoff_us", 0) <= 0):
+        return set()
+    support = origin.get("receiver_support_by_native_line")
+    signatures = origin.get("receiver_line_by_signature")
+    if not isinstance(support, dict) or not isinstance(signatures, dict):
+        return set()
+    lines: set[int] = set()
+    for raw_line, streams in support.items():
+        try:
+            line = int(raw_line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(raw_line, bool) or str(line) != str(raw_line) or line < 1 or not isinstance(streams, dict):
+            continue
+        rows = [items[0] for items in streams.values()
+            if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict)]
+        if not rows or len(rows) != len(streams) or len(streams) != origin.get("stream_count"):
+            continue
+        totals = {(row.get("sum_start_seconds"), row.get("sum_end_seconds"),
+                   row.get("sum_seconds"), row.get("sum_bytes")) for row in rows}
+        if len(totals) != 1:
+            continue
+        start, end, seconds, amount = next(iter(totals))
+        if (any(isinstance(item, bool) or not isinstance(item, (int, float))
+                for item in (start, end, seconds))
+                or not isinstance(amount, int) or isinstance(amount, bool) or amount < 0):
+            continue
+        source_rows = [(row.get("original_start_us"), row.get("original_end_us"), row.get("bytes")) for row in rows]
+        if any(any(isinstance(value, bool) or not isinstance(value, int)
+                   for value in row) for row in source_rows):
+            continue
+        if (sum(row[2] for row in source_rows) != amount
+                or not any(left < 0 < right for left, right, _bytes in source_rows)):
+            continue
+        signature = (float(start), float(end), float(seconds), amount)
+        if signatures.get(signature) == line:
+            lines.add(line)
+    return lines
+
+
+def _paired_iperf_build_compatible(value: ValidatorInput, unit: Any,
+        receiver: SourceRef, client: SourceRef) -> bool:
+    """Use closed bootstrap receipts and actual commands without inventing diagnostics."""
+    from .acquisition import _expected_build_identity, _parse_build_identity
+
+    commit, patch_path, patch_sha, source_sha = _expected_build_identity("iperf3")
+    expected_source = f"iperf-{commit}"
+    if receiver.source_identity != expected_source or client.source_identity != expected_source:
+        return False
+    identities = []
+    try:
+        for role, source in (("vm_a", client), ("vm_b", receiver)):
+            records = [record for record in value.artifact_records
+                if record.artifact_id == f"f02r-{role}-iperf3-build"]
+            metadata = [item for item in value.vm_metadata_records if str(item.vm_role) == role]
+            if len(records) != 1 or len(metadata) != 1:
+                return False
+            record = records[0]
+            if (str(record.producer) != role or record.kind != "build-identity"
+                    or record.deployment_id != value.identity.deployment_id or record.unit_id is not None
+                    or record.closed is not True or str(record.retrieval_state) != "verified"):
+                return False
+            record.verify_materialized_file(Path(value.child_result_root))
+            identity_bytes = _artifact_path(value, record).read_bytes()
+            identity = _parse_build_identity(identity_bytes)
+            pinned = {"tool": "iperf3", "source_reference": expected_source,
+                "source_sha256": source_sha, "upstream_commit": commit, "patch_path": patch_path,
+                "patch_sha256": patch_sha, "observation_capability": "CNB_ACQ_V1",
+                "observation_semantics": "iperf-3.17.1-stats-v1"}
+            if any(identity.get(key) != expected for key, expected in pinned.items()):
+                return False
+            banner, binary_hash = identity["binary_version"], identity["binary_sha256"]
+            if (not isinstance(banner, str) or not re.fullmatch(r"[a-f0-9]{64}", str(binary_hash))
+                    or not identity.get("compiler_version") or not identity.get("build_configuration")
+                    or not identity.get("capabilities") or identity.get("binary_path") != "/var/lib/cnb/install/bin/iperf3"):
+                return False
+            provenance = _provenance_evidence(metadata[0], "iperf3")
+            metadata_build = metadata[0].source_builds.value.get("iperf3", {})
+            supplied = metadata_build.get("supplied", {})
+            # F04 may retain a subset of the bootstrap observation. Every retained
+            # field must agree with this role's independent receipt, including A
+            # whose client JSON is associated through B's acquisition source.
+            for field, expected in (*identity.items(), ("identity_bytes", identity_bytes.decode("utf-8"))):
+                actual = supplied.get(field)
+                actual = actual.get("value") if isinstance(actual, dict) else actual
+                if actual is not None and actual != expected:
+                    return False
+            current_build_hash = metadata_build.get("current_binary_sha256", {})
+            current_build_hash = current_build_hash.get("value") if isinstance(current_build_hash, dict) else current_build_hash
+            match_flags = [metadata_build.get(key, {}) for key in
+                ("matches_bootstrap_binary", "matches_bootstrap_version")]
+            if (current_build_hash is not None and current_build_hash != binary_hash
+                    or any((flag.get("value") if isinstance(flag, dict) else flag) is False for flag in match_flags)):
+                return False
+            if (metadata[0].deployment_id != record.deployment_id
+                    or supplied.get("source_sha256") != source_sha
+                    or provenance["source_reference"] != expected_source
+                    or provenance["supplied_version"] != banner or provenance["supplied_hash"] != binary_hash
+                    or (provenance["observed_version"] is not None and provenance["observed_version"] != banner)
+                    or (provenance["current_hash"] is not None and provenance["current_hash"] != binary_hash)
+                    or (source.binary_version is not None and source.binary_version != banner)):
+                return False
+            commands = []
+            for command in value.commands:
+                argv = command.request.get("argv", [])
+                if (str(command.producer) != role or command.deployment_id != record.deployment_id
+                        or not isinstance(argv, list) or not argv):
+                    continue
+                matches = (command.unit_id == unit.unit_id and argv[0] == identity["binary_path"]
+                    and _option(argv, "-c") is not None) if role == "vm_a" else (
+                        _f02r_iperf_listener(command, argv) and identity["binary_path"] in argv)
+                if matches:
+                    commands.append(command)
+            if len(commands) != 1:
+                return False
+            command = commands[0]
+            if (command.binary_version.value != banner or command.source_identity.value != expected_source
+                    or str(command.result.get("outcome")) != "succeeded"
+                    or isinstance(command.result.get("exit_code"), bool) or command.result.get("exit_code") != 0):
+                return False
+            identities.append(identity)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    left, right = identities
+    equal_fields = ("binary_sha256", "compiler_version", "build_configuration", "binary_path", "capabilities")
+    if any(left[field] != right[field] for field in equal_fields):
+        return False
+    if left["binary_version"] == right["binary_version"]:
+        return True
+    banners = [identity["binary_version"].split("\n") for identity in identities]
+    if any(len(lines) != 3 or re.fullmatch(r"iperf 3\.17\.1 \(cJSON [0-9.]+\)", lines[0]) is None
+            or not lines[2].startswith("Optional features available: ") for lines in banners):
+        return False
+    uname = [re.fullmatch(r"Linux ([A-Za-z0-9][A-Za-z0-9.-]*) (\S.*)", lines[1]) for lines in banners]
+    return (all(uname) and banners[0][0] == banners[1][0] and banners[0][2] == banners[1][2]
+            and uname[0].group(2) == uname[1].group(2))
+
+
+def _qualify_receiver_total_mismatch(value: ValidatorInput, unit: Any, tcp: NativeParse | None,
+        coverage: dict[str, Any], acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]],
+        verified_origins: dict[str, dict[str, Any]]) -> NativeParse | None:
+    """Make a B final/interval discrepancy informational only with complete paired proof."""
+    if tcp is None or not coverage.get("complete") or tcp.client_native is None:
+        return tcp
+    client = tcp.client_native
+    if any(item.severity == "error" for item in (*tcp.findings, *client.findings)):
+        return tcp
+    if any(item.severity == "warning" and item.code not in {
+            "native.iperf3.total_mismatch", "native.iperf3.interval_duration"} for item in client.findings):
+        return tcp
+    if not _iperf_nominal_completion_proven(value, unit, tcp, acquisition, verified_origins):
+        return tcp
+    b_total = unique_receiver_total(tcp.receiver_totals)
+    client_total = unique_receiver_total(client.receiver_totals)
+    if (b_total is None or client_total is None
+            or b_total.get("session_id") != tcp.sessions[0]
+            or client_total.get("session_id") not in client.sessions
+            or b_total["bytes"] != client_total["bytes"]
+            or not math.isclose(b_total["seconds"], client_total["seconds"], rel_tol=0, abs_tol=.002)):
+        return tcp
+    start = tcp.session_details[0].get("start", {})
+    cookie = start.get("cookie") if isinstance(start, dict) else None
+    origin = verified_origins.get(cookie) if isinstance(cookie, str) else None
+    source = tcp.source
+    client_source = client.source
+    if (not isinstance(origin, dict) or source is None or client_source is None
+            or origin.get("receiver_artifact_id") != source.artifact_id
+            or origin.get("receiver_artifact_sha256") != source.sha256
+            or not re.fullmatch(r"[a-f0-9]{64}", str(origin.get("build_sha256", "")))
+            or not origin.get("build_artifact_id")
+            or not source.source_identity or source.source_identity != client_source.source_identity
+            or origin.get("stream_count") != (unit.streams or 1)
+            or not origin.get("receiver_support_by_native_line")
+            or not origin.get("receiver_line_by_signature")
+            or acquisition.get(unit.unit_id, ([], ["missing replay"]))[1]):
+        return tcp
+    receipt_compatibility = not (source.binary_version and source.binary_version == client_source.binary_version)
+    if receipt_compatibility and not _paired_iperf_build_compatible(value, unit, source, client_source):
+        return tcp
+    if len(client.session_details) != 1:
+        return tcp
+    client_detail = client.session_details[0]
+    client_start = client_detail.get("start")
+    embedded_start = client_detail.get("embedded_receiver_start")
+    if (not isinstance(client_start, dict) or client_start.get("cookie") != cookie
+            or not isinstance(embedded_start, dict) or embedded_start.get("cookie") != cookie):
+        return tcp
+    for alias in ("client_final", "embedded_receiver_final"):
+        final = unique_receiver_total(client_detail.get(alias, ()))
+        if (final is None or final["bytes"] != b_total["bytes"]
+                or not math.isclose(final["seconds"], b_total["seconds"], rel_tol=0, abs_tol=.002)):
+            return tcp
+    crossing_lines = _verified_reset_crossing_lines(origin, source)
+    crossing_signatures = {signature for signature, line in origin["receiver_line_by_signature"].items()
+        if line in crossing_lines}
+    # A client-only bad SUM cannot inherit the B reset exemption. Its own
+    # exact parser diagnostic must independently describe a proved crossing.
+    for finding in client.findings:
+        if finding.severity != "warning" or finding.code != "native.iperf3.interval_duration":
+            continue
+        matches = [item for item in client.receiver_finding_evidence
+            if item[0] == finding.code and item[1] == finding.message and item[2] in client.sessions]
+        if len(matches) != 1:
+            return tcp
+        detail = matches[0][4]
+        if (detail.get("omitted") is not False or
+                (detail.get("start"), detail.get("end"), detail.get("seconds"), detail.get("bytes"))
+                not in crossing_signatures):
+            return tcp
+    evidence: dict[tuple[str, str], list[tuple[str, int, dict[str, Any]]]] = {}
+    for code, message, session, line, detail in tcp.receiver_finding_evidence:
+        evidence.setdefault((code, message), []).append((session, line, detail))
+    updated = []
+    for finding in tcp.findings:
+        matches = evidence.get((finding.code, finding.message), [])
+        match = matches[0] if len(matches) == 1 else None
+        if match is not None and match[0] == tcp.sessions[0] and finding.unit_id == unit.unit_id:
+            _session, line, detail = match
+            if (finding.code == "native.iperf3.total_mismatch" and finding.severity == "warning"
+                    and detail.get("final_bytes") == b_total["bytes"]):
+                finding = finding.model_copy(update={"severity": "info",
+                    "message": (f"verified receiver final bytes={detail['final_bytes']} disagree with "
+                        f"included receiver interval sum={detail['interval_bytes']}; client and receiver final bytes "
+                        f"agree; discrepancy cause is unknown")})
+            elif (finding.code == "native.iperf3.interval_duration" and line in crossing_lines
+                    and detail.get("omitted") is False):
+                # Match this finding's exact session/line/message and native SUM.
+                rows = origin["receiver_support_by_native_line"].get(line,
+                    origin["receiver_support_by_native_line"].get(str(line), {}))
+                sums = {(row["sum_start_seconds"], row["sum_end_seconds"], row["sum_seconds"], row["sum_bytes"])
+                    for items in rows.values() for row in items}
+                if (detail.get("start"), detail.get("end"), detail.get("seconds"), detail.get("bytes")) in sums:
+                    finding = finding.model_copy(update={"severity": "info"})
+        if (finding.code == "native.iperf3.window_unavailable" and crossing_lines
+                and finding.unit_id == unit.unit_id and finding.message ==
+                "receiver intervals cross the verified reset; native rows before the source-derived boundary are excluded"):
+            finding = finding.model_copy(update={"severity": "info"})
+        updated.append(finding)
+    if receipt_compatibility and any(before.severity == "warning" and after.severity == "info"
+            for before, after in zip(tcp.findings, updated)):
+        updated.append(_finding("native.iperf3.paired_build_identity", "info",
+            "qualification identity is established by independently verified supplied build sidecars and actual commands; "
+            "postmeasurement version and binary-hash diagnostics retain their recorded availability",
+            unit=unit.unit_id, artifact=source.artifact_id))
+    return replace(tcp, findings=tuple(updated))
 
 
 def _tcp_statistics(tcp: NativeParse | None) -> dict[str, Any]:
@@ -968,13 +1521,17 @@ def _tcp_statistics(tcp: NativeParse | None) -> dict[str, Any]:
         return {"received_bytes": Evidence[int](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "measured_seconds": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable"),
                 "throughput_gbps": Evidence[float](unavailable_reason="receiver iperf3 evidence is unavailable")}
-    if tcp.receiver_intervals:
-        return receiver_statistics(tcp.receiver_intervals)
-    if len(tcp.receiver_totals) == 1:
-        total = tcp.receiver_totals[0]
+    total = unique_receiver_total(tcp.receiver_totals)
+    if total is not None:
         return {"received_bytes": Evidence[int](value=total["bytes"]),
                 "measured_seconds": Evidence[float](value=total["seconds"]),
                 "throughput_gbps": Evidence[float](value=8 * total["bytes"] / total["seconds"] / 1e9)}
+    if tcp.receiver_totals:
+        return {"received_bytes": Evidence[int](unavailable_reason="receiver final totals conflict or have ambiguous session identity"),
+                "measured_seconds": Evidence[float](unavailable_reason="receiver final totals conflict or have ambiguous session identity"),
+                "throughput_gbps": Evidence[float](unavailable_reason="receiver final totals conflict or have ambiguous session identity")}
+    if tcp.receiver_intervals:
+        return receiver_statistics(tcp.receiver_intervals)
     return {"received_bytes": Evidence[int](unavailable_reason="no receiver-side measured intervals or unique receiver total"),
             "measured_seconds": Evidence[float](unavailable_reason="receiver measured duration unavailable"),
             "throughput_gbps": Evidence[float](unavailable_reason="receiver throughput unavailable")}
@@ -1134,7 +1691,8 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
             if any(len(_option_values(argv, flag)) != 1 for flag in ("-p", "--mps", "--reply-every", "-m", "-t")):
                 findings.append(_finding("command.duplicate_option", "error", "Sockperf resolved options must each occur once", unit=command.unit_id))
             unit = next((u for u in value.measurement_units if u.unit_id == command.unit_id), None)
-            expected_duration = unit.measured_seconds + (5 if unit and unit.phase == "idle_latency" else 10) if unit else None
+            expected_duration = (sockperf_idle_probe_seconds(unit.measured_seconds)
+                if unit and unit.phase == "idle_latency" else unit.measured_seconds + 10 if unit else None)
             if expected_duration is not None and _option(argv, "-t") != str(expected_duration) and unit.kind not in {"probe_chunk", "continuous_day"}:
                 findings.append(_finding("command.duration", "error", f"Sockperf duration must be {expected_duration} seconds including warm-up/coordination", unit=unit.unit_id))
             if unit and unit.kind == "probe_chunk":
@@ -1302,8 +1860,81 @@ def _command_findings(value: ValidatorInput) -> list[ValidationFinding]:
     return findings
 
 
+def _iperf_nominal_completion_proven(value: ValidatorInput, unit: Any, tcp: NativeParse | None,
+        acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]],
+        verified_origins: dict[str, dict[str, Any]]) -> bool:
+    """Prove nominal short-run completion from the verified same-VM receiver lifecycle."""
+    phase = str(getattr(unit.phase, "value", unit.phase))
+    mode = str(getattr(value.mode, "value", value.mode))
+    context = str(getattr(value.context, "value", value.context))
+    allowed_mode = (mode == ExperimentMode.SHORT_STUDY.value
+        or (mode == ExperimentMode.ACCEPTANCE.value and context == "failure_check"))
+    if (not allowed_mode or phase not in {"single_flow", "multi_flow"}
+            or tcp is None or len(tcp.sessions) != 1 or len(tcp.session_details) != 1):
+        return False
+    receiver_total = unique_receiver_total(tcp.receiver_totals)
+    if receiver_total is None or receiver_total.get("session_id") != tcp.sessions[0]:
+        return False
+    detail = tcp.session_details[0]
+    start = detail.get("start") if isinstance(detail, dict) else None
+    settings = start.get("test_start") if isinstance(start, dict) else None
+    if not isinstance(settings, dict):
+        return False
+    if any(isinstance(settings.get(key), bool) for key in ("duration", "omit", "num_streams")):
+        return False
+    client_commands = [command for command in value.commands if command.unit_id == unit.unit_id
+        and command.producer == "vm_a" and isinstance(command.request.get("argv"), list)
+        and command.request["argv"] and "iperf3" in str(command.request["argv"][0]).lower()
+        and _option(command.request["argv"], "-c") is not None]
+    if len(client_commands) != 1:
+        return False
+    command = client_commands[0]
+    argv = command.request["argv"]
+    outcome = str(getattr(command.result.get("outcome"), "value", command.result.get("outcome", ""))).lower()
+    exit_code = command.result.get("exit_code")
+    duration, omit = _option(argv, "-t"), _option(argv, "-O")
+    try:
+        duration_value = int(duration) if duration is not None and duration.isdecimal() else None
+        omit_value = int(omit) if omit is not None and omit.isdecimal() else None
+        native_duration = int(settings["duration"])
+        native_omit = int(settings["omit"])
+        native_streams = int(settings["num_streams"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (outcome != "succeeded" or isinstance(exit_code, bool) or exit_code != 0
+            or duration_value != unit.measured_seconds or omit_value is None
+            or native_duration != duration_value or native_omit != omit_value
+            or str(settings.get("protocol", "")).upper() != "TCP"
+            or _option(argv, "-P") != str(unit.streams or 1)
+            or native_streams != (unit.streams or 1)):
+        return False
+    if acquisition.get(unit.unit_id, ([], []))[1]:
+        return False
+    cookie = start.get("cookie")
+    observed = verified_origins.get(cookie) if isinstance(cookie, str) else None
+    if not isinstance(observed, dict):
+        return False
+    required = observed.get("nominal_required_seconds")
+    span = observed.get("nominal_receiver_span_seconds")
+    stream_count = observed.get("stream_count")
+    origin_utc = observed.get("origin_utc")
+    crossing_cutoff = observed.get("crossing_start_cutoff_us")
+    if (isinstance(required, bool) or not isinstance(required, int)
+            or required != duration_value + omit_value
+            or isinstance(span, bool) or not isinstance(span, (int, float))
+            or not math.isfinite(span) or span < required
+            or isinstance(stream_count, bool) or stream_count != native_streams
+            or isinstance(origin_utc, bool) or not isinstance(origin_utc, (int, float))
+            or not math.isfinite(origin_utc)
+            or isinstance(crossing_cutoff, bool) or not isinstance(crossing_cutoff, int)
+            or crossing_cutoff < 0):
+        return False
+    return True
+
+
 def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativeParse | None,
-              acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None) -> dict[str, Any]:
+              acquisition: dict[str, tuple[list[tuple[str, float, float]], list[str]]] | None = None,
+              verified_iperf_origins: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     requested = unit.measured_seconds
     unit_timings = [t for t in value.timings if t.unit_id == unit.unit_id]
     timing = unit_timings[0] if len(unit_timings) == 1 else None
@@ -1312,6 +1943,9 @@ def _coverage(value: ValidatorInput, unit: Any, sock: NativeParse, tcp: NativePa
     tcp_stats = _tcp_statistics(tcp) if tcp else None
     observed = tcp_stats["measured_seconds"].value if tcp_stats else None
     full_duration = observed is not None and observed >= requested
+    if not full_duration and _iperf_nominal_completion_proven(value, unit, tcp, acquisition or {},
+            verified_iperf_origins or {}):
+        full_duration = True
     if unit.kind == "continuous_day":
         measured = sorted((item for item in (tcp.receiver_intervals if tcp else ()) if not item.omitted),
                           key=lambda item: (item.session_id, item.start_seconds, item.line))
@@ -1480,6 +2114,14 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     findings, records, provenance = _validate_artifacts(value)
     findings.extend(_validate_materialized_records(value, records))
     findings.extend(_validate_manifests(value))
+    control_association, control_suppressions = _replayed_iperf3_control_association(value)
+    if control_association is not None and control_association.get("status") == "verified":
+        for name in ("readiness_cookie", "server_interrupt"):
+            row = control_association[name]
+            findings.append(_finding(f"control.iperf3.{name}", "info",
+                f"{row['classification']} in closed VM B log bytes {row['byte_start']}:{row['byte_end']} "
+                f"(lines {row['error_line']}-{row['end_line']}); source SHA-256 {control_association['raw_sha256']}",
+                artifact=control_association["artifact_id"]))
     resolved_findings, resolved_obj = _resolved_snapshot_findings(value)
     findings.extend(resolved_findings)
     findings.extend(_command_findings(value))
@@ -1501,15 +2143,13 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     for unit in value.measurement_units:
         unit_origins = verified_origins_by_unit.get(unit.unit_id, {})
         if unit_origins:
-            sock, tcp = _parse_unit(value, unit, records, unit_origins)
+            sock, tcp = _parse_unit(value, unit, records, unit_origins, control_suppressions)
         else:
-            sock, tcp = _parse_unit(value, unit, records)
+            sock, tcp = _parse_unit(value, unit, records, control_suppressions=control_suppressions)
         if value.mode in {ExperimentMode.ACCEPTANCE, ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION}:
             parsed_sock[unit.unit_id] = NativeParse(probe_counts=sock.probe_counts, findings=sock.findings,
                 source=sock.source, sessions=sock.sessions)
         findings.extend(sock.findings)
-        if tcp:
-            findings.extend(tcp.findings)
         measured_samples = _measured_samples(value, unit, sock, acquisition)
         rtt = rtt_statistics([s.rtt_us for s in measured_samples])
         tcp_stats = _tcp_statistics(tcp)
@@ -1538,7 +2178,10 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
             for item in sock.probe_counts
         ):
             findings.append(_finding("generation.unavailable", "warning", "valid-duration sent/runtime evidence is unavailable", unit=unit.unit_id))
-        coverage = _coverage(value, unit, sock, tcp, acquisition)
+        coverage = _coverage(value, unit, sock, tcp, acquisition, unit_origins)
+        tcp = _qualify_receiver_total_mismatch(value, unit, tcp, coverage, acquisition, unit_origins)
+        if tcp:
+            findings.extend(tcp.findings)
         if sock.samples or (tcp and (tcp.receiver_intervals or tcp.receiver_totals)):
             any_measurement = True
         if not coverage["complete"]:
@@ -1601,12 +2244,13 @@ def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> Validat
     idle_unit = next((unit for unit in units_payload if unit["phase"] == "idle_latency"), None)
     idle_id = idle_unit["unit_id"] if idle_unit else None
     idle_findings = [finding for finding in findings if finding.unit_id in {None, idle_id}]
-    idle_valid = bool(idle_unit and idle_unit["coverage"]["complete"] and not idle_findings)
+    idle_valid = bool(idle_unit and idle_unit["coverage"]["complete"]
+                      and not _has_degrading_findings(idle_findings))
     idle_median = idle_unit["rtt"]["median_us"].value if idle_valid else None
     for unit in units_payload:
         unit_findings = [finding for finding in findings if finding.unit_id in {None, unit["unit_id"]}]
         unit["data_validity"] = ("invalid" if any(f.severity == "error" for f in unit_findings)
-                                 else "partial" if unit_findings or not unit["coverage"]["complete"]
+                                 else "partial" if _has_degrading_findings(unit_findings) or not unit["coverage"]["complete"]
                                  else "valid" if unit["sample_count"] or unit["receiver_interval_count"]
                                  else "unavailable")
         phase = unit["phase"]

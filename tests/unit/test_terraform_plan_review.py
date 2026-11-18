@@ -24,10 +24,19 @@ def scope(provider, root, scenario="same_zone"):
     if provider == "gcp":
         v = dict(project_id="review-project", zone_a="europe-north1-a", zone_b="europe-north1-a")
         if root == "pair":
-            v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102")
+            if scenario == "inter_region":
+                v.update(zone_a="europe-west3-a", zone_b="europe-west2-a")
+            v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102", scenario=scenario)
             r = {"terraform_data.scope_guard": {"input": v["project_id"]}}
-            for role in ("a", "b"):
-                r["google_compute_instance_from_template.vm_" + role] = {"project": v["project_id"], "zone": v["zone_" + role], "name": v["name_" + role], "source_instance_template": v["template_" + role]}
+            namespace = "scope"
+            ips = ("10.80.1.10", "10.81.1.11") if scenario == "inter_region" else ("10.80.1.10", "10.80.1.11")
+            for i, role in enumerate(("a", "b")):
+                region = "-".join(v["zone_" + role].split("-")[:-1])
+                suffix = "b" if role == "b" and scenario == "inter_region" else "a"
+                nic = {"network": f"projects/{v['project_id']}/global/networks/{namespace}-net",
+                       "subnetwork": f"projects/{v['project_id']}/regions/{region}/subnetworks/{namespace}-{suffix}",
+                       "network_ip": ips[i], "nic_type": "GVNIC", "access_config": [{"nat_ip": None, "network_tier": "PREMIUM", "public_ptr_domain_name": None}]}
+                r["google_compute_instance_from_template.vm_" + role] = {"project": v["project_id"], "zone": v["zone_" + role], "name": v["name_" + role], "source_instance_template": v["template_" + role], "network_interface": [nic]}
             return v, r
         v.update(namespace="scope", scenario=scenario, controller_cidr="203.0.113.4/32", public_key="fixture-public-key", labels={"cnb-run": "run", "cnb-deploy": "deploy"}, expiry_time="2026-11-14T00:20:00Z", image_a="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", image_b="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105")
         if scenario == "inter_region": v["zone_b"] = "europe-west2-a"
@@ -75,6 +84,13 @@ def test_all_four_roots_have_exact_fresh_scope(provider, root):
     assert len(checked) == len(resources)
 
 
+@pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization", "inter_region"])
+def test_gcp_pair_review_pins_role_specific_template_addresses_and_networks(scenario):
+    v, resources = scope("gcp", "pair", scenario)
+    checked = tp.validate_scope(plan_document(v, resources, "gcp"), "gcp", ROOT/"terraform/gcp/pair", v)
+    assert len(checked) == len(resources)
+
+
 @pytest.mark.parametrize("scenario,count", [("same_zone",8),("cross_zone",8),("placement_optimization",9),("inter_region",9)])
 def test_gcp_protection_scenario_scope(scenario,count):
     v,r = scope("gcp","protection",scenario)
@@ -107,6 +123,9 @@ def test_rejects_unreviewable_resource_or_input_changes(mutation):
     ("aws","safety","aws_iam_role_policy.expiry",("policy",),'{"Statement":[]}'),
     ("gcp","pair","google_compute_instance_from_template.vm_b",("source_instance_template",),"foreign"),
     ("gcp","pair","google_compute_instance_from_template.vm_a",("project",),"foreign"),
+    ("gcp","pair","google_compute_instance_from_template.vm_a",("network_interface",0,"network_ip"),"10.80.1.3"),
+    ("gcp","pair","google_compute_instance_from_template.vm_b",("network_interface",0,"subnetwork"),"projects/review-project/regions/europe-north1/subnetworks/scope-b"),
+    ("gcp","pair","google_compute_instance_from_template.vm_a",("network_interface",0,"access_config"),[{},{}]),
     ("gcp","protection",'google_compute_instance_template.role["vm_a"]',("disk",0,"disk_size_gb"),64),
     ("gcp","protection",'google_compute_instance_template.role["vm_a"]',("scheduling",0,"instance_termination_action"),"DELETE"),
     ("gcp","protection",'google_compute_instance_template.role["vm_a"]',("scheduling",0,"termination_time"),"later"),

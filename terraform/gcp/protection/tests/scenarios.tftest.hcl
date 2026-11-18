@@ -81,6 +81,30 @@ run "reject_finland_image_alias" {
   expect_failures = [terraform_data.scope_guard]
 }
 
+run "finland_same_zone_b" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-b"
+    zone_b = "europe-north1-b"
+  }
+  assert {
+    condition     = google_compute_subnetwork.a.region == "europe-north1" && google_compute_instance_template.role["vm_a"].machine_type == "n2-standard-4"
+    error_message = "approved Finland B pair keeps the regional network and selected VM shape"
+  }
+}
+
+run "finland_same_zone_c" {
+  command = plan
+  variables {
+    zone_a = "europe-north1-c"
+    zone_b = "europe-north1-c"
+  }
+  assert {
+    condition     = google_compute_subnetwork.a.region == "europe-north1" && google_compute_instance_template.role["vm_b"].machine_type == "n2-standard-4"
+    error_message = "approved Finland C pair keeps the regional network and selected VM shape"
+  }
+}
+
 run "cross_zone" {
   command = plan
   variables {

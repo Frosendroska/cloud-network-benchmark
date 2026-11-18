@@ -1,6 +1,7 @@
 import json
 import hashlib
 import shutil
+from types import SimpleNamespace
 from datetime import timedelta
 from pathlib import Path
 
@@ -10,8 +11,11 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from cloud_network_benchmark.errors import CollisionError, PersistenceError, ValidationError
 from cloud_network_benchmark.contracts import FailureEvidence, ScheduleEntry, StringEvidence
+from cloud_network_benchmark.contracts.admission import ReservationEvidence
+from cloud_network_benchmark.contracts.common import Evidence
 from cloud_network_benchmark.manifests import (
     CampaignManifest,
+    ChildRunManifest,
     RepositoryGitProvenance,
     StaticGitProvenance,
     initialize_campaign,
@@ -19,6 +23,7 @@ from cloud_network_benchmark.manifests import (
     update_child_evidence,
     update_child_execution,
 )
+from cloud_network_benchmark.lifecycle_projection import _sync_manifest
 from cloud_network_benchmark.contracts import StructuredEvidence
 
 
@@ -260,6 +265,39 @@ def test_atomic_updates_preserve_execution_and_cleanup_failures(repository_root:
     parent = json.loads(Path(result.parent_manifest_path).read_text())
     assert parent["aggregate_state"] == "partially_complete"
     assert len(parent["lifecycle_events"]) == 4
+
+
+def test_projection_finalizes_pre_outcome_claim_failure_before_later_cleanup(repository_root: Path,
+        tmp_path: Path, frozen_clock: object, deterministic_token: object,
+        fake_git_commits: dict[str, str]) -> None:
+    initialized = initialize(repository_root, tmp_path / "projection-results", frozen_clock,
+        deterministic_token, fake_git_commits)
+    child_reference = initialized.children[0]
+    child = ChildRunManifest.model_validate_json(Path(child_reference.manifest_path).read_text())
+    start = frozen_clock()
+    failed_at = start + timedelta(seconds=10)
+    cleanup_started = failed_at + timedelta(microseconds=1)
+    cleanup_finished = cleanup_started + timedelta(seconds=5)
+    reservation = ReservationEvidence(schema_version=2, campaign_id=child.campaign_id,
+        reservation_id=Evidence[str](value="projection-reservation"), state="reserved",
+        reserved_cost_usd=Evidence[float](value=0.0), cap_started_at=Evidence(value=start),
+        expires_at=Evidence(value=start + timedelta(seconds=1200)),
+        cap_start_policy_id=StringEvidence(value="offline-projection-fixture"),
+        source_path="offline-fixture.json", source_sha256="a" * 64)
+    result = SimpleNamespace(execution_state="failed", cleanup_state="succeeded",
+        interrupted=False, primary_failure="aws claim failed (TimeoutError)", values={},
+        stage_times={
+            "claim": {"started_at": start + timedelta(seconds=9), "finished_at": failed_at},
+            "cleanup": {"started_at": cleanup_started, "finished_at": cleanup_finished},
+        })
+    updated = _sync_manifest(parent_path=Path(initialized.parent_manifest_path),
+        child_path=Path(child_reference.manifest_path), root=Path(child_reference.result_path),
+        child=child, result=result, reservation=reservation, evaluated_at=cleanup_finished)
+    assert updated.execution_state == "failed"
+    assert updated.cleanup_state == "succeeded"
+    assert updated.failure.occurred_at == failed_at
+    assert updated.lifecycle_events[-2].occurred_at == cleanup_started
+    assert updated.lifecycle_events[-1].occurred_at == cleanup_finished
 
 
 def test_atomic_evidence_update_replaces_unavailable_values(repository_root: Path, tmp_path: Path, frozen_clock: object, deterministic_token: object, fake_git_commits: dict[str, str]) -> None:

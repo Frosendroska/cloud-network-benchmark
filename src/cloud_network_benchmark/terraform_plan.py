@@ -173,8 +173,32 @@ def _aws_scope(r: dict, root: Path, v: dict) -> None:
 def _gcp_scope(r: dict, root: str, v: dict) -> None:
     _same(r["terraform_data.scope_guard"].get("input"), v["project_id"], "project guard")
     if root == "pair":
+        if v.get("scenario") not in {"same_zone", "cross_zone", "placement_optimization", "inter_region"}:
+            raise PlanReviewError("GCP pair scenario is missing or unsupported")
+        namespace = v["name_a"][:-2] if v["name_a"].endswith("-a") else ""
+        if not namespace:
+            raise PlanReviewError("GCP pair A name does not provide the selected resource namespace")
+        region_a = "-".join(v["zone_a"].split("-")[:-1])
+        region_b = "-".join(v["zone_b"].split("-")[:-1])
+        ips = ("10.80.1.10", "10.81.1.11") if v["scenario"] == "inter_region" else ("10.80.1.10", "10.80.1.11")
+        network = f"projects/{v['project_id']}/global/networks/{namespace}-net"
         for role in ("a", "b"):
-            _fields(r[f"google_compute_instance_from_template.vm_{role}"], {"project": v["project_id"], "name": v[f"name_{role}"], "zone": v[f"zone_{role}"], "source_instance_template": v[f"template_{role}"]}, f"GCP VM {role}")
+            resource = r[f"google_compute_instance_from_template.vm_{role}"]
+            _fields(resource, {"project": v["project_id"], "name": v[f"name_{role}"], "zone": v[f"zone_{role}"], "source_instance_template": v[f"template_{role}"]}, f"GCP VM {role}")
+            expected_region = region_a if role == "a" else region_b
+            subnet_suffix = "a" if role == "a" or v["scenario"] != "inter_region" else "b"
+            nic = resource.get("network_interface", [])
+            if not isinstance(nic, list) or len(nic) != 1 or not isinstance(nic[0], dict):
+                raise PlanReviewError(f"GCP VM {role} must have exactly one reviewed network interface")
+            _fields(nic[0], {"network": network,
+                             "subnetwork": f"projects/{v['project_id']}/regions/{expected_region}/subnetworks/{namespace}-{subnet_suffix}",
+                             "network_ip": ips[0 if role == "a" else 1], "nic_type": "GVNIC"}, f"GCP VM {role} network interface")
+            access = nic[0].get("access_config", [])
+            if (not isinstance(access, list) or len(access) != 1 or not isinstance(access[0], dict) or
+                    access[0].get("nat_ip") not in (None, "") or
+                    access[0].get("network_tier") not in (None, "PREMIUM") or
+                    set(access[0]) - {"nat_ip", "network_tier", "public_ptr_domain_name"}):
+                raise PlanReviewError(f"GCP VM {role} must request exactly one ephemeral external IPv4 access config")
         return
     for address, a in r.items():
         if address.startswith("google_compute_"):

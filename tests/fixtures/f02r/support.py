@@ -46,10 +46,10 @@ class BootstrapRunner:
             tool=aid.rsplit("-",1)[-1]
             port=11111 if tool=="sockperf" else 5201
             args=f"server -i 10.0.0.2 -p {port}" if tool=="sockperf" else f"-s -B 10.0.0.2 -p {port} --json-stream --forceflush"
-            out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
+            out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {args}; }}\nStandardOutput=append:/var/lib/cnb/results/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/results/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
         elif "listener-config-" in aid:
             tool=aid.rsplit("-",1)[-1]
-            out=f"# /run/systemd/transient/cnb-campaign-aws-deployment-{tool}.service\n[Service]\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\n"
+            out=f"# /run/systemd/transient/cnb-campaign-aws-deployment-{tool}.service\n[Service]\nStandardOutput=append:/var/lib/cnb/results/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/results/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\n"
         elif "listener-process-" in aid:
             tool=aid.rsplit("-",1)[-1]; pid=20 if tool=="sockperf" else 21
             out=f"/var/lib/cnb/install/bin/{tool}\n"+"c"*64+f" /proc/{pid}/exe"
@@ -58,7 +58,7 @@ class BootstrapRunner:
             if not self.existing_listeners: out="LoadState=not-found\n"
             else:
                 port=11111 if tool=="sockperf" else (5202 if self.mismatched_listener else 5201)
-                out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {'server -i 10.0.0.2 -p '+str(port) if tool=='sockperf' else '-s -B 10.0.0.2 -p '+str(port)+' --json-stream --forceflush'}; }}\nStandardOutput=append:/var/lib/cnb/work/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/work/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
+                out=f"LoadState=loaded\nActiveState=active\nMainPID={20 if tool=='sockperf' else 21}\nExecStart={{ path=/var/lib/cnb/install/bin/{tool}; argv[]=/var/lib/cnb/install/bin/{tool} {'server -i 10.0.0.2 -p '+str(port) if tool=='sockperf' else '-s -B 10.0.0.2 -p '+str(port)+' --json-stream --forceflush'}; }}\nStandardOutput=append:/var/lib/cnb/results/{'server-logs/sockperf.log' if tool=='sockperf' else 'server-logs/iperf3-server.jsonl'}\nStandardError=append:/var/lib/cnb/results/{'server-logs/sockperf.err' if tool=='sockperf' else 'server-logs/iperf3-server.err'}\nRestart=no\n"
         elif "acl" in aid and "inspect" in aid:
             if self.existing_acl or self.created_acl: out=nft_listing("campaign-aws-deployment", numeric_priority=" -y " in request.argv[-1])
             else: return result(aid,success=False,stderr="No such file or directory")
@@ -68,6 +68,7 @@ class BootstrapRunner:
         elif aid.endswith("-6") and any(f"-{tool}-6" in aid for tool in ("sockperf","iperf3")): out="sockperf version 3.10" if "sockperf" in aid else "iperf3 version 3.17"
         elif aid.endswith("-7") and any(f"-{tool}-7" in aid for tool in ("sockperf","iperf3")): out="c"*64+f" /var/lib/cnb/install/bin/{'sockperf' if 'sockperf' in aid else 'iperf3'}"
         elif aid.endswith("-8") and any(f"-{tool}-8" in aid for tool in ("sockperf","iperf3")): out=("Usage: sockperf [options]\nserver under-load" if "sockperf" in aid else "Usage: iperf3 [options]\n-s -c -B -p -P -t -O -i -l -C cubic -Z -J --get-server-output --json-stream --forceflush")
+        elif request.argv and request.argv[-1].startswith("python3 -c "): out="CNB_TCP_CONGESTION=cubic"
         elif aid.endswith("-9") and "sockperf" in aid: out="Usage: sockperf server -i -p"
         elif aid.endswith("-10") and "sockperf" in aid: out="Usage: sockperf under-load -i -p -m --mps --reply-every --full-rtt --no-rdtsc --full-log -t"
         elif "listener-" in aid: out="Active: active (running)"

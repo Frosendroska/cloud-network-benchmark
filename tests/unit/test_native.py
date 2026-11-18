@@ -8,6 +8,7 @@ import pytest
 
 from cloud_network_benchmark.native import (
     ReceiverInterval, SourceRef, parse_iperf3, parse_sockperf, receiver_statistics, rtt_statistics,
+    unique_receiver_total,
 )
 
 
@@ -66,6 +67,31 @@ def test_iperf3_receiver_is_authoritative_and_final_total_is_not_added():
     assert stats["throughput_gbps"].value == 1.0
 
 
+def test_iperf3_collapses_exact_client_final_total_aliases(tmp_path):
+    path = tmp_path / "client-aliases.json"
+    final = {"sum_received":{"bytes":12_266_110_976,"seconds":9.999802,"sender":False}}
+    path.write_text(json.dumps({"end":final,"server_output_json":{"end":final}}))
+    parsed = parse_iperf3(path, source=source(path, "iperf3-client"), format="json")
+    assert len(parsed.receiver_totals) == 1
+    assert unique_receiver_total(parsed.receiver_totals)["bytes"] == 12_266_110_976
+    assert unique_receiver_total(parsed.receiver_totals)["seconds"] == 9.999802
+
+
+@pytest.mark.parametrize("second", [
+    {"sum_received":{"bytes":12_266_110_975,"seconds":9.999802,"sender":False}},
+    {"sum_received":{"bytes":12_266_110_976,"seconds":9.999803,"sender":False}},
+])
+def test_iperf3_conflicting_final_aliases_are_fatal_not_interval_fallback(tmp_path, second):
+    path = tmp_path / "client-conflict.json"
+    first = {"sum_received":{"bytes":12_266_110_976,"seconds":9.999802,"sender":False}}
+    path.write_text(json.dumps({"end":first,"server_output_json":{"end":second}}))
+    parsed = parse_iperf3(path, source=source(path, "iperf3-client"), format="json")
+    assert len(parsed.receiver_totals) == 2
+    assert unique_receiver_total(parsed.receiver_totals) is None
+    assert any(item.code == "native.iperf3.total_conflict" and item.severity == "error"
+        for item in parsed.findings)
+
+
 def test_iperf3_sender_only_is_not_receiver_evidence():
     path = FIXTURES / "iperf3-sender-only.json"
     parsed = parse_iperf3(path, source=source(path), format="json")
@@ -97,6 +123,32 @@ def test_iperf3_multiple_sessions_are_kept_separate_and_not_silently_combined(tm
     parsed = parse_iperf3(path, source=SourceRef("iperf3", path.name, "0" * 64), format="jsonl")
     assert [item.session_id for item in parsed.receiver_intervals] == ["1", "2"]
     assert any(item.code == "native.iperf3.multiple_sessions" for item in parsed.findings)
+
+
+def test_iperf3_orphan_end_events_do_not_create_or_overwrite_sessions(tmp_path):
+    path = tmp_path / "orphan-ends.jsonl"
+    interval = {"sum": {"start": 5, "end": 6, "seconds": 1, "bytes": 125000000, "sender": False}}
+    actual_end = {"sum_received": {"bytes": 125000000, "seconds": 1}}
+    path.write_text("\n".join(json.dumps(item) for item in [
+        {"event": "error", "data": "error - unable to receive cookie at server: "},
+        {"event": "end", "data": {}},
+        {"event": "start", "data": {"cookie": "measured-session"}},
+        {"event": "interval", "data": interval},
+        {"event": "end", "data": actual_end},
+        {"event": "error", "data": "interrupt - the server has terminated"},
+        {"event": "end", "data": {}},
+    ]) + "\n", encoding="utf-8")
+
+    parsed = parse_iperf3(path, source=source(path), format="jsonl")
+
+    assert parsed.sessions == ("1",)
+    assert [item.session_id for item in parsed.receiver_intervals] == ["1"]
+    assert parsed.session_details == ({"session_id": "1", "start": {"cookie": "measured-session"},
+        "end": actual_end},)
+    orphan_events = [item for item in parsed.findings if item.code == "native.iperf3.event"]
+    assert len(orphan_events) == 2
+    assert all(item.severity == "error" for item in orphan_events)
+    assert sum(item.code == "native.iperf3.error" for item in parsed.findings) == 2
 
 
 @pytest.mark.parametrize(("filename", "finding", "intervals"), [

@@ -73,6 +73,7 @@ class ValidatorInput(StrictModel):
     vm_metadata: StructuredEvidence
     provider_metadata: StructuredEvidence
     tool_versions: StructuredEvidence
+    iperf3_control_evidence: StructuredEvidence = Field(default_factory=lambda: StructuredEvidence(unavailable_reason="not captured"))
     implementation_git_commit: StringEvidence
     design_git_commit: StringEvidence
     implementation_git: GitSnapshot = Field(default_factory=lambda: GitSnapshot(commit=StringEvidence(unavailable_reason="not supplied"), dirty=Evidence[bool](unavailable_reason="not supplied"), diff_sha256=StringEvidence(unavailable_reason="not supplied")))

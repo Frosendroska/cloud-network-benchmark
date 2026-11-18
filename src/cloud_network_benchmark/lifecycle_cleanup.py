@@ -93,16 +93,56 @@ class CleanupClock:
 def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     deployment = saved.deployment
     if saved.provider == Provider.AWS:
-        from .providers import aws
-        settings = __import__("cloud_network_benchmark.providers.aws", fromlist=["AwsRuntimeSettings"]).AwsRuntimeSettings.model_validate(saved.settings)
+        settings = _aws_cleanup_settings(saved.settings)
         return settings.private_state_root / saved.expiry_request.resource_namespace / deployment.run_id / deployment.deployment_id / "attempt.json"
     if saved.provider == Provider.GCP:
-        settings = __import__("cloud_network_benchmark.providers.gcp", fromlist=["GcpRuntimeSettings"]).GcpRuntimeSettings.model_validate(saved.settings)
+        settings = _gcp_cleanup_settings(saved.settings)
         prefix = hashlib.sha256(deployment.run_id.encode()).hexdigest()[:12]
         return settings.private_state_root / prefix / deployment.run_id / deployment.deployment_id / "attempt.json"
     from .azure_provider import AzureRuntimeOptions
     options = AzureRuntimeOptions.model_validate(saved.settings)
     return options.attempt_root / "recovery.json"
+
+
+def _aws_cleanup_settings(value: dict[str, Any]):
+    """Validate saved AWS settings, adapting only the retired cleanup snapshot shape."""
+    from .providers.aws import AwsRuntimeSettings
+
+    settings = dict(value)
+    phase_fields = {"post_registration_workflow_seconds", "post_provision_workflow_seconds"}
+    missing = phase_fields - settings.keys()
+    if missing:
+        if missing != phase_fields:
+            raise ValueError("historical AWS cleanup settings omit only part of the phase allowance snapshot")
+        remaining = settings.get("complete_workflow_remaining_seconds")
+        if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining <= 0:
+            raise ValueError("historical AWS cleanup settings lack their original complete-workflow remainder")
+        # These launch-only values are deliberately equal: the strict registration
+        # invariant rejects the adapted model if anyone accidentally reuses it to launch.
+        settings.update({key: remaining for key in phase_fields})
+    return AwsRuntimeSettings.model_validate(settings)
+
+
+def _gcp_cleanup_settings(value: dict[str, Any]):
+    """Adapt older GCP cleanup snapshots conservatively without reducing their fit allowance."""
+    from math import isfinite
+    from .providers.gcp import GcpRuntimeSettings
+
+    settings = dict(value)
+    phase_fields = {"registration_workflow_seconds", "post_registration_workflow_seconds"}
+    missing = phase_fields - settings.keys()
+    if missing:
+        if missing != phase_fields:
+            raise ValueError("historical GCP cleanup settings omit only part of the phase allowance snapshot")
+        remaining = settings.get("complete_workflow_remaining_seconds")
+        if (isinstance(remaining, bool) or not isinstance(remaining, (int, float))
+                or not isfinite(float(remaining)) or remaining <= 0):
+            raise ValueError("historical GCP cleanup settings lack their original complete-workflow remainder")
+        # Retain the full allowance as future work so this adapted snapshot
+        # cannot understate the remainder if reused for registration/provision.
+        settings.update({"registration_workflow_seconds": 0.0,
+            "post_registration_workflow_seconds": float(remaining)})
+    return GcpRuntimeSettings.model_validate(settings)
 
 
 def _validate_request(saved: SavedProviderCleanupSettings) -> None:
@@ -111,8 +151,8 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
     if r.expires_at.value != reservation.expires_at.value - timedelta(seconds=saved.provider_lead_seconds):
         raise ValueError("saved provider expiry request no longer matches its original F11 lead")
     if saved.provider == Provider.AWS:
-        from .providers.aws import AwsProviderDriver, AwsRuntimeSettings, SAFETY_LEAD_SECONDS
-        settings = AwsRuntimeSettings.model_validate(saved.settings)
+        from .providers.aws import AwsProviderDriver, SAFETY_LEAD_SECONDS
+        settings = _aws_cleanup_settings(saved.settings)
         driver = AwsProviderDriver.__new__(AwsProviderDriver); driver.settings = settings
         from .providers.aws import _namespace, _legacy_namespace
         expected_namespaces = {_namespace(d), _legacy_namespace(d)}
@@ -124,8 +164,8 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
                 or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)):
             raise ValueError("saved AWS request target differs from the original deployment")
     elif saved.provider == Provider.GCP:
-        from .providers.gcp import GcpRuntimeSettings, SAFETY_LEAD_SECONDS
-        settings = GcpRuntimeSettings.model_validate(saved.settings)
+        from .providers.gcp import SAFETY_LEAD_SECONDS
+        settings = _gcp_cleanup_settings(saved.settings)
         expected = f"project={settings.project_id};run_id={d.run_id};deployment_id={d.deployment_id};roles=vm_a,vm_b"
         if (r.resource_namespace != d.run_id or r.target_selector != expected or r.action != "stop"
                 or saved.provider_lead_seconds != SAFETY_LEAD_SECONDS
@@ -157,7 +197,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
         if not Path(record.journal_reference).is_file() or Path(record.journal_reference).is_symlink():
             raise ValueError("original AWS recovery journal is unavailable")
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
-        result = AwsProviderDriver(runner, AwsRuntimeSettings.model_validate(saved.settings),
+        result = AwsProviderDriver(runner, _aws_cleanup_settings(saved.settings),
             clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _known_resource_ids(journal)
@@ -166,8 +206,8 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
         except (OSError, json.JSONDecodeError):
             pass
     elif saved.provider == Provider.GCP:
-        from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
-        result = GcpProviderDriver(runner, GcpRuntimeSettings.model_validate(saved.settings),
+        from .providers.gcp import GcpProviderDriver
+        result = GcpProviderDriver(runner, _gcp_cleanup_settings(saved.settings),
             clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
@@ -176,6 +216,8 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
             absent_ids.extend(_nested_resource_ids(state.get("templates", {})))
             absent_ids.extend(_nested_resource_ids(state.get("observed_resources", {})))
             absent_ids.extend(_nested_resource_ids(state.get("observed_disks", [])))
+            namespace = GcpProviderDriver._namespace(d)
+            absent_ids.extend(_verified_orphan_template_ids(state, {f"{namespace}-a", f"{namespace}-b"}))
         except (OSError, json.JSONDecodeError):
             pass
     else:
@@ -205,6 +247,24 @@ def _nested_resource_ids(value: Any) -> list[str]:
     elif isinstance(value, (list, tuple)):
         for item in value: rows.extend(_nested_resource_ids(item))
     return rows
+
+
+def _verified_orphan_template_ids(state: Any, expected_names: set[str]) -> list[str]:
+    recovery = state.get("orphan_template_recovery") if isinstance(state, dict) else None
+    if not isinstance(recovery, dict) or recovery.get("absence_verified") is not True:
+        return []
+    deleted = recovery.get("deleted")
+    if not isinstance(deleted, list) or len(deleted) != 2 or any(not isinstance(item, dict) for item in deleted):
+        return []
+    names = [item.get("name") for item in deleted]
+    if not all(isinstance(name, str) for name in names) or set(names) != expected_names:
+        return []
+    identities = [item.get("id") for item in deleted if isinstance(item, dict)]
+    if len(identities) != 2 or any(not isinstance(value, str) or not value.isdigit() for value in identities):
+        return []
+    if len(set(identities)) != 2:
+        return []
+    return identities
 
 
 def _journal_ids(path: Path, key: str) -> list[str]:
@@ -336,10 +396,13 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
     elif saved.provider == Provider.AWS:
         absent_ids = _known_resource_ids(journal) + _nested_resource_ids(state.get("safety", {}))
     elif saved.provider == Provider.GCP:
+        from .providers.gcp import GcpProviderDriver
         absent_ids = (_journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
             + _nested_resource_ids(state.get("templates", {}))
             + _nested_resource_ids(state.get("observed_resources", {}))
-            + _nested_resource_ids(state.get("observed_disks", [])))
+            + _nested_resource_ids(state.get("observed_disks", []))
+            + _verified_orphan_template_ids(state, {f"{GcpProviderDriver._namespace(saved.deployment)}-a",
+                                                   f"{GcpProviderDriver._namespace(saved.deployment)}-b"}))
     else:
         absent_ids = [value for value in state.get("vm_ids", ()) if isinstance(value, str)]
         prereq = state.get("expiry", {})
@@ -436,7 +499,7 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> 
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             elif saved.provider == Provider.GCP:
-                from .providers.gcp import GcpCleanupResult
+                from .providers.gcp import GcpCleanupResult, GcpProviderDriver
                 result = GcpCleanupResult.model_validate(receipt["cleanup_result"])
                 journal = _expected_journal(saved)
                 state = json.loads(journal.read_text(encoding="utf-8"))
@@ -444,7 +507,9 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> 
                     + _journal_ids(journal, "observed_disks")
                     + _nested_resource_ids(state.get("templates", {}))
                     + _nested_resource_ids(state.get("observed_resources", {}))
-                    + _nested_resource_ids(state.get("observed_disks", [])))
+                    + _nested_resource_ids(state.get("observed_disks", []))
+                    + _verified_orphan_template_ids(state, {f"{GcpProviderDriver._namespace(saved.deployment)}-a",
+                                                           f"{GcpProviderDriver._namespace(saved.deployment)}-b"}))
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             else:

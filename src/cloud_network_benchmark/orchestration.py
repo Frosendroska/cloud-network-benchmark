@@ -496,12 +496,6 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
         if isinstance(value, Mapping):
             inventory = value.get("inventory", inventory)
         inventory_proves_absence = False
-        def empty_inventory(value: Any) -> bool:
-            if isinstance(value, Mapping):
-                return all(empty_inventory(item) for item in value.values())
-            if isinstance(value, (list, tuple, set)):
-                return len(value) == 0
-            return value in (None, False, {}, [])
         if provider == "aws" and isinstance(inventory, Mapping):
             safety = inventory.get("safety_absent")
             regions = inventory.get("regions")
@@ -509,7 +503,8 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
                 and isinstance(safety, Mapping) and bool(safety) and all(item is True for item in safety.values())
                 and isinstance(regions, Mapping) and bool(regions)
                 and all(isinstance(item, Mapping) and item.get("complete") is True
-                        and empty_inventory(item.get("resources")) for item in regions.values()))
+                        and isinstance(item.get("remaining"), Mapping) and not item["remaining"]
+                        for item in regions.values()))
         elif provider == "gcp" and isinstance(inventory, Mapping):
             inventory_proves_absence = (inventory.get("pages_complete") is True
                 and inventory.get("zone_scope") == "all_project_zones"
@@ -574,8 +569,8 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
 
 
 def _stage_budget_name(stage: str) -> str:
-    return {"protect":"registration", "claim":"registration", "create":"preparation",
-        "prepare":"preparation", "stabilize":"preparation", "measure":"measurement",
+    return {"protect":"registration", "claim":"preparation", "create":"preparation",
+        "prepare":"post_provision", "stabilize":"stabilization", "measure":"measurement",
         "close":"retrieval", "retrieve":"retrieval", "cleanup":"cleanup"}[stage]
 
 
@@ -585,6 +580,8 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
     completed = {
         "registration": (),
         "preparation": ("registration",),
+        "post_provision": ("registration", "provision"),
+        "stabilization": ("registration", "provision", "readiness"),
         "measurement": ("registration", "preparation"),
         "retrieval": ("registration", "preparation", "measurement"),
     }
@@ -593,6 +590,8 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
     fields = {
         "registration": (),
         "preparation": ("registration_seconds",),
+        "post_provision": ("registration_seconds", "provision_seconds"),
+        "stabilization": ("registration_seconds", "provision_seconds", "readiness_seconds"),
         "measurement": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"),
         "retrieval": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
                       "measurement_seconds", "measurement_shutdown_seconds"),
@@ -916,6 +915,8 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                 stage_remainders={
                     "registration": allowance.registration_seconds,
                     "preparation": allowance.preparation_seconds,
+                    "post_provision": _remaining_f11_allowance(allowance, "post_provision").total_seconds,
+                    "stabilization": _remaining_f11_allowance(allowance, "stabilization").total_seconds,
                     "measurement": allowance.measurement_seconds+allowance.measurement_shutdown_seconds,
                     "retrieval": allowance.retrieval_seconds,
                     "cleanup": allowance.cleanup_seconds,
@@ -926,7 +927,15 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
                 or abs(context.cap_deadline_monotonic-(cap_start+cap_seconds)) > 1e-6
                 or abs(context.lifetime_cap_seconds-cap_seconds) > 1e-6):
             raise ValueError("caller lifecycle context does not match the original F11 reservation")
-        context = __import__("dataclasses").replace(context, provider_trigger_monotonic=provider_trigger)
+        stage_remainders = dict(context.stage_remainders)
+        stage_remainders["preparation"] = max(stage_remainders.get("preparation", 0.0),
+                                                allowance.preparation_seconds)
+        stage_remainders["post_provision"] = max(stage_remainders.get("post_provision", 0.0),
+            _remaining_f11_allowance(allowance, "post_provision").total_seconds)
+        stage_remainders["stabilization"] = max(stage_remainders.get("stabilization", 0.0),
+            _remaining_f11_allowance(allowance, "stabilization").total_seconds)
+        context = __import__("dataclasses").replace(context, provider_trigger_monotonic=provider_trigger,
+                                                     stage_remainders=stage_remainders)
     except (KeyError, TypeError, ValueError) as exc:
         return initialization_failed("reserved_timing_invalid",
             f"reserved attempt timing is unavailable or inconsistent ({type(exc).__name__})")

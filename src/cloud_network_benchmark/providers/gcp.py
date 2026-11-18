@@ -12,7 +12,7 @@ import uuid
 from threading import local
 import time
 from datetime import datetime, timedelta, timezone
-from math import isfinite
+from math import isclose, isfinite
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlparse
@@ -30,7 +30,7 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {
     "europe-west3": ("europe-west3-a", "europe-west3-b"),
     "europe-west2": ("europe-west2-a",),
-    "europe-north1": ("europe-north1-a",),
+    "europe-north1": ("europe-north1-a", "europe-north1-b", "europe-north1-c"),
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
@@ -65,6 +65,8 @@ class GcpRuntimeSettings(StrictModel):
     complete_workflow_cost_handoff: StructuredEvidence
     support_cost_evidence: StructuredEvidence
     complete_workflow_remaining_seconds: float = Field(gt=0)
+    registration_workflow_seconds: float = Field(ge=0)
+    post_registration_workflow_seconds: float = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
@@ -94,8 +96,25 @@ class GcpRuntimeSettings(StrictModel):
             raise ValueError("complete workflow estimate must be finite")
         return value
 
+    @field_validator("registration_workflow_seconds")
+    @classmethod
+    def finite_registration_time(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("registration workflow estimate must be finite")
+        return value
+
+    @field_validator("post_registration_workflow_seconds")
+    @classmethod
+    def finite_post_registration_time(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("post-registration workflow estimate must be finite")
+        return value
+
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
+        if not isclose(self.complete_workflow_remaining_seconds - self.post_registration_workflow_seconds,
+                       self.registration_workflow_seconds, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("complete workflow allowance must equal registration plus post-registration work")
         validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
@@ -183,15 +202,16 @@ class GcpProviderDriver:
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         if journal.get("registered"):
             if journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
                 raise GcpProviderError("an earlier controller session cannot reuse registered protection; resolve the attempt through cleanup", category="cleanup_open")
             if journal.get("binding_sha256") != self._binding_fingerprint(deployment):
                 raise GcpProviderError("registered attempt no longer matches its immutable inputs", category="state_identity_mismatch")
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             return ExpiryEvidence.model_validate(journal["expiry"])
         if journal.get("registration_may_have_started"):
             raise GcpProviderError("an earlier interrupted registration cannot be restarted under this attempt", category="cleanup_open")
+        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds, time.monotonic() + max(0.0, (trigger - self.clock()).total_seconds()))
         journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": CONTROLLER_SESSION_ID})
         self._save(attempt, journal)
@@ -223,7 +243,7 @@ class GcpProviderDriver:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise GcpProviderError("registration clock must be timezone-aware", category="cap_order")
             now = now.astimezone(timezone.utc)
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             if not reservation.cap_started_at.value <= now <= trigger:
                 raise GcpProviderError("expiry registration is outside the original reservation window", category="cap_order")
             cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
@@ -276,18 +296,18 @@ class GcpProviderDriver:
             raise GcpProviderError("reservation, project or cost-source identity changed after registration", category="state_identity_mismatch")
         self._assert_no_open_cleanup(deployment)
         trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
         self._verify_registered_templates(journal, trigger, deployment)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
         self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds), time.monotonic() + max(0.0, (trigger-self.clock()).total_seconds()))
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
         try:
             templates = journal["templates"]
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(reservation, trigger, self.settings.post_registration_workflow_seconds)
             pair = self._terraform(attempt, "pair", "apply", deployment, {"template_a": templates["vm_a"]["self_link_unique"], "template_b": templates["vm_b"]["self_link_unique"]})
             values = self._outputs(pair).get("instances", {})
             if set(values) != {"vm_a", "vm_b"} or len({str(item.get("id")) for item in values.values()}) != 2 or len({item.get("name") for item in values.values()}) != 2:
@@ -360,6 +380,7 @@ class GcpProviderDriver:
             if journal.get("registered") or journal.get("registration_may_have_started"):
                 self._terraform(attempt, "protection", "destroy", deployment, {})
             inventory = self._inventory(deployment)
+            inventory = self._recover_interrupted_templates(journal, deployment, inventory)
             if not inventory["pages_complete"] or inventory["resources"]:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
             expiry = journal.get("expiry")
@@ -384,6 +405,111 @@ class GcpProviderDriver:
             self._save(attempt, journal)
             expiry = journal.get("expiry")
             return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure, primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+
+    def _recover_interrupted_templates(self, journal: dict[str, Any], deployment: ProviderDeploymentInput,
+                                       inventory: dict[str, Any]) -> dict[str, Any]:
+        """Delete only both exact templates proven by an interrupted original registration."""
+        if not (journal.get("registration_may_have_started") and not journal.get("registered")
+                and not journal.get("templates")):
+            return inventory
+        reservation = deployment.reservation.value
+        if (not inventory.get("pages_complete") or not isinstance(reservation, ReservationEvidence)
+                or journal.get("binding_sha256") != self._binding_fingerprint(deployment)
+                or journal.get("reservation_id") != reservation.reservation_id.value):
+            return inventory
+        try:
+            cap_start = datetime.fromisoformat(journal["cap_started_at"].replace("Z", "+00:00"))
+            cap_end = datetime.fromisoformat(journal["cap_expires_at"].replace("Z", "+00:00"))
+            trigger = datetime.fromisoformat(journal["trigger"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            return inventory
+        expected_start = reservation.cap_started_at.value
+        expected_end = reservation.expires_at.value
+        if (cap_start.tzinfo is None or cap_end.tzinfo is None or trigger.tzinfo is None
+                or cap_start != expected_start or cap_end != expected_end
+                or trigger != expected_end - timedelta(seconds=SAFETY_LEAD_SECONDS)):
+            return inventory
+        namespace = self._namespace(deployment)
+        expected_names = {f"{namespace}-a", f"{namespace}-b"}
+        templates = [item for item in inventory.get("support_resources", [])
+                     if item.get("selfLink") and "/instanceTemplates/" in str(item["selfLink"])]
+        saved_recovery = journal.get("orphan_template_recovery")
+        new_recovery = saved_recovery is None
+        if saved_recovery is None:
+            if len(templates) != 2 or {item.get("name") for item in templates} != expected_names:
+                return inventory
+            original_ids = {item["name"]: str(self._int64(item.get("id")) or "") for item in templates}
+            if any(not value for value in original_ids.values()) or len(set(original_ids.values())) != 2:
+                return inventory
+            saved_recovery = {"deleted": [{"name": name, "id": original_ids[name]} for name in sorted(expected_names)],
+                              "absence_verified": False}
+        if not isinstance(saved_recovery, dict) or saved_recovery.get("absence_verified") not in {False, True}:
+            return inventory
+        rows = saved_recovery.get("deleted")
+        if not isinstance(rows, list) or len(rows) != 2 or any(not isinstance(item, dict) for item in rows):
+            return inventory
+        original_ids = {item.get("name"): item.get("id") for item in rows}
+        if (set(original_ids) != expected_names or len(set(original_ids.values())) != 2
+                or any(not isinstance(value, str) or not value.isdigit() or value == "0" for value in original_ids.values())):
+            return inventory
+        current = {item.get("name"): item for item in templates}
+        if len(current) != len(templates) or not set(current) <= expected_names:
+            return inventory
+        remaining: list[tuple[str, str]] = []
+        for role, name in (("vm_a", f"{namespace}-a"), ("vm_b", f"{namespace}-b")):
+            item = current.get(name)
+            if item is None:
+                continue
+            template_id = self._int64(item.get("id"))
+            expected_path = f"projects/{self.settings.project_id}/global/instanceTemplates/{name}"
+            if (template_id is None or str(template_id) != original_ids[name]
+                    or self._compute_path(item.get("selfLink")) != expected_path):
+                return inventory
+            unique = f"projects/{self.settings.project_id}/global/instanceTemplates/{name}?uniqueId={template_id}"
+            identity = {"id": str(template_id), "name": name, "zone": deployment.vm_a.zone if role == "vm_a" else deployment.vm_b.zone,
+                        "self_link_unique": unique,
+                        "expected_policy": self._selected_policy_path(deployment) if deployment.scenario == "placement_optimization" else None}
+            described = self._gcloud_json(["compute", "instance-templates", "describe", name,
+                                           "--project", self.settings.project_id, "--format=json"],
+                                          f"gcp-orphan-template-read-{role}")
+            self._validate_template(described, identity, role, deployment, trigger)
+            self._validate_template_created_at(described.get("creationTimestamp"), cap_start, trigger)
+            remaining.append((name, str(template_id)))
+        if new_recovery:
+            journal["orphan_template_recovery"] = saved_recovery
+            self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+        if saved_recovery["absence_verified"] and current:
+            return inventory
+        if not remaining:
+            if inventory.get("pages_complete"):
+                saved_recovery["absence_verified"] = True
+                self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+            return inventory
+        command_failure: Exception | None = None
+        for name, _template_id in remaining:
+            try:
+                result = self._run("gcp-orphan-template-delete",
+                                   [self.settings.gcloud, "compute", "instance-templates", "delete", name,
+                                    "--project", self.settings.project_id, "--quiet"],
+                                   self.settings.private_state_root)
+                if result.outcome != "succeeded" or result.exit_code != 0:
+                    raise GcpProviderError("verified orphan template deletion failed", category="cleanup_incomplete",
+                                           action_id=result.action_id)
+            except Exception as exc:
+                command_failure = exc
+                break
+        after = self._inventory(deployment)
+        inventory.clear()
+        inventory.update(after)
+        remaining = [item for item in after.get("support_resources", []) if item.get("name") in expected_names
+                     and "/instanceTemplates/" in str(item.get("selfLink", ""))]
+        if command_failure is not None:
+            raise command_failure
+        if not after.get("pages_complete") or remaining:
+            raise GcpProviderError("interrupted registration templates remain or absence is unproven", category="cleanup_incomplete")
+        saved_recovery["absence_verified"] = True
+        self._save(self._active_attempt or self._attempt_dir(deployment), journal)
+        return after
 
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
@@ -433,7 +559,8 @@ class GcpProviderDriver:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
         northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
-                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
+                    and deployment.vm_a.zone == deployment.vm_b.zone
+                    and deployment.vm_a.zone in REGION_ZONES["europe-north1"])
         if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
                             and deployment.experiment_id == "EXP-902"):
             raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
@@ -876,7 +1003,7 @@ class GcpProviderDriver:
         elif root == "protection":
             template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
         else:
-            template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
+            template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario}
         template.update(extra)
         serialized_vars = json.dumps(template, sort_keys=True).encode("utf-8")
         self._write_private(vars_path, serialized_vars)
@@ -887,8 +1014,21 @@ class GcpProviderDriver:
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         if root == "pair" and action == "apply":
             trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-            slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
-            self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
+            # post-registration allowance includes this provision stage. Preserve
+            # the downstream reserve after it, while retaining the earlier
+            # absolute provision/command deadline established by provision().
+            provision_allowance = (
+                deployment.provisioning_timeout_seconds
+                or self.settings.registration_timeout_seconds
+            )
+            if provision_allowance > self.settings.post_registration_workflow_seconds:
+                raise GcpProviderError(
+                    "pair provision allowance exceeds the post-registration workflow allowance",
+                    category="cap_insufficient",
+                )
+            downstream_reserve = self.settings.post_registration_workflow_seconds - provision_allowance
+            pair_deadline = time.monotonic() + (trigger - self.clock()).total_seconds() - downstream_reserve
+            self._deadline = min(self._deadline or float("inf"), pair_deadline)
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
             raise GcpProviderError(f"GCP Terraform {root} {action} failed", category="terraform_failed", action_id=rc.action_id)
@@ -900,7 +1040,7 @@ class GcpProviderDriver:
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
         if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
-        if args and args[0] == "compute" and len(args) > 1 and args[1] == "instances" and args[2:3] == ["list"] or args and args[0] == "compute" and len(args) > 2 and args[2] == "list":
+        if args[:1] == ["compute"] and "list" in args and "--format=json" in args:
             if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
         try:
@@ -1034,12 +1174,15 @@ class GcpProviderDriver:
         # --regions on addresses is not a supported complete-list query and can
         # produce warnings even for empty output. Never suppress such warnings.
         collections = (
-            ("addresses", "addresses", addresses), ("subnetworks", "subnet", support),
-            ("instance-templates", "instance_templates", support), ("networks", "networks", support),
-            ("firewall-rules", "firewalls", support), ("routes", "routes", support),
-            ("resource-policies", "policy", support))
-        for command, action, target in collections:
-            result = self._gcloud_json(["compute", command, "list", "--project", self.settings.project_id, "--format=json"],
+            ("addresses", "addresses", ["compute", "addresses", "list"], addresses),
+            ("subnetworks", "subnet", ["compute", "networks", "subnets", "list"], support),
+            ("instance-templates", "instance_templates", ["compute", "instance-templates", "list"], support),
+            ("networks", "networks", ["compute", "networks", "list"], support),
+            ("firewall-rules", "firewalls", ["compute", "firewall-rules", "list"], support),
+            ("routes", "routes", ["compute", "routes", "list"], support),
+            ("resource-policies", "policy", ["compute", "resource-policies", "list"], support))
+        for command, action, argv, target in collections:
+            result = self._gcloud_json([*argv, "--project", self.settings.project_id, "--format=json"],
                 f"gcp-{action}-inventory-all-scopes")
             if not isinstance(result, list):
                 raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")
@@ -1160,7 +1303,11 @@ class GcpProviderDriver:
         after = self._gcloud_json(["compute", "instances", "describe", name, "--zone", zone, "--project", self.settings.project_id, "--format=json"], "gcp-hostkey-instance-after")
         if not self._same_vm_identity(after, initial, name, zone) or self._public_ip(after) != self._public_ip(initial):
             raise GcpProviderError("instance identity changed after host-key read", category="hostkey_identity_mismatch")
-        items = response.get("queryValue", {}).get("items", [])
+        # gcloud's --format=json projection returns queryValue.items directly as
+        # a list; it does not return the REST response envelope.
+        if not isinstance(response, list):
+            raise GcpProviderError("guest attributes must be a CLI item list", category="hostkey_unavailable")
+        items = response
         key = None
         for entry in items:
             if not isinstance(entry, dict) or entry.get("namespace") != "hostkeys":

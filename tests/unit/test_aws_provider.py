@@ -13,7 +13,7 @@ pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 from pydantic import ValidationError
 
 from cloud_network_benchmark.config import resolve_campaign
-from cloud_network_benchmark.contracts.admission import ExpiryRequest, ReservationEvidence
+from cloud_network_benchmark.contracts.admission import ExpiryEvidence, ExpiryRequest, ReservationEvidence
 from cloud_network_benchmark.contracts.common import Evidence, FailureEvidence, StringEvidence
 from cloud_network_benchmark.contracts.common import StructuredEvidence
 from cloud_network_benchmark.contracts.deployment import ProviderDeploymentInput
@@ -115,6 +115,8 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
             "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
         }),
         "complete_workflow_remaining_seconds": 120,
+        "post_registration_workflow_seconds": 120,
+        "post_provision_workflow_seconds": 100,
     }
     values.update(overrides)
     if deployment.admission.requires_primary_review and "primary_review_decision" not in values:
@@ -336,17 +338,18 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     ("instance", "instance identity"),
     ("account", "account differs"),
     ("zone", "physical AWS zone ID"),
+    ("zone_missing", "physical AWS zone ID"),
     ("tags", "ownership tags differ"),
     ("image_owner", "Canonical Ubuntu"),
     ("disk", "32 GiB gp3"),
 ])
-def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_path, mutation, match):
+def test_provider_observation_authenticates_account_placement_image_and_disk(tmp_path, mutation, match):
     deployment = make_deployment()
     instance = {
         "InstanceId": "i-0123456789abcdef0", "State": {"Name": "running"},
         "InstanceType": "m7i.xlarge", "ImageId": "ami-0123456789abcdef0",
         "PrivateIpAddress": "10.60.1.10", "PublicIpAddress": "8.8.8.8",
-        "Placement": {"AvailabilityZone": "eu-central-1a"},
+        "Placement": {"AvailabilityZone": "eu-central-1a", "AvailabilityZoneId": "euc1-az2"},
         "Tags": [{"Key": "cnb_run_id", "Value": deployment.run_id},
                  {"Key": "cnb_deployment_id", "Value": deployment.deployment_id},
                  {"Key": "cnb_role", "Value": "vm_a"}],
@@ -356,7 +359,6 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
     responses = {
         "get-caller-identity": {"Account": "123456789012"},
         "describe-instances": {"Reservations": [{"Instances": [instance]}]},
-        "describe-instance-topology": {"Instances": [{"ZoneId": "euc1-az2"}]},
         "describe-images": {"Images": [{"ImageId": instance["ImageId"], "OwnerId": "099720109477",
             "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
             "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]},
@@ -370,7 +372,9 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
     elif mutation == "instance":
         instance["InstanceId"] = "i-foreign"
     elif mutation == "zone":
-        responses["describe-instance-topology"]["Instances"][0]["ZoneId"] = "wrong-zone"
+        instance["Placement"]["AvailabilityZoneId"] = "wrong-zone"
+    elif mutation == "zone_missing":
+        del instance["Placement"]["AvailabilityZoneId"]
     elif mutation == "tags":
         instance["Tags"][1]["Value"] = "foreign-deployment"
     elif mutation == "image_owner":
@@ -379,13 +383,18 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         responses["describe-volumes"]["Volumes"][0]["Size"] = 64
 
     class Runner:
+        def __init__(self):
+            self.operations = []
+
         def run(self, request):
             operation = request.argv[2]
+            self.operations.append(operation)
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0,
                 stdout=json.dumps(responses.get(operation, {})), stderr="")
 
-    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
     expected = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
         "private_ipv4": "10.60.1.10", "public_ipv4": "8.8.8.8", "zone": "eu-central-1a",
         "zone_id": "euc1-az2", "image_id": instance["ImageId"], "boot_volume_id": "vol-0123456789abcdef0",
@@ -393,10 +402,89 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
     if match:
         with pytest.raises(AwsProviderError, match=match):
             driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
+        if mutation in {"zone", "zone_missing"}:
+            assert runner.operations == ["get-caller-identity", "describe-instances"]
     else:
         actual = driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
         assert actual["zone_id"] == "euc1-az2"
         assert actual["boot_volume_type"] == "gp3"
+        assert "describe-instance-topology" not in runner.operations
+
+
+def test_pair_catalog_observations_are_reused_only_within_one_verification_call(tmp_path):
+    deployment = make_deployment()
+    calls = []
+    class Runner:
+        def run(self, request):
+            operation = request.argv[2]
+            calls.append((operation, request.argv))
+            instance_id = request.argv[request.argv.index("--instance-ids") + 1] if "--instance-ids" in request.argv else None
+            role = "vm_b" if instance_id == "i-vm_b" else "vm_a"
+            if operation == "get-caller-identity":
+                data = {"Account": "123456789012"}
+            elif operation == "describe-instances":
+                region = request.argv[request.argv.index("--region") + 1]
+                instance = {"InstanceId": instance_id, "State": {"Name": "running"},
+                    "InstanceType": "m7i.xlarge", "ImageId": "ami-0123456789abcdef0",
+                    "PrivateIpAddress": "10.60.1.10" if role == "vm_a" else "10.60.1.11",
+                    "PublicIpAddress": "8.8.8.8" if role == "vm_a" else "1.1.1.1",
+                    "Placement": {"AvailabilityZone": f"{region}a", "AvailabilityZoneId": "euc1-az2" if region == "eu-central-1" else "euw2-az1"},
+                    "Tags": [{"Key": "cnb_run_id", "Value": deployment.run_id},
+                        {"Key": "cnb_deployment_id", "Value": deployment.deployment_id}, {"Key": "cnb_role", "Value": role}],
+                    "NetworkInterfaces": [{"InterfaceType": "interface"}],
+                    "BlockDeviceMappings": [{"Ebs": {"VolumeId": f"vol-{role}", "DeleteOnTermination": True}}]}
+                data = {"Reservations": [{"Instances": [instance]}]}
+            elif operation == "describe-images":
+                data = {"Images": [{"ImageId": "ami-0123456789abcdef0", "OwnerId": "099720109477", "Architecture": "x86_64",
+                    "VirtualizationType": "hvm", "RootDeviceType": "ebs", "State": "available",
+                    "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]}
+            elif operation == "describe-instance-types":
+                data = {"InstanceTypes": [{"InstanceType": "m7i.xlarge", "ProcessorInfo": {"SupportedArchitectures": ["x86_64"]},
+                    "VCpuInfo": {"DefaultVCpus": 4}, "MemoryInfo": {"SizeInMiB": 16384}}]}
+            elif operation == "describe-volumes":
+                data = {"Volumes": [{"VolumeId": f"vol-{role}", "Size": 32, "VolumeType": "gp3"}]}
+            else:
+                data = {}
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW, finished_at=NOW,
+                duration_seconds=0, exit_code=0, stdout=json.dumps(data), stderr="")
+
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
+        provider="aws", action="stop", state="registered", registration_id=Evidence[str](value="aws-ssm:test"),
+        registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)), expires_at=Evidence[datetime](value=NOW + timedelta(seconds=900)),
+        target_selector=driver._target_selector(deployment, driver._regions(deployment)),
+        provider_metadata=StructuredEvidence(value={"regional_execution_ids": {"eu-central-1": "exec-test"}}))
+    deployment = deployment.model_copy(update={"expiry": Evidence[ExpiryEvidence](value=expiry)})
+    driver._verify_host_key = lambda detail: {"known_hosts_path": f"/private/tmp/{detail['instance_id']}.known_hosts"}
+    raw = {"vms": {role: {"instance_id": f"i-{role}",
+        "private_ipv4": "10.60.1.10" if role == "vm_a" else "10.60.1.11",
+        "public_ipv4": "8.8.8.8" if role == "vm_a" else "1.1.1.1", "region": "eu-central-1",
+        "zone": "eu-central-1a", "zone_id": "euc1-az2", "image_id": "ami-0123456789abcdef0",
+        "image_owner_id": "099720109477", "architecture": "x86_64", "shape": "m7i.xlarge",
+        "boot_volume_id": f"vol-{role}", "placement_group": None} for role in ("vm_a", "vm_b")}}
+    # Exercise the production normalization path with the real verifier. Its cache
+    # must be passed using the verifier's keyword-only argument.
+    driver._normalize_output(deployment, raw, NOW, NOW)
+    assert [name for name, _ in calls].count("describe-images") == 1
+    assert [name for name, _ in calls].count("describe-instance-types") == 1
+    assert [name for name, _ in calls].count("describe-instances") == 2
+    assert [name for name, _ in calls].count("describe-volumes") == 2
+    # A new provision/normalization gets a new cache and repeats both catalog reads.
+    driver._normalize_output(deployment, raw, NOW, NOW)
+    assert [name for name, _ in calls].count("describe-images") == 2
+    assert [name for name, _ in calls].count("describe-instance-types") == 2
+    # A different region is a distinct cache key even for the same account,
+    # image ID, and shape; both catalog queries must run again.
+    other_region = {"region": "eu-west-2", "instance_id": "i-vm_a", "private_ipv4": "10.60.1.10",
+        "public_ipv4": "8.8.8.8", "zone": "eu-west-2a", "zone_id": "euw2-az1",
+        "image_id": "ami-0123456789abcdef0", "boot_volume_id": "vol-vm_a", "placement_group": None}
+    cross_region_cache = {}
+    driver._verify_observed_instance(other_region, "same_zone", "vm_a", deployment.run_id,
+        deployment.deployment_id, catalog_cache=cross_region_cache)
+    driver._verify_observed_instance({**other_region, "instance_id": "i-vm_b", "boot_volume_id": "vol-vm_b", "private_ipv4": "10.60.1.11", "public_ipv4": "1.1.1.1"},
+        "same_zone", "vm_b", deployment.run_id, deployment.deployment_id, catalog_cache=cross_region_cache)
+    assert [name for name, _ in calls].count("describe-images") == 3
+    assert [name for name, _ in calls].count("describe-instance-types") == 3
 
 
 def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_path):
@@ -794,6 +882,77 @@ def test_terminal_expiry_accepts_sleep_complete_while_stop_is_running():
             _terminal_stop_step(params, status="InProgress"),
         ]}
     _validate_terminal_execution(execution, "exec", "eu-central-1", {"document_name": "expiry", "document_version": "1"}, params)
+
+
+def test_terminal_expiry_accepts_uninitialized_pending_stop_while_bound_sleep_is_active():
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    execution = {"AutomationExecutionId": "exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False, "AutomationExecutionStatus": "InProgress",
+        "CurrentAction": "aws:sleep", "CurrentStepName": "waitUntilExpiry",
+        "StepExecutions": [
+            {"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress",
+                "Inputs": {"Timestamp": params["ExpiryTriggerUtc"][0]}},
+            {"StepName": "discoverAndStopOwnedInstances", "Action": "aws:executeScript", "StepStatus": "Pending",
+                "Inputs": {}},
+        ]}
+    safety = {"document_name": "expiry", "document_version": "1"}
+    _validate_terminal_execution(execution, "exec", "eu-central-1", safety, params)
+
+    # The placeholder is acceptable only before that step starts and while the
+    # exact registered execution remains on its bound expiry sleep.
+    wrong_step_action = json.loads(json.dumps(execution))
+    wrong_step_action["StepExecutions"][1]["Action"] = "aws:runCommand"
+    with pytest.raises(AwsProviderError, match="stop step identity"):
+        _validate_terminal_execution(wrong_step_action, "exec", "eu-central-1", safety, params)
+    wrong_execution = json.loads(json.dumps(execution))
+    wrong_execution["CurrentStepName"] = "discoverAndStopOwnedInstances"
+    wrong_execution["CurrentAction"] = "aws:executeScript"
+    with pytest.raises(AwsProviderError, match="stop step identity"):
+        _validate_terminal_execution(wrong_execution, "exec", "eu-central-1", safety, params)
+    wrong_inputs = json.loads(json.dumps(execution))
+    wrong_inputs["StepExecutions"][1]["Inputs"] = {"InputPayload": "{}"}
+    with pytest.raises(AwsProviderError, match="stop step identity"):
+        _validate_terminal_execution(wrong_inputs, "exec", "eu-central-1", safety, params)
+
+
+def test_terminal_expiry_accepts_exact_cancelled_sleep_with_pending_uninitialized_stop():
+    params = {"AutomationAssumeRole": ["arn:aws:iam::238360820461:role/expiry"],
+        "ExpiryTriggerUtc": ["2026-11-15T12:35:35Z"], "RunId": ["run"],
+        "DeploymentId": ["deployment"], "Region": ["eu-north-1"]}
+    execution = {"AutomationExecutionId": "exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False,
+        "AutomationExecutionStatus": "Cancelled", "StepExecutions": [
+            {"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "Cancelled",
+                "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])},
+                "Outputs": {}, "OverriddenParameters": {}},
+            {"StepName": "discoverAndStopOwnedInstances", "Action": "aws:executeScript",
+                "StepStatus": "Pending", "Inputs": {}, "OverriddenParameters": {}},
+        ]}
+    safety = {"document_name": "expiry", "document_version": "1"}
+    _validate_terminal_execution(execution, "exec", "eu-north-1", safety, params)
+
+    wrong_identity = json.loads(json.dumps(execution))
+    wrong_identity["Parameters"]["RunId"] = ["foreign"]
+    with pytest.raises(AwsProviderError, match="identity differs"):
+        _validate_terminal_execution(wrong_identity, "exec", "eu-north-1", safety, params)
+    wrong_action = json.loads(json.dumps(execution))
+    wrong_action["StepExecutions"][1]["Action"] = "aws:runCommand"
+    with pytest.raises(AwsProviderError, match="stop step identity"):
+        _validate_terminal_execution(wrong_action, "exec", "eu-north-1", safety, params)
+    wrong_inputs = json.loads(json.dumps(execution))
+    wrong_inputs["StepExecutions"][1]["Inputs"] = {"InputPayload": "{}"}
+    with pytest.raises(AwsProviderError, match="stop step identity"):
+        _validate_terminal_execution(wrong_inputs, "exec", "eu-north-1", safety, params)
+
+    driver = object.__new__(AwsProviderDriver)
+    driver.settings = type("Settings", (), {"registration_timeout_seconds": 30, "aws_cli": "aws"})()
+    driver._run = lambda *_args: CommandResult(action_id="aws-expiry-read-terminal-eu-north-1",
+        outcome="succeeded", started_at=NOW, finished_at=NOW, duration_seconds=0,
+        exit_code=0, stdout=json.dumps({"AutomationExecution": execution}), stderr="")
+    final = driver._cancel_or_confirm_terminal("eu-north-1", "exec", safety, params)
+    assert final["state"] == "Cancelled"
+    assert final["steps"][1]["Inputs"] == {}
 
 
 def test_automation_confirmation_retries_pending_with_one_execution_id_and_scalar_inputs(tmp_path):

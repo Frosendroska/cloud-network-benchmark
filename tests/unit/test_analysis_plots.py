@@ -19,6 +19,9 @@ def test_histogram_has_50_equal_width_edges_and_constant_value_rule():
 def test_render_produces_deterministic_offline_figures(tmp_path):
     payload = {"selection_fingerprint": "f" * 64, "runs": [{"run_id": "run-1", "unit_id": "u1",
         "phase": "multi_flow", "mode": "short_study", "provider": "aws", "rtt": {"valid_replies": 2},
+        "receiver_plot_intervals": [{"start_seconds":1.000890,"end_seconds":2.000919,
+            "bytes":12_266_110_976,"measured_seconds":1.000029,"throughput_gbps":98.12,
+            "artifact_id":"iperf3_server_log","path":"server.jsonl","sha256":"a"*64,"line":10}],
         "source_refs": ["sockperf.csv"]}], "bins": [{"run_id": "run-1", "unit_id": "u1",
         "start_seconds": 0, "end_seconds": 1, "rtt": {"valid_replies": 2,
         "median_us": {"value": 3.0}}, "source_refs": ["sockperf.csv"]}],
@@ -41,3 +44,18 @@ def test_render_produces_deterministic_offline_figures(tmp_path):
             assert root.attrib.get("width", "").endswith("pt")
             assert root.attrib.get("height", "").endswith("pt")
     assert any("no eligible" in item["caption"].lower() or item["row_ids"] for item in specs_a)
+    receiver_spec = next(item for item in specs_a if item["figure_id"] == "receiver-time-series")
+    assert "server.jsonl" in receiver_spec["sources"]
+    assert "No source-supported receiver intervals" not in (first / receiver_spec["svg"].removeprefix("figures/")).read_text()
+
+
+def test_short_phase_without_native_line_proof_does_not_fall_back_to_receiver_bins(tmp_path):
+    payload = {"selection_fingerprint":"e" * 64,
+        "runs":[{"run_id":"run-1","unit_id":"u1","phase":"single_flow",
+            "mode":"short_study","kind":"phase","receiver_plot_intervals":[]}],
+        "bins":[{"run_id":"run-1","unit_id":"u1","phase":"single_flow",
+            "mode":"short_study","start_seconds":0,"end_seconds":1,
+            "receiver":{"throughput_gbps":{"value":99}}}], "deployments":[]}
+    render_figures(payload, tmp_path)
+    svg = (tmp_path / "receiver-time-series.svg").read_text(encoding="utf-8")
+    assert "No source-verified VM B receiver intervals" in svg

@@ -15,6 +15,8 @@ resource "terraform_data" "scope_guard" {
         "placement_optimization|europe-west3-a|europe-west3-a",
         "inter_region|europe-west3-a|europe-west2-a",
         "same_zone|europe-north1-a|europe-north1-a",
+        "same_zone|europe-north1-b|europe-north1-b",
+        "same_zone|europe-north1-c|europe-north1-c",
       ], "${var.scenario}|${var.zone_a}|${var.zone_b}")
       error_message = "GCP protection accepts only the selected baseline topology or Finland same-zone pair."
     }

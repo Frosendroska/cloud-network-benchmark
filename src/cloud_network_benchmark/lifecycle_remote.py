@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 import shlex
+import re
 import time
 import threading
 from dataclasses import dataclass
@@ -32,6 +33,38 @@ class _Attempt:
     retrieval: Any = None
     f03_process_record: dict[str, Any] | None = None
     f03_process_absent_at: datetime | None = None
+    iperf3_control_pre_measure: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _MeasurementStageWindow:
+    execution_deadline_monotonic: float
+    shutdown_deadline_monotonic: float
+
+
+def _measurement_stage_window(*, overall_deadline: float, measurement_started: float,
+        allowance: Any) -> _MeasurementStageWindow:
+    """Bound measurement and shutdown while preserving retrieval and cleanup reserves."""
+    workflow_end = overall_deadline - float(allowance.retrieval_seconds) - float(allowance.cleanup_seconds)
+    shutdown = float(allowance.measurement_shutdown_seconds)
+    execution_end = min(measurement_started + float(allowance.measurement_seconds), workflow_end - shutdown)
+    return _MeasurementStageWindow(execution_end, execution_end + shutdown)
+
+
+def _wait_for_stabilization(*, wait_until: float, deadline: Any,
+        clock: Callable[[], float], cancelled: Callable[[], bool],
+        sleep: Callable[[float], None]) -> None:
+    """Wait to the stabilization boundary without deriving sleep from two clocks."""
+    while True:
+        if cancelled():
+            raise InterruptedError("controller cancellation was requested during stabilization")
+        now = clock()
+        if deadline.remaining(lambda: now) <= 0:
+            raise TimeoutError("original provider cap expired during stabilization/slot wait")
+        remaining = wait_until - now
+        if remaining <= 0:
+            return
+        sleep(min(1.0, remaining))
 
 
 def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, children: dict[str, Any],
@@ -51,11 +84,11 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     from .diagnostics import _declarations
     from .diagnostics import build_collection_context
     from .lifecycle_adapters import (RemoteStages,
-        guest_duration, inventory_remote_workspace, prepare_remote_pair,
+        capture_iperf3_control_prefix, guest_duration, inventory_remote_workspace, prepare_remote_pair,
         run_remote_f03, start_remote_diagnostics, stop_remote_diagnostics,
         stop_vm_b_listeners)
     from .lifecycle_bundle import (build_remote_closed_inventory, lifecycle_declarations,
-        retrieve_closed_bundle_with_ledger)
+        remote_inventory_paths_by_role, retrieve_closed_bundle_with_ledger)
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
 
@@ -169,13 +202,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if wait_until + allowance.measurement_seconds + allowance.retrieval_seconds + allowance.cleanup_seconds > item.deadline.overall_deadline_monotonic:
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "stabilization and remaining stages do not fit the original cap"})
-            while clock.monotonic() < wait_until:
-                if cancel_event.is_set():
-                    raise InterruptedError("controller cancellation was requested during stabilization")
-                remaining = wait_until - clock.monotonic()
-                if item.deadline.remaining(clock.monotonic) <= 0:
-                    raise TimeoutError("original provider cap expired during stabilization/slot wait")
-                sleep(min(1.0, remaining))
+            _wait_for_stabilization(wait_until=wait_until, deadline=item.deadline,
+                clock=clock.monotonic, cancelled=cancel_event.is_set, sleep=sleep)
             end_mono, end_utc = clock.monotonic(), clock.utc_now()
             item.stable = {"started_at": start_utc, "finished_at": end_utc,
                 "elapsed_seconds": end_mono-start_mono, "scheduled_start": slot}
@@ -185,6 +213,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 {"failure": f"{type(exc).__name__}: stabilization failed"})
 
     def measure(deployment: Any, provision: Any):
+        item = None
         try:
             if cancel_event.is_set():
                 return ProviderStageOutcome("measure", False, {"failure": "controller cancellation was requested"})
@@ -213,28 +242,34 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     # no-symlink path, then bind the declared guest path.
                     output_root=repository_root / ".f09-remote-workspace" / deployment.deployment_id / role,
                     duration_seconds=max(total_seconds, diagnostic_duration), prepared=bootstrap)
-                context["output_root"] = runtime["access"]["bootstrap"].workspace
+                context["output_root"] = runtime["access"]["bootstrap"].results_workspace
                 item.diagnostics[role] = start_remote_diagnostics(connection, context,
                     runner=runner, remote_root=str(Path(guest_runtime.remote_root) / "diagnostics-control"),
                     deadline=item.deadline, clock=clock.monotonic)
 
             # Bracket a trusted guest UTC observation over the authenticated VM-A
-            # control channel. Full round-trip time is charged as uncertainty.
+            # control channel. Charge setup time to the reserved measurement
+            # stage, and reserve shutdown before retrieval and cleanup.
             vm = connection.vm_a
             before_mono, before_utc = clock.monotonic(), clock.utc_now()
+            measurement_allowance = _remaining_f11_allowance(runtime["allowance"], "measurement")
+            measurement_window = _measurement_stage_window(
+                overall_deadline=item.deadline.overall_deadline_monotonic,
+                measurement_started=before_mono, allowance=measurement_allowance)
+            clock_remaining = min(item.deadline.remaining(clock.monotonic),
+                max(0.0, measurement_window.execution_deadline_monotonic - before_mono))
             request = _request(f"f09-control-clock-{deployment.deployment_id}", vm,
                 ["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"],
-                min(connection.timeouts.command_seconds, item.deadline.remaining(clock.monotonic)))
+                min(connection.timeouts.command_seconds, clock_remaining))
             response = _execute(runner, request)
             after_mono, after_utc = clock.monotonic(), clock.utc_now()
             if response.outcome != CommandOutcome.SUCCEEDED:
                 raise RuntimeError("authenticated guest UTC control observation failed")
             guest_now = datetime.fromisoformat(response.stdout.strip().replace("Z", "+00:00"))
             roundtrip = after_mono - before_mono
-            active_end = item.deadline.overall_deadline_monotonic - float(runtime["allowance"].retrieval_seconds) - float(runtime["allowance"].cleanup_seconds)
-            controller_remaining = active_end - after_mono
+            controller_remaining = measurement_window.shutdown_deadline_monotonic - after_mono
             effective_deadline = min(item.deadline.cap_expires_at,
-                after_utc + __import__("datetime").timedelta(seconds=active_end-after_mono))
+                after_utc + __import__("datetime").timedelta(seconds=controller_remaining))
             safe = guest_duration(effective_deadline_utc=effective_deadline,
                 guest_now_utc=guest_now, controller_observed_remaining=controller_remaining,
                 transport_elapsed_seconds=roundtrip, clock_uncertainty_seconds=roundtrip)
@@ -285,7 +320,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     finished_at=Evidence(unavailable_reason="bootstrap transport timing is not native process timing")))
             guest_request = GuestRequest(schema_version=2, identity=pair.identity,
                 observation=item.observation, b_private_ipv4=connection.private_ipv4_b,
-                output_root=Path(runtime["access"]["bootstrap"].workspace),
+                output_root=Path(runtime["access"]["bootstrap"].results_workspace),
                 effective_deadline_utc=effective_deadline, safe_remaining_seconds=safe,
                 clock_uncertainty_seconds=roundtrip, source_revision=guest_runtime.source_revision,
                 expected_source_revision=item.source_revision,
@@ -296,22 +331,42 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 build_observations=[build.model_dump(mode="json") for build in builds],
                 receiver_command_evidence=[command.model_dump(mode="json") for command in receiver_commands],
                 source_artifact_records=[])
+            iperf_listener = next((listener for listener in bootstrap.listeners
+                if listener.tool == "iperf3" and listener.state == "active"), None)
+            if iperf_listener is not None:
+                item.iperf3_control_pre_measure = capture_iperf3_control_prefix(connection,
+                    iperf_listener, controller_session_id=ledger.controller_session_id,
+                    runner=runner, deadline=item.deadline,
+                    active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
+                    clock=clock.monotonic)
+            else:
+                item.iperf3_control_pre_measure = {"available": False,
+                    "reason": "prepared iperf3 listener identity is unavailable"}
+            boundary_failure = _pre_measure_capture_failure(item.iperf3_control_pre_measure,
+                connection=connection, listener=iperf_listener,
+                controller_session_id=ledger.controller_session_id)
+            if boundary_failure is not None:
+                return _measurement_handoff_failure(item,
+                    RuntimeError("VM B owner-bound pre-measure log-prefix proof is unavailable"),
+                    boundary_failure=boundary_failure)
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
+                active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
+                shutdown_deadline_monotonic=measurement_window.shutdown_deadline_monotonic,
                 cancel_event=cancel_event, sleep=sleep,
                 on_process_record=lambda record: _record_f03_process(record, control, control_lock, item))
             if item.guest.failure and "process_group_stopped" in item.guest.failure:
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at
             item.guest = __import__("dataclasses").replace(item.guest,
-                receiver_command_evidence=tuple(receiver_commands))
+                receiver_command_evidence=tuple(receiver_commands), diagnostics=dict(item.diagnostics),
+                iperf3_control_pre_measure=item.iperf3_control_pre_measure or {})
             item.measurement_ended_at = (item.guest.outcome.guest_finished_at
                 if item.guest.outcome is not None else after_utc)
             return ProviderStageOutcome("measure", item.guest.outcome is not None
                 and item.guest.outcome.outcome == "succeeded", item.guest)
         except Exception as exc:
-            return ProviderStageOutcome("measure", False,
-                {"failure": f"{type(exc).__name__}: remote measurement handoff failed ({exc})"})
+            return _measurement_handoff_failure(item, exc)
 
     def close(deployment: Any, provision: Any):
         try:
@@ -338,6 +393,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         runner=runner, deadline=item.deadline, clock=clock.monotonic)
             if item.listener_closure is None or not item.listener_closure.closed or item.listener_closure.failures:
                 item.listener_closure = stop_vm_b_listeners(item.connection, runner=runner,
+                    results_workspace=runtime["access"]["bootstrap"].results_workspace,
+                    controller_session_id=ledger.controller_session_id,
                     deadline=item.deadline, clock=clock.monotonic)
             closures = item.closures or {}
             measurement_closed_at = (item.guest.outcome.guest_finished_at if item.guest and item.guest.outcome
@@ -377,13 +434,6 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         or transfer is None or transfer["debited_bytes"] >= transfer["payload_limit_bytes"]):
                     return ProviderStageOutcome("retrieve", False,
                         {"failure": "result_transfer_allowance_exhausted"})
-            for role in ("vm_a", "vm_b"):
-                item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
-                    workspace=runtime["access"]["bootstrap"].workspace, runner=runner,
-                    deadline=item.deadline, clock=clock.monotonic)
-            if any(value.failures for value in item.inventories.values()):
-                return ProviderStageOutcome("retrieve", False,
-                    {"failure": "one or more remote inventories are incomplete", "inventories": item.inventories})
             declarations = lifecycle_declarations(item.observation.artifact_layout,
                 mode=item.observation.mode, measurement_units=item.observation.measurement_units,
                 schedule_supplied=item.observation.schedule_entry.value is not None,
@@ -396,6 +446,33 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 if previous is not None and previous != declaration:
                     raise ValueError("artifact declaration identity is contradictory")
                 unique[declaration.artifact_id] = declaration
+            declarations = list(unique.values())
+            expected_paths = remote_inventory_paths_by_role(declarations)
+            transfer = rec.get("result_transfer", {}).get(provider)
+            inventory_byte_budget = None
+            if rec.get("execution_scope") == "paid_request":
+                if (not isinstance(transfer, Mapping)
+                        or isinstance(transfer.get("payload_limit_bytes"), bool)
+                        or not isinstance(transfer.get("payload_limit_bytes"), int)
+                        or isinstance(transfer.get("debited_bytes"), bool)
+                        or not isinstance(transfer.get("debited_bytes"), int)):
+                    return ProviderStageOutcome("retrieve", False,
+                        {"failure": "result_transfer_inventory_bound_unavailable"})
+                inventory_byte_budget = transfer["payload_limit_bytes"] - transfer["debited_bytes"]
+                if inventory_byte_budget <= 0:
+                    return ProviderStageOutcome("retrieve", False,
+                        {"failure": "result_transfer_allowance_exhausted"})
+            inventoried_bytes = 0
+            for role in ("vm_a", "vm_b"):
+                item.inventories[role] = inventory_remote_workspace(item.connection, role=role,
+                    workspace=runtime["access"]["bootstrap"].results_workspace, runner=runner,
+                    deadline=item.deadline, clock=clock.monotonic, expected_paths=expected_paths[role],
+                    maximum_bytes=(inventory_byte_budget - inventoried_bytes
+                        if inventory_byte_budget is not None else None))
+                inventoried_bytes += sum(int(row["size_bytes"]) for row in item.inventories[role].files)
+            if any(value.failures for value in item.inventories.values()):
+                return ProviderStageOutcome("retrieve", False,
+                    {"failure": "one or more remote inventories are incomplete", "inventories": item.inventories})
             materialized = materialize_build_identity_artifacts(item.result_root,
                 deployment.deployment_id, item.prepared.evidence["bootstrap"].builds)
             closure_times = {
@@ -405,7 +482,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             manifest = build_remote_closed_inventory(
                 identity=pair_of(provision).identity.model_dump(mode="json"),
                 deployment_id=deployment.deployment_id,
-                remote_workspace=runtime["access"]["bootstrap"].workspace,
+                remote_workspace=runtime["access"]["bootstrap"].results_workspace,
                 declarations=list(unique.values()),
                 remote_files={role: item.inventories[role].files for role in ("vm_a", "vm_b")},
                 source_vm_ids={"vm_a": item.connection.vm_a.host, "vm_b": item.connection.vm_b.host},
@@ -437,6 +514,71 @@ def _record_f03_process(record: dict[str, Any], control: dict[str, Any], lock: A
     with lock:
         control["process_record"] = dict(record)
         attempt.f03_process_record = dict(record)
+
+
+def _pre_measure_capture_failure(capture: Any, *, connection: Any, listener: Any,
+        controller_session_id: str) -> str | None:
+    """Fail closed before F03 unless the same prepared VM B listener was captured."""
+    if not isinstance(capture, Mapping) or capture.get("available") is not True:
+        return "pre-measure listener prefix snapshot is missing or unavailable"
+    snapshot, action = capture.get("snapshot"), capture.get("action")
+    if not isinstance(snapshot, Mapping) or action is None:
+        return "pre-measure listener prefix snapshot has no owned action evidence"
+    action_payload = action.model_dump(mode="json") if hasattr(action, "model_dump") else action
+    if not isinstance(action_payload, Mapping):
+        return "pre-measure listener prefix action evidence is malformed"
+    result = action_payload.get("result")
+    request = action_payload.get("request")
+    argv = request.get("argv", []) if isinstance(request, Mapping) else []
+    remote_command = " ".join(str(item) for item in argv)
+    if (action_payload.get("action_id") != f"f09-iperf3-control-prefix-measure-{connection.deployment_id}"
+            or action_payload.get("action_type") != "ssh"
+            or action_payload.get("role") != "vm_b"
+            or action_payload.get("vm_id") != connection.vm_b.host
+            or not isinstance(result, Mapping) or result.get("outcome") != "succeeded"
+            or result.get("exit_code") != 0
+            or any(token not in remote_command for token in
+                (listener.stdout_path, listener.stderr_path, controller_session_id, listener.unit))):
+        return "pre-measure listener prefix action is not bound to the selected VM B listener"
+    count, digest, ids = snapshot.get("prefix_bytes"), snapshot.get("prefix_sha256"), snapshot.get("log_ids")
+    valid_ids = (isinstance(ids, list) and len(ids) == 2 and all(isinstance(pair, list) and len(pair) == 2
+        and all(isinstance(number, int) and not isinstance(number, bool) and number >= 0 for number in pair)
+        for pair in ids) and ids[0] != ids[1])
+    if (snapshot.get("boundary") != "pre_measure"
+            or snapshot.get("deployment_id") != connection.deployment_id
+            or snapshot.get("controller_session_id") != controller_session_id
+            or snapshot.get("listener_invocation_id") != "f02r-vm_b-listener-iperf3"
+            or snapshot.get("unit") != listener.unit
+            or snapshot.get("log_path") != listener.stdout_path
+            or isinstance(snapshot.get("pid"), bool) or not isinstance(snapshot.get("pid"), int) or snapshot["pid"] <= 0
+            or isinstance(snapshot.get("start_ticks"), bool) or not isinstance(snapshot.get("start_ticks"), int)
+            or snapshot["start_ticks"] < 0
+            or not isinstance(snapshot.get("boot_id"), str)
+            or re.fullmatch(r"[0-9a-fA-F-]{36}", snapshot["boot_id"]) is None
+            or snapshot.get("cgroup") != f"/system.slice/{listener.unit}.service"
+            or not valid_ids
+            or isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 65536
+            or not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+        return "pre-measure listener prefix snapshot has foreign or incomplete owner/boundary identity"
+    return None
+
+
+def _measurement_handoff_failure(attempt: _Attempt | None, error: BaseException,
+        *, boundary_failure: str | None = None) -> Any:
+    """Retain diagnostic handles while keeping exception text out of durable evidence."""
+    from .lifecycle_adapters import RemoteDiagnosticsStartError
+    from .orchestration import ProviderStageOutcome
+    evidence = {"failure": f"{type(error).__name__}: remote measurement handoff failed",
+        "diagnostics": attempt.diagnostics if attempt is not None else {},
+        "iperf3_control_pre_measure": (attempt.iperf3_control_pre_measure
+            if attempt is not None and attempt.iperf3_control_pre_measure is not None
+            else {"available": False, "reason": "measurement boundary was not captured"})}
+    if boundary_failure is not None:
+        evidence["boundary_failure"] = boundary_failure
+    if isinstance(error, RemoteDiagnosticsStartError):
+        evidence["startup_failure"] = error.safe_reason
+        evidence["actions"] = error.actions
+    return ProviderStageOutcome("measure", False, evidence)
 
 
 def build_aws_remote_stages(**kwargs: Any):

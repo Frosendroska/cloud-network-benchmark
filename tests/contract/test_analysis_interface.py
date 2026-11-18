@@ -41,6 +41,38 @@ def test_actual_f08_pair_revalidates_and_fingerprints_descriptor_order(repositor
     assert report.payload["sources"]
     assert report.payload["selection_fingerprint"]
     assert report.payload["runs"][0]["current_data_validity"] == "valid"
+    for section in ("runs", "reliability", "findings"):
+        assert report.payload[section]
+        assert all(row["saved_result_metrics_consistent"] is True
+                   and row["saved_result_differing_fields"] == []
+                   for row in report.payload[section])
+
+
+@pytest.mark.parametrize("field", ["value", "unavailable_reason"])
+def test_saved_nested_metric_mutation_is_reported_independently_of_validity(repository_root,
+        tmp_path, frozen_clock, deterministic_token, fake_git_commits, request, field):
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+
+    _value, _result, selection = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
+        deterministic_token, fake_git_commits, request)
+    descriptor = json.loads(selection.read_text(encoding="utf-8"))
+    result_path = selection.parent / descriptor["runs"][0]["validation_result"]
+    saved = json.loads(result_path.read_text(encoding="utf-8"))
+    metric = saved["metrics"]["value"]["units"][0]["rtt"]["median_us"]
+    assert metric["value"] is not None
+    assert metric["unavailable_reason"] is None
+    metric[field] = metric["value"] + 1 if field == "value" else "altered saved reason"
+    result_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    report = analyze_selection(selection, analysis_git=_git())
+    for section in ("runs", "reliability", "findings"):
+        assert report.payload[section]
+        assert all(row["saved_result_metrics_consistent"] is False
+                   and row["saved_result_differing_fields"] == ["units"]
+                   for row in report.payload[section])
+    assert all(row["recorded_data_validity"] == row["current_data_validity"] == "valid"
+               for row in report.payload["runs"])
 
 
 def test_changed_native_source_cannot_keep_recorded_validity(repository_root, tmp_path,

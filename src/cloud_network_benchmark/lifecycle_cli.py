@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,13 +95,18 @@ class CountingRunner:
     def __init__(self, delegate):
         self.delegate = delegate
         self.actions = []
+        self.supports_concurrent_commands = bool(
+            getattr(delegate, "supports_concurrent_commands", False))
+        self._actions_lock = threading.Lock()
 
     def run(self, request):
-        self.actions.append(request.action_id)
+        with self._actions_lock:
+            self.actions.append(request.action_id)
         return self.delegate.run(request)
 
     def run_bounded_copy(self, request, destination, maximum_payload_bytes):
-        self.actions.append(request.action_id)
+        with self._actions_lock:
+            self.actions.append(request.action_id)
         return self.delegate.run_bounded_copy(request,destination,maximum_payload_bytes)
 
 
