@@ -981,18 +981,19 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "capture_fault", "unknown_server_error"), [
-    ("failure_check", False, False, "partial", "eu-central-1", "none", False),
-    ("failure_check", True, False, "valid", "eu-central-1", "none", False),
-    ("failure_check", True, True, "valid", "eu-central-1", "none", False),
-    ("failure_check", True, True, "valid", "eu-north-1", "none", False),
-    ("failure_check", True, True, "invalid", "eu-central-1", "none", True),
-    ("failure_check", False, False, "partial", "eu-central-1", "missing", False),
-    ("failure_check", False, False, "partial", "eu-central-1", "failed", False),
-    ("failure_check", False, False, "partial", "eu-central-1", "foreign", False),
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "capture_fault", "unknown_server_error", "prebuilt_origins"), [
+    ("failure_check", False, False, "partial", "eu-central-1", "none", False, False),
+    ("failure_check", True, False, "valid", "eu-central-1", "none", False, False),
+    ("failure_check", True, True, "valid", "eu-central-1", "none", False, False),
+    ("failure_check", True, True, "valid", "eu-north-1", "none", False, False),
+    ("failure_check", True, True, "invalid", "eu-central-1", "none", True, False),
+    ("failure_check", False, False, "partial", "eu-central-1", "missing", False, False),
+    ("failure_check", False, False, "partial", "eu-central-1", "failed", False, False),
+    ("failure_check", False, False, "partial", "eu-central-1", "foreign", False, False),
+    ("failure_check", True, False, "valid", "eu-north-1", "none", False, True),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, capture_fault, unknown_server_error):
+        tmp_path, repository_root, request, fake_git_commits, monkeypatch, context_name, full_native, late_tail, expected_validity, region, capture_fault, unknown_server_error, prebuilt_origins):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -1036,6 +1037,61 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     runner.clock = clock
     runtime["sleep"] = clock.sleep
     from cloud_network_benchmark import lifecycle_adapters
+    if prebuilt_origins:
+        from dataclasses import replace
+        from cloud_network_benchmark.bootstrap import BuildObservation, _required_capabilities
+        from cloud_network_benchmark.contracts.common import VmRole
+        from tests.integration.test_acquisition_producer import _build
+        source_builds = {tool: _build(tool, VmRole.VM_A, f"f02r-vm_a-{tool}-build")
+            for tool in ("sockperf", "iperf3")}
+        bundle_path = tmp_path / "controller-prebuilt-tools.tar.gz"
+        bundle_path.write_bytes(b"offline controller bundle artifact fixture\n")
+        bundle_digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        prebuilt = []
+        for role in ("vm_a", "vm_b"):
+            for tool in ("sockperf", "iperf3"):
+                source = source_builds[tool]
+                operational_evidence = json.dumps({"fixture": "controller-prebuilt production measure"},
+                    sort_keys=True)
+                compiler = source.compiler_version
+                controller = {"tool": tool, "source_reference": source.source_reference,
+                    "source_sha256": source.source_sha256, "binary_sha256": source.binary_sha256,
+                    "upstream_commit": source.upstream_commit, "patch_path": source.patch_path,
+                    "patch_sha256": source.patch_sha256,
+                    "operational_build_evidence_json": operational_evidence,
+                    "build_evidence_sha256": hashlib.sha256(operational_evidence.encode()).hexdigest()}
+                guest = {"binary_sha256": source.binary_sha256, "binary_version": source.binary_version,
+                    "binary_path": source.binary_path}
+                proof = {"schema": "CNB_PREBUILT_V1", "origin": "controller-prebuilt",
+                    "tool": tool, "role": role, "binary_sha256": source.binary_sha256,
+                    "bundle_sha256": bundle_digest,
+                    "bundle_artifact_id": "f02r-controller-prebuilt-bundle",
+                    "controller_receipt": controller, "guest_verification": guest}
+                proof_bytes = json.dumps(proof, sort_keys=True) + "\n"
+                prebuilt.append(BuildObservation(role=role, tool=tool,
+                    source_reference=source.source_reference, source_sha256=source.source_sha256,
+                    compiler_version=compiler, binary_path=guest["binary_path"],
+                    binary_version=guest["binary_version"], binary_sha256=guest["binary_sha256"],
+                    capabilities=_required_capabilities(tool), artifact_id=f"f02r-{role}-{tool}-build",
+                    upstream_commit=source.upstream_commit, patch_path=source.patch_path,
+                    patch_sha256=source.patch_sha256, build_configuration="prebuilt fixture",
+                    observation_capability="CNB_ACQ_V1",
+                    observation_semantics="sockperf-3.10-enabled-v1" if tool == "sockperf"
+                        else "iperf-3.17.1-stats-v1",
+                    identity_bytes=source.identity_bytes, build_origin="controller-prebuilt",
+                    origin_artifact_id=f"f02r-{role}-{tool}-origin", origin_proof_bytes=proof_bytes,
+                    prebuilt_bundle_path=str(bundle_path),
+                    prebuilt_bundle_sha256=bundle_digest,
+                    bundle_artifact_id="f02r-controller-prebuilt-bundle"))
+        original_prepare_pair = lifecycle_adapters.prepare_remote_pair
+        def prepare_with_prebuilt_origins(*args, **kwargs):
+            prepared_outcome = original_prepare_pair(*args, **kwargs)
+            if prepared_outcome.succeeded:
+                evidence = dict(prepared_outcome.evidence)
+                evidence["bootstrap"] = evidence["bootstrap"].model_copy(update={"builds": prebuilt})
+                return replace(prepared_outcome, evidence=evidence)
+            return prepared_outcome
+        monkeypatch.setattr(lifecycle_adapters, "prepare_remote_pair", prepare_with_prebuilt_origins)
     original_remote_f03 = lifecycle_adapters.run_remote_f03
     handoff = {}
     def capture_remote_f03(connection, guest_request, **kwargs):
@@ -1055,6 +1111,34 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["protect"].state == "registered"
     assert provider_result.values["claim"].eligible is True, provider_result.values
     assert provider_result.values["claim"].creation_granted is True, provider_result.values
+    if prebuilt_origins:
+        prepared_outcome = provider_result.values["prepare"]
+        assert prepared_outcome.stage == "prepare" and prepared_outcome.succeeded is True
+        prepared_bootstrap = prepared_outcome.evidence["bootstrap"]
+        assert len(prepared_bootstrap.builds) == 4
+        assert all(build.build_origin == "controller-prebuilt"
+            and build.origin_proof_bytes
+            and build.origin_artifact_id
+            for build in prepared_bootstrap.builds)
+        assert len(runner.diagnostics_contexts) == 2
+        assert len(runner.diagnostics_outcomes) == 2
+        for context in runner.diagnostics_contexts.values():
+            role = context["vm_role"]
+            for tool in ("sockperf", "iperf3"):
+                build = next(row for row in prepared_bootstrap.builds
+                    if row.role == role and row.tool == tool)
+                source_row = context["metadata_seed"]["source_builds"]["value"][tool]
+                assert source_row["build_origin"] == "controller-prebuilt"
+                assert source_row["origin_proof_sha256"] == hashlib.sha256(
+                    build.origin_proof_bytes.encode("utf-8")).hexdigest()
+        assert any(action.startswith("f09-iperf3-control-prefix-measure-") for action in runner.actions)
+        assert len([action for action in runner.actions if action.startswith("f09-diagnostics-start-")]) == 2
+        assert handoff.get("request") is not None, "production measure must dispatch the F03 request"
+        measurement = provider_result.values["measure"]
+        assert measurement.succeeded is True
+        assert measurement.evidence.iperf3_control_pre_measure["available"] is True
+        assert provider_result.values["cleanup"].cleanup_failure is None
+        return
     if region == "eu-north-1":
         assert provider_result.primary_failure is None
     else:
