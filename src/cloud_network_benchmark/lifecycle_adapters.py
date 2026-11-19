@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
+import stat
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
@@ -18,6 +20,168 @@ from .contracts.deployment import ProviderDeploymentInput
 from .contracts.common import Evidence
 from .providers.aws import AwsProviderDriver
 from .providers.gcp import GcpProviderDriver
+
+
+_F03_FAILURE_PREVIEW_BYTES = 192
+_F03_FAILURE_RECORD_BYTES = 32768
+
+
+def _f03_guest_supervisor_script() -> str:
+    """Build a bounded draining supervisor for failure-only guest output."""
+    return r'''import hashlib,json,os,re,selectors,signal,stat,subprocess,sys
+directory,invocation,status_path,python,module_root,request_path,outcome_path=sys.argv[1:]
+preview_limit=192
+if not re.fullmatch(r"[0-9a-f]{32}",invocation): raise SystemExit("invalid invocation")
+st=os.lstat(directory)
+if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)&0o077: raise SystemExit("failure-output directory ownership or mode is invalid")
+# The controller signals the whole owned session. Keep this supervisor alive
+# long enough to drain the guest's pipes; exec resets this caught handler in
+# the child so lifecycle_guest still receives and handles SIGTERM normally.
+signal.signal(signal.SIGTERM,lambda *_:None)
+env=os.environ.copy(); env["PYTHONPATH"]=module_root
+child=subprocess.Popen([python,"-m","cloud_network_benchmark.lifecycle_guest","--request",request_path,"--outcome",outcome_path],
+ stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,close_fds=True)
+selector=selectors.DefaultSelector(); records={}
+for label,stream in (("stdout",child.stdout),("stderr",child.stderr)):
+ selector.register(stream,selectors.EVENT_READ,label); records[label]={"hash":hashlib.sha256(),"bytes":0,"tail":bytearray(),"line":bytearray(),"dropping":False,"pem":False,"hits":0,"truncated":False}
+def clean_line(row,raw):
+ text=raw.decode("utf-8","replace")
+ if row["pem"]:
+  if re.search(r"-----END [^-]*PRIVATE KEY-----",text): row["pem"]=False
+  row["hits"]+=1; return b"[REDACTED_PRIVATE_KEY]\n"
+ if re.search(r"-----BEGIN [^-]*PRIVATE KEY-----",text):
+  row["pem"]=not bool(re.search(r"-----END [^-]*PRIVATE KEY-----",text)); row["hits"]+=1; return b"[REDACTED_PRIVATE_KEY]\n"
+ text,h=re.subn(r"(?:AKIA|ASIA)[A-Z0-9]{16}","[REDACTED_ACCESS_KEY_ID]",text); row["hits"]+=h
+ text,h=re.subn(r"(?i)([\"']?\b(?:aws_secret_access_key|aws_session_token|authorization|password|passwd|token|secret|api[_-]?key)\b[\"']?\s*[=:]\s*).*$",r"\1[REDACTED]",text); row["hits"]+=h
+ text,h=re.subn(r"(?i)\b(Bearer|Basic)\s+.*$",r"\1 [REDACTED]",text); row["hits"]+=h
+ text="".join(ch if ch in "\n\r\t" or ord(ch)>=32 and ord(ch)!=127 else "�" for ch in text)
+ return text.encode("utf-8","replace")
+def consume(row,chunk):
+ for byte in chunk:
+  if row["dropping"]:
+   if byte==10: row["dropping"]=False
+   continue
+  if byte==10:
+   row["tail"].extend(clean_line(row,bytes(row["line"])+b"\n")); row["line"].clear()
+  elif len(row["line"])<4096: row["line"].append(byte)
+  else: row["line"].clear(); row["dropping"]=True; row["truncated"]=True
+ if len(row["tail"])>preview_limit: del row["tail"][:-preview_limit]; row["truncated"]=True
+def trim_tail(row):
+ if len(row["tail"])>preview_limit: del row["tail"][:-preview_limit]; row["truncated"]=True
+ # A byte-boundary cut can begin in the middle of a UTF-8 sequence. Ignore
+ # incomplete edge bytes so decoding can never expand the capped preview.
+ row["tail"][:]=bytes(row["tail"]).decode("utf-8","ignore").encode("utf-8")
+while selector.get_map():
+ for key,_ in selector.select():
+  chunk=os.read(key.fileobj.fileno(),65536); row=records[key.data]
+  if not chunk:
+   selector.unregister(key.fileobj); key.fileobj.close()
+   if row["line"] and not row["dropping"]: row["tail"].extend(clean_line(row,bytes(row["line"])))
+   trim_tail(row)
+   row["line"].clear(); continue
+  row["hash"].update(chunk); row["bytes"]+=len(chunk); consume(row,chunk)
+status=child.wait()
+def publish_status(code):
+ try:
+  tmp=status_path+".tmp"; fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+  try:
+   with os.fdopen(fd,"wb",closefd=False) as output: output.write((str(code)+"\n").encode()); output.flush(); os.fsync(output.fileno())
+  finally: os.close(fd)
+  os.replace(tmp,status_path)
+ except OSError: pass
+publish_status(status if status>=0 else 128-status)
+if status==0:
+ # No output is retained on successful completion.
+ try: os.rmdir(directory)
+ except OSError: pass
+else:
+ try:
+  payload={"schema_version":1,"invocation_id":invocation,"streams":{}}
+  for label,row in records.items():
+   preview=bytes(row["tail"]).decode("utf-8","replace")
+   payload["streams"][label]={"preview":preview,"sha256":row["hash"].hexdigest(),"source_bytes":row["bytes"],
+    "preview_truncated":row["truncated"],"redactions_applied":row["hits"]>0,"redaction_count":row["hits"],
+    "hash_basis":"complete guest stream sha256; preview is bounded tail after redaction"}
+  data=(json.dumps(payload,sort_keys=True,separators=(",",":"),ensure_ascii=True)+"\n").encode()
+  try:
+   fd=os.open(os.path.join(directory,"failure-output.json"),os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+   try:
+    if len(data)>32768: raise OSError("failure-output record exceeds its byte limit")
+    with os.fdopen(fd,"wb",closefd=False) as output: output.write(data); output.flush(); os.fsync(output.fileno())
+   finally: os.close(fd)
+  except OSError:
+   # Failure evidence is optional. Keep the original child exit status below.
+   pass
+ except BaseException:
+  pass
+# Diagnostics are optional and may never change the guest's terminal status.
+try:
+ if status==0:
+  os.unlink(os.path.join(directory,"failure-output.json"))
+ else:
+  pass
+except OSError: pass
+raise SystemExit(status if status>=0 else 128-status)'''
+
+
+def _redact_f03_preview(value: str) -> tuple[str, int]:
+    patterns = (
+        (re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}"), "[REDACTED_ACCESS_KEY_ID]"),
+        (re.compile(r"(?i)(\b(?:aws_secret_access_key|aws_session_token|authorization|password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+"), r"\1[REDACTED]"),
+        (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 [REDACTED]"),
+        (re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", re.S), "[REDACTED_PRIVATE_KEY]"),
+    )
+    count = 0
+    for pattern, replacement in patterns:
+        value, hits = pattern.subn(replacement, value); count += hits
+    return value, count
+
+
+def _f03_failure_output_reader_script(path: str) -> str:
+    """Read one small, private regular diagnostic file without following links."""
+    return ("import base64,os,stat,sys; p=sys.argv[1]; d=os.path.dirname(p); ds=os.lstat(d); "
+        "assert stat.S_ISDIR(ds.st_mode) and ds.st_uid==os.getuid() and not (stat.S_IMODE(ds.st_mode)&0o077); st=os.lstat(p); "
+        "assert stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and not (stat.S_IMODE(st.st_mode)&0o077) and st.st_size<=32768; "
+        "fd=os.open(p,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)); f=os.fstat(fd); "
+        "assert stat.S_ISREG(f.st_mode) and f.st_ino==st.st_ino and f.st_dev==st.st_dev and f.st_uid==os.getuid() and not (stat.S_IMODE(f.st_mode)&0o077); "
+        "b=os.read(fd,32769); os.close(fd); assert len(b)==st.st_size and len(b)<=32768; print(base64.b64encode(b).decode('ascii'))")
+
+
+def _f03_python_exec_argument(script: str) -> str:
+    """Encode generated helper code into a transport-safe printable argv token."""
+    return f"exec(bytes.fromhex('{script.encode('utf-8').hex()}'))"
+
+
+def _f03_serialize_failure_output(payload: Mapping[str, Any]) -> str:
+    """Serialize one durable evidence envelope within the legacy 4096 limit."""
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(serialized) > 4096:
+        raise ValueError("failure-output evidence envelope exceeds 4096 characters")
+    return serialized
+
+
+def _f03_failure_output_timeout(deadline: Any, clock: Callable[[], float], shutdown_end: float,
+                                transfer_seconds: float) -> float:
+    """Cap optional retrieval by the existing cleanup and transfer budgets."""
+    remaining = min(deadline.remaining(clock, cleanup=True), max(0.0, shutdown_end - clock()))
+    return min(transfer_seconds, remaining) if remaining > 0 else 0.0
+
+
+def _f03_best_effort_diagnostic(collect: Callable[[], Any], unavailable: Callable[[], Any]) -> None:
+    """A diagnostic exception must not escape into the primary lifecycle result."""
+    try:
+        collect()
+    except BaseException:
+        try:
+            unavailable()
+        except BaseException:
+            pass
+
+
+def _f03_failure_output_launch_guard(process_path: str, failure_dir: str) -> str:
+    """Preserve the exact per-invocation collision guards before launch."""
+    return ("test ! -e " + shlex.quote(process_path) + "; umask 077; test ! -e "
+        + shlex.quote(failure_dir) + "; mkdir -m 700 -- " + shlex.quote(failure_dir) + "; ")
 
 
 @dataclass(frozen=True)
@@ -355,7 +519,8 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                    active_deadline_monotonic: float | None = None,
                    shutdown_deadline_monotonic: float | None = None,
                    cancel_event: Any = None, sleep: Callable[[float], None] = __import__("time").sleep,
-                   on_process_record: Callable[[dict[str, Any]], None] | None = None) -> RemoteGuestExecution:
+                   on_process_record: Callable[[dict[str, Any]], None] | None = None,
+                   retain_failure_output: bool = False) -> RemoteGuestExecution:
     """Run the existing F03 entry on VM A and strictly retrieve its outcome.
 
     Request and response files use unique per-invocation names under the
@@ -364,8 +529,9 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     success until the returned ``GuestOutcome`` validates and matches identity.
     """
     import uuid
-    from .access import _action, _execute, _request
+    from .access import RemoteActionEvidence, _action, _execute, _request
     from .contracts.common import CommandOutcome
+    from .contracts.execution import CommandResult
     from .lifecycle_guest import GuestOutcome, GuestRequest
 
     request = GuestRequest.model_validate(request.model_dump(mode="python"))
@@ -379,7 +545,10 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
     invocation = uuid.uuid4().hex
     root = PurePosixPath(runtime.remote_root) / "control"
     request_path, outcome_path = root / f"{invocation}.request.json", root / f"{invocation}.outcome.json"
+    failure_dir = root / f"{invocation}.failure-output"
+    failure_path = failure_dir / "failure-output.json"
     local_outcome = None
+    local_failure_output = None
     actions = []
     cancellation_status = "not_needed"
     stage = "request staging"
@@ -391,6 +560,90 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
 
     def active_remaining() -> float:
         return min(deadline.remaining(clock), max(0.0, active_end - clock()))
+
+    def add_failure_output_action(reason: str, *, request=None, result=None, payload=None):
+        action_id = f"f09-guest-failure-output-{invocation}"
+        if request is None:
+            actions.append(RemoteActionEvidence(action_id=action_id, action_type="ssh", vm_id=vm.host,
+                role="vm_a", request={"action_id": action_id, "action_type": "ssh",
+                    "skipped": True, "reason": reason},
+                result={"outcome": "unavailable", "reason": reason}))
+            return
+        if payload is not None:
+            safe_result = result.model_copy(update={"action_id": action_id,
+                "stdout": _f03_serialize_failure_output(payload),
+                "stderr": "", "redactions": request.redactions})
+        else:
+            safe_result = result.model_copy(update={"action_id": action_id,
+                "stdout": "", "stderr": f"failure output unavailable: {reason}",
+                "redactions": request.redactions})
+        actions.append(_action(action_id, "ssh", vm, request, safe_result))
+
+    def collect_failure_output(*, skip_reason: str | None = None):
+        if not retain_failure_output:
+            return
+        if skip_reason:
+            add_failure_output_action(skip_reason)
+            return
+        transfer_timeout = _f03_failure_output_timeout(deadline, clock, shutdown_end,
+            connection.timeouts.transfer_seconds)
+        if transfer_timeout <= 0:
+            add_failure_output_action("existing shutdown/transfer allowance exhausted; not retrieved")
+            return
+        remote_reader = _f03_failure_output_reader_script(str(failure_path))
+        download = _request(f"f09-guest-failure-output-{invocation}", vm,
+            ["python3", "-c", _f03_python_exec_argument(remote_reader), str(failure_path)],
+            transfer_timeout, action_type="ssh")
+        result = _execute(runner, download)
+        if result.outcome != CommandOutcome.SUCCEEDED:
+            add_failure_output_action("bounded failure-output transfer failed", request=download, result=result)
+            return
+        try:
+            import base64
+            encoded = result.stdout.strip()
+            if len(encoded) > ((_F03_FAILURE_RECORD_BYTES + 2) // 3) * 4:
+                raise ValueError("bounded failure-output transport exceeded its cap")
+            source = base64.b64decode(encoded, validate=True)
+            if len(source) > _F03_FAILURE_RECORD_BYTES:
+                raise ValueError("bounded failure-output record exceeded its cap")
+            row = json.loads(source)
+            if (set(row) != {"schema_version", "invocation_id", "streams"}
+                    or isinstance(row["schema_version"], bool) or row["schema_version"] != 1
+                    or row["invocation_id"] != invocation
+                    or set(row["streams"]) != {"stdout", "stderr"}):
+                raise ValueError("failure-output record identity or schema is invalid")
+            safe = {"schema_version": 1, "invocation_id": invocation, "streams": {}}
+            for name in ("stdout", "stderr"):
+                stream = row["streams"][name]
+                if (set(stream) != {"preview", "sha256", "source_bytes", "preview_truncated",
+                        "redactions_applied", "redaction_count", "hash_basis"}
+                        or not isinstance(stream["preview"], str)
+                        or len(stream["preview"].encode("utf-8")) > _F03_FAILURE_PREVIEW_BYTES
+                        or not re.fullmatch(r"[a-f0-9]{64}", stream["sha256"])
+                        or isinstance(stream["source_bytes"], bool)
+                        or not isinstance(stream["source_bytes"], int) or stream["source_bytes"] < 0
+                        or not isinstance(stream["preview_truncated"], bool)
+                        or not isinstance(stream["redactions_applied"], bool)
+                        or isinstance(stream["redaction_count"], bool)
+                        or not isinstance(stream["redaction_count"], int) or stream["redaction_count"] < 0
+                        or stream["hash_basis"] != "complete guest stream sha256; preview is bounded tail after redaction"):
+                    raise ValueError("failure-output stream schema is invalid")
+                preview, redactions = _redact_f03_preview(stream["preview"])
+                encoded = preview.encode("utf-8")
+                safe["streams"][name] = {**stream,
+                    "preview": encoded[-_F03_FAILURE_PREVIEW_BYTES:].decode("utf-8", "ignore"),
+                    "preview_truncated": stream["preview_truncated"] or len(encoded) > _F03_FAILURE_PREVIEW_BYTES,
+                    "redactions_applied": bool(stream["redactions_applied"] or redactions),
+                    "redaction_count": stream["redaction_count"] + redactions}
+            add_failure_output_action("", request=download, result=result, payload=safe)
+        except BaseException:
+            add_failure_output_action("bounded failure-output file was invalid", request=download, result=result)
+
+    def collect_failure_output_best_effort(*, skip_reason: str | None = None):
+        if not retain_failure_output:
+            return
+        _f03_best_effort_diagnostic(lambda: collect_failure_output(skip_reason=skip_reason),
+            lambda: add_failure_output_action("failure-output diagnostics unavailable"))
 
     def retrieve_outcome(*, preserve_cleanup: bool):
         """Retrieve the closed guest outcome under the original F03 deadline."""
@@ -421,6 +674,8 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             outcome, source_bytes, retrieve_error = retrieve_outcome(preserve_cleanup=preserve_cleanup)
             unavailable = (f"partial guest outcome unavailable: {retrieve_error}"
                 if retrieve_error else "partial guest outcome retained")
+        collect_failure_output_best_effort(skip_reason=None if cancellation_status == "process_group_stopped"
+            else "process-group closure was not verified; collection skipped")
         return RemoteGuestExecution(outcome, tuple(actions), f"{message}; {unavailable}",
             outcome_source_bytes=source_bytes)
 
@@ -429,6 +684,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
         with tempfile.TemporaryDirectory(prefix="cnb-f09-guest-") as temp_dir:
             local_request = Path(temp_dir) / "request.json"
             local_outcome = Path(temp_dir) / "outcome.json"
+            local_failure_output = Path(temp_dir) / "failure-output.json"
             local_request.write_text(request.model_dump_json(indent=2), encoding="utf-8")
             remaining = active_remaining()
             if remaining <= 0:
@@ -464,10 +720,6 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             guest_argv = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
                           f"cloud_network_benchmark.lifecycle_guest --request {shlex.quote(str(request_path))} "
                           f"--outcome {shlex.quote(str(outcome_path))}")
-            guest_wrapper = (guest_argv + "; status=$?; printf '%s\\n' \"$status\" > "
-                + shlex.quote(str(status_path) + ".tmp") + "; mv -f -- "
-                + shlex.quote(str(status_path) + ".tmp") + " " + shlex.quote(str(status_path))
-                + "; exit \"$status\"")
             record_python = ("import json,os,sys,time; pid=int(sys.argv[3]); "
                 "deadline=time.monotonic()+2; "
                 "exec('while True:\\n try:\\n  pg=os.getpgid(pid); sid=os.getsid(pid); break\\n except ProcessLookupError:\\n  if time.monotonic()>=deadline: raise\\n  time.sleep(.02)'); "
@@ -475,12 +727,25 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 "row={'deployment_id':sys.argv[1],'invocation_id':sys.argv[2],'pid':pid,'process_group':pg,'session_id':sid,'boot_id':open('/proc/sys/kernel/random/boot_id').read().strip(),'start_ticks':int(tail[19])}; "
                 "assert pid==pg==sid and row['start_ticks']>0; "
                 "tmp=sys.argv[4]+'.tmp'; open(tmp,'x').write(json.dumps(row,sort_keys=True)); os.replace(tmp,sys.argv[4]); print(json.dumps(row,sort_keys=True))")
-            command = ("set -eu; test ! -e " + shlex.quote(str(process_path)) + "; "
-                       "setsid sh -c " + shlex.quote(guest_wrapper)
-                       + " </dev/null >/dev/null 2>&1 & child=$!; "
-                       "python3 -c " + shlex.quote(record_python) + " "
-                       + shlex.quote(connection.deployment_id) + " " + shlex.quote(invocation) + " \"$child\" "
-                       + shlex.quote(str(process_path)))
+            if retain_failure_output:
+                command = ("set -eu; " + _f03_failure_output_launch_guard(str(process_path), str(failure_dir))
+                    + "setsid python3 -c " + shlex.quote(_f03_python_exec_argument(_f03_guest_supervisor_script())) + " "
+                    + " ".join(shlex.quote(value) for value in (str(failure_dir), invocation,
+                        str(status_path), python, module_root, str(request_path), str(outcome_path)))
+                    + " </dev/null >/dev/null 2>&1 & child=$!; python3 -c "
+                    + shlex.quote(record_python) + " " + shlex.quote(connection.deployment_id)
+                    + " " + shlex.quote(invocation) + " \"$child\" " + shlex.quote(str(process_path)))
+            else:
+                guest_wrapper = (guest_argv + "; status=$?; printf '%s\\n' \"$status\" > "
+                    + shlex.quote(str(status_path) + ".tmp") + "; mv -f -- "
+                    + shlex.quote(str(status_path) + ".tmp") + " " + shlex.quote(str(status_path))
+                    + "; exit \"$status\"")
+                command = ("set -eu; test ! -e " + shlex.quote(str(process_path)) + "; "
+                           "setsid sh -c " + shlex.quote(guest_wrapper)
+                           + " </dev/null >/dev/null 2>&1 & child=$!; "
+                           "python3 -c " + shlex.quote(record_python) + " "
+                           + shlex.quote(connection.deployment_id) + " " + shlex.quote(invocation) + " \"$child\" "
+                           + shlex.quote(str(process_path)))
             execute = _request(f"f09-guest-run-{invocation}", vm,
                 ["sh", "-c", command], min(connection.timeouts.command_seconds, remaining))
             stage = "guest command execution"
@@ -541,6 +806,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             outcome, source_bytes, outcome_error = retrieve_outcome(preserve_cleanup=False)
             cancelled_race = cancel_event is not None and cancel_event.is_set()
             if outcome_error:
+                collect_failure_output_best_effort(skip_reason="guest exited 0; failure-only output was discarded")
                 return RemoteGuestExecution(None, tuple(actions),
                     f"F03 outcome retrieval/validation failed: {outcome_error}",
                     outcome_source_bytes=source_bytes)

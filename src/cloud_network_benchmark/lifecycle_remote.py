@@ -354,7 +354,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 active_deadline_monotonic=measurement_window.execution_deadline_monotonic,
                 shutdown_deadline_monotonic=measurement_window.shutdown_deadline_monotonic,
                 cancel_event=cancel_event, sleep=sleep,
-                on_process_record=lambda record: _record_f03_process(record, control, control_lock, item))
+                on_process_record=lambda record: _record_f03_process(record, control, control_lock, item),
+                retain_failure_output=str(item.observation.provider) == "aws")
             if item.guest.failure and "process_group_stopped" in item.guest.failure:
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at
