@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any, Callable
@@ -308,11 +309,38 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         # The legacy local -state override is not carried into a saved plan's
         # backend configuration. Keep apply on the original attempt state too.
         result = execute(request.action_id, [*prefix, "apply", "-input=false", f"-state={state}", str(binary)])
-        _private(directory / "apply-result.json", _json({"action_id": result.action_id, "outcome": str(result.outcome), "exit_code": result.exit_code}))
+        apply_evidence = {"action_id": result.action_id, "outcome": str(result.outcome), "exit_code": result.exit_code}
+        if provider == "aws" and result.outcome != "succeeded":
+            diagnostic = {}
+            for field in ("stdout", "stderr"):
+                raw = getattr(result, field)
+                text = _redact_apply_diagnostic(raw, result.redactions)
+                diagnostic[field] = text[:8192]
+                diagnostic[field + "_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+                diagnostic[field + "_truncated"] = len(text) > 8192
+            apply_evidence["diagnostic"] = diagnostic
+        try:
+            _private(directory / "apply-result.json", _json(apply_evidence))
+        except OSError:
+            # Evidence I/O must not replace the provider's original failed result;
+            # its caller retains the original category and proceeds to cleanup.
+            if result.outcome == "succeeded":
+                raise
         return result
     except BaseException as exc:
         _private(directory / "failure.json", _json({"category": "terraform_plan_review", "error_type": type(exc).__name__}))
         raise
+
+
+def _redact_apply_diagnostic(value: str, secrets: list[str]) -> str:
+    """Bounded redaction for private AWS saved-apply failure diagnostics."""
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(?:AKIA|ASIA)[A-Z0-9]{16}", "[REDACTED_ACCESS_KEY_ID]", value)
+    value = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", value)
+    value = re.sub(r"(?i)((?:aws_secret_access_key|aws_session_token|authorization|bearer|password|token|secret|credential)\s*[=: ]\s*)[^\s,;]+", r"\1[REDACTED]", value)
+    value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", value, flags=re.S)
+    return value
 
 
 def record_operator_review(directory: Path, request_sha256: str, reviewer: str, inspection: str) -> Path:

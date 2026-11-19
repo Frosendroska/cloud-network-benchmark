@@ -1634,6 +1634,7 @@ class AwsProviderDriver:
             timeout_seconds=timeout,
             stdin=stdin,
             environment_classification="contains_secret_references" if self.settings.authentication_reference else "none",
+            redactions=[self.settings.authentication_reference, self.settings.public_key],
         )
         if provisioning_action:
             self._require_provision_time(action_id + " initialization", action_id=action_id)

@@ -186,6 +186,46 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert runner.requests[-1].timeout_seconds <= runner.requests[0].timeout_seconds
 
 
+def test_aws_failed_saved_apply_retains_bounded_redacted_diagnostics(tmp_path, operator):
+    req, runner = request(tmp_path, "aws", "pair")
+    secret = "private-ssh-key:attempt-only"
+    public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fixture-public"
+    req = req.model_copy(update={"redactions": [secret, public_key]})
+    original_run = runner.run
+
+    def fail_apply(command):
+        if "apply" in command.argv:
+            runner.requests.append(command)
+            return result(command, failed=True).model_copy(update={
+                "stderr": (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP "
+                           "Authorization: Bearer bearer-secret\n-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
+                           "-----END RSA PRIVATE KEY-----"),
+                "stdout": "resource error",
+                "redactions": command.redactions,
+            })
+        return original_run(command)
+
+    returned = tp.reviewed_apply(req, fail_apply)
+    assert returned.outcome == "failed"
+    review_dir = next(tmp_path.glob("*-review-*"))
+    evidence_path = review_dir / "apply-result.json"
+    evidence = json.loads(evidence_path.read_text())
+    assert review_dir.stat().st_mode & 0o777 == 0o700
+    assert evidence_path.stat().st_mode & 0o777 == 0o600
+    diagnostic = evidence["diagnostic"]
+    assert "apply denied" in diagnostic["stderr"]
+    assert "[REDACTED]" in diagnostic["stderr"]
+    assert "abc123" not in diagnostic["stderr"]
+    assert secret not in diagnostic["stderr"] and public_key not in diagnostic["stderr"]
+    assert "AKIAABCDEFGHIJKLMNOP" not in diagnostic["stderr"]
+    raw_stderr = (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP "
+                  "Authorization: Bearer bearer-secret\n-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
+                  "-----END RSA PRIVATE KEY-----")
+    assert diagnostic["stderr_sha256"] == hashlib.sha256(raw_stderr.encode()).hexdigest()
+    assert "bearer-secret" not in diagnostic["stderr"] and "private-bytes" not in diagnostic["stderr"]
+    assert diagnostic["stderr_truncated"] is False
+
+
 def test_missing_operator_receipt_never_applies_and_preserves_files(tmp_path):
     req,runner=request(tmp_path)
     with pytest.raises(tp.PlanReviewError,match="inspection required"): tp.reviewed_apply(req,runner.run)
