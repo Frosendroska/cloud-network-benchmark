@@ -11,6 +11,9 @@ from cloud_network_benchmark import terraform_plan as tp
 from cloud_network_benchmark.azure_plan_scope import security_rules
 from tests.contract.test_azure_provider_contract import deployment, options
 from tests.unit.test_terraform_plan_review import plan_document, SavedPlanRunner, operator, ROOT
+from cloud_network_benchmark.contracts.execution import CommandResult
+
+NOW = datetime(2026, 11, 14, tzinfo=timezone.utc)
 
 
 def azure_scope(root="pair", scenario="same_zone", region="swedencentral"):
@@ -124,6 +127,27 @@ def test_azure_dispatch_applies_only_saved_binary_to_original_state(tmp_path,ope
     assert "-auto-approve" not in applied.argv and not any(a.startswith("-var-file") for a in applied.argv)
     binary=Path(applied.argv[-1]);assert binary.parent.parent==workspace and binary.exists()
     assert json.loads((binary.parent/"accepted-review.json").read_text())["binding"]["state"]==str(workspace/(root+".tfstate"))
+
+
+def test_azure_failed_apply_evidence_write_error_still_propagates(tmp_path, operator, monkeypatch):
+    d=deployment(ROOT);o=options(tmp_path);workspace,_=az._workspace(o,d)
+    v,r=azure_scope("pair");varfile=workspace/"vars.json";varfile.write_text(json.dumps(v))
+    runner=SavedPlanRunner(azure_document(v,r))
+    original_run=runner.run
+    def fail_apply(command):
+        if "apply" in command.argv:
+            return CommandResult(action_id=command.action_id,outcome="failed",started_at=NOW,
+                finished_at=NOW,duration_seconds=0,exit_code=1,stdout="",stderr="Azure apply failure",
+                redactions=command.redactions)
+        return original_run(command)
+    runner.run=fail_apply
+    original_private=tp._private
+    def fail_result_write(path,content):
+        if path.name=="apply-result.json": raise PermissionError("fixture evidence write failure")
+        return original_private(path,content)
+    monkeypatch.setattr(tp,"_private",fail_result_write)
+    with pytest.raises(PermissionError,match="fixture evidence write failure"):
+        az._tf(workspace,o,runner,lambda:1.,"terraform/azure/pair","apply",f"-var-file={varfile}",action="pair_apply")
 
 
 @pytest.mark.parametrize("root",["expiry","pair"])

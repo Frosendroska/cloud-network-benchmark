@@ -310,7 +310,9 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         # backend configuration. Keep apply on the original attempt state too.
         result = execute(request.action_id, [*prefix, "apply", "-input=false", f"-state={state}", str(binary)])
         apply_evidence = {"action_id": result.action_id, "outcome": str(result.outcome), "exit_code": result.exit_code}
-        if provider == "aws" and result.outcome != "succeeded":
+        apply_failed = result.outcome != "succeeded" or result.exit_code != 0
+        aws_apply_failed = provider == "aws" and apply_failed
+        if aws_apply_failed:
             diagnostic = {}
             for field in ("stdout", "stderr"):
                 raw = getattr(result, field)
@@ -324,7 +326,7 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         except OSError:
             # Evidence I/O must not replace the provider's original failed result;
             # its caller retains the original category and proceeds to cleanup.
-            if result.outcome == "succeeded":
+            if not aws_apply_failed:
                 raise
         return result
     except BaseException as exc:
@@ -338,7 +340,10 @@ def _redact_apply_diagnostic(value: str, secrets: list[str]) -> str:
         value = value.replace(secret, "[REDACTED]")
     value = re.sub(r"(?:AKIA|ASIA)[A-Z0-9]{16}", "[REDACTED_ACCESS_KEY_ID]", value)
     value = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", value)
-    value = re.sub(r"(?i)((?:aws_secret_access_key|aws_session_token|authorization|bearer|password|token|secret|credential)\s*[=: ]\s*)[^\s,;]+", r"\1[REDACTED]", value)
+    sensitive = r"(?:aws_access_key_id|aws_secret_access_key|aws_session_token|authorization|bearer|password|token|secret|credential)"
+    value = re.sub(rf'''(?i)(["']?{sensitive}["']?\s*:\s*)(["'])([^"'\r\n]*)(\2)''',
+                   r"\1\2[REDACTED]\4", value)
+    value = re.sub(rf"(?i)((?:{sensitive})\s*[=:]\s*)[^\s,;}}\"']+", r"\1[REDACTED]", value)
     value = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]", value, flags=re.S)
     return value
 

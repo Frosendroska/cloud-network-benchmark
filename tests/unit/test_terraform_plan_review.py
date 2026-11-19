@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
 from cloud_network_benchmark import terraform_plan as tp
@@ -197,9 +198,13 @@ def test_aws_failed_saved_apply_retains_bounded_redacted_diagnostics(tmp_path, o
         if "apply" in command.argv:
             runner.requests.append(command)
             return result(command, failed=True).model_copy(update={
-                "stderr": (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP "
-                           "Authorization: Bearer bearer-secret\n-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
-                           "-----END RSA PRIVATE KEY-----"),
+                "stderr": (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP ASIA1234567890ABCDEF "
+                           'aws_secret_access_key=plain-secret '
+                           '{"aws_session_token":"json-session-secret", "aws_secret_access_key": "json-secret-key", '
+                           '"aws_access_key_id": "json-access-id"} '
+                           "Authorization: Bearer bearer-secret\nProxy-Authorization: Basic basic-secret\n"
+                           "-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
+                           "-----END RSA PRIVATE KEY----- " + "x" * 9000),
                 "stdout": "resource error",
                 "redactions": command.redactions,
             })
@@ -218,12 +223,60 @@ def test_aws_failed_saved_apply_retains_bounded_redacted_diagnostics(tmp_path, o
     assert "abc123" not in diagnostic["stderr"]
     assert secret not in diagnostic["stderr"] and public_key not in diagnostic["stderr"]
     assert "AKIAABCDEFGHIJKLMNOP" not in diagnostic["stderr"]
-    raw_stderr = (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP "
-                  "Authorization: Bearer bearer-secret\n-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
-                  "-----END RSA PRIVATE KEY-----")
+    assert "ASIA1234567890ABCDEF" not in diagnostic["stderr"]
+    for sentinel in ("json-session-secret", "json-secret-key", "json-access-id", "plain-secret"):
+        assert sentinel not in diagnostic["stderr"]
+    raw_stderr = (f"apply denied; token=abc123 {secret} {public_key} AKIAABCDEFGHIJKLMNOP ASIA1234567890ABCDEF "
+                  'aws_secret_access_key=plain-secret '
+                  '{"aws_session_token":"json-session-secret", "aws_secret_access_key": "json-secret-key", '
+                  '"aws_access_key_id": "json-access-id"} '
+                  "Authorization: Bearer bearer-secret\nProxy-Authorization: Basic basic-secret\n"
+                  "-----BEGIN RSA PRIVATE KEY-----\nprivate-bytes\n"
+                  "-----END RSA PRIVATE KEY----- " + "x" * 9000)
     assert diagnostic["stderr_sha256"] == hashlib.sha256(raw_stderr.encode()).hexdigest()
     assert "bearer-secret" not in diagnostic["stderr"] and "private-bytes" not in diagnostic["stderr"]
-    assert diagnostic["stderr_truncated"] is False
+    assert len(diagnostic["stderr"]) == 8192
+    assert diagnostic["stderr_truncated"] is True
+
+
+@pytest.mark.parametrize("provider,write_error_expected", [("aws", False), ("gcp", True)])
+def test_apply_result_write_failure_preserves_only_failed_aws_result(tmp_path, operator, monkeypatch, provider, write_error_expected):
+    req, runner = request(tmp_path, provider, "pair")
+    original_run = runner.run
+    failed = None
+
+    def fail_apply(command):
+        nonlocal failed
+        if "apply" in command.argv:
+            runner.requests.append(command)
+            failed = result(command, failed=True).model_copy(update={"stderr": "provider apply failure"})
+            return failed
+        return original_run(command)
+
+    original_private = tp._private
+
+    def fail_result_write(path, content):
+        if path.name == "apply-result.json":
+            raise PermissionError("fixture evidence write failure")
+        return original_private(path, content)
+
+    monkeypatch.setattr(tp, "_private", fail_result_write)
+    if write_error_expected:
+        with pytest.raises(PermissionError, match="fixture evidence write failure"):
+            tp.reviewed_apply(req, fail_apply)
+        return
+
+    returned = tp.reviewed_apply(req, fail_apply)
+    assert returned is failed
+    assert returned.action_id == req.action_id
+    assert returned.outcome == "failed" and returned.exit_code == 1
+    assert returned.stderr == "provider apply failure"
+
+
+def test_command_result_rejects_succeeded_outcome_with_nonzero_exit_code():
+    with pytest.raises(ValidationError, match="succeeded requires exit code 0"):
+        CommandResult(action_id="aws-pair-apply", outcome="succeeded", started_at=NOW,
+            finished_at=NOW, duration_seconds=0, exit_code=1, stdout="", stderr="")
 
 
 def test_missing_operator_receipt_never_applies_and_preserves_files(tmp_path):
