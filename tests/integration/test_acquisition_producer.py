@@ -301,6 +301,7 @@ def test_f03_measurement_does_not_open_controller_bundle_from_guest_namespace(re
 
     resolved = observation(repository_root, "acceptance")
     guest_root = tmp_path / "guest-root"
+    guest_root.mkdir()
     controller_bundle = tmp_path / "controller-private" / "controller-tools.tar.gz"
     bundle_bytes = b"verified controller-prebuilt bundle fixture\n"
     bundle_digest = hashlib.sha256(bundle_bytes).hexdigest()
