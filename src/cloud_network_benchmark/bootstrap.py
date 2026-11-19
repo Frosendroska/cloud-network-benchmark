@@ -230,7 +230,8 @@ class BuildObservation(StrictModel):
 
 
 def materialize_build_identity_artifacts(root: Path, deployment_id: str,
-        builds: List[BuildObservation] | tuple[BuildObservation, ...]) -> tuple[ArtifactRecord, ...]:
+        builds: List[BuildObservation] | tuple[BuildObservation, ...], *,
+        include_controller_bundle: bool = True) -> tuple[ArtifactRecord, ...]:
     """Persist exact remote sidecar bytes captured by the bootstrap command."""
     records: list[ArtifactRecord] = []
     for build in builds:
@@ -268,7 +269,14 @@ def materialize_build_identity_artifacts(root: Path, deployment_id: str,
                 sha256=StringEvidence(value=hashlib.sha256(proof_raw).hexdigest()), retrieval_state="verified")
             proof_record.verify_materialized_file(root)
             records.append(proof_record)
-    bundle = next((b for b in builds if getattr(b, "build_origin", "guest-source-build") == "controller-prebuilt"), None)
+    # Guest measurements receive the original controller path as provenance,
+    # but that path is outside the guest filesystem. Only the controller can
+    # archive those original bytes; guest-side calls still materialize both
+    # roles' identity and origin sidecars without reopening the controller path.
+    bundle = None
+    if include_controller_bundle:
+        bundle = next((b for b in builds
+            if getattr(b, "build_origin", "guest-source-build") == "controller-prebuilt"), None)
     if bundle is not None:
         source = Path(bundle.prebuilt_bundle_path or "")
         if (not source.is_absolute() or any(p.is_symlink() for p in (source, *source.parents)) or not source.is_file()

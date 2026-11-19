@@ -962,7 +962,7 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
             raise ValueError("short-run measurement can materialize build identities only for VM A")
         materialized_builds = tuple(build for build in materialized_builds if build.role == context.local_vm_role)
     build_records = materialize_build_identity_artifacts(Path(context.root), context.identity.deployment_id,
-        materialized_builds)
+        materialized_builds, include_controller_bundle=False)
     if build_records:
         result = replace(result, artifact_records=build_records)
     if not context.source_artifact_records or not context.build_observations:

@@ -278,6 +278,17 @@ def test_actual_optional_bootstrap_request_has_typed_success_or_failure_without_
         from cloud_network_benchmark.contracts.artifacts import ArtifactLayout
         from cloud_network_benchmark.lifecycle_bundle import lifecycle_declarations
         all_builds=builds+builds_b
+        # Model the real guest namespace: it receives controller-prebuilt
+        # provenance, but cannot resolve the controller's absolute bundle path.
+        guest_builds = [build.model_copy(update={"prebuilt_bundle_path": str(
+            tmp_path / "guest-filesystem" / "controller-tools.tar.gz")}) for build in builds]
+        guest_root = tmp_path / "guest-results"
+        guest_records = materialize_build_identity_artifacts(guest_root, c.deployment_id,
+            guest_builds, include_controller_bundle=False)
+        assert {record.kind for record in guest_records} == {"build-identity", "build-origin"}
+        assert all((guest_root / record.path).is_file() for record in guest_records)
+        assert not (guest_root / "metadata/build/controller-prebuilt-tools.tar.gz").exists()
+
         result_root=tmp_path/"results"
         records=materialize_build_identity_artifacts(result_root,c.deployment_id,all_builds)
         record_by_id={record.artifact_id:record for record in records}
@@ -285,6 +296,23 @@ def test_actual_optional_bootstrap_request_has_typed_success_or_failure_without_
             assert (result_root/record_by_id[build.artifact_id].path).read_bytes()==build.identity_bytes.encode()
             assert (result_root/record_by_id[build.origin_artifact_id].path).read_bytes()==build.origin_proof_bytes.encode()
         assert {r.kind for r in records}=={"build-identity","build-origin","controller-prebuilt-bundle"}
+        bundle_record = next(record for record in records if record.kind == "controller-prebuilt-bundle")
+        assert (result_root / bundle_record.path).read_bytes() == path.read_bytes()
+
+        missing = builds[0].model_copy(update={"prebuilt_bundle_path": str(tmp_path / "missing-bundle")})
+        with pytest.raises(ValueError, match="prebuilt bundle changed"):
+            materialize_build_identity_artifacts(tmp_path / "missing-output", c.deployment_id, [missing])
+        bundle_bytes = path.read_bytes()
+        path.write_bytes(bundle_bytes + b"tampered")
+        with pytest.raises(ValueError, match="prebuilt bundle changed"):
+            materialize_build_identity_artifacts(tmp_path / "tampered-output", c.deployment_id, [builds[0]])
+        path.write_bytes(bundle_bytes)
+        symlink_path = tmp_path / "bundle-link.tar.gz"
+        symlink_path.symlink_to(path)
+        linked = builds[0].model_copy(update={"prebuilt_bundle_path": str(symlink_path)})
+        with pytest.raises(ValueError, match="prebuilt bundle changed"):
+            materialize_build_identity_artifacts(tmp_path / "symlink-output", c.deployment_id, [linked])
+
         declarations=lifecycle_declarations(ArtifactLayout(),mode="acceptance",measurement_units=[],build_observations=all_builds)
         declared={d.artifact_id for d in declarations}
         assert {f"f02r-{role}-{tool}-origin" for role in ("vm_a","vm_b") for tool in ("sockperf","iperf3")} <= declared

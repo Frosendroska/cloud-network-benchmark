@@ -295,6 +295,71 @@ def test_vm_a_measurement_and_actual_inventory_exclude_prepared_vm_b_identity(re
     assert not any(path.startswith("metadata/build/vm_b-") for path in inventoried_paths)
 
 
+def test_f03_measurement_does_not_open_controller_bundle_from_guest_namespace(repository_root, tmp_path):
+    """Exercise run_measurement with a controller path absent while guest code runs."""
+    from cloud_network_benchmark.bootstrap import BuildObservation, materialize_build_identity_artifacts
+
+    resolved = observation(repository_root, "acceptance")
+    guest_root = tmp_path / "guest-root"
+    controller_bundle = tmp_path / "controller-private" / "controller-tools.tar.gz"
+    bundle_bytes = b"verified controller-prebuilt bundle fixture\n"
+    bundle_digest = hashlib.sha256(bundle_bytes).hexdigest()
+    assert controller_bundle.is_absolute() and not controller_bundle.exists()
+
+    builds = []
+    for role in (VmRole.VM_A, VmRole.VM_B):
+        for tool in ("sockperf", "iperf3"):
+            source = vars(_build(tool, role, f"f02r-{role.value}-{tool}-build"))
+            operational = json.dumps({"fixture": "controller prebuilt evidence", "role": role.value,
+                "tool": tool}, sort_keys=True)
+            receipt = {"tool": tool, "source_reference": source["source_reference"],
+                "source_sha256": source["source_sha256"], "binary_sha256": source["binary_sha256"],
+                "upstream_commit": source["upstream_commit"], "patch_path": source["patch_path"],
+                "patch_sha256": source["patch_sha256"], "operational_build_evidence_json": operational,
+                "build_evidence_sha256": hashlib.sha256(operational.encode()).hexdigest()}
+            proof = {"schema": "CNB_PREBUILT_V1", "origin": "controller-prebuilt", "tool": tool,
+                "role": role.value, "binary_sha256": source["binary_sha256"],
+                "bundle_sha256": bundle_digest, "bundle_artifact_id": "f02r-controller-prebuilt-bundle",
+                "controller_receipt": receipt, "guest_verification": {
+                    "binary_sha256": source["binary_sha256"], "binary_version": source["binary_version"],
+                    "binary_path": source["binary_path"]}}
+            builds.append(BuildObservation.model_validate({**source,
+                "build_origin": "controller-prebuilt",
+                "origin_artifact_id": f"f02r-{role.value}-{tool}-origin",
+                "origin_proof_bytes": json.dumps(proof, sort_keys=True) + "\n",
+                "prebuilt_bundle_path": str(controller_bundle),
+                "prebuilt_bundle_sha256": bundle_digest,
+                "bundle_artifact_id": "f02r-controller-prebuilt-bundle"}))
+
+    clock = FakeClock()
+    runtime = dataclass_replace(context(resolved, guest_root), local_vm_role=VmRole.VM_A.value,
+        build_observations=tuple(builds))
+    processes = FakeProcesses(clock)
+    result = run_measurement(resolved, runtime, processes=processes, clock=clock)
+
+    assert result.outcome == "succeeded"
+    assert set(result.executed_unit_ids) == {unit.unit_id for unit in resolved.measurement_units}
+    assert len(result.command_evidence) == 5
+    assert all(command.result["outcome"] == "succeeded" for command in result.command_evidence)
+    for tool in ("sockperf", "iperf3"):
+        assert (guest_root / f"metadata/build/vm_a-{tool}.identity").is_file()
+        assert (guest_root / f"metadata/build/vm_a-{tool}.origin.json").is_file()
+        assert not (guest_root / f"metadata/build/vm_b-{tool}.identity").exists()
+    assert not (guest_root / "metadata/build/controller-prebuilt-tools.tar.gz").exists()
+
+    # The same absolute path is available to the controller after guest
+    # measurement, which remains the owner of bundle validation and archival.
+    controller_bundle.parent.mkdir(parents=True)
+    controller_bundle.write_bytes(bundle_bytes)
+    controller_root = tmp_path / "controller-results"
+    controller_records = materialize_build_identity_artifacts(controller_root,
+        runtime.identity.deployment_id, tuple(builds))
+    bundle_record = next(record for record in controller_records
+        if record.kind == "controller-prebuilt-bundle")
+    assert (controller_root / bundle_record.path).read_bytes() == bundle_bytes
+    assert bundle_record.sha256.value == bundle_digest
+
+
 def test_f09_closed_both_role_inventory_retrieves_and_seals_receiver_artifact(repository_root, tmp_path):
     """Compose guest production, listener close, strict inventories and bounded bundle copy."""
     import subprocess
