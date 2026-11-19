@@ -667,9 +667,11 @@ def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock
                 category="readiness_deadline_exhausted", message="bundle setup exceeded readiness allowance",
                 occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
     aid = f"f02r-{role}-prebuilt-packages"
-    argv = ["sudo", "sh", "-c", "apt-get update && apt-get install -y " +
-            " ".join(shlex.quote(package) for package in config.bootstrap_packages)]
-    req = _request(aid, vm, argv, min(connection.timeouts.command_seconds, remaining))
+    command_timeout = min(connection.timeouts.command_seconds, remaining)
+    package_script = _prebuilt_package_setup_script(config.bootstrap_packages, command_timeout)
+    encoded_script = f"exec(bytes.fromhex('{package_script.encode().hex()}'))"
+    argv = ["sudo", "python3", "-u", "-c", encoded_script]
+    req = _request(aid, vm, argv, command_timeout)
     result = _execute(runner, req); actions.append(_action(aid, "ssh", vm, req, result))
     if result.outcome != CommandOutcome.SUCCEEDED:
         return _failure_result(connection, actions, vm, req, result, "prebuilt_package_setup_failed",
@@ -791,6 +793,168 @@ def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock
         return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_receipt_invalid",
             "guest bundle receipt could not be tied to the approved origin and installed binary", builds, listeners)
     return None
+
+
+def _prebuilt_package_setup_script(packages: Sequence[str], command_timeout: float) -> str:
+    """Bound apt acquisition and retain small, sanitized diagnostics on failure."""
+    package_json = json.dumps(list(packages))
+    timeout_literal = repr(float(command_timeout))
+    diagnostic_program = r'''import json, os, pathlib, re, socket
+rows = set()
+def accept(uri, suites):
+    try:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(uri)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+            return
+        if host != "ubuntu.com" and not host.endswith(".ubuntu.com"):
+            return
+        if not re.fullmatch(r"[a-z0-9.-]{1,253}", host):
+            return
+        for suite in suites.split():
+            if len(rows) >= 32:
+                return
+            if re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", suite):
+                rows.add((host, suite))
+    except Exception:
+        return
+for path in (pathlib.Path("/etc/apt/sources.list"), pathlib.Path("/etc/apt/sources.list.d/ubuntu.sources")):
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", errors="replace") as source_file:
+            text = source_file.read(65536)
+        if path.name == "ubuntu.sources":
+            for stanza in re.split(r"\n\s*\n", text):
+                fields = {}
+                for line in stanza.splitlines():
+                    match = re.match(r"^(URIs|Suites):\s*(.*)$", line)
+                    if match:
+                        fields[match.group(1)] = match.group(2).split()
+                for uri in fields.get("URIs", []):
+                    accept(uri, " ".join(fields.get("Suites", [])))
+        else:
+            for line in text.splitlines():
+                match = re.match(r"^\s*deb(?:-src)?\s+(?:\[[^]]*\]\s+)?(\S+)\s+(\S+)", line)
+                if match:
+                    accept(match.group(1), match.group(2))
+    except Exception:
+        continue
+safe_rows = [host + "=" + suite for host, suite in sorted(rows)[:32]]
+print("CNB_APT_SOURCES=" + ",".join(safe_rows))
+try:
+    addresses = socket.getaddrinfo("security.ubuntu.com", 80, type=socket.SOCK_STREAM)
+    print("CNB_SECURITY_ENDPOINT_DNS=ok address_count=" + str(len(addresses)))
+    first = addresses[0]
+    connection = socket.socket(first[0], first[1], first[2])
+    connection.settimeout(0.7)
+    connection.connect(first[4])
+    print("CNB_SECURITY_ENDPOINT_FIRST_ADDRESS_CONNECT=ok family=" + str(first[0]))
+    connection.close()
+except Exception as exc:
+    print("CNB_SECURITY_ENDPOINT_OBSERVATION_ERROR=" + type(exc).__name__)
+'''
+    return f'''import json, re, subprocess, sys, time
+PACKAGES = json.loads({package_json!r})
+OUTER_TIMEOUT = {timeout_literal}
+DIAGNOSTIC_PROGRAM = {diagnostic_program!r}
+APT_OPTIONS = ["-o", "Acquire::Retries=0", "-o", "Acquire::http::Timeout=8",
+               "-o", "Acquire::https::Timeout=8"]
+UPDATE_OPTIONS = APT_OPTIONS + ["-o", "APT::Update::Error-Mode=any"]
+def emit_output(value):
+    text = value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+    text = re.sub(r"(?i)(https?://)[^/@\\s]+@", r"\\1[redacted]@", text)
+    if len(text) > 12000:
+        text = "[output truncated]\\n" + text[-12000:]
+    if text:
+        print(text, end="" if text.endswith("\\n") else "\\n")
+def say(value):
+    try:
+        print(value, flush=True)
+    except Exception:
+        pass
+def diagnostics(command_deadline):
+    def emit_diagnostic(value):
+        text = value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+        safe = re.sub(r"[^A-Za-z0-9_= .,:+/-]", "?", text)[:1600]
+        if safe:
+            say(safe.replace("\\n", " | "))
+    try:
+        remaining = command_deadline - time.monotonic()
+        if remaining <= 0:
+            say("CNB_DIAGNOSTICS_SKIPPED=command_budget_exhausted")
+            return
+        result = subprocess.run([sys.executable, "-u", "-c", DIAGNOSTIC_PROGRAM],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=min(2.7, remaining), check=False)
+        say("CNB_SECURITY_ENDPOINT_OBSERVATION_SCOPE=first-address-only")
+        emit_diagnostic(result.stdout)
+        if result.returncode != 0:
+            say("CNB_DIAGNOSTIC_PROCESS_EXIT=" + str(result.returncode))
+    except subprocess.TimeoutExpired as exc:
+        say("CNB_SECURITY_ENDPOINT_OBSERVATION_SCOPE=first-address-only")
+        emit_diagnostic(exc.stdout)
+        say("CNB_DIAGNOSTICS_ERROR=TimeoutExpired")
+    except Exception as exc:
+        say("CNB_DIAGNOSTICS_ERROR=" + type(exc).__name__)
+def best_effort_diagnostics(command_deadline):
+    try:
+        diagnostics(command_deadline)
+    except Exception as exc:
+        say("CNB_DIAGNOSTICS_ERROR=" + type(exc).__name__)
+def run_stage(stage, args, deadline):
+    command = ["apt-get", *args]
+    say("CNB_APT_STAGE=" + stage + " COMMAND=" + json.dumps(command, separators=(",", ":")))
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return 124, "[stage budget exhausted]"
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=left, check=False)
+        return completed.returncode, completed.stdout
+    except KeyboardInterrupt:
+        return 130, "[apt stage interrupted]"
+    except subprocess.TimeoutExpired as exc:
+        return 124, (exc.stdout or b"") + (exc.stderr or b"") + b"\\n[apt stage timed out]\\n"
+    except Exception as exc:
+        return 127, "[apt invocation failed: " + type(exc).__name__ + "]"
+def main():
+    command_deadline = time.monotonic() + max(0.0, OUTER_TIMEOUT)
+    apt_deadline = command_deadline - 3.0
+    if apt_deadline <= time.monotonic():
+        say("CNB_APT_STAGE=update COMMAND_BUDGET_EXHAUSTED")
+        say("CNB_APT_RESULT=stage:update exit=124")
+        best_effort_diagnostics(command_deadline)
+        return 124
+    update_args = [*UPDATE_OPTIONS, "update"]
+    code, output = run_stage("update", update_args, apt_deadline)
+    try:
+        emit_output(output)
+    except Exception:
+        pass
+    if code != 0:
+        say("CNB_APT_RESULT=stage:update exit=" + str(code))
+        best_effort_diagnostics(command_deadline)
+        return code
+    install_args = [*APT_OPTIONS, "install", "-y", *PACKAGES]
+    code, output = run_stage("install", install_args, apt_deadline)
+    try:
+        emit_output(output)
+    except Exception:
+        pass
+    if code != 0:
+        say("CNB_APT_RESULT=stage:install exit=" + str(code))
+        best_effort_diagnostics(command_deadline)
+        return code
+    say("CNB_APT_RESULT=success")
+    return 0
+try:
+    sys.exit(main())
+except KeyboardInterrupt:
+    print("CNB_APT_RESULT=interrupted")
+    best_effort_diagnostics(time.monotonic())
+    sys.exit(130)
+'''
 
 
 class _CancellationRunner:

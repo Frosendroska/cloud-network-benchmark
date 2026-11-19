@@ -329,6 +329,298 @@ def test_changed_bundle_fails_immediate_role_upload_recheck(tmp_path):
     assert not any(r.action_type=="scp" for r in runner.requests)
 
 
+@pytest.mark.parametrize(
+    "update_code,install_code,expected_stage,expected_exit,expected_calls",
+    [(17, 0, "update", 17, ["update"]), (0, 23, "install", 23, ["update", "install"])],
+)
+def test_prebuilt_package_script_bounds_apt_and_preserves_stage_failure(
+    update_code, install_code, expected_stage, expected_exit, expected_calls
+):
+    import contextlib
+    import io
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential", "python3-venv"], 90)
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    calls = []
+    def fake_run(argv, **kwargs):
+        operation = "update" if "update" in argv else "install"
+        calls.append((operation, argv, kwargs))
+        code = update_code if operation == "update" else install_code
+        return SimpleNamespace(returncode=code, stdout=(
+            "synthetic apt failure https://name:secret@example.ubuntu.com/x\n" if code else "ok\n"))
+
+    ns = {}
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    ns["subprocess"] = SimpleNamespace(run=fake_run, TimeoutExpired=real_subprocess.TimeoutExpired,
+                                       PIPE=real_subprocess.PIPE, STDOUT=real_subprocess.STDOUT)
+    ns["diagnostics"] = lambda *_args: (_ for _ in ()).throw(RuntimeError("diagnostics unavailable"))
+    rendered = io.StringIO()
+    with contextlib.redirect_stdout(rendered):
+        result_code = ns["main"]()
+
+    assert result_code == expected_exit
+    assert [call[0] for call in calls] == expected_calls
+    update_argv = next(argv for operation, argv, _ in calls if operation == "update")
+    assert update_argv[0] == "apt-get" and update_argv[-1] == "update"
+    assert "Acquire::Retries=0" in update_argv
+    assert "Acquire::http::Timeout=8" in update_argv
+    assert "Acquire::https::Timeout=8" in update_argv
+    assert "APT::Update::Error-Mode=any" in update_argv
+    assert [call[2]["timeout"] for call in calls] == pytest.approx([87.0] * len(calls), abs=0.01)
+    if install_code:
+        install_argv = next(argv for operation, argv, _ in calls if operation == "install")
+        assert install_argv[-3:] == ["-y", "build-essential", "python3-venv"]
+    assert f"CNB_APT_RESULT=stage:{expected_stage} exit={expected_exit}" in rendered.getvalue()
+    assert "CNB_DIAGNOSTICS_ERROR=RuntimeError" in rendered.getvalue()
+    assert "name:secret@" not in rendered.getvalue()
+
+
+def test_prebuilt_package_script_timeout_is_reported_and_stops_before_install():
+    import contextlib
+    import io
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential"], 90)
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    calls = []
+    def timeout_run(argv, **kwargs):
+        calls.append(argv)
+        raise real_subprocess.TimeoutExpired(argv, kwargs["timeout"], output=b"partial apt output")
+    ns = {}
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    ns["subprocess"] = SimpleNamespace(run=timeout_run, TimeoutExpired=real_subprocess.TimeoutExpired,
+                                       PIPE=real_subprocess.PIPE, STDOUT=real_subprocess.STDOUT)
+    ns["diagnostics"] = lambda *_args: None
+    rendered = io.StringIO()
+    with contextlib.redirect_stdout(rendered):
+        assert ns["main"]() == 124
+    assert len(calls) == 1 and calls[0][-1] == "update"
+    assert "stage:update exit=124" in rendered.getvalue()
+
+
+def test_prebuilt_package_script_interruption_keeps_interrupted_status_without_install():
+    import contextlib
+    import io
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential"], 90)
+    calls = []
+    def interrupted_run(argv, **kwargs):
+        calls.append(argv)
+        raise KeyboardInterrupt()
+    ns = {}
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    ns["subprocess"] = SimpleNamespace(run=interrupted_run, TimeoutExpired=real_subprocess.TimeoutExpired,
+                                       PIPE=real_subprocess.PIPE, STDOUT=real_subprocess.STDOUT)
+    ns["diagnostics"] = lambda *_args: (_ for _ in ()).throw(RuntimeError("diagnostics unavailable"))
+    rendered = io.StringIO()
+    with contextlib.redirect_stdout(rendered):
+        assert ns["main"]() == 130
+    assert len(calls) == 1 and calls[0][-1] == "update"
+    assert "CNB_APT_RESULT=stage:update exit=130" in rendered.getvalue()
+    assert "CNB_DIAGNOSTICS_ERROR=RuntimeError" in rendered.getvalue()
+
+
+def test_prebuilt_package_output_write_failure_preserves_apt_failure():
+    import contextlib
+    import io
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential"], 90)
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    ns = {}
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    ns["subprocess"] = SimpleNamespace(run=lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=17, stdout="apt update failed"), TimeoutExpired=real_subprocess.TimeoutExpired,
+        PIPE=real_subprocess.PIPE, STDOUT=real_subprocess.STDOUT)
+    ns["emit_output"] = lambda _value: (_ for _ in ()).throw(OSError("report write failed"))
+    ns["diagnostics"] = lambda *_args: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert ns["main"]() == 17
+    diagnostic = ns["DIAGNOSTIC_PROGRAM"]
+    assert "/etc/apt/sources.list.d/ubuntu.sources" in diagnostic
+    assert 'getattr(os, "O_NOFOLLOW", 0)' in diagnostic and "read(65536)" in diagnostic
+    assert "getaddrinfo(\"security.ubuntu.com\"" in diagnostic
+    assert "socket.socket(first[0], first[1], first[2])" in diagnostic
+
+
+def test_prebuilt_diagnostic_program_reads_only_bounded_official_sources_and_handles_ipv6(tmp_path):
+    import contextlib
+    import io
+    import json as json_module
+    import pathlib as pathlib_module
+    import re as re_module
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential"], 90)
+    ns = {}
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    contents = {
+        "/etc/apt/sources.list": (
+            "deb https://name:secret@mirror.ubuntu.com/ubuntu noble main\n"
+            "deb https://archive.ubuntu.com/ubuntu noble-updates main\n"
+            "deb https://packages.example.net/ubuntu noble main\n"),
+        "/etc/apt/sources.list.d/ubuntu.sources": (
+            "Types: deb\nURIs: http://security.ubuntu.com/ubuntu\n"
+            "Suites: noble-security\nComponents: main\n"),
+    }
+    file_rows = {}
+    opened = []
+    def fake_open(path, flags):
+        opened.append((path, flags))
+        fd = len(opened)
+        file_rows[fd] = contents[path]
+        return fd
+    fake_os = SimpleNamespace(open=fake_open, fdopen=lambda fd, *_args, **_kwargs: io.StringIO(file_rows[fd]),
+                              O_RDONLY=0, O_NOFOLLOW=0x20000)
+    reads = []
+    class BoundedText(io.StringIO):
+        def read(self, size=-1):
+            reads.append(size)
+            return super().read(size)
+    fake_os.fdopen = lambda fd, *_args, **_kwargs: BoundedText(file_rows[fd])
+    connections = []
+    class FakeSocket:
+        def __init__(self, family, socktype, proto):
+            self.created = (family, socktype, proto)
+        def settimeout(self, value):
+            assert value == 0.7
+        def connect(self, address):
+            connections.append((self.created, address))
+        def close(self):
+            pass
+    def getaddrinfo(host, port, type):
+        assert (host, port, type) == ("security.ubuntu.com", 80, 1)
+        return [(10, 1, 6, "", ("2001:db8::1", 80, 0, 0)),
+                (2, 1, 6, "", ("192.0.2.1", 80))]
+    fake_socket = SimpleNamespace(SOCK_STREAM=1, socket=FakeSocket, getaddrinfo=getaddrinfo)
+    program = ns["DIAGNOSTIC_PROGRAM"].replace("import json, os, pathlib, re, socket", "")
+    probe_ns = {"json": json_module, "os": fake_os, "pathlib": pathlib_module,
+                "re": re_module, "socket": fake_socket}
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exec(compile(program, "<prebuilt-diagnostic>", "exec"), probe_ns)
+    rendered = output.getvalue()
+    assert len(opened) == 2
+    assert [path for path, _ in opened] == list(contents)
+    assert all(flags & fake_os.O_NOFOLLOW for _, flags in opened)
+    assert reads == [65536, 65536]
+    assert "archive.ubuntu.com=noble-updates" in rendered
+    assert "security.ubuntu.com=noble-security" in rendered
+    assert "mirror.ubuntu.com" not in rendered and "example.net" not in rendered
+    assert "secret" not in rendered
+    assert len(connections) == 1
+    assert connections[0][0] == (10, 1, 6)
+    assert connections[0][1] == ("2001:db8::1", 80, 0, 0)
+
+    fake_socket.getaddrinfo = lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("secret DNS detail"))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exec(compile(program, "<prebuilt-diagnostic>", "exec"), probe_ns)
+    assert "ValueError" in output.getvalue()
+    assert "secret DNS detail" not in output.getvalue()
+
+
+def test_prebuilt_diagnostics_obey_remaining_command_budget_and_bound_output():
+    import contextlib
+    import io
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.bootstrap import _prebuilt_package_setup_script
+
+    script = _prebuilt_package_setup_script(["build-essential"], 90)
+    source_text = script.split("\ntry:\n    sys.exit(main())", 1)[0]
+    calls = []
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="Z" * 2000)
+    ns = {}
+    exec(compile(source_text, "<prebuilt-package-script>", "exec"), ns)
+    ns["subprocess"] = SimpleNamespace(run=fake_run, TimeoutExpired=real_subprocess.TimeoutExpired,
+                                       PIPE=real_subprocess.PIPE, STDOUT=real_subprocess.STDOUT)
+    output = io.StringIO()
+    ns["OUTER_TIMEOUT"] = 2.5
+    with contextlib.redirect_stdout(output):
+        assert ns["main"]() == 124
+    assert len(calls) == 1
+    assert calls[0][0][0] == ns["sys"].executable and calls[0][0][1:3] == ["-u", "-c"]
+    assert calls[0][1]["timeout"] <= 2.5
+    assert "Z" * 1601 not in output.getvalue()
+    assert output.getvalue().count("Z") == 1600
+
+    calls.clear()
+    output = io.StringIO()
+    ns["OUTER_TIMEOUT"] = 0
+    with contextlib.redirect_stdout(output):
+        assert ns["main"]() == 124
+    assert not calls
+    assert "CNB_DIAGNOSTICS_SKIPPED=command_budget_exhausted" in output.getvalue()
+
+
+def test_prebuilt_bootstrap_timeout_keeps_both_role_evidence_and_cancels_followup(tmp_path):
+    import threading
+    from datetime import datetime, timedelta, timezone
+    from cloud_network_benchmark.access import RemoteDeadline
+    from cloud_network_benchmark.bootstrap import run_bootstrap
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from tests.fixtures.f02r.support import connection, result
+
+    sources, bundle, declared = make_bundle(tmp_path)
+    config = BootstrapConfig(sources=sources, remote_root="/var/lib/cnb", workspace="/var/lib/cnb/work",
+        results_workspace="/var/lib/cnb/results", install_prefix="/var/lib/cnb/install",
+        prebuilt_bundle={"path": str(bundle), "sha256": declared["sha256"]})
+    c = connection(tmp_path)
+    c = c.model_copy(update={"timeouts": c.timeouts.model_copy(update={"command_seconds": 90, "transfer_seconds": 45})})
+    now = datetime.now(timezone.utc)
+    deadline = RemoteDeadline(readiness_deadline_monotonic=200, overall_deadline_monotonic=1200,
+        cleanup_reserve_seconds=10, cap_started_at=now, cap_expires_at=now + timedelta(seconds=1200))
+
+    class Runner:
+        supports_concurrent_commands = True
+        def __init__(self):
+            self.requests = []
+            self.packages = threading.Barrier(2, timeout=5)
+        def run(self, request):
+            self.requests.append(request)
+            if request.action_id.endswith("cloud-init"):
+                return result(request.action_id, "status: done")
+            if "listener-inspect-" in request.action_id:
+                return result(request.action_id, "LoadState=not-found")
+            if request.action_id.endswith("prebuilt-packages"):
+                self.packages.wait()
+                return CommandResult(action_id=request.action_id, outcome="timed_out", started_at=now,
+                    finished_at=now + timedelta(seconds=90), duration_seconds=90, exit_code=None,
+                    stdout="Hit: regional archive\\nIgn: security.ubuntu.com noble-security\\n", stderr="")
+            raise AssertionError("unexpected follow-up after package timeout: " + request.action_id)
+
+    runner = Runner()
+    outcome = run_bootstrap(c, config, runner, deadline=deadline, clock=lambda: 100)
+    package_ids = {request.action_id for request in runner.requests if request.action_id.endswith("prebuilt-packages")}
+    assert package_ids == {"f02r-vm_a-prebuilt-packages", "f02r-vm_b-prebuilt-packages"}
+    assert not outcome.succeeded and outcome.failure.category == "prebuilt_package_setup_failed"
+    evidence_ids = {item.action_id for item in outcome.actions}
+    assert package_ids <= evidence_ids
+    assert not any(item.action_type == "scp" for item in outcome.actions)
+    assert not outcome.builds and not outcome.listeners
+    assert all("apt-get update" not in " ".join(request.argv) for request in runner.requests)
+    package_request = next(request for request in runner.requests if request.action_id.endswith("prebuilt-packages"))
+    assert package_request.timeout_seconds == 90
+    command = package_request.argv[-1]
+    assert command.startswith("sudo python3 -u -c ")
+
+
 def test_local_bundle_revalidation_consuming_readiness_deadline_prevents_upload(tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
     from cloud_network_benchmark.access import RemoteDeadline
