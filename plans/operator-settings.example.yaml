@@ -54,6 +54,12 @@ approvals:
   diagnostic_day_authorized: *pending_approval
   size_export_review: *pending_approval
   study_window: *pending_approval
+  weekly_concurrency:
+    confirmed: false
+    source: null
+    fields:
+      mode: paired_s1_s3
+      max_parallel_entries: 2
 pricing:
   reviewed: false
   id: null

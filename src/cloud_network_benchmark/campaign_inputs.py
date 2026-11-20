@@ -150,7 +150,7 @@ def _gate_rows(settings, stage):
         required.add("paid_acceptance")
     required |= {"acceptance": set(), "calibration": {"calibration_authorized"},
                  "day": {"common_n", "diagnostic_day_authorized", "size_export_review"},
-                 "week": {"common_n", "study_window"}}[stage]
+                 "week": {"common_n", "study_window", "weekly_concurrency"}}[stage]
     for key in sorted(required):
         row = declarations.get(key)
         if not isinstance(row, dict) or row.get("confirmed") is not True:
@@ -159,6 +159,24 @@ def _gate_rows(settings, stage):
         if not isinstance(row.get("fields", {}), dict):
             raise ValueError(f"approvals.{key}.fields must be a map")
     return {key: declarations[key] for key in required}
+
+
+def _weekly_dispatch_policy(settings, approval_refs):
+    """Freeze the only supported parallel WEEK group to the reviewed S1/S3 pair."""
+    declaration = {**settings.get("approvals", {}),
+                   **settings.get("stage_inputs", {}).get("week", {}).get("approvals", {})}["weekly_concurrency"]
+    _validate_weekly_concurrency(declaration)
+    evidence_path = _path(approval_refs["weekly_concurrency"], "weekly_concurrency evidence", file=True)
+    return {"policy_id": "weekly-paired-s1-s3-v1", "group_by": "launch_at",
+        "scenarios": ["S1", "S3"], "priorities": ["P0", "P1"],
+        "max_parallel_entries": 2, "evidence_path": str(evidence_path),
+        "evidence_sha256": _sha(evidence_path)}
+
+
+def _validate_weekly_concurrency(declaration):
+    fields = declaration.get("fields", {})
+    if fields.get("mode") != "paired_s1_s3" or fields.get("max_parallel_entries") != 2:
+        raise ValueError("weekly_concurrency must explicitly admit paired_s1_s3 with max_parallel_entries: 2")
 
 
 def _common_n(settings):
@@ -194,7 +212,9 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 raise ValueError("private state and exportable results cannot contain one another")
         if sys.version_info < (3, 12):
             raise ValueError("deploy the campaign driver with Python 3.12 or newer")
-        _gate_rows(settings, stage)
+        gates = _gate_rows(settings, stage)
+        if stage == "week":
+            _validate_weekly_concurrency(gates["weekly_concurrency"])
         _cost_payload(settings, root)
         if stage in {"day", "week"}:
             _common_n(settings)
@@ -596,7 +616,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             raise ValueError(f"credential_refresh evidence does not cover {entry_id} through cleanup")
         if scheduled:
             schedule_rows.append([entry_id, data["config_id"], data["experiment_id"], scheduled.isoformat(), window, data["admission"]["priority"]])
-        entries.append({"entry_id": entry_id, "config_path": str(config_path), "scheduled_start": scheduled.isoformat() if scheduled else None,
+        scenario = "S1" if alias in {"s1", "s1_acceptance"} else "S3" if alias in {"s3", "s3_acceptance"} else None
+        entries.append({"entry_id": entry_id, "scenario": scenario,
+            "priority": data["admission"]["priority"], "config_path": str(config_path), "scheduled_start": scheduled.isoformat() if scheduled else None,
             "launch_at": launch_at.isoformat(), "private_root": str(private / entry_id),
             "requires_supervision": entry_id.endswith("FAIL"),
             "acceptance_check": "server_and_controller_loss" if entry_id.endswith("FAIL") else None,
@@ -666,5 +688,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "minimum_free_bytes": int(settings.get("minimum_free_bytes", 0)),
         "operator_log_path": str(Path(state_root) / "campaign.log"),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
+    if stage == "week":
+        stage_data["dispatch_policy"] = _weekly_dispatch_policy(settings, approvals)
     atomic_write_json(private / "prepared.json", stage_data)
     return stage_data

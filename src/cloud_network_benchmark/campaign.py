@@ -36,6 +36,55 @@ def _now(clock: Any) -> datetime:
     return _utc(value)
 
 
+def _validate_week_dispatch_policy(policy: Any) -> None:
+    """Recheck the frozen, source-bound cap immediately before dispatch."""
+    if (not isinstance(policy, dict) or policy.get("policy_id") != "weekly-paired-s1-s3-v1"
+            or policy.get("group_by") != "launch_at" or policy.get("scenarios") != ["S1", "S3"]
+            or policy.get("priorities") != ["P0", "P1"] or policy.get("max_parallel_entries") != 2):
+        raise ValueError("WEEK dispatch requires the frozen paired S1/S3 two-entry policy")
+    evidence = Path(policy.get("evidence_path", ""))
+    if (not evidence.is_file() or evidence.is_symlink()
+            or _digest(evidence) != policy.get("evidence_sha256")):
+        raise ValueError("WEEK concurrency admission evidence is missing or changed")
+    try:
+        admission = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("WEEK concurrency admission evidence is unreadable") from exc
+    source = Path(admission.get("source_path", ""))
+    source_hash = admission.get("source_sha256")
+    if (admission.get("mode") != "paired_s1_s3" or admission.get("max_parallel_entries") != 2
+            or not isinstance(source_hash, str) or len(source_hash) != 64
+            or any(char not in "0123456789abcdef" for char in source_hash)
+            or not source.is_file() or source.is_symlink() or _digest(source) != source_hash):
+        raise ValueError("WEEK concurrency admission evidence does not authorize the bounded S1/S3 pair")
+
+
+def _week_slot_groups(stage: dict[str, Any]) -> dict[datetime, list[dict[str, Any]]]:
+    """Validate and return the explicitly admitted two-entry S1/S3 WEEK slots."""
+    _validate_week_dispatch_policy(stage.get("dispatch_policy"))
+    groups: dict[datetime, list[dict[str, Any]]] = {}
+    entry_ids: set[str] = set()
+    for entry in stage.get("entries", []):
+        entry_id = entry.get("entry_id")
+        if not isinstance(entry_id, str) or entry_id in entry_ids:
+            raise ValueError("WEEK entries must have unique stable identities")
+        entry_ids.add(entry_id)
+        if entry.get("scenario") not in {"S1", "S3"} or entry.get("priority") not in {"P0", "P1"}:
+            raise ValueError("WEEK concurrency is limited to the registered P0/S1 and P1/S3 pair")
+        if not entry.get("scheduled_start"):
+            raise ValueError("WEEK paired entries require their frozen schedule slot")
+        groups.setdefault(_utc(entry["launch_at"]), []).append(entry)
+    if not groups:
+        raise ValueError("WEEK requires at least one admitted S1/S3 slot")
+    for slot, entries in groups.items():
+        if (len(entries) != 2
+                or {entry["scenario"] for entry in entries} != {"S1", "S3"}
+                or {entry["priority"] for entry in entries} != {"P0", "P1"}
+                or len({entry["scheduled_start"] for entry in entries}) != 1):
+            raise ValueError(f"WEEK slot {slot.isoformat()} must contain exactly one P0/S1 and one P1/S3 entry")
+    return groups
+
+
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -140,6 +189,7 @@ class CampaignDriver:
 
     def run(self, stage: dict[str, Any]) -> dict[str, Any]:
         state_root = Path(stage["state_root"]).resolve()
+        weekly_slots = _week_slot_groups(stage) if stage.get("stage") == "week" else None
         journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
         lock_path = journal_path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +207,8 @@ class CampaignDriver:
                           for item in journal["entries"].values())
             if stage.get("stage") == "acceptance":
                 blocked |= any(item["state"] == "failed" for item in journal["entries"].values())
+            if stage.get("stage") == "week":
+                blocked |= any(item["state"] in {"failed", "missed"} for item in journal["entries"].values())
             entries_by_time: dict[datetime, list[dict[str, Any]]] = {}
             for entry in stage["entries"]:
                 state = journal["entries"][entry["entry_id"]]["state"]
@@ -174,6 +226,8 @@ class CampaignDriver:
                 now = _now(self.clock)
                 pending = self._exclude_expired_slots(pending, journal, journal_path, now)
                 if not pending:
+                    if stage.get("stage") == "week":
+                        blocked = True
                     continue
                 min_free = int(stage.get("minimum_free_bytes", 0))
                 if min_free:
@@ -213,7 +267,24 @@ class CampaignDriver:
                         _write_json(journal_path, journal)
                         blocked = True
                         continue
-                groups = [[item] for item in pending] if stage.get("stage") == "acceptance" else [pending]
+                if stage.get("stage") == "week":
+                    _validate_week_dispatch_policy(stage.get("dispatch_policy"))
+                if stage.get("stage") == "acceptance":
+                    groups = [[item] for item in pending]
+                elif stage.get("stage") == "week":
+                    admitted = (weekly_slots or {}).get(launch_at, [])
+                    if len(pending) != 2 or {item["entry_id"] for item in pending} != {
+                            item["entry_id"] for item in admitted}:
+                        for item in pending:
+                            self._transition(journal, item["entry_id"], "missed",
+                                finished_at=_now(self.clock).isoformat(),
+                                error="paired weekly slot is incomplete; no singleton dispatch is permitted")
+                        _write_json(journal_path, journal)
+                        blocked = True
+                        continue
+                    groups = [admitted]
+                else:
+                    groups = [pending]
                 for group in groups:
                     for entry in group:
                         self._transition(journal, entry["entry_id"], "starting", started_at=_now(self.clock).isoformat())
@@ -249,6 +320,8 @@ class CampaignDriver:
                             if ((journal["entries"][entry_id].get("result") or {}).get("cleanup_open")
                                     or (journal["entries"][entry_id].get("result") or {}).get("launch_uncertain")
                                     or (stage.get("stage") == "acceptance"
+                                        and journal["entries"][entry_id]["state"] == "failed")
+                                    or (stage.get("stage") == "week"
                                         and journal["entries"][entry_id]["state"] == "failed")):
                                 blocked = True
                     if blocked:

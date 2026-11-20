@@ -115,6 +115,8 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
             "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
         }),
         "complete_workflow_remaining_seconds": 120,
+        "post_registration_workflow_seconds": 120,
+        "post_provision_workflow_seconds": 100,
     }
     values.update(overrides)
     if deployment.admission.requires_primary_review and "primary_review_decision" not in values:

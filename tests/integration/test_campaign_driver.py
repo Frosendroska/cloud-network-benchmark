@@ -6,6 +6,7 @@ These cases do not establish provider acceptance or Linux service readiness.
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -43,12 +44,18 @@ class FakeClock:
 def stage_fixture(tmp_path, *, slots=28):
     (tmp_path / "results").mkdir(exist_ok=True)
     entries = []
+    approval_source = tmp_path / "weekly-concurrency-source.json"
+    approval_source.write_text('{"fixture":"SYNTHETIC OFFLINE TEST ONLY"}\n')
+    evidence = tmp_path / "weekly-concurrency-evidence.json"
+    evidence.write_text(json.dumps({"mode": "paired_s1_s3", "max_parallel_entries": 2,
+        "source_path": str(approval_source), "source_sha256": hashlib.sha256(approval_source.read_bytes()).hexdigest()}) + "\n")
     for index in range(slots):
         slot = START + timedelta(hours=6 * index)
-        for priority in ("P0", "P1"):
+        for priority, scenario in (("P0", "S1"), ("P1", "S3")):
             eid = f"{priority}-{index:02}"
             entries.append({
-                "entry_id": eid, "config_path": str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"),
+                "entry_id": eid, "scenario": scenario, "priority": priority,
+                "config_path": str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"),
                 "schedule_path": str(tmp_path / "schedule.csv"), "row_id": eid,
                 "scheduled_start": (slot + timedelta(seconds=120)).isoformat(),
                 "launch_at": slot.isoformat(),
@@ -59,6 +66,9 @@ def stage_fixture(tmp_path, *, slots=28):
                 "private_root": str(tmp_path / "private" / eid),
             })
     return {"stage_id": "offline-week", "stage": "week", "controller_session_id": "stable-session",
+            "dispatch_policy": {"policy_id": "weekly-paired-s1-s3-v1", "group_by": "launch_at",
+                "scenarios": ["S1", "S3"], "priorities": ["P0", "P1"], "max_parallel_entries": 2,
+                "evidence_path": str(evidence), "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()},
             "ledger_path": str(tmp_path / "ledger.json"), "scope_id": "offline-week-scope",
             "state_root": str(tmp_path / "state"), "results_root": str(tmp_path / "results"),
             "entries": entries, "minimum_free_bytes": 1024}
@@ -136,14 +146,36 @@ def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budge
     driver(clock, lambda *_: pytest.fail("completed observation relaunched")).run(stage)
 
 
+def test_acceptance_s1_s3_entries_remain_serial(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["stage"] = "acceptance"
+    stage.pop("dispatch_policy")
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def launch(entry, _):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        threading.Event().wait(0.01)
+        with lock:
+            active -= 1
+        return {"status": "complete", "cleanup_open": False}
+
+    driver(FakeClock(), launch).run(stage)
+    assert peak == 1
+
+
 def test_missed_slots_are_recorded_and_never_backfilled(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock(START + timedelta(hours=1))
     launched = []
     driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
     states = {key: value["state"] for key, value in journal(stage)["entries"].items()}
-    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "complete", "P1-01": "complete"}
-    assert set(launched) == {"P0-01", "P1-01"}
+    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "missed", "P1-01": "missed"}
+    assert launched == []
 
 
 @pytest.mark.parametrize("uncertain_state", ["starting", "running"])
@@ -368,7 +400,7 @@ def test_lifecycle_records_sampled_disk_highwater_even_when_space_recovers_befor
     assert result["peak_process_rss_bytes"] == 50 * 1024
 
 
-def test_week_measurement_failure_with_verified_cleanup_keeps_later_independent_slots(tmp_path):
+def test_week_measurement_failure_with_verified_cleanup_blocks_later_slots(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock()
     launched = []
@@ -379,9 +411,45 @@ def test_week_measurement_failure_with_verified_cleanup_keeps_later_independent_
 
     driver(clock, launch).run(stage)
     saved = journal(stage)
-    assert set(launched) == {"P0-00", "P1-00", "P0-01", "P1-01"}
+    assert set(launched) == {"P0-00", "P1-00"}
     assert saved["entries"]["P0-00"]["state"] == "failed"
-    assert all(saved["entries"][name]["state"] == "complete" for name in ("P1-00", "P0-01", "P1-01"))
+    assert saved["entries"]["P1-00"]["state"] == "complete"
+    assert all(saved["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
+
+
+def test_week_rejects_incomplete_or_duplicate_pair_before_launch(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["entries"][1]["scenario"] = "S1"
+    called = []
+    with pytest.raises(ValueError, match="exactly one P0/S1 and one P1/S3"):
+        driver(FakeClock(), lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+
+
+def test_week_rejects_changed_concurrency_evidence_before_launch(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    Path(stage["dispatch_policy"]["evidence_path"]).write_text("{}\n")
+    called = []
+    with pytest.raises(ValueError, match="evidence is missing or changed"):
+        driver(FakeClock(), lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+
+
+def test_week_restart_does_not_launch_a_single_remaining_pair_member(tmp_path):
+    stage = stage_fixture(tmp_path, slots=2)
+    clock = FakeClock()
+    engine = driver(clock, lambda *_: {"status": "complete"})
+    path = Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    saved["entries"]["P1-00"]["state"] = "complete"
+    saved["entries"]["P1-00"]["finished_at"] = clock.utc_now().isoformat()
+    path.write_text(json.dumps(saved))
+    called = []
+    result = driver(clock, lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+    assert result["entries"]["P0-00"]["state"] == "missed"
+    assert result["entries"]["P1-00"]["state"] == "complete"
+    assert all(result["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
 
 
 def test_sleeping_controller_that_wakes_after_the_slot_never_launches_backfill(tmp_path):

@@ -133,12 +133,18 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     for provider, value in providers.items():
         row = _keys(value, {"options", "bootstrap_template", "terraform_directory", "sources"}, f"providers.{provider}")
         optional = {"plan_review_timeout_seconds"}
+        if provider == "aws":
+            optional.add("iam_settle_seconds")
         present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
         options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
         if "plan_review_timeout_seconds" in present:
             seconds = options["plan_review_timeout_seconds"]
             if type(seconds) is not int or not 0 <= seconds <= 600:
                 raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
+        if "iam_settle_seconds" in present:
+            seconds = options["iam_settle_seconds"]
+            if type(seconds) is not int or not 0 <= seconds <= 60:
+                raise ValueError("iam_settle_seconds must be an integer in 0..60")
         for name in ("public_key_path", "ssh_public_key_path"):
             if name in options:
                 options[name] = _source_path(path.parent, options[name], f"providers.{provider}.{name}")
@@ -157,7 +163,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs must be a map of existing F11 gate names to evidence files")
     allowed_gates = {"f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n",
         "study_window", "calibration_authorized", "diagnostic_day_authorized", "size_export_review",
-        "optional_review", "original_failure"}
+        "optional_review", "original_failure", "weekly_concurrency"}
     if set(root["approval_refs"]) - allowed_gates:
         raise ValueError("approval_refs names an unknown F11 gate")
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")
@@ -470,7 +476,12 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
         "cost_input_id": costs.cost_input_id, "cost_input_sha256": reservation.source_sha256,
         "cost_source_path": reservation.source_path,
         "complete_workflow_cost_handoff": StructuredEvidence(value=support),
-        "complete_workflow_remaining_seconds": ceil(remaining.total_seconds)}
+        "complete_workflow_remaining_seconds": ceil(remaining.total_seconds),
+        "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
+            runtime["allowance"], "preparation").total_seconds),
+        "post_provision_workflow_seconds": ceil(_remaining_f11_allowance(
+            runtime["allowance"], "post_provision").total_seconds),
+        "registration_timeout_seconds": ceil(runtime["allowance"].registration_seconds)}
     if observation.admission.requires_primary_review:
         review = sources.get("primary_review_path")
         if review is None:
@@ -484,7 +495,8 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
                 or hashlib.sha256(review_source.read_bytes()).hexdigest() != declared_hash):
             raise ValueError("AWS primary review source hash does not match its bytes")
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
-    settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0))
+    settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0),
+        iam_settle_seconds=options.get("iam_settle_seconds", 0))
     driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
     trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -700,12 +712,18 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "cost_source_path": reservation.source_path,
                 "complete_workflow_cost_handoff": StructuredEvidence(value=support),
                 "complete_workflow_remaining_seconds": ceil(_remaining_f11_allowance(
-                    runtime["allowance"], "registration").total_seconds)}
+                    runtime["allowance"], "registration").total_seconds),
+                "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
+                    runtime["allowance"], "preparation").total_seconds),
+                "post_provision_workflow_seconds": ceil(_remaining_f11_allowance(
+                    runtime["allowance"], "post_provision").total_seconds),
+                "registration_timeout_seconds": ceil(runtime["allowance"].registration_seconds)}
             if observation.admission.requires_primary_review:
                 review = row["sources"].get("primary_review_path")
                 if review is None: raise ValueError("AWS scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
+            settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0),
+                iam_settle_seconds=config.get("iam_settle_seconds", 0))
             driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",

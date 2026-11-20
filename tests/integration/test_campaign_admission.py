@@ -79,6 +79,8 @@ def operator_settings(tmp_path, root, monkeypatch):
             "payload_limit_bytes": 1000, "protocol_overhead_allowance_bytes": 1000,
             "protocol_overhead_priced_usd": ".001"} for provider in ("aws", "azure", "gcp")}
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+    settings["approvals"]["weekly_concurrency"] = {"confirmed": True, "source": str(source),
+        "fields": {"mode": "paired_s1_s3", "max_parallel_entries": 2}}
     for stage, measurement in (("acceptance", 76), ("week", 226), ("calibration", 1180)):
         settings["stage_inputs"][stage] = {"first_day_utc": tomorrow,
             "start_utc": f"{tomorrow}T06:00:00+00:00",
@@ -135,6 +137,28 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     assert len(namespaces) == len(set(namespaces)) == 6
 
 
+def test_generated_week_freezes_the_bounded_source_hashed_pair_policy(repository_root, tmp_path, monkeypatch, request):
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    stage = prepare_stage({"stage": "week"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+    policy = stage["dispatch_policy"]
+    evidence_path = Path(policy["evidence_path"])
+    evidence = json.loads(evidence_path.read_text())
+    assert len(stage["entries"]) == 56
+    assert policy["policy_id"] == "weekly-paired-s1-s3-v1"
+    assert policy["max_parallel_entries"] == 2
+    assert policy["evidence_sha256"] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    assert evidence["mode"] == "paired_s1_s3" and evidence["max_parallel_entries"] == 2
+    assert evidence["source_sha256"] == hashlib.sha256(Path(evidence["source_path"]).read_bytes()).hexdigest()
+    assert {(entry["scenario"], entry["priority"]) for entry in stage["entries"][:2]} == {("S1", "P0"), ("S3", "P1")}
+    assert len({entry["config_path"] for entry in stage["entries"]}) == 56
+    assert len({entry["parent_manifest_path"] for entry in stage["entries"]}) == 56
+    assert len({entry["private_root"] for entry in stage["entries"]}) == 56
+    assert len({entry["runtime_config_path"] for entry in stage["entries"]}) == 56
+    assert len({run_id for entry in stage["entries"] for run_id in entry["run_ids"].values()}) == 168
+
+
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     stage = prepare_stage({"stage": "week"}, settings, repository_root,
@@ -168,6 +192,13 @@ def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isol
     assert len(all_run_ids) == len(set(all_run_ids)) == 168
     assert len(namespaces) == len(set(namespaces)) == 168
     assert len({entry["private_root"] for entry in entries}) == 56
+    policy = stage["dispatch_policy"]
+    assert policy["policy_id"] == "weekly-paired-s1-s3-v1"
+    assert policy["max_parallel_entries"] == 2
+    assert policy["evidence_sha256"] == hashlib.sha256(Path(policy["evidence_path"]).read_bytes()).hexdigest()
+    policy_source = json.loads(Path(policy["evidence_path"]).read_text())
+    assert policy_source["mode"] == "paired_s1_s3" and policy_source["max_parallel_entries"] == 2
+    assert {(entry["scenario"], entry["priority"]) for entry in entries[:2]} == {("S1", "P0"), ("S3", "P1")}
     assert len({entry["runtime_config_path"] for entry in entries}) == 56
     assert len({entry["cost_inputs_path"] for entry in entries}) == 1
     # Real source-template accounting at the paired first slot. Production paid
@@ -190,6 +221,18 @@ def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isol
         assert admitted.reasons == ("financial_authorization_invalid",)
     assert len(book.inspect()["reservations"]) == 0
     assert {row["session"] for row in book.inspect()["reservations"].values()} == set()
+
+
+def test_week_check_requires_exact_bounded_concurrency_admission(repository_root, tmp_path, monkeypatch):
+    import cloud_network_benchmark.campaign_inputs as inputs
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["approvals"]["weekly_concurrency"]["fields"]["max_parallel_entries"] = 3
+    blockers = inputs.validate_stage_inputs({"stage": "week"}, settings, repository_root,
+        local_preparation=True)
+    assert blockers == ["weekly_concurrency must explicitly admit paired_s1_s3 with max_parallel_entries: 2"]
+    assert not Path(settings["state_root"]).exists()
+    assert not Path(settings["results_root"]).exists()
 
 
 def test_complete_static_check_reaches_identity_review_without_mutation(repository_root, tmp_path, monkeypatch):

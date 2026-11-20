@@ -993,6 +993,45 @@ def test_s4_inventory_scans_both_regions_global_addresses_and_exact_known_ids(tm
     assert {item["name"] for item in inventory["support_resources"]} == {"known-template", f"{namespace}-net"}
 
 
+def test_cleanup_inventory_uses_valid_gcloud_subnet_list_grammar(tmp_path):
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    deployment, base = _cleanup_fixture(tmp_path)
+
+    class GcloudGrammarRunner:
+        # Simulate gcloud's command parser: invalid resource paths fail instead
+        # of returning a plausible empty inventory.
+        valid_lists = {
+            ("compute", "instances", "list"), ("compute", "disks", "list"),
+            ("compute", "addresses", "list"), ("compute", "networks", "subnets", "list"),
+            ("compute", "instance-templates", "list"), ("compute", "networks", "list"),
+            ("compute", "firewall-rules", "list"), ("compute", "routes", "list"),
+            ("compute", "resource-policies", "list"),
+        }
+
+        def __init__(self):
+            self.commands = []
+
+        def run(self, request):
+            now = datetime.now(timezone.utc)
+            args = tuple(request.argv[1:])
+            command = args[:args.index("--project")]
+            self.commands.append(command)
+            if command not in self.valid_lists:
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
+                    finished_at=now, duration_seconds=0, exit_code=2, stdout="",
+                    stderr="Invalid choice: 'subnetworks'. Did you mean 'networks'? ")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                finished_at=now, duration_seconds=0, exit_code=0, stdout="[]", stderr="")
+
+    runner = GcloudGrammarRunner()
+    driver = GcpProviderDriver(runner, base.settings)
+    inventory = driver._inventory(deployment)
+    assert inventory["pages_complete"] is True
+    assert ("compute", "networks", "subnets", "list") in runner.commands
+    assert ("compute", "subnetworks", "list") not in runner.commands
+
+
 def test_later_inventory_failure_keeps_protection_and_launch_blocked(tmp_path, monkeypatch):
     import json
     from cloud_network_benchmark.contracts.common import Evidence
