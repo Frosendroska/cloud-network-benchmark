@@ -13,6 +13,7 @@ from cloud_network_benchmark.admission import BudgetLedger, WorkflowAllowance, l
 from cloud_network_benchmark.config import resolve_campaign
 from cloud_network_benchmark.financial_controls import financial_binding
 from cloud_network_benchmark.lifecycle_runtime import build_admission_request, build_runtime, load_initialized_campaign
+from cloud_network_benchmark.contracts.admission import Evidence, ExpiryEvidence, Provider, StructuredEvidence
 from cloud_network_benchmark.manifests import initialize_campaign, ChildRunManifest
 from cloud_network_benchmark.orchestration import run_lifecycle, SavedLifecycleRecovery
 from tests.financial_helpers import synthetic_finances, save
@@ -316,3 +317,193 @@ def test_factory_conservatively_clamps_legacy_sequential_clock_mapping(tmp_path)
     assert deadline<original_deadline
     assert fixture.clock.utc_now()+timedelta(seconds=deadline-fixture.clock.monotonic())<=decision.evidence.expires_at.value
     assert built['ledger'].inspect()['reservations'][decision.evidence.reservation_id.value]['cap_start_monotonic']==row['cap_start_monotonic']
+
+
+class FixedClock:
+    def __init__(self, instant):
+        self.instant = instant
+        self.elapsed = 0.0
+        self.utc_offset = 0.0
+    def utc_now(self): return self.instant + timedelta(seconds=self.elapsed+self.utc_offset)
+    def monotonic(self): return 100000.0 + self.elapsed
+    def advance(self, seconds): self.elapsed += seconds
+
+
+def _claim_with_azure_registration(fixture, monkeypatch, *, minute_floor=True, mutate=None):
+    from cloud_network_benchmark import azure_provider
+
+    built = build(fixture)
+    reserved = built["ledger"].reserve(built["request"], plan=built["plan"])
+    assert reserved.status == "reserved", reserved.reasons
+    hooks = built["workflow_factory"](reserved.evidence)["azure"]
+    captured = {}
+
+    def register(_deployment, request, _options, _runner, *, clock, utc_now):
+        requested = request.expires_at.value
+        effective = requested.replace(second=0, microsecond=0) if minute_floor else requested
+        metadata = {"mechanism": "azure_automation_once_deallocate",
+            "requested_trigger": requested.isoformat(), "trigger": effective.isoformat(),
+            "reservation_id": reserved.evidence.reservation_id.value,
+            "source_sha256": reserved.evidence.source_sha256,
+            "resource_group": request.resource_namespace,
+            "target_ids": request.target_selector.split(";")}
+        evidence = ExpiryEvidence(schema_version=2, run_id=request.run_id,
+            deployment_id=request.deployment_id, provider=Provider.AZURE, action="deallocate",
+            state="registered", registration_id=Evidence(value="synthetic-registration"),
+            registered_at=Evidence(value=utc_now()+timedelta(seconds=5)),
+            expires_at=Evidence(value=effective), target_selector=request.target_selector,
+            provider_metadata=StructuredEvidence(value=metadata))
+        if mutate is not None:
+            evidence = mutate(evidence, request)
+        captured["request"] = request
+        captured["evidence"] = evidence
+        return evidence
+
+    monkeypatch.setattr(azure_provider, "register_expiry", register)
+    hooks.protect()
+    fixture.clock.advance(15)
+    result = hooks.claim()
+    captured["hooks"] = hooks
+    return result, built, reserved, captured
+
+
+@pytest.mark.parametrize("fractional", [False, True])
+def test_azure_factory_claim_binds_floored_schedule_and_keeps_original_request(tmp_path, monkeypatch, fractional):
+    fixture = prepared(tmp_path, "azure", support="0.04")
+    cap_start = NOW.replace(second=4, microsecond=437261) if fractional else NOW.replace(second=0, microsecond=0)
+    fixture.clock = FixedClock(cap_start)
+    result, built, reserved, captured = _claim_with_azure_registration(fixture, monkeypatch)
+    request, evidence = captured["request"], captured["evidence"]
+    if fractional:
+        requested_lead = fixture.runtime["allowance"].provider_leads_seconds["azure"]
+        assert request.expires_at.value == reserved.evidence.expires_at.value-timedelta(seconds=requested_lead)
+        assert evidence.expires_at.value == request.expires_at.value.replace(second=0, microsecond=0)
+        assert evidence.expires_at.value < request.expires_at.value
+        assert result.eligible and result.creation_granted, result.reason_codes
+        row = built["ledger"].inspect()["reservations"][reserved.evidence.reservation_id.value]
+        assert row["provider_deadline"] == evidence.expires_at.value.isoformat()
+        assert row["provider_trigger_monotonic"] <= row["cap_start_monotonic"] + (
+            evidence.expires_at.value-reserved.evidence.cap_started_at.value).total_seconds()
+        initial_trigger = row["provider_trigger_monotonic"]
+        initial_deadline = row["provider_deadline"]
+        replay = captured["hooks"].claim()
+        assert replay.eligible and not replay.creation_granted
+        assert "creation_already_claimed" in replay.reason_codes
+        repeated = built["ledger"].inspect()["reservations"][reserved.evidence.reservation_id.value]
+        assert repeated["provider_trigger_monotonic"] == initial_trigger
+        assert repeated["provider_deadline"] == initial_deadline
+        fixture.clock.utc_offset = -2
+        rollback = captured["hooks"].claim()
+        assert not rollback.eligible and "financial_quote_stale" in rollback.reason_codes
+        after_rollback = built["ledger"].inspect()["reservations"][reserved.evidence.reservation_id.value]
+        assert after_rollback["provider_trigger_monotonic"] == initial_trigger
+        assert after_rollback["provider_deadline"] == initial_deadline
+    else:
+        assert request.expires_at.value == evidence.expires_at.value
+        assert result.eligible and result.creation_granted, result.reason_codes
+
+
+@pytest.mark.parametrize("bad", ["late", "early", "ceil", "wrong_request_metadata", "wrong_reservation_metadata", "wrong_source_metadata", "wrong_timezone", "absent_metadata", "wrong_target"])
+def test_azure_factory_claim_rejects_unproven_or_mismatched_expiry(tmp_path, monkeypatch, bad):
+    fixture = prepared(tmp_path, "azure", support="0.04")
+    fixture.clock = FixedClock(NOW.replace(second=4, microsecond=437261))
+
+    def mutate(evidence, request):
+        when = request.expires_at.value.replace(second=0, microsecond=0)
+        metadata = copy.deepcopy(evidence.provider_metadata.value)
+        if bad == "late":
+            when = request.expires_at.value + timedelta(microseconds=1)
+            metadata["trigger"] = when.isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "early":
+            when = request.expires_at.value - timedelta(seconds=1)
+            metadata["trigger"] = when.isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "ceil":
+            when += timedelta(minutes=1)
+            metadata["trigger"] = when.isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "wrong_request_metadata":
+            metadata["requested_trigger"] = (request.expires_at.value+timedelta(seconds=1)).isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "wrong_reservation_metadata":
+            metadata["reservation_id"] = "different-reservation"
+            return evidence.model_copy(update={
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "wrong_source_metadata":
+            metadata["source_sha256"] = "0"*64
+            return evidence.model_copy(update={
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "wrong_timezone":
+            metadata["trigger"] = when.astimezone(timezone(timedelta(hours=1))).isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "absent_metadata":
+            return evidence.model_copy(update={"provider_metadata":StructuredEvidence(unavailable_reason="not observed")})
+        return evidence.model_copy(update={"target_selector":"wrong-target"})
+
+    result, _built, _reserved, _captured = _claim_with_azure_registration(
+        fixture, monkeypatch, mutate=mutate)
+    assert not result.eligible and not result.creation_granted
+    assert result.reason_codes == ("expiry_mismatch",)
+
+
+def test_azure_factory_rejects_registration_for_another_run_before_claim(tmp_path, monkeypatch):
+    from pydantic import ValidationError
+
+    fixture = prepared(tmp_path, "azure", support="0.04")
+    fixture.clock = FixedClock(NOW.replace(second=4, microsecond=437261))
+    def mutate(evidence, _request):
+        return evidence.model_copy(update={"run_id":"other-azure", "deployment_id":"other-azure-deployment"})
+    with pytest.raises(ValidationError):
+        _claim_with_azure_registration(fixture, monkeypatch, mutate=mutate)
+
+
+def test_azure_factory_rejects_when_only_unrounded_trigger_fits_and_keeps_ledger_unchanged(tmp_path, monkeypatch):
+    fixture = prepared(tmp_path, "azure", support="0.04")
+    fixture.clock = FixedClock(NOW.replace(second=59, microsecond=999999))
+    fixture.runtime["allowance"] = WorkflowAllowance(0, 0, 0, 60, 80, 5, 0, 1,
+        "SYNTHETIC-short-fit", {"azure":360})
+    request, plan = build_admission_request(campaign=fixture.campaign, parent=fixture.parent,
+        children=fixture.children, costs=fixture.costs, runtime=fixture.runtime,
+        controller_session_id="SYNTHETIC")
+    fixture.card["entries"] = [financial_binding(plan, request)]
+    card_ref = save(fixture.cardpath, fixture.card)
+    for evidence in fixture.runtime["approval_evidence"].values():
+        evidence["source_path"] = card_ref["path"]
+        evidence["source_sha256"] = card_ref["sha256"]
+    built = build(fixture)
+    reserved = built["ledger"].reserve(built["request"], plan=built["plan"])
+    assert reserved.status == "reserved", reserved.reasons
+    hooks = built["workflow_factory"](reserved.evidence)["azure"]
+    from cloud_network_benchmark import azure_provider
+    request_holder = {}
+    def register(_deployment, request, _options, _runner, *, clock, utc_now):
+        request_holder["request"] = request
+        effective = request.expires_at.value.replace(second=0, microsecond=0)
+        return ExpiryEvidence(schema_version=2, run_id=request.run_id, deployment_id=request.deployment_id,
+            provider=Provider.AZURE, action="deallocate", state="registered",
+            registration_id=Evidence(value="synthetic-registration"),
+            registered_at=Evidence(value=utc_now()+timedelta(seconds=5)), expires_at=Evidence(value=effective),
+            target_selector=request.target_selector, provider_metadata=StructuredEvidence(value={
+                "mechanism":"azure_automation_once_deallocate",
+                "requested_trigger":request.expires_at.value.isoformat(), "trigger":effective.isoformat(),
+                "reservation_id":reserved.evidence.reservation_id.value,
+                "source_sha256":reserved.evidence.source_sha256,
+                "resource_group":request.resource_namespace,
+                "target_ids":request.target_selector.split(";")}))
+    monkeypatch.setattr(azure_provider, "register_expiry", register)
+    hooks.protect()
+    request = request_holder["request"]
+    elapsed = (request.expires_at.value-fixture.clock.instant).total_seconds()-170
+    fixture.clock.elapsed = elapsed
+    before = built["ledger"].inspect()
+    result = hooks.claim()
+    after = built["ledger"].inspect()
+    assert not result.eligible and not result.creation_granted
+    assert result.reason_codes == ("workflow_time_insufficient",)
+    assert before == after
