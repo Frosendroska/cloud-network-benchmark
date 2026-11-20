@@ -107,6 +107,7 @@ def test_pair_apply_review_rechecks_full_budget_and_preserves_total_stage_deadli
     # review. Cap- and trigger-exhaustion cases stop before dispatch.
     o=o.model_copy(update={"complete_workflow_seconds":810,
         "post_registration_workflow_seconds":760,"command_timeout_seconds":180,
+        "plan_review_timeout_seconds":60,
         "cap_deadline_monotonic":782 if anchor=="cap" else 1000})
     d=d.model_copy(update={"provisioning_timeout_seconds":180})
     reservation=d.reservation.value.model_copy(update={
