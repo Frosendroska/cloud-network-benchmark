@@ -1347,28 +1347,70 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply",
             apply_timeout_seconds=min(options.command_timeout_seconds, provision_deadline_monotonic-preapply_mono),
             before_apply=apply_budget_after_review); results.append(apply.durable_view())
-        out=_tf(root,options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
+        post_apply_options=options.model_copy(update={"cap_deadline_monotonic":min(options.cap_deadline_monotonic,provision_deadline_monotonic)})
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair output and host trust")
+        out=_tf(root,post_apply_options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
         outputs=json.loads(out.stdout)
         observed_images={}
         vms=[]; key_lines=[]
         for role in ("a","b"):
             data=_validate_vm_output_data(deployment,options,role,outputs["vm_"+role]["value"],ids[0 if role=="a" else 1])
-            data["image"]=_observe_vm_image(options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image,deployment.vm_a.region if role=="a" else deployment.vm_b.region,
+            data["image"]=_observe_vm_image(post_apply_options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image,deployment.vm_a.region if role=="a" else deployment.vm_b.region,
                 deployment.vm_a.zone if role=="a" else deployment.vm_b.zone,
                 deployment.vm_a.connection_user if role=="a" else deployment.vm_b.connection_user)
             observed_images[role]=data["image"]
             valid_outputs[role]=data
             nonce=secrets.token_urlsafe(24)
             script=f"printf 'CNB-AZ-HOSTKEY:{nonce}\\n'; cat /etc/ssh/ssh_host_ed25519_key.pub"
-            command=_command(runner,options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts",script,"--output","json"],"host_key_identity",clock)
+            command=_command(runner,post_apply_options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts",script,"--output","json"],"host_key_identity",clock)
+            if clock() >= provision_deadline_monotonic:
+                raise TimeoutError("original Azure provision-stage deadline elapsed during host trust")
             action=json.loads(command.stdout)
             statuses=action.get("value",[])
-            success=[x for x in statuses if isinstance(x,dict) and str(x.get("code","")).lower()=="componentstatus/stdout/succeeded"]
-            if len(success)!=1 or any(str(x.get("level","")).lower()=="error" or str(x.get("code","")).lower().endswith("/failed") for x in statuses):
+            if not isinstance(statuses,list) or not statuses or any(not isinstance(item,dict) for item in statuses):
                 raise ValueError("authenticated Azure Run Command did not report successful completion")
-            script_out=success[0].get("message","")
+            codes=[str(item.get("code","")).lower() for item in statuses]
+            legacy_stdout="componentstatus/stdout/succeeded"
+            legacy_stderr="componentstatus/stderr/succeeded"
+            consolidated_code="provisioningstate/succeeded"
             marker=f"CNB-AZ-HOSTKEY:{nonce}"
-            if not isinstance(script_out,str) or script_out.count(marker)!=1:
+            if sum(str(item.get("message","")).count(marker) for item in statuses)!=1:
+                raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
+            if any(str(item.get("level","")).lower()=="error" or code.endswith("/failed")
+                    for item,code in zip(statuses,codes)):
+                raise ValueError("authenticated Azure Run Command did not report successful completion")
+            if consolidated_code in codes:
+                if len(statuses)!=1 or codes[0]!=consolidated_code:
+                    raise ValueError("authenticated Azure Run Command returned mixed or ambiguous statuses")
+                status=statuses[0]
+                consolidated=True
+            else:
+                if (codes.count(legacy_stdout)!=1 or any(code not in {legacy_stdout,legacy_stderr} for code in codes)
+                        or codes.count(legacy_stderr)>1):
+                    raise ValueError("authenticated Azure Run Command did not report successful completion")
+                status=statuses[codes.index(legacy_stdout)]
+                stderr_status=[item for item,code in zip(statuses,codes) if code==legacy_stderr]
+                if stderr_status and str(stderr_status[0].get("message","" )).strip():
+                    raise ValueError("authenticated Azure Run Command stderr is not empty")
+                consolidated=False
+            script_out=status.get("message","")
+            if not isinstance(script_out,str):
+                raise ValueError("authenticated Azure Run Command stdout is malformed")
+            if script_out.count(marker)!=1:
+                raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
+            if "[stdout]" in script_out or "[stderr]" in script_out:
+                if (script_out.count("[stdout]")!=1 or script_out.count("[stderr]")!=1
+                        or script_out.index("[stdout]")>script_out.index("[stderr]")):
+                    raise ValueError("authenticated Azure Run Command output framing is malformed or ambiguous")
+                stdout_start=script_out.index("[stdout]")+len("[stdout]")
+                stderr_start=script_out.index("[stderr]")
+                if script_out[stderr_start+len("[stderr]"):].strip():
+                    raise ValueError("authenticated Azure Run Command stderr or mixed output is not empty")
+                script_out=script_out[stdout_start:stderr_start]
+            elif consolidated:
+                raise ValueError("authenticated Azure Run Command consolidated output framing is missing")
+            if script_out.count(marker)!=1:
                 raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
             suffix=script_out.split(marker,1)[1]
             parsed_keys=[line.strip() for line in suffix.splitlines() if _KEY.fullmatch(line.strip())]
@@ -1377,12 +1419,16 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
             key=_key_material(parsed_keys[0])
             key_lines.append(f"{data['public_ipv4']} {key}")
             vms.append(_vm_output(deployment,role,data,key,options))
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair trust materialization")
         known=root/"known_hosts"
         if known.exists(): raise FileExistsError("known_hosts already exists; refusing overwrite")
         with known.open("x",encoding="utf-8") as f: f.write("\n".join(key_lines)+"\n")
         os.chmod(known,0o600)
         state=json.loads(journal.read_text(encoding="utf-8"))
         state["pair_state"]="created"; state["known_hosts_reference"]=str(known); _atomic_private(journal,state)
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair output materialization")
         started=apply.started_at
         output=ProviderDeploymentOutput(schema_version=2,identity=_identity(deployment),run_id=deployment.run_id,deployment_id=deployment.deployment_id,
             mode=deployment.mode,provider=Provider.AZURE,scenario=Scenario(deployment.scenario),apply_action_id=apply.action_id,

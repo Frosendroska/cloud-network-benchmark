@@ -577,6 +577,102 @@ def test_registered_pair_provision_normalizes_both_vms_and_materializes_authenti
     assert [r.action_type for r in runner.requests].index("job_binding_readback") < [r.action_type for r in runner.requests].index("pair_apply")
 
 
+def _use_consolidated_run_command_response(runner, *, code="ProvisioningState/succeeded", level="Info", stderr="", duplicate=False, nonce_mode="valid", key_mode="valid", preamble="Enable succeeded:\n", legacy_two_status=False, frame_mode="valid"):
+    original=runner.run
+    def run(request):
+        result=original(request)
+        if request.action_type=="host_key_identity":
+            payload=json.loads(result.stdout)
+            status=payload["value"][0]
+            status["code"]=code; status["level"]=level
+            message=status["message"]
+            if nonce_mode=="missing": message=message.replace("CNB-AZ-HOSTKEY:","CNB-AZ-OTHER:")
+            elif nonce_mode=="duplicate": message += message
+            elif nonce_mode=="stale": message=message.replace("CNB-AZ-HOSTKEY:","CNB-AZ-HOSTKEY:stale-")
+            if key_mode=="malformed": message=message.rsplit("\n",2)[0]+"\nnot-a-key\n"
+            if legacy_two_status:
+                status["code"]="ComponentStatus/StdOut/succeeded"
+                status["message"]=message
+                payload["value"].append({"code":"ComponentStatus/StdErr/succeeded","level":"Info","message":""})
+            else:
+                status["message"]=preamble+"[stdout]\n"+message+"[stderr]\n"+stderr
+                if frame_mode=="duplicate": status["message"]=status["message"].replace("[stderr]","[stdout]\n[stderr]")
+                elif frame_mode=="missing": status["message"]=status["message"].replace("[stdout]","")
+            if duplicate: payload["value"].append(dict(status))
+            return result.model_copy(update={"stdout":json.dumps(payload)})
+        return result
+    runner.run=run
+
+
+def _registered_pair_result(repository_root, tmp_path, runner_factory=AutomationRunner, *, response=None):
+    d=deployment(repository_root).model_copy(update={"provisioning_timeout_seconds":180}); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=18)})
+    runner=runner_factory(d,o,now)
+    if response is not None: _use_consolidated_run_command_response(runner,**response)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16,seconds=42)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    clock=(lambda:runner.mono) if hasattr(runner,"mono") else (lambda:2.)
+    result=provision(registered,o,runner,clock=clock,utc_now=lambda:now+timedelta(seconds=1))
+    return result,runner,o
+
+
+def test_consolidated_success_response_authenticates_both_hosts_on_create_pair_path(repository_root:Path,tmp_path:Path):
+    # Structural synthetic response: the original post-cleanup response body was not retained.
+    result,runner,o=_registered_pair_result(repository_root,tmp_path,response={})
+    assert result.deployment is not None and not result.failures
+    assert len([r for r in runner.requests if r.action_type=="host_key_identity"])==2
+    assert len((o.attempt_root/"known_hosts").read_text().splitlines())==2
+
+
+def test_legacy_stdout_and_empty_stderr_success_statuses_remain_supported(repository_root:Path,tmp_path:Path):
+    result,runner,o=_registered_pair_result(repository_root,tmp_path,response={"legacy_two_status":True})
+    assert result.deployment is not None and not result.failures
+    assert len([r for r in runner.requests if r.action_type=="host_key_identity"])==2
+    assert len((o.attempt_root/"known_hosts").read_text().splitlines())==2
+
+
+@pytest.mark.parametrize("response",[
+    {"code":"ProvisioningState/failed"},
+    {"code":"ProvisioningState/unknown"},
+    {"level":"Error"},
+    {"stderr":"unexpected stderr"},
+    {"duplicate":True},
+    {"nonce_mode":"missing"},
+    {"nonce_mode":"duplicate"},
+    {"nonce_mode":"stale"},
+    {"key_mode":"malformed"},
+    {"frame_mode":"duplicate"},
+    {"frame_mode":"missing"},
+])
+def test_consolidated_run_command_rejects_failure_unknown_and_mixed_responses(repository_root:Path,tmp_path:Path,response):
+    result,_,o=_registered_pair_result(repository_root,tmp_path,response=response)
+    assert result.failures and result.deployment is not None
+    assert not (o.attempt_root/"known_hosts").exists()
+    assert not (o.attempt_root/"terraform-outputs.redacted.json").exists()
+
+
+def test_late_host_trust_completion_cannot_establish_pair_identity(repository_root:Path,tmp_path:Path):
+    class LateRunner(AutomationRunner):
+        mono=2.
+        image_observations=0
+        host_commands=0
+        def run(self,request):
+            result=super().run(request)
+            if request.action_type=="vm_image_observation":
+                self.image_observations+=1
+                self.mono=143.524726 if self.image_observations==1 else self.mono+2.691137
+            if request.action_type=="host_key_identity":
+                self.host_commands+=1
+                # The second command duration is synthetic, set equal to the first observed 33.6501576s.
+                self.mono+=33.6501576
+            return result
+    result,runner,o=_registered_pair_result(repository_root,tmp_path,LateRunner,response={})
+    assert result.failures and "provision-stage deadline" in result.failures[0].message
+    assert runner.host_commands==2 and runner.mono>180
+    assert not (o.attempt_root/"known_hosts").exists()
+    assert not (o.attempt_root/"terraform-outputs.redacted.json").exists()
+
+
 def test_host_identity_failure_preserves_partial_normalized_output_without_connection(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=18)})
