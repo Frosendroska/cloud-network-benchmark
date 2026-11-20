@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -262,8 +263,19 @@ def await_review(directory: Path, binding: dict, deadline: float) -> dict:
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 
-def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 0) -> CommandResult:
+def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 0,
+                   apply_timeout_seconds: float | None = None,
+                   before_apply: Callable[[], float] | None = None) -> CommandResult:
     """Plan -> JSON/scope -> bounded operator inspection -> same saved-plan apply."""
+    if (apply_timeout_seconds is None) != (before_apply is None):
+        raise PlanReviewError("split saved-apply deadlines require both a stage ceiling and a fresh-fit callback")
+    if (isinstance(review_seconds, bool) or not isinstance(review_seconds, (int, float))
+            or not math.isfinite(review_seconds) or review_seconds < 0):
+        raise PlanReviewError("saved-plan review timeout must be finite and nonnegative")
+    if (apply_timeout_seconds is not None and (isinstance(apply_timeout_seconds, bool)
+            or not isinstance(apply_timeout_seconds, (int, float))
+            or not math.isfinite(apply_timeout_seconds) or apply_timeout_seconds <= 0)):
+        raise PlanReviewError("saved-apply stage ceiling must be finite and positive")
     deadline = time.monotonic() + request.timeout_seconds
     argv = request.argv
     root = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-chdir=")))
@@ -308,7 +320,26 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
               (binary_hash, binding["json_sha256"], inputs_hash, sources_hash, state_hash), "reviewed artifact hashes")
         # The legacy local -state override is not carried into a saved plan's
         # backend configuration. Keep apply on the original attempt state too.
-        result = execute(request.action_id, [*prefix, "apply", "-input=false", f"-state={state}", str(binary)])
+        if time.monotonic() >= deadline:
+            raise PlanReviewError("original apply deadline elapsed during saved-plan review")
+        apply_budget = deadline - time.monotonic()
+        if apply_timeout_seconds is not None:
+            apply_budget = apply_timeout_seconds
+            if before_apply is not None:
+                # Providers may recheck independent UTC/monotonic anchors after
+                # a human review and return the remaining apply budget. This
+                # callback must not move any original deadline.
+                fresh_budget = before_apply()
+                if (isinstance(fresh_budget, bool) or not isinstance(fresh_budget, (int, float))
+                        or not math.isfinite(fresh_budget) or fresh_budget <= 0):
+                    raise PlanReviewError("saved apply has no positive remaining provider budget")
+                apply_budget = min(apply_budget, fresh_budget)
+        if apply_budget <= 0:
+            raise PlanReviewError("saved apply no longer fits its original stage deadline")
+        apply_request = request.model_copy(update={"action_id": request.action_id,
+            "argv": [*prefix, "apply", "-input=false", f"-state={state}", str(binary)],
+            "timeout_seconds": apply_budget})
+        result = run(apply_request)
         apply_evidence = {"action_id": result.action_id, "outcome": str(result.outcome), "exit_code": result.exit_code}
         apply_failed = result.outcome != "succeeded" or result.exit_code != 0
         aws_apply_failed = provider == "aws" and apply_failed

@@ -709,6 +709,18 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             admission["cost_input_sha256"] = StringEvidence(value=reservation.source_sha256)
             data["admission"] = admission
             deployment = ProviderDeploymentInput.model_validate(data)
+        elif provider == "azure":
+            # F11 reserves a distinct provisioning component. Keep the
+            # configured per-deployment ceiling when it is tighter, while
+            # preserving the smaller admitted component as the effective
+            # provider-call bound.
+            provision_ceiling = float(runtime["allowance"].provision_seconds)
+            configured = deployment.provisioning_timeout_seconds
+            effective = min(float(configured) if configured is not None else provision_ceiling,
+                provision_ceiling)
+            if not math.isfinite(effective) or effective < 1:
+                raise ValueError("F11 Azure provision allowance must provide at least one whole second")
+            deployment = deployment.model_copy(update={"provisioning_timeout_seconds":int(effective)})
         deployments[provider] = deployment
         config = row["options"]
         if provider == "aws":

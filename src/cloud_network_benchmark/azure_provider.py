@@ -676,7 +676,9 @@ def _validate_provider_registrations(runner: CommandRunner, options: AzureRuntim
 
 
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
-             clock: Callable[[], float], *, allow_not_found: bool = False) -> CommandResult:
+             clock: Callable[[], float], *, allow_not_found: bool = False,
+             apply_timeout_seconds: float | None = None,
+             before_apply: Callable[[], float] | None = None) -> CommandResult:
     remaining = options.cap_deadline_monotonic-clock()
     if remaining <= 0: raise TimeoutError("original reservation deadline elapsed")
     if argv[:1] == ["az"] and "--subscription" not in argv:
@@ -708,7 +710,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     if "apply" in argv and any(arg.startswith("-chdir=") for arg in argv):
         from .terraform_plan import reviewed_apply
         req = req.model_copy(update={"cwd": str(root)})
-        result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds)
+        result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds,
+            apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply)
     else:
         result = execute(req)
     if result.outcome != "succeeded" and not (allow_not_found and _is_exact_not_found(result)):
@@ -1175,7 +1178,9 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
 
 
 def _tf(root: Path, options: AzureRuntimeOptions, runner: CommandRunner, clock: Callable[[], float],
-        workdir: str, *args: str, action: str) -> CommandResult:
+        workdir: str, *args: str, action: str,
+        apply_timeout_seconds: float | None = None,
+        before_apply: Callable[[], float] | None = None) -> CommandResult:
     state = root / ("expiry.tfstate" if workdir.endswith("/expiry") else "pair.tfstate")
     source_root = Path(__file__).resolve().parents[2] / workdir
     argv = ["terraform", f"-chdir={source_root}", *args]
@@ -1183,7 +1188,8 @@ def _tf(root: Path, options: AzureRuntimeOptions, runner: CommandRunner, clock: 
         argv += [f"-state={state}"]
     if args and args[0] == "init":
         argv += [f"-backend-config=path={state}", "-lockfile=readonly"]
-    return _command(runner, options, root, argv, action, clock)
+    return _command(runner, options, root, argv, action, clock,
+        apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply)
 
 
 def _key_material(text: str) -> str:
@@ -1278,7 +1284,10 @@ def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root:
 
 def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
               clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureProviderResult:
-    now=utc_now().astimezone(UTC); mono=clock(); name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
+    now=utc_now().astimezone(UTC); mono=clock()
+    provision_stage_seconds = float(deployment.provisioning_timeout_seconds or options.command_timeout_seconds)
+    provision_deadline_monotonic = mono + provision_stage_seconds
+    name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
         raise ValueError("Azure expiry price input date cannot be in the future")
     root,journal=_workspace(options,deployment); state=json.loads(journal.read_text()); failures=[]; results=[]; apply=None; outputs=None; valid_outputs={}
@@ -1290,6 +1299,8 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         _verify_registered_expiry(deployment,options,root,runner,clock,now)
         fresh_utc=utc_now().astimezone(UTC); fresh_mono=clock()
         _validate_request(deployment,options,fresh_utc,fresh_mono,require_registered=True)
+        if provision_deadline_monotonic-fresh_mono <= 0:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair creation")
         if deployment.expiry.value.expires_at.value - fresh_utc < timedelta(seconds=options.post_registration_workflow_seconds):
             raise TimeoutError("remaining complete workflow no longer fits before the registered trigger")
         if options.cap_deadline_monotonic-fresh_mono < options.post_registration_workflow_seconds:
@@ -1298,14 +1309,44 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=True; state["pair_state"]="creating"; _atomic_private(journal,state)
         args=["apply","-input=false",f"-var-file={pair_vars}"]
         preapply_utc=utc_now().astimezone(UTC); preapply_mono=clock()
-        if deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds) or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds:
+        if (provision_deadline_monotonic-preapply_mono <= 0
+                or deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds)
+                or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds):
             state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=False; state["pair_state"]="not_started"; _atomic_private(journal,state)
             raise TimeoutError("complete workflow no longer fits immediately before pair apply")
         review_slack = min(options.cap_deadline_monotonic-preapply_mono,
             (deployment.expiry.value.expires_at.value-preapply_utc).total_seconds()) - options.post_registration_workflow_seconds
         if review_slack <= 0: raise TimeoutError("pair plan review no longer fits before the workflow allowance")
-        review_options = options.model_copy(update={"cap_deadline_monotonic":preapply_mono+review_slack})
-        apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply"); results.append(apply.durable_view())
+        review_deadline = min(preapply_mono+review_slack, provision_deadline_monotonic)
+        if review_deadline <= preapply_mono:
+            raise TimeoutError("pair plan review no longer fits within the original provision-stage allowance")
+        review_options = options.model_copy(update={"cap_deadline_monotonic":review_deadline})
+        if provision_stage_seconds > options.post_registration_workflow_seconds:
+            raise TimeoutError("pair provision stage exceeds the post-registration workflow allowance")
+        # The F11 allowance reserves the provision component inside the full
+        # post-registration remainder. Runtime construction clamps the
+        # deployment timeout to that component; preserve any stricter config.
+        downstream_reserve = options.post_registration_workflow_seconds - provision_stage_seconds
+
+        def apply_budget_after_review() -> float:
+            reviewed_utc = utc_now().astimezone(UTC)
+            reviewed_mono = clock()
+            trigger_remaining = (deployment.expiry.value.expires_at.value - reviewed_utc).total_seconds()
+            cap_remaining = options.cap_deadline_monotonic - reviewed_mono
+            stage_remaining = provision_deadline_monotonic - reviewed_mono
+            if trigger_remaining < options.post_registration_workflow_seconds or cap_remaining < options.post_registration_workflow_seconds:
+                raise TimeoutError("complete workflow no longer fits immediately after pair plan review")
+            if stage_remaining <= 0:
+                raise TimeoutError("original Azure provision-stage deadline elapsed during pair plan review")
+            remaining = min(options.command_timeout_seconds, stage_remaining,
+                cap_remaining - downstream_reserve, trigger_remaining - downstream_reserve)
+            if remaining <= 0:
+                raise TimeoutError("pair apply has no remaining stage budget after saved-plan review")
+            return remaining
+
+        apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply",
+            apply_timeout_seconds=min(options.command_timeout_seconds, provision_deadline_monotonic-preapply_mono),
+            before_apply=apply_budget_after_review); results.append(apply.durable_view())
         out=_tf(root,options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
         outputs=json.loads(out.stdout)
         observed_images={}

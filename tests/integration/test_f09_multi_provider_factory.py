@@ -371,7 +371,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
         "sha256": "a" * 64, "automation_rate_per_job_minute": 0.002, "job_minutes_bound": 20}))
     runtime = {"initialized_campaign_manifest": parent_path,
         "ledger": {"path": tmp_path / "ledger.json", "scope_id": "azure-source-shaped", "initialize_if_missing": True},
-        "allowance": WorkflowAllowance(10, 30, 30, 60, 80, 5, 10, 10,
+        "allowance": WorkflowAllowance(10, 180, 30, 60, 80, 5, 10, 10,
             "synthetic-test-policy", {"azure": 360}), "copy_retry_seconds": 1,
         "approval_evidence": gates,
         "access": {"timeouts": TimeoutPolicy(ssh_seconds=5, command_seconds=10,
@@ -433,6 +433,7 @@ def test_default_azure_factory_uses_observed_cleanup_runner_for_provision_and_cl
     provider = result.provider_results["azure"]
     assert provider.values["protect"].state == "registered", provider.values["protect"].failure
     assert observed["options"].plan_review_timeout_seconds == 30
+    assert observed["deployment"].provisioning_timeout_seconds == 180
     assert provider.values["claim"].eligible is True
     assert provider.values["claim"].creation_granted is True
     assert provider.values["create"] is not None, (provider.primary_failure, provider.values)

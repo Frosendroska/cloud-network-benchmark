@@ -187,6 +187,61 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert runner.requests[-1].timeout_seconds <= runner.requests[0].timeout_seconds
 
 
+def test_delayed_review_keeps_apply_inside_fresh_stage_budget(tmp_path,monkeypatch):
+    req,runner=request(tmp_path)
+    clock=[100.0]
+    monkeypatch.setattr(tp.time,"monotonic",lambda:clock[0])
+    def delayed_review(directory,binding,deadline):
+        receipt={"decision":"approved","binding":binding,"reviewer":"offline fixture","inspection":"checked saved plan"}
+        (directory/"operator-review.json").write_text(json.dumps(receipt))
+        clock[0]+=45.0
+        return receipt
+    monkeypatch.setattr(tp,"await_review",delayed_review)
+    assert tp.reviewed_apply(req,runner.run,review_seconds=60,apply_timeout_seconds=180,
+        before_apply=lambda:180.0).outcome=="succeeded"
+    assert [item.argv[2] for item in runner.requests]==["plan","show","apply"]
+    assert runner.requests[-1].timeout_seconds==180.0
+
+
+def test_split_apply_deadline_rejects_missing_fresh_fit_anchor(tmp_path):
+    req,runner=request(tmp_path)
+    with pytest.raises(tp.PlanReviewError,match="require both"):
+        tp.reviewed_apply(req,runner.run,apply_timeout_seconds=180)
+    assert runner.requests==[]
+
+
+@pytest.mark.parametrize("invalid_budget",[0.0,-1.0,float("nan"),float("inf")])
+def test_split_apply_rejects_invalid_fresh_budget_without_apply(tmp_path,monkeypatch,invalid_budget):
+    req,runner=request(tmp_path)
+    def approve_now(directory,binding,deadline):
+        receipt={"decision":"approved","binding":binding,"reviewer":"offline fixture","inspection":"checked saved plan"}
+        (directory/"operator-review.json").write_text(json.dumps(receipt))
+        return receipt
+    monkeypatch.setattr(tp,"await_review",approve_now)
+    with pytest.raises(tp.PlanReviewError,match="no positive remaining"):
+        tp.reviewed_apply(req,runner.run,review_seconds=60,apply_timeout_seconds=180,
+            before_apply=lambda:invalid_budget)
+    assert [item.argv[2] for item in runner.requests]==["plan","show"]
+
+
+@pytest.mark.parametrize("review_elapsed",[60.0,61.0])
+def test_exhausted_review_budget_never_dispatches_apply(tmp_path,monkeypatch,review_elapsed):
+    req,runner=request(tmp_path)
+    req=req.model_copy(update={"timeout_seconds":60.0})
+    clock=[100.0]
+    monkeypatch.setattr(tp.time,"monotonic",lambda:clock[0])
+    def delayed_review(directory,binding,deadline):
+        receipt={"decision":"approved","binding":binding,"reviewer":"offline fixture","inspection":"checked saved plan"}
+        (directory/"operator-review.json").write_text(json.dumps(receipt))
+        clock[0]+=review_elapsed
+        return receipt
+    monkeypatch.setattr(tp,"await_review",delayed_review)
+    with pytest.raises(tp.PlanReviewError,match="deadline|stage deadline"):
+        tp.reviewed_apply(req,runner.run,review_seconds=60,apply_timeout_seconds=180,
+            before_apply=lambda:180.0)
+    assert [item.argv[2] for item in runner.requests]==["plan","show"]
+
+
 def test_aws_failed_saved_apply_retains_bounded_redacted_diagnostics(tmp_path, operator):
     req, runner = request(tmp_path, "aws", "pair")
     secret = "private-ssh-key:attempt-only"
