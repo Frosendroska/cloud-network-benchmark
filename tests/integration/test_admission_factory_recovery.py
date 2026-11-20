@@ -466,7 +466,7 @@ def test_azure_factory_rejects_registration_for_another_run_before_claim(tmp_pat
 def test_azure_factory_rejects_when_only_unrounded_trigger_fits_and_keeps_ledger_unchanged(tmp_path, monkeypatch):
     fixture = prepared(tmp_path, "azure", support="0.04")
     fixture.clock = FixedClock(NOW.replace(second=59, microsecond=999999))
-    fixture.runtime["allowance"] = WorkflowAllowance(0, 0, 0, 60, 80, 5, 0, 1,
+    fixture.runtime["allowance"] = WorkflowAllowance(0, 1, 0, 60, 80, 5, 0, 1,
         "SYNTHETIC-short-fit", {"azure":360})
     request, plan = build_admission_request(campaign=fixture.campaign, parent=fixture.parent,
         children=fixture.children, costs=fixture.costs, runtime=fixture.runtime,
