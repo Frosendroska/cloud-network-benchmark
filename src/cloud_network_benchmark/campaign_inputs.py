@@ -30,6 +30,7 @@ from .manifests import initialize_campaign
 from .paths import atomic_write_json
 from .scheduling import load_schedule
 from .campaign_identity import check_provider_identities
+from .storage_admission import validate_storage_review
 
 STAGES = {"acceptance", "calibration", "day", "week"}
 CONFIGS = {
@@ -150,7 +151,7 @@ def _gate_rows(settings, stage):
         required.add("paid_acceptance")
     required |= {"acceptance": set(), "calibration": {"calibration_authorized"},
                  "day": {"common_n", "diagnostic_day_authorized", "size_export_review"},
-                 "week": {"common_n", "study_window", "weekly_concurrency"}}[stage]
+                 "week": {"common_n", "study_window", "weekly_concurrency", "size_export_review"}}[stage]
     for key in sorted(required):
         row = declarations.get(key)
         if not isinstance(row, dict) or row.get("confirmed") is not True:
@@ -284,21 +285,13 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         missing_tools = [name for name in ("terraform", "aws", "az", "gcloud", "ssh", "scp") if shutil.which(name) is None]
         if missing_tools:
             raise ValueError("install required controller tools on Linux: " + ", ".join(missing_tools))
-        if stage == "day":
-            review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
-            for name in ("measured_log_bytes", "measured_seconds", "expected_raw_bytes", "export_verified_bytes"):
-                if type(review.get(name)) not in {int, float} or not math.isfinite(review[name]) or review[name] <= 0:
-                    raise ValueError(f"DAY size_export_review requires actual positive {name} from acceptance/calibration")
-            if review.get("export_checksum_verified") is not True:
-                raise ValueError("DAY needs actual checksum-verified export evidence")
-            expected = int(review["expected_raw_bytes"])
-            if expected < review["measured_log_bytes"] / review["measured_seconds"] * 86400:
-                raise ValueError("DAY projected raw bytes undercount measured log growth")
-            if int(settings.get("minimum_free_bytes", 0)) < expected * 2:
-                raise ValueError("minimum_free_bytes must cover DAY native bundles plus verified export staging")
         minimum = settings.get("minimum_free_bytes")
         if type(minimum) is not int or minimum <= 0:
             raise ValueError("set positive minimum_free_bytes from measured stage storage needs")
+        if stage in {"day", "week"}:
+            review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
+            validate_storage_review(stage, review, minimum_free_bytes=minimum,
+                                    results_path=Path(settings["results_root"]))
         disk_path = Path(settings["results_root"])
         while not disk_path.exists():
             disk_path = disk_path.parent

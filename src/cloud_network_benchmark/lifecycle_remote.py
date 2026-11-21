@@ -420,7 +420,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 filesystem=item.result_root, deadline=item.deadline,
                 provider_trigger=deployment.expiry.value.expires_at.value,
                 retry_seconds=float(runtime["copy_retry_seconds"]), now_utc=clock.utc_now,
-                clock=clock.monotonic)
+                clock=clock.monotonic, compressed_transfer=True)
             return ProviderStageOutcome("retrieve", item.retrieval.complete
                 and not item.retrieval.failures, item.retrieval)
         except Exception as exc:

@@ -281,7 +281,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
                            reservation_id: str, provider_trigger: datetime,
                            retry_seconds: float, now_utc: Callable[[], datetime],
                            clock: Callable[[], float],
-                           already_retried: Sequence[str] = ()) -> RetrievalResult:
+                           already_retried: Sequence[str] = (),
+                           compressed_transfer: bool = False) -> RetrievalResult:
     """Retrieve once, then re-admit and retry each failed concrete item once.
 
     Each F02 call is explicitly limited to one attempt. F09 makes a fresh
@@ -290,7 +291,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
     throughout, so the cleanup reserve is not reset between rounds.
     """
     first = run_retrieval(connection, manifest, runner, filesystem, deadline=deadline,
-                          clock=clock, max_attempts=1, transfer_admission=transfer_admission)
+                          clock=clock, max_attempts=1, transfer_admission=transfer_admission,
+                          compressed_transfer=compressed_transfer)
     merged = first
     consumed = set(already_retried)
     # Without a durable consumer, refuse retries rather than allow repeated
@@ -328,7 +330,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
         one_item = retry_manifest(manifest, (artifact_id,))
         second = run_retrieval(connection, one_item, runner, filesystem, deadline=deadline,
                                clock=clock, max_attempts=1, attempt_offset=1,
-                               transfer_admission=transfer_admission)
+                               transfer_admission=transfer_admission,
+                               compressed_transfer=compressed_transfer)
         attempts = [*merged.attempts, *second.attempts]
         by_id = {record.artifact_id: record for record in merged.records}
         by_id.update({record.artifact_id: record for record in second.records})

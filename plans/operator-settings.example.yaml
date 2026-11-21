@@ -159,11 +159,17 @@ stage_inputs:
         confirmed: false
         source: null
         fields:
-          measured_log_bytes: null
-          measured_seconds: null
+          measured_run_raw_bytes: null
+          measured_run_seconds: null
           expected_raw_bytes: null
-          export_verified_bytes: null
-          export_checksum_verified: false
+          expected_archive_bytes: null
+          expected_archive_part_count: null
+          max_guest_raw_bytes: null
+          measured_guest_free_bytes: null
+          guest_headroom_bytes: null
+          destination_headroom_bytes: null
+          archive_manifest_sha256: null
+          archive_checksum_verified: false
     allowance:
       source_id: null
       registration_seconds: null
@@ -178,6 +184,22 @@ stage_inputs:
   week:
     first_day_utc: null
     windows_utc: {night: null, morning: null, afternoon: null, evening: null}
+    approvals:
+      size_export_review:
+        confirmed: false
+        source: null
+        fields:
+          measured_run_raw_bytes: null
+          measured_run_seconds: null
+          expected_raw_bytes: null
+          expected_archive_bytes: null
+          expected_archive_part_count: null
+          max_guest_raw_bytes: null
+          measured_guest_free_bytes: null
+          guest_headroom_bytes: null
+          destination_headroom_bytes: null
+          archive_manifest_sha256: null
+          archive_checksum_verified: false
     allowance:
       source_id: null
       registration_seconds: null

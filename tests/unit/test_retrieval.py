@@ -484,3 +484,67 @@ def test_budget_exhaustion_accounts_for_all_remaining_items(tmp_path):
     m=RetrievalManifest(identity=c.identity.model_dump(),deployment_id=c.deployment_id,remote_workspace=base.remote_workspace,declarations=declarations,items=[first,second],measurement_ended_at=base.measurement_ended_at,producers_closed_at=base.producers_closed_at,closure_evidence="closed")
     outcome=run_retrieval(c,m,lambda req: (_ for _ in ()).throw(AssertionError("zero budget must prevent command")),tmp_path,deadline=deadline(),clock=lambda:291)
     assert not outcome.complete and len(outcome.records)==2 and all(r.retrieval_state=="failed" for r in outcome.records)
+
+
+def test_compressed_closed_file_retrieval_checks_remote_archive_and_original_manifest(tmp_path):
+    import gzip
+    payload = b"native-result-row\n" * 500
+    c = connection(tmp_path)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            return result(request.action_id, f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            self.requests.append(request)
+            archive = gzip.compress(payload, mtime=0)
+            assert len(archive) <= maximum_payload_bytes
+            Path(destination).write_bytes(archive)
+            proof = f"CNB_ARCHIVE {len(archive)} {hashlib.sha256(archive).hexdigest()}\n"
+            return result(request.action_id, stderr=proof + "CNB_BOUNDED_COPY_EOF\n")
+    runner = Runner()
+    outcome = run_retrieval(c, manifest(c, payload), runner, tmp_path, deadline=deadline(),
+        clock=lambda: 100, max_attempts=1, compressed_transfer=True)
+    assert outcome.complete and outcome.records[0].sha256.value == hashlib.sha256(payload).hexdigest()
+    assert outcome.attempts[0].transport_encoding == "gzip"
+    assert outcome.attempts[0].archive_bytes < len(payload)
+    assert outcome.attempts[0].archive_sha256 == hashlib.sha256(gzip.compress(payload, mtime=0)).hexdigest()
+    assert (tmp_path / "measurements/a.csv").read_bytes() == payload
+    assert all("gzip -n -c" in request.argv[-1] for request in runner.requests if request.action_id.startswith("f02r-retrieve-sockperf-a-") and request.action_type == "ssh")
+
+
+@pytest.mark.parametrize("damage", ["archive_digest", "payload", "partial"])
+def test_corrupt_or_partial_compressed_retrieval_never_publishes(tmp_path, damage):
+    import gzip
+    payload = b"native-result-row\n" * 100
+    c = connection(tmp_path)
+    class Runner:
+        def run(self, request):
+            return result(request.action_id, f"{len(payload)} {hashlib.sha256(payload).hexdigest()}")
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            archive = gzip.compress(b"other-payload" if damage == "payload" else payload, mtime=0)
+            Path(destination).write_bytes(archive[:-1] if damage == "partial" else archive)
+            checksum = "0" * 64 if damage == "archive_digest" else hashlib.sha256(archive).hexdigest()
+            proof = f"CNB_ARCHIVE {len(archive)} {checksum}\nCNB_BOUNDED_COPY_EOF\n"
+            return result(request.action_id, stderr=proof)
+    outcome = run_retrieval(c, manifest(c, payload), Runner(), tmp_path, deadline=deadline(),
+        clock=lambda:100, max_attempts=1, compressed_transfer=True)
+    assert not outcome.complete and outcome.records[0].retrieval_state == "failed"
+    assert not (tmp_path / "measurements/a.csv").exists()
+
+
+def test_compressed_retrieval_stops_before_copy_on_low_controller_disk(tmp_path, monkeypatch):
+    import cloud_network_benchmark.retrieval as retrieval
+    c = connection(tmp_path)
+    calls = []
+    class Runner:
+        def run(self, request):
+            calls.append(request)
+            return result(request.action_id, f"6 {hashlib.sha256(b'native').hexdigest()}")
+        def run_bounded_copy(self, *args):
+            pytest.fail("low disk must stop before archive transfer")
+    monkeypatch.setattr(retrieval.shutil, "disk_usage", lambda _: type("Usage", (), {"free": 0})())
+    outcome = run_retrieval(c, manifest(c), Runner(), tmp_path, deadline=deadline(),
+        clock=lambda:100, max_attempts=1, compressed_transfer=True)
+    assert not outcome.complete and outcome.failure.category == "destination_low_disk"
+    assert calls == []  # Disk preflight precedes even remote observation.
