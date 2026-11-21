@@ -2107,6 +2107,19 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -2629,6 +2642,9 @@
     },
     "implementation_git_commit": {
       "$ref": "#/$defs/Evidence_str_"
+    },
+    "iperf3_control_evidence": {
+      "$ref": "#/$defs/Evidence_Dict_str__Any__"
     },
     "measurement_direction": {
       "$ref": "#/$defs/MeasurementDirection"

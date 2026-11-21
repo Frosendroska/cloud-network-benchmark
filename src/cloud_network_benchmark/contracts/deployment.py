@@ -71,6 +71,19 @@ class ProviderDeploymentInput(StrictModel):
     reservation: Evidence[ReservationEvidence] = Field(default_factory=lambda: Evidence[ReservationEvidence](unavailable_reason="not evaluated"))
     expiry: Evidence[ExpiryEvidence] = Field(default_factory=lambda: Evidence[ExpiryEvidence](unavailable_reason="not registered"))
 
+    @model_validator(mode="before")
+    @classmethod
+    def exact_profile_input_types(cls, value):
+        if isinstance(value, dict):
+            admission = value.get("admission") or {}
+            if isinstance(admission, dict) and admission.get("timing_profile") == "azure_exp901_sweden_acceptance_v1":
+                for key in ("vm_a", "vm_b"):
+                    vm = value.get(key) or {}
+                    if (vm.get("region") != "swedencentral" or type(vm.get("zone")) is not str
+                            or vm.get("zone") != "1" or vm.get("vm_shape") != "Standard_D4s_v5"):
+                        raise ValueError("deployment timing profile inputs must use the canonical Azure pair identity")
+        return value
+
     @classmethod
     def from_observation(
         cls,
@@ -160,9 +173,20 @@ class ProviderDeploymentInput(StrictModel):
             raise ValueError("replacement context and replaces_run_id must be supplied together")
         if self.context == "replacement" and ExperimentMode(self.mode) != ExperimentMode.SHORT_STUDY:
             raise ValueError("replacement deployments are only valid for short_study mode")
-        for name, expected in AdmissionRequirements.expected_for(self.mode, self.scenario).items():
+        profile = self.admission.timing_profile
+        for name, expected in AdmissionRequirements.expected_for(self.mode, self.scenario, profile).items():
             if getattr(self.admission, name) != expected:
                 raise ValueError(f"admission.{name} must match deployment mode and scenario")
+        if profile == "azure_exp901_sweden_acceptance_v1":
+            if (self.experiment_id != "EXP-901" or self.provider != Provider.AZURE
+                    or self.mode != ExperimentMode.ACCEPTANCE or self.context != "failure_check"
+                    or self.scenario != Scenario.SAME_ZONE or self.vm_a.region != "swedencentral"
+                    or self.vm_b.region != "swedencentral" or self.vm_a.zone != "1" or self.vm_b.zone != "1"
+                    or self.vm_a.vm_shape != "Standard_D4s_v5" or self.vm_b.vm_shape != "Standard_D4s_v5"
+                    or self.placement.kind != "none"):
+                raise ValueError("deployment timing profile identity/scope mismatch")
+        elif profile is not None:
+            raise ValueError("unsupported timing profile")
         if self.vm_a.role != VmRole.VM_A.value or self.vm_b.role != VmRole.VM_B.value:
             raise ValueError("deployment requires VM A and VM B roles")
         if self.vm_a.function != "client_traffic_generator" or self.vm_b.function != "server_receiver":
@@ -205,6 +229,8 @@ class ProviderDeploymentInput(StrictModel):
         if expiry is not None and (expiry.run_id != self.run_id or expiry.deployment_id != self.deployment_id or expiry.provider != provider):
             raise ValueError("expiry identity must match deployment input")
         reservation = self.reservation.value
+        if reservation is not None and reservation.state == "reserved" and reservation.timing_profile != profile:
+            raise ValueError("deployment admission and reservation timing profiles differ")
         if reservation is not None and reservation.campaign_id != self.campaign_id:
             raise ValueError("reservation campaign_id must match deployment input")
         if reservation is not None and expiry is not None and reservation.expires_at.value is not None and expiry.expires_at.value is not None:
@@ -241,6 +267,23 @@ class ProviderDeploymentInput(StrictModel):
                     "instance_termination_action": {"const": "STOP"},
                 },
             }}},
+        })
+        schema["allOf"].append({
+            "if": {"properties": {"admission": {"properties": {
+                "timing_profile": {"const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}},
+                "required": ["admission"]},
+            "then": {"properties": {
+                "experiment_id": {"const": "EXP-901"}, "provider": {"const": "azure"},
+                "mode": {"const": "acceptance"}, "context": {"const": "failure_check"},
+                "scenario": {"const": "same_zone"},
+                "vm_a": {"properties": {"region": {"const": "swedencentral"}, "zone": {"const": "1"}, "vm_shape": {"const": "Standard_D4s_v5"}}},
+                "vm_b": {"properties": {"region": {"const": "swedencentral"}, "zone": {"const": "1"}, "vm_shape": {"const": "Standard_D4s_v5"}}},
+                "placement": {"properties": {"kind": {"const": "none"}}},
+                "admission": {"properties": {"lifetime_cap_seconds": {"const": 1800}}},
+                "reservation": {"properties": {"value": {"properties": {
+                    "timing_profile": {"const": "azure_exp901_sweden_acceptance_v1"}},
+                    "required": ["timing_profile"]}}}
+            }, "required": ["experiment_id", "provider", "mode", "context", "scenario", "vm_a", "vm_b", "placement", "admission"]}
         })
         return schema
 

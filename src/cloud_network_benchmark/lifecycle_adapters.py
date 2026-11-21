@@ -161,7 +161,7 @@ def stage_guest_runtime(connection: Any, *, source_root: Path, source_revision: 
             f"tar -xzf {shlex.quote(destination)} -C {shlex.quote(runtime)}",
             f"test \"$(cat {shlex.quote(runtime + '/runtime-source-revision.txt')})\" = {shlex.quote(source_revision)}",
             f"python3 -m venv --system-site-packages {shlex.quote(runtime + '/venv')}",
-            f"{shlex.quote(runtime + '/venv/bin/python')} -m pip install 'pydantic>=2.0,<3' 'PyYAML>=6.0,<7'",
+            f"{shlex.quote(runtime + '/venv/bin/python')} -m pip install 'pydantic>=2.13.5,<3' 'PyYAML>=6.0,<7'",
             f"PYTHONPATH={shlex.quote(runtime + '/source')} {shlex.quote(runtime + '/venv/bin/python')} -c {shlex.quote(python_probe)}",
         ))
         verify = _request(f"f09-runtime-verify-{connection.deployment_id}", vm,

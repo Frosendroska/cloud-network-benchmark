@@ -84,6 +84,19 @@
         "requires_schedule": {
           "title": "Requires Schedule",
           "type": "boolean"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -1368,6 +1381,150 @@
             },
             "maxItems": 1,
             "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "timing_profile": {
+                "const": "azure_exp901_sweden_acceptance_v1"
+              }
+            },
+            "required": [
+              "timing_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1800
+              }
+            }
+          },
+          "context": {
+            "const": "failure_check"
+          },
+          "experiment_id": {
+            "const": "EXP-901"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "provider_configs": {
+            "properties": {
+              "azure": {
+                "properties": {
+                  "placement": {
+                    "properties": {
+                      "kind": {
+                        "const": "none"
+                      }
+                    }
+                  },
+                  "regions": {
+                    "properties": {
+                      "vm_a": {
+                        "const": "swedencentral"
+                      },
+                      "vm_b": {
+                        "const": "swedencentral"
+                      }
+                    }
+                  },
+                  "vm_shape": {
+                    "const": "Standard_D4s_v5"
+                  },
+                  "zones": {
+                    "properties": {
+                      "vm_a": {
+                        "const": "1"
+                      },
+                      "vm_b": {
+                        "const": "1"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "vm_shape",
+                  "regions",
+                  "zones",
+                  "placement"
+                ]
+              }
+            },
+            "required": [
+              "azure"
+            ]
+          },
+          "scenario": {
+            "const": "same_zone"
+          },
+          "selected_providers": {
+            "const": [
+              "azure"
+            ]
+          }
+        },
+        "required": [
+          "experiment_id",
+          "mode",
+          "context",
+          "scenario",
+          "selected_providers",
+          "admission",
+          "provider_configs"
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "admission": {
+              "properties": {
+                "timing_profile": {
+                  "const": "azure_exp901_sweden_acceptance_v1"
+                }
+              },
+              "required": [
+                "timing_profile"
+              ]
+            }
+          }
+        },
+        "properties": {
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1200
+              }
+            }
           }
         }
       }

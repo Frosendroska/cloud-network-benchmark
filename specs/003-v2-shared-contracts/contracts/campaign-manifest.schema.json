@@ -65,6 +65,19 @@
         "requires_schedule": {
           "title": "Requires Schedule",
           "type": "boolean"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -860,6 +873,19 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
