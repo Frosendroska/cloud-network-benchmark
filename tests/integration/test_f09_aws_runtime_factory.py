@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import gzip
 import json
 import re
 import shlex
@@ -240,14 +241,23 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         remote_argv = shlex.split(request.argv[-1])
         assert remote_argv[:2] == ["sh", "-c"] and len(remote_argv) == 3
         script = remote_argv[2]
-        match = re.search(
-            r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
-            script,
-        )
-        assert match is not None, script
-        assert int(match.group(2)) == maximum_payload_bytes
-        assert "os.read(3, 1)" in script and BOUNDED_COPY_EOF_MARKER in script
-        source_tokens = shlex.split(match.group(1))
+        compressed = "gzip -n -c " in script
+        if compressed:
+            source_match = re.search(r"gzip -n -c (.*?) >", script)
+            assert source_match is not None, script
+            assert "CNB_ARCHIVE %s %s\\n" in script
+            assert "CNB_IDENTITY" in script
+            source_tokens = shlex.split(source_match.group(1))
+        else:
+            match = re.search(
+                r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
+                script,
+            )
+            assert match is not None, script
+            assert int(match.group(2)) == maximum_payload_bytes
+            assert "os.read(3, 1)" in script
+            source_tokens = shlex.split(match.group(1))
+        assert BOUNDED_COPY_EOF_MARKER in script
         assert len(source_tokens) == 1
         relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/work")
         root = self.workspace_roots[role]
@@ -255,14 +265,30 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         assert source.resolve().is_relative_to(root.resolve())
         assert source.is_file() and not source.is_symlink()
         self.actions.append(request.action_id)
-        with source.open("rb") as remote, Path(destination).open("xb") as local:
-            local.write(remote.read(maximum_payload_bytes))
-        within_cap = source.stat().st_size <= maximum_payload_bytes
+        source_bytes = source.read_bytes()
+        if compressed:
+            archive = gzip.compress(source_bytes, mtime=0)
+            if len(archive) <= maximum_payload_bytes:
+                with Path(destination).open("xb") as local:
+                    local.write(archive)
+                within_cap = len(source_bytes) <= maximum_payload_bytes
+                proof = f"CNB_ARCHIVE {len(archive)} {hashlib.sha256(archive).hexdigest()}\n"
+            else:
+                with Path(destination).open("xb") as local:
+                    local.write(source_bytes[:maximum_payload_bytes])
+                within_cap = len(source_bytes) <= maximum_payload_bytes
+                proof = f"CNB_IDENTITY {len(source_bytes)} {hashlib.sha256(source_bytes).hexdigest()}\n"
+        else:
+            with Path(destination).open("xb") as local:
+                local.write(source_bytes[:maximum_payload_bytes])
+            within_cap = len(source_bytes) <= maximum_payload_bytes
+            proof = ""
         return CommandResult(action_id=request.action_id,
             outcome="succeeded" if within_cap else "failed", started_at=self._now(),
             finished_at=self._now(), duration_seconds=0,
             exit_code=0 if within_cap else 1, stdout="",
-            stderr="" if within_cap else "remote source exceeds charged payload cap")
+            stderr=(proof + BOUNDED_COPY_EOF_MARKER + "\n") if within_cap
+                else "remote source exceeds charged payload cap")
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -896,6 +922,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
     assert any(action.startswith("f02r-retrieve-") for action in runner.actions)
+    assert any(attempt.transport_encoding == "gzip"
+        for attempt in provider_result.values["retrieve"].evidence.attempts)
+    assert any(attempt.transport_encoding == "identity"
+        for attempt in provider_result.values["retrieve"].evidence.attempts)
     assert any(action.startswith("f02r-") for action in runner.actions)
     assert f"aws-expiry-start-{region}" in runner.actions
     assert "aws-pair-apply" in runner.actions

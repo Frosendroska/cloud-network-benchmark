@@ -211,16 +211,22 @@ def _bounded_gzip_script(item: RetrievalItem) -> str:
     return ("set -eu; "
         f"if {ancestors} && [ -f {path} ] && [ ! -L {path} ]; then :; else exit 1; fi; "
         f"actual_size=$(wc -c < {path}); [ \"$actual_size\" -eq {item.expected_size_bytes} ] || exit 1; "
-        f"actual_hash=$(sha256sum {path}); set -- $actual_hash; [ \"$1\" = {digest} ] || exit 1; "
+        f"actual_hash=$(sha256sum {path}); set -- $actual_hash; [ \"$1\" = {digest} ] || exit 1; source_digest=$1; "
         f"free_kib=$(df -Pk {folder} | awk 'END {{print $4}}'); "
         f"[ \"$free_kib\" -ge {max(1, (item.expected_size_bytes + 1048576 + 1023) // 1024)} ] || exit 1; "
         f"tmp=$(mktemp {folder}/.cnb-archive.XXXXXX); "
         "trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; "
         f"gzip -n -c {path} > \"$tmp\"; size=$(wc -c < \"$tmp\"); "
-        f"[ \"$size\" -le {item.expected_size_bytes} ] || exit 1; "
+        f"if [ \"$size\" -le {item.expected_size_bytes} ]; then "
         "archive_hash=$(sha256sum \"$tmp\"); set -- $archive_hash; "
         "printf 'CNB_ARCHIVE %s %s\\n' \"$size\" \"$1\" >&2; "
         f"dd bs=65536 count={item.expected_size_bytes} iflag=count_bytes status=none < \"$tmp\" || exit 1; "
+        "else "
+        f"printf 'CNB_IDENTITY {item.expected_size_bytes} %s\\n' \"$source_digest\" >&2; "
+        f"exec 3< {path} || exit 1; "
+        f"dd bs=65536 count={item.expected_size_bytes} iflag=count_bytes status=none <&3 || exit 1; "
+        "python3 -c 'import os,sys; sys.exit(0 if os.read(3, 1) == b\"\" else 1)' || exit 1; "
+        "fi; "
         f"printf '{BOUNDED_COPY_EOF_MARKER}\\n' >&2")
 
 
@@ -538,6 +544,7 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             actions.append(_action(req.action_id, req.action_type, vm, req, result))
             size = digest = None
             archive_bytes = archive_digest = None
+            transport_encoding = "identity"
             reason = None
             if req.argv and req.argv[-1] == "[request-construction-failed]":
                 reason = "transport_preflight_failed"
@@ -548,21 +555,32 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             else:
                 try:
                     if compressed_transfer:
-                        archive_bytes, archive_digest = _hash_file(staging, deadline=deadline, clock=clock)
-                        proofs = [line.split() for line in result.stderr.splitlines()
-                                  if line.startswith("CNB_ARCHIVE ")]
-                        if (len(proofs) != 1 or len(proofs[0]) != 3
-                                or not proofs[0][1].isdigit()
-                                or int(proofs[0][1]) != archive_bytes
-                                or proofs[0][2] != archive_digest):
-                            raise ValueError("remote archive byte count or SHA-256 proof mismatch")
-                        decoded = staging.with_name(staging.name + ".decoded")
-                        try:
-                            size, digest = _decode_gzip_verified(staging, decoded, item)
-                        except ValueError as exc:
-                            raise ValueError(f"compressed archive verification failed: {exc}") from exc
-                        staging.unlink()
-                        os.replace(decoded, staging)
+                        archive_proofs = [line.split() for line in result.stderr.splitlines()
+                                          if line.startswith("CNB_ARCHIVE ")]
+                        identity_proofs = [line.split() for line in result.stderr.splitlines()
+                                           if line.startswith("CNB_IDENTITY ")]
+                        if len(archive_proofs) == 1 and not identity_proofs:
+                            transport_encoding = "gzip"
+                            archive_bytes, archive_digest = _hash_file(staging, deadline=deadline, clock=clock)
+                            proof = archive_proofs[0]
+                            if (len(proof) != 3 or not proof[1].isdigit()
+                                    or int(proof[1]) != archive_bytes or proof[2] != archive_digest):
+                                raise ValueError("remote archive byte count or SHA-256 proof mismatch")
+                            decoded = staging.with_name(staging.name + ".decoded")
+                            try:
+                                size, digest = _decode_gzip_verified(staging, decoded, item)
+                            except ValueError as exc:
+                                raise ValueError(f"compressed archive verification failed: {exc}") from exc
+                            staging.unlink()
+                            os.replace(decoded, staging)
+                        elif len(identity_proofs) == 1 and not archive_proofs:
+                            proof = identity_proofs[0]
+                            if (len(proof) != 3 or not proof[1].isdigit()
+                                    or int(proof[1]) != item.expected_size_bytes
+                                    or proof[2] != item.expected_sha256):
+                                raise ValueError("remote identity byte count or SHA-256 proof mismatch")
+                        else:
+                            raise ValueError("remote transfer encoding proof is missing or ambiguous")
                     size, digest = _hash_file(staging, deadline=deadline, clock=clock)
                     if result.outcome != CommandOutcome.SUCCEEDED:
                         reason = f"copy_{result.outcome}"
@@ -584,9 +602,9 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt,
                 staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed",
                 size_bytes=size, sha256=digest, reason=reason,
-                transport_encoding="gzip" if compressed_transfer else "identity",
-                archive_bytes=archive_bytes if compressed_transfer else None,
-                archive_sha256=archive_digest if compressed_transfer else None))
+                transport_encoding=transport_encoding,
+                archive_bytes=archive_bytes,
+                archive_sha256=archive_digest))
             if reason == "transport_preflight_failed":
                 stop = True
             if reason is None:
