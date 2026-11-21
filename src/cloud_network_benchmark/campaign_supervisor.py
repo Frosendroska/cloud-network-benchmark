@@ -85,6 +85,8 @@ def observe(state_root: Path, stop: threading.Event, interval: float = 30.0) -> 
                 preflight = _read_only_preflight(stage)
                 last_preflight = time.monotonic()
             usage = shutil.disk_usage(state_root)
+            minimum_free = int(stage.get("minimum_free_bytes", 0))
+            disk_below_minimum = bool(minimum_free and usage.free < minimum_free)
             status = {
                 "schema_version": 1, "observed_at": datetime.now(timezone.utc).isoformat(),
                 "stage_id": stage_id, "campaign_id": stage.get("campaign_id"),
@@ -98,8 +100,10 @@ def observe(state_root: Path, stop: threading.Event, interval: float = 30.0) -> 
                     key: (row.get("result") or {}).get("provider_results", {}) for key, row in entries.items()
                     if (row.get("result") or {}).get("provider_results")},
                 "credential_preflight": preflight,
-                "disk": {"path": str(state_root), "free_bytes": usage.free, "total_bytes": usage.total},
-                "health": "fault" if liabilities or stale_outputs or preflight.get("status") == "blocked" or any(x == "failed" for x in
+                "disk": {"path": str(state_root), "free_bytes": usage.free, "total_bytes": usage.total,
+                         "minimum_free_bytes": minimum_free,
+                         "below_minimum": disk_below_minimum},
+                "health": "fault" if liabilities or stale_outputs or disk_below_minimum or preflight.get("status") == "blocked" or any(x == "failed" for x in
                     (row.get("state") for row in entries.values())) else "healthy",
                 "observer_mode": "read_only_provider_identity_and_expiry",
             }

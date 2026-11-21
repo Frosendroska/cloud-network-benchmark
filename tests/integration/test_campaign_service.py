@@ -106,6 +106,47 @@ def test_observer_binds_ids_paths_and_records_cleanup_disk_and_stale_fault(tmp_p
     assert snapshot["disk"]["free_bytes"] > 0
 
 
+@pytest.mark.parametrize("row_state,minimum,free,expected_health", [
+    ("failed", 100, 500, "fault"),
+    ("missed", 100, 500, "healthy"),
+    ("complete", 100, 50, "fault"),
+    ("complete", 100, 500, "healthy"),
+])
+def test_observer_reports_child_failure_missed_state_and_low_disk(tmp_path, monkeypatch,
+                                                                   row_state, minimum, free, expected_health):
+    import json
+    import threading
+    from types import SimpleNamespace
+    import cloud_network_benchmark.campaign_supervisor as supervisor
+
+    state = tmp_path / "state"
+    stage_dir = state / "stage-1"
+    stage_dir.mkdir(parents=True)
+    stage = {"stage_id": "stage-1", "stage": "acceptance", "results_root": str(tmp_path / "results"),
+             "minimum_free_bytes": minimum, "entries": []}
+    journal = {"entries": {"entry-1": {"state": row_state, "result": {}}}}
+    (stage_dir / "prepared-stage.json").write_text(json.dumps(stage))
+    (stage_dir / "campaign-journal.json").write_text(json.dumps(journal))
+    (state / "active-stage.json").write_text(json.dumps({"stage_id": "stage-1",
+        "stage_path": str(stage_dir / "prepared-stage.json")}))
+    monkeypatch.setattr(supervisor, "_read_only_preflight", lambda _: {"status": "qualified"})
+    monkeypatch.setattr(supervisor.shutil, "disk_usage", lambda _: SimpleNamespace(free=free, total=1000))
+
+    class StopAfterOne:
+        calls = 0
+        def is_set(self):
+            return self.calls > 0
+        def wait(self, _):
+            self.calls += 1
+
+    supervisor.observe(state, StopAfterOne(), interval=0)
+    snapshot = json.loads((state / "observer-status.json").read_text())
+    assert snapshot["health"] == expected_health
+    assert snapshot["missed_entries"] == (["entry-1"] if row_state == "missed" else [])
+    assert snapshot["disk"]["below_minimum"] is (free < minimum)
+    assert snapshot["disk"]["minimum_free_bytes"] == minimum
+
+
 def test_periodic_preflight_reports_identity_terraform_and_expiry_without_leaking_output(monkeypatch):
     import cloud_network_benchmark.campaign_identity as identity
     import cloud_network_benchmark.campaign_supervisor as supervisor
