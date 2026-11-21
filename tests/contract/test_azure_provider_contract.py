@@ -35,7 +35,7 @@ def options(tmp_path: Path, priority: str = "P0"):
         controller_cidr="192.0.2.8/32", attempt_root=tmp_path/"attempt", authentication_reference="private:ssh-key",
         ssh_public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc f06", selected_image="/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/images/providers/Microsoft.Compute/galleries/ubuntu/images/ubuntu2404/versions/24.04.20261001",
         complete_workflow_seconds=900, post_registration_workflow_seconds=600, cap_deadline_monotonic=1000,
-        admission_evidence={"priority":priority,"priority_review_reference":"offline-review","outstanding_cleanup":False,"reservation_id":"res-f06","source_sha256":"a"*64}, retry_end_at=datetime.now(UTC)+timedelta(minutes=16),
+        admission_evidence={"priority":priority,"priority_review_reference":"offline-review","outstanding_cleanup":False,"reservation_id":"res-f06","source_sha256":"a"*64}, retry_end_at=datetime.now(UTC)+timedelta(minutes=17),
         poll_seconds=15, command_timeout_seconds=60, expiry_cost_input={"source_id":"automation-prices-2026-10-22","date":"2026-10-22","sha256":"d"*64,"automation_rate_per_job_minute":0.002,"job_minutes_bound":20})
 
 

@@ -667,7 +667,7 @@ def test_runbook_poll_interval_must_match_bounded_integer_contract(repository_ro
 @pytest.mark.parametrize("invalid",["reservation_snapshot","expiry_cost","future_price"])
 def test_registration_preflight_rejects_unadmitted_or_unpriced_requests_before_any_external_action(repository_root: Path, tmp_path: Path, invalid):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    request=expiry_request(d,o,now+timedelta(minutes=15))
+    request=expiry_request(d,o,now+timedelta(minutes=16))
     if invalid=="reservation_snapshot":
         o=AzureRuntimeOptions.model_validate({**o.model_dump(),"admission_evidence":{**o.admission_evidence,"source_sha256":"e"*64}})
     elif invalid=="expiry_cost":
@@ -683,9 +683,9 @@ def test_registration_preflight_rejects_unadmitted_or_unpriced_requests_before_a
 
 def test_registration_records_readbacks_and_narrow_rbac(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     assert expiry.state=="registered" and expiry.action=="deallocate"
     kinds=[x.action_type for x in runner.requests]
     assert kinds.index("expiry_prerequisites") < kinds.index("job_binding_create")
@@ -699,27 +699,27 @@ def test_registration_records_readbacks_and_narrow_rbac(repository_root: Path, t
 
 def test_registration_rejects_foreign_assigned_role_definition(repository_root: Path,tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,wrong_role_definition=True)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     assert expiry.state=="failed"
     assert "pair_apply" not in [r.action_type for r in runner.requests]
 
 
 def test_registration_polls_asynchronous_publication_within_bound(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,publish_delay=1)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now,sleep=lambda seconds:None)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now,sleep=lambda seconds:None)
     assert expiry.state=="registered"
     assert [r.action_type for r in runner.requests].count("runbook_readback")==2
 
 
 def test_provision_rechecks_published_content_before_pair_apply(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     changed=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     runner.script += "# changed after confirmation\n"
     result=provision(changed,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
@@ -731,9 +731,9 @@ def test_provision_rechecks_published_content_before_pair_apply(repository_root:
 @pytest.mark.parametrize("evidence", ["schedule", "binding", "permission", "runOn"])
 def test_provision_rechecks_schedule_binding_and_role_before_pair_apply(repository_root: Path, tmp_path: Path, evidence):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     runner.tamper_recheck=evidence
     result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
@@ -749,9 +749,9 @@ def test_provision_rechecks_schedule_binding_and_role_before_pair_apply(reposito
 ])
 def test_provision_rechecks_current_az_accounts_module_before_pair_apply(repository_root: Path,tmp_path: Path,module):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     runner=AutomationRunner(d,o,now,module_recheck=module)
     runner.script=registration.script; runner.schedule=registration.schedule; runner.binding=registration.binding
     runner.publish_reads=registration.publish_reads
@@ -764,9 +764,9 @@ def test_provision_rechecks_current_az_accounts_module_before_pair_apply(reposit
 
 def test_registered_pair_provision_normalizes_both_vms_and_materializes_authenticated_known_hosts(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
     assert result.deployment is not None and result.cleanup_required, result.failures
@@ -788,9 +788,9 @@ def test_registered_pair_provision_normalizes_both_vms_and_materializes_authenti
 
 def test_host_identity_failure_preserves_partial_normalized_output_without_connection(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,bad_key_for="b")
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_required and result.deployment is not None
@@ -802,9 +802,9 @@ def test_host_identity_failure_preserves_partial_normalized_output_without_conne
 
 def test_stale_run_command_nonce_cannot_materialize_known_hosts(repository_root: Path,tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,stale_nonce_for="b")
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.failures and "nonce" in result.failures[0].message
@@ -817,7 +817,7 @@ def test_stale_run_command_nonce_cannot_materialize_known_hosts(repository_root:
 @pytest.mark.parametrize("mode", ["consolidated", "legacy"])
 def test_run_command_accepts_authenticated_consolidated_and_legacy_success(repository_root: Path, tmp_path: Path, mode):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now); original=runner.run
     def run(request):
         result=original(request)
@@ -829,7 +829,7 @@ def test_run_command_accepts_authenticated_consolidated_and_legacy_success(repos
         payload["value"]=[status]
         return result.model_copy(update={"stdout":json.dumps(payload)})
     runner.run=run
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.deployment is not None and not result.failures, result.failures
@@ -839,7 +839,7 @@ def test_run_command_accepts_authenticated_consolidated_and_legacy_success(repos
 @pytest.mark.parametrize("mutation", ["failure_code", "duplicate_nonce", "nonempty_stderr"])
 def test_run_command_rejects_untrusted_consolidated_host_response(repository_root: Path, tmp_path: Path, mutation):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now); original=runner.run
     def run(request):
         result=original(request)
@@ -851,7 +851,7 @@ def test_run_command_rejects_untrusted_consolidated_host_response(repository_roo
             else "Enable succeeded:\n[stdout]\n"+message+"[stderr]\nunexpected")
         return result.model_copy(update={"stdout":json.dumps(payload)})
     runner.run=run
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.failures and result.deployment is not None
@@ -861,9 +861,9 @@ def test_run_command_rejects_untrusted_consolidated_host_response(repository_roo
 @pytest.mark.parametrize("architecture,publisher,offer", [("Arm64","Canonical","ubuntu2404"),("x64","Contoso","ubuntu2404"),("x64","Canonical","debian"),(None,"Canonical","ubuntu2404")])
 def test_incompatible_image_metadata_rejects_before_pair_apply(repository_root: Path,tmp_path: Path,architecture,publisher,offer):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,image_architecture=architecture,image_publisher=publisher,image_offer=offer,image_sku=offer)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     result=provision(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.failures and "image metadata" in result.failures[0].message
     assert "pair_apply" not in [r.action_type for r in runner.requests]
@@ -871,9 +871,9 @@ def test_incompatible_image_metadata_rejects_before_pair_apply(repository_root: 
 
 def test_created_vm_image_identity_is_observed_not_copied_from_request(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,vm_image_mismatch=True)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.,utc_now=lambda:now)
     result=provision(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.failures and "differs from the requested" in result.failures[0].message
     journal=json.loads((o.attempt_root/"recovery.json").read_text())
@@ -921,10 +921,10 @@ def test_marketplace_compute_readback_requires_complete_matching_x64_linux_ident
 
 def test_absolute_nonzero_monotonic_origin_survives_mapping_registration_provision_and_cleanup(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16),"cap_deadline_monotonic":501001})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17),"cap_deadline_monotonic":501001})
     assert build_pair_inputs(d,o)["scenario"]=="same_zone"
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:500001.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:500001.,utc_now=lambda:now)
     assert expiry.state=="registered"
     runner=AutomationRunner(d,o,now)
     runner.script=registration.script; runner.schedule=registration.schedule; runner.binding=registration.binding
@@ -938,9 +938,9 @@ def test_absolute_nonzero_monotonic_origin_survives_mapping_registration_provisi
 
 def test_fresh_cap_is_rechecked_after_last_expiry_read_and_before_apply(repository_root: Path,tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16),"complete_workflow_seconds":600})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17),"complete_workflow_seconds":600})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     class AdvancingRunner(AutomationRunner):
         mono=2.
         def run(self,request):
@@ -958,9 +958,9 @@ def test_fresh_cap_is_rechecked_after_last_expiry_read_and_before_apply(reposito
 @pytest.mark.parametrize("fail_at",["pair_apply","pair_output"])
 def test_pair_apply_and_output_failures_keep_cleanup_required_journal(repository_root: Path, tmp_path: Path, fail_at):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,fail_at=fail_at)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
     journal=json.loads((o.attempt_root/"recovery.json").read_text())
@@ -971,9 +971,9 @@ def test_pair_apply_and_output_failures_keep_cleanup_required_journal(repository
 
 def test_foreign_vm_output_identity_preserves_only_the_valid_role(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,wrong_vm_id_for="b")
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_required and result.deployment is not None
@@ -984,9 +984,9 @@ def test_foreign_vm_output_identity_preserves_only_the_valid_role(repository_roo
 @pytest.mark.parametrize("residual,expected", [(False,"succeeded"),(True,"failed")])
 def test_cleanup_proves_vm_absence_and_blocks_expiry_teardown_for_residual_pair_resource(repository_root: Path, tmp_path: Path, residual, expected):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration_runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration_runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration_runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     runner=CleanupRunner(d,o,now,residual=residual)
     result=destroy(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
@@ -1010,9 +1010,9 @@ def test_cleanup_proves_vm_absence_and_blocks_expiry_teardown_for_residual_pair_
 def test_cleanup_never_proves_absence_without_exact_account_removal(
         repository_root: Path, tmp_path: Path, case):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration_runner=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,
         registration_runner,clock=lambda:1.0,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     kwargs={}
@@ -1046,9 +1046,9 @@ def test_cleanup_never_proves_absence_without_exact_account_removal(
 ])
 def test_partial_registration_is_cleaned_from_journal_without_registered_expiry_dto(repository_root:Path,tmp_path:Path,fail_at,account_present,children):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     failed=AutomationRunner(d,o,now,fail_at=fail_at)
-    evidence=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,failed,clock=lambda:1.,utc_now=lambda:now)
+    evidence=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,failed,clock=lambda:1.,utc_now=lambda:now)
     assert evidence.state=="failed"
     cleanup_runner=CleanupRunner(d,o,now,account_present=account_present,present_children=children)
     result=destroy(d,o,cleanup_runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
@@ -1059,9 +1059,9 @@ def test_partial_registration_is_cleaned_from_journal_without_registered_expiry_
 
 def test_cleanup_result_export_redacts_bounded_private_pem_sentinel(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
     sentinel="-----BEGIN RSA PRIVATE KEY-----cleanup-secret-----END RSA PRIVATE KEY-----"
     result=destroy(registered,o,CleanupRunner(d,o,now,secret_output=sentinel),clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
@@ -1071,9 +1071,9 @@ def test_cleanup_result_export_redacts_bounded_private_pem_sentinel(repository_r
 
 def test_cleanup_rejects_modified_private_terraform_inputs_before_runner_call(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     pair_vars=o.attempt_root/"pair.auto.tfvars.json"
     pair=json.loads(pair_vars.read_text()); pair["resource_group_name"]="foreign-group"; pair_vars.write_text(json.dumps(pair))
     assert pair_vars.stat().st_mode & 0o777==0o600
@@ -1086,9 +1086,9 @@ def test_cleanup_rejects_modified_private_terraform_inputs_before_runner_call(re
 
 def test_blank_complete_inventory_fails_closed_and_preserves_launch_block(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     runner=CleanupRunner(d,o,now,blank_inventory=True)
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
@@ -1099,9 +1099,9 @@ def test_blank_complete_inventory_fails_closed_and_preserves_launch_block(reposi
 @pytest.mark.parametrize("inventory", ["[{\"malformed\":\"no id\"}]", "[null]", "[{\"id\":\"foreign-role\"}]"])
 def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_blocks_launch(repository_root:Path,tmp_path:Path,inventory):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     runner=CleanupRunner(d,o,now,role_definition_inventory=inventory)
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
@@ -1112,9 +1112,9 @@ def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_bloc
 @pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]}"])
 def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root:Path,tmp_path:Path,inventory):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     runner=CleanupRunner(d,o,now,role_assignment_inventory=inventory)
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
@@ -1124,9 +1124,9 @@ def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root
 
 def test_interrupted_registration_reuses_observed_job_identity(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,fail_at="runbook_publish")
-    request=expiry_request(d,o,now+timedelta(minutes=15))
+    request=expiry_request(d,o,now+timedelta(minutes=16))
     first=register_expiry(d,request,o,runner,clock=lambda:1.,utc_now=lambda:now)
     first_id=json.loads((o.attempt_root/"recovery.json").read_text())["expiry"]["job_schedule_id"]
     second=register_expiry(d,request,o,runner,clock=lambda:1.,utc_now=lambda:now)
@@ -1136,9 +1136,9 @@ def test_interrupted_registration_reuses_observed_job_identity(repository_root:P
 
 def test_repeated_cleanup_recovers_after_child_delete_interruption(repository_root:Path,tmp_path:Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     registration=AutomationRunner(d,o,now)
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,registration,clock=lambda:1.,utc_now=lambda:now)
     runner=CleanupRunner(d,o,now,fail_delete_once="expiry_schedules_delete")
     first=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert first.cleanup_state=="failed" and first.launch_blocked
@@ -1159,9 +1159,9 @@ def test_missing_recovery_journal_blocks_launch_and_never_calls_cloud(repository
 
 def test_registration_failure_after_mutation_returns_failed_evidence_and_keeps_journal(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
-    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
     runner=AutomationRunner(d,o,now,fail_at="runbook_publish")
-    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
     assert expiry.state=="failed" and expiry.failure is not None
     journal=json.loads((o.attempt_root/"recovery.json").read_text())
     assert journal["expiry_state"]=="failed" and journal["failures"]
