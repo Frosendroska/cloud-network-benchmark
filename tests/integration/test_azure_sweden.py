@@ -15,7 +15,17 @@ IMAGE = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
 def sweden(root,tmp_path):
     d=deployment(root)
     d=d.model_copy(update={"vm_a":d.vm_a.model_copy(update={"region":"swedencentral"}),"vm_b":d.vm_b.model_copy(update={"region":"swedencentral"})})
-    now=datetime.now(timezone.utc)
+    # Use one minute-aligned fake instant for the provider clock and reservation.
+    # A real wall clock here made the +15 minute requested trigger floor up to
+    # 59 seconds earlier while this fixture allowed only a 30 second workflow
+    # margin, so unrelated Sweden success/recovery cases failed before reaching
+    # their intended assertions.
+    now=datetime.now(timezone.utc).replace(second=0,microsecond=0)
+    reservation=d.reservation.value.model_copy(update={
+        "cap_started_at":d.reservation.value.cap_started_at.model_copy(update={"value":now-timedelta(seconds=30)}),
+        "expires_at":d.reservation.value.expires_at.model_copy(update={"value":now+timedelta(seconds=1170)}),
+    })
+    d=d.model_copy(update={"reservation":d.reservation.model_copy(update={"value":reservation})})
     o=options(tmp_path).model_copy(update={"selected_image":IMAGE,"retry_end_at":now+timedelta(minutes=16)})
     return d,o,now
 
@@ -50,6 +60,18 @@ def test_deployment_exception_is_bounded_even_for_direct_calls(repository_root,t
     assert not o.attempt_root.exists()
 
 
+def test_minute_floor_that_breaks_complete_workflow_is_rejected_before_runner(repository_root,tmp_path):
+    d,o,now=sweden(repository_root,tmp_path)
+    runner=SwedenRunner(d,o,now)
+    # Request is just before the next minute: flooring takes it from +14:59
+    # to +14:00, while the original 900-second workflow bound ends at +14:30.
+    request=expiry_request(d,o,now+timedelta(minutes=14,seconds=59))
+    with pytest.raises(ValueError,match="complete workflow bound exceeds actual expiry trigger"):
+        az.register_expiry(d,request,o,runner,clock=lambda:1.,utc_now=lambda:now)
+    assert not runner.requests
+    assert not o.attempt_root.exists()
+
+
 def test_sweden_mapping_image_expiry_and_host_identity(repository_root,tmp_path,isolated_legacy_saved_plan_boundary):
     d,o,now=sweden(repository_root,tmp_path);runner=SwedenRunner(d,o,now)
     pair=az.build_pair_inputs(d,o)
@@ -72,6 +94,54 @@ def test_sweden_mapping_image_expiry_and_host_identity(repository_root,tmp_path,
     assert image.argv[image.argv.index("--urn")+1]==IMAGE
     assert [q.action_type for q in runner.requests].index("job_binding_readback") < [q.action_type for q in runner.requests].index("pair_apply")
     assert (o.attempt_root/"expiry.auto.tfvars.json").read_bytes()==original_expiry
+
+
+@pytest.mark.parametrize("review_elapsed,anchor",[(46.0,None),(80.0,"trigger"),(21.0,"cap")])
+def test_pair_apply_review_rechecks_full_budget_and_preserves_total_stage_deadline(
+        repository_root,tmp_path,monkeypatch,isolated_legacy_saved_plan_boundary,review_elapsed,anchor):
+    from cloud_network_benchmark.contracts.common import Evidence
+    d,o,base=sweden(repository_root,tmp_path)
+    # The usual pair-apply review starts with 839 seconds to trigger and a
+    # complete post-registration allowance of 760 seconds. The successful
+    # case retains only the original provision-stage remainder after 46s of
+    # review. Cap- and trigger-exhaustion cases stop before dispatch.
+    o=o.model_copy(update={"complete_workflow_seconds":810,
+        "post_registration_workflow_seconds":760,"command_timeout_seconds":180,
+        "plan_review_timeout_seconds":60,
+        "cap_deadline_monotonic":782 if anchor=="cap" else 1000})
+    d=d.model_copy(update={"provisioning_timeout_seconds":180})
+    reservation=d.reservation.value.model_copy(update={
+        "cap_started_at":d.reservation.value.cap_started_at.model_copy(update={"value":base-timedelta(seconds=30)}),
+        "expires_at":d.reservation.value.expires_at.model_copy(update={"value":base+timedelta(seconds=1170)}),
+    })
+    d=d.model_copy(update={"reservation":d.reservation.model_copy(update={"value":reservation})})
+    requested_trigger=base+timedelta(minutes=14,seconds=59)
+    register_clock=[2.0]
+    expiry=az.register_expiry(d,expiry_request(d,o,requested_trigger),o,
+        SwedenRunner(d,o,base),clock=lambda:register_clock[0],utc_now=lambda:base)
+    assert expiry.state=="registered",expiry.failure
+    d=d.model_copy(update={"expiry":Evidence(value=expiry)})
+
+    clock=[2.0]
+    calls=[]
+    def reviewed(request,execute,*,review_seconds,apply_timeout_seconds,before_apply):
+        calls.append((request.timeout_seconds,review_seconds,apply_timeout_seconds))
+        clock[0]+=review_elapsed
+        calls.append((before_apply(),))
+        return execute(request.model_copy(update={"timeout_seconds":calls[-1][0]}))
+    monkeypatch.setattr("cloud_network_benchmark.terraform_plan.reviewed_apply",reviewed)
+    monkeypatch.setattr(az,"_verify_registered_expiry",lambda *_args:None)
+    runner=SwedenRunner(d,o,base)
+    result=az.provision(d,o,runner,clock=lambda:clock[0],
+        utc_now=lambda:base+timedelta(seconds=clock[0]-1))
+    if anchor is None:
+        assert result.deployment is not None,(result.failures,calls,[q.action_type for q in runner.requests])
+        assert calls[0]==pytest.approx((79.0,60,180))
+        assert calls[1]==pytest.approx((134.0,))
+        assert any(q.action_type=="pair_apply" for q in runner.requests)
+    else:
+        assert result.deployment is None and result.failures
+        assert not any(q.action_type=="pair_apply" for q in runner.requests)
 
 
 @pytest.mark.parametrize("failure",[None,"runbook_draft","pair_apply"])

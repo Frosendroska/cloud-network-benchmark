@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+import cloud_network_benchmark.azure_provider as azure_provider
 from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, register_expiry, provision, destroy, build_pair_inputs
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
@@ -15,6 +16,24 @@ pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
 from tests.fixtures.f06 import RESPONSE_FIXTURES
 from tests.contract.test_azure_provider_contract import deployment, options
+
+
+def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_keys():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_attempt_resource_group
+    now=datetime.now(timezone.utc); group="cnb-attempt"
+    payload={"error":{"code":"ResourceGroupNotFound","message":f"Resource group '{group}' could not be found."}}
+    expected="ERROR: Not Found("+json.dumps(payload,separators=(",",":"))+")"
+    accepted=CommandResult(action_id="absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=expected)
+    assert _is_exact_missing_attempt_resource_group(accepted,group)
+    assert not _is_exact_missing_attempt_resource_group(accepted,"foreign-group")
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceGroupNotFound","code":"AuthorizationFailed","message":"Resource group \'cnb-attempt\' could not be found."}})'})
+    assert not _is_exact_missing_attempt_resource_group(duplicate,group)
+    duplicate_outer=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceGroupNotFound","message":"Resource group \'cnb-attempt\' could not be found."},"error":{"code":"ResourceGroupNotFound","message":"Resource group \'cnb-attempt\' could not be found."}})'})
+    assert not _is_exact_missing_attempt_resource_group(duplicate_outer,group)
+    duplicate_message=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceGroupNotFound","message":"foreign","message":"Resource group \'cnb-attempt\' could not be found."}})'})
+    assert not _is_exact_missing_attempt_resource_group(duplicate_message,group)
+    assert not _is_exact_missing_attempt_resource_group(accepted.model_copy(update={"stdout":"unexpected"}),group)
 
 
 def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: Path, tmp_path: Path):
@@ -38,11 +57,17 @@ class AutomationRunner:
         self.publish_reads=0; self.requests=[]; self.script=""; self.schedule={}; self.binding={}; self.tamper_recheck=None
         self.name=_slug(deployment_input)
         self.account=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Automation/automationAccounts/{self.name}-auto"
-        self.assignment_id=f"{self.account}/providers/Microsoft.Authorization/roleAssignments/assignment"
-        self.role_id=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Authorization/roleDefinitions/role"
+        self.assignment_id=(f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}"
+            "/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000001")
+        self.role_id=(f"/subscriptions/{options_input.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/"
+            "00000000-0000-0000-0000-000000000002")
         self.group_id=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}"
     def run(self, request):
         self.requests.append(request)
+        if request.action_type in {"profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}:
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":[]}),stderr="")
         if request.action_type=="runbook_content": self.script=request.argv[request.argv.index("--body")+1]
         if request.action_type=="schedule_create": self.schedule=json.loads(request.argv[request.argv.index("--body")+1])
         if request.action_type=="job_binding_create": self.binding=json.loads(request.argv[request.argv.index("--body")+1])
@@ -185,6 +210,441 @@ def expiry_request(d, o, trigger):
     slug=_slug(d); ids=[f"/subscriptions/{o.subscription_id}/resourceGroups/{slug}/providers/Microsoft.Compute/virtualMachines/{slug}-{role}" for role in ("a","b")]
     return ExpiryRequest(schema_version=2,run_id=d.run_id,deployment_id=d.deployment_id,provider="azure",action="deallocate",
         expires_at={"value":trigger},reservation_id={"value":d.reservation.value.reservation_id.value},resource_namespace=slug,target_selector=";".join(ids))
+
+
+def profile_attempt(repository_root: Path,attempt_root: Path,now: datetime):
+    from cloud_network_benchmark.contracts.common import Evidence
+    profile="azure_exp901_sweden_acceptance_v1"
+    base=deployment(repository_root)
+    start=now-timedelta(seconds=100)
+    reservation=base.reservation.value.model_copy(update={"timing_profile":profile,
+        "cap_started_at":Evidence(value=start),"expires_at":Evidence(value=start+timedelta(seconds=1800))})
+    admission=base.admission.model_copy(update={"timing_profile":profile,"lifetime_cap_seconds":1800})
+    d=base.model_copy(update={"admission":admission,"reservation":Evidence(value=reservation),
+        "vm_a":base.vm_a.model_copy(update={"region":"swedencentral"}),
+        "vm_b":base.vm_b.model_copy(update={"region":"swedencentral"})})
+    allowance={"registration_seconds":180,"provision_seconds":240,"readiness_seconds":180,
+        "stabilization_seconds":60,"measurement_seconds":100,"measurement_shutdown_seconds":15,
+        "retrieval_seconds":45,"cleanup_seconds":660,"azure_provider_lead_seconds":120}
+    value=options(attempt_root,d.admission.priority).model_dump(mode="python")
+    value.update(complete_workflow_seconds=1480,post_registration_workflow_seconds=1300,
+        cap_deadline_monotonic=2700,retry_end_at=start+timedelta(seconds=1800),
+        timing_profile=profile,cleanup_timing_path=attempt_root/"f09-private"/"azure-cleanup-timing"/"timer.json",
+        profile_allowance=allowance,command_timeout_seconds=180)
+    return d,AzureRuntimeOptions.model_validate(value),start
+
+
+def register_profile_expiry(d,o,start,now,runner,*,clock=1000.0):
+    # Match the source-bound cap origin established by default factory preparation.
+    origin_mono=clock-(now-start).total_seconds()
+    azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:start)
+    return register_expiry(d,expiry_request(d,o,start+timedelta(seconds=1680)),o,runner,
+        clock=lambda:clock,utc_now=lambda:now)
+
+
+@pytest.mark.parametrize("anchor_state", ["missing","corrupt","foreign"])
+def test_profile_registration_requires_original_timer_before_any_provider_call(
+        repository_root: Path,tmp_path: Path,anchor_state):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    if anchor_state=="corrupt":
+        o.cleanup_timing_path.parent.mkdir(parents=True,exist_ok=True)
+        o.cleanup_timing_path.write_text('{"schema_version":1,"sha256":"broken"}')
+        o.cleanup_timing_path.chmod(0o600)
+    elif anchor_state=="foreign":
+        foreign=d.model_copy(update={"run_id":"foreign-profile-run"})
+        origin_mono=1000.0-(now-start).total_seconds()
+        azure_provider._initialize_profile_timing(foreign,o,clock=lambda:origin_mono,utc_now=lambda:start)
+    runner=AutomationRunner(d,o,now)
+    evidence=register_expiry(d,expiry_request(d,o,start+timedelta(seconds=1680)),o,runner,
+        clock=lambda:1000.0,utc_now=lambda:now)
+    assert evidence.state=="failed"
+    assert runner.requests==[]
+    assert not (o.attempt_root/"recovery.json").exists()
+
+
+class ProfileCleanupRunner(CleanupRunner):
+    def __init__(self,*args,fail_first_absence=False,advance_clock_on_expiry=None,unowned_watcher=False,
+                 advance_clock_on_action=None,corrupt_timer_on_final=False,residual_attempt_group=False,
+                 residual_role=None,role_pages=False,capture_timing=False,missing_group_error=None,**kwargs):
+        super().__init__(*args,**kwargs); self.fail_first_absence=fail_first_absence; self.failed_absence=False
+        self.advance_clock_on_expiry=advance_clock_on_expiry
+        self.advance_clock_on_action=advance_clock_on_action
+        self.unowned_watcher=unowned_watcher
+        self.corrupt_timer_on_final=corrupt_timer_on_final
+        self.timer_corruptions=0
+        self.residual_attempt_group=residual_attempt_group
+        self.residual_role=residual_role
+        self.role_pages=role_pages or residual_role is not None
+        self.capture_timing=capture_timing
+        self.timing_snapshot=None
+        self.missing_group_error=missing_group_error
+    def run(self, request):
+        if request.action_type == "profile_absence_group":
+            self.requests.append(request)
+            if self.fail_first_absence and not self.failed_absence:
+                self.failed_absence=True; out="true"
+            else: out="false"
+        elif request.action_type in {"profile_absence_resources","profile_absence_role_assignments"}:
+            self.requests.append(request)
+            values=([{"id":f"/subscriptions/{self.o.subscription_id}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral",
+                "type":"Microsoft.Network/networkWatchers"}] if self.unowned_watcher and request.action_type=="profile_absence_resources" else [])
+            out=json.dumps({"value":values})
+        elif request.action_type in {"profile_absence_role_definitions","profile_absence_role_definitions_page_2"}:
+            self.requests.append(request)
+            url=request.argv[request.argv.index("--url") + 1]
+            assert "%24filter=type%20eq%20%27CustomRole%27" in url
+            role_id=f"/subscriptions/{self.o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/owned-custom-role"
+            role_name=_slug(self.d)+"-deallocate-only"
+            if request.action_type.endswith("page_2"):
+                values=([{"id":role_id,"properties":{"roleName":role_name}}] if self.residual_role else
+                    [{"id":f"/subscriptions/{self.o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/other-custom-role",
+                      "properties":{"roleName":"Unrelated custom role"}}])
+                out=json.dumps({"value":values})
+            else:
+                values=[{"id":f"/subscriptions/{self.o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/page-one-custom-role",
+                    "properties":{"roleName":"Unrelated first-page custom role"}}]
+                payload={"value":values}
+                if self.role_pages or self.residual_role:
+                    payload["nextLink"]=url.split("?",1)[0]+"?%24filter=type%20eq%20%27CustomRole%27&api-version=2022-04-01&$skiptoken=page-two"
+                out=json.dumps(payload)
+            if self.capture_timing and self.o.cleanup_timing_path.is_file():
+                self.timing_snapshot=json.loads(self.o.cleanup_timing_path.read_text(encoding="utf-8"))
+        elif request.action_type=="profile_absence_groups":
+            self.requests.append(request)
+            values=([{"id":f"/subscriptions/{self.o.subscription_id}/resourceGroups/NetworkWatcherRG",
+                "name":"NetworkWatcherRG"}] if self.unowned_watcher else [])
+            if self.residual_attempt_group:
+                values.append({"id":f"/subscriptions/{self.o.subscription_id}/resourceGroups/{_slug(self.d)}",
+                    "name":_slug(self.d)})
+            out=json.dumps({"value":values})
+        elif request.action_type == "profile_absence_automation":
+            self.requests.append(request)
+            if self.missing_group_error is not None:
+                group=("foreign-group" if self.missing_group_error=="foreign" else _slug(self.d))
+                message=f"Resource group '{group}' could not be found."
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceGroupNotFound",
+                    "message":message}},separators=(",",":"))+")"
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,
+                    stdout="",stderr=stderr)
+            if self.corrupt_timer_on_final and any("/runbooks/" in arg for arg in request.argv):
+                self.o.cleanup_timing_path.write_text('{"schema_version":1,"sha256":"corrupt"}')
+                self.timer_corruptions+=1
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,
+                stdout="",stderr='{"error":{"code":"ResourceNotFound"}}')
+        if request.action_type not in {
+            "profile_absence_group","profile_absence_resources","profile_absence_role_assignments",
+            "profile_absence_role_definitions","profile_absence_role_definitions_page_2",
+            "profile_absence_groups","profile_absence_automation"}:
+            result=super().run(request)
+            if request.action_type=="expiry_destroy" and self.advance_clock_on_expiry:
+                self.advance_clock_on_expiry()
+            if self.advance_clock_on_action:
+                elapsed=self.advance_clock_on_action(request.action_type)
+                if elapsed:
+                    self.now += timedelta(seconds=elapsed)
+                    result=result.model_copy(update={"finished_at":self.now,"duration_seconds":elapsed})
+            return result
+        return CommandResult(
+                action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,started_at=self.now,
+                finished_at=self.now,duration_seconds=0,exit_code=0,stdout=out,stderr="")
+
+
+@pytest.mark.parametrize("cleanup_mono,expected_cleanup,expected_timing", [
+    (1100.0,"succeeded","within_deadline"),(2520.0,"succeeded","late")])
+def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
+        repository_root: Path,tmp_path: Path,cleanup_mono,expected_cleanup,expected_timing):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registered_clock=1000.0
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration,clock=registered_clock)
+    assert evidence.state=="registered"
+    assert o.cleanup_timing_path.exists()
+    runner=ProfileCleanupRunner(d,o,now,role_pages=True)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=evidence)}),o,runner,
+        clock=lambda:cleanup_mono,utc_now=lambda:now+timedelta(seconds=cleanup_mono-registered_clock))
+    assert result.cleanup_state==expected_cleanup and not result.launch_blocked,result.failures
+    assert result.timing_status==expected_timing
+    if expected_timing=="within_deadline":
+        assert result.timing_failure is None
+    else:
+        assert result.timing_failure is not None
+    assert any(r.action_type=="profile_absence_role_definitions" for r in runner.requests)
+    assert any(r.action_type=="profile_absence_role_definitions_page_2" for r in runner.requests)
+    assert any(r.action_type=="profile_absence_automation" for r in runner.requests)
+
+
+@pytest.mark.parametrize(("missing_group_error","expected_cleanup"), [
+    ("exact","succeeded"),("foreign","failed")])
+def test_profile_absence_cli_missing_group_requires_exact_owned_parent(
+        repository_root: Path,tmp_path: Path,missing_group_error,expected_cleanup):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=evidence)})
+    runner=ProfileCleanupRunner(d,o,now,missing_group_error=missing_group_error)
+    result=destroy(registered,o,runner,clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state==expected_cleanup
+    group_check=next(i for i,r in enumerate(runner.requests) if r.action_type=="profile_absence_group")
+    account_checks=[(i,r) for i,r in enumerate(runner.requests) if r.action_type=="profile_absence_automation"]
+    assert account_checks and group_check < account_checks[0][0]
+    expected_prefix=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}/providers/Microsoft.Automation/").lower()
+    account_urls=[r.argv[r.argv.index("--url") + 1].lower() for _,r in account_checks]
+    assert all(url.startswith(expected_prefix) for url in account_urls)
+    if missing_group_error=="exact":
+        assert not result.launch_blocked and result.timing_status=="within_deadline"
+    else:
+        assert result.launch_blocked
+        assert any("profile_absence_automation failed" in failure.message for failure in result.failures)
+
+
+def test_missing_stop_full_cleanup_closes_copied_ledger_but_keeps_acceptance_unknown(
+        repository_root: Path,tmp_path: Path):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_cleanup import save_cleanup_settings, reconcile_saved_cleanup_result
+    from cloud_network_benchmark.orchestration import cleanup_lifecycle
+
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    cap=d.reservation.value.expires_at.value
+    # Match the incident's pre-apply journal shape: timer exists, no registered
+    # STOP, no prior cleanup entry, no expiry apply, and no resource creation.
+    azure_provider._initialize_profile_timing(d,o,clock=lambda:1000.0,utc_now=lambda:start)
+    root,journal=azure_provider._workspace(o,d)
+    pre_state=json.loads(journal.read_text(encoding="utf-8"))
+    assert pre_state["creation_may_have_started"] is False
+    assert pre_state.get("expiry") is None
+    timer=json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
+    assert timer["provider_stop_at"] is None and timer["first_cleanup_monotonic"] is None
+
+    request=expiry_request(d,o,start+timedelta(seconds=1680))
+    settings_path=save_cleanup_settings(provider="azure",deployment=d,request=request,
+        reservation=d.reservation.value,provider_lead_seconds=120.0,settings=o,
+        private_root=tmp_path/"saved-cleanup")
+    runner=ProfileCleanupRunner(d,o,now,account_present=False,role_pages=True,capture_timing=True)
+    physical=destroy(d,o,runner,clock=lambda:1000.0,utc_now=lambda:now)
+
+    assert physical.cleanup_state=="succeeded" and physical.launch_blocked is False, physical.failures
+    assert physical.timing_status=="unknown" and physical.timing_failure is not None
+    assert runner.timing_snapshot is not None
+    assert runner.timing_snapshot["provider_stop_at"] is None
+    assert runner.timing_snapshot["first_cleanup_monotonic"] is None
+    assert runner.timing_snapshot["first_cleanup_at"] is None
+    assert runner.timing_snapshot["cap_deadline_monotonic"]==o.cap_deadline_monotonic
+    assert runner.timing_snapshot["cap_expires_at"]==cap.isoformat()
+    assert all(not ("apply" in item.argv and any(arg.startswith("-chdir=") for arg in item.argv))
+        for item in runner.requests)
+
+    reservation_id=d.reservation.value.reservation_id.value
+    ledger_path=tmp_path/"isolated-copied-ledger.json"
+    ledger_path.write_text("isolated fake ledger; never connected to the original ledger\n")
+    class CopiedLedger:
+        path=ledger_path
+        scope_id="isolated-e901d168-copy"
+        def __init__(self):
+            self.state={"reservations":{reservation_id:{
+                "evidence":d.reservation.value.model_dump(mode="json"),"provider_cleanup":{}}}}
+            self.events=[]
+        def inspect(self):
+            return json.loads(json.dumps(self.state))
+        def reconcile(self,event):
+            self.events.append(event)
+            row=self.state["reservations"][event.reservation_id]
+            row.setdefault("provider_cleanup",{})[event.provider]=event.cleanup_verified_absent
+    copied_ledger=CopiedLedger()
+
+    recovery_path=tmp_path/"outer-recovery"/"lifecycle-recovery.json"
+    recovery_path.parent.mkdir(mode=0o700)
+    recovery_path.write_text(json.dumps({"schema_version":1,"attempt_id":d.run_id,
+        "controller_session_id":"offline-copied-ledger-test","reservation_id":reservation_id,
+        "ledger_path":str(ledger_path),"ledger_scope_id":copied_ledger.scope_id,
+        "providers":[{"provider":"azure","deployment_id":d.deployment_id,
+            "journal_reference":str(journal),"expiry_registered":False,
+            "creation_may_have_started":False,"cleanup_open":True,
+            "cleanup_settings_reference":str(settings_path),
+            "cleanup_timing_status":"unknown",
+            "cleanup_timing_failure":"actual registered STOP timing anchor is missing"}]}))
+    recovery_path.chmod(0o600)
+    saved_recovery=SimpleNamespace(reservation_id=reservation_id,ledger_path=str(ledger_path),
+        ledger_scope_id=copied_ledger.scope_id)
+
+    def reconcile(record,result):
+        return reconcile_saved_cleanup_result(record,result,recovery=saved_recovery,ledger=copied_ledger,
+            utc_now=lambda:now+timedelta(seconds=1))
+
+    outcome=cleanup_lifecycle(recovery_path,current_session_id="offline-recovery-session",
+        cleanup_actions={"azure":lambda _record:physical},reconcile=reconcile,ledger=copied_ledger)
+    row=outcome.providers["azure"]
+    assert row["reconciled"] is True and row["cleanup"]=="succeeded", row
+    assert row["cleanup_open"] is False and row["launch_blocked"] is False
+    assert row["cleanup_timing_status"]=="unknown" and row["acceptance_failed"] is True
+    assert copied_ledger.state["reservations"][reservation_id]["provider_cleanup"]["azure"] is True
+    assert copied_ledger.events and copied_ledger.events[0].cleanup_verified_absent is True
+    assert outcome.complete is False
+    persisted=json.loads(recovery_path.read_text(encoding="utf-8"))["providers"][0]
+    assert persisted["cleanup_open"] is False
+    assert persisted["cleanup_timing_status"]=="unknown"
+
+
+@pytest.mark.parametrize("residual_role", ["id", "name"])
+def test_profile_absence_rejects_residual_attempt_custom_role(repository_root: Path,tmp_path: Path,residual_role):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    expiry=type(d.expiry)(value=evidence)
+    if residual_role=="id":
+        expiry=expiry.model_copy(update={"role_definition_id":
+            f"/subscriptions/{o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/owned-custom-role"})
+    runner=ProfileCleanupRunner(d,o,now,residual_role=residual_role)
+    result=destroy(d.model_copy(update={"expiry":expiry}),o,runner,
+        clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="failed"
+    assert any("role-definition inventory found the attempt custom role" in failure.message
+        for failure in result.failures)
+
+
+@pytest.mark.parametrize("bad_page", ["malformed", "foreign", "cyclic"])
+def test_filtered_custom_role_inventory_still_rejects_untrustworthy_pages(
+        repository_root: Path,tmp_path: Path,bad_page):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,_=profile_attempt(repository_root,tmp_path,now)
+    class BadInventory:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            url=request.argv[request.argv.index("--url") + 1]
+            if bad_page=="malformed": out="{"
+            elif bad_page=="foreign":
+                out=json.dumps({"value":[],"nextLink":"https://management.azure.com/subscriptions/foreign/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01"})
+            else:
+                out=json.dumps({"value":[],"nextLink":url})
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout=out,stderr="")
+    runner=BadInventory()
+    endpoint=f"/subscriptions/{o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions?%24filter=type%20eq%20%27CustomRole%27&api-version=2022-04-01"
+    with pytest.raises(RuntimeError):
+        azure_provider._read_arm_collection(runner,o,repository_root,endpoint,"profile_absence_role_definitions",
+            lambda:1100.0,("id",))
+    assert len(runner.requests)==1
+
+
+def test_unchanged_unfiltered_builtin_catalog_reproduces_size_limit(repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,_=profile_attempt(repository_root,tmp_path,now)
+    old_endpoint=(f"/subscriptions/{o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions"
+        "?api-version=2022-04-01")
+    large_builtin=json.dumps({"value":[{"id":f"/subscriptions/{o.subscription_id}/providers/"
+        "Microsoft.Authorization/roleDefinitions/builtin-role","properties":{"roleName":"Built-in role "
+        +"x"*1_000_100}}]})
+    assert len(large_builtin.encode())>1_000_000
+    class UnfilteredCatalog:
+        def run(self,request):
+            assert request.argv[request.argv.index("--url") + 1].endswith("roleDefinitions?api-version=2022-04-01")
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout=large_builtin,stderr="")
+    with pytest.raises(RuntimeError,match="above the 1 MiB bounded-response limit"):
+        azure_provider._read_arm_collection(UnfilteredCatalog(),o,o.attempt_root,old_endpoint,
+            "profile_absence_role_definitions",lambda:1100.0,("id",))
+
+
+def test_profile_absence_recovery_uses_separate_window_without_replaying_destroy(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    clock_state={"mono":1000.0}
+    advances={"pair_destroy":[150.0,150.0],"expiry_destroy":[150.0,145.0]}
+    def advance_action(action):
+        values=advances.get(action)
+        if not values: return 0.0
+        elapsed=values.pop(0); clock_state["mono"]+=elapsed
+        return elapsed
+    runner=ProfileCleanupRunner(d,o,now,fail_first_absence=True,
+        advance_clock_on_action=advance_action)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=evidence)})
+    clock=lambda:clock_state["mono"]
+    utc=lambda:now+timedelta(seconds=clock_state["mono"]-1000.0)
+    first=destroy(registered,o,runner,clock=clock,utc_now=utc)
+    assert first.cleanup_state=="failed" and first.timing_status=="within_deadline"
+    assert clock_state["mono"]==1300.0
+    clock_state["mono"]=1300.0
+    second=destroy(registered,o,runner,clock=clock,utc_now=utc)
+    assert second.cleanup_state=="failed" and second.timing_status=="within_deadline"
+    assert clock_state["mono"]==1595.0
+    prior_destroy_count=sum(r.action_type=="pair_destroy" for r in runner.requests)
+    clock_state["mono"]=1601.0
+    third=destroy(registered,o,runner,clock=clock,utc_now=utc)
+    assert third.cleanup_state=="succeeded" and third.timing_status=="within_deadline"
+    assert sum(r.action_type=="pair_destroy" for r in runner.requests)==prior_destroy_count
+
+
+def test_profile_cleanup_never_claims_absence_for_new_unowned_network_watcher(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    runner=ProfileCleanupRunner(d,o,now,unowned_watcher=True)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=evidence)}),o,runner,
+        clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="failed" and result.launch_blocked
+    assert any("Network Watcher" in item.message for item in result.failures)
+    assert not any(item.action_type.endswith("_delete") and "NetworkWatcherRG" in " ".join(item.argv)
+        for item in runner.requests)
+
+
+def test_profile_final_timer_corruption_keeps_physical_absence_but_marks_timing_unknown(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    runner=ProfileCleanupRunner(d,o,now,corrupt_timer_on_final=True)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=evidence)}),o,runner,
+        clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked
+    assert result.timing_status=="unknown" and result.timing_failure is not None
+    assert runner.timer_corruptions==1
+
+
+def test_missing_watcher_baseline_allows_empty_fresh_inventory_to_close_with_unknown_status(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    journal=o.attempt_root/"recovery.json"
+    state=json.loads(journal.read_text())
+    state.pop("profile_external_baseline")
+    journal.write_text(json.dumps(state))
+    runner=ProfileCleanupRunner(d,o,now)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=evidence)}),o,runner,
+        clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked
+    assert result.timing_status=="unknown" and result.timing_failure is not None
+    assert any(r.action_type=="profile_absence_resources" for r in runner.requests)
+    assert any(r.action_type=="profile_absence_groups" for r in runner.requests)
+    assert not any(item.action_type.endswith("_delete") and "NetworkWatcher" in " ".join(item.argv)
+        for item in runner.requests)
+
+
+def test_profile_cleanup_rejects_attempt_group_listed_after_exists_false(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    evidence=register_profile_expiry(d,o,start,now,registration)
+    runner=ProfileCleanupRunner(d,o,now,residual_attempt_group=True)
+    result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=evidence)}),o,runner,
+        clock=lambda:1100.0,utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="failed" and result.launch_blocked
+    assert any("attempt resource group" in item.message for item in result.failures)
 
 
 def test_registration_requires_lead_and_exact_target_ids(repository_root: Path, tmp_path: Path):
@@ -352,6 +812,50 @@ def test_stale_run_command_nonce_cannot_materialize_known_hosts(repository_root:
     command_requests=[r for r in runner.requests if r.action_type=="host_key_identity"]
     assert [r.argv[r.argv.index("--ids")+1] for r in command_requests]==json.loads((o.attempt_root/"recovery.json").read_text())["vm_ids"]
     assert len({r.argv[r.argv.index("--scripts")+1].split("CNB-AZ-HOSTKEY:",1)[1].split("\\n",1)[0] for r in command_requests})==2
+
+
+@pytest.mark.parametrize("mode", ["consolidated", "legacy"])
+def test_run_command_accepts_authenticated_consolidated_and_legacy_success(repository_root: Path, tmp_path: Path, mode):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    runner=AutomationRunner(d,o,now); original=runner.run
+    def run(request):
+        result=original(request)
+        if request.action_type!="host_key_identity": return result
+        payload=json.loads(result.stdout); status=payload["value"][0]
+        if mode=="consolidated":
+            status["code"]="ProvisioningState/succeeded"
+            status["message"]="Enable succeeded:\n[stdout]\n"+status["message"]+"[stderr]\n"
+        payload["value"]=[status]
+        return result.model_copy(update={"stdout":json.dumps(payload)})
+    runner.run=run
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    result=provision(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.deployment is not None and not result.failures, result.failures
+    assert len((o.attempt_root/"known_hosts").read_text().splitlines())==2
+
+
+@pytest.mark.parametrize("mutation", ["failure_code", "duplicate_nonce", "nonempty_stderr"])
+def test_run_command_rejects_untrusted_consolidated_host_response(repository_root: Path, tmp_path: Path, mutation):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    runner=AutomationRunner(d,o,now); original=runner.run
+    def run(request):
+        result=original(request)
+        if request.action_type!="host_key_identity": return result
+        payload=json.loads(result.stdout); status=payload["value"][0]
+        status["code"]="ProvisioningState/failed" if mutation=="failure_code" else "ProvisioningState/succeeded"
+        message=status["message"]
+        status["message"]=("Enable succeeded:\n[stdout]\n"+message+message+"[stderr]\n" if mutation=="duplicate_nonce"
+            else "Enable succeeded:\n[stdout]\n"+message+"[stderr]\nunexpected")
+        return result.model_copy(update={"stdout":json.dumps(payload)})
+    runner.run=run
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    result=provision(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.failures and result.deployment is not None
+    assert not (o.attempt_root/"known_hosts").exists()
 
 
 @pytest.mark.parametrize("architecture,publisher,offer", [("Arm64","Canonical","ubuntu2404"),("x64","Contoso","ubuntu2404"),("x64","Canonical","debian"),(None,"Canonical","ubuntu2404")])

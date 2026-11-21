@@ -122,6 +122,8 @@ class SavedProviderRecovery(StrictModel):
     creation_may_have_started: bool
     cleanup_open: bool
     cleanup_settings_reference: str | None = None
+    cleanup_timing_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    cleanup_timing_failure: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SavedLifecycleRecovery(StrictModel):

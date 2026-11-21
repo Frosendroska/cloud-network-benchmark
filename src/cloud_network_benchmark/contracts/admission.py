@@ -89,6 +89,8 @@ def _is_secret_field_name(value: str) -> bool:
 class AdmissionRequirements(StrictModel):
     priority: Literal["P0", "P1", "P2", "P3"]
     lifetime_cap_seconds: Literal[1200, 1800, 87600]
+    timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
     hard_budget_usd: Literal[300] = 300
     protected_buffer_usd: Literal[50] = 50
     cost_input_id: str = Field(min_length=1)
@@ -101,7 +103,7 @@ class AdmissionRequirements(StrictModel):
     requires_expiry: bool
 
     @staticmethod
-    def expected_for(mode: ExperimentMode, scenario: Scenario) -> dict[str, object]:
+    def expected_for(mode: ExperimentMode, scenario: Scenario, timing_profile: str | None = None) -> dict[str, object]:
         mode, scenario = ExperimentMode(mode), Scenario(scenario)
         priority = {
             Scenario.SAME_ZONE: "P0",
@@ -115,6 +117,12 @@ class AdmissionRequirements(StrictModel):
             ExperimentMode.CALIBRATION: 1800,
             ExperimentMode.DIAGNOSTIC_DAY: 87600,
         }[mode]
+        if timing_profile == "azure_exp901_sweden_acceptance_v1":
+            if mode != ExperimentMode.ACCEPTANCE or scenario != Scenario.SAME_ZONE:
+                raise ValueError("Azure EXP-901 timing profile is only valid for same-zone acceptance")
+            cap = 1800
+        elif timing_profile is not None:
+            raise ValueError("unsupported timing profile")
         scheduled = mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
         return {
             "priority": priority,
@@ -150,6 +158,12 @@ class ReservationRequest(StrictModel):
     mode: ExperimentMode
     priority: Literal["P0", "P1", "P2", "P3"]
     lifetime_cap_seconds: Literal[1200, 1800, 87600]
+    timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(default=None, exclude_if=lambda value: value is None)
+    experiment_id: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
+    context: Optional[Literal["standard", "failure_check", "replacement"]] = Field(default=None, exclude_if=lambda value: value is None)
+    scenario: Optional[Scenario] = Field(default=None, exclude_if=lambda value: value is None)
+    config_sha256: Optional[str] = Field(default=None, pattern=SHA256_PATTERN, exclude_if=lambda value: value is None)
+    resolved_sha256: Optional[str] = Field(default=None, pattern=SHA256_PATTERN, exclude_if=lambda value: value is None)
     estimated_cost_usd: Evidence[float]
     source_path: str = Field(min_length=1)
     source_sha256: str = Field(pattern=SHA256_PATTERN)
@@ -166,6 +180,15 @@ class ReservationRequest(StrictModel):
                 raise ValueError("cost evidence must be finite and nonnegative")
         expected_cap = {ExperimentMode.ACCEPTANCE:1200, ExperimentMode.SHORT_STUDY:1200,
                         ExperimentMode.CALIBRATION:1800, ExperimentMode.DIAGNOSTIC_DAY:87600}[ExperimentMode(self.mode)]
+        if self.timing_profile == "azure_exp901_sweden_acceptance_v1":
+            if (self.mode != ExperimentMode.ACCEPTANCE or self.selected_providers != [Provider.AZURE]
+                    or self.experiment_id != "EXP-901" or self.context != "failure_check"
+                    or self.scenario != Scenario.SAME_ZONE or self.config_sha256 is None
+                    or self.resolved_sha256 is None):
+                raise ValueError("Azure EXP-901 timing profile requires the exact Azure failure-check acceptance scope")
+            expected_cap = 1800
+        elif self.timing_profile is not None:
+            raise ValueError("unsupported timing profile")
         if self.lifetime_cap_seconds != expected_cap:
             raise ValueError("lifetime_cap_seconds must match reservation mode")
         if self.schedule_entry_id.value is not None and not re.fullmatch(IDENTIFIER_PATTERN, self.schedule_entry_id.value):
@@ -178,10 +201,35 @@ class ReservationRequest(StrictModel):
             raise ValueError("active reserved cost must be finite and nonnegative")
         return self
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        schema = handler(core_schema)
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"timing_profile": {"const": "azure_exp901_sweden_acceptance_v1"}},
+                   "required": ["timing_profile"]},
+            "then": {"properties": {"mode": {"const": "acceptance"}, "selected_providers": {"const": ["azure"]},
+                "experiment_id": {"const": "EXP-901"}, "context": {"const": "failure_check"},
+                "scenario": {"const": "same_zone"}, "lifetime_cap_seconds": {"const": 1800},
+                "config_sha256": {"type": "string", "pattern": SHA256_PATTERN},
+                "resolved_sha256": {"type": "string", "pattern": SHA256_PATTERN}},
+                "required": ["experiment_id", "context", "scenario", "config_sha256", "resolved_sha256"]}
+        })
+        for mode, cap in (("acceptance", 1200), ("short_study", 1200),
+                          ("calibration", 1800), ("diagnostic_day", 87600)):
+            condition = {"properties": {"mode": {"const": mode}}, "required": ["mode"]}
+            if mode == "acceptance":
+                condition["not"] = {"properties": {"timing_profile": {
+                    "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}
+            schema["allOf"].append({"if": condition,
+                "then": {"properties": {"lifetime_cap_seconds": {"const": cap}}}})
+        return schema
+
 
 class ReservationEvidence(StrictModel):
     schema_version: Literal[2]
     campaign_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
     reservation_id: Evidence[str]
     state: Literal["not_evaluated", "reserved", "rejected", "released"]
     reserved_cost_usd: Evidence[float]

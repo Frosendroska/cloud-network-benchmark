@@ -212,6 +212,33 @@ def test_operator_wait_cannot_extend_command_deadline(tmp_path,monkeypatch):
     assert not any("apply" in r.argv for r in runner.requests)
 
 
+def test_saved_apply_uses_fresh_provider_budget_after_review(tmp_path, monkeypatch):
+    def approve(directory, binding, deadline):
+        return {"decision":"approved","binding":binding,"reviewer":"fixture","inspection":"checked"}
+    monkeypatch.setattr(tp,"await_review",approve)
+    req,runner=request(tmp_path)
+    result=tp.reviewed_apply(req,runner.run,apply_timeout_seconds=20,before_apply=lambda:12.5)
+    assert result.outcome == "succeeded"
+    assert runner.requests[-1].timeout_seconds == pytest.approx(12.5)
+
+
+def test_saved_apply_rejects_missing_split_deadline_callback(tmp_path):
+    req,runner=request(tmp_path)
+    with pytest.raises(tp.PlanReviewError,match="both a stage ceiling"):
+        tp.reviewed_apply(req,runner.run,apply_timeout_seconds=20)
+    assert runner.requests == []
+
+
+def test_saved_apply_fails_closed_when_provider_budget_elapsed(tmp_path,monkeypatch):
+    def approve(directory, binding, deadline):
+        return {"decision":"approved","binding":binding,"reviewer":"fixture","inspection":"checked"}
+    monkeypatch.setattr(tp,"await_review",approve)
+    req,runner=request(tmp_path)
+    with pytest.raises(tp.PlanReviewError,match="positive remaining provider budget"):
+        tp.reviewed_apply(req,runner.run,apply_timeout_seconds=20,before_apply=lambda:0)
+    assert not any("apply" in call.argv for call in runner.requests)
+
+
 @pytest.mark.parametrize("provider,root",[("aws","safety"),("aws","pair"),("gcp","protection"),("gcp","pair")])
 def test_provider_dispatch_requires_review_but_destroy_remains_accessible(tmp_path,provider,root):
     req,runner=request(tmp_path,provider,root)

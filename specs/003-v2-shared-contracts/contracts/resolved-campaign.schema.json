@@ -84,6 +84,19 @@
         "requires_schedule": {
           "title": "Requires Schedule",
           "type": "boolean"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -1668,9 +1681,6 @@
             "properties": {
               "admission": {
                 "properties": {
-                  "lifetime_cap_seconds": {
-                    "const": 1200
-                  },
                   "priority": {
                     "const": "P0"
                   },
@@ -3897,6 +3907,167 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "timing_profile": {
+                      "const": "azure_exp901_sweden_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "timing_profile"
+                  ]
+                }
+              }
+            },
+            "properties": {
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            },
+            "required": [
+              "mode",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "timing_profile": {
+                    "const": "azure_exp901_sweden_acceptance_v1"
+                  }
+                },
+                "required": [
+                  "timing_profile"
+                ]
+              }
+            },
+            "required": [
+              "admission"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1800
+                  }
+                }
+              },
+              "context": {
+                "const": "failure_check"
+              },
+              "experiment_id": {
+                "const": "EXP-901"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "provider": {
+                "const": "azure"
+              },
+              "provider_config": {
+                "properties": {
+                  "placement": {
+                    "properties": {
+                      "kind": {
+                        "const": "none"
+                      }
+                    }
+                  },
+                  "regions": {
+                    "properties": {
+                      "vm_a": {
+                        "const": "swedencentral"
+                      },
+                      "vm_b": {
+                        "const": "swedencentral"
+                      }
+                    }
+                  },
+                  "vm_shape": {
+                    "const": "Standard_D4s_v5"
+                  },
+                  "zones": {
+                    "properties": {
+                      "vm_a": {
+                        "const": "1"
+                      },
+                      "vm_b": {
+                        "const": "1"
+                      }
+                    }
+                  }
+                }
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "timing_profile": {
+                      "const": "azure_exp901_sweden_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "timing_profile"
+                  ]
+                }
+              }
+            },
+            "properties": {
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            },
+            "required": [
+              "mode",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 1200
+                  }
+                }
+              }
+            }
+          }
         }
       ],
       "properties": {
@@ -4688,9 +4859,6 @@
         "properties": {
           "admission": {
             "properties": {
-              "lifetime_cap_seconds": {
-                "const": 1200
-              },
               "priority": {
                 "const": "P0"
               },
@@ -6914,6 +7082,193 @@
                 }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "admission": {
+              "properties": {
+                "timing_profile": {
+                  "const": "azure_exp901_sweden_acceptance_v1"
+                }
+              },
+              "required": [
+                "timing_profile"
+              ]
+            }
+          }
+        },
+        "properties": {
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1200
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "timing_profile": {
+                "const": "azure_exp901_sweden_acceptance_v1"
+              }
+            },
+            "required": [
+              "timing_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1800
+              }
+            }
+          },
+          "context": {
+            "const": "failure_check"
+          },
+          "experiment_id": {
+            "const": "EXP-901"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "observations": {
+            "items": {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "lifetime_cap_seconds": {
+                      "const": 1800
+                    },
+                    "timing_profile": {
+                      "const": "azure_exp901_sweden_acceptance_v1"
+                    }
+                  }
+                },
+                "provider": {
+                  "const": "azure"
+                },
+                "provider_config": {
+                  "properties": {
+                    "placement": {
+                      "properties": {
+                        "kind": {
+                          "const": "none"
+                        }
+                      }
+                    },
+                    "regions": {
+                      "properties": {
+                        "vm_a": {
+                          "const": "swedencentral"
+                        },
+                        "vm_b": {
+                          "const": "swedencentral"
+                        }
+                      }
+                    },
+                    "vm_shape": {
+                      "const": "Standard_D4s_v5"
+                    },
+                    "zones": {
+                      "properties": {
+                        "vm_a": {
+                          "const": "1"
+                        },
+                        "vm_b": {
+                          "const": "1"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "required": [
+                "admission",
+                "provider",
+                "provider_config"
+              ]
+            }
+          },
+          "scenario": {
+            "const": "same_zone"
+          },
+          "selected_providers": {
+            "const": [
+              "azure"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "admission": {
+              "properties": {
+                "timing_profile": {
+                  "const": "azure_exp901_sweden_acceptance_v1"
+                }
+              },
+              "required": [
+                "timing_profile"
+              ]
+            }
+          }
+        },
+        "properties": {
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1200
+              }
+            }
           }
         }
       }

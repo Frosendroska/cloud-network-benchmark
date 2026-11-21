@@ -84,6 +84,19 @@
         "requires_schedule": {
           "title": "Requires Schedule",
           "type": "boolean"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -962,6 +975,19 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "timing_profile": {
+          "anyOf": [
+            {
+              "const": "azure_exp901_sweden_acceptance_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timing Profile"
         }
       },
       "required": [
@@ -1143,6 +1169,109 @@
             "type": "object"
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "timing_profile": {
+                "const": "azure_exp901_sweden_acceptance_v1"
+              }
+            },
+            "required": [
+              "timing_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 1800
+              }
+            }
+          },
+          "context": {
+            "const": "failure_check"
+          },
+          "experiment_id": {
+            "const": "EXP-901"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "placement": {
+            "properties": {
+              "kind": {
+                "const": "none"
+              }
+            }
+          },
+          "provider": {
+            "const": "azure"
+          },
+          "reservation": {
+            "properties": {
+              "value": {
+                "properties": {
+                  "timing_profile": {
+                    "const": "azure_exp901_sweden_acceptance_v1"
+                  }
+                },
+                "required": [
+                  "timing_profile"
+                ]
+              }
+            }
+          },
+          "scenario": {
+            "const": "same_zone"
+          },
+          "vm_a": {
+            "properties": {
+              "region": {
+                "const": "swedencentral"
+              },
+              "vm_shape": {
+                "const": "Standard_D4s_v5"
+              },
+              "zone": {
+                "const": "1"
+              }
+            }
+          },
+          "vm_b": {
+            "properties": {
+              "region": {
+                "const": "swedencentral"
+              },
+              "vm_shape": {
+                "const": "Standard_D4s_v5"
+              },
+              "zone": {
+                "const": "1"
+              }
+            }
+          }
+        },
+        "required": [
+          "experiment_id",
+          "provider",
+          "mode",
+          "context",
+          "scenario",
+          "vm_a",
+          "vm_b",
+          "placement",
+          "admission"
+        ]
       }
     }
   ],

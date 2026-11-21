@@ -90,6 +90,43 @@ class CleanupClock:
     def utc_now() -> datetime: return datetime.now(timezone.utc)
 
 
+def _saved_azure_timing(record: Any, saved: SavedProviderCleanupSettings) -> tuple[str | None, str | None]:
+    if saved.provider != Provider.AZURE or saved.deployment.admission.timing_profile is None:
+        return None, None
+    from . import azure_provider
+    try:
+        raw_path = saved.settings.get("cleanup_timing_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("profile timing-state path is missing")
+        path = Path(raw_path)
+        if path.is_symlink() or not path.is_file() or any(parent.is_symlink() for parent in path.parents):
+            raise ValueError("profile timing state is missing or unsafe")
+        if path.stat().st_mode & 0o077:
+            raise PermissionError("profile timing state is not private")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(state, dict) or state.get("sha256") != azure_provider._profile_timing_digest(state)
+                or state.get("run_id") != saved.deployment.run_id
+                or state.get("deployment_id") != saved.deployment.deployment_id
+                or state.get("reservation_id") != saved.reservation.reservation_id.value
+                or state.get("config_sha256") != saved.deployment.config_sha256):
+            raise ValueError("profile timing state is corrupt or belongs to another attempt")
+        if state.get("clock_identity") != azure_provider._clock_identity():
+            return "unknown", "cleanup resumed on a different monotonic clock epoch"
+        if (time.monotonic() < float(state.get("last_monotonic", 0))
+                or datetime.now(timezone.utc) < datetime.fromisoformat(state.get("last_utc", "1970-01-01T00:00:00+00:00"))):
+            return "unknown", "cleanup clock moved backwards since its last durable observation"
+        status = state.get("timing_status")
+        if status not in {"within_deadline", "late", "unknown"}:
+            return "unknown", "profile timing status is missing or unsupported"
+        failure = state.get("timing_failure")
+        if record.cleanup_timing_status in {"late", "unknown"}:
+            status = record.cleanup_timing_status
+            failure = failure or record.cleanup_timing_failure
+        return status, failure
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        return "unknown", f"profile timing state is unavailable ({type(exc).__name__})"
+
+
 def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     deployment = saved.deployment
     if saved.provider == Provider.AWS:

@@ -363,6 +363,20 @@ class CampaignConfiguration(StrictModel):
     admission: AdmissionRequirements
     replacement_context: Optional[ReplacementContext] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def exact_profile_input_types(cls, value):
+        if isinstance(value, dict):
+            admission = value.get("admission") or {}
+            if isinstance(admission, dict) and admission.get("timing_profile") == "azure_exp901_sweden_acceptance_v1":
+                azure = (value.get("provider_configs") or {}).get("azure") or {}
+                regions, zones = azure.get("regions") or {}, azure.get("zones") or {}
+                if (regions.get("vm_a") != "swedencentral" or regions.get("vm_b") != "swedencentral"
+                        or type(zones.get("vm_a")) is not str or zones.get("vm_a") != "1"
+                        or type(zones.get("vm_b")) is not str or zones.get("vm_b") != "1"):
+                    raise ValueError("timing profile region and zone inputs must use canonical string values")
+        return value
+
     @field_validator("scheduled_start")
     @classmethod
     def timezone_required(cls, value: Optional[datetime]) -> Optional[datetime]:
@@ -388,7 +402,20 @@ class CampaignConfiguration(StrictModel):
         all_clouds = providers == {Provider.AWS, Provider.AZURE, Provider.GCP}
         _validate_protocol_scope(mode, self.context, self.replacement_context, providers, self.scenario,
                                  complete_campaign=True)
-        admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario))
+        profile = self.admission.timing_profile
+        admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario), profile)
+        if profile == "azure_exp901_sweden_acceptance_v1":
+            azure = self.provider_configs.get(Provider.AZURE)
+            if (self.experiment_id != "EXP-901" or mode != ExperimentMode.ACCEPTANCE
+                    or self.context != "failure_check" or providers != {Provider.AZURE}
+                    or Scenario(self.scenario) != Scenario.SAME_ZONE or azure is None
+                    or azure.vm_shape != "Standard_D4s_v5"
+                    or azure.regions.vm_a != "swedencentral" or azure.regions.vm_b != "swedencentral"
+                    or str(azure.zones.vm_a) != "1" or str(azure.zones.vm_b) != "1"
+                    or azure.placement.kind != "none"):
+                raise ValueError("Azure EXP-901 timing profile requires the exact reviewed Sweden Central zone 1 acceptance scope")
+        elif profile is not None:
+            raise ValueError("unsupported timing profile")
         for name, expected in admission_expected.items():
             if getattr(self.admission, name) != expected:
                 raise ValueError(f"admission.{name} does not match mode/scenario")
@@ -472,6 +499,33 @@ class CampaignConfiguration(StrictModel):
             for mode, values in mode_specs.items()
         ]
         _add_protocol_scope_schema(schema)
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"admission": {"properties": {
+                "timing_profile": {"const": "azure_exp901_sweden_acceptance_v1"}},
+                "required": ["timing_profile"]}}, "required": ["admission"]},
+            "then": {
+                "properties": {
+                    "experiment_id": {"const": "EXP-901"}, "mode": {"const": "acceptance"},
+                    "context": {"const": "failure_check"}, "scenario": {"const": "same_zone"},
+                    "selected_providers": {"const": ["azure"]},
+                    "admission": {"properties": {"lifetime_cap_seconds": {"const": 1800}}},
+                    "provider_configs": {"properties": {"azure": {"properties": {
+                        "vm_shape": {"const": "Standard_D4s_v5"},
+                        "regions": {"properties": {"vm_a": {"const": "swedencentral"}, "vm_b": {"const": "swedencentral"}}},
+                        "zones": {"properties": {"vm_a": {"const": "1"}, "vm_b": {"const": "1"}}},
+                        "placement": {"properties": {"kind": {"const": "none"}}}},
+                        "required": ["vm_shape", "regions", "zones", "placement"]}}, "required": ["azure"]}
+                },
+                "required": ["experiment_id", "mode", "context", "scenario", "selected_providers", "admission", "provider_configs"]
+            }
+        })
+        schema.setdefault("allOf", []).append({
+            "if": {"properties": {"mode": {"const": "acceptance"}, "scenario": {"const": "same_zone"}},
+                "required": ["mode", "scenario"],
+                "not": {"properties": {"admission": {"properties": {"timing_profile": {
+                    "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}}}},
+            "then": {"properties": {"admission": {"properties": {"lifetime_cap_seconds": {"const": 1200}}}}}
+        })
         return schema
 
 
@@ -541,6 +595,12 @@ class ResolvedObservation(StrictModel):
             scheduled_start=self.scheduled_start, schedule_entry=self.schedule_entry.value,
             benchmark=self.benchmark, measurement_units=self.measurement_units, admission=self.admission,
         )
+        if self.admission.timing_profile:
+            pc = self.provider_config
+            if (Provider(self.provider) != Provider.AZURE or pc.vm_shape != "Standard_D4s_v5"
+                    or pc.regions.vm_a != "swedencentral" or pc.regions.vm_b != "swedencentral"
+                    or pc.zones.vm_a != "1" or pc.zones.vm_b != "1" or pc.placement.kind != "none"):
+                raise ValueError("resolved timing profile is not bound to the reviewed Azure pair")
         expected_layout = ArtifactLayout.for_mode(self.mode, self.measurement_units)
         if self.artifact_layout.mode is None:
             object.__setattr__(self, "artifact_layout", expected_layout)
@@ -597,6 +657,12 @@ class ResolvedCampaign(StrictModel):
                 self.config_id, self.experiment_id, self.mode, self.context, self.replacement_context, self.scenario, self.scheduled_start,
                 self.schedule_entry, self.measurement_units, self.admission, self.benchmark, self.options):
                 raise ValueError("observation shared intent must match campaign")
+            if self.admission.timing_profile:
+                pc = item.provider_config
+                if (pc.vm_shape != "Standard_D4s_v5" or pc.regions.vm_a != "swedencentral"
+                        or pc.regions.vm_b != "swedencentral" or pc.zones.vm_a != "1"
+                        or pc.zones.vm_b != "1" or pc.placement.kind != "none"):
+                    raise ValueError("resolved timing profile is not bound to the reviewed Azure pair")
         return self
 
     @classmethod
@@ -727,13 +793,22 @@ def _validate_resolved_protocol(
 ) -> None:
     normalized_mode = ExperimentMode(mode)
     normalized_context = str(getattr(context, "value", context))
+    profile = admission.timing_profile
+    if profile == "azure_exp901_sweden_acceptance_v1":
+        if (experiment_id != "EXP-901" or normalized_mode != ExperimentMode.ACCEPTANCE
+                or normalized_context != "failure_check" or set(map(Provider, provider_set)) != {Provider.AZURE}
+                or Scenario(scenario) != Scenario.SAME_ZONE
+                or (observation_provider is not None and Provider(observation_provider) != Provider.AZURE)):
+            raise ValueError("resolved Azure EXP-901 timing profile identity mismatch")
+    elif profile is not None:
+        raise ValueError("unsupported timing profile")
     benchmark.validate_mode(normalized_mode)
     _validate_protocol_scope(normalized_mode, context, replacement_context, provider_set, scenario,
                              observation_provider=observation_provider,
                              complete_campaign=observation_provider is None)
     if measurement_units != derive_measurement_units(normalized_mode, benchmark):
         raise ValueError("resolved measurement units must be derived from benchmark mode and N state")
-    for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario).items():
+    for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario, profile).items():
         if getattr(admission, name) != expected:
             raise ValueError(f"resolved identity admission.{name} must match mode and scenario")
     if scheduled_start is not None and (scheduled_start.tzinfo is None or scheduled_start.utcoffset() is None):
@@ -836,7 +911,8 @@ def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
             scheduled = mode in {"short_study", "calibration", "diagnostic_day"}
             admission_values = {
                 "priority": priority,
-                "lifetime_cap_seconds": 1200 if mode in {"acceptance", "short_study"} else 1800 if mode == "calibration" else 87600,
+                **({} if mode == "acceptance" and scenario == "same_zone" else {
+                    "lifetime_cap_seconds": 1200 if mode in {"acceptance", "short_study"} else 1800 if mode == "calibration" else 87600}),
                 "requires_common_n": mode in {"short_study", "diagnostic_day"},
                 "requires_schedule": scheduled,
                 "requires_primary_review": scheduled and priority in {"P2", "P3"},
@@ -880,7 +956,56 @@ def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
                     ] + [{"properties": {"streams": {"const": common_n}}}]}}},
                 }
                 schema_constraints.append(stream_constraint)
+    schema_constraints.append({
+        "if": {"properties": {"mode": {"const": "acceptance"}, "scenario": {"const": "same_zone"}},
+               "required": ["mode", "scenario"],
+               "not": {"properties": {"admission": {"properties": {"timing_profile": {
+                   "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}}}},
+        "then": {"properties": {"admission": {"properties": {"lifetime_cap_seconds": {"const": 1200}}}}}
+    })
     schema.setdefault("allOf", []).extend(schema_constraints)
+    profile_then = {"properties": {
+        "experiment_id": {"const": "EXP-901"}, "mode": {"const": "acceptance"},
+        "context": {"const": "failure_check"}, "scenario": {"const": "same_zone"},
+        "admission": {"properties": {"lifetime_cap_seconds": {"const": 1800}}}
+    }}
+    if "provider" in schema.get("properties", {}):
+        profile_then["properties"]["provider"] = {"const": "azure"}
+        profile_then["properties"]["provider_config"] = {"properties": {
+            "vm_shape": {"const": "Standard_D4s_v5"},
+            "regions": {"properties": {"vm_a": {"const": "swedencentral"}, "vm_b": {"const": "swedencentral"}}},
+            "zones": {"properties": {"vm_a": {"const": "1"}, "vm_b": {"const": "1"}}},
+            "placement": {"properties": {"kind": {"const": "none"}}}
+        }}
+    else:
+        profile_then["properties"]["selected_providers"] = {"const": ["azure"]}
+        profile_then["properties"]["observations"] = {
+            "items": {
+                "properties": {
+                    "admission": {"properties": {"timing_profile": {"const": "azure_exp901_sweden_acceptance_v1"},
+                                                     "lifetime_cap_seconds": {"const": 1800}}},
+                    "provider": {"const": "azure"},
+                    "provider_config": {"properties": {
+                        "vm_shape": {"const": "Standard_D4s_v5"},
+                        "regions": {"properties": {"vm_a": {"const": "swedencentral"}, "vm_b": {"const": "swedencentral"}}},
+                        "zones": {"properties": {"vm_a": {"const": "1"}, "vm_b": {"const": "1"}}},
+                        "placement": {"properties": {"kind": {"const": "none"}}}
+                    }},
+                },
+                "required": ["admission", "provider", "provider_config"],
+            }
+        }
+    schema_constraints.extend([
+        {"if": {"properties": {"admission": {"properties": {"timing_profile": {
+            "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}},
+            "required": ["admission"]}, "then": profile_then},
+        {"if": {"properties": {"mode": {"const": "acceptance"}, "scenario": {"const": "same_zone"}},
+            "required": ["mode", "scenario"],
+            "not": {"properties": {"admission": {"properties": {"timing_profile": {
+                "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}}}},
+         "then": {"properties": {"admission": {"properties": {"lifetime_cap_seconds": {"const": 1200}}}}}}
+    ])
+    schema.setdefault("allOf", []).extend(schema_constraints[-2:])
     return schema
 
 

@@ -5,6 +5,7 @@ All external operations are argv-based and injected. Importing this module is of
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import ipaddress
 import json
 import os
@@ -16,6 +17,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import date
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -32,6 +34,16 @@ from .contracts.deployment import (ProviderDeploymentInput, ProviderDeploymentOu
 from .contracts.execution import CommandRequest, CommandResult, CommandRunner
 
 UTC = timezone.utc
+
+
+def _is_uuid_segment(value: str) -> bool:
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except (ValueError, AttributeError):
+        return False
+_EXPLICIT_UTC_NOW: ContextVar[Callable[[], datetime] | None] = ContextVar("azure_explicit_utc_now", default=None)
+_EXPLICIT_TIMING_IDENTITY: ContextVar[dict[str, str] | None] = ContextVar("azure_explicit_timing_identity", default=None)
+_TIMING_OBSERVATION_FAILURE: ContextVar[str | None] = ContextVar("azure_timing_observation_failure", default=None)
 AUTOMATION_API = "2024-10-23"
 COMPUTE_API = "2025-04-01"
 ROLE_ACTIONS = ["Microsoft.Compute/virtualMachines/read",
@@ -57,6 +69,12 @@ class AzureRuntimeOptions(StrictModel):
     command_timeout_seconds: float = Field(gt=0)
     expiry_cost_input: dict[str, Any]
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
+    cleanup_timing_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
+    cleanup_timing_active: bool = Field(default=False, exclude_if=lambda value: value is False)
+    cleanup_timing_phase: Optional[Literal["routine", "absence", "emergency"]] = Field(default=None, exclude_if=lambda value: value is None)
+    profile_allowance: Optional[dict[str, float]] = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("subscription_id", "tenant_id")
     @classmethod
@@ -107,6 +125,12 @@ class AzureRuntimeOptions(StrictModel):
         if not self.authentication_reference.strip() or not self.ssh_public_key.strip():
             raise ValueError("private authentication reference and public key are required")
         _key_material(self.ssh_public_key)
+        if self.timing_profile and (self.cleanup_timing_path is None or not self.cleanup_timing_path.is_absolute()):
+            raise ValueError("profile cleanup requires an absolute external timing-state path")
+        if self.timing_profile and self.cleanup_timing_path.is_relative_to(self.attempt_root):
+            raise ValueError("profile cleanup timing state must survive provider attempt-root deletion")
+        if self.timing_profile and self.command_timeout_seconds > 180:
+            raise ValueError("profile Azure commands are capped at 180 seconds")
         if not self.admission_evidence.get("priority_review_reference") and self.admission_evidence.get("priority") in {"P2", "P3"}:
             raise ValueError("P2/P3 requires explicit priority review evidence")
         if self.admission_evidence.get("outstanding_cleanup") is not False:
@@ -166,6 +190,9 @@ class AzureCleanupResult(StrictModel):
     failures: list[FailureEvidence] = Field(default_factory=list)
     resources: list[dict[str, Any]] = Field(default_factory=list)
     launch_blocked: bool
+    timing_status: Optional[Literal["within_deadline", "late", "unknown"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
+    timing_failure: Optional[FailureEvidence] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def _slug(d: ProviderDeploymentInput) -> str:
@@ -208,15 +235,32 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         raise ValueError("matching active reservation evidence is required")
     if reservation.campaign_id != d.campaign_id or reservation.expires_at.value is None or reservation.cap_started_at.value is None:
         raise ValueError("reservation identity and cap evidence must be complete")
-    mode_cap=int(AdmissionRequirements.expected_for(d.mode,d.scenario)["lifetime_cap_seconds"])
+    profile=d.admission.timing_profile
+    if profile != o.timing_profile:
+        raise ValueError("Azure runtime timing profile differs from source-bound deployment")
+    if d.reservation.value.timing_profile != profile:
+        raise ValueError("Azure reservation timing profile differs from deployment")
+    mode_cap=int(AdmissionRequirements.expected_for(d.mode,d.scenario,profile)["lifetime_cap_seconds"])
     if d.admission.lifetime_cap_seconds != mode_cap:
         raise ValueError("admitted lifetime cap does not match the selected mode")
+    if profile:
+        from .admission import AZURE_EXP901_ALLOWANCE, AZURE_EXP901_PROVIDER_LEAD_SECONDS
+        expected_allowance = {**AZURE_EXP901_ALLOWANCE,
+            "azure_provider_lead_seconds": AZURE_EXP901_PROVIDER_LEAD_SECONDS}
+        if o.profile_allowance != expected_allowance:
+            raise ValueError("Azure EXP-901 profile requires the exact registered workflow allowance vector")
+        if (o.complete_workflow_seconds != 1480 or o.post_registration_workflow_seconds != 1300
+                or o.command_timeout_seconds > 180
+                or (d.cleanup_timeout_seconds or 300) > 300):
+            raise ValueError("Azure EXP-901 profile workflow or command allowance differs from the reviewed envelope")
     mode_measurement_seconds={"acceptance":30,"short_study":180,"calibration":720,"diagnostic_day":86400}[ExperimentMode(d.mode).value]
     if (o.complete_workflow_seconds < mode_measurement_seconds or o.post_registration_workflow_seconds < mode_measurement_seconds
             or o.complete_workflow_seconds > mode_cap or o.post_registration_workflow_seconds > mode_cap):
         raise ValueError("workflow bounds do not cover the selected mode or exceed its lifetime ceiling")
     if now < reservation.cap_started_at.value or reservation.expires_at.value-reservation.cap_started_at.value > timedelta(seconds=mode_cap):
         raise ValueError("reservation chronology or original mode lifetime ceiling is invalid")
+    if profile and reservation.expires_at.value-reservation.cap_started_at.value != timedelta(seconds=1800):
+        raise ValueError("Azure EXP-901 profile requires the exact original 1800-second reservation cap")
     if o.admission_evidence.get("reservation_id") != reservation.reservation_id.value or o.admission_evidence.get("source_sha256") != reservation.source_sha256:
         raise ValueError("admission snapshot must bind this reservation and its source hash")
     expiry_cost_bound = float(o.expiry_cost_input["automation_rate_per_job_minute"]) * float(o.expiry_cost_input["job_minutes_bound"])
@@ -273,6 +317,369 @@ def _atomic_private(path: Path, value: dict[str, Any]) -> None:
         os.chmod(path, 0o600)
     finally:
         if os.path.exists(name): os.unlink(name)
+
+
+def _clock_identity() -> str:
+    """Identify the OS monotonic-clock epoch so a reboot cannot renew cleanup time."""
+    import platform
+    boot_id = Path("/proc/sys/kernel/random/boot_id")
+    if boot_id.is_file():
+        epoch = boot_id.read_text(encoding="ascii").strip()
+    else:
+        # On platforms without a kernel boot UUID, bind to the host and its
+        # wall-minus-monotonic boot epoch. A clock step is handled separately
+        # as a sticky timing failure.
+        epoch = str(round(time.time() - time.monotonic()))
+    return hashlib.sha256(f"{platform.system()}\0{platform.node()}\0{epoch}".encode()).hexdigest()
+
+
+def _profile_timing_digest(value: dict[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "sha256"}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _profile_timing_identity(deployment: ProviderDeploymentInput) -> dict[str,str]:
+    return {"profile":deployment.admission.timing_profile or "",
+        "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,
+        "reservation_id":deployment.reservation.value.reservation_id.value or "",
+        "config_sha256":deployment.config_sha256}
+
+
+def _utc_from_clock(clock: Callable[[], float]) -> Callable[[], datetime]:
+    owner = getattr(clock, "__self__", None)
+    candidate = getattr(owner, "utc_now", None)
+    explicit = _EXPLICIT_UTC_NOW.get()
+    return candidate if callable(candidate) else explicit if explicit is not None else lambda: datetime.now(UTC)
+
+
+def _profile_timing_mutate(options: AzureRuntimeOptions, update: Callable[[dict[str, Any]], dict[str, Any]], *,
+                           create: bool = False, expected_identity: dict[str,str] | None = None) -> dict[str, Any]:
+    path = options.cleanup_timing_path
+    if path is None or not path.is_absolute() or path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise ValueError("external Azure cleanup timing state path is missing or unsafe")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600); fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise ValueError("external Azure cleanup timing state cannot be a symlink")
+        if path.exists():
+            if path.stat().st_mode & 0o077:
+                raise PermissionError("external Azure cleanup timing state must remain private")
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(current, dict) or current.get("schema_version") != 1
+                    or current.get("sha256") != _profile_timing_digest(current)):
+                raise ValueError("external Azure cleanup timing state is corrupt")
+        elif create:
+            current = {}
+        else:
+            raise FileNotFoundError("original Azure cleanup timing anchor is unavailable")
+        if expected_identity and any(current.get(key)!=value for key,value in expected_identity.items()):
+            raise ValueError("external Azure cleanup timing state belongs to another attempt")
+        updated = update(dict(current))
+        updated["sha256"] = _profile_timing_digest(updated)
+        _atomic_private(path, updated)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return updated
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN); os.close(lock_fd)
+
+
+def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                               *, clock: Callable[[], float], utc_now: Callable[[], datetime]) -> None:
+    if deployment.admission.timing_profile != "azure_exp901_sweden_acceptance_v1":
+        return
+    mono = float(clock()); wall = utc_now().astimezone(UTC)
+    if (options.cleanup_timing_path is not None and not options.cleanup_timing_path.exists()
+            and (options.attempt_root / "recovery.json").exists()):
+        raise ValueError("missing profile timing anchor cannot be recreated after provider recovery state exists")
+    reservation = deployment.reservation.value
+    body = {"schema_version": 1, "profile": deployment.admission.timing_profile,
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "reservation_id": reservation.reservation_id.value,
+        "config_sha256": deployment.config_sha256,
+        "clock_identity": _clock_identity(), "origin_monotonic": mono,
+        "origin_utc": wall.isoformat(), "last_monotonic": mono, "last_utc": wall.isoformat(),
+        "cap_deadline_monotonic": options.cap_deadline_monotonic,
+        "cap_started_at": reservation.cap_started_at.value.isoformat(),
+        "cap_expires_at": reservation.expires_at.value.isoformat(),
+        "provider_stop_at": None, "first_cleanup_monotonic": None,
+        "first_cleanup_at": None, "routine_deadline_monotonic": None,
+        "absence_deadline_monotonic": None, "routine_deadline_utc": None,
+        "absence_deadline_utc": None, "fresh_absence_deadline_utc": None,
+        "cleanup_invocations": 0,
+        "fresh_absence_deadline_monotonic": None,
+        "timing_status": "within_deadline", "timing_failure": None,
+        "absence_verified_at": None}
+    def initialize(current):
+        if not current:
+            return body
+        if any(current.get(key) != body[key] for key in ("profile", "run_id", "deployment_id", "reservation_id", "config_sha256",
+                "clock_identity", "cap_deadline_monotonic", "cap_started_at", "cap_expires_at")):
+            raise ValueError("existing Azure cleanup clock anchor differs from the original source-bound attempt")
+        return current
+    _profile_timing_mutate(options, initialize, create=True)
+
+
+def _bind_profile_stop(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                       stop_at: datetime) -> None:
+    if deployment.admission.timing_profile != "azure_exp901_sweden_acceptance_v1":
+        return
+    stop = stop_at.astimezone(UTC)
+    def bind(state):
+        if (state.get("run_id") != deployment.run_id or state.get("deployment_id") != deployment.deployment_id
+                or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
+                or state.get("config_sha256") != deployment.config_sha256):
+            raise ValueError("Azure cleanup timing anchor identity differs from registered deployment")
+        existing = state.get("provider_stop_at")
+        if existing is not None and existing != stop.isoformat():
+            raise ValueError("Azure registered STOP changed after its timing anchor was saved")
+        if stop <= datetime.fromisoformat(state["origin_utc"]) or stop > datetime.fromisoformat(state["cap_expires_at"]):
+            raise ValueError("actual registered STOP is outside the original cap chronology")
+        state["provider_stop_at"] = stop.isoformat()
+        return state
+    _profile_timing_mutate(options, bind,expected_identity=_profile_timing_identity(deployment))
+
+
+def _require_profile_timing_anchor(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                                   *, require_stop: bool) -> dict[str, Any] | None:
+    if deployment.admission.timing_profile is None:
+        return None
+    def check(state):
+        if (state.get("profile") != deployment.admission.timing_profile
+                or state.get("run_id") != deployment.run_id
+                or state.get("deployment_id") != deployment.deployment_id
+                or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
+                or state.get("config_sha256") != deployment.config_sha256):
+            raise ValueError("Azure cleanup timing anchor identity mismatch")
+        if require_stop and state.get("provider_stop_at") != deployment.expiry.value.expires_at.value.isoformat():
+            raise ValueError("actual registered STOP is absent from the original cleanup timing anchor")
+        return state
+    return _profile_timing_mutate(options, check,expected_identity=_profile_timing_identity(deployment))
+
+
+def _observe_profile_cleanup_clock(options: AzureRuntimeOptions, *, clock: Callable[[], float],
+                                   utc_now: Callable[[], datetime], phase: str = "routine") -> dict[str, Any] | None:
+    if options.timing_profile is None:
+        return None
+    mono = float(clock()); wall = utc_now().astimezone(UTC)
+    def observe(state):
+        if state.get("first_cleanup_monotonic") is None:
+            return state
+        if state.get("clock_identity") != _clock_identity():
+            state["timing_status"] = "unknown"
+            state["timing_failure"] = state.get("timing_failure") or "cleanup resumed on a different monotonic clock epoch"
+        previous_mono = float(state.get("last_monotonic", mono))
+        previous_wall = datetime.fromisoformat(state.get("last_utc", wall.isoformat()))
+        if mono < previous_mono or wall < previous_wall:
+            state["timing_status"] = "unknown"
+            state["timing_failure"] = state.get("timing_failure") or "cleanup clock moved backwards"
+        bound = state.get("fresh_absence_deadline_monotonic") if phase == "absence" else state.get("routine_deadline_monotonic")
+        utc_bound = (state.get("fresh_absence_deadline_utc") or state.get("absence_deadline_utc")
+            if phase == "absence" else state.get("routine_deadline_utc"))
+        utc_elapsed = utc_bound is None or wall >= datetime.fromisoformat(utc_bound)
+        if ((bound is not None and mono >= float(bound)) or utc_elapsed) and state.get("timing_status") == "within_deadline":
+            state["timing_status"] = "late"
+            state["timing_failure"] = state.get("timing_failure") or f"profile {phase} UTC or monotonic deadline elapsed"
+        state["last_monotonic"] = max(previous_mono, mono)
+        if wall >= previous_wall:
+            state["last_utc"] = wall.isoformat()
+        return state
+    try:
+        return _profile_timing_mutate(options, observe,expected_identity=_EXPLICIT_TIMING_IDENTITY.get())
+    except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+        _TIMING_OBSERVATION_FAILURE.set(f"profile timing observation failed ({type(exc).__name__})")
+        return None
+
+
+def _begin_profile_cleanup(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, *,
+                           clock: Callable[[], float], utc_now: Callable[[], datetime],
+                           invocation_seconds: float) -> tuple[float, dict[str, Any] | None, str | None]:
+    now_mono = float(clock()); now_utc = utc_now().astimezone(UTC)
+    if deployment.admission.timing_profile is None:
+        return now_mono + max(1.0, invocation_seconds), None, None
+    fallback = now_mono + min(300.0, max(1.0, invocation_seconds))
+    try:
+        def begin(state):
+            if (state.get("profile") != deployment.admission.timing_profile
+                    or state.get("run_id") != deployment.run_id
+                    or state.get("deployment_id") != deployment.deployment_id
+                    or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
+                    or state.get("config_sha256") != deployment.config_sha256):
+                raise ValueError("profile cleanup timing anchor identity mismatch")
+            failure = state.get("timing_failure")
+            status = state.get("timing_status", "unknown")
+            if state.get("clock_identity") != _clock_identity():
+                status, failure = "unknown", failure or "cleanup clock identity is unrecognized"
+            missing_stop = state.get("provider_stop_at") is None
+            if missing_stop:
+                status, failure = "unknown", failure or "actual registered STOP timing anchor is missing"
+            if (state.get("first_cleanup_monotonic") is None
+                    and state.get("missing_stop_cleanup_observed_monotonic") is None):
+                cap_mono = float(state["cap_deadline_monotonic"])
+                cap_utc = datetime.fromisoformat(state["cap_expires_at"])
+                if missing_stop:
+                    # Continue bounded owned cleanup using only the original cap. This does not
+                    # invent a STOP or restore acceptance timing status.
+                    routine_mono = min(now_mono + 600.0, cap_mono - 60.0)
+                    absence_mono = min(now_mono + 660.0, cap_mono)
+                    routine_utc = min(now_utc + timedelta(seconds=600), cap_utc - timedelta(seconds=60))
+                    absence_utc = min(now_utc + timedelta(seconds=660), cap_utc)
+                else:
+                    stop = datetime.fromisoformat(state["provider_stop_at"])
+                    origin = datetime.fromisoformat(state["origin_utc"])
+                    stop_mono = float(state["origin_monotonic"]) + (stop - origin).total_seconds()
+                    routine_mono = min(now_mono + 600.0, stop_mono - 60.0, cap_mono - 60.0)
+                    absence_mono = min(now_mono + 660.0, stop_mono, cap_mono)
+                    routine_utc = min(now_utc + timedelta(seconds=600), stop - timedelta(seconds=60),
+                        cap_utc - timedelta(seconds=60))
+                    absence_utc = min(now_utc + timedelta(seconds=660), stop, cap_utc)
+                if missing_stop:
+                    state.update(missing_stop_cleanup_observed_monotonic=now_mono,
+                        missing_stop_cleanup_observed_at=now_utc.isoformat())
+                else:
+                    state.update(first_cleanup_monotonic=now_mono, first_cleanup_at=now_utc.isoformat())
+                state.update(routine_deadline_monotonic=routine_mono, absence_deadline_monotonic=absence_mono,
+                    routine_deadline_utc=routine_utc.isoformat(), absence_deadline_utc=absence_utc.isoformat())
+            prior_mono = float(state.get("last_monotonic", now_mono))
+            prior_utc = datetime.fromisoformat(state.get("last_utc", now_utc.isoformat()))
+            if now_mono < prior_mono or now_utc < prior_utc:
+                status, failure = "unknown", failure or "cleanup clock moved backwards"
+            if state["cleanup_invocations"] >= 3:
+                status, failure = "late", failure or "supported cleanup and two recoveries were exhausted"
+            routine = state.get("routine_deadline_monotonic")
+            routine_utc = state.get("routine_deadline_utc")
+            absence = state.get("fresh_absence_deadline_monotonic")
+            absence_utc = state.get("fresh_absence_deadline_utc") or state.get("absence_deadline_utc")
+            in_absence_recovery = (state.get("absence_started_at") is not None and absence is not None
+                and absence_utc is not None and now_mono < float(absence)
+                and now_utc < datetime.fromisoformat(absence_utc))
+            if ((routine is None or now_mono >= float(routine) or routine_utc is None
+                    or now_utc >= datetime.fromisoformat(routine_utc)) and not in_absence_recovery):
+                status, failure = "late", failure or "shared routine cleanup deadline elapsed"
+            if missing_stop:
+                # Expiry of the bounded cleanup window cannot turn a missing
+                # registered STOP into a measured late/within-deadline result.
+                status = "unknown"
+                failure = failure or "actual registered STOP timing anchor is missing"
+            state["cleanup_invocations"] += 1
+            state["timing_status"] = status
+            state["timing_failure"] = failure
+            state["last_monotonic"] = max(prior_mono, now_mono)
+            if now_utc >= prior_utc:
+                state["last_utc"] = now_utc.isoformat()
+            return state
+        state = _profile_timing_mutate(options, begin,expected_identity=_profile_timing_identity(deployment))
+        routine = state.get("routine_deadline_monotonic")
+        absence = state.get("fresh_absence_deadline_monotonic")
+        absence_recovery = (state.get("absence_started_at") is not None and absence is not None
+            and now_mono < float(absence) and (state.get("fresh_absence_deadline_utc") is not None
+                and now_utc < datetime.fromisoformat(state["fresh_absence_deadline_utc"])))
+        within = state.get("timing_status") == "within_deadline" and (routine is not None or absence_recovery)
+        utc_bound = (state.get("fresh_absence_deadline_utc") or state.get("absence_deadline_utc")
+            if absence_recovery else state.get("routine_deadline_utc"))
+        utc_mapped = now_mono + max(0.0, (datetime.fromisoformat(utc_bound) - now_utc).total_seconds()) if utc_bound else now_mono
+        deadline = min(fallback, float(absence if absence_recovery else routine), utc_mapped) if within else fallback
+        return deadline, state, None if within else str(state.get("timing_failure") or "cleanup timing is unknown")
+    except (OSError, ValueError, PermissionError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return fallback, None, f"cleanup timing anchor unavailable ({type(exc).__name__})"
+
+
+def _finish_profile_timing(options: AzureRuntimeOptions, *, clock: Callable[[], float],
+                           utc_now: Callable[[], datetime], absence_verified: bool) -> dict[str, Any] | None:
+    if options.timing_profile is None:
+        return None
+    mono = float(clock()); wall = utc_now().astimezone(UTC)
+    def finish(state):
+        in_absence_phase = absence_verified or state.get("absence_started_at") is not None
+        bound = (state.get("fresh_absence_deadline_monotonic") or state.get("absence_deadline_monotonic")
+            if in_absence_phase else state.get("routine_deadline_monotonic"))
+        utc_bound = (state.get("fresh_absence_deadline_utc") or state.get("absence_deadline_utc")
+            if in_absence_phase else state.get("routine_deadline_utc"))
+        if ((bound is not None and mono >= float(bound)) or utc_bound is None
+                or wall >= datetime.fromisoformat(utc_bound)) and state.get("timing_status") == "within_deadline":
+            state["timing_status"] = "late"
+            state["timing_failure"] = f"profile {'absence' if in_absence_phase else 'routine cleanup'} deadline elapsed"
+        previous_mono = float(state.get("last_monotonic", mono))
+        previous_wall = datetime.fromisoformat(state.get("last_utc", wall.isoformat()))
+        if mono < previous_mono or wall < previous_wall:
+            state["timing_status"] = "unknown"
+            state["timing_failure"] = state.get("timing_failure") or "cleanup clock moved backwards"
+        state["last_monotonic"] = max(previous_mono, mono)
+        if wall >= previous_wall:
+            state["last_utc"] = wall.isoformat()
+        if absence_verified:
+            state["absence_verified_at"] = wall.isoformat()
+        return state
+    try:
+        state = _profile_timing_mutate(options, finish,expected_identity=_EXPLICIT_TIMING_IDENTITY.get())
+        # Include the time spent writing and syncing the durable observation.
+        # Otherwise a slow fsync could persist a false within-deadline result.
+        persisted_mono = float(clock()); persisted_wall = utc_now().astimezone(UTC)
+        phase = "absence" if (absence_verified or state.get("absence_started_at") is not None) else "routine"
+        bound_key = ("fresh_absence_deadline_monotonic" if phase == "absence"
+            and state.get("fresh_absence_deadline_monotonic") is not None else
+            "absence_deadline_monotonic" if phase == "absence" else "routine_deadline_monotonic")
+        persisted_bound = state.get(bound_key)
+        previous_mono = float(state.get("last_monotonic", persisted_mono))
+        previous_wall = datetime.fromisoformat(state.get("last_utc", persisted_wall.isoformat()))
+        persisted_utc_bound = (state.get("fresh_absence_deadline_utc") or state.get("absence_deadline_utc")
+            if phase == "absence" else state.get("routine_deadline_utc"))
+        late = ((persisted_bound is not None and persisted_mono >= float(persisted_bound))
+            or persisted_utc_bound is None or persisted_wall >= datetime.fromisoformat(persisted_utc_bound))
+        backwards = persisted_mono < previous_mono or persisted_wall < previous_wall
+        if (late and state.get("timing_status") == "within_deadline") or backwards:
+            def mark_persistence_result(current):
+                if backwards:
+                    current["timing_status"] = "unknown"
+                    current["timing_failure"] = current.get("timing_failure") or "cleanup clock moved backwards during durable timing write"
+                elif current.get("timing_status") == "within_deadline":
+                    current["timing_status"] = "late"
+                    current["timing_failure"] = f"profile {phase} cleanup deadline elapsed during durable timing write"
+                current["last_monotonic"] = max(float(current.get("last_monotonic", persisted_mono)), persisted_mono)
+                current["last_utc"] = max(datetime.fromisoformat(current.get("last_utc", persisted_wall.isoformat())),
+                    persisted_wall).isoformat()
+                return current
+            state = _profile_timing_mutate(options, mark_persistence_result,
+                expected_identity=_EXPLICIT_TIMING_IDENTITY.get())
+        return state
+    except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+        _TIMING_OBSERVATION_FAILURE.set(f"profile timing finalization failed ({type(exc).__name__})")
+        return None
+
+
+def _mark_profile_absence_started(options: AzureRuntimeOptions, *, clock: Callable[[], float],
+                                  utc_now: Callable[[], datetime]) -> dict[str, Any] | None:
+    if options.timing_profile is None:
+        return None
+    mono = float(clock()); wall = utc_now().astimezone(UTC)
+    try:
+        def mark(state):
+            if state.get("absence_started_at") is None:
+                state["absence_started_at"]=wall.isoformat()
+                state["absence_started_monotonic"]=mono
+                state["fresh_absence_deadline_monotonic"]=min(
+                    mono+60.0,float(state.get("absence_deadline_monotonic",mono+60.0)))
+                absence_end=datetime.fromisoformat(state.get("absence_deadline_utc",wall.isoformat()))
+                state["fresh_absence_deadline_utc"]=min(wall+timedelta(seconds=60),absence_end).isoformat()
+            return state
+        return _profile_timing_mutate(options, mark,expected_identity=_EXPLICIT_TIMING_IDENTITY.get())
+    except (OSError, ValueError, PermissionError, json.JSONDecodeError) as exc:
+        _TIMING_OBSERVATION_FAILURE.set(f"profile absence timing anchor could not be saved ({type(exc).__name__})")
+        return None
+
+
+def _timing_failure(status: str | None, message: str | None, occurred_at: datetime) -> FailureEvidence | None:
+    if status in (None, "within_deadline") and not message:
+        return None
+    return FailureEvidence(category="azure_cleanup_timing", message=(message or f"cleanup timing status is {status}")[:1000],
+        occurred_at=occurred_at, details={"timing_status": status or "unknown", "acceptance_failed": True})
 
 
 def _persist_tfvars(root: Path, journal: Path, name: str, values: dict[str, Any]) -> Path:
@@ -408,12 +815,17 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
         "active_priority": "Regular", "network_limit_mbps": 12500}
 
 
-def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions) -> tuple[Path, Path, Path, Path]:
+def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, *,
+                     clock: Callable[[], float] = time.monotonic,
+                     utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+                     initialize_timing: bool = True) -> tuple[Path, Path, Path, Path]:
     """Save the original local cleanup identity/inputs before live preflight.
 
     This records prospective targets only. It makes no provider call or absence
     claim, and does not require an unexpired approval, quote or launch cap.
     """
+    if initialize_timing:
+        _initialize_profile_timing(deployment, options, clock=clock, utc_now=utc_now)
     pair_values = build_pair_inputs(deployment, options)
     root, journal = _workspace(options, deployment)
     pair_vars = _persist_tfvars(root, journal, "pair", pair_values)
@@ -435,6 +847,39 @@ def _is_exact_not_found(result: CommandResult) -> bool:
         return code in {"ResourceNotFound", "NotFound"}
     except (json.JSONDecodeError, AttributeError):
         return re.match(r"\s*(?:ERROR:\s*)?\(ResourceNotFound\)(?:\s|$)", text) is not None
+
+
+def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_group: str) -> bool:
+    """Accept only Azure CLI's structured wrapper for this exact absent parent."""
+    if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
+        return False
+    wrapped = re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*", result.stderr, re.DOTALL)
+    if wrapped is None:
+        return False
+    def unique_object(pairs):
+        output = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError("duplicate JSON key")
+            output[key] = value
+        return output
+    try:
+        payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {"error"}:
+        return False
+    error = payload["error"]
+    expected_message = f"Resource group '{resource_group}' could not be found."
+    return (isinstance(error, dict) and set(error) == {"code", "message"}
+        and error.get("code") == "ResourceGroupNotFound" and error.get("message") == expected_message)
+
+
+def _azure_schedule_trigger(requested: datetime) -> datetime:
+    """Floor Azure Automation OneTime schedules to their exact UTC minute."""
+    if requested.tzinfo is None or requested.utcoffset() is None:
+        raise ValueError("Azure expiry request must include a timezone")
+    return requested.astimezone(UTC).replace(second=0, microsecond=0)
 
 
 def _assert_subscription(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
@@ -465,8 +910,44 @@ def _validate_provider_registrations(runner: CommandRunner, options: AzureRuntim
 
 
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
-             clock: Callable[[], float], *, allow_not_found: bool = False) -> CommandResult:
+             clock: Callable[[], float], *, allow_not_found: bool = False,
+             allow_missing_resource_group: str | None = None,
+             apply_timeout_seconds: float | None = None,
+             before_apply: Callable[[], float] | None = None) -> CommandResult:
+    if options.cleanup_timing_active:
+        _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
+            phase=options.cleanup_timing_phase or "routine")
     remaining = options.cap_deadline_monotonic-clock()
+    if options.cleanup_timing_active and options.cleanup_timing_phase == "routine":
+        try:
+            timing = json.loads(options.cleanup_timing_path.read_text(encoding="utf-8"))
+            deadline = timing.get("routine_deadline_monotonic")
+            if isinstance(deadline, (int, float)):
+                remaining = min(remaining, float(deadline) - clock())
+            utc_deadline = timing.get("routine_deadline_utc")
+            if isinstance(utc_deadline, str):
+                remaining = min(remaining, (datetime.fromisoformat(utc_deadline)
+                    - _utc_from_clock(clock)().astimezone(UTC)).total_seconds())
+            else:
+                remaining = min(remaining, 0.0)
+        except (OSError, ValueError, TypeError):
+            remaining = min(remaining, 0.0)
+    if options.cleanup_timing_active and options.cleanup_timing_phase == "absence":
+        try:
+            timing = json.loads(options.cleanup_timing_path.read_text(encoding="utf-8"))
+            deadline = timing.get("fresh_absence_deadline_monotonic")
+            if isinstance(deadline, (int, float)) and deadline > clock():
+                remaining = min(remaining, float(deadline) - clock())
+            else:
+                remaining = min(remaining, 0.0)
+            utc_deadline = timing.get("fresh_absence_deadline_utc")
+            if isinstance(utc_deadline, str):
+                remaining = min(remaining, (datetime.fromisoformat(utc_deadline)
+                    - _utc_from_clock(clock)().astimezone(UTC)).total_seconds())
+            else:
+                remaining = min(remaining, 0.0)
+        except (OSError, ValueError, TypeError):
+            remaining = min(remaining, 0.0)
     if remaining <= 0: raise TimeoutError("original reservation deadline elapsed")
     if argv[:1] == ["az"] and "--subscription" not in argv:
         index = next((i for i,value in enumerate(argv) if value.startswith("--")), len(argv))
@@ -475,7 +956,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     tf_root = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("-chdir=")), "terraform")
     environment["TF_DATA_DIR"] = str(root / ("terraform-data-" + Path(tf_root).name))
     req = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type=action, argv=argv,
-        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=min(options.command_timeout_seconds, remaining),
+        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=min(
+            options.command_timeout_seconds, 180.0 if options.timing_profile else options.command_timeout_seconds, remaining),
         environment=environment, environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
     def execute(req: CommandRequest) -> CommandResult:
         try:
@@ -488,6 +970,9 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
                 _atomic_private(journal,state)
             raise RuntimeError(_redact(options, exc)) from exc
         result = result.model_copy(update={"redactions":list(set(result.redactions + req.redactions))})
+        if options.cleanup_timing_active:
+            _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
+                phase=options.cleanup_timing_phase or "routine")
         journal = root / "recovery.json"
         if journal.is_file() and not journal.is_symlink():
             state=json.loads(journal.read_text(encoding="utf-8"))
@@ -497,10 +982,14 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     if "apply" in argv and any(arg.startswith("-chdir=") for arg in argv):
         from .terraform_plan import reviewed_apply
         req = req.model_copy(update={"cwd": str(root)})
-        result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds)
+        result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds,
+            apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply)
     else:
         result = execute(req)
-    if result.outcome != "succeeded" and not (allow_not_found and _is_exact_not_found(result)):
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or (
+        allow_missing_resource_group is not None
+        and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
+    if result.outcome != "succeeded" and not accepted_absence:
         raise RuntimeError(_redact(options,f"{action} failed with {result.outcome}: {result.stderr[:1000]}"))
     if len(result.stdout.encode("utf-8"))>1_000_000 or len(result.stderr.encode("utf-8"))>1_000_000:
         raise RuntimeError(f"{action} produced output above the 1 MiB bounded-response limit")
@@ -598,6 +1087,36 @@ def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, ro
     raise RuntimeError(f"{action} exceeded the bounded 1000-page inventory limit")
 
 
+def _watcher_baseline(groups: list[dict[str,Any]], resources: list[dict[str,Any]]) -> dict[str,Any]:
+    group_ids=sorted(item["id"].lower() for item in groups
+        if item["name"].lower().startswith(("networkwatcher", "newnetworkwatcher")))
+    watcher_ids=sorted(item["id"].lower() for item in resources
+        if item["type"].lower()=="microsoft.network/networkwatchers")
+    snapshot={"groups":group_ids,"watchers":watcher_ids}
+    snapshot["sha256"]=hashlib.sha256(json.dumps(snapshot,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    return snapshot
+
+
+def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                                      runner: CommandRunner, root: Path, journal: Path,
+                                      clock: Callable[[],float]) -> None:
+    if deployment.admission.timing_profile is None:
+        return
+    resources,_=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "profile_watcher_baseline_resources",clock,("id","type"))
+    groups,_=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "profile_watcher_baseline_groups",clock,("id","name"))
+    baseline=_watcher_baseline(groups,resources)
+    state=json.loads(journal.read_text(encoding="utf-8"))
+    prior=state.get("profile_external_baseline")
+    if prior is not None and prior!=baseline:
+        raise RuntimeError("pre-creation Network Watcher baseline changed during registration recovery")
+    state["profile_external_baseline"]=baseline
+    _atomic_private(journal,state)
+
+
 def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
                             account: str, collection: str, child: str,
                             clock: Callable[[],float], actions: list[dict[str,Any]]) -> None:
@@ -618,6 +1137,99 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
         raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 
+def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                            runner: CommandRunner, root: Path, clock: Callable[[], float],
+                            state: dict[str, Any], actions: list[dict[str, Any]]) -> None:
+    """Fresh, independent Azure inventory after all requested deletes completed."""
+    name = _slug(deployment)
+    group_prefix = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/".lower()
+    group = _command(runner, options, root, ["az", "group", "exists", "--name", name, "--output", "json"],
+        "profile_absence_group", clock)
+    actions.append(_safe_cleanup_action(options, group))
+    present = json.loads(group.stdout)
+    if group.stderr.strip() or type(present) is not bool or present:
+        raise RuntimeError("independent Azure absence inventory found or could not exclude the attempt resource group")
+    resources, evidence = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "profile_absence_resources", clock, ("id", "type"))
+    actions.extend(evidence)
+    groups, evidence = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "profile_absence_groups", clock, ("id","name"))
+    actions.extend(evidence)
+    expected_group_id=f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}".lower()
+    residual_attempt_groups=[row["id"] for row in groups if row["id"].lower()==expected_group_id]
+    if residual_attempt_groups:
+        raise RuntimeError("independent Azure group inventory found the attempt resource group: "
+            + ", ".join(residual_attempt_groups))
+    baseline=state.get("profile_external_baseline")
+    baseline_valid=(isinstance(baseline,dict) and baseline.get("sha256")==hashlib.sha256(
+            json.dumps({key:value for key,value in baseline.items() if key!="sha256"},
+                sort_keys=True,separators=(",",":")).encode()).hexdigest()
+            and isinstance(baseline.get("groups"),list) and isinstance(baseline.get("watchers"),list))
+    current=_watcher_baseline(groups,resources)
+    if not baseline_valid:
+        if current["groups"] or current["watchers"]:
+            raise RuntimeError("Network Watcher baseline is unavailable and fresh inventory contains resources with unproven ownership")
+        def mark_unknown(timer):
+            timer["timing_status"]="unknown"
+            timer["timing_failure"]=timer.get("timing_failure") or "pre-creation Network Watcher ownership baseline is unavailable"
+            return timer
+        _profile_timing_mutate(options,mark_unknown,expected_identity=_EXPLICIT_TIMING_IDENTITY.get())
+    else:
+        new_groups=sorted(set(current["groups"])-set(baseline["groups"]))
+        new_watchers=sorted(set(current["watchers"])-set(baseline["watchers"]))
+        if new_groups or new_watchers:
+            raise RuntimeError("independent inventory found Network Watcher resources or parent groups with unproven attempt ownership")
+    remaining = [row["id"] for row in resources if row["id"].lower().startswith(group_prefix)]
+    if remaining:
+        raise RuntimeError("independent Azure resource inventory found attempt-owned resources: " + ", ".join(remaining))
+    expiry = state.get("expiry", {})
+    principal = expiry.get("principal_id")
+    assignment_id = expiry.get("role_assignment_id")
+    assignments, evidence = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01",
+        "profile_absence_role_assignments", clock, ("id",))
+    actions.extend(evidence)
+    for row in assignments:
+        properties=row.get("properties")
+        if not isinstance(properties,dict) or not isinstance(properties.get("principalId"),str) or not properties["principalId"].strip():
+            raise RuntimeError("independent Azure role-assignment inventory lacks principal ownership fields")
+    owned_assignments = [row["id"] for row in assignments if row["id"].lower().startswith(group_prefix)
+        or (assignment_id and row["id"].lower() == str(assignment_id).lower())
+        or (principal and str(row.get("properties", {}).get("principalId", "")).lower() == str(principal).lower())]
+    if owned_assignments:
+        raise RuntimeError("independent Azure role-assignment inventory found attempt-owned assignments")
+    definitions, evidence = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/providers/Microsoft.Authorization/roleDefinitions?%24filter=type%20eq%20%27CustomRole%27&api-version=2022-04-01",
+        "profile_absence_role_definitions", clock, ("id",))
+    actions.extend(evidence)
+    for row in definitions:
+        properties=row.get("properties")
+        if not isinstance(properties,dict) or not isinstance(properties.get("roleName"),str) or not properties["roleName"].strip():
+            raise RuntimeError("independent Azure role-definition inventory lacks role ownership fields")
+    definition_id = expiry.get("role_definition_id")
+    definition_name = name + "-deallocate-only"
+    if any((definition_id and row["id"].lower() == str(definition_id).lower())
+            or str(row.get("properties", {}).get("roleName", "")) == definition_name for row in definitions):
+        raise RuntimeError("independent Azure role-definition inventory found the attempt custom role")
+    account = expiry.get("automation_account_id")
+    if account:
+        targets = [(account, "automation account", AUTOMATION_API)]
+        for collection, key in (("jobSchedules", "job_schedule_id"), ("schedules", "schedule"), ("runbooks", "runbook")):
+            child = expiry.get(key) or expiry.get("metadata", {}).get(key)
+            if child:
+                targets.append((f"{account}/{collection}/{child}", f"Automation {collection} child", AUTOMATION_API))
+        for target, label, api in targets:
+            result = _command(runner, options, root, _azure_rest("GET", f"{target}?api-version={api}"),
+                "profile_absence_automation", clock, allow_not_found=True,
+                allow_missing_resource_group=state["resource_group"])
+            actions.append(_safe_cleanup_action(options, result))
+            if result.outcome != "failed" or not (_is_exact_not_found(result)
+                    or _is_exact_missing_attempt_resource_group(result, state["resource_group"])):
+                raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
+
+
 def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None) -> list[str]:
     args = ["az", "rest", "--method", method, "--url", url, "--output", "json"]
     if body is not None: args += ["--headers", "Content-Type=application/json", "--body", json.dumps(body, separators=(",", ":"))]
@@ -629,16 +1241,37 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
                     sleep: Callable[[float], None]) -> ExpiryEvidence:
     """Prepare/read back Automation and bind one UTC job before pair creation."""
     now = utc_now().astimezone(UTC); mono = clock()
+    if deployment.admission.timing_profile:
+        # Factory preparation owns the original anchor. Registration must never
+        # recreate it after the attempt has begun or make provider calls first.
+        anchor = _require_profile_timing_anchor(deployment, options, require_stop=False)
+        reservation = deployment.reservation.value
+        anchor_origin_utc=datetime.fromisoformat(anchor["origin_utc"])
+        anchor_origin_mono=float(anchor["origin_monotonic"])
+        mapped_cap=anchor_origin_mono+(reservation.expires_at.value-anchor_origin_utc).total_seconds()
+        if (anchor.get("clock_identity") != _clock_identity()
+                or datetime.fromisoformat(anchor["cap_started_at"]) != reservation.cap_started_at.value
+                or datetime.fromisoformat(anchor["cap_expires_at"]) != reservation.expires_at.value
+                or anchor_origin_utc < reservation.cap_started_at.value or anchor_origin_utc > now
+                or anchor_origin_mono > mono
+                or float(anchor["cap_deadline_monotonic"]) != float(options.cap_deadline_monotonic)
+                or float(anchor["cap_deadline_monotonic"]) > mapped_cap + 1e-6
+                or anchor.get("provider_stop_at") is not None):
+            raise ValueError("original Azure profile timing anchor is foreign, expired, or already bound")
     name, ids = _validate_request(deployment, options, now, mono)
     if request.provider != Provider.AZURE or request.action != "deallocate" or request.run_id != deployment.run_id or request.deployment_id != deployment.deployment_id:
         raise ValueError("expiry request identity/action mismatch")
     if request.resource_namespace != name:
         raise ValueError("expiry request namespace does not match deterministic attempt")
     reservation = deployment.reservation.value
-    trigger = request.expires_at.value
-    if trigger is None:
+    requested_trigger = request.expires_at.value
+    if requested_trigger is None:
         raise ValueError("expiry trigger is required")
-    if trigger >= reservation.expires_at.value or trigger >= options.retry_end_at:
+    trigger = _azure_schedule_trigger(requested_trigger)
+    if trigger <= now:
+        raise ValueError("minute-aligned Azure expiry trigger is no longer in the future")
+    if (requested_trigger >= reservation.expires_at.value or requested_trigger >= options.retry_end_at
+            or trigger >= reservation.expires_at.value or trigger >= options.retry_end_at):
         raise ValueError("expiry trigger must precede retry end and reservation cap")
     if (options.retry_end_at-trigger).total_seconds() > float(options.expiry_cost_input["job_minutes_bound"])*60:
         raise ValueError("bounded Automation job minutes do not cover the configured retry window")
@@ -654,7 +1287,9 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("expiry request namespace does not match deterministic attempt")
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
-    root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options)
+    root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options, clock=clock,
+        utc_now=utc_now, initialize_timing=False)
+    _capture_profile_watcher_baseline(deployment,options,runner,root,journal,clock)
     _validate_provider_registrations(runner, options, root, clock)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"
@@ -886,11 +1521,21 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
         raise ValueError("Azure expiry price input date cannot be in the future")
     reservation = deployment.reservation.value
-    trigger = request.expires_at.value
+    requested_trigger = request.expires_at.value
+    trigger = _azure_schedule_trigger(requested_trigger) if requested_trigger is not None else None
     if request.provider != Provider.AZURE or request.action != "deallocate" or request.run_id != deployment.run_id or request.deployment_id != deployment.deployment_id:
         raise ValueError("expiry request identity/action mismatch")
-    if trigger is None or trigger >= reservation.expires_at.value or trigger >= options.retry_end_at:
+    if (requested_trigger is None or trigger is None or requested_trigger >= reservation.expires_at.value
+            or requested_trigger >= options.retry_end_at or trigger >= reservation.expires_at.value
+            or trigger >= options.retry_end_at):
         raise ValueError("expiry trigger must precede retry end and reservation cap")
+    if deployment.admission.timing_profile:
+        expected_requested = reservation.cap_started_at.value + timedelta(seconds=1680)
+        if (reservation.expires_at.value - reservation.cap_started_at.value != timedelta(seconds=1800)
+                or options.retry_end_at != reservation.expires_at.value
+                or requested_trigger != expected_requested
+                or trigger != _azure_schedule_trigger(expected_requested)):
+            raise ValueError("Azure EXP-901 profile requires its exact 1680-second requested STOP and floored trigger")
     if trigger <= now + timedelta(seconds=300):
         raise ValueError("Automation schedule requires at least 300 seconds lead")
     if (options.retry_end_at-trigger).total_seconds() > float(options.expiry_cost_input["job_minutes_bound"])*60:
@@ -905,7 +1550,10 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
     try:
-        return _register_expiry_impl(deployment, request, options, runner, clock=clock, utc_now=utc_now, sleep=sleep)
+        evidence = _register_expiry_impl(deployment, request, options, runner, clock=clock, utc_now=utc_now, sleep=sleep)
+        if evidence.state == "registered" and evidence.expires_at.value is not None:
+            _bind_profile_stop(deployment, options, evidence.expires_at.value)
+        return evidence
     except Exception as exc:
         root = options.attempt_root
         journal = root / "recovery.json"
@@ -923,7 +1571,9 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
 
 
 def _tf(root: Path, options: AzureRuntimeOptions, runner: CommandRunner, clock: Callable[[], float],
-        workdir: str, *args: str, action: str) -> CommandResult:
+        workdir: str, *args: str, action: str,
+        apply_timeout_seconds: float | None = None,
+        before_apply: Callable[[], float] | None = None) -> CommandResult:
     state = root / ("expiry.tfstate" if workdir.endswith("/expiry") else "pair.tfstate")
     source_root = Path(__file__).resolve().parents[2] / workdir
     argv = ["terraform", f"-chdir={source_root}", *args]
@@ -931,7 +1581,8 @@ def _tf(root: Path, options: AzureRuntimeOptions, runner: CommandRunner, clock: 
         argv += [f"-state={state}"]
     if args and args[0] == "init":
         argv += [f"-backend-config=path={state}", "-lockfile=readonly"]
-    return _command(runner, options, root, argv, action, clock)
+    return _command(runner, options, root, argv, action, clock,
+        apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply)
 
 
 def _key_material(text: str) -> str:
@@ -1026,7 +1677,12 @@ def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root:
 
 def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
               clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureProviderResult:
-    now=utc_now().astimezone(UTC); mono=clock(); name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
+    provision_stage_seconds = float(deployment.provisioning_timeout_seconds or options.command_timeout_seconds)
+    mono=clock()
+    provision_deadline_monotonic = mono + provision_stage_seconds
+    now=utc_now().astimezone(UTC)
+    _require_profile_timing_anchor(deployment, options, require_stop=True)
+    name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
         raise ValueError("Azure expiry price input date cannot be in the future")
     root,journal=_workspace(options,deployment); state=json.loads(journal.read_text()); failures=[]; results=[]; apply=None; outputs=None; valid_outputs={}
@@ -1038,6 +1694,8 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         _verify_registered_expiry(deployment,options,root,runner,clock,now)
         fresh_utc=utc_now().astimezone(UTC); fresh_mono=clock()
         _validate_request(deployment,options,fresh_utc,fresh_mono,require_registered=True)
+        if provision_deadline_monotonic-fresh_mono <= 0:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair creation")
         if deployment.expiry.value.expires_at.value - fresh_utc < timedelta(seconds=options.post_registration_workflow_seconds):
             raise TimeoutError("remaining complete workflow no longer fits before the registered trigger")
         if options.cap_deadline_monotonic-fresh_mono < options.post_registration_workflow_seconds:
@@ -1046,36 +1704,108 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=True; state["pair_state"]="creating"; _atomic_private(journal,state)
         args=["apply","-input=false",f"-var-file={pair_vars}"]
         preapply_utc=utc_now().astimezone(UTC); preapply_mono=clock()
-        if deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds) or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds:
+        if (provision_deadline_monotonic-preapply_mono <= 0
+                or deployment.expiry.value.expires_at.value-preapply_utc < timedelta(seconds=options.post_registration_workflow_seconds)
+                or options.cap_deadline_monotonic-preapply_mono < options.post_registration_workflow_seconds):
             state=json.loads(journal.read_text(encoding="utf-8")); state["creation_may_have_started"]=False; state["pair_state"]="not_started"; _atomic_private(journal,state)
             raise TimeoutError("complete workflow no longer fits immediately before pair apply")
         review_slack = min(options.cap_deadline_monotonic-preapply_mono,
             (deployment.expiry.value.expires_at.value-preapply_utc).total_seconds()) - options.post_registration_workflow_seconds
         if review_slack <= 0: raise TimeoutError("pair plan review no longer fits before the workflow allowance")
-        review_options = options.model_copy(update={"cap_deadline_monotonic":preapply_mono+review_slack})
-        apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply"); results.append(apply.durable_view())
-        out=_tf(root,options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
+        review_deadline = min(preapply_mono+review_slack, provision_deadline_monotonic)
+        if review_deadline <= preapply_mono:
+            raise TimeoutError("pair plan review no longer fits within the original provision-stage allowance")
+        review_options = options.model_copy(update={"cap_deadline_monotonic":review_deadline})
+        if provision_stage_seconds > options.post_registration_workflow_seconds:
+            raise TimeoutError("pair provision stage exceeds the post-registration workflow allowance")
+        # The F11 allowance reserves the provision component inside the full
+        # post-registration remainder. Runtime construction clamps the
+        # deployment timeout to that component; preserve any stricter config.
+        downstream_reserve = options.post_registration_workflow_seconds - provision_stage_seconds
+
+        def apply_budget_after_review() -> float:
+            reviewed_utc = utc_now().astimezone(UTC)
+            reviewed_mono = clock()
+            trigger_remaining = (deployment.expiry.value.expires_at.value - reviewed_utc).total_seconds()
+            cap_remaining = options.cap_deadline_monotonic - reviewed_mono
+            stage_remaining = provision_deadline_monotonic - reviewed_mono
+            if trigger_remaining < options.post_registration_workflow_seconds or cap_remaining < options.post_registration_workflow_seconds:
+                raise TimeoutError("complete workflow no longer fits immediately after pair plan review")
+            if stage_remaining <= 0:
+                raise TimeoutError("original Azure provision-stage deadline elapsed during pair plan review")
+            remaining = min(options.command_timeout_seconds, stage_remaining,
+                cap_remaining - downstream_reserve, trigger_remaining - downstream_reserve)
+            if remaining <= 0:
+                raise TimeoutError("pair apply has no remaining stage budget after saved-plan review")
+            return remaining
+
+        apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply",
+            apply_timeout_seconds=min(options.command_timeout_seconds, provision_deadline_monotonic-preapply_mono),
+            before_apply=apply_budget_after_review); results.append(apply.durable_view())
+        post_apply_options=options.model_copy(update={"cap_deadline_monotonic":min(options.cap_deadline_monotonic,provision_deadline_monotonic)})
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair output and host trust")
+        out=_tf(root,post_apply_options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")
         outputs=json.loads(out.stdout)
         observed_images={}
         vms=[]; key_lines=[]
         for role in ("a","b"):
             data=_validate_vm_output_data(deployment,options,role,outputs["vm_"+role]["value"],ids[0 if role=="a" else 1])
-            data["image"]=_observe_vm_image(options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image,deployment.vm_a.region if role=="a" else deployment.vm_b.region,
+            data["image"]=_observe_vm_image(post_apply_options,runner,root,ids[0 if role=="a" else 1],clock,options.selected_image,deployment.vm_a.region if role=="a" else deployment.vm_b.region,
                 deployment.vm_a.zone if role=="a" else deployment.vm_b.zone,
                 deployment.vm_a.connection_user if role=="a" else deployment.vm_b.connection_user)
             observed_images[role]=data["image"]
             valid_outputs[role]=data
             nonce=secrets.token_urlsafe(24)
             script=f"printf 'CNB-AZ-HOSTKEY:{nonce}\\n'; cat /etc/ssh/ssh_host_ed25519_key.pub"
-            command=_command(runner,options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts",script,"--output","json"],"host_key_identity",clock)
+            command=_command(runner,post_apply_options,root,["az","vm","run-command","invoke","--ids",ids[0 if role=="a" else 1],"--command-id","RunShellScript","--scripts",script,"--output","json"],"host_key_identity",clock)
+            if clock() >= provision_deadline_monotonic:
+                raise TimeoutError("original Azure provision-stage deadline elapsed during host trust")
             action=json.loads(command.stdout)
             statuses=action.get("value",[])
-            success=[x for x in statuses if isinstance(x,dict) and str(x.get("code","")).lower()=="componentstatus/stdout/succeeded"]
-            if len(success)!=1 or any(str(x.get("level","")).lower()=="error" or str(x.get("code","")).lower().endswith("/failed") for x in statuses):
+            if not isinstance(statuses,list) or not statuses or any(not isinstance(item,dict) for item in statuses):
                 raise ValueError("authenticated Azure Run Command did not report successful completion")
-            script_out=success[0].get("message","")
+            codes=[str(item.get("code","")).lower() for item in statuses]
+            legacy_stdout="componentstatus/stdout/succeeded"
+            legacy_stderr="componentstatus/stderr/succeeded"
+            consolidated_code="provisioningstate/succeeded"
             marker=f"CNB-AZ-HOSTKEY:{nonce}"
-            if not isinstance(script_out,str) or script_out.count(marker)!=1:
+            if sum(str(item.get("message","")).count(marker) for item in statuses)!=1:
+                raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
+            if any(str(item.get("level","")).lower()=="error" or code.endswith("/failed")
+                    for item,code in zip(statuses,codes)):
+                raise ValueError("authenticated Azure Run Command did not report successful completion")
+            if consolidated_code in codes:
+                if len(statuses)!=1 or codes[0]!=consolidated_code:
+                    raise ValueError("authenticated Azure Run Command returned mixed or ambiguous statuses")
+                status=statuses[0]
+                consolidated=True
+            else:
+                if (codes.count(legacy_stdout)!=1 or any(code not in {legacy_stdout,legacy_stderr} for code in codes)
+                        or codes.count(legacy_stderr)>1):
+                    raise ValueError("authenticated Azure Run Command did not report successful completion")
+                status=statuses[codes.index(legacy_stdout)]
+                stderr_status=[item for item,code in zip(statuses,codes) if code==legacy_stderr]
+                if stderr_status and str(stderr_status[0].get("message","" )).strip():
+                    raise ValueError("authenticated Azure Run Command stderr is not empty")
+                consolidated=False
+            script_out=status.get("message","")
+            if not isinstance(script_out,str):
+                raise ValueError("authenticated Azure Run Command stdout is malformed")
+            if script_out.count(marker)!=1:
+                raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
+            if "[stdout]" in script_out or "[stderr]" in script_out:
+                if (script_out.count("[stdout]")!=1 or script_out.count("[stderr]")!=1
+                        or script_out.index("[stdout]")>script_out.index("[stderr]")):
+                    raise ValueError("authenticated Azure Run Command output framing is malformed or ambiguous")
+                stdout_start=script_out.index("[stdout]")+len("[stdout]")
+                stderr_start=script_out.index("[stderr]")
+                if script_out[stderr_start+len("[stderr]"):].strip():
+                    raise ValueError("authenticated Azure Run Command stderr or mixed output is not empty")
+                script_out=script_out[stdout_start:stderr_start]
+            elif consolidated:
+                raise ValueError("authenticated Azure Run Command consolidated output framing is missing")
+            if script_out.count(marker)!=1:
                 raise ValueError("authenticated Azure Run Command response nonce is missing, stale, or ambiguous")
             suffix=script_out.split(marker,1)[1]
             parsed_keys=[line.strip() for line in suffix.splitlines() if _KEY.fullmatch(line.strip())]
@@ -1084,12 +1814,16 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
             key=_key_material(parsed_keys[0])
             key_lines.append(f"{data['public_ipv4']} {key}")
             vms.append(_vm_output(deployment,role,data,key,options))
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair trust materialization")
         known=root/"known_hosts"
         if known.exists(): raise FileExistsError("known_hosts already exists; refusing overwrite")
         with known.open("x",encoding="utf-8") as f: f.write("\n".join(key_lines)+"\n")
         os.chmod(known,0o600)
         state=json.loads(journal.read_text(encoding="utf-8"))
         state["pair_state"]="created"; state["known_hosts_reference"]=str(known); _atomic_private(journal,state)
+        if clock() >= provision_deadline_monotonic:
+            raise TimeoutError("original Azure provision-stage deadline elapsed before pair output materialization")
         started=apply.started_at
         output=ProviderDeploymentOutput(schema_version=2,identity=_identity(deployment),run_id=deployment.run_id,deployment_id=deployment.deployment_id,
             mode=deployment.mode,provider=Provider.AZURE,scenario=Scenario(deployment.scenario),apply_action_id=apply.action_id,
@@ -1171,14 +1905,33 @@ def _partial_empty_vm(role: str, reason: str) -> ProviderVmOutput:
         unavailable=StructuredEvidence(value={"reason":reason}),public_ipv4=Evidence(unavailable_reason="provider output unavailable"))
 
 
-def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
+def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
             clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureCleanupResult:
-    options = options.model_copy(update={"cap_deadline_monotonic": clock() +
-        (deployment.cleanup_timeout_seconds or options.command_timeout_seconds)})
-    start=utc_now().astimezone(UTC); root=options.attempt_root; journal=root/"recovery.json"; actions=[]; failures=[]; resources=[]
+    start=utc_now().astimezone(UTC)
+    configured_timeout = float(deployment.cleanup_timeout_seconds or options.command_timeout_seconds)
+    invocation_seconds=(min(300.0, configured_timeout) if deployment.admission.timing_profile else configured_timeout)
+    invocation_start=float(clock())
+    invocation_deadline, timing_state, timing_note = _begin_profile_cleanup(deployment, options,
+        clock=clock, utc_now=utc_now, invocation_seconds=invocation_seconds)
+    if deployment.admission.timing_profile and timing_state is not None and timing_note is None:
+        absence_bound=(timing_state.get("fresh_absence_deadline_monotonic")
+            if timing_state.get("absence_started_at") is not None
+            else timing_state.get("absence_deadline_monotonic"))
+        if isinstance(absence_bound,(int,float)):
+            invocation_deadline=min(invocation_start+invocation_seconds,float(absence_bound))
+    options = options.model_copy(update={"cap_deadline_monotonic": invocation_deadline,
+        "cleanup_timing_active": deployment.admission.timing_profile is not None and timing_state is not None,
+        "cleanup_timing_phase": ("emergency" if timing_note else "routine")
+            if deployment.admission.timing_profile else None})
+    root=options.attempt_root; journal=root/"recovery.json"; actions=[]; failures=[]; resources=[]
     if not journal.is_file() or journal.is_symlink():
         failures.append(FailureEvidence(category="recovery_missing",message="private recovery journal unavailable",occurred_at=start))
-        return AzureCleanupResult(identity=_identity(deployment),cleanup_state=CleanupState.FAILED,attempted_at=start,finished_at=utc_now(),failures=failures,launch_blocked=True)
+        if timing_state is not None:
+            timing_state = _finish_profile_timing(options, clock=clock, utc_now=utc_now, absence_verified=False) or timing_state
+        status = timing_state.get("timing_status") if timing_state else ("unknown" if deployment.admission.timing_profile else None)
+        timing_failure = _timing_failure(status, timing_note or (timing_state or {}).get("timing_failure"), utc_now())
+        return AzureCleanupResult(identity=_identity(deployment),cleanup_state=CleanupState.FAILED,attempted_at=start,
+            finished_at=utc_now(),failures=failures,launch_blocked=True,timing_status=status,timing_failure=timing_failure)
     state=json.loads(journal.read_text())
     if state.get("run_id")!=deployment.run_id or state.get("deployment_id")!=deployment.deployment_id:
         raise ValueError("recovery journal identity mismatch; refusing cross-attempt cleanup")
@@ -1187,13 +1940,68 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
     expected_vm_ids=[f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}/providers/Microsoft.Compute/virtualMachines/{_slug(deployment)}-{role}" for role in ("a","b")]
     if state.get("vm_ids") != expected_vm_ids:
         raise ValueError("recovery journal contains foreign target identities; refusing cleanup")
+    if (deployment.admission.timing_profile and timing_state
+            and timing_state.get("absence_started_at") is not None
+            and timing_note is None):
+        expected_group=f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
+        expected_account=expected_group+f"/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
+        prereq=state.get("expiry",{})
+        assignment=prereq.get("role_assignment_id")
+        definition=prereq.get("role_definition_id")
+        assignment_prefix=(expected_group+"/providers/Microsoft.Authorization/roleAssignments/").lower()
+        definition_prefix=(f"/subscriptions/{options.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/").lower()
+        if (prereq.get("automation_account_id") not in (None,expected_account)
+                or prereq.get("resource_group_id") not in (None,expected_group)
+                or (assignment and (not str(assignment).lower().startswith(assignment_prefix)
+                    or not _is_uuid_segment(str(assignment)[len(assignment_prefix):])))
+                or (definition and (not str(definition).lower().startswith(definition_prefix)
+                    or not _is_uuid_segment(str(definition)[len(definition_prefix):])))):
+            raise ValueError("recovery journal contains foreign expiry identities; refusing absence recovery")
+        # Routine deletion and its pre-inventory checks completed before the
+        # prior process entered the separately budgeted fresh absence window.
+        # Resume that read-only proof directly; replaying teardown here would
+        # consume the independent 60-second allowance.
+        absence_options=options.model_copy(update={"cleanup_timing_phase":"absence"})
+        try:
+            _verify_profile_absence(deployment,absence_options,runner,root,clock,state,actions)
+            resources=[]
+            timing_state=_finish_profile_timing(options,clock=clock,utc_now=utc_now,absence_verified=True)
+            shutil.rmtree(root)
+            status=timing_state.get("timing_status") if timing_state else "unknown"
+            failure=_timing_failure(status,(timing_state or {}).get("timing_failure"),utc_now())
+            return AzureCleanupResult(identity=_identity(deployment),cleanup_state=CleanupState.SUCCEEDED,
+                attempted_at=start,finished_at=utc_now(),actions=actions,failures=[],resources=[],
+                launch_blocked=False,timing_status=status,timing_failure=failure)
+        except Exception as exc:
+            failures.append(FailureEvidence(category="azure_cleanup_absence",message=_redact(options,exc)[:1000],occurred_at=utc_now()))
+            state=json.loads(journal.read_text(encoding="utf-8"))
+            state["failures"].append({"category":"azure_cleanup_absence","message":_redact(options,exc)[:1000]})
+            _atomic_private(journal,state)
+            finalized=_finish_profile_timing(options,clock=clock,utc_now=utc_now,absence_verified=False)
+            timing_state=finalized
+            status=timing_state.get("timing_status") if timing_state else "unknown"
+            failure=_timing_failure(status,(timing_state or {}).get("timing_failure"),utc_now())
+            return AzureCleanupResult(identity=_identity(deployment),cleanup_state=CleanupState.FAILED,
+                attempted_at=start,finished_at=utc_now(),actions=actions,failures=failures,
+                resources=[],launch_blocked=True,timing_status=status,timing_failure=failure)
     expected_group = f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
     expected_account = expected_group + f"/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
     prereq = state.get("expiry", {})
+    role_assignment_id = prereq.get("role_assignment_id")
+    role_definition_id = prereq.get("role_definition_id")
+    assignment_prefix = (expected_group + "/providers/Microsoft.Authorization/roleAssignments/").lower()
+    definition_prefix = (f"/subscriptions/{options.subscription_id}"
+        "/providers/Microsoft.Authorization/roleDefinitions/").lower()
+    valid_assignment = (isinstance(role_assignment_id, str)
+        and role_assignment_id.lower().startswith(assignment_prefix)
+        and _is_uuid_segment(role_assignment_id[len(assignment_prefix):]))
+    valid_definition = (isinstance(role_definition_id, str)
+        and role_definition_id.lower().startswith(definition_prefix)
+        and _is_uuid_segment(role_definition_id[len(definition_prefix):]))
     if (prereq.get("automation_account_id") not in (None, expected_account)
             or prereq.get("resource_group_id") not in (None, expected_group)
-            or any(prereq.get(key) and not str(prereq[key]).lower().startswith(expected_group.lower() + "/")
-                   for key in ("role_assignment_id", "role_definition_id"))):
+            or (role_assignment_id and not valid_assignment)
+            or (role_definition_id and not valid_definition)):
         raise ValueError("recovery journal contains foreign expiry identities; refusing cleanup")
     try:
         # Pair destroy precedes inventory. Expiry remains until direct inventory proves both VMs absent.
@@ -1307,6 +2115,24 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         if definitions:
             raise RuntimeError("custom role definition inventory contains an unexpected identity")
         actions.append(_safe_cleanup_action(options,residual_defs))
+        if deployment.admission.timing_profile:
+            phase="emergency"
+            if timing_state is not None:
+                try:
+                    _mark_profile_absence_started(options, clock=clock, utc_now=utc_now)
+                    current_timing=_require_profile_timing_anchor(deployment,options,require_stop=False)
+                    absence_deadline=(current_timing or {}).get("fresh_absence_deadline_monotonic")
+                    if ((current_timing or {}).get("timing_status")=="within_deadline"
+                            and isinstance(absence_deadline,(int,float)) and clock()<float(absence_deadline)):
+                        phase="absence"
+                except (OSError,ValueError,PermissionError,KeyError,TypeError) as exc:
+                    timing_state=None
+                    _TIMING_OBSERVATION_FAILURE.set(f"profile timing state became unavailable during cleanup ({type(exc).__name__})")
+            absence_options = options.model_copy(update={"cleanup_timing_phase": phase})
+            _verify_profile_absence(deployment, absence_options, runner, root, clock, state, actions)
+            resources = []
+            if timing_state is not None:
+                timing_state = _finish_profile_timing(options, clock=clock, utc_now=utc_now, absence_verified=True)
         shutil.rmtree(root)
         cleanup=CleanupState.SUCCEEDED; blocked=False
     except Exception as exc:
@@ -1314,4 +2140,31 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         state=json.loads(journal.read_text(encoding="utf-8"))
         state["failures"].append({"category":"azure_cleanup","message":_redact(options,exc)[:1000]}); _atomic_private(journal,state)
         cleanup=CleanupState.FAILED; blocked=True
-    return AzureCleanupResult(identity=_identity(deployment),cleanup_state=cleanup,attempted_at=start,finished_at=utc_now(),actions=actions,failures=failures,resources=resources,launch_blocked=blocked)
+    if deployment.admission.timing_profile and timing_state is not None:
+        timing_state = _finish_profile_timing(options, clock=clock, utc_now=utc_now,
+            absence_verified=cleanup == CleanupState.SUCCEEDED)
+    timing_status = timing_state.get("timing_status") if timing_state else ("unknown" if deployment.admission.timing_profile else None)
+    timing_failure = _timing_failure(timing_status,
+        timing_note or (timing_state or {}).get("timing_failure"), utc_now())
+    return AzureCleanupResult(identity=_identity(deployment),cleanup_state=cleanup,attempted_at=start,finished_at=utc_now(),
+        actions=actions,failures=failures,resources=resources,launch_blocked=blocked,
+        timing_status=timing_status,timing_failure=timing_failure)
+
+
+def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
+            clock: Callable[[], float], utc_now: Callable[[], datetime]) -> AzureCleanupResult:
+    """Run Azure cleanup with the caller's explicit UTC clock in command tracing."""
+    token = _EXPLICIT_UTC_NOW.set(utc_now)
+    identity_token = _EXPLICIT_TIMING_IDENTITY.set(_profile_timing_identity(deployment))
+    observation_token = _TIMING_OBSERVATION_FAILURE.set(None)
+    try:
+        result=_destroy_impl(deployment, options, runner, clock=clock, utc_now=utc_now)
+        timing_error=_TIMING_OBSERVATION_FAILURE.get()
+        if timing_error:
+            result=result.model_copy(update={"timing_status":"unknown",
+                "timing_failure":_timing_failure("unknown",timing_error,utc_now())})
+        return result
+    finally:
+        _TIMING_OBSERVATION_FAILURE.reset(observation_token)
+        _EXPLICIT_TIMING_IDENTITY.reset(identity_token)
+        _EXPLICIT_UTC_NOW.reset(token)

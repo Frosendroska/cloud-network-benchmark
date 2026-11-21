@@ -249,7 +249,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
                             controller_session_id: str | None = None):
     """Build F11 inputs from the initialized identities and exact sourced cost rows."""
     from decimal import Decimal
-    from .admission import AdmissionPlan, WorkflowAllowance
+    from .admission import AdmissionPlan, WorkflowAllowance, validate_timing_profile_allowance
     from .contracts.admission import ReservationRequest
     from .contracts.common import Evidence, Provider
     from .contracts.deployment import ProviderDeploymentInput
@@ -292,6 +292,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
     estimated = sum((Decimal(str(component["amount_usd"]))
         for row in rows.values() for component in row["components"].values()), Decimal("0"))
     allowance = runtime["allowance"]
+    validate_timing_profile_allowance(campaign.admission.timing_profile, allowance, set(child_ids))
     if set(allowance.provider_leads_seconds) != set(child_ids):
         raise ValueError("allowance provider set differs from initialized campaign")
     schedule = campaign.schedule_entry.value
@@ -311,6 +312,12 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
             Evidence[str](unavailable_reason="acceptance has no schedule row")),
         selected_providers=[Provider(name) for name in child_ids], mode=campaign.mode,
         priority=campaign.admission.priority, lifetime_cap_seconds=campaign.admission.lifetime_cap_seconds,
+        timing_profile=campaign.admission.timing_profile,
+        experiment_id=campaign.experiment_id if campaign.admission.timing_profile else None,
+        context=campaign.context if campaign.admission.timing_profile else None,
+        scenario=campaign.scenario if campaign.admission.timing_profile else None,
+        config_sha256=campaign.config_source.sha256 if campaign.admission.timing_profile else None,
+        resolved_sha256=campaign.resolved_sha256 if campaign.admission.timing_profile else None,
         estimated_cost_usd=Evidence[float](value=float(estimated)), source_path=costs.source_path,
         source_sha256=costs.payload_sha256,
         incurred_cost_usd=Evidence[float](unavailable_reason="F11 ledger derives current incurred charges"),
@@ -652,10 +659,12 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
     from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
     from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
     from .admission import aws_expiry_cost_handoff
+    from .admission import validate_timing_profile_allowance
     from .lifecycle_cleanup import save_cleanup_settings
     from . import azure_provider
 
     selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
+    validate_timing_profile_allowance(campaign.admission.timing_profile, runtime["allowance"], selected)
     if set(children) != selected or set(stages) != selected:
         raise ValueError("runtime workflows, stages and initialized provider set must match")
     if (reservation.state != "reserved" or reservation.source_path != costs.source_path
@@ -695,6 +704,18 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             admission["cost_input_sha256"] = StringEvidence(value=reservation.source_sha256)
             data["admission"] = admission
             deployment = ProviderDeploymentInput.model_validate(data)
+        elif provider == "azure":
+            # F11 reserves a distinct provisioning component. Keep the
+            # configured per-deployment ceiling when it is tighter, while
+            # preserving the smaller admitted component as the effective
+            # provider-call bound.
+            provision_ceiling = float(runtime["allowance"].provision_seconds)
+            configured = deployment.provisioning_timeout_seconds
+            effective = min(float(configured) if configured is not None else provision_ceiling,
+                provision_ceiling)
+            if not math.isfinite(effective) or effective < 1:
+                raise ValueError("F11 Azure provision allowance must provide at least one whole second")
+            deployment = deployment.model_copy(update={"provisioning_timeout_seconds":int(effective)})
         deployments[provider] = deployment
         config = row["options"]
         if provider == "aws":
@@ -798,6 +819,19 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 post_registration_workflow_seconds=float(_remaining_f11_allowance(
                     runtime["allowance"], "preparation").total_seconds),
                 cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
+                timing_profile=deployment.admission.timing_profile,
+                cleanup_timing_path=(Path(private_root) / "azure-cleanup-timing" / child.run_id
+                    / f"{child.deployment_id}.json") if deployment.admission.timing_profile else None,
+                profile_allowance=({"registration_seconds": float(runtime["allowance"].registration_seconds),
+                    "provision_seconds": float(runtime["allowance"].provision_seconds),
+                    "readiness_seconds": float(runtime["allowance"].readiness_seconds),
+                    "stabilization_seconds": float(runtime["allowance"].stabilization_seconds),
+                    "measurement_seconds": float(runtime["allowance"].measurement_seconds),
+                    "measurement_shutdown_seconds": float(runtime["allowance"].measurement_shutdown_seconds),
+                    "retrieval_seconds": float(runtime["allowance"].retrieval_seconds),
+                    "cleanup_seconds": float(runtime["allowance"].cleanup_seconds),
+                    "azure_provider_lead_seconds": float(runtime["allowance"].provider_leads_seconds["azure"])}
+                    if deployment.admission.timing_profile else None),
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
                 plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
@@ -813,7 +847,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     provider_lead_seconds=lead, settings=options, private_root=Path(private_root)))
             # Local recovery and original Terraform inputs must exist before
             # the advancing-clock preflight can fail. No provider calls here.
-            azure_provider.prepare_recovery(deployment, options)
+            azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic, utc_now=clock.utc_now)
             azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             options_by_provider[provider] = (options, None)
 
