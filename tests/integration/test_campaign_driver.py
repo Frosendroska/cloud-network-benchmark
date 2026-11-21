@@ -331,7 +331,9 @@ def test_restart_rejects_changed_frozen_ownership_or_schedule(tmp_path, changed)
         modified["entries"][0][changed] = (START + timedelta(hours=1)).isoformat()
     else:
         modified["entries"][0][changed] = str(tmp_path / "wrong-private-state")
-    with pytest.raises(ValueError, match="changed|match|frozen"):
+    expected_error = (r"WEEK slot .* must contain exactly one P0/S1 and one P1/S3 entry"
+                      if changed == "launch_at" else r"changed|match|frozen")
+    with pytest.raises(ValueError, match=expected_error):
         driver(clock, lambda *_: pytest.fail("altered frozen observation launched")).run(modified)
 
 
