@@ -281,7 +281,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             horizon = _utc(settings["stage_inputs"][stage]["start_utc"], "start_utc") + timedelta(seconds=1800 if stage == "calibration" else 87600)
         if valid_through < horizon:
             raise ValueError(f"credential_refresh evidence must remain valid through stage cleanup ({horizon.isoformat()})")
-        missing_tools = [name for name in ("terraform", "aws", "az", "gcloud", "ssh", "scp", "systemctl") if shutil.which(name) is None]
+        missing_tools = [name for name in ("terraform", "aws", "az", "gcloud", "ssh", "scp") if shutil.which(name) is None]
         if missing_tools:
             raise ValueError("install required controller tools on Linux: " + ", ".join(missing_tools))
         if stage == "day":
@@ -687,6 +687,10 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "results_root": str(result), "repository_root": str(root), "entries": entries,
         "minimum_free_bytes": int(settings.get("minimum_free_bytes", 0)),
         "operator_log_path": str(Path(state_root) / "campaign.log"),
+        "observer_identity": {provider: {key: settings["providers"][provider][key] for key in
+            ({"aws": ("account_id",), "azure": ("subscription_id", "tenant_id"),
+             "gcp": ("project_id",)}[provider])} for provider in sorted(settings["providers"])},
+        "credential_valid_through_utc": settings["credential_refresh"]["valid_through_utc"],
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
     if stage == "week":
         stage_data["dispatch_policy"] = _weekly_dispatch_policy(settings, approvals)

@@ -135,7 +135,7 @@ class CampaignDriver:
         self.validate = validate
         self.settings_loader = settings_loader
         self.launch = launch or self._launch_lifecycle
-        self.dispatch = dispatch or self._dispatch_systemd
+        self.dispatch = dispatch or self._dispatch_user_space
         self.reconcile = reconcile if reconcile is not None else (self._reconcile_lifecycle if launch is None else None)
         self.clock = clock or _SystemClock()
         self.sleep = sleep
@@ -898,14 +898,40 @@ class CampaignDriver:
             return None
 
     @staticmethod
-    def _dispatch_systemd(stage: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch_user_space(stage: dict[str, Any]) -> dict[str, Any]:
+        """Detach one user-space supervisor from the invoking SSH session.
+
+        A session service cannot meet the Halle operating contract because it
+        may require linger or sudo.  A new session, closed stdin and durable
+        append-only output keep this process independent of SSH and Codex while
+        deliberately retaining the documented host-reboot limitation.
+        """
+        import os
         import subprocess
-        result = subprocess.run(["systemctl", "--user", "start", "cloud-network-benchmark-campaign.service"],
-                                check=False, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError("could not hand campaign to systemd user service; install/enable the service and linger first: "
-                               + (result.stderr.strip() or result.stdout.strip()))
-        return {"service": "cloud-network-benchmark-campaign.service", "started": True}
+        import sys
+        state_root = Path(stage["state_root"]).resolve()
+        state_root.mkdir(parents=True, exist_ok=True)
+        log_path = Path(stage.get("operator_log_path") or state_root / "campaign-supervisor.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path = state_root / "campaign-supervisor.pid"
+        if pid_path.is_file():
+            try:
+                old_pid = int(pid_path.read_text().strip())
+                os.kill(old_pid, 0)
+            except (ValueError, ProcessLookupError):
+                pass
+            else:
+                raise RuntimeError(f"campaign supervisor already exists as PID {old_pid}; inspect status before resuming")
+        with log_path.open("ab", buffering=0) as output:
+            process = subprocess.Popen([sys.executable, "-m", "cloud_network_benchmark.campaign_supervisor",
+                                        "--state-root", str(state_root)], stdin=subprocess.DEVNULL,
+                                       stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+                                       close_fds=True, cwd=stage.get("repository_root") or None)
+        temporary = pid_path.with_suffix(".tmp")
+        temporary.write_text(f"{process.pid}\n", encoding="ascii")
+        os.replace(temporary, pid_path)
+        return {"supervisor": "user-space", "pid": process.pid, "started": True,
+                "log": str(log_path), "host_reboot_recovery": "not provided"}
 
 
 class _SystemClock:

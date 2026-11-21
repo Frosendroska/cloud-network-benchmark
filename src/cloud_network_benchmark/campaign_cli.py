@@ -20,9 +20,11 @@ def _parser() -> argparse.ArgumentParser:
         item = commands.add_parser(action)
         item.add_argument("--plan", required=True, type=Path)
         item.add_argument("--settings", type=Path)
-        item.add_argument("--execute", action="store_true", help="required to hand off a campaign to systemd")
+        item.add_argument("--execute", action="store_true", help="required to detach the user-space campaign supervisor")
     status = commands.add_parser("status")
     status.add_argument("--settings", type=Path)
+    resume = commands.add_parser("resume", help="read current durable state without starting or dispatching work")
+    resume.add_argument("--settings", type=Path)
     logs = commands.add_parser("logs")
     logs.add_argument("--settings", type=Path)
     logs.add_argument("--follow", action="store_true")
@@ -48,8 +50,12 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
             result = campaign.run_active(args.state_root)
         else:
             settings = load_operator_settings(args.settings or DEFAULT_SETTINGS)
-            if args.action == "status":
+            if args.action in {"status", "resume"}:
                 result = campaign.status(Path(settings["state_root"]))
+                observer = Path(settings["state_root"]) / "observer-status.json"
+                result = {"campaigns": result, "observer": json.loads(observer.read_text(encoding="utf-8"))
+                          if observer.is_file() and not observer.is_symlink() else None,
+                          "starts_work": False}
             elif args.action == "logs":
                 path = Path(settings.get("operator_log_path") or Path(settings["state_root"]) / "campaign.log")
                 for line in campaign.logs(path, follow=args.follow):
@@ -59,7 +65,7 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
                 result = campaign.continue_supervised(Path(settings["state_root"]), args.stage_id,
                     args.entry_id, confirmed=args.confirm_supervision)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
-        if args.action == "status":
+        if args.action in {"status", "resume"}:
             return 0
         if args.action == "run":
             # A returned status means the durable journal handled the campaign
