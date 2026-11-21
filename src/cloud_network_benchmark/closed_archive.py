@@ -21,30 +21,34 @@ FAT32_FILE_LIMIT = (1 << 32) - 1
 _CHUNK = 1024 * 1024
 
 
-def _sha(path: Path) -> tuple[int, str]:
+def _sha(path: Path, guard: Callable[[], None] | None = None) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
         while block := stream.read(_CHUNK):
+            if guard is not None:
+                guard()
             size += len(block)
             digest.update(block)
     return size, digest.hexdigest()
 
 
-def _safe_files(source: Path) -> list[tuple[str, Path, int, str]]:
+def _safe_files(source: Path, guard: Callable[[], None] | None = None) -> list[tuple[str, Path, int, str]]:
     source = Path(source)
     if source.is_symlink() or not source.is_dir():
         raise ValueError("archive source must be a real directory")
     source = source.resolve(strict=True)
     result = []
     for path in sorted(source.rglob("*")):
+        if guard is not None:
+            guard()
         if path.is_symlink():
             raise ValueError(f"archive source contains a symlink: {path.relative_to(source)}")
         if path.is_file():
             relative = path.relative_to(source).as_posix()
             if not relative or PurePosixPath(relative).is_absolute() or ".." in PurePosixPath(relative).parts:
                 raise ValueError("archive member path is unsafe")
-            size, digest = _sha(path)
+            size, digest = _sha(path, guard)
             result.append((relative, path, size, digest))
     if not result:
         raise ValueError("cannot archive an empty result tree")
@@ -52,8 +56,9 @@ def _safe_files(source: Path) -> list[tuple[str, Path, int, str]]:
 
 
 class _PartSink:
-    def __init__(self, root: Path, max_part_bytes: int):
+    def __init__(self, root: Path, max_part_bytes: int, guard: Callable[[], None] | None = None):
         self.root, self.limit = root, max_part_bytes
+        self.guard = guard
         self.parts: list[dict] = []
         self.archive_hash = hashlib.sha256()
         self.archive_bytes = 0
@@ -70,6 +75,8 @@ class _PartSink:
     def write(self, data: bytes) -> int:
         offset = 0
         while offset < len(data):
+            if self.guard is not None:
+                self.guard()
             if self.stream is None or self.part_bytes == self.limit:
                 self._close_part()
                 self._open()
@@ -173,7 +180,8 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
                           free_bytes: Callable[[Path], int] | None = None,
                           minimum_headroom_bytes: int = 0,
                           minimum_source_headroom_bytes: int = 0,
-                          before_write: Callable[[int], None] | None = None) -> dict:
+                          before_write: Callable[[int], None] | None = None,
+                          guard: Callable[[], None] | None = None) -> dict:
     """Create and publish a deterministic archive directory, preserving source.
 
     Parts use a conservative 4 GiB-minus-one bound by default, so each part is
@@ -190,7 +198,7 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
     destination = Path(destination)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError("archive destination must be new")
-    rows = _safe_files(source)
+    rows = _safe_files(source, guard)
     raw_bytes = sum(row[2] for row in rows)
     upper = projected_archive_upper_bound(raw_bytes, len(rows))
     if free_bytes is not None and free_bytes(source) < minimum_source_headroom_bytes:
@@ -200,7 +208,7 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
         raise OSError("destination free space does not cover archive upper bound and required headroom")
     temp = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".partial", dir=parent))
     try:
-        sink = _PartSink(temp, max_part_bytes)
+        sink = _PartSink(temp, max_part_bytes, guard)
         with gzip.GzipFile(filename="", mode="wb", fileobj=sink, mtime=0, compresslevel=9) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
                 for name, path, size, _digest in rows:

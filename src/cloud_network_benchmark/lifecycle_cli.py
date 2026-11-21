@@ -16,6 +16,19 @@ from .lifecycle_bundle import recommend_calibration_common_n
 from .lifecycle_runtime import load_runtime_config, load_initialized_campaign
 
 
+def _archive_status_projection(result: Any) -> dict[str, Any]:
+    """Keep durable nonsecret archive outcome without request/session data."""
+    outcome = result.values.get("retrieve")
+    evidence = getattr(outcome, "evidence", None)
+    status = getattr(evidence, "archive_status", None)
+    if not isinstance(status, dict):
+        return {"status": "not_configured", "verified": False}
+    keys = {"status", "verified", "bucket", "prefix", "manifest_sha256", "archive_bytes",
+        "controller_archive_disk_bytes", "staging_peak_bytes", "staging_filesystem_free_bytes",
+        "completion_generation", "reason", "error", "partial_objects"}
+    return {key: status[key] for key in sorted(keys & status.keys())}
+
+
 def preview_lifecycle(*, config_path: Path, repository_root: Path,
                        schedule_path: Path | None, row_id: str | None,
                        cost_inputs_path: Path, now: datetime | None = None) -> dict[str, Any]:
@@ -195,6 +208,7 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         if lifecycle.reservation_evidence is not None else None),
                     providers={provider: {"execution_state": item.execution_state,
                         "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
+                        "archive_status": _archive_status_projection(item),
                         "secondary_failures": item.secondary_failures,
                         "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
                             if provider in validations else None)}
@@ -272,7 +286,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             error_report.update(primary_failure=lifecycle.primary_failure,
                 campaign_id=initialized.campaign_id,run_ids={key:value.run_id for key,value in children.items()},
                 providers={key:{"execution_state":value.execution_state,"cleanup_state":value.cleanup_state,
-                    "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures}
+                    "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures,
+                    "archive_status":_archive_status_projection(value)}
                     for key,value in lifecycle.provider_results.items()})
         print(json.dumps(error_report,sort_keys=True),file=sys.stderr)
         return 1 if lifecycle is not None else 2

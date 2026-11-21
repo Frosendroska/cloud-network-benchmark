@@ -87,6 +87,41 @@ def test_healthy_providers_overlap_and_failed_peer_does_not_skip_cleanup():
     assert {p for p, stage in trace.events if stage == "cleanup"} == {"aws", "gcp"}
 
 
+@pytest.mark.parametrize("archive_ok", [True, False])
+def test_archive_verification_controls_retrieval_success_then_cleanup_without_remeasurement(archive_ok):
+    from cloud_network_benchmark.retrieval import RetrievalResult
+    trace = Trace()
+    base = hooks("aws", trace)
+    retrieval = RetrievalResult(complete=archive_ok,
+        failures=[] if archive_ok else [{"reason": "remote verification failed"}],
+        archive_status={"status": "verified" if archive_ok else "failed", "verified": archive_ok})
+    result = ProviderHooks(**{**base.__dict__,
+        "retrieve": lambda: (trace.add("aws", "retrieve") or
+            ProviderStageOutcome("retrieve", archive_ok, retrieval))})
+    outcome = execute_provider_workflows({"aws": result},
+        context=LifecycleContext("session-archive", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for provider, stage in trace.events if provider == "aws"]
+    assert stages.count("measure") == 1
+    assert stages.count("cleanup") == 1 and stages[-1] == "cleanup"
+    assert (outcome.provider_results["aws"].execution_state == "succeeded") is archive_ok
+    assert outcome.provider_results["aws"].cleanup_state == "succeeded"
+    if not archive_ok:
+        assert outcome.provider_results["aws"].primary_failure
+
+
+def test_lifecycle_cli_projects_only_nonsecret_archive_status():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_cli import _archive_status_projection
+    evidence = SimpleNamespace(archive_status={"status": "failed", "verified": False,
+        "bucket": "research-archive", "prefix": "cnb/v1/aws/exp/run/",
+        "partial_objects": [{"key": "manifest.json", "generation": "4"}],
+        "session_uri": "must-not-escape"})
+    result = SimpleNamespace(values={"retrieve": SimpleNamespace(evidence=evidence)})
+    projected = _archive_status_projection(result)
+    assert projected["status"] == "failed" and projected["verified"] is False
+    assert "partial_objects" in projected and "session_uri" not in projected
+
+
 def test_claim_failure_is_provider_local_after_complete_protection():
     trace = Trace()
     rows = {name: hooks(name, trace, fail="claim" if name == "aws" else None)

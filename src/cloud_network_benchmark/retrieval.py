@@ -171,6 +171,7 @@ class RetrievalResult(StrictModel):
     failures: List[dict] = Field(default_factory=list)
     attempts: List[TransferAttempt] = Field(default_factory=list)
     failure: AccessFailureEvidence | None = None
+    archive_status: dict = Field(default_factory=lambda: {"status": "not_configured", "verified": False})
 
 
 def _inventory_script(source_path: str) -> str:

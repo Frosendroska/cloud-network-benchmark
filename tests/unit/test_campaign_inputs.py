@@ -37,6 +37,18 @@ def test_expired_credential_refresh_evidence_cannot_pass_preflight(tmp_path, mon
     assert blockers and any("credential" in value.lower() or "refresh" in value.lower() for value in blockers)
 
 
+def test_archive_paths_must_not_overlap_results_or_private_state(tmp_path, monkeypatch):
+    import cloud_network_benchmark.campaign_inputs as inputs
+    monkeypatch.setattr(inputs, "_selected", lambda _: [])
+    settings = {"state_root": str(tmp_path / "private"), "results_root": str(tmp_path / "results"),
+        "archive_sink": {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
+            "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
+            "archive_root": str(tmp_path / "results" / "archive"),
+            "staging_directory": str(tmp_path / "stage")}}
+    blockers = validate_stage_inputs({"stage": "acceptance"}, settings, tmp_path)
+    assert any("must not overlap results_root" in item for item in blockers)
+
+
 def test_runner_uses_locally_frozen_common_n_without_running_measurement_analysis(tmp_path, monkeypatch):
     import json
     import cloud_network_benchmark.campaign_inputs as inputs

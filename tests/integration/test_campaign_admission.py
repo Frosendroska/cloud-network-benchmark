@@ -51,7 +51,7 @@ def operator_settings(tmp_path, root, monkeypatch):
     keys = {"authentication_reference": str(key), "controller_cidr": "192.0.2.1/32",
             "diagnostic_interfaces": {"vm_a": "ens5", "vm_b": "ens5"}}
     settings = {"schema_version": 1, "state_root": str(tmp_path / "private"),
-        "results_root": str(tmp_path / "results"), "minimum_free_bytes": 1024,
+        "results_root": str(tmp_path / "results"), "minimum_free_bytes": 4096,
         "ledger": {"path": str(tmp_path / "private" / "ledger.json"), "scope_id": "offline-generated-shared"},
         "credential_refresh": {"confirmed": True, "source": str(source),
             "valid_through_utc": (datetime.now(timezone.utc) + timedelta(days=40)).isoformat()},
@@ -89,6 +89,13 @@ def operator_settings(tmp_path, root, monkeypatch):
                 "stabilization_seconds": 60, "measurement_seconds": measurement, "measurement_shutdown_seconds": 1,
                 "retrieval_seconds": 20, "cleanup_seconds": 20, "source_id": "synthetic-measured-fixture",
                 "provider_leads_seconds": {"aws": 360, "azure": 60, "gcp": 60}}}
+    settings["approvals"]["size_export_review"] = {"confirmed": True, "source": str(source),
+        "fields": {"measured_run_raw_bytes": 1, "measured_run_seconds": 180,
+            "expected_raw_bytes": 2000, "expected_archive_bytes": 100,
+            "max_guest_raw_bytes": 1, "measured_guest_free_bytes": 1000,
+            "guest_headroom_bytes": 1, "destination_headroom_bytes": 1,
+            "archive_manifest_sha256": "a" * 64, "archive_checksum_verified": True,
+            "expected_archive_part_count": 1}}
     return settings
 
 
@@ -157,6 +164,25 @@ def test_generated_week_freezes_the_bounded_source_hashed_pair_policy(repository
     assert len({entry["private_root"] for entry in stage["entries"]}) == 56
     assert len({entry["runtime_config_path"] for entry in stage["entries"]}) == 56
     assert len({run_id for entry in stage["entries"] for run_id in entry["run_ids"].values()}) == 168
+
+
+def test_archive_sink_runtime_config_loads_through_real_stage_generation(repository_root, tmp_path, monkeypatch, request):
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    archive_root, staging_root = tmp_path / "archive", tmp_path / "archive-staging"
+    archive_root.mkdir()
+    staging_root.mkdir()
+    settings["archive_sink"] = {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
+        "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
+        "archive_root": str(archive_root), "staging_directory": str(staging_root)}
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+    entry = stage["entries"][0]
+    runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+    assert runtime["archive_sink"]["bucket"] == "valid-bucket"
+    assert runtime["archive_sink"]["maximum_archive_bytes"] == 1_000_000
+    assert runtime["archive_sink"]["archive_root"] == archive_root
+    assert runtime["archive_sink"]["staging_directory"] == staging_root
 
 
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):

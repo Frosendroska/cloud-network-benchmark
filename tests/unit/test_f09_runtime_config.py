@@ -32,6 +32,15 @@ def test_runtime_config_requires_exact_provider_selection(tmp_path):
         load_runtime_config(path, selected_providers={"gcp"})
 
 
+def test_post_provision_remainder_uses_only_the_original_reserved_components():
+    from cloud_network_benchmark.lifecycle_runtime import _post_provision_seconds
+    allowance = WorkflowAllowance(registration_seconds=10, provision_seconds=20,
+        readiness_seconds=30, stabilization_seconds=40, measurement_seconds=50,
+        measurement_shutdown_seconds=5, retrieval_seconds=15, cleanup_seconds=25,
+        source_id="synthetic-test", provider_leads_seconds={"aws": 1})
+    assert _post_provision_seconds(allowance) == 165
+
+
 def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_root, tmp_path):
     campaign, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml",
                                    repository_root)

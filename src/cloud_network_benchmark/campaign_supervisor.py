@@ -57,9 +57,24 @@ def observe(state_root: Path, stop: threading.Event, interval: float = 30.0) -> 
             entries = journal.get("entries", {})
             liabilities = []
             output_freshness = {}
+            archive_status = {}
+            archive_faults = []
             stale_outputs = []
             for entry_id, row in entries.items():
                 result = row.get("result") or {}
+                provider_results = result.get("provider_results", {})
+                if isinstance(provider_results, dict):
+                    archives = {provider: value.get("archive_status")
+                        for provider, value in provider_results.items()
+                        if isinstance(value, dict) and value.get("archive_status") is not None}
+                    if archives:
+                        archive_status[entry_id] = archives
+                        for provider, archive in archives.items():
+                            state = archive.get("status")
+                            if state in {"failed", "withheld"} or (
+                                    state != "not_configured" and archive.get("verified") is not True):
+                                archive_faults.append({"entry_id": entry_id, "provider": provider,
+                                    "status": state, "verified": archive.get("verified")})
                 if result.get("cleanup_open") is True or result.get("launch_uncertain") is True:
                     liabilities.append({"entry_id": entry_id, "cleanup_open": result.get("cleanup_open"),
                                         "launch_uncertain": result.get("launch_uncertain")})
@@ -99,11 +114,13 @@ def observe(state_root: Path, stop: threading.Event, interval: float = 30.0) -> 
                 "provider_expiry_evidence": {
                     key: (row.get("result") or {}).get("provider_results", {}) for key, row in entries.items()
                     if (row.get("result") or {}).get("provider_results")},
+                "remote_archive_status": archive_status,
+                "remote_archive_faults": archive_faults,
                 "credential_preflight": preflight,
                 "disk": {"path": str(state_root), "free_bytes": usage.free, "total_bytes": usage.total,
                          "minimum_free_bytes": minimum_free,
                          "below_minimum": disk_below_minimum},
-                "health": "fault" if liabilities or stale_outputs or disk_below_minimum or preflight.get("status") == "blocked" or any(x == "failed" for x in
+                "health": "fault" if liabilities or stale_outputs or archive_faults or disk_below_minimum or preflight.get("status") == "blocked" or any(x == "failed" for x in
                     (row.get("state") for row in entries.values())) else "healthy",
                 "observer_mode": "read_only_provider_identity_and_expiry",
             }

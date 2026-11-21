@@ -33,9 +33,12 @@ def test_launch_detaches_one_user_space_supervisor_without_systemd_or_linger(tmp
 
 
 def test_user_space_supervisor_keeps_host_reboot_risk_explicit():
-    source = (ROOT / "src/cloud_network_benchmark/campaign.py").read_text()
-    assert "start_new_session=True" in source
-    assert "host_reboot_recovery\": \"not provided\"" in source
+    campaign_source = (ROOT / "src/cloud_network_benchmark/campaign.py").read_text()
+    supervisor_source = (ROOT / "src/cloud_network_benchmark/campaign_supervisor.py").read_text()
+    assert "user-space supervisor" in campaign_source
+    assert "cloud-network-benchmark-campaign.service" not in campaign_source
+    assert "start_new_session=True" in campaign_source
+    assert "host_reboot_recovery\": \"not provided\"" in campaign_source
 
 
 @pytest.mark.parametrize("outcome", ["complete", "failed", "missed", "awaiting_operator"])
@@ -145,6 +148,41 @@ def test_observer_reports_child_failure_missed_state_and_low_disk(tmp_path, monk
     assert snapshot["missed_entries"] == (["entry-1"] if row_state == "missed" else [])
     assert snapshot["disk"]["below_minimum"] is (free < minimum)
     assert snapshot["disk"]["minimum_free_bytes"] == minimum
+
+
+def test_observer_exposes_failed_remote_archive_and_keeps_health_faulted(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.campaign_supervisor as supervisor
+
+    state = tmp_path / "state"
+    stage_dir = state / "stage-1"
+    stage_dir.mkdir(parents=True)
+    stage = {"stage_id": "stage-1", "stage": "acceptance", "results_root": str(tmp_path / "results"),
+        "minimum_free_bytes": 0, "entries": []}
+    journal = {"entries": {"entry-1": {"state": "failed", "result": {
+        "cleanup_open": True, "provider_results": {"aws": {
+            "execution_state": "failed", "cleanup_state": "succeeded",
+            "archive_status": {"status": "failed", "verified": False,
+                "partial_objects": [{"key": "cnb/v1/aws/exp/run/manifest.json", "generation": "7"}]}}}}}}}
+    (stage_dir / "prepared-stage.json").write_text(json.dumps(stage))
+    (stage_dir / "campaign-journal.json").write_text(json.dumps(journal))
+    (state / "active-stage.json").write_text(json.dumps({"stage_id": "stage-1",
+        "stage_path": str(stage_dir / "prepared-stage.json")}))
+    monkeypatch.setattr(supervisor, "_read_only_preflight", lambda _: {"status": "qualified"})
+
+    class StopAfterOne:
+        calls = 0
+        def is_set(self):
+            return self.calls > 0
+        def wait(self, _):
+            self.calls += 1
+
+    supervisor.observe(state, StopAfterOne(), interval=0)
+    snapshot = json.loads((state / "observer-status.json").read_text())
+    assert snapshot["health"] == "fault"
+    assert snapshot["remote_archive_status"]["entry-1"]["aws"]["verified"] is False
+    assert snapshot["remote_archive_faults"][0]["provider"] == "aws"
+    assert snapshot["cleanup_liabilities"][0]["entry_id"] == "entry-1"
 
 
 def test_periodic_preflight_reports_identity_terraform_and_expiry_without_leaking_output(monkeypatch):

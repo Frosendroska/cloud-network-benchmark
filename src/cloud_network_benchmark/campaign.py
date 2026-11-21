@@ -182,10 +182,10 @@ class CampaignDriver:
             pointer = state_root / "active-stage.json"
             _write_json(pointer, {"stage_id": stage["stage_id"], "stage_path": str(journal_path.parent / "prepared-stage.json")})
         dispatch_result = self.dispatch(stage)
-        _append_log(stage, f"stage {stage['stage_id']} dispatched to systemd; {len(stage['entries'])} planned entries")
+        _append_log(stage, f"stage {stage['stage_id']} dispatched to user-space supervisor; {len(stage['entries'])} planned entries")
         return {"status": "dispatched", "stage_id": stage["stage_id"],
                 "journal": str(journal_path), "entries": len(journal["entries"]),
-                "service": "cloud-network-benchmark-campaign.service", "dispatch": dispatch_result}
+                "supervisor": dispatch_result.get("supervisor", "unknown"), "dispatch": dispatch_result}
 
     def run(self, stage: dict[str, Any]) -> dict[str, Any]:
         state_root = Path(stage["state_root"]).resolve()

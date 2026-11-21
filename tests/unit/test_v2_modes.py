@@ -14,13 +14,13 @@ from cloud_network_benchmark.contracts.common import Evidence
 from cloud_network_benchmark.errors import ValidationError
 
 
-def test_ten_configs_cover_four_modes_and_complete_scenario_matrix(repository_root: Path) -> None:
+def test_registered_configs_cover_four_modes_and_complete_scenario_matrix(repository_root: Path) -> None:
     experiment_paths = sorted((repository_root / "configs/experiments").glob("*.yaml"))
     test_paths = sorted((repository_root / "configs/tests").glob("*.yaml"))
     paths = experiment_paths + test_paths
-    assert len(paths) == 10
+    assert len(paths) == 12
     configs = [CampaignConfiguration.model_validate(yaml.safe_load(path.read_text())) for path in paths]
-    assert len({config.config_id for config in configs}) == 10
+    assert len({config.config_id for config in configs}) == 12
     expected_ids = {
         "exp-001-multi-provider.yaml": "exp-001-short",
         "exp-002-cross-zone.yaml": "exp-002-short",
@@ -29,10 +29,13 @@ def test_ten_configs_cover_four_modes_and_complete_scenario_matrix(repository_ro
         "exp-001-calibration.yaml": "exp-001-calibration",
         "exp-001-diagnostic-day.yaml": "exp-001-day",
         "exp-900-single-provider.yaml": "exp-900-acceptance",
+        "exp-900-single-provider-north.yaml": "exp-900-north-acceptance",
         "exp-901-azure-single-provider.yaml": "exp-901-acceptance",
         "exp-902-gcp-single-provider.yaml": "exp-902-acceptance",
+        "exp-902-gcp-single-provider-north.yaml": "exp-902-north-acceptance",
         "exp-903-three-provider-smoke.yaml": "exp-903-acceptance",
     }
+    assert len({config.config_id for config in configs}) == len(expected_ids)
     assert {path.name: config.config_id for path, config in zip(paths, configs)} == expected_ids
     assert configs[-1].context == "standard"
     assert {config.mode for config in configs} == {"acceptance", "short_study", "calibration", "diagnostic_day"}

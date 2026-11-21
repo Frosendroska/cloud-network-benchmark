@@ -203,6 +203,28 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
     try:
         entries = _selected(plan)
         stage = plan["stage"]
+        archive_sink = settings.get("archive_sink")
+        if archive_sink is not None:
+            from .gcs_archive import valid_bucket_name
+            if (not isinstance(archive_sink, dict)
+                    or set(archive_sink) != {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                        "minimum_controller_free_bytes", "archive_root", "staging_directory"}
+                    or not valid_bucket_name(archive_sink.get("bucket"))
+                    or type(archive_sink.get("maximum_staging_bytes")) is not int
+                    or archive_sink["maximum_staging_bytes"] <= 0
+                    or type(archive_sink.get("maximum_archive_bytes")) is not int
+                    or archive_sink["maximum_archive_bytes"] <= 0
+                    or type(archive_sink.get("minimum_controller_free_bytes")) is not int
+                    or archive_sink["minimum_controller_free_bytes"] < 0):
+                raise ValueError("archive_sink requires a bucket and measured archive, staging and free-space bounds")
+            _path(archive_sink["archive_root"], "archive_sink.archive_root")
+            _path(archive_sink["staging_directory"], "archive_sink.staging_directory")
+            for label in ("archive_root", "staging_directory"):
+                candidate = Path(archive_sink[label])
+                for base_name in ("results_root", "state_root"):
+                    base = Path(settings[base_name])
+                    if candidate == base or candidate in base.parents or base in candidate.parents:
+                        raise ValueError(f"archive_sink.{label} must not overlap {base_name}")
         _path(settings.get("state_root"), "state_root")
         _path(settings.get("results_root"), "results_root")
         if Path(settings["state_root"]) == Path(settings["results_root"]):
@@ -668,6 +690,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 "bootstrap": _bootstrap(), "guest_remote_root": "/var/lib/cnb/work",
                 "diagnostic_interfaces": {p: settings["providers"][p]["diagnostic_interfaces"] for p in providers}},
             "providers": provider_runtime, "approval_refs": approvals}
+        if settings.get("archive_sink") is not None:
+            runtime["archive_sink"] = copy.deepcopy(settings["archive_sink"])
         runtime_path = private / entry["entry_id"] / "runtime.json"
         runtime_path.parent.mkdir(exist_ok=True, mode=0o700)
         atomic_write_json(runtime_path, runtime)

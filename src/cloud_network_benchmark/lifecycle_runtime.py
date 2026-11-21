@@ -21,6 +21,14 @@ def _constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is forbidden: {value}")
 
 
+def _post_provision_seconds(allowance: Any) -> float:
+    """Bound remaining work after registration and the reserved VM provision phase."""
+    remaining = float(allowance.total_seconds) - float(allowance.registration_seconds) - float(allowance.provision_seconds)
+    if not math.isfinite(remaining) or remaining < 0:
+        raise ValueError("F11 post-provision remainder is invalid")
+    return remaining
+
+
 def _keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError(f"{label} must contain exactly: {', '.join(sorted(expected))}")
@@ -69,8 +77,10 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
                          parse_constant=_constant)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("runtime configuration is not valid UTF-8 JSON") from exc
-    root = _keys(raw, {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
-        "copy_retry_seconds", "access", "providers", "approval_refs"}, "runtime config")
+    root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
+        "copy_retry_seconds", "access", "providers", "approval_refs"}
+    root = _keys(raw, root_keys | ({"archive_sink"} if isinstance(raw, dict) and "archive_sink" in raw else set()),
+        "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
     root["initialized_campaign_manifest"] = _source_path(path.parent,
@@ -83,6 +93,19 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("ledger.initialize_if_missing must be boolean")
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
+    if "archive_sink" in root:
+        sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+            "minimum_controller_free_bytes", "archive_root", "staging_directory"},
+            "archive_sink")
+        from .gcs_archive import valid_bucket_name
+        if (not valid_bucket_name(sink["bucket"])
+                or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
+                or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
+                or type(sink["minimum_controller_free_bytes"]) is not int
+                or sink["minimum_controller_free_bytes"] < 0):
+            raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
+        for field in ("archive_root", "staging_directory"):
+            sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
     allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
         "readiness_seconds", "stabilization_seconds", "measurement_seconds",
         "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds",
@@ -486,8 +509,7 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
         "complete_workflow_remaining_seconds": ceil(remaining.total_seconds),
         "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
             runtime["allowance"], "preparation").total_seconds),
-        "post_provision_workflow_seconds": ceil(_remaining_f11_allowance(
-            runtime["allowance"], "post_provision").total_seconds),
+        "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
         "registration_timeout_seconds": ceil(runtime["allowance"].registration_seconds)}
     if observation.admission.requires_primary_review:
         review = sources.get("primary_review_path")
@@ -575,6 +597,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                     ledger=ledger, reservation=reservation, runner=runner, clock=clock,
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",
+                    archive_sink=runtime.get("archive_sink"),
                     sleep=runtime.get("sleep", __import__("time").sleep))
         workflows = build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
@@ -736,8 +759,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     runtime["allowance"], "registration").total_seconds),
                 "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
                     runtime["allowance"], "preparation").total_seconds),
-                "post_provision_workflow_seconds": ceil(_remaining_f11_allowance(
-                    runtime["allowance"], "post_provision").total_seconds),
+                "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
                 "registration_timeout_seconds": ceil(runtime["allowance"].registration_seconds)}
             if observation.admission.requires_primary_review:
                 review = row["sources"].get("primary_review_path")
