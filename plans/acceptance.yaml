@@ -1,2 +1,8 @@
 stage: acceptance
 settings: /etc/cloud-network-benchmark/operator.yaml
+configs:
+  s1_acceptance: configs/tests/exp-903-three-provider-smoke.yaml
+  aws_failure: configs/tests/exp-900-single-provider-north.yaml
+  azure_failure: configs/tests/azure-901-single-provider-north.yaml
+  gcp_failure: configs/tests/exp-902-gcp-single-provider-north.yaml
+  s3_acceptance: configs/experiments/exp-003-placement-optimization.yaml

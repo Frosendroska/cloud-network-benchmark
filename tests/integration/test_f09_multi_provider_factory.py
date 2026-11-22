@@ -536,20 +536,22 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 for p in ("aws", "azure", "gcp")}},
         "providers": {
             "aws": {"options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
-                "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}, "public_key_path": pub,
+                "ami_ids": {"eu-central-1": "ami-0123456789abcdef0",
+                    "eu-north-1": "ami-084df9e6ad4622caf"}, "public_key_path": pub,
                 "authentication_reference": str(identities["aws"])}, "bootstrap_template": ROOT / "terraform/aws/pair/main.tf",
                 "terraform_directory": ROOT / "terraform/aws", "sources": {"expiry_cost_path": aws_cost,
                     "primary_review_path": None}},
             "azure": {"options": {"subscription_id": "00000000-0000-0000-0000-000000000001",
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
-                "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
+                "selected_image": "Canonical:ubuntu-24_04-lts:server:24.04.202610250",
                 "ssh_public_key_path": pub, "authentication_reference": str(identities["azure"]),
                 "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
                 "bootstrap_template": ROOT / "terraform/azure/pair/main.tf", "terraform_directory": ROOT / "terraform/azure",
                 "sources": {"expiry_cost_path": azure_cost, "primary_review_path": None}},
             "gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
                 "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
-                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"},
+                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
+                    "europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105"},
                 "public_key_path": pub, "authentication_reference": str(identities["gcp"])},
                 "bootstrap_template": ROOT / "terraform/gcp/pair/main.tf", "terraform_directory": ROOT / "terraform/gcp",
                 "sources": {"workflow_cost_handoff_path": gcp_handoff,
@@ -578,6 +580,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             def __init__(self, root):
                 self.clock = clock
                 self.aws = FakePreparedAwsRunner()
+                self.aws.region = "eu-north-1"
+                self.aws.zone = "eu-north-1a"
+                self.aws.image_id = runtime["providers"]["aws"]["options"]["ami_ids"][self.aws.region]
                 self.gcp = GcpSourceRunner()
                 self.gcp.clock = clock
                 self.azure = None
@@ -676,15 +681,32 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 if request.action_id.startswith("azure-"):
                     assert self.azure is not None
                     self.azure.now = clock.utc_now()
+                    if request.action_type == "image_preflight":
+                        publisher, offer, sku, version = self.azure.o.selected_image.split(":")
+                        image_id = (f"/subscriptions/{self.azure.o.subscription_id}/providers/Microsoft.Compute/locations/swedencentral/"
+                            f"publishers/{publisher}/artifacttypes/vmimage/offers/{offer}/skus/{sku}/versions/{version}")
+                        payload = {"id": image_id, "name": version, "location": "swedencentral",
+                            "architecture": "x64", "osDiskImage": {"operatingSystem": "Linux"}}
+                        now = clock.utc_now()
+                        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                            finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
                     if request.action_type == "vm_image_observation":
                         self.azure.requests.append(request)
                         publisher, offer, sku, version = self.azure.o.selected_image.split(":")
-                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
+                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"swedencentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                             "offer": offer, "sku": sku, "exactVersion": version}}}
                         now = clock.utc_now()
                         return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
                             finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
                     outcome = self.azure.run(request)
+                    if request.action_type == "pair_output" and outcome.outcome == "succeeded":
+                        output = json.loads(outcome.stdout)
+                        for role in ("vm_a", "vm_b"):
+                            output[role]["value"]["region"] = "swedencentral"
+                        outcome = CommandResult(action_id=outcome.action_id, outcome=outcome.outcome,
+                            started_at=outcome.started_at, finished_at=outcome.finished_at,
+                            duration_seconds=outcome.duration_seconds, exit_code=outcome.exit_code,
+                            stdout=json.dumps(output), stderr=outcome.stderr)
                     if request.action_type == "pair_destroy" and outcome.outcome == "succeeded":
                         self.azure.account_present = False
                         self.azure.present_children.clear()
@@ -914,7 +936,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert provider_result.values["protect"].state == "registered", (provider_name, provider_result.values)
             assert provider_result.values["claim"].eligible is True, (provider_name, provider_result.values["claim"])
             assert provider_result.values["claim"].creation_granted is True, (provider_name, provider_result.values["claim"])
-            assert provider_result.values["create"] is not None, (provider_name, provider_result.primary_failure, provider_result.values)
+            assert provider_result.values.get("create") is not None, (provider_name, provider_result.primary_failure, provider_result.values)
             created = provider_result.values["create"]
             if provider_name == "azure":
                 created = created.deployment
