@@ -103,35 +103,36 @@ class LocalMeasurementProcesses:
             out.close()
             err.close()
             raise
+        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events,
+                              self.preview_bytes, None, self.observer_callback)
+        for name, pipe, target in (("stdout", proc.stdout, out), ("stderr", proc.stderr, err)):
+            thread = threading.Thread(target=self._drain, args=(handle, name, pipe, target), daemon=True)
+            handle.threads.append(thread)
+            thread.start()
         try:
             observer_record = self._observer_record(request, proc.pid, proc_root=self.proc_root) if self.observer_callback else None
-        except BaseException:
-            proc.terminate()
-            proc.wait()
-            out.close()
-            err.close()
-            raise
-        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events,
-                              self.preview_bytes, observer_record, self.observer_callback)
+        except BaseException as start_error:
+            try:
+                self.stop(handle, started_mono + request.timeout_seconds)
+            except BaseException as cleanup_error:
+                raise RuntimeError("observer process identity failed and bounded process cleanup failed") from cleanup_error
+            raise start_error
+        handle.observer_record = observer_record
         if observer_record is not None:
             try:
                 self.observer_callback({"event": "started", **observer_record})
-            except BaseException:
-                proc.terminate()
-                proc.wait()
-                out.close()
-                err.close()
-                raise
+            except BaseException as start_error:
+                try:
+                    self.stop(handle, started_mono + request.timeout_seconds)
+                except BaseException as cleanup_error:
+                    raise RuntimeError("observer publication failed and bounded process cleanup failed") from cleanup_error
+                raise start_error
         if request.stdin is not None and proc.stdin is not None:
             try:
                 proc.stdin.write(request.stdin.encode())
                 proc.stdin.close()
             except OSError:
                 pass
-        for name, pipe, target in (("stdout", proc.stdout, out), ("stderr", proc.stderr, err)):
-            thread = threading.Thread(target=self._drain, args=(handle, name, pipe, target), daemon=True)
-            handle.threads.append(thread)
-            thread.start()
         waiter = threading.Thread(target=self._watch_exit, args=(handle,), daemon=True)
         handle.threads.append(waiter)
         waiter.start()

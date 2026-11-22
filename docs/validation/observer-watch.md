@@ -67,7 +67,8 @@ Each role contains exact `workspace`, `processes`, and `files`. VM A must publis
 receiver) and `diagnostics`. Every process record has `kind`, `pid`, `boot_id`,
 and `/proc/<pid>/stat` `start_ticks` captured when that exact process starts.
 The guest probe reads the live proc state too; zombie, exited and invalid
-states cannot pass the process check.
+states cannot pass the process check. Linux stopped/tracing states `T` and `t`
+also fail liveness even when PID, boot ID and start ticks still match.
 VM A `files` must include the current Sockperf chunk and any completed chunks,
 plus the local diagnostics path. VM B must include receiver JSONL and local
 diagnostics. File records have workspace-relative `path` and `kind`; Sockperf

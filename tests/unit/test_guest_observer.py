@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from cloud_network_benchmark.guest_observer import observe_bindings, probe_role
 
 
@@ -105,7 +107,8 @@ def test_executed_remote_snippet_rejects_zombie_exited_and_invalid_proc_states(t
     payload = {"workspace": str(workspace), "proc_root": str(proc_root),
         "processes": [{"kind": "producer", "pid": 321}],
         "files": [{"path": "measurements/current.csv", "kind": "sockperf_chunk"}]}
-    for state, expected_alive in (("S", True), ("Z", False), ("X", False), ("?", False)):
+    for state, expected_alive in (("R", True), ("S", True), ("D", True),
+                                  ("T", False), ("t", False), ("Z", False), ("X", False), ("?", False)):
         process_dir = proc_root / "321"
         process_dir.mkdir(exist_ok=True)
         fields = [state] + ["1"] * 18 + ["987"]
@@ -115,6 +118,16 @@ def test_executed_remote_snippet_rejects_zombie_exited_and_invalid_proc_states(t
         process = json.loads(result.stdout)["processes"]["producer"]
         assert process["alive"] is expected_alive
         assert process["state"] == state
+
+
+@pytest.mark.parametrize("state", ["T", "t"])
+def test_stopped_and_tracing_observer_processes_are_not_healthy(state):
+    role = role_binding("vm_a")
+    observed = fresh_probe(role, {"processes": role["processes"], "files": role["files"]})
+    observed["processes"]["producer"]["state"] = state
+    result = probe_role(role, WORKSPACE, "vm_a", now=NOW, owned_role=role, probe=lambda *_: observed)
+    assert result["health"] == "fault"
+    assert "process_identity_mismatch:producer" in result["errors"]
 
 
 def test_receiver_and_diagnostic_staleness_are_faults_and_incomplete_bindings_unknown():

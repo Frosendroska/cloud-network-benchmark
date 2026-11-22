@@ -28,6 +28,61 @@ def test_local_process_boundary_is_replaceable_and_exclusive(tmp_path, monkeypat
     assert ProcessEvent.__name__ == "ProcessEvent"
 
 
+def test_observer_start_identity_failure_uses_bounded_stop_for_term_resistant_child(tmp_path, monkeypatch):
+    class TermResistantPopen:
+        last_instance = None
+
+        def __init__(self, argv, **kwargs):
+            self.argv, self.kwargs = argv, kwargs
+            self.pid = 8765
+            self.returncode = None
+            self.stdout, self.stderr = BytesIO(), BytesIO()
+            self.stdin = None
+            self.killed = False
+            self.wait_timeouts = []
+            type(self).last_instance = self
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            assert timeout is not None
+            if not self.killed:
+                time.sleep(min(timeout, 0.01))
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            return self.returncode
+
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", TermResistantPopen)
+    proc_root = tmp_path / "proc"
+    (proc_root / "sys/kernel/random").mkdir(parents=True)
+    (proc_root / "sys/kernel/random/boot_id").write_text("01234567-89ab-cdef-0123-456789abcdef\n")
+    executable = tmp_path / "sockperf"
+    executable.write_text("source-shaped sockperf executable")
+    output_root = tmp_path / "workspace"
+    output_root.mkdir()
+    output = output_root / "measurements/current.csv"
+    output.parent.mkdir()
+    runner = LocalMeasurementProcesses(SystemMeasurementClock(), observer_callback=lambda _event: None,
+                                       proc_root=proc_root)
+    request = CommandRequest(action_id="observer-start-fail", action_type="measurement",
+        argv=[str(executable), "--full-log", str(output)], cwd=str(output_root), timeout_seconds=0.05)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="identity/path is unavailable"):
+        runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    process = TermResistantPopen.last_instance
+    assert process.killed
+    assert process.wait_timeouts and all(value is not None for value in process.wait_timeouts)
+    assert time.monotonic() - started < 0.5
+
+
 def test_local_adapter_drains_both_streams_preserves_bytes_and_bounds_redacted_preview(tmp_path, monkeypatch):
     payload = b"secret-value\n" + b"x" * 100
 
