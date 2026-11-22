@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 from threading import Barrier
 
 import pytest
@@ -352,6 +353,38 @@ def test_late_cleanup_timing_is_durable_without_reopening_absence_liability(tmp_
     assert result.providers["aws"]["acceptance_failed"] is True
     assert result.providers["aws"]["cleanup"] == "not_required"
     assert result.complete is False
+
+
+@pytest.mark.parametrize(("previous_status", "timing_status", "expected_status", "acceptance_failed"), [
+    (None, "late", "late", True),
+    (None, "within_deadline", "within_deadline", False),
+    ("late", "within_deadline", "late", True),
+    ("unknown", "within_deadline", "unknown", True)])
+def test_cleanup_recovery_projects_new_receipt_timing_after_absence_proof(
+        tmp_path, previous_status, timing_status, expected_status, acceptance_failed):
+    path = tmp_path / "private" / "recovery.json"
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-recovered-timing",
+        controller_session_id="session", reservation_id="reservation-recovered-timing",
+        providers=[{"provider": "aws", "deployment_id": "aws-deployment",
+            "journal_reference": "private/aws.json", "expiry_registered": True,
+            "creation_may_have_started": True, "cleanup_open": True,
+            "cleanup_timing_status": previous_status,
+            "cleanup_timing_failure": "earlier acceptance timing was unresolved"
+                if previous_status else None}])
+    write_recovery_journal(path, recovery)
+    from types import SimpleNamespace
+    cleanup = SimpleNamespace(cleanup_state="succeeded",
+        inventory=SimpleNamespace(value={"cleanup_timing": {"status": timing_status}}))
+    reconciliation = {"absence_proved": True, "billable_resources_present": False,
+        "cleanup_open": False, "billing_final": False, "incurred_usd": 0.0}
+    result = cleanup_lifecycle(path, current_session_id="recovery-session",
+        cleanup_actions={"aws": lambda _record: cleanup}, reconcile=lambda *_args: reconciliation)
+    row = SavedLifecycleRecovery.validate_unique(json.loads(path.read_text())).providers[0]
+    assert row.cleanup_open is False
+    assert row.cleanup_timing_status == expected_status
+    assert result.providers["aws"]["absence_proved"] is True
+    assert result.providers["aws"]["acceptance_failed"] is acceptance_failed
+    assert result.complete is (not acceptance_failed)
 
 
 def test_admission_is_reserved_before_provider_factory_and_offline_scope_never_dispatches():

@@ -696,7 +696,9 @@ class AwsProviderDriver:
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
         timing = dict(journal.get("cleanup_acceptance_timing", {}))
         timing["routine_deadline_utc"] = acceptance_routine_end.isoformat()
-        if timing.get("status") not in {"late", "unknown"} and self.clock().astimezone(timezone.utc) >= acceptance_routine_end:
+        if (len(self._cleanup_acceptance_deadlines) == 1
+                and timing.get("status") not in {"late", "unknown"}
+                and self.clock().astimezone(timezone.utc) >= acceptance_routine_end):
             timing["status"] = "late"
         if len(self._cleanup_acceptance_deadlines) > 1:
             timing["absence_deadline_utc"] = self._cleanup_acceptance_deadlines[-1].isoformat()
@@ -1446,8 +1448,13 @@ class AwsProviderDriver:
     def _failed_cleanup(self, inventory: dict[str, Any], secondary: list[FailureEvidence], primary: FailureEvidence | None, failure: FailureEvidence, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
         journal = self._load_journal(self._attempt_dir(deployment), deployment)
         expiry = self._expiry_from_journal(deployment, journal)
-        timing = {"status": "late" if any(self.clock().astimezone(timezone.utc) >= bound
-            for bound in self._cleanup_acceptance_deadlines) else "within_deadline"}
+        timing = dict(journal.get("cleanup_acceptance_timing", {}))
+        if timing.get("status") not in {"late", "unknown"}:
+            final_phase_deadline = (self._cleanup_acceptance_deadlines[-1]
+                if self._cleanup_acceptance_deadlines else None)
+            timing["status"] = ("late" if final_phase_deadline is not None
+                and self.clock().astimezone(timezone.utc) >= final_phase_deadline
+                else "within_deadline")
         if self._cleanup_acceptance_deadlines:
             timing["routine_deadline_utc"] = self._cleanup_acceptance_deadlines[0].isoformat()
             if len(self._cleanup_acceptance_deadlines) > 1:

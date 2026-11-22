@@ -538,9 +538,10 @@ def test_aws_cleanup_runs_bounded_recovery_after_original_stop_deadline(tmp_path
     assert expired.expires_at.value == cap_end
 
 
-@pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
+@pytest.mark.parametrize(("routine_finish", "absence_finish", "expected_status"), [
+    (599, 601, "within_deadline"), (601, 603, "late"), (599, 661, "late")])
 def test_aws_cleanup_checks_routine_and_absence_at_their_own_boundaries(
-        tmp_path, routine_finish, expected_status):
+        tmp_path, routine_finish, absence_finish, expected_status):
     class Runner:
         def run(self, request):
             identity = legacy_cleanup_read_reply(request)
@@ -561,9 +562,11 @@ def test_aws_cleanup_checks_routine_and_absence_at_their_own_boundaries(
     calls = [0]
     def inventory(*_args):
         calls[0] += 1
-        current[0] = NOW + timedelta(seconds=routine_finish if calls[0] == 1 else routine_finish+2)
+        current[0] = NOW + timedelta(seconds=routine_finish)
         return {"complete": True, "remaining": {}, "resources": {}}
     driver._inventory_region = inventory
+    driver._verify_safety_absent = lambda *_args: current.__setitem__(
+        0, NOW+timedelta(seconds=absence_finish)) or True
     result = driver.cleanup(deployment)
     assert result.cleanup_state == "succeeded"
     assert result.inventory.value["cleanup_timing"]["status"] == expected_status

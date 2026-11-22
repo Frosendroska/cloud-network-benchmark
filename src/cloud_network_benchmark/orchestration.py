@@ -222,14 +222,43 @@ def update_provider_recovery(recovery_path: Path, provider: str, stage: str, sta
                     payload["creation_may_have_started"] = True
                 if stage == "protect" and status == "succeeded":
                     payload["expiry_registered"] = True
-                if stage == "cleanup" and status == "succeeded":
-                    payload.update(expiry_registered=False, creation_may_have_started=False, cleanup_open=False)
+                if stage == "cleanup":
                     if cleanup_timing_status in {"within_deadline", "late", "unknown"}:
                         payload["cleanup_timing_status"] = cleanup_timing_status
                         payload["cleanup_timing_failure"] = cleanup_timing_failure
+                    if status == "succeeded":
+                        payload.update(expiry_registered=False, creation_may_have_started=False, cleanup_open=False)
             rows.append(payload)
         return SavedLifecycleRecovery.model_validate({**recovery.model_dump(), "providers": rows}), None
     _mutate_recovery_journal(recovery_path, update)
+
+
+def _sticky_cleanup_timing(previous: str | None, current: str | None) -> str | None:
+    """Keep an earlier acceptance failure when later cleanup evidence is better."""
+    priority = {"within_deadline": 0, "unknown": 1, "late": 2}
+    if previous not in priority:
+        return current
+    if current not in priority:
+        return previous
+    return previous if priority[previous] >= priority[current] else current
+
+
+def _saved_cleanup_timing_status(recovery_path: Path, provider: str) -> str | None:
+    recovery = SavedLifecycleRecovery.validate_unique(
+        json.loads(recovery_path.read_text(encoding="utf-8")))
+    matches = [item for item in recovery.providers if item.provider == provider]
+    if len(matches) != 1:
+        raise ValueError("provider recovery record is missing or ambiguous")
+    return matches[0].cleanup_timing_status
+
+
+def _saved_cleanup_timing_failure(recovery_path: Path, provider: str) -> str | None:
+    recovery = SavedLifecycleRecovery.validate_unique(
+        json.loads(recovery_path.read_text(encoding="utf-8")))
+    matches = [item for item in recovery.providers if item.provider == provider]
+    if len(matches) != 1:
+        raise ValueError("provider recovery record is missing or ambiguous")
+    return matches[0].cleanup_timing_failure
 
 
 def update_archive_recovery(recovery_path: Path, provider: str, archive_status: Mapping[str, Any]) -> None:
@@ -396,6 +425,31 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                 cleanup_result = action(record)
             except BaseException as exc:
                 errors.append(f"cleanup failed ({type(exc).__name__})")
+        cleanup_inventory = getattr(getattr(cleanup_result, "inventory", None), "value", None)
+        cleanup_timing_row = (cleanup_inventory.get("cleanup_timing")
+            if isinstance(cleanup_inventory, Mapping) else None)
+        cleanup_timing_status = (cleanup_timing_row.get("status")
+            if isinstance(cleanup_timing_row, Mapping) else getattr(cleanup_result, "timing_status", None))
+        cleanup_timing_status = _sticky_cleanup_timing(record.cleanup_timing_status, cleanup_timing_status)
+        cleanup_timing_failure = getattr(cleanup_result, "timing_failure", None)
+        if cleanup_timing_failure is not None and not isinstance(cleanup_timing_failure, str):
+            cleanup_timing_failure = getattr(cleanup_timing_failure, "message", str(cleanup_timing_failure))
+            if not isinstance(cleanup_timing_failure, str):
+                cleanup_timing_failure = str(cleanup_timing_failure)
+        if (record.cleanup_timing_status == cleanup_timing_status
+                and cleanup_timing_failure is None):
+            cleanup_timing_failure = record.cleanup_timing_failure
+        if cleanup_timing_status in {"within_deadline", "late", "unknown"}:
+            cleanup_timing = {"cleanup_timing_status": cleanup_timing_status,
+                "cleanup_timing_failure": cleanup_timing_failure,
+                "acceptance_failed": cleanup_timing_status in {"late", "unknown"}}
+            try:
+                update_provider_recovery(recovery_path, record.provider, "cleanup",
+                    "failed",
+                    cleanup_timing_status=cleanup_timing_status,
+                    cleanup_timing_failure=cleanup_timing_failure)
+            except BaseException as exc:
+                errors.append(f"cleanup timing recovery update failed ({type(exc).__name__})")
         try:
             reconciliation = reconcile(record, cleanup_result)
             if ledger is not None:
@@ -431,7 +485,9 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
             # Clear durable liability only after explicit absence and ledger
             # reconciliation evidence; callback return alone is insufficient.
             try:
-                update_provider_recovery(recovery_path, record.provider, "cleanup", "succeeded")
+                update_provider_recovery(recovery_path, record.provider, "cleanup", "succeeded",
+                    cleanup_timing_status=cleanup_timing_status,
+                    cleanup_timing_failure=cleanup_timing_failure)
             except BaseException as exc:
                 errors.append(f"recovery journal update failed ({type(exc).__name__})")
                 reconciled = False
@@ -736,10 +792,19 @@ def execute_provider_workflows(
                         timing = inventory.get("cleanup_timing") if isinstance(inventory, Mapping) else None
                         timing_status = (timing.get("status") if isinstance(timing, Mapping)
                             else getattr(_value, "timing_status", None))
+                        timing_status = _sticky_cleanup_timing(
+                            _saved_cleanup_timing_status(recovery_path, provider), timing_status)
+                    timing_failure = getattr(_value, "timing_failure", None) if stage == "cleanup" else None
+                    if timing_failure is not None and not isinstance(timing_failure, str):
+                        timing_failure = getattr(timing_failure, "message", str(timing_failure))
+                        if not isinstance(timing_failure, str):
+                            timing_failure = str(timing_failure)
+                    if timing_failure is None:
+                        timing_failure = _saved_cleanup_timing_failure(recovery_path, provider)
                     update_provider_recovery(recovery_path, provider, stage,
                         "succeeded" if success else "failed",
                         cleanup_timing_status=timing_status,
-                        cleanup_timing_failure=getattr(_value, "timing_failure", None) if stage == "cleanup" else None)
+                        cleanup_timing_failure=timing_failure)
                     if stage == "cleanup":
                         if timing_status in {"late", "unknown"}:
                             result = results[provider]
