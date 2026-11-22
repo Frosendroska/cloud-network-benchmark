@@ -171,8 +171,16 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     archive_root, staging_root = tmp_path / "archive", tmp_path / "archive-staging"
     archive_root.mkdir()
     staging_root.mkdir()
+    quota_evidence = tmp_path / "quota-evidence.json"
+    quota_payload = json.dumps({"measured_free_bytes": 1_000_000}, sort_keys=True).encode()
+    quota_evidence.write_bytes(quota_payload)
     settings["archive_sink"] = {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
         "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
+        "minimum_guest_free_bytes": 2048, "maximum_capsule_bytes": 65536,
+        "controller_quota_free_bytes": 1_000_000,
+        "controller_quota_evidence_path": str(quota_evidence),
+        "controller_quota_evidence_sha256": hashlib.sha256(quota_payload).hexdigest(),
+        "restore_path": str(tmp_path / "restore"),
         "archive_root": str(archive_root), "staging_directory": str(staging_root)}
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
@@ -181,6 +189,7 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     runtime = load_runtime_config(Path(entry["runtime_config_path"]))
     assert runtime["archive_sink"]["bucket"] == "valid-bucket"
     assert runtime["archive_sink"]["maximum_archive_bytes"] == 1_000_000
+    assert runtime["archive_sink"]["maximum_capsule_bytes"] == 65536
     assert runtime["archive_sink"]["archive_root"] == archive_root
     assert runtime["archive_sink"]["staging_directory"] == staging_root
 

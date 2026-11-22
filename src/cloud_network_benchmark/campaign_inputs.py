@@ -207,16 +207,40 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         if archive_sink is not None:
             from .gcs_archive import valid_bucket_name
             if (not isinstance(archive_sink, dict)
-                    or set(archive_sink) != {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-                        "minimum_controller_free_bytes", "archive_root", "staging_directory"}
+                    or not {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                        "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+                        "controller_quota_free_bytes", "controller_quota_evidence_path",
+                        "controller_quota_evidence_sha256", "archive_root", "staging_directory"}.issubset(archive_sink)
+                    or set(archive_sink) - {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                        "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+                        "controller_quota_free_bytes", "controller_quota_evidence_path",
+                        "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"}
                     or not valid_bucket_name(archive_sink.get("bucket"))
                     or type(archive_sink.get("maximum_staging_bytes")) is not int
                     or archive_sink["maximum_staging_bytes"] <= 0
                     or type(archive_sink.get("maximum_archive_bytes")) is not int
                     or archive_sink["maximum_archive_bytes"] <= 0
                     or type(archive_sink.get("minimum_controller_free_bytes")) is not int
-                    or archive_sink["minimum_controller_free_bytes"] < 0):
-                raise ValueError("archive_sink requires a bucket and measured archive, staging and free-space bounds")
+                    or archive_sink["minimum_controller_free_bytes"] < 0
+                    or type(archive_sink.get("minimum_guest_free_bytes")) is not int
+                    or archive_sink["minimum_guest_free_bytes"] < 0
+                    or type(archive_sink.get("maximum_capsule_bytes")) is not int
+                    or archive_sink["maximum_capsule_bytes"] <= 0
+                    or type(archive_sink.get("controller_quota_free_bytes")) is not int
+                    or archive_sink["controller_quota_free_bytes"] < 0):
+                raise ValueError("archive_sink requires measured guest/controller bounds and capsule state maximum")
+            _path(archive_sink["controller_quota_evidence_path"], "archive_sink.controller_quota_evidence_path", file=True)
+            from .storage_admission import validate_controller_quota_evidence
+            validate_controller_quota_evidence(archive_sink["controller_quota_free_bytes"],
+                archive_sink["controller_quota_evidence_path"], archive_sink["controller_quota_evidence_sha256"])
+            if "restore_path" in archive_sink:
+                _path(archive_sink["restore_path"], "archive_sink.restore_path")
+            for field in ("archive_root", "staging_directory"):
+                candidate = Path(archive_sink[field])
+                for base_name in ("results_root", "state_root"):
+                    base = Path(settings[base_name])
+                    if candidate == base or candidate in base.parents or base in candidate.parents:
+                        raise ValueError(f"archive_sink.{field} must not overlap {base_name}")
             _path(archive_sink["archive_root"], "archive_sink.archive_root")
             _path(archive_sink["staging_directory"], "archive_sink.staging_directory")
             for label in ("archive_root", "staging_directory"):
@@ -312,13 +336,28 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             raise ValueError("set positive minimum_free_bytes from measured stage storage needs")
         if stage in {"day", "week"}:
             review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
+            remote_archive = archive_sink is not None
+            if remote_archive and review.get("capsule_state_manifest_bytes", 0) < archive_sink["maximum_capsule_bytes"]:
+                raise ValueError("storage review capsule state bound is below archive_sink.maximum_capsule_bytes")
+            if remote_archive and (review.get("controller_quota_free_bytes") != archive_sink["controller_quota_free_bytes"]
+                    or review.get("controller_quota_evidence_sha256") != archive_sink["controller_quota_evidence_sha256"]
+                    or review.get("controller_quota_evidence_path") != archive_sink["controller_quota_evidence_path"]):
+                raise ValueError("storage review controller quota does not match the archive sink evidence")
             validate_storage_review(stage, review, minimum_free_bytes=minimum,
-                                    results_path=Path(settings["results_root"]))
+                                    results_path=Path(settings["results_root"]),
+                                    storage_mode="remote_archive" if remote_archive else "local")
         disk_path = Path(settings["results_root"])
         while not disk_path.exists():
             disk_path = disk_path.parent
-        if shutil.disk_usage(disk_path).free < minimum:
-            raise ValueError("insufficient local free disk for the declared stage requirement")
+        storage_floor = (review.get("expected_concurrent_archive_part_count", 1)
+            * review.get("maximum_archive_part_bytes", 0)
+            + review.get("capsule_state_manifest_bytes", 0)
+            + review.get("controller_reserve_bytes", 0)) if stage in {"day", "week"} and archive_sink is not None else minimum
+        observed_storage_free = (archive_sink["controller_quota_free_bytes"]
+            if stage in {"day", "week"} and archive_sink is not None
+            else shutil.disk_usage(disk_path).free)
+        if observed_storage_free < storage_floor:
+            raise ValueError("measured destination quota or free space is below the declared stage requirement")
         # Check the installed bounded transport before read-only identity APIs.
         # Source-bound amounts and approval still fail closed at admission.
         if not local_preparation:
@@ -692,6 +731,10 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "providers": provider_runtime, "approval_refs": approvals}
         if settings.get("archive_sink") is not None:
             runtime["archive_sink"] = copy.deepcopy(settings["archive_sink"])
+            if stage in {"day", "week"}:
+                review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
+                runtime["archive_sink"]["controller_quota_free_bytes"] = review["controller_quota_free_bytes"]
+                runtime["archive_sink"]["controller_quota_evidence_sha256"] = review["controller_quota_evidence_sha256"]
         runtime_path = private / entry["entry_id"] / "runtime.json"
         runtime_path.parent.mkdir(exist_ok=True, mode=0o700)
         atomic_write_json(runtime_path, runtime)

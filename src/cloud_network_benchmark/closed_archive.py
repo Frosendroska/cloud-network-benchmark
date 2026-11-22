@@ -187,7 +187,8 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
                           minimum_source_headroom_bytes: int = 0,
                           before_write: Callable[[int], None] | None = None,
                           guard: Callable[[], None] | None = None,
-                          on_part: Callable[[Path, dict], None] | None = None) -> dict:
+                          on_part: Callable[[Path, dict], None] | None = None,
+                          include_files: Iterable[str] | None = None) -> dict:
     """Create and publish a deterministic archive directory, preserving source.
 
     Parts use a conservative 4 GiB-minus-one bound by default, so each part is
@@ -205,6 +206,17 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
     if destination.exists() or destination.is_symlink():
         raise FileExistsError("archive destination must be new")
     rows = _safe_files(source, guard)
+    if include_files is not None:
+        selected = list(include_files)
+        if (not selected or len(selected) != len(set(selected))
+                or any(not isinstance(name, str) or not name or PurePosixPath(name).is_absolute()
+                    or PurePosixPath(name).as_posix() != name or ".." in PurePosixPath(name).parts
+                    for name in selected)):
+            raise ValueError("archive file selection must contain unique normalized relative paths")
+        by_name = {row[0]: row for row in rows}
+        if set(selected) - set(by_name):
+            raise ValueError("archive file selection references a missing source file")
+        rows = [by_name[name] for name in sorted(selected)]
     raw_bytes = sum(row[2] for row in rows)
     upper = projected_archive_upper_bound(raw_bytes, len(rows))
     if free_bytes is not None and free_bytes(source) < minimum_source_headroom_bytes:

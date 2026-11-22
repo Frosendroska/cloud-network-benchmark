@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from cloud_network_benchmark.closed_archive import create_closed_archive
-from cloud_network_benchmark.gcs_archive import upload_sealed_archive
+from cloud_network_benchmark.gcs_archive import upload_sealed_archive, publish_guest_archive_parts
 
 
 class Deadline:
@@ -98,6 +98,52 @@ def test_upload_is_immutable_verified_idempotent_and_keeps_native_sources(tmp_pa
         key: value for key, value in second.items() if key != "staging_filesystem_free_bytes"}
     assert first["staging_peak_bytes"] <= 8192
     assert {p.name: p.read_bytes() for p in source.iterdir()} == original
+
+
+def test_guest_parts_publish_generation_bound_manifest_and_completion(tmp_path):
+    backend = FakeGCS()
+    staging = tmp_path / "staging"; staging.mkdir()
+    content = b"closed-native-part"
+    digest = hashlib.sha256(content).hexdigest()
+    part = {"path": "archive.tar.gz.part-00001", "size_bytes": len(content), "sha256": digest}
+    guest_archives = [{"role": role, "manifest": {"files": [{"path": f"{role}/run.csv",
+        "size_bytes": 17, "sha256": "b" * 64}], "parts": [part], "raw_bytes": 17,
+        "archive_bytes": len(content), "archive_sha256": digest}} for role in ("vm_a", "vm_b")]
+    def fetch(role, selected):
+        assert role in {"vm_a", "vm_b"} and selected == part
+        path = staging / "one.part"; path.write_bytes(content); return path
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="approved-later", provider="aws",
+        experiment_id="exp-001", run_id="run-001", closed_inventory={"items": []},
+        maximum_part_bytes=4096, maximum_archive_bytes=4096, minimum_controller_free_bytes=0,
+        controller_quota_free_bytes=100_000, deadline=Deadline(), clock=lambda: 0.0)
+    assert receipt["status"] == "verified"
+    assert receipt["validation_state"] == "archive_pending_validation"
+    assert [row["role"] for row in receipt["manifest"]["roles"]] == ["vm_a", "vm_b"]
+    assert receipt["completion_generation"]
+    assert not list(staging.iterdir())
+
+
+def test_guest_part_publish_preflights_occupied_prefix_without_mutation(tmp_path):
+    backend = FakeGCS()
+    prefix = "cnb/v1/aws/exp-001/run-001/"
+    backend.objects[prefix + "manifest.json"] = (b"occupied", "prior")
+    staging = tmp_path / "staging"; staging.mkdir()
+    called = []
+    content = b"part"; digest = hashlib.sha256(content).hexdigest()
+    part = {"path": "archive.tar.gz.part-00001", "size_bytes": len(content), "sha256": digest}
+    with pytest.raises(ValueError, match="already occupied"):
+        publish_guest_archive_parts(guest_archives=[{"role": role, "manifest": {
+            "files": [{"path": f"{role}/run.csv", "size_bytes": 1, "sha256": "c" * 64}],
+            "parts": [part], "raw_bytes": 1, "archive_bytes": len(content), "archive_sha256": digest}}
+            for role in ("vm_a", "vm_b")],
+            fetch_part=lambda *_: called.append(True),
+            staging_directory=staging, backend=backend, bucket="approved-later", provider="aws",
+            experiment_id="exp-001", run_id="run-001", closed_inventory={}, maximum_part_bytes=4096,
+            maximum_archive_bytes=4096, minimum_controller_free_bytes=0, controller_quota_free_bytes=4096,
+            deadline=Deadline(), clock=lambda: 0.0)
+    assert called == []
+    assert list(backend.objects) == [prefix + "manifest.json"]
 
 
 def test_requires_sealed_archive_and_rejects_changed_part_after_seal(tmp_path):

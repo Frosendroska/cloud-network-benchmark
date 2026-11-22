@@ -76,17 +76,17 @@ class PostMeasurementBarrier:
         try:
             end = clock() + maximum_wait
             while True:
-                if cancelled():
-                    raise InterruptedError("barrier lock acquisition was cancelled")
-                remaining = min(maximum_wait, end - clock())
-                if deadline is not None:
-                    remaining = min(remaining, deadline.remaining(clock, cleanup=True))
-                if remaining <= 0:
-                    raise TimeoutError("barrier lock acquisition reached its bounded deadline")
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
+                    if cancelled():
+                        raise InterruptedError("barrier lock acquisition was cancelled")
+                    remaining = min(maximum_wait, end - clock())
+                    if deadline is not None:
+                        remaining = min(remaining, deadline.remaining(clock, cleanup=True))
+                    if remaining <= 0:
+                        raise TimeoutError("barrier lock acquisition reached its bounded deadline")
                     time.sleep(min(0.025, remaining))
             state = json.loads(self.path.read_text(encoding="utf-8"))
             if state.get("spec_sha256") != self.digest or state.get("spec") != self.spec:
@@ -120,10 +120,16 @@ class PostMeasurementBarrier:
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.lock_path, flags, 0o600)
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise TimeoutError("barrier initialization lock is already held") from exc
+            end = time.monotonic() + 1.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("barrier initialization lock is already held") from exc
+                    time.sleep(min(0.025, remaining))
             if self.path.exists():
                 state = json.loads(self.path.read_text(encoding="utf-8"))
                 if state.get("spec_sha256") != self.digest or state.get("spec") != self.spec:
@@ -191,7 +197,7 @@ class PostMeasurementBarrier:
                 except (TimeoutError, InterruptedError):
                     pass
                 raise TimeoutError("post-measurement barrier reached the original deadline")
-            snapshot = self._locked(lambda state: dict(state), deadline=deadline, clock=clock,
+            snapshot = self._locked(lambda state: dict(state), clock=clock,
                 cancelled=cancelled, maximum_wait=remaining)
             if snapshot["state"] == "released":
                 return snapshot

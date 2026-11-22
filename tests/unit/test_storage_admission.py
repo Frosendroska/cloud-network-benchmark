@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,15 @@ def review(**changes):
         "archive_checksum_verified": True}
     value.update(changes)
     return value
+
+
+def quota_fields(tmp_path, free=222_000):
+    path = tmp_path / "quota-evidence.json"
+    content = json.dumps({"measured_free_bytes": free}, sort_keys=True).encode()
+    path.write_bytes(content)
+    return {"controller_quota_free_bytes": free,
+        "controller_quota_evidence_path": str(path),
+        "controller_quota_evidence_sha256": hashlib.sha256(content).hexdigest()}
 
 
 @pytest.mark.parametrize(("stage", "expected_runs"), [("day", 3), ("week", 168)])
@@ -69,28 +80,45 @@ def test_unverified_or_malformed_archive_manifest_fails_closed(tmp_path):
 
 
 def test_remote_archive_mode_uses_aggregate_controller_peak_and_separate_restore_peak(tmp_path):
-    remote = review(expected_raw_bytes=200_000, expected_archive_bytes=100_000,
+    remote = review(**quota_fields(tmp_path), measured_run_seconds=86_400,
+        expected_raw_bytes=400_000, expected_archive_bytes=100_000,
         expected_archive_part_count=4, expected_concurrent_archive_part_count=3,
         maximum_archive_part_bytes=64_000, capsule_state_manifest_bytes=20_000,
-        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000)
+        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000,
+        maximum_guest_archive_bytes=80_000_000, measured_guest_free_bytes=300_000_000)
     result = validate_storage_review("day", remote, minimum_free_bytes=222_000,
-        results_path=tmp_path / "halle", restore_path=tmp_path / "mac-restore",
-        storage_mode="remote_archive", disk_free=lambda path: 222_000 if "halle" in str(path) else 400_000)
+        results_path=tmp_path / "halle", storage_mode="remote_archive",
+        disk_free=lambda _path: 1)
     assert result["controller_peak_required_bytes"] == 222_000
-    assert result["restore_destination_required_bytes"] == 350_000
-    assert result["observed_restore_free_bytes"] == 400_000
+    assert result["restore_destination_required_bytes"] is None
+    assert result["observed_restore_free_bytes"] is None
 
 
-def test_remote_archive_requires_measured_roomy_restore_space_and_aggregate_parts(tmp_path):
-    remote = review(expected_raw_bytes=200_000, expected_archive_bytes=100_000,
+def test_remote_archive_admission_is_independent_of_later_restore_capacity(tmp_path):
+    remote = review(**quota_fields(tmp_path), measured_run_seconds=86_400,
+        expected_raw_bytes=400_000, expected_archive_bytes=100_000,
         expected_archive_part_count=4, expected_concurrent_archive_part_count=3,
         maximum_archive_part_bytes=64_000, capsule_state_manifest_bytes=20_000,
-        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000)
-    with pytest.raises(OSError, match="roomy restore destination"):
-        validate_storage_review("day", remote, minimum_free_bytes=222_000,
-            results_path=tmp_path, restore_path=tmp_path / "mac",
-            storage_mode="remote_archive", disk_free=lambda _: 222_000)
+        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000,
+        maximum_guest_archive_bytes=80_000_000, measured_guest_free_bytes=300_000_000)
+    result = validate_storage_review("day", remote, minimum_free_bytes=222_000,
+        results_path=tmp_path, storage_mode="remote_archive", disk_free=lambda _: 1)
+    assert result["observed_destination_free_bytes"] == remote["controller_quota_free_bytes"]
     with pytest.raises(ValueError, match="aggregate archive part inventory"):
         validate_storage_review("day", {**remote, "expected_archive_part_count": 1}, minimum_free_bytes=222_000,
+            results_path=tmp_path, restore_path=tmp_path / "mac",
+            storage_mode="remote_archive", disk_free=lambda _: 1_000_000)
+
+
+def test_remote_guest_archive_projection_fails_when_only_raw_growth_fits(tmp_path):
+    remote = review(**quota_fields(tmp_path), measured_run_seconds=86_400,
+        expected_raw_bytes=400_000, expected_archive_bytes=100_000,
+        expected_archive_part_count=4, expected_concurrent_archive_part_count=3,
+        maximum_archive_part_bytes=64_000, capsule_state_manifest_bytes=20_000,
+        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000,
+        maximum_guest_archive_bytes=10_000, measured_guest_free_bytes=200_000_000,
+        max_guest_raw_bytes=150_000_000, guest_headroom_bytes=50_000_000)
+    with pytest.raises(ValueError, match="raw output, compressed archive"):
+        validate_storage_review("day", remote, minimum_free_bytes=222_000,
             results_path=tmp_path, restore_path=tmp_path / "mac",
             storage_mode="remote_archive", disk_free=lambda _: 1_000_000)

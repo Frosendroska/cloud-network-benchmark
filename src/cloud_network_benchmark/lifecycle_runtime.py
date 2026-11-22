@@ -79,8 +79,9 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("runtime configuration is not valid UTF-8 JSON") from exc
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
-    root = _keys(raw, root_keys | ({"archive_sink"} if isinstance(raw, dict) and "archive_sink" in raw else set()),
-        "runtime config")
+    optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
+        "measurement_start_barrier") if isinstance(raw, dict) and key in raw}
+    root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
     root["initialized_campaign_manifest"] = _source_path(path.parent,
@@ -95,17 +96,43 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("copy_retry_seconds must be positive and finite")
     if "archive_sink" in root:
         sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-            "minimum_controller_free_bytes", "archive_root", "staging_directory"},
+            "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+            "controller_quota_free_bytes", "controller_quota_evidence_path",
+            "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"},
             "archive_sink")
         from .gcs_archive import valid_bucket_name
         if (not valid_bucket_name(sink["bucket"])
                 or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
                 or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
                 or type(sink["minimum_controller_free_bytes"]) is not int
-                or sink["minimum_controller_free_bytes"] < 0):
+                or sink["minimum_controller_free_bytes"] < 0
+                or type(sink["minimum_guest_free_bytes"]) is not int or sink["minimum_guest_free_bytes"] < 0
+                or type(sink["maximum_capsule_bytes"]) is not int or sink["maximum_capsule_bytes"] <= 0
+                or type(sink["controller_quota_free_bytes"]) is not int or sink["controller_quota_free_bytes"] < 0):
             raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
-        for field in ("archive_root", "staging_directory"):
+        for field in ("controller_quota_evidence_path", "archive_root", "staging_directory"):
             sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
+        if "restore_path" in sink:
+            sink["restore_path"] = _source_path(path.parent, sink["restore_path"], "archive_sink.restore_path", must_exist=False)
+        from .storage_admission import validate_controller_quota_evidence
+        validate_controller_quota_evidence(sink["controller_quota_free_bytes"],
+            sink["controller_quota_evidence_path"], sink["controller_quota_evidence_sha256"])
+    for field in ("post_measurement_barrier", "measurement_start_barrier"):
+        if field in root:
+            barrier = root[field]
+            if not isinstance(barrier, dict) or type(barrier.get("schema_version")) is not int or barrier["schema_version"] != 1:
+                raise ValueError(f"{field} must be a version 1 barrier mapping")
+            root_value = barrier.get("barrier_root", barrier.get("absolute_barrier_root"))
+            participants = barrier.get("participants", barrier.get("expected_participants"))
+            if (not isinstance(root_value, str) or not Path(root_value).is_absolute()
+                    or not isinstance(participants, list) or not participants):
+                raise ValueError(f"{field} requires an absolute barrier root and participant list")
+            barrier = dict(barrier)
+            barrier["barrier_root"] = str(Path(root_value).absolute())
+            barrier["participants"] = participants
+            if "start_utc" in barrier:
+                barrier["start_utc"] = str(barrier["start_utc"])
+            root[field] = barrier
     allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
         "readiness_seconds", "stabilization_seconds", "measurement_seconds",
         "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds",
@@ -593,7 +620,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
             actual_stages = {}
             for provider, child in children.items():
                 actual_stages[provider] = build_provider_remote_stages(provider=provider,
-                    campaign=campaign, parent=parent, children={provider: child}, runtime=runtime,
+                    campaign=campaign, parent=parent, children=children, runtime=runtime,
                     ledger=ledger, reservation=reservation, runner=runner, clock=clock,
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",

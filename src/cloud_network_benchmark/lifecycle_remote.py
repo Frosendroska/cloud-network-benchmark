@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import shlex
+import hashlib
+import json
 import time
 import threading
 from dataclasses import dataclass
@@ -61,8 +63,9 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     from .lifecycle_guest import GuestRequest
     from .post_measurement_barrier import PostMeasurementBarrier
 
-    if set(children) != {provider}:
-        raise ValueError("production remote stages require exactly one provider child")
+    selected = {str(getattr(value, "value", value)) for value in campaign.selected_providers}
+    if provider not in children or set(children) != selected:
+        raise ValueError("production remote stages require the complete selected provider child set")
     child = children[provider]
     observation = child.resolved_observation
     if (str(getattr(observation.provider, "value", observation.provider)) != provider
@@ -72,6 +75,17 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     barrier = None
     barrier_participant = None
     barrier_spec = runtime.get("post_measurement_barrier")
+    if barrier_spec is None and archive_sink is not None:
+        participants = []
+        for selected_provider, selected_child in sorted(children.items()):
+            entry = getattr(getattr(selected_child.resolved_observation, "schedule_entry", None), "value", None)
+            participants.append({"entry_id": getattr(entry, "entry_id", None) or selected_child.run_id,
+                "provider": selected_provider, "run_id": selected_child.run_id})
+        barrier_id = "archive-post-close-" + hashlib.sha256(json.dumps(
+            participants, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+        barrier_spec = {"schema_version": 1, "barrier_id": barrier_id,
+            "barrier_root": str(Path(archive_sink["archive_root"]) / ".post-measurement-barriers"),
+            "participants": participants}
     if barrier_spec is not None:
         barrier = PostMeasurementBarrier(barrier_spec)
         schedule_entry = getattr(observation, "schedule_entry", None)
@@ -205,8 +219,19 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     {"failure": "F11 measurement remainder is insufficient", "reasons": fit.reason_codes})
             start_mono, start_utc = clock.monotonic(), clock.utc_now()
             slot = item.observation.scheduled_start
-            wait_until = max(start_mono + 60.0,
-                start_mono + max(0.0, (slot - start_utc).total_seconds()) if slot else start_mono)
+            if measurement_start_barrier is not None:
+                frozen_start = datetime.fromisoformat(
+                    measurement_start_barrier.spec["start_utc"].replace("Z", "+00:00"))
+                if slot is None or abs((slot - frozen_start).total_seconds()) > 1e-6:
+                    raise ValueError("paired scheduled_start must equal its source-bound frozen UTC start")
+                until_slot = (frozen_start - start_utc).total_seconds()
+                if until_slot <= 60.0:
+                    raise TimeoutError("paired preparation did not finish at least 60 seconds before frozen start")
+                wait_until = start_mono + max(60.0, until_slot - 60.0)
+            else:
+                # Ordinary single-run scheduling retains its existing wait behavior.
+                wait_until = max(start_mono + 60.0,
+                    start_mono + max(0.0, (slot - start_utc).total_seconds()) if slot else start_mono)
             if wait_until + allowance.measurement_seconds + allowance.retrieval_seconds + allowance.cleanup_seconds > item.deadline.overall_deadline_monotonic:
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "stabilization and remaining stages do not fit the original cap"})
@@ -250,10 +275,24 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     measurement_start_barrier.abort("frozen_start_outside_original_deadline",
                         deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
                     raise TimeoutError("frozen measurement start exceeds the original deadline")
-                if delay > 0:
-                    sleep(delay)
-                if cancel_event.is_set() or clock.utc_now() < frozen_start:
-                    raise InterruptedError("frozen measurement start wait did not complete safely")
+                required_after_start = (sum(float(unit.measured_seconds) for unit in item.observation.measurement_units)
+                    + float(runtime["allowance"].measurement_shutdown_seconds)
+                    + float(runtime["allowance"].retrieval_seconds))
+                if delay + required_after_start > item.deadline.remaining(clock.monotonic, cleanup=True):
+                    measurement_start_barrier.abort("measurement_and_retrieval_do_not_fit_original_deadline",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("frozen start leaves insufficient measured and retrieval time before cleanup reserve")
+                target_mono = clock.monotonic() + max(0.0, delay)
+                while clock.monotonic() < target_mono:
+                    if cancel_event.is_set() or item.deadline.remaining(clock.monotonic, cleanup=True) <= required_after_start:
+                        measurement_start_barrier.abort("cancelled_or_cap_too_short_before_frozen_start",
+                            deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                        raise InterruptedError("frozen measurement start wait lost its original cap fit")
+                    sleep(min(0.25, target_mono - clock.monotonic()))
+                if clock.utc_now() < frozen_start:
+                    measurement_start_barrier.abort("utc_monotonic_start_mapping_was_early",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("monotonic start mapping preceded the frozen UTC boundary")
             pair, connection = pair_of(provision), item.connection
             bootstrap = item.prepared.evidence["bootstrap"]
             guest_runtime = item.prepared.evidence["guest_runtime"]
@@ -507,7 +546,6 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 from .guest_archive import create_remote_guest_archive
                 from .retrieval import RetrievalResult
                 import hashlib
-                import shutil
                 bucket = archive_sink["bucket"]
                 max_staging = int(archive_sink["maximum_staging_bytes"])
                 max_archive = int(archive_sink["maximum_archive_bytes"])
@@ -522,8 +560,27 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 max_part = min(max_staging, 0xFFFFFFFF)
                 guest_archives = []
                 total_projection = 0
+                inventory_by_role = {}
                 for role in ("vm_a", "vm_b"):
-                    rows = item.inventories[role].files
+                    rows_by_path = {row["path"]: dict(row) for row in item.inventories[role].files}
+                    workspace = Path(manifest.remote_workspace)
+                    selected = []
+                    for native in manifest.items:
+                        if native.source_role != role:
+                            continue
+                        try:
+                            relative = Path(native.source_path).relative_to(workspace).as_posix()
+                        except ValueError as exc:
+                            raise ValueError("closed native source path escaped the measured workspace") from exc
+                        row = rows_by_path.get(relative)
+                        if (row is None or row["size_bytes"] != native.expected_size_bytes
+                                or row["sha256"] != native.expected_sha256):
+                            raise ValueError("closed role inventory differs from its declared native artifacts")
+                        selected.append(row)
+                    if not selected:
+                        raise ValueError(f"closed native inventory has no declared artifacts for {role}")
+                    inventory_by_role[role] = selected
+                    rows = selected
                     from .closed_archive import projected_archive_upper_bound
                     total_projection += projected_archive_upper_bound(sum(row["size_bytes"] for row in rows), len(rows))
                 if total_projection > max_archive:
@@ -532,7 +589,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     guest_dir = f"/tmp/cnb-closed-{deployment.deployment_id}-{role}"
                     guest_archives.append(create_remote_guest_archive(item.connection, role=role,
                         source_directory=manifest.remote_workspace, archive_directory=guest_dir,
-                        expected_inventory=item.inventories[role].files,
+                        expected_inventory=inventory_by_role[role],
                         maximum_part_bytes=max_part, maximum_archive_bytes=max_archive,
                         minimum_free_bytes=int(archive_sink.get("minimum_guest_free_bytes", min_free)),
                         runner=runner, deadline=item.deadline, clock=clock.monotonic))
@@ -543,7 +600,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     part_counter += 1
                     remaining = item.deadline.remaining(clock.monotonic, cleanup=True)
                     size = part["size_bytes"]
-                    if remaining <= 0 or size > max_staging or shutil.disk_usage(staging_root).free < size + min_free:
+                    if (remaining <= 0 or size > max_staging
+                            or archive_sink["controller_quota_free_bytes"] < size + min_free):
                         raise OSError("one bounded guest part does not fit the original retrieval window or staging quota")
                     rec = ledger.inspect()["reservations"].get(reservation.reservation_id.value, {})
                     if rec.get("execution_scope") == "paid_request":
@@ -555,7 +613,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     destination = staging_root / f".{deployment.deployment_id}-{role}-{part_counter:06d}.part"
                     if destination.exists() or destination.is_symlink():
                         raise FileExistsError("one-part staging destination already exists")
-                    remote = f"{vm.user}@{vm.host}:{guest_archives[0 if role == 'vm_a' else 1]['archive_directory']}/{part['path']}"
+                    archive_dir = next(row["archive_directory"] for row in guest_archives if row["role"] == role)
+                    remote = f"{vm.user}@{vm.host}:{archive_dir}/{part['path']}"
                     request = _request(f"f09-guest-part-{deployment.deployment_id}-{role}-{part_counter}",
                         vm, [remote, str(destination)], min(item.connection.timeouts.transfer_seconds, remaining), "scp")
                     result = _execute(runner, request)
@@ -572,6 +631,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     fetch_part=fetch_part, staging_directory=staging_root, backend=backend,
                     bucket=bucket, provider=provider, experiment_id=child.experiment_id,
                     run_id=pair_of(provision).identity.run_id, maximum_part_bytes=max_part,
+                    maximum_archive_bytes=max_archive, minimum_controller_free_bytes=min_free,
+                    controller_quota_free_bytes=archive_sink["controller_quota_free_bytes"],
                     closed_inventory=manifest.model_dump(mode="json"), deadline=item.deadline,
                     clock=clock.monotonic)
                 archive_status["actions"] = actions
