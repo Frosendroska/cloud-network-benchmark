@@ -332,7 +332,11 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
             lock_fd = _review_admission_lock(review_admission_path, review_runtime_deadline)
             review_deadline = min(review_runtime_deadline, time.monotonic() + (review_seconds if review_seconds > 0 else request.timeout_seconds))
         else:
-            review_deadline = min(deadline, time.monotonic() + review_seconds)
+            # A zero review_seconds is the legacy mode: operator review is
+            # bounded by the original request deadline. Positive values set
+            # a shorter manual-review window, still capped by that deadline.
+            review_window = review_seconds if review_seconds > 0 else request.timeout_seconds
+            review_deadline = min(deadline, time.monotonic() + review_window)
         if review_admission_path is not None and time.monotonic() >= review_deadline:
             raise PlanReviewError("saved-plan review window expired before request publication")
         _private(directory / "review-request.json", _json(binding))

@@ -235,6 +235,27 @@ def test_operator_wait_cannot_extend_command_deadline(tmp_path,monkeypatch):
     assert not any("apply" in r.argv for r in runner.requests)
 
 
+@pytest.mark.parametrize("review_seconds,expected_deadline", [(0, 160.0), (5, 105.0)])
+def test_review_window_uses_legacy_request_budget_or_explicit_manual_window(
+        tmp_path, monkeypatch, review_seconds, expected_deadline):
+    monkeypatch.setattr(tp.time, "monotonic", lambda: 100.0)
+    original_await = tp.await_review
+    observed = []
+
+    def approve(directory, binding, deadline):
+        observed.append(deadline)
+        (directory / "operator-review.json").write_text(json.dumps({
+            "decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "checked complete JSON and approved source scope"}))
+        return original_await(directory, binding, deadline)
+
+    monkeypatch.setattr(tp, "await_review", approve)
+    req, runner = request(tmp_path)
+    tp.reviewed_apply(req, runner.run, review_seconds=review_seconds)
+    assert observed == [expected_deadline]
+    assert runner.requests[-1].argv[2] == "apply"
+
+
 def test_saved_apply_uses_fresh_provider_budget_after_review(tmp_path, monkeypatch):
     def approve(directory, binding, deadline):
         return {"decision":"approved","binding":binding,"reviewer":"fixture","inspection":"checked"}
