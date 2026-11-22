@@ -1,6 +1,9 @@
 from io import BytesIO
+import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -81,6 +84,48 @@ def test_observer_start_identity_failure_uses_bounded_stop_for_term_resistant_ch
     assert process.killed
     assert process.wait_timeouts and all(value is not None for value in process.wait_timeouts)
     assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires native Linux /proc and SIGSTOP")
+def test_linux_sigstop_term_resistant_observer_failure_reaps_and_drains(tmp_path):
+    ready = tmp_path / "ready"
+
+    class FailingIdentity(LocalMeasurementProcesses):
+        handle = None
+
+        def _observer_record(self, request, pid, **kwargs):
+            end = time.monotonic() + 0.5
+            while not ready.exists() and time.monotonic() < end:
+                time.sleep(0.005)
+            assert ready.exists(), "finite fixture child did not become ready"
+            os.kill(pid, signal.SIGSTOP)
+            raise RuntimeError("injected observer identity failure")
+
+        def stop(self, handle, deadline_monotonic):
+            self.handle = handle
+            return super().stop(handle, deadline_monotonic)
+
+    runner = FailingIdentity(SystemMeasurementClock(), observer_callback=lambda _event: None)
+    program = ("import signal,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+               f"pathlib.Path({str(ready)!r}).touch(); time.sleep(10)")
+    request = CommandRequest(action_id="linux-observer-failure", action_type="measurement",
+        argv=[sys.executable, "-c", program], cwd=str(tmp_path), timeout_seconds=1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="injected observer identity failure"):
+            runner.start(request, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.3
+        handle = runner.handle
+        assert handle is not None and handle.process.poll() is not None
+        assert not [message for message in handle.stream_errors
+                    if "reap failed" in message or "join failed" in message or "flush failed" in message]
+    finally:
+        if runner.handle is not None:
+            process = runner.handle.process
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
 
 
 def test_local_adapter_drains_both_streams_preserves_bytes_and_bounds_redacted_preview(tmp_path, monkeypatch):
