@@ -26,15 +26,7 @@ def _materialize_review(repository_root, tmp_path, frozen_clock, deterministic_t
 
     # Materialize every selected provider in this actual one-provider scope,
     # rather than falsely marking untouched siblings of a three-cloud parent done.
-    config_name = f"campaign-review-{tmp_path.name}.yaml"
-    config_path = repository_root / "configs/experiments" / config_name
-    config = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
-    config["selected_providers"] = ["aws"]
-    config["context"] = "failure_check"
-    config["experiment_id"] = "EXP-900"
-    config["provider_configs"] = {"aws": config["provider_configs"]["aws"]}
-    config_path.write_text(yaml.safe_dump(config))
-    request.addfinalizer(lambda: config_path.unlink(missing_ok=True))
+    config_name = "exp-900-single-provider-north.yaml"
     value, result, _ = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
         deterministic_token, fake_git_commits, request, mode="acceptance", config_name=config_name)
     raw = Path(value.child_result_root)
@@ -62,7 +54,7 @@ def _materialize_review(repository_root, tmp_path, frozen_clock, deterministic_t
         checks[name] = row
     failures = tmp_path / "synthetic-failure-review.yaml"
     failures.write_text(yaml.safe_dump({"schema_version": 1, "checks": checks}))
-    accepted_options = {"account_id": "123456789012", "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}}
+    accepted_options = {"account_id": "123456789012", "ami_ids": {"eu-north-1": "ami-0123456789abcdef0"}}
     runtime_path = tmp_path / "synthetic-accepted-runtime.json"
     runtime_path.write_text(json.dumps({"initialized_campaign_manifest": str(parent_path),
         "providers": {"aws": {"options": accepted_options}}}))
@@ -182,7 +174,7 @@ def test_acceptance_scope_rejects_unverified_or_mismatched_sources(repository_ro
     elif corruption == "changed_account":
         evidence["requested_provider_scope"]["aws"]["account_id"] = "999999999999"
     elif corruption == "changed_concrete_image":
-        evidence["requested_provider_scope"]["aws"]["ami_ids"] = {"eu-central-1": "ami-fedcba98765432100"}
+        evidence["requested_provider_scope"]["aws"]["ami_ids"] = {"eu-north-1": "ami-fedcba98765432100"}
     elif corruption == "changed_accepted_runtime":
         runtime = tmp_path / "synthetic-accepted-runtime.json"
         runtime.write_text(runtime.read_text() + " ")
