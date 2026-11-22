@@ -24,10 +24,12 @@ boot=(proc/"sys/kernel/random/boot_id").read_text().strip(); out={"boot_id":boot
 valid={"R","S","D","W","X","x","K","P","I"}
 for x in p["processes"]:
  s=(proc/str(x["pid"])/"stat").read_text(); f=s[s.rfind(")")+2:].split(); state=f[0]; ticks=int(f[19])
- out["processes"][x["kind"]]={"pid":x["pid"],"boot_id":boot,"start_ticks":ticks,"state":state,"alive":state in valid and state not in {"Z","X","x"}}
+ hz=os.sysconf("SC_CLK_TCK"); age=max(0.0,float((proc/"uptime").read_text().split()[0])-ticks/hz)
+ out["processes"][x["kind"]]={"pid":x["pid"],"boot_id":boot,"start_ticks":ticks,"state":state,"age_seconds":age,"age_resolution_seconds":1.0/hz,"alive":state in valid and state not in {"Z","X","x"}}
 for x in p["files"]:
- q=(root/x["path"]).resolve(strict=True); q.is_relative_to(root.resolve(strict=True)) or sys.exit(21)
- st=q.stat(); out["files"][x["path"]]={"size":st.st_size,"mtime":st.st_mtime,"kind":x["kind"]}
+ q=(root/x["path"]).resolve(strict=False); q.is_relative_to(root.resolve(strict=True)) or sys.exit(21)
+ if not q.exists() and x.get("output_state")=="finalization_pending": out["files"][x["path"]]={"exists":False,"kind":x["kind"]}; continue
+ st=q.stat(); out["files"][x["path"]]={"exists":True,"size":st.st_size,"mtime":st.st_mtime,"kind":x["kind"]}
 print(json.dumps(out,sort_keys=True))'''
 
 _LIVE_PROC_STATES = {"R", "S", "D", "W", "K", "P", "I"}
@@ -64,8 +66,9 @@ def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str,
             errors.append("connection_binding_invalid")
     procs = role.get("processes")
     expected = {"producer", "diagnostics"} if role_name == "vm_a" else {"receiver", "diagnostics"}
-    if (not isinstance(procs, list) or len(procs) != len(expected)
-            or {x.get("kind") for x in procs if isinstance(x, dict)} != expected):
+    kinds = {x.get("kind") for x in procs if isinstance(x, dict)} if isinstance(procs, list) else set()
+    allowed = (kinds in (expected, expected | {"tcp_client"}) if role_name == "vm_a" else kinds == expected)
+    if not isinstance(procs, list) or not allowed or len(procs) != len(kinds):
         errors.append("process_bindings_incomplete")
     else:
         for item in procs:
@@ -76,6 +79,8 @@ def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str,
     files = role.get("files")
     required_file_kinds = ({"sockperf_chunk", "diagnostics"} if role_name == "vm_a"
                            else {"iperf3_receiver", "diagnostics"})
+    if role_name == "vm_a" and "tcp_client" in kinds:
+        required_file_kinds.add("iperf3_client")
     if not isinstance(files, list) or not required_file_kinds <= {
             x.get("kind") for x in files if isinstance(x, dict)}:
         errors.append("output_bindings_incomplete")
@@ -136,9 +141,26 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
                 or actual.get("boot_id") != expected["boot_id"]
                 or actual.get("start_ticks") != expected["start_ticks"]):
             problems.append("process_identity_mismatch:" + expected["kind"])
+        if expected.get("kind") in {"producer", "tcp_client"} and "timeout_seconds" in expected:
+            age = actual.get("age_seconds") if isinstance(actual, Mapping) else None
+            resolution = actual.get("age_resolution_seconds") if isinstance(actual, Mapping) else None
+            if (isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age)
+                    or isinstance(resolution, bool) or not isinstance(resolution, (int, float))
+                    or not math.isfinite(resolution) or resolution < 0 or resolution > 0.1
+                    or age < 0 or age > expected["timeout_seconds"] + resolution):
+                problems.append("measurement_process_exceeded_original_timeout:" + expected["kind"])
     observed_files = result.get("files", {})
     for item in role["files"]:
         value = observed_files.get(item["path"])
+        pending = item.get("state") == "current" and item.get("output_state") == "finalization_pending"
+        if pending:
+            process_kind = "producer" if item["kind"] == "sockperf_chunk" else "tcp_client"
+            process = next((row for row in role["processes"] if row["kind"] == process_kind), None)
+            if process is None or process.get("path") != item["path"]:
+                problems.append("pending_output_has_no_matching_live_process:" + item["kind"])
+            if not isinstance(value, Mapping) or value.get("exists") not in {True, False}:
+                problems.append("pending_output_probe_invalid:" + item["kind"])
+            continue
         if not isinstance(value, dict) or type(value.get("size")) is not int or value["size"] <= 0:
             problems.append("output_missing_or_empty:" + item["kind"])
             continue
@@ -148,25 +170,18 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
                 raise ValueError
             if mtime > check_now + 5:
                 problems.append("output_time_in_future:" + item["kind"])
-            elif not (item["kind"] == "sockperf_chunk" and item.get("state") == "completed") and check_now - mtime > freshness_seconds:
+            elif item.get("state") != "completed" and check_now - mtime > freshness_seconds:
                 problems.append("output_stale:" + item["kind"])
         except (KeyError, TypeError, ValueError, OverflowError):
             problems.append("output_timestamp_invalid:" + item["kind"])
     if role_name == "vm_a":
         current_chunks = [x for x in role["files"] if x["kind"] == "sockperf_chunk" and x["state"] == "current"]
-        fresh_current = False
-        for item in current_chunks:
-            value = observed_files.get(item["path"])
-            try:
-                mtime = float(value["mtime"])
-                fresh_current |= (isinstance(value, Mapping) and type(value.get("size")) is int
-                                  and value["size"] > 0 and math.isfinite(mtime)
-                                  and check_now - freshness_seconds <= mtime <= check_now + 5)
-            except (TypeError, ValueError, KeyError, OverflowError):
-                continue
-        if not fresh_current:
-            problems.append("current_sockperf_chunk_not_fresh")
-    return {"health": "fault" if problems else "healthy", "errors": sorted(set(problems))}
+        if not current_chunks:
+            problems.append("current_sockperf_chunk_missing")
+    pending_outputs = [item["kind"] for item in role["files"]
+        if item.get("state") == "current" and item.get("output_state") == "finalization_pending"]
+    return {"health": "fault" if problems else "healthy", "errors": sorted(set(problems)),
+            "outputs_pending_finalization": pending_outputs}
 
 
 def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,

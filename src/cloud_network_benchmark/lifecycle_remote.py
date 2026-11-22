@@ -469,7 +469,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 on_process_record=lambda record: _record_f03_process(record, control, control_lock, item),
                 on_observer_progress=(lambda progress: observer_progress_callback(
                     deployment, pair, connection, bootstrap, item.diagnostics or {}, progress)
-                    if observer_progress_callback is not None and mode == "diagnostic_day" else None))
+                    if observer_progress_callback is not None else None))
             if item.guest.failure and "process_group_stopped" in item.guest.failure:
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at

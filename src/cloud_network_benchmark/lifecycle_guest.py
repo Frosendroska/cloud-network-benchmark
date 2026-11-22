@@ -97,11 +97,13 @@ def execute_request(request: GuestRequest, *, processes=None, clock=None) -> Gue
     if processes is None:
         from .contracts.common import ExperimentMode
         observer_callback = None
-        if request.observation.mode == ExperimentMode.DIAGNOSTIC_DAY:
+        if request.observation.mode in {ExperimentMode.DIAGNOSTIC_DAY,
+                                       ExperimentMode.ACCEPTANCE, ExperimentMode.CALIBRATION}:
             from .observer_publisher import GuestObserverProgress
             observer_callback = GuestObserverProgress(
                 request.output_root / ".observer-progress.json",
-                deployment_id=request.identity.deployment_id)
+                deployment_id=request.identity.deployment_id,
+                observation=request.observation)
         processes = LocalMeasurementProcesses(clock, observer_callback=observer_callback)
     if request.observation.provider != request.identity.provider:
         raise ValueError("provider identity mismatch")

@@ -110,7 +110,8 @@ class LocalMeasurementProcesses:
             handle.threads.append(thread)
             thread.start()
         try:
-            observer_record = self._observer_record(request, proc.pid, proc_root=self.proc_root) if self.observer_callback else None
+            observer_record = self._observer_record(request, proc.pid, stdout_path=stdout_path,
+                proc_root=self.proc_root) if self.observer_callback else None
         except BaseException as start_error:
             try:
                 self.stop(handle, started_mono + request.timeout_seconds)
@@ -142,7 +143,8 @@ class LocalMeasurementProcesses:
         handle.process.wait()
         if handle.observer_record is not None and handle.observer_callback is not None:
             try:
-                handle.observer_callback({"event": "completed", **handle.observer_record})
+                handle.observer_callback({"event": "completed", "exit_code": handle.process.returncode,
+                    **handle.observer_record})
             except BaseException as exc:
                 handle.observer_errors.append(f"observer progress update failed: {type(exc).__name__}")
         event = ProcessEvent(handle, "exit", "", self.clock.monotonic(), self.clock.utc_now())
@@ -155,13 +157,24 @@ class LocalMeasurementProcesses:
                 return
 
     @staticmethod
-    def _observer_record(request: CommandRequest, pid: int, *, proc_root: Path = Path("/proc")) -> Mapping[str, object] | None:
-        """Capture only the actual Sockperf process and its actual --full-log path."""
-        if not request.argv or Path(request.argv[0]).name != "sockperf":
+    def _observer_record(request: CommandRequest, pid: int, *, stdout_path: Path,
+                         proc_root: Path = Path("/proc")) -> Mapping[str, object] | None:
+        """Capture actual client processes and the paths already owned by F03."""
+        if not request.argv:
+            return None
+        tool = Path(request.argv[0]).name
+        if tool == "sockperf":
+            kind = "producer"
+        elif tool == "iperf3" and "-c" in request.argv:
+            kind = "tcp_client"
+        else:
             return None
         try:
-            index = request.argv.index("--full-log")
-            output = Path(request.argv[index + 1])
+            if kind == "producer":
+                index = request.argv.index("--full-log")
+                output = Path(request.argv[index + 1])
+            else:
+                output = Path(stdout_path)
             workspace = Path(request.cwd).resolve(strict=True)
             output = output.resolve(strict=False)
             relative = output.relative_to(workspace).as_posix()
@@ -174,8 +187,19 @@ class LocalMeasurementProcesses:
             raise RuntimeError("actual Sockperf observer process identity/path is unavailable") from exc
         if not relative or relative.startswith("../") or ticks <= 0 or len(boot_id) != 36:
             raise RuntimeError("actual Sockperf observer process identity/path is invalid")
-        return {"kind": "producer", "pid": pid, "boot_id": boot_id,
-                "start_ticks": ticks, "path": relative}
+        action_id = request.action_id
+        prefix = "sockperf-" if kind == "producer" else "iperf3-"
+        if not action_id.startswith(prefix) or len(action_id) == len(prefix):
+            raise RuntimeError("actual measurement observer action identity is invalid")
+        try:
+            duration = int(request.argv[request.argv.index("-t") + 1])
+        except (ValueError, IndexError, TypeError):
+            raise RuntimeError("actual measurement observer duration is unavailable") from None
+        return {"kind": kind, "pid": pid, "boot_id": boot_id, "start_ticks": ticks,
+                "path": relative, "action_id": action_id, "unit_id": action_id[len(prefix):],
+                "timeout_seconds": request.timeout_seconds, "requested_seconds": duration,
+                "streaming_output": kind == "tcp_client" and "--json-stream" in request.argv
+                    and "--forceflush" in request.argv}
 
     def _drain(self, handle: LocalProcess, channel: str, pipe: object, target: BinaryIO) -> None:
         try:

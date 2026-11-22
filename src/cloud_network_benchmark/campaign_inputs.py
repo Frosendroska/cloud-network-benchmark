@@ -834,11 +834,11 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 "bootstrap": _bootstrap(settings.get("prebuilt_bundle")), "guest_remote_root": "/var/lib/cnb/work",
                 "diagnostic_interfaces": {p: settings["providers"][p]["diagnostic_interfaces"] for p in providers}},
             "providers": provider_runtime, "approval_refs": approvals}
-        if stage == "day":
+        if stage in {"day", "acceptance", "calibration"}:
             stage_private = Path(state_root) / stage_id
             runtime["observer"] = {"stage_id": stage_id, "campaign_id": stage_id,
-                "entry_id": entry_id,
-                "workspace": runtime["access"]["bootstrap"].workspace,
+                "entry_id": entry["entry_id"],
+                "workspace": runtime["access"]["bootstrap"]["workspace"],
                 "state_path": str(stage_private / "observer-aggregate.json"),
                 "journal_path": str(stage_private / "campaign-journal.json"),
                 "prepared_stage_path": str(stage_private / "prepared-stage.json"),
@@ -867,7 +867,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
              "gcp": ("project_id",)}[provider])} for provider in sorted(settings["providers"])},
         "credential_valid_through_utc": settings["credential_refresh"]["valid_through_utc"],
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
-    if stage == "day":
+    if stage in {"day", "acceptance", "calibration"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),
             observer_launch_receipt_root=str(private / "observer-launch-receipts"))

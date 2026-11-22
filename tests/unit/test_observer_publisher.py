@@ -43,9 +43,10 @@ def _participant(entry, provider, run):
 
 def _probe(_role, payload):
     return {"processes": {item["kind"]: {"pid": item["pid"], "boot_id": item["boot_id"],
-        "start_ticks": item["start_ticks"], "state": "S", "alive": True}
+        "start_ticks": item["start_ticks"], "age_seconds": 1.0, "age_resolution_seconds": 0.01,
+        "state": "S", "alive": True}
         for item in payload["processes"]},
-        "files": {item["path"]: {"size": 10, "mtime": time.time() - 1, "kind": item["kind"]}
+        "files": {item["path"]: {"exists": True, "size": 10, "mtime": time.time() - 1, "kind": item["kind"]}
                   for item in payload["files"]}}
 
 
@@ -53,6 +54,7 @@ def _actual_sockperf_progress(tmp_path, monkeypatch):
     from cloud_network_benchmark.contracts.execution import CommandRequest
     from cloud_network_benchmark.measurement_process import LocalMeasurementProcesses, SystemMeasurementClock
     from cloud_network_benchmark.observer_publisher import GuestObserverProgress
+    from types import SimpleNamespace
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -69,7 +71,8 @@ def _actual_sockperf_progress(tmp_path, monkeypatch):
             self.stdout, self.stderr = BytesIO(), BytesIO()
             self.stdin = None
             self._done = threading.Event()
-            Path(argv[argv.index("--full-log") + 1]).write_text("native-shaped output")
+            self.csv_path = Path(argv[argv.index("--full-log") + 1])
+            self.csv_path.touch()
         def poll(self):
             return self.returncode
         def wait(self, timeout=None):
@@ -78,24 +81,34 @@ def _actual_sockperf_progress(tmp_path, monkeypatch):
             return self.returncode
         def terminate(self):
             self.returncode = -15
+            self.csv_path.write_text("native-shaped output")
+            self._done.set()
+        def finish(self):
+            self.returncode = 0
+            self.csv_path.write_text("native-shaped output")
             self._done.set()
         def kill(self):
             self.terminate()
     monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
-    progress = GuestObserverProgress(workspace / ".observer-progress.json", deployment_id="run-aws-deployment")
+    observation = SimpleNamespace(measurement_units=[SimpleNamespace(unit_id="day", kind="continuous_day",
+        phase="multi_flow", streams=4, trial_index=None, parent_unit_id=None)])
+    progress = GuestObserverProgress(workspace / ".observer-progress.json", deployment_id="run-aws-deployment",
+        observation=observation)
     runner = LocalMeasurementProcesses(SystemMeasurementClock(), observer_callback=progress, proc_root=proc_root)
     csv = workspace / "measurements" / "probe.csv"
     csv.parent.mkdir()
-    request = CommandRequest(action_id="f03-sockperf-probe", action_type="measurement",
-        argv=[str(executable), "--full-log", str(csv)], cwd=str(workspace), timeout_seconds=10)
+    request = CommandRequest(action_id="sockperf-probe-chunk-000001", action_type="measurement",
+        argv=[str(executable), "--full-log", str(csv), "-t", "300"], cwd=str(workspace), timeout_seconds=600)
     handle = runner.start(request, stdout_path=workspace / "out", stderr_path=workspace / "err")
     deadline = time.monotonic() + 2
     while not progress.path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     snapshot = json.loads(progress.path.read_text())
     assert snapshot["producer"]["pid"] == 3501
-    assert snapshot["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "current"}]
-    assert csv.stat().st_size > 0
+    assert snapshot["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "current",
+        "output_state": "finalization_pending", "unit_id": "probe-chunk-000001", "phase": "multi_flow",
+        "streams": 4, "trial_index": None, "parent_unit_id": "day"}]
+    assert csv.stat().st_size == 0
     return runner, handle, snapshot, progress, proc_root, executable, workspace
 
 
@@ -135,7 +148,8 @@ def test_actual_receipt_and_runtime_records_are_hash_pinned_and_consumable(tmp_p
         "observer_launch_receipt_sha256": receipt_sha}
     result = observe_bindings(stage, binding_path, now=time.time(), probe=_probe,
                               run=lambda *_a, **_k: pytest.fail("unexpected SSH"))
-    assert result["health"] == "healthy"
+    assert result["health"] == "healthy", {key: {role: value["errors"] for role, value in row["roles"].items()}
+        for key, row in result.get("entries", {}).items()}
     assert len(result["entries"]) == 3
     process_runner.stop(process_handle, time.monotonic() + 2)
 
@@ -144,22 +158,32 @@ def test_production_process_hook_publishes_atomic_observed_rotation(tmp_path, mo
     from cloud_network_benchmark.contracts.execution import CommandRequest
 
     runner, handle, first, progress, proc_root, executable, workspace = _actual_sockperf_progress(tmp_path, monkeypatch)
-    runner.stop(handle, time.monotonic() + 2)
+    handle.process.finish()
+    while runner.poll(handle) is None:
+        time.sleep(0.01)
     closed = json.loads(progress.path.read_text())
     assert closed["producer"] is None
-    assert closed["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "completed"}]
+    assert closed["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "completed",
+        "output_state": "complete", "unit_id": "probe-chunk-000001", "phase": "multi_flow",
+        "streams": 4, "trial_index": None, "parent_unit_id": "day"}]
     stat_path = proc_root / "3501/stat"
     stat_path.write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
     second_csv = workspace / "measurements" / "probe-002.csv"
-    second = CommandRequest(action_id="f03-sockperf-probe-2", action_type="measurement",
-        argv=[str(executable), "--full-log", str(second_csv)], cwd=str(workspace), timeout_seconds=10)
+    second = CommandRequest(action_id="sockperf-probe-chunk-000002", action_type="measurement",
+        argv=[str(executable), "--full-log", str(second_csv), "-t", "300"], cwd=str(workspace), timeout_seconds=600)
     next_handle = runner.start(second, stdout_path=workspace / "out-2", stderr_path=workspace / "err-2")
     rotated = json.loads(progress.path.read_text())
     assert rotated["producer"]["start_ticks"] == 7654322
     assert rotated["sockperf_chunks"] == [
-        {"path": "measurements/probe.csv", "state": "completed"},
-        {"path": "measurements/probe-002.csv", "state": "current"}]
-    runner.stop(next_handle, time.monotonic() + 2)
+        {"path": "measurements/probe.csv", "state": "completed", "output_state": "complete",
+         "unit_id": "probe-chunk-000001", "phase": "multi_flow", "streams": 4,
+         "trial_index": None, "parent_unit_id": "day"},
+        {"path": "measurements/probe-002.csv", "state": "current", "output_state": "finalization_pending",
+         "unit_id": "probe-chunk-000002", "phase": "multi_flow", "streams": 4,
+         "trial_index": None, "parent_unit_id": "day"}]
+    next_handle.process.finish()
+    while runner.poll(next_handle) is None:
+        time.sleep(0.01)
 
 
 def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_path, monkeypatch):
@@ -225,25 +249,32 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     assert _stage_digest(stage) == frozen_stage_digest
     def probe(_role, payload):
         return {"processes": {item["kind"]: {"pid": item["pid"], "boot_id": item["boot_id"],
-            "start_ticks": item["start_ticks"], "alive": True, "state": "S"}
+            "start_ticks": item["start_ticks"], "age_seconds": 1.0, "age_resolution_seconds": 0.01,
+            "alive": True, "state": "S"}
             for item in payload["processes"]},
-            "files": {item["path"]: {"size": 16, "mtime": time.time() - 1}
+                "files": {item["path"]: {"exists": True, "size": 16, "mtime": time.time() - 1}
                 for item in payload["files"]}}
     observed = observe_bindings(stage, bindings_path, now=time.time(), probe=probe)
-    assert observed["health"] == "healthy"
+    assert observed["health"] == "healthy", {key: {role: value["errors"] for role, value in row["roles"].items()}
+        for key, row in observed.get("entries", {}).items()}
     assert len(observed["entries"]) == 3
 
-    runner.stop(handle, time.monotonic() + 2)
+    handle.process.finish()
+    while runner.poll(handle) is None:
+        time.sleep(0.01)
+    closed_progress = json.loads(progress_writer.path.read_text())
+    for callback, deployment, pair, connection, bootstrap, diagnostics in callbacks.values():
+        assert callback(deployment, pair, connection, bootstrap, diagnostics, closed_progress)["status"] == "incomplete"
     (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
-    rotated_command = CommandRequest(action_id="f03-sockperf-rotate", action_type="measurement",
-        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-002.csv")],
+    rotated_command = CommandRequest(action_id="sockperf-probe-chunk-000002", action_type="measurement",
+        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-002.csv"), "-t", "300"],
         cwd=str(workspace_path), timeout_seconds=10)
     rotated_handle = runner.start(rotated_command, stdout_path=workspace_path / "out-rotate",
         stderr_path=workspace_path / "err-rotate")
     rotated_progress = json.loads(progress_writer.path.read_text())
     callback, deployment, pair, connection, bootstrap, diagnostics = callbacks["aws"]
-    second = callback(deployment, pair, connection, bootstrap, diagnostics, rotated_progress)
-    assert second["status"] == "published"
+    second_reports = [callback(*callbacks[provider][1:], rotated_progress) for provider in run_ids]
+    assert [row["status"] for row in second_reports] == ["incomplete", "incomplete", "published"]
     refreshed_stage = json.loads(prepared_path.read_text())
     refreshed = observe_bindings(refreshed_stage, bindings_path, now=time.time(), probe=probe)
     assert refreshed["health"] == "healthy"
@@ -258,10 +289,12 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     first_owned = next(iter(tampered["participants"].values()))
     first_owned["vm_a"]["vm_id"] = "foreign-vm"
     receipt_path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n")
-    runner.stop(rotated_handle, time.monotonic() + 2)
+    rotated_handle.process.finish()
+    while runner.poll(rotated_handle) is None:
+        time.sleep(0.01)
     (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654323\n")
-    third_command = CommandRequest(action_id="f03-sockperf-rotate-3", action_type="measurement",
-        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-003.csv")],
+    third_command = CommandRequest(action_id="sockperf-probe-chunk-000003", action_type="measurement",
+        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-003.csv"), "-t", "300"],
         cwd=str(workspace_path), timeout_seconds=10)
     third_handle = runner.start(third_command, stdout_path=workspace_path / "out-rotate-3",
         stderr_path=workspace_path / "err-rotate-3")
@@ -292,6 +325,37 @@ def test_guest_progress_rejects_partial_or_inconsistent_rotation():
             {"path": "measurements/two.csv", "state": "current"}]}, deployment_id="deploy")
     with pytest.raises(ValueError, match="deployment/schema"):
         validate_guest_progress(valid, deployment_id="foreign")
+
+
+@pytest.mark.parametrize(("unit_id", "unit_kind", "phase", "streams", "trial_index"), [
+    ("V-S1-multi", "phase", "multi_flow", 4, None),
+    ("CAL-4-1", "calibration_trial", "multi_flow", 4, 1),
+])
+def test_fixed_acceptance_and_calibration_progress_maps_phase_outputs(
+        tmp_path, unit_id, unit_kind, phase, streams, trial_index):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.observer_publisher import GuestObserverProgress, validate_guest_progress
+
+    unit = SimpleNamespace(unit_id=unit_id, kind=unit_kind, phase=phase, streams=streams,
+        trial_index=trial_index, parent_unit_id=None)
+    writer = GuestObserverProgress(tmp_path / "progress.json", deployment_id="fixed-run-deployment",
+        observation=SimpleNamespace(measurement_units=[unit]))
+    base = {"pid": 801, "boot_id": BOOT, "start_ticks": 80801,
+        "unit_id": unit_id, "timeout_seconds": 90, "requested_seconds": 20,
+        "phase": phase, "streams": streams, "trial_index": trial_index,
+        "parent_unit_id": None}
+    writer({"event": "started", "kind": "producer", **base, "path": f"measurements/{unit_id}.csv",
+        "action_id": f"sockperf-{unit_id}", "streaming_output": False})
+    writer({"event": "started", "kind": "tcp_client", **{**base, "pid": 802, "start_ticks": 80802},
+        "path": f"measurements/{unit_id}.iperf3.json", "action_id": f"iperf3-{unit_id}",
+        "streaming_output": False})
+    progress = validate_guest_progress(json.loads(writer.path.read_text()), deployment_id="fixed-run-deployment")
+    assert progress["producer"]["unit_id"] == unit_id
+    assert progress["producer"]["phase"] == phase
+    assert progress["producer"]["streams"] == streams
+    assert progress["producer"]["trial_index"] == trial_index
+    assert progress["tcp_client"]["pid"] == 802
+    assert progress["iperf3_outputs"][0]["path"] == f"measurements/{unit_id}.iperf3.json"
 
 
 def test_f02_listener_process_receipt_parses_real_identity_and_rejects_reuse():

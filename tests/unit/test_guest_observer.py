@@ -93,6 +93,34 @@ def test_guest_probe_detects_stale_unreachable_reused_pid_and_missing_outputs():
         probe=lambda *_: missing)["errors"]
 
 
+def test_live_sockperf_full_log_may_remain_empty_until_process_finalizes():
+    role = role_binding("vm_a")
+    path = "measurements/probe-0001.csv"
+    role["processes"][0].update({"path": path, "action_id": "sockperf-probe-0001",
+        "unit_id": "probe-0001", "timeout_seconds": 90, "requested_seconds": 70,
+        "phase": "single_flow", "streams": 1, "trial_index": None, "parent_unit_id": None,
+        "streaming_output": False})
+    role["files"][0].update({"output_state": "finalization_pending", "unit_id": "probe-0001",
+        "phase": "single_flow", "streams": 1, "trial_index": None, "parent_unit_id": None})
+    def probe(_role, payload):
+        return {"processes": {item["kind"]: {"pid": item["pid"], "boot_id": item["boot_id"],
+            "start_ticks": item["start_ticks"], "state": "S", "alive": True, "age_seconds": 80,
+            "age_resolution_seconds": 0.01}
+            for item in payload["processes"]},
+            "files": {item["path"]: {"exists": False} if item.get("output_state") == "finalization_pending"
+                else {"exists": True, "size": 10, "mtime": NOW - 1} for item in payload["files"]}}
+    result = probe_role(role, WORKSPACE, "vm_a", now=NOW, owned_role=role, probe=probe)
+    assert result["health"] == "healthy", result
+    assert result["outputs_pending_finalization"] == ["sockperf_chunk"]
+
+    overrun = probe_role(role, WORKSPACE, "vm_a", now=NOW, owned_role=role,
+        probe=lambda _role, payload: {**probe(_role, payload), "processes": {
+            **probe(_role, payload)["processes"], "producer": {**probe(_role, payload)["processes"]["producer"],
+                "age_seconds": 90.1}}})
+    assert overrun["health"] == "fault"
+    assert "measurement_process_exceeded_original_timeout:producer" in overrun["errors"]
+
+
 def test_executed_remote_snippet_rejects_zombie_exited_and_invalid_proc_states(tmp_path):
     import subprocess
     import sys
@@ -104,6 +132,7 @@ def test_executed_remote_snippet_rejects_zombie_exited_and_invalid_proc_states(t
     proc_root = tmp_path / "proc"
     (proc_root / "sys/kernel/random").mkdir(parents=True)
     (proc_root / "sys/kernel/random/boot_id").write_text("boot-1\n")
+    (proc_root / "uptime").write_text("1000.0 0.0\n")
     payload = {"workspace": str(workspace), "proc_root": str(proc_root),
         "processes": [{"kind": "producer", "pid": 321}],
         "files": [{"path": "measurements/current.csv", "kind": "sockperf_chunk"}]}

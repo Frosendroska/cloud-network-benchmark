@@ -130,12 +130,17 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), clock)
     register_generated_cleanup(stage, request)
+    assert stage["observer_bindings_path"]
+    assert stage["observer_launch_receipt_root"]
     book = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic, controller_session_id=stage["controller_session_id"])
     book.initialize(load_cost_inputs(Path(stage["entries"][0]["cost_inputs_path"])))
     namespaces = []
     for entry in stage["entries"][:2]:
         runtime, parent, children, request, plan = load_entry(stage, entry, repository_root)
+        assert runtime["observer"]["stage_id"] == stage["stage_id"]
+        assert runtime["observer"]["entry_id"] == entry["entry_id"]
+        assert runtime["observer"]["workspace"] == runtime["access"]["bootstrap"].workspace
         namespaces.extend(plan.namespaces.values())
         decision = book.reserve(request, plan=plan)
         assert decision.status == "rejected"
@@ -145,6 +150,25 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
         assert all(Path(row["bootstrap_template"]).is_file() for row in runtime["providers"].values())
     assert len(book.inspect()["reservations"]) == 0
     assert len(namespaces) == len(set(namespaces)) == 6
+
+
+def test_generated_calibration_binds_runtime_observer_without_changing_workload(repository_root, tmp_path, monkeypatch, request):
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    clock = Clock()
+    stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), clock)
+    register_generated_cleanup(stage, request)
+    assert stage["observer_bindings_path"]
+    assert stage["observer_launch_receipt_root"]
+    assert len(stage["entries"]) == 1
+    runtime = load_runtime_config(Path(stage["entries"][0]["runtime_config_path"]))
+    assert runtime["observer"]["stage_id"] == stage["stage_id"]
+    assert runtime["observer"]["entry_id"] == "CAL-S1"
+    assert runtime["observer"]["workspace"] == runtime["access"]["bootstrap"].workspace
+    _parent, children = load_initialized_campaign(Path(stage["entries"][0]["parent_manifest_path"]),
+        repository_root=repository_root, config_path=Path(stage["entries"][0]["config_path"]))
+    assert len(children) == 3
+    assert all(child.mode == "calibration" for child in children.values())
 
 
 def test_generated_week_freezes_the_bounded_source_hashed_pair_policy(repository_root, tmp_path, monkeypatch, request):
