@@ -1,13 +1,15 @@
 """Offline protocol tests for Azure's registered-expiry gate."""
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
-from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, register_expiry, provision, destroy, build_pair_inputs
+from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, ROLE_ACTIONS, _slug, register_expiry, provision, destroy, build_pair_inputs
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
 from cloud_network_benchmark.contracts.execution import CommandResult
@@ -30,17 +32,20 @@ class AutomationRunner:
     def __init__(self, deployment_input, options_input, now, fail_at=None, publish_delay=0, bad_key_for=None, wrong_vm_id_for=None,
                  stale_nonce_for=None, image_architecture="x64", wrong_role_definition=False,
                  image_publisher="Canonical", image_offer=None, image_sku=None, vm_image_mismatch=False,
-                 image_os="Linux", module_recheck=None, marketplace_response=None):
+                 image_os="Linux", module_recheck=None, marketplace_response=None, content_corrupt=False,
+                 expiry_state_overrides=None):
         self.d=deployment_input; self.o=options_input; self.now=now; self.fail_at=fail_at; self.publish_delay=publish_delay; self.bad_key_for=bad_key_for; self.wrong_vm_id_for=wrong_vm_id_for
         self.stale_nonce_for=stale_nonce_for; self.image_architecture=image_architecture; self.wrong_role_definition=wrong_role_definition
         self.image_publisher=image_publisher; self.image_offer=image_offer; self.image_sku=image_sku; self.vm_image_mismatch=vm_image_mismatch
         self.image_os=image_os; self.module_recheck=module_recheck; self.marketplace_response=marketplace_response
+        self.content_corrupt=content_corrupt
+        self.expiry_state_overrides=expiry_state_overrides or {}
         self.publish_reads=0; self.requests=[]; self.script=""; self.schedule={}; self.binding={}; self.tamper_recheck=None
         self.name=_slug(deployment_input)
         self.account=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Automation/automationAccounts/{self.name}-auto"
-        self.assignment_id=f"{self.account}/providers/Microsoft.Authorization/roleAssignments/assignment"
-        self.role_id=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Authorization/roleDefinitions/role"
         self.group_id=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}"
+        self.assignment_id=f"{self.group_id}/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000005"
+        self.role_id=f"/subscriptions/{options_input.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000004"
     def run(self, request):
         self.requests.append(request)
         if request.action_type=="runbook_content": self.script=request.argv[request.argv.index("--body")+1]
@@ -74,7 +79,10 @@ class AutomationRunner:
             payload["location"]=self.d.vm_a.region
             payload.setdefault("properties",{}).update({"runbookType":"PowerShell","runtimeEnvironment":"PowerShell-5.1"})
             out=json.dumps(payload)
-        elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script
+        elif request.action_type in {"published_content_readback","expiry_content_recheck"}:
+            output=Path(request.argv[request.argv.index("--output-file")+1])
+            content=self.script.encode()
+            output.write_bytes(content[:-1]+b"!" if self.content_corrupt else content)
         elif request.action_type in {"schedule_readback","expiry_schedule_recheck"}:
             p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True; out=json.dumps({"properties":p})
         elif request.action_type in {"job_binding_readback","expiry_binding_recheck"}:
@@ -109,17 +117,47 @@ class AutomationRunner:
             vm=self.d.vm_a if request.argv[request.argv.index("--ids")+1].endswith("-a") else self.d.vm_b
             out=json.dumps({"id":request.argv[request.argv.index("--ids")+1],"location":vm.region,"zones":[vm.zone],"hardwareProfile":{"vmSize":vm.vm_shape},"osProfile":{"adminUsername":vm.connection_user},"storageProfile":{"imageReference":{"id":actual}}})
         outcome=CommandOutcome.FAILED if request.action_type==self.fail_at else CommandOutcome.SUCCEEDED
+        if request.action_type=="expiry_prerequisites" and outcome==CommandOutcome.SUCCEEDED:
+            self._write_expiry_state()
+        if request.action_type=="expiry_destroy" and outcome==CommandOutcome.SUCCEEDED and (self.o.attempt_root/"expiry.tfstate").is_file():
+            path=self.o.attempt_root/"expiry.tfstate"
+            saved=json.loads(path.read_text())
+            saved["resources"]=[]
+            path.write_text(json.dumps(saved))
         return CommandResult(action_id=request.action_id,outcome=outcome,started_at=self.now,finished_at=self.now,duration_seconds=0,
             exit_code=1 if outcome==CommandOutcome.FAILED else 0,stdout=out,stderr="injected failure" if outcome==CommandOutcome.FAILED else "")
+
+    def _write_expiry_state(self):
+        definitions={"id":self.role_id,"role_definition_resource_id":self.role_id,
+            "name":self.name+"-deallocate-only","scope":self.group_id,
+            "assignable_scopes":[self.group_id],"permissions":[{"actions":[
+                "Microsoft.Compute/virtualMachines/read",
+                "Microsoft.Compute/virtualMachines/instanceView/read",
+                "Microsoft.Compute/virtualMachines/deallocate/action"],
+                "not_actions":[],"data_actions":None,"not_data_actions":None}]}
+        assignment={"id":self.assignment_id,"scope":self.group_id,"principal_id":"00000000-0000-0000-0000-000000000003",
+            "role_definition_id":self.role_id}
+        group={"id":self.group_id,"name":self.name,"location":self.d.vm_a.region,
+            "tags":{"deployment_id":self.d.deployment_id}}
+        account={"id":self.account,"identity":[{"principal_id":"00000000-0000-0000-0000-000000000003"}]}
+        resources=[]
+        for kind,name,attrs in (("azurerm_resource_group","attempt",group),
+                ("azurerm_automation_account","expiry",account),
+                ("azurerm_role_definition","deallocate",definitions),
+                ("azurerm_role_assignment","deallocate",assignment)):
+            resources.append({"mode":"managed","type":kind,"name":name,"instances":[{"attributes":
+                {**attrs,**self.expiry_state_overrides.get(kind+"."+name,{})}}]})
+        (self.o.attempt_root/"expiry.tfstate").write_text(json.dumps({"version":4,"resources":resources}))
 
 
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
-                 account_present=True, account_resource_id=None, account_absence="absent",
+                 account_present=True, account_resource_id=None, account_absence="absent", parent_exists=True,
                  present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
+        self.parent_exists=parent_exists
         self.account_resource_id=account_resource_id
         self.account_absence=account_absence
         self.role_definition_inventory=role_definition_inventory
@@ -133,7 +171,7 @@ class CleanupRunner(AutomationRunner):
             self.requests.append(request)
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr="(ResourceNotFound) VM not found")
         if request.action_type=="parent_group_absence":
-            self.requests.append(request); out=json.dumps(self.account_present)
+            self.requests.append(request); out=json.dumps(self.parent_exists)
         elif request.action_type=="pair_inventory_page_2":
             self.requests.append(request)
             resources=[] if not self.residual else [{"id":self.group_id+"/providers/Microsoft.Network/networkInterfaces/leftover","type":"Microsoft.Network/networkInterfaces"}]
@@ -142,6 +180,8 @@ class CleanupRunner(AutomationRunner):
             self.requests.append(request)
             url=request.argv[request.argv.index("--url")+1].split("?",1)[0]
             resources=[{"id":self.account_resource_id or self.account,"type":"Microsoft.Automation/automationAccounts"}] if self.account_present else []
+            if not self.parent_exists:
+                resources.append({"id":f"/subscriptions/{self.o.subscription_id}/resourceGroups/unrelated/providers/Microsoft.Network/virtualNetworks/keep","type":"Microsoft.Network/virtualNetworks"})
             out="" if self.blank_inventory else json.dumps({"value":resources,"nextLink":url+"?api-version=2021-04-01&$skiptoken=two"})
         elif request.action_type=="expiry_inventory": self.requests.append(request); out="false"
         elif request.action_type=="role_cleanup_inventory": self.requests.append(request); out=self.role_assignment_inventory
@@ -253,6 +293,29 @@ def test_registration_polls_asynchronous_publication_within_bound(repository_roo
     expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.0,utc_now=lambda:now,sleep=lambda seconds:None)
     assert expiry.state=="registered"
     assert [r.action_type for r in runner.requests].count("runbook_readback")==2
+
+
+def test_published_content_readback_uses_exact_file_bytes_and_rejects_corruption(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    runner=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,runner,clock=lambda:1.,utc_now=lambda:now)
+    assert expiry.state=="registered"
+    readback=next(r for r in runner.requests if r.action_type=="published_content_readback")
+    assert readback.argv[readback.argv.index("--output-file")+1]
+    assert "--output" not in readback.argv
+    assert not list(o.attempt_root.glob(".*.content"))
+    journal=json.loads((o.attempt_root/"recovery.json").read_text())
+    assert journal["expiry"]["metadata"]["published_content_sha256"]==hashlib.sha256(runner.script.encode()).hexdigest()
+
+    corrupt_options=options(tmp_path/"corrupt",d.admission.priority)
+    corrupt_options=AzureRuntimeOptions.model_validate({**corrupt_options.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    corrupt=AutomationRunner(d,corrupt_options,now,content_corrupt=True)
+    failed=register_expiry(d,expiry_request(d,corrupt_options,now+timedelta(minutes=15)),corrupt_options,corrupt,
+        clock=lambda:1.,utc_now=lambda:now)
+    assert failed.state=="failed"
+    assert "publication/content readback did not match" in failed.failure.message
+    assert not any(r.action_type=="schedule_create" for r in corrupt.requests)
 
 
 def test_provision_rechecks_published_content_before_pair_apply(repository_root: Path, tmp_path: Path):
@@ -530,6 +593,128 @@ def test_cleanup_never_proves_absence_without_exact_account_removal(
         expected_detail = ("Automation account absence is not proven" if case == "account_still_present"
             else "automation_account_absence failed")
         assert any(expected_detail in failure.message for failure in result.failures)
+
+
+def test_cleanup_with_absent_parent_uses_original_subscription_inventory_and_vm_ids(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration=AutomationRunner(d,o,now)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,clock=lambda:1.,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    runner=CleanupRunner(d,o,now,parent_exists=False,account_present=False)
+    result=destroy(registered,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked, result.failures
+    inventory=next(r for r in runner.requests if r.action_type=="pair_inventory")
+    url=inventory.argv[inventory.argv.index("--url")+1]
+    assert url==f"https://management.azure.com/subscriptions/{o.subscription_id}/resources?api-version=2021-04-01"
+    queried=[r.argv[r.argv.index("--ids")+1] for r in runner.requests if r.action_type=="vm_absence_by_id"]
+    assert queried==[f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{role}" for role in ("a","b")]
+    assert not any(r.action_type.endswith("_delete") for r in runner.requests)
+
+
+def test_cleanup_accepts_subscription_scoped_custom_role_from_original_terraform_output(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    from cloud_network_benchmark.lifecycle_cleanup import cleanup_saved_provider, save_cleanup_settings
+    request=expiry_request(d,o,d.reservation.value.expires_at.value-timedelta(seconds=300))
+    registration=AutomationRunner(d,o,now,fail_at="runbook_publish")
+    evidence=register_expiry(d,request,o,registration,clock=lambda:1.,utc_now=lambda:now)
+    assert evidence.state=="failed"
+    journal=json.loads((o.attempt_root/"recovery.json").read_text())
+    expected_role=f"/subscriptions/{o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000004"
+    assert journal["expiry"]["role_definition_id"]==expected_role
+    saved=save_cleanup_settings(provider="azure",deployment=d,request=request,
+        reservation=d.reservation.value,provider_lead_seconds=300.,settings=o,private_root=tmp_path/"f09")
+    record=SimpleNamespace(provider="azure",deployment_id=d.deployment_id,
+        journal_reference=str(o.attempt_root/"recovery.json"),cleanup_settings_reference=str(saved))
+    cleanup=CleanupRunner(d,o,now,account_present=True,present_children={"runbooks"})
+    result,retained,absent_ids=cleanup_saved_provider(record,runner=cleanup,
+        utc_now=lambda:now+timedelta(seconds=1),monotonic_now=lambda:2.)
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked, result.failures
+    assert retained.deployment.deployment_id==d.deployment_id and expected_role in absent_ids
+    assert any(r.action_type=="expiry_destroy" for r in cleanup.requests)
+
+
+def test_cleanup_rejects_subscription_scoped_role_from_another_subscription_before_commands(repository_root:Path,tmp_path:Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    registration=AutomationRunner(d,o,now,fail_at="runbook_publish")
+    register_expiry(d,expiry_request(d,o,now+timedelta(minutes=15)),o,registration,
+        clock=lambda:1.,utc_now=lambda:now)
+    journal_path=o.attempt_root/"recovery.json"
+    journal=json.loads(journal_path.read_text())
+    journal["expiry"]["role_definition_id"]="/subscriptions/foreign/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000004"
+    journal_path.write_text(json.dumps(journal))
+    class NoCloud:
+        def __init__(self): self.requests=[]
+        def run(self,request): self.requests.append(request); raise AssertionError("foreign role identity must stop cleanup")
+    runner=NoCloud()
+    with pytest.raises(ValueError,match="foreign expiry identities"):
+        destroy(d,o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
+    assert not runner.requests
+
+
+@pytest.mark.parametrize("tamper", ["same_subscription_role", "same_group_assignment",
+    "principal", "assignable_scope", "permissions"])
+def test_saved_f09_cleanup_rejects_role_state_mismatch_before_expiry_destroy(repository_root:Path,tmp_path:Path,tamper):
+    from cloud_network_benchmark.lifecycle_cleanup import cleanup_saved_provider, save_cleanup_settings
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    request=expiry_request(d,o,d.reservation.value.expires_at.value-timedelta(seconds=300))
+    overrides={}
+    if tamper=="principal":
+        overrides["azurerm_automation_account.expiry"]={"identity":[{"principal_id":"00000000-0000-0000-0000-000000000099"}]}
+    elif tamper=="assignable_scope":
+        overrides["azurerm_role_definition.deallocate"]={"assignable_scopes":["/subscriptions/foreign/resourceGroups/other"]}
+    else:
+        overrides["azurerm_role_definition.deallocate"]={"permissions":[{"actions":ROLE_ACTIONS+
+            ["Microsoft.Compute/virtualMachines/start/action"],"not_actions":[],"data_actions":None,
+            "not_data_actions":[]}]}
+    registration=AutomationRunner(d,o,now,fail_at="runbook_publish",expiry_state_overrides=overrides)
+    assert register_expiry(d,request,o,registration,clock=lambda:1.,utc_now=lambda:now).state=="failed"
+    journal_path=o.attempt_root/"recovery.json"
+    journal=json.loads(journal_path.read_text())
+    if tamper=="same_subscription_role":
+        journal["expiry"]["role_definition_id"]=f"/subscriptions/{o.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000099"
+        journal_path.write_text(json.dumps(journal))
+    elif tamper=="same_group_assignment":
+        journal["expiry"]["role_assignment_id"]=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+            "/providers/Microsoft.Authorization/roleAssignments/00000000-0000-0000-0000-000000000099")
+        journal_path.write_text(json.dumps(journal))
+    saved=save_cleanup_settings(provider="azure",deployment=d,request=request,
+        reservation=d.reservation.value,provider_lead_seconds=300.,settings=o,private_root=tmp_path/"f09")
+    record=SimpleNamespace(provider="azure",deployment_id=d.deployment_id,
+        journal_reference=str(journal_path),cleanup_settings_reference=str(saved))
+    cleanup=CleanupRunner(d,o,now,account_present=True,present_children={"runbooks"})
+    result,_,_=cleanup_saved_provider(record,runner=cleanup,utc_now=lambda:now+timedelta(seconds=1),
+        monotonic_now=lambda:2.)
+    assert result.cleanup_state=="failed" and result.launch_blocked, result.failures
+    assert not any(request.action_type=="expiry_destroy" for request in cleanup.requests)
+    assert any(request.action_type=="pair_destroy" for request in cleanup.requests)
+
+
+def test_saved_f09_cleanup_retries_after_successful_expiry_destroy_with_empty_state(repository_root:Path,tmp_path:Path):
+    from cloud_network_benchmark.lifecycle_cleanup import cleanup_saved_provider, save_cleanup_settings
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=16)})
+    request=expiry_request(d,o,d.reservation.value.expires_at.value-timedelta(seconds=300))
+    registration=AutomationRunner(d,o,now,fail_at="runbook_publish")
+    assert register_expiry(d,request,o,registration,clock=lambda:1.,utc_now=lambda:now).state=="failed"
+    saved=save_cleanup_settings(provider="azure",deployment=d,request=request,
+        reservation=d.reservation.value,provider_lead_seconds=300.,settings=o,private_root=tmp_path/"f09")
+    record=SimpleNamespace(provider="azure",deployment_id=d.deployment_id,
+        journal_reference=str(o.attempt_root/"recovery.json"),cleanup_settings_reference=str(saved))
+    first=CleanupRunner(d,o,now,account_present=True,present_children={"runbooks"},
+        role_definition_inventory='[{"id":"/subscriptions/foreign/providers/Microsoft.Authorization/roleDefinitions/foreign"}]')
+    failed,_,_=cleanup_saved_provider(record,runner=first,utc_now=lambda:now+timedelta(seconds=1),
+        monotonic_now=lambda:2.)
+    assert failed.cleanup_state=="failed" and failed.launch_blocked
+    assert json.loads((o.attempt_root/"expiry.tfstate").read_text())["resources"]==[]
+    second=CleanupRunner(d,o,now,account_present=False)
+    recovered,_,_=cleanup_saved_provider(record,runner=second,utc_now=lambda:now+timedelta(seconds=2),
+        monotonic_now=lambda:3.)
+    assert recovered.cleanup_state=="succeeded" and not recovered.launch_blocked, recovered.failures
+    assert any(request.action_type=="expiry_destroy" for request in second.requests)
 
 
 @pytest.mark.parametrize("fail_at,account_present,children", [

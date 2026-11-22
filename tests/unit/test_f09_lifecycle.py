@@ -192,12 +192,16 @@ def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
     full = WorkflowAllowance(10, 20, 30, 40, 60, 5, 12, 8, "sourced", {"aws": 50})
     registration = _remaining_f11_allowance(full, "registration")
     preparation = _remaining_f11_allowance(full, "preparation")
+    post_provision = _remaining_f11_allowance(full, "post_provision")
     measurement = _remaining_f11_allowance(full, "measurement")
     retrieval = _remaining_f11_allowance(full, "retrieval")
     assert registration == full
     assert preparation.completed_stages == ("registration",)
     assert (preparation.registration_seconds, preparation.provision_seconds,
             preparation.readiness_seconds, preparation.stabilization_seconds) == (0, 20, 30, 40)
+    assert post_provision.completed_stages == ("registration", "provision")
+    assert (post_provision.registration_seconds, post_provision.provision_seconds,
+            post_provision.readiness_seconds, post_provision.stabilization_seconds) == (0, 0, 30, 40)
     assert measurement.completed_stages == ("registration", "preparation")
     assert (measurement.registration_seconds, measurement.provision_seconds,
             measurement.readiness_seconds, measurement.stabilization_seconds) == (0, 0, 0, 0)

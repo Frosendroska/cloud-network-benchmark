@@ -48,8 +48,8 @@ run "same_zone" {
 run "finland_same_zone" {
   command = plan
   variables {
-    zone_a = "europe-north1-a"
-    zone_b = "europe-north1-a"
+    zone_a = "europe-north1-c"
+    zone_b = "europe-north1-c"
   }
   assert {
     condition = (google_compute_subnetwork.a.region == "europe-north1" &&
@@ -74,8 +74,8 @@ run "reject_finland_cross_zone" {
 run "reject_finland_image_alias" {
   command = plan
   variables {
-    zone_a  = "europe-north1-a"
-    zone_b  = "europe-north1-a"
+    zone_a  = "europe-north1-c"
+    zone_b  = "europe-north1-c"
     image_b = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
   }
   expect_failures = [terraform_data.scope_guard]

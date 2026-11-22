@@ -115,6 +115,8 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
             "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
         }),
         "complete_workflow_remaining_seconds": 120,
+        "post_registration_workflow_seconds": 120,
+        "post_provision_workflow_seconds": 100,
     }
     values.update(overrides)
     if deployment.admission.requires_primary_review and "primary_review_decision" not in values:
@@ -126,15 +128,17 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
     return AwsRuntimeSettings(**values)
 
 
-def test_stockholm_provider_scope_rejects_non_acceptance_identity_before_commands(tmp_path):
+def test_stockholm_provider_scope_supports_research_locality_and_rejects_other_scenarios(tmp_path):
     deployment = make_deployment(config_path="configs/tests/exp-900-single-provider-north.yaml")
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment=deployment,
         ami_ids={"eu-north-1": "ami-0123456789abcdef0"}), clock=lambda: NOW)
     assert driver._regions(deployment) == ["eu-north-1"]
+    study = deployment.model_copy(update={"experiment_id": "EXP-001", "mode": "short_study", "context": "standard"})
+    assert driver._regions(study) == ["eu-north-1"]
     for changed in (deployment.model_copy(update={"experiment_id": "EXP-999"}),
                     deployment.model_copy(update={"context": "standard"}),
-                    deployment.model_copy(update={"mode": "short_study"})):
-        with pytest.raises(AwsProviderError, match="Stockholm is limited"):
+                    deployment.model_copy(update={"scenario": "cross_zone"})):
+        with pytest.raises(AwsProviderError, match="unsupported"):
             driver._regions(changed)
 
 

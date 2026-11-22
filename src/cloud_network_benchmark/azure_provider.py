@@ -174,6 +174,174 @@ def _slug(d: ProviderDeploymentInput) -> str:
     return stem[:36].rstrip("-") + "-" + suffix
 
 
+def _is_uuid_segment(value: str) -> bool:
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except (ValueError, AttributeError):
+        return False
+
+
+def _terraform_state_attributes(state_path: Path, resource_type: str, name: str) -> dict[str, Any]:
+    if state_path.is_symlink() or not state_path.is_file():
+        raise RuntimeError("original Azure expiry Terraform state is unavailable")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("original Azure expiry Terraform state is unreadable") from exc
+    if state.get("version") != 4 or not isinstance(state.get("resources"), list):
+        raise RuntimeError("original Azure expiry Terraform state schema is unsupported")
+    matches = [item for item in state["resources"]
+        if isinstance(item, dict) and item.get("mode") == "managed"
+        and item.get("type") == resource_type and item.get("name") == name
+        and not item.get("module")]
+    if len(matches) != 1 or not isinstance(matches[0].get("instances"), list):
+        raise RuntimeError(f"original Azure expiry state does not identify one {resource_type}.{name}")
+    instances = [item for item in matches[0]["instances"]
+        if isinstance(item, dict) and not item.get("deposed")]
+    if len(instances) != 1 or not isinstance(instances[0].get("attributes"), dict):
+        raise RuntimeError(f"original Azure expiry state has ambiguous {resource_type}.{name} instances")
+    return instances[0]["attributes"]
+
+
+def _azure_expiry_state_identity(root: Path, deployment: ProviderDeploymentInput,
+                                 options: AzureRuntimeOptions) -> dict[str, Any]:
+    state_path=root/"expiry.tfstate"
+    group=_terraform_state_attributes(state_path,"azurerm_resource_group","attempt")
+    account=_terraform_state_attributes(state_path,"azurerm_automation_account","expiry")
+    role=_terraform_state_attributes(state_path,"azurerm_role_definition","deallocate")
+    assignment=_terraform_state_attributes(state_path,"azurerm_role_assignment","deallocate")
+    identity=account.get("identity"); permissions=role.get("permissions")
+    if not isinstance(identity,list) or len(identity)!=1 or not isinstance(identity[0],dict):
+        raise RuntimeError("original Azure expiry Terraform state lacks one managed identity")
+    if not isinstance(permissions,list) or len(permissions)!=1 or not isinstance(permissions[0],dict):
+        raise RuntimeError("original Azure expiry Terraform state lacks one custom-role permission set")
+    permission=permissions[0]
+    role_id=role.get("role_definition_resource_id") or role.get("id")
+    result={"resource_group_id":group.get("id"),"resource_group_name":group.get("name"),
+        "resource_group_tags":group.get("tags"),"automation_account_id":account.get("id"),
+        "principal_id":identity[0].get("principal_id"),"role_assignment_id":assignment.get("id"),
+        "role_definition_id":role_id,"role_name":role.get("name"),"role_scope":role.get("scope"),
+        "role_assignable_scopes":role.get("assignable_scopes"),"role_actions":permission.get("actions"),
+        "role_not_actions":permission.get("not_actions"),"role_data_actions":permission.get("data_actions"),
+        "role_not_data_actions":permission.get("not_data_actions"),"assignment_scope":assignment.get("scope"),
+        "assignment_principal_id":assignment.get("principal_id"),
+        "assignment_role_definition_id":assignment.get("role_definition_id")}
+    expected_group=f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
+    expected_account=expected_group+f"/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
+    assignment_prefix=(expected_group+"/providers/Microsoft.Authorization/roleAssignments/").lower()
+    role_prefix=(f"/subscriptions/{options.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/").lower()
+    if (not all(isinstance(result.get(key),str) and result[key] for key in (
+            "resource_group_id","resource_group_name","automation_account_id","principal_id",
+            "role_assignment_id","role_definition_id","role_name","role_scope","assignment_scope",
+            "assignment_principal_id","assignment_role_definition_id"))
+            or not isinstance(result["role_assignable_scopes"],list)
+            or not isinstance(result["role_actions"],list)
+            or not isinstance(result["role_not_actions"],list)
+            or result["role_data_actions"] not in (None,[])
+            or result["role_not_data_actions"] not in (None,[])):
+        raise RuntimeError("original Azure expiry Terraform state contains incomplete or broader role data")
+    if (result["resource_group_id"].lower()!=expected_group.lower()
+            or result["resource_group_name"]!=_slug(deployment)
+            or not isinstance(result["resource_group_tags"],dict)
+            or result["resource_group_tags"].get("deployment_id")!=deployment.deployment_id
+            or result["automation_account_id"].lower()!=expected_account.lower()
+            or result["role_name"]!=_slug(deployment)+"-deallocate-only"
+            or result["role_scope"].lower()!=expected_group.lower()
+            or result["assignment_scope"].lower()!=expected_group.lower()
+            or [str(item).lower() for item in result["role_assignable_scopes"]]!=[expected_group.lower()]
+            or sorted(result["role_actions"])!=sorted(ROLE_ACTIONS)
+            or result["role_not_actions"] or result["role_data_actions"] not in (None,[])
+            or result["role_not_data_actions"] not in (None,[])
+            or result["assignment_principal_id"].lower()!=result["principal_id"].lower()
+            or result["assignment_role_definition_id"].lower()!=result["role_definition_id"].lower()
+            or not result["role_assignment_id"].lower().startswith(assignment_prefix)
+            or not _is_uuid_segment(result["role_assignment_id"][len(assignment_prefix):])
+            or not result["role_definition_id"].lower().startswith(role_prefix)
+            or not _is_uuid_segment(result["role_definition_id"][len(role_prefix):])):
+        raise RuntimeError("original Azure expiry Terraform role identity, scope or permissions differ from the attempt")
+    return result
+
+
+def _identity_digest(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _saved_expiry_identity(expiry: dict[str, Any]) -> dict[str, Any]:
+    record=expiry.get("terraform_identity")
+    if (not isinstance(record,dict) or record.get("schema_version")!=1
+            or not isinstance(record.get("identity"),dict)
+            or record.get("sha256")!=_identity_digest(record["identity"])):
+        raise RuntimeError("saved Azure expiry Terraform identity evidence is missing or changed")
+    return record["identity"]
+
+
+def _verify_partial_expiry_state(root: Path, identity: dict[str, Any], *, allow_missing: bool) -> None:
+    path=root/"expiry.tfstate"
+    if path.is_symlink():
+        raise RuntimeError("original Azure expiry Terraform state cannot be a symlink")
+    if not path.is_file():
+        if allow_missing:
+            return
+        raise RuntimeError("original Azure expiry Terraform state disappeared before destroy")
+    try:
+        state=json.loads(path.read_text(encoding="utf-8"))
+    except (OSError,UnicodeDecodeError,json.JSONDecodeError) as exc:
+        raise RuntimeError("original Azure expiry Terraform state is unreadable after cleanup began") from exc
+    resources=state.get("resources") if isinstance(state,dict) and state.get("version")==4 else None
+    if not isinstance(resources,list):
+        raise RuntimeError("original Azure expiry Terraform state schema is unsupported")
+    expected={
+        ("azurerm_resource_group","attempt"):("resource_group_id","id"),
+        ("azurerm_automation_account","expiry"):("automation_account_id","id"),
+        ("azurerm_role_definition","deallocate"):("role_definition_id","role_definition_resource_id"),
+        ("azurerm_role_assignment","deallocate"):("role_assignment_id","id")}
+    seen=set()
+    for resource in resources:
+        if not isinstance(resource,dict) or resource.get("mode")!="managed" or resource.get("module"):
+            raise RuntimeError("Azure expiry Terraform state contains an unexpected managed resource")
+        key=(resource.get("type"),resource.get("name"))
+        if key not in expected or key in seen or not isinstance(resource.get("instances"),list):
+            raise RuntimeError("Azure expiry Terraform state contains an unknown or duplicate resource")
+        seen.add(key)
+        identity_key,id_attribute=expected[key]
+        for instance in resource["instances"]:
+            if not isinstance(instance,dict) or instance.get("deposed"):
+                continue
+            attributes=instance.get("attributes")
+            if not isinstance(attributes,dict):
+                raise RuntimeError("Azure expiry Terraform state instance is malformed")
+            resource_id=attributes.get(id_attribute) or attributes.get("id")
+            if not isinstance(resource_id,str) or resource_id.lower()!=str(identity[identity_key]).lower():
+                raise RuntimeError("remaining Azure expiry Terraform state identity differs from the verified attempt")
+            if key==("azurerm_resource_group","attempt") and (
+                    attributes.get("name")!=identity["resource_group_name"]
+                    or not isinstance(attributes.get("tags"),dict)
+                    or attributes["tags"].get("deployment_id")!=identity["resource_group_tags"]["deployment_id"]):
+                raise RuntimeError("remaining Azure resource group state differs from the verified attempt")
+            if key==("azurerm_automation_account","expiry"):
+                current=attributes.get("identity")
+                if current and (not isinstance(current,list) or len(current)!=1
+                        or current[0].get("principal_id","").lower()!=identity["principal_id"].lower()):
+                    raise RuntimeError("remaining Azure Automation principal differs from the verified attempt")
+            if key==("azurerm_role_definition","deallocate"):
+                permissions=attributes.get("permissions")
+                if (attributes.get("name")!=identity["role_name"]
+                        or str(attributes.get("scope","")).lower()!=identity["role_scope"].lower()
+                        or [str(item).lower() for item in attributes.get("assignable_scopes",[])]!=
+                            [str(item).lower() for item in identity["role_assignable_scopes"]]
+                        or not isinstance(permissions,list) or len(permissions)!=1
+                        or permissions[0].get("actions")!=identity["role_actions"]
+                        or permissions[0].get("not_actions")!=identity["role_not_actions"]
+                        or permissions[0].get("data_actions") not in (None,[])
+                        or permissions[0].get("not_data_actions") not in (None,[])):
+                    raise RuntimeError("remaining Azure custom role state differs from the verified attempt")
+            if key==("azurerm_role_assignment","deallocate") and (
+                    str(attributes.get("scope","")).lower()!=identity["assignment_scope"].lower()
+                    or str(attributes.get("principal_id","")).lower()!=identity["principal_id"].lower()
+                    or str(attributes.get("role_definition_id","")).lower()!=identity["role_definition_id"].lower()):
+                raise RuntimeError("remaining Azure role assignment state differs from the verified attempt")
+
+
 def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: datetime,
                      mono: float | None, *, require_registered: bool = False,
                      check_live_clock: bool = True) -> tuple[str, list[str]]:
@@ -192,10 +360,17 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         Scenario.INTER_REGION: ("germanywestcentral", "uksouth", "1", "1", "none"),
     }[Scenario(d.scenario)]
     got = (d.vm_a.region, d.vm_b.region, d.vm_a.zone, d.vm_b.zone, d.placement.kind)
-    sweden_component = (d.experiment_id == "EXP-901" and d.mode == ExperimentMode.ACCEPTANCE
-        and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE
-        and got == ("swedencentral", "swedencentral", "1", "1", "none"))
-    if got != expected and not sweden_component:
+    sweden_locality = ("swedencentral", "swedencentral", "1", "1", "none")
+    sweden_placement = ("swedencentral", "swedencentral", "1", "1", "proximity_placement_group")
+    sweden_research = (d.experiment_id in {"EXP-001", "EXP-003"}
+        and d.mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+        and d.context == "standard"
+        and got == (sweden_placement if d.scenario == Scenario.PLACEMENT_OPTIMIZATION else sweden_locality))
+    sweden_acceptance = (d.mode == ExperimentMode.ACCEPTANCE
+        and ((d.experiment_id == "EXP-901" and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
+             or (d.experiment_id == "EXP-903" and d.context == "standard" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
+             or (d.experiment_id == "EXP-003" and d.context == "standard" and d.scenario == Scenario.PLACEMENT_OPTIMIZATION and got == sweden_placement)))
+    if got != expected and not (sweden_research or sweden_acceptance):
         raise ValueError(f"scenario locality/placement mismatch: expected {expected}, got {got}")
     if d.scenario == Scenario.PLACEMENT_OPTIMIZATION and not d.placement.name:
         raise ValueError("placement optimization requires a named PPG")
@@ -618,6 +793,30 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
         raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 
+def _read_runbook_content(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
+                          account: str, runbook: str, action: str,
+                          clock: Callable[[],float]) -> bytes:
+    """Read exact Automation content bytes without Azure CLI text formatting."""
+    output = root / f".{action}.content"
+    if output.is_symlink() or output.exists():
+        raise FileExistsError("runbook content readback path already exists")
+    try:
+        result = _command(runner, options, root,
+            ["az", "rest", "--method", "GET", "--url",
+             f"{account}/runbooks/{runbook}/content?api-version={AUTOMATION_API}",
+             "--output-file", str(output)], action, clock)
+        if result.stdout or result.stderr:
+            raise RuntimeError("runbook content readback returned unexpected command output")
+        if output.is_symlink() or not output.is_file():
+            raise RuntimeError("runbook content readback did not create a regular file")
+        if output.stat().st_size > 1_000_000:
+            raise RuntimeError("runbook content readback exceeded the 1 MiB bounded-response limit")
+        return output.read_bytes()
+    finally:
+        if output.is_file() and not output.is_symlink():
+            output.unlink()
+
+
 def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None) -> list[str]:
     args = ["az", "rest", "--method", method, "--url", url, "--output", "json"]
     if body is not None: args += ["--headers", "Content-Type=application/json", "--body", json.dumps(body, separators=(",", ":"))]
@@ -718,8 +917,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         if remaining <= 0:
             raise TimeoutError("runbook publication did not reach Published within the original command deadline")
         sleep(min(options.poll_seconds,remaining))
-    content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{rb}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "published_content_readback", clock)
-    digest = hashlib.sha256(content.stdout.encode()).hexdigest()
+    content = _read_runbook_content(runner, options, root, account, rb, "published_content_readback", clock)
+    digest = hashlib.sha256(content).hexdigest()
     if published.get("properties", {}).get("state") != "Published" or digest != hashlib.sha256(script.encode()).hexdigest():
         raise RuntimeError("runbook publication/content readback did not match uploaded script")
     sched_url = f"{account}/schedules/{sched}?api-version={AUTOMATION_API}"
@@ -829,8 +1028,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
         raise RuntimeError("registered Automation account region changed")
     if account_read.get("identity",{}).get("type") != "SystemAssigned" or account_read.get("identity",{}).get("principalId","").lower() != str(m.get("managed_identity_principal_id","")).lower():
         raise RuntimeError("registered Automation system-assigned identity changed")
-    content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{m['runbook']}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "expiry_content_recheck", clock)
-    if hashlib.sha256(content.stdout.encode()).hexdigest() != m.get("published_content_sha256"):
+    content = _read_runbook_content(runner, options, root, account, m["runbook"], "expiry_content_recheck", clock)
+    if hashlib.sha256(content).hexdigest() != m.get("published_content_sha256"):
         raise RuntimeError("registered runbook content changed after expiry registration")
     schedule_url = f"{account}/schedules/{m['schedule']}?api-version={AUTOMATION_API}"
     schedule = json.loads(_command(runner, options, root, _azure_rest("GET", schedule_url), "expiry_schedule_recheck", clock).stdout or "{}")
@@ -1190,10 +1389,26 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
     expected_group = f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
     expected_account = expected_group + f"/providers/Microsoft.Automation/automationAccounts/{_slug(deployment)}-auto"
     prereq = state.get("expiry", {})
+    role_assignment_id = prereq.get("role_assignment_id")
+    role_definition_id = prereq.get("role_definition_id")
+    expected_assignment_prefix = (expected_group
+        + "/providers/Microsoft.Authorization/roleAssignments/").lower()
+    # Azure custom-role definitions are subscription-scoped ARM resources even
+    # when their assignable scope is this attempt's resource group. The exact
+    # role-definition ID is persisted from this attempt's Terraform output;
+    # the assignment remains scoped beneath the owned resource group.
+    expected_definition_prefix = (f"/subscriptions/{options.subscription_id}"
+        "/providers/Microsoft.Authorization/roleDefinitions/").lower()
+    valid_assignment = (isinstance(role_assignment_id, str)
+        and role_assignment_id.lower().startswith(expected_assignment_prefix)
+        and _is_uuid_segment(role_assignment_id[len(expected_assignment_prefix):]))
+    valid_definition = (isinstance(role_definition_id, str)
+        and role_definition_id.lower().startswith(expected_definition_prefix)
+        and _is_uuid_segment(role_definition_id[len(expected_definition_prefix):]))
     if (prereq.get("automation_account_id") not in (None, expected_account)
             or prereq.get("resource_group_id") not in (None, expected_group)
-            or any(prereq.get(key) and not str(prereq[key]).lower().startswith(expected_group.lower() + "/")
-                   for key in ("role_assignment_id", "role_definition_id"))):
+            or (role_assignment_id and not valid_assignment)
+            or (role_definition_id and not valid_definition)):
         raise ValueError("recovery journal contains foreign expiry identities; refusing cleanup")
     try:
         # Pair destroy precedes inventory. Expiry remains until direct inventory proves both VMs absent.
@@ -1232,14 +1447,36 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         applied=any(item.get("request",{}).get("action_type")=="expiry_prerequisites"
                     and "apply" in item.get("request",{}).get("argv",[])
                     and item.get("result",{}).get("outcome")=="succeeded" for item in state.get("actions",[]))
-        if applied and not prereq.get("role_assignment_id"):
-            _tf(root,options,runner,clock,"terraform/azure/expiry","init","-input=false",action="expiry_recovery_identity_init")
-            raw=_tf(root,options,runner,clock,"terraform/azure/expiry","output","-json",action="expiry_recovery_identity_output").stdout
-            outputs=json.loads(raw)
-            recovered={k:outputs.get(k,{}).get("value") for k in ("resource_group_id","automation_account_id","principal_id","role_assignment_id","role_definition_id")}
-            if not all(isinstance(value,str) and value for value in recovered.values()):
-                raise RuntimeError("interrupted expiry prerequisite identities cannot be recovered completely")
-            prereq.update(recovered); state["expiry"]=prereq; _atomic_private(journal,state)
+        if applied:
+            marker=prereq.get("terraform_identity")
+            if marker is None:
+                recovered=_azure_expiry_state_identity(root,deployment,options)
+                prereq["terraform_identity"]={"schema_version":1,"identity":recovered,
+                    "sha256":_identity_digest(recovered)}
+            else:
+                recovered=_saved_expiry_identity(prereq)
+                prior_destroy=any(item.get("request",{}).get("action_type")=="expiry_destroy"
+                    for item in state.get("actions",[]))
+                if prior_destroy:
+                    _verify_partial_expiry_state(root,recovered,allow_missing=True)
+                else:
+                    current=_azure_expiry_state_identity(root,deployment,options)
+                    if current!=recovered:
+                        raise RuntimeError("original Azure expiry Terraform state changed after identity validation")
+            for key in ("resource_group_id","automation_account_id","principal_id",
+                        "role_assignment_id","role_definition_id"):
+                original=prereq.get(key)
+                if original and str(original).lower()!=str(recovered[key]).lower():
+                    raise RuntimeError(f"saved expiry {key} differs from its original Terraform state")
+                prereq[key]=recovered[key]
+            metadata=prereq.get("metadata",{})
+            if metadata and any(str(metadata.get(key,"")).lower()!=str(recovered[source]).lower()
+                    for key,source in (("role_definition_id","role_definition_id"),
+                        ("role_assignment_id","role_assignment_id"),("resource_group_id","resource_group_id"),
+                        ("automation_account_id","automation_account_id"),
+                        ("managed_identity_principal_id","principal_id"))):
+                raise RuntimeError("registered expiry metadata differs from its original Terraform state")
+            state["expiry"]=prereq; _atomic_private(journal,state)
         endpoint = (f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}/resources?api-version=2021-04-01"
             if parent_exists else f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01")
         found,inventory_evidence=_read_arm_collection(runner,options,root,endpoint,"pair_inventory",clock,("id","type"))
