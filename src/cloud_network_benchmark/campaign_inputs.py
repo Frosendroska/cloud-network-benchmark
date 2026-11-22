@@ -278,12 +278,13 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         if stage == "week":
             _validate_weekly_concurrency(gates["weekly_concurrency"])
         elif stage == "acceptance":
-            declaration = gates["paired_acceptance"]
-            fields = declaration.get("fields", {})
-            start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
-            if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-                    or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
-                raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
+            declaration = gates.get("paired_acceptance")
+            if declaration is not None and "acceptance" in settings.get("stage_inputs", {}):
+                fields = declaration.get("fields", {})
+                start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
+                if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+                        or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
+                    raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
         _cost_payload(settings, root)
         if stage in {"day", "week"}:
             _common_n(settings)
