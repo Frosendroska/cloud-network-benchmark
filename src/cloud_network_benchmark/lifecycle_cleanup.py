@@ -151,7 +151,11 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
         str(saved.provider.value if hasattr(saved.provider, "value") else saved.provider), defaults[saved.provider])
     if r.expires_at.value != reservation.expires_at.value - timedelta(seconds=saved.provider_lead_seconds):
         raise ValueError("saved provider expiry request no longer matches its original F11 lead")
-    if saved.provider_lead_seconds != expected_lead:
+    # A named workflow profile fixes its provider lead. Unprofiled workflows
+    # retain the exact source-bound lead saved with their original expiry
+    # request; _validate_request above verifies that request against the same
+    # reservation without silently substituting a profile default.
+    if d.admission.workflow_profile is not None and saved.provider_lead_seconds != expected_lead:
         raise ValueError("saved provider expiry lead differs from the fixed workflow profile")
     if saved.provider == Provider.AWS:
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
