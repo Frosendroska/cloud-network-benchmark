@@ -266,6 +266,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         optional = {"plan_review_timeout_seconds"}
         if provider == "aws":
             optional.add("iam_settle_seconds")
+            optional.add("expiry_role_permissions_boundary_arn")
         present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
         options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
         if "plan_review_timeout_seconds" in present:
@@ -640,7 +641,8 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
             raise ValueError("AWS primary review source hash does not match its bytes")
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
     settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0),
-        iam_settle_seconds=options.get("iam_settle_seconds", 0))
+        iam_settle_seconds=options.get("iam_settle_seconds", 0),
+        expiry_role_permissions_boundary_arn=options.get("expiry_role_permissions_boundary_arn"))
     driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
     trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -883,7 +885,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 if review is None: raise ValueError("AWS scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
             settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0),
-                iam_settle_seconds=config.get("iam_settle_seconds", 0))
+                iam_settle_seconds=config.get("iam_settle_seconds", 0),
+                expiry_role_permissions_boundary_arn=config.get("expiry_role_permissions_boundary_arn"))
             driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
