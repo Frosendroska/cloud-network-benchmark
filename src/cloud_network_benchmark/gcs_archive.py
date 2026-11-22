@@ -60,7 +60,14 @@ class _GoogleRequestBudget:
         # OAuth's refresh helper may retry unsuccessful responses internally. Turn
         # every such response into a transport failure before it can enter that loop.
         response = self.dispatch(request, *args, **kwargs)
-        status = getattr(response, "status_code", 200)
+        status = getattr(response, "status", None)
+        if status is None:
+            status = getattr(response, "status_code", None)
+        if type(status) is not int:
+            close = getattr(response, "close", None)
+            if close:
+                close()
+            raise self._transport_error("Google credential request returned an invalid HTTP status")
         if not 200 <= status < 300:
             close = getattr(response, "close", None)
             if close:
@@ -74,8 +81,12 @@ class _GoogleRequestBudget:
         return request(*args, **kwargs)
 
 
-def _disable_http_retries(session: Any, adapter_type: type) -> None:
+def _disable_http_retries(session: Any, adapter_type: type, budget: _GoogleRequestBudget) -> None:
     adapter = adapter_type(max_retries=0)
+    send = adapter.send
+    def bounded_send(request, *args, **kwargs):
+        return budget.dispatch(send, request, *args, **kwargs)
+    adapter.send = bounded_send
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
@@ -180,13 +191,13 @@ class GoogleCloudStorageBackend:
                 lifetime=lifetime)
             self._request_budget = _GoogleRequestBudget(auth_exceptions.TransportError)
             auth_session = Request().session
-            _disable_http_retries(auth_session, HTTPAdapter)
+            _disable_http_retries(auth_session, HTTPAdapter, self._request_budget)
             auth_request = Request(session=auth_session)
             bounded_auth_request = lambda *args, **kwargs: self._request_budget.auth_request(
                 auth_request, *args, **kwargs)
             authorized_session = AuthorizedSession(credentials,
                 auth_request=bounded_auth_request, max_refresh_attempts=0)
-            _disable_http_retries(authorized_session, HTTPAdapter)
+            _disable_http_retries(authorized_session, HTTPAdapter, self._request_budget)
             storage_request = authorized_session.request
             def bounded_storage_request(*args, **kwargs):
                 return self._request_budget.dispatch(storage_request, *args, **kwargs)

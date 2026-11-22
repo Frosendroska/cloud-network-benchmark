@@ -530,6 +530,7 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
         def request(self, *args, **kwargs): return type("Response", (), {"status_code": 200})()
     class Adapter:
         def __init__(self, *, max_retries): self.max_retries = max_retries
+        def send(self, request, **kwargs): return type("Response", (), {"status": 200})()
     class Request:
         def __init__(self, session=None): self.session = session or Session()
         def __call__(self, *args, **kwargs): return self.session.request(*args, **kwargs)
@@ -644,6 +645,45 @@ def test_google_auth_and_storage_subrequests_share_one_operation_budget():
     assert storage_timeouts == [8]
 
 
+def test_google_transport_clamps_timeout_at_final_auth_and_storage_send():
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    now, events = [20.0], []
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: now[0])
+    class Response:
+        def __init__(self, status): self.status = status
+    class Session:
+        def __init__(self, kind): self.kind, self.adapters = kind, {}
+        def mount(self, prefix, adapter): self.adapters[prefix] = adapter
+        def request(self, request, *, timeout):
+            response = self.adapters["https://"].send(request, timeout=timeout)
+            return response
+    class Adapter:
+        def __init__(self, *, max_retries): self.max_retries = max_retries
+        def send(self, request, *, timeout):
+            events.append((request, timeout))
+            if request == "auth":
+                now[0] += 9.5
+            return Response(200)
+
+    auth_session, storage_session = Session("auth"), Session("storage")
+    archive_sink._disable_http_retries(auth_session, Adapter, budget)
+    archive_sink._disable_http_retries(storage_session, Adapter, budget)
+    def auth_request(*, timeout):
+        return auth_session.request("auth", timeout=timeout)
+    def authorized_request(*, timeout):
+        # Models AuthorizedSession.before_request followed by its storage send,
+        # both receiving the original timeout from its outer request call.
+        budget.auth_request(auth_request, timeout=timeout)
+        return storage_session.request("storage", timeout=timeout)
+
+    with budget.operation(10):
+        budget.dispatch(authorized_request, timeout=10)
+    assert [event[0] for event in events] == ["auth", "storage"]
+    assert events[0][1] == 10
+    assert events[1][1] == pytest.approx(0.5)
+
+
 def test_google_request_budget_fails_before_storage_dispatch_after_auth_exhaustion():
     import cloud_network_benchmark.gcs_archive as archive_sink
 
@@ -691,6 +731,25 @@ def test_google_auth_failure_and_connection_error_are_not_retried():
         with pytest.raises(OSError, match="offline fake"):
             budget.auth_request(failed_connection)
     assert connection_calls == [10]
+
+
+@pytest.mark.parametrize("response", [
+    type("GoogleAuthResponse", (), {"status": 503})(),
+    type("MissingStatusResponse", (), {})(),
+    type("InvalidStatusResponse", (), {"status": "503", "status_code": 503})(),
+])
+def test_google_auth_response_status_is_read_from_sdk_interface_and_fails_closed(response):
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: 1.0)
+    calls = []
+    def request(*, timeout):
+        calls.append(timeout)
+        return response
+    with budget.operation(10):
+        with pytest.raises(RuntimeError):
+            budget.auth_request(request)
+    assert calls == [10]
 
 
 def test_google_storage_401_is_returned_after_one_dispatch():
