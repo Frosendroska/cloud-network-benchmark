@@ -397,6 +397,49 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     assert calls[3][1]["if_generation_match"] == 7 and calls[3][1]["retry"] is None
 
 
+@pytest.mark.parametrize(("reload_elapsed", "expect_download", "expected_timeout"), [
+    (9.5, True, 0.5), (10.0, False, None),
+])
+def test_google_backend_download_shares_one_monotonic_timeout(
+        monkeypatch, tmp_path, reload_elapsed, expect_download, expected_timeout):
+    calls = []
+    now = [100.0]
+    class Blob:
+        generation, size = 7, 4
+        def reload(self, **kwargs):
+            calls.append(("reload", kwargs))
+            now[0] += reload_elapsed
+        def download_to_filename(self, path, **kwargs):
+            calls.append(("download", kwargs))
+            Path(path).write_bytes(b"data")
+    class Bucket:
+        def blob(self, _key, **_kwargs): return Blob()
+    class Client:
+        def bucket(self, _name): return Bucket()
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    cloud.storage = types.SimpleNamespace(Client=Client)
+    google.cloud = cloud
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    import cloud_network_benchmark.gcs_archive as archive_sink
+    monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
+    from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
+    backend = GoogleCloudStorageBackend("valid-bucket")
+    target = tmp_path / "remote-part"
+    if expect_download:
+        backend.download("key", target, maximum_bytes=10, timeout_seconds=10, generation="7")
+        assert target.read_bytes() == b"data"
+        assert calls[1][0] == "download"
+        assert calls[1][1]["timeout"] == pytest.approx(expected_timeout)
+        assert calls[1][1]["retry"] is None
+    else:
+        with pytest.raises(TimeoutError, match="shared timeout"):
+            backend.download("key", target, maximum_bytes=10, timeout_seconds=10, generation="7")
+        assert [kind for kind, _ in calls] == ["reload"]
+        assert not target.exists()
+
+
 def test_bounded_relay_reconstructs_archive_and_never_stages_full_bundle(tmp_path):
     import gzip
     import tarfile

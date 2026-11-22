@@ -8,7 +8,7 @@ import json
 import time
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -34,6 +34,71 @@ class _Attempt:
     retrieval: Any = None
     f03_process_record: dict[str, Any] | None = None
     f03_process_absent_at: datetime | None = None
+
+
+def _fetch_bounded_guest_archive_part(*, runner: Any, connection: Any, role: str,
+        source_path: str, destination: Path, staging_directory: Path, size_bytes: int,
+        maximum_staging_bytes: int, minimum_free_bytes: int,
+        controller_quota_free_bytes: int, deadline: Any, clock: Callable[[], float],
+        action_id: str, actions: list[Any]) -> Path:
+    """Receive one frozen guest part through the bounded SSH stdout path."""
+    from pathlib import PurePosixPath
+    from .access import _action, _request
+    from .contracts.common import CommandOutcome
+    from .retrieval import _bounded_stream_script
+
+    source = PurePosixPath(source_path)
+    if (not source_path.startswith("/") or source.as_posix() != source_path
+            or ".." in source.parts):
+        raise ValueError("guest archive part source must be normalized absolute POSIX")
+    if (type(size_bytes) is not int or size_bytes <= 0
+            or type(maximum_staging_bytes) is not int or maximum_staging_bytes <= 0
+            or type(minimum_free_bytes) is not int or minimum_free_bytes < 0
+            or type(controller_quota_free_bytes) is not int or controller_quota_free_bytes < 0):
+        raise ValueError("guest archive receive bounds must be positive measured integers")
+    if size_bytes > maximum_staging_bytes or size_bytes + minimum_free_bytes > controller_quota_free_bytes:
+        raise OSError("one bounded guest part does not fit the configured staging quota")
+    staging_directory, destination = Path(staging_directory), Path(destination)
+    if (staging_directory.is_symlink() or not staging_directory.is_dir()
+            or destination.parent.resolve() != staging_directory.resolve()
+            or destination.exists() or destination.is_symlink()):
+        raise ValueError("bounded guest part destination is not a new one-part staging file")
+    remaining = deadline.remaining(clock, cleanup=True)
+    if remaining <= 0:
+        raise TimeoutError("guest archive part reached the original retrieval window")
+    vm = connection.vm_a if role == "vm_a" else connection.vm_b if role == "vm_b" else None
+    if vm is None:
+        raise ValueError("guest archive part role must be vm_a or vm_b")
+    request = _request(action_id, vm,
+        ["sh", "-c", _bounded_stream_script(source_path, size_bytes)],
+        min(connection.timeouts.transfer_seconds, remaining))
+    request = request.model_copy(update={"argv": [request.argv[0], "-T", *request.argv[1:]]})
+    from .contracts.execution import CommandResult
+    started = datetime.now(timezone.utc)
+    try:
+        result = runner.run_bounded_copy(request, destination, size_bytes)
+    except KeyboardInterrupt:
+        finished = datetime.now(timezone.utc)
+        result = CommandResult(action_id=action_id, outcome=CommandOutcome.INTERRUPTED,
+            started_at=started, finished_at=finished,
+            duration_seconds=max(0.0, (finished - started).total_seconds()),
+            exit_code=None, stdout="", stderr="bounded guest archive receive interrupted",
+            redactions=request.redactions)
+    except Exception as exc:
+        finished = datetime.now(timezone.utc)
+        result = CommandResult(action_id=action_id, outcome=CommandOutcome.FAILED,
+            started_at=started, finished_at=finished,
+            duration_seconds=max(0.0, (finished - started).total_seconds()),
+            exit_code=1, stdout="", stderr=f"bounded guest archive receiver raised {type(exc).__name__}",
+            redactions=request.redactions)
+    actions.append(_action(request.action_id, request.action_type, vm, request, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(f"one bounded archive part retrieval failed for {role}")
+    if destination.is_symlink() or not destination.is_file() or destination.stat().st_size != size_bytes:
+        destination.unlink(missing_ok=True)
+        raise ValueError("retrieved guest part differs from its frozen byte bound")
+    return destination
 
 
 def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, children: dict[str, Any],
@@ -609,23 +674,16 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         if not ledger.debit_result_transfer(reservation.reservation_id.value,
                                 provider=provider, attempt_id=attempt_id, maximum_payload_bytes=size):
                             raise ValueError("result-transfer ledger denied this exact guest part")
-                    vm = item.connection.vm_a if role == "vm_a" else item.connection.vm_b
                     destination = staging_root / f".{deployment.deployment_id}-{role}-{part_counter:06d}.part"
-                    if destination.exists() or destination.is_symlink():
-                        raise FileExistsError("one-part staging destination already exists")
                     archive_dir = next(row["archive_directory"] for row in guest_archives if row["role"] == role)
-                    remote = f"{vm.user}@{vm.host}:{archive_dir}/{part['path']}"
-                    request = _request(f"f09-guest-part-{deployment.deployment_id}-{role}-{part_counter}",
-                        vm, [remote, str(destination)], min(item.connection.timeouts.transfer_seconds, remaining), "scp")
-                    result = _execute(runner, request)
-                    actions.append(_action(request.action_id, request.action_type, vm, request, result))
-                    if result.outcome != CommandOutcome.SUCCEEDED:
-                        destination.unlink(missing_ok=True)
-                        raise RuntimeError(f"one bounded archive part retrieval failed for {role}")
-                    if destination.is_symlink() or not destination.is_file() or destination.stat().st_size != size:
-                        destination.unlink(missing_ok=True)
-                        raise ValueError("retrieved guest part differs from its frozen byte bound")
-                    return destination
+                    return _fetch_bounded_guest_archive_part(runner=runner, connection=item.connection,
+                        role=role, source_path=f"{archive_dir}/{part['path']}",
+                        destination=destination, staging_directory=staging_root, size_bytes=size,
+                        maximum_staging_bytes=max_staging, minimum_free_bytes=min_free,
+                        controller_quota_free_bytes=archive_sink["controller_quota_free_bytes"],
+                        deadline=item.deadline, clock=clock.monotonic,
+                        action_id=f"f09-guest-part-{deployment.deployment_id}-{role}-{part_counter}",
+                        actions=actions)
                 backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket)
                 archive_status = publish_guest_archive_parts(guest_archives=guest_archives,
                     fetch_part=fetch_part, staging_directory=staging_root, backend=backend,
