@@ -19,14 +19,18 @@ from typing import Any, Callable, Mapping
 
 _REMOTE = r'''import json, os, pathlib, sys, time
 p=json.loads(sys.argv[1]); root=pathlib.Path(p["workspace"]); root.is_dir() or sys.exit(20)
-boot=pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(); out={"boot_id":boot,"processes":{},"files":{}}
+proc=pathlib.Path(p.get("proc_root", "/proc"))
+boot=(proc/"sys/kernel/random/boot_id").read_text().strip(); out={"boot_id":boot,"processes":{},"files":{}}
+valid={"R","S","D","T","t","W","X","x","K","P","I"}
 for x in p["processes"]:
- s=pathlib.Path(f"/proc/{x['pid']}/stat").read_text(); f=s[s.rfind(")")+2:].split(); ticks=int(f[19])
- out["processes"][x["kind"]]={"pid":x["pid"],"boot_id":boot,"start_ticks":ticks,"alive":True}
+ s=(proc/str(x["pid"])/"stat").read_text(); f=s[s.rfind(")")+2:].split(); state=f[0]; ticks=int(f[19])
+ out["processes"][x["kind"]]={"pid":x["pid"],"boot_id":boot,"start_ticks":ticks,"state":state,"alive":state in valid and state not in {"Z","X","x"}}
 for x in p["files"]:
  q=(root/x["path"]).resolve(strict=True); q.is_relative_to(root.resolve(strict=True)) or sys.exit(21)
  st=q.stat(); out["files"][x["path"]]={"size":st.st_size,"mtime":st.st_mtime,"kind":x["kind"]}
 print(json.dumps(out,sort_keys=True))'''
+
+_LIVE_PROC_STATES = {"R", "S", "D", "T", "t", "W", "K", "P", "I"}
 
 
 def _safe_rel(value: Any) -> bool:
@@ -108,7 +112,7 @@ def _ssh_probe(role: Mapping[str, Any], payload: dict, *, timeout: float,
 def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: float,
                run: Callable[..., Any] = subprocess.run, probe: Callable[..., dict] | None = None,
                freshness_seconds: float = 120, owned_role: Mapping[str, Any] | None = None,
-               timeout: float = 12) -> dict:
+               timeout: float = 12, clock: Callable[[], float] | None = None) -> dict:
     if not all(math.isfinite(value) for value in (now, freshness_seconds, timeout)) or freshness_seconds <= 0 or timeout <= 0:
         return {"health": "unknown", "errors": ["observer_clock_or_probe_budget_invalid"]}
     errors = _validate_role(role, workspace, role_name, owned_role)
@@ -121,10 +125,14 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
         return {"health": "fault", "errors": ["guest_probe_unreachable" if isinstance(exc, (OSError, subprocess.SubprocessError, RuntimeError)) else "guest_probe_invalid"]}
     if not isinstance(result, Mapping):
         return {"health": "fault", "errors": ["guest_probe_malformed"]}
+    check_now = clock() if clock is not None else now
+    if not math.isfinite(check_now):
+        return {"health": "unknown", "errors": ["observer_clock_invalid"]}
     problems = []
     for expected in role["processes"]:
         actual = result.get("processes", {}).get(expected["kind"], {})
         if (not isinstance(actual, Mapping) or actual.get("alive") is not True or actual.get("pid") != expected["pid"]
+                or actual.get("state") not in _LIVE_PROC_STATES
                 or actual.get("boot_id") != expected["boot_id"]
                 or actual.get("start_ticks") != expected["start_ticks"]):
             problems.append("process_identity_mismatch:" + expected["kind"])
@@ -138,9 +146,9 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
             mtime = float(value["mtime"])
             if not math.isfinite(mtime):
                 raise ValueError
-            if mtime > now + 5:
+            if mtime > check_now + 5:
                 problems.append("output_time_in_future:" + item["kind"])
-            elif not (item["kind"] == "sockperf_chunk" and item.get("state") == "completed") and now - mtime > freshness_seconds:
+            elif not (item["kind"] == "sockperf_chunk" and item.get("state") == "completed") and check_now - mtime > freshness_seconds:
                 problems.append("output_stale:" + item["kind"])
         except (KeyError, TypeError, ValueError, OverflowError):
             problems.append("output_timestamp_invalid:" + item["kind"])
@@ -153,7 +161,7 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
                 mtime = float(value["mtime"])
                 fresh_current |= (isinstance(value, Mapping) and type(value.get("size")) is int
                                   and value["size"] > 0 and math.isfinite(mtime)
-                                  and now - freshness_seconds <= mtime <= now + 5)
+                                  and check_now - freshness_seconds <= mtime <= check_now + 5)
             except (TypeError, ValueError, KeyError, OverflowError):
                 continue
         if not fresh_current:
@@ -166,7 +174,8 @@ def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,
                      probe: Callable[..., dict] | None = None,
                      active_entry_ids: set[str] | None = None,
                      probe_budget_seconds: float = 20,
-                     monotonic: Callable[[], float] = time.monotonic) -> dict:
+                     monotonic: Callable[[], float] = time.monotonic,
+                     clock: Callable[[], float] | None = None) -> dict:
     """Verify the hash-pinned binding against prepared stage IDs, then probe all roles."""
     try:
         raw = Path(bindings_path).read_bytes()
@@ -177,7 +186,8 @@ def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,
         if (bindings.get("stage_id") != stage.get("stage_id")
                 or bindings.get("campaign_id") != stage.get("campaign_id")):
             return {"health": "fault", "errors": ["stage_binding_mismatch"]}
-        at = __import__("time").time() if now is None else now
+        observed_clock = clock or (time.time if now is None else lambda: now)
+        at = observed_clock()
         if not math.isfinite(at) or not math.isfinite(probe_budget_seconds) or probe_budget_seconds <= 0:
             return {"health": "unknown", "errors": ["observer_clock_or_budget_invalid"]}
         prepared_rows = stage.get("entries", [])
@@ -235,7 +245,7 @@ def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,
                     role_results[role] = {"health": "fault", "errors": ["guest_probe_budget_exhausted"]}
                 else:
                     role_results[role] = probe_role(binding, workspace, role, now=at, run=run, probe=probe,
-                        owned_role=owned_participant.get(role), timeout=min(12.0, remaining))
+                        owned_role=owned_participant.get(role), timeout=min(12.0, remaining), clock=observed_clock)
             results[result_key] = {"provider": provider, "run_id": run_id, "deployment_id": entry["deployment_id"],
                                       "roles": role_results,
                                       "health": "healthy" if all(x["health"] == "healthy" for x in role_results.values()) else "fault"}

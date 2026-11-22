@@ -31,7 +31,7 @@ def role_binding(role: str) -> dict:
 
 def fresh_probe(_role, payload):
     return {"processes": {item["kind"]: {"alive": True, "pid": item["pid"],
-                "boot_id": item["boot_id"], "start_ticks": item["start_ticks"]}
+                "boot_id": item["boot_id"], "start_ticks": item["start_ticks"], "state": "S"}
                 for item in payload["processes"]},
             "files": {item["path"]: {"size": 10, "mtime": 990, "kind": item["kind"]}
                       for item in payload["files"]}}
@@ -89,6 +89,32 @@ def test_guest_probe_detects_stale_unreachable_reused_pid_and_missing_outputs():
     del missing["files"]["measurements/probe-0001.csv"]
     assert "output_missing_or_empty:sockperf_chunk" in probe_role(role, WORKSPACE, "vm_a", now=NOW, owned_role=role,
         probe=lambda *_: missing)["errors"]
+
+
+def test_executed_remote_snippet_rejects_zombie_exited_and_invalid_proc_states(tmp_path):
+    import subprocess
+    import sys
+    from cloud_network_benchmark.guest_observer import _REMOTE
+
+    workspace = tmp_path / "workspace"
+    (workspace / "measurements").mkdir(parents=True)
+    (workspace / "measurements/current.csv").write_text("sample")
+    proc_root = tmp_path / "proc"
+    (proc_root / "sys/kernel/random").mkdir(parents=True)
+    (proc_root / "sys/kernel/random/boot_id").write_text("boot-1\n")
+    payload = {"workspace": str(workspace), "proc_root": str(proc_root),
+        "processes": [{"kind": "producer", "pid": 321}],
+        "files": [{"path": "measurements/current.csv", "kind": "sockperf_chunk"}]}
+    for state, expected_alive in (("S", True), ("Z", False), ("X", False), ("?", False)):
+        process_dir = proc_root / "321"
+        process_dir.mkdir(exist_ok=True)
+        fields = [state] + ["1"] * 18 + ["987"]
+        (process_dir / "stat").write_text("321 (sockperf) " + " ".join(fields))
+        result = subprocess.run([sys.executable, "-c", _REMOTE, json.dumps(payload)],
+            capture_output=True, text=True, check=True, timeout=2)
+        process = json.loads(result.stdout)["processes"]["producer"]
+        assert process["alive"] is expected_alive
+        assert process["state"] == state
 
 
 def test_receiver_and_diagnostic_staleness_are_faults_and_incomplete_bindings_unknown():
@@ -224,6 +250,21 @@ def test_guest_fanout_has_one_total_probe_deadline(tmp_path):
     assert elapsed[0] == 20
     assert any("guest_probe_budget_exhausted" in role["errors"]
                for entry in result["entries"].values() for role in entry["roles"].values())
+
+
+def test_output_freshness_uses_clock_after_each_probe_response(tmp_path):
+    stage, path, _, _ = pinned_stage(tmp_path)
+    wall = [NOW]
+
+    def delayed_probe(role, payload):
+        wall[0] += 6
+        result = fresh_probe(role, payload)
+        for value in result["files"].values():
+            value["mtime"] = wall[0]
+        return result
+
+    result = observe_bindings(stage, path, probe=delayed_probe, now=NOW, clock=lambda: wall[0])
+    assert result["health"] == "healthy"
 
 
 def test_watcher_rejects_future_snapshot_timestamp():

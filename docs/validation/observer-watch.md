@@ -66,6 +66,8 @@ Each role contains exact `workspace`, `processes`, and `files`. VM A must publis
 `diagnostics` process records; VM B must publish `receiver` (actual iperf3
 receiver) and `diagnostics`. Every process record has `kind`, `pid`, `boot_id`,
 and `/proc/<pid>/stat` `start_ticks` captured when that exact process starts.
+The guest probe reads the live proc state too; zombie, exited and invalid
+states cannot pass the process check.
 VM A `files` must include the current Sockperf chunk and any completed chunks,
 plus the local diagnostics path. VM B must include receiver JSONL and local
 diagnostics. File records have workspace-relative `path` and `kind`; Sockperf
@@ -78,9 +80,10 @@ identity-mismatched probes cannot yield healthy.
 The consumer makes bounded `ssh` calls using batch mode, strict known-host
 checking, 5-second connect and at most 12-second per-probe limits. All probes
 in one observer cycle share a 20-second total deadline; later probes are marked
-budget-exhausted after that deadline. Its remote Python
-snippet only reads `/proc`, the boot ID, workspace existence, and explicitly
-bound file metadata. It never copies data, runs a provider CLI, or changes guest
+budget-exhausted after that deadline. Its remote Python snippet only reads
+`/proc`, the boot ID, workspace existence, and explicitly bound file metadata.
+Output freshness is evaluated against the controller clock after each guest
+response completes. It never copies data, runs a provider CLI, or changes guest
 state. All subprocess and clock boundaries are injectable for no-call tests.
 
 **Lifecycle-owner handoff:** at the measurement launch boundary, persist the
