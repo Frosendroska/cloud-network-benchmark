@@ -37,9 +37,9 @@ from .validation_profiles import (ACCEPTANCE_PROFILE, CALIBRATION_PROFILE,
 STAGES = {"acceptance", "calibration", "day", "week"}
 CONFIGS = {
     "s1_acceptance": "configs/tests/exp-903-three-provider-smoke.yaml",
-    "aws_failure": "configs/tests/exp-900-single-provider.yaml",
-    "azure_failure": "configs/tests/exp-901-azure-single-provider.yaml",
-    "gcp_failure": "configs/tests/exp-902-gcp-single-provider.yaml",
+    "aws_failure": "configs/tests/exp-900-single-provider-north.yaml",
+    "azure_failure": "configs/tests/azure-901-single-provider-north.yaml",
+    "gcp_failure": "configs/tests/exp-902-gcp-single-provider-north.yaml",
     "s3_acceptance": "configs/experiments/exp-003-placement-optimization.yaml",
     "calibration": "configs/experiments/exp-001-calibration.yaml",
     "day": "configs/experiments/exp-001-diagnostic-day.yaml",

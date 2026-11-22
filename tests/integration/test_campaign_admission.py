@@ -191,6 +191,69 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     assert _acceptance_pair(stage) == pair
 
 
+def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
+        repository_root, tmp_path, monkeypatch, request):
+    """Production drafting keeps plan overrides aligned with priced config identities."""
+    from cloud_network_benchmark.validation_profiles import (
+        ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE,
+    )
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["stage_inputs"]["acceptance"].update(
+        workflow_profile=ACCEPTANCE_PROFILE, failure_workflow_profile=FAILURE_PROFILE)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
+    settings["stage_inputs"]["acceptance"]["execution_window_utc"] = {
+        "not_before_utc": lower, "not_after_utc": upper}
+    settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE)
+    settings["stage_inputs"]["calibration"]["execution_window_utc"] = {
+        "not_before_utc": lower, "not_after_utc": upper}
+    settings["stage_inputs"]["acceptance"].pop("allowance", None)
+    settings["stage_inputs"]["calibration"].pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [
+        ACCEPTANCE_PROFILE, FAILURE_PROFILE, CALIBRATION_PROFILE]
+    plan = {"stage": "acceptance", "configs": {
+        "aws_failure": "configs/tests/exp-900-single-provider-north.yaml",
+        "azure_failure": "configs/tests/azure-901-single-provider-north.yaml",
+        "gcp_failure": "configs/tests/exp-902-gcp-single-provider-north.yaml",
+    }}
+
+    stage = prepare_stage(plan, settings, repository_root, Path(settings["state_root"]),
+        Path(settings["results_root"]), Clock(), draft=True)
+    calibration = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+
+    assert stage["status"] == "DRAFT_UNAPPROVED"
+    assert len(stage["entries"]) == 5
+    assert calibration["status"] == "DRAFT_UNAPPROVED"
+    assert len(stage["entries"]) + len(calibration["entries"]) == 6
+    assert sum(len(row["run_ids"]) for row in stage["entries"] + calibration["entries"]) == 12
+    assert all(not Path(path).exists() for path in calibration["approval_refs"].values())
+    failures = {row["config_alias"]: yaml.safe_load(Path(row["config_path"]).read_text())
+        for row in stage["entries"] if row["entry_id"].endswith("FAIL")}
+    expected = {
+        "aws_failure": ("exp-900-north-acceptance", "eu-north-1"),
+        "azure_failure": ("exp-901-north-acceptance", "swedencentral"),
+        "gcp_failure": ("exp-902-north-acceptance", "europe-north1"),
+    }
+    for alias, (config_id, region) in expected.items():
+        assert failures[alias]["config_id"] == config_id
+        assert region in failures[alias]["provider_configs"][
+            failures[alias]["selected_providers"][0]]["regions"].values()
+    prices = json.loads(Path(stage["cost_input_path"]).read_text())["provider_run_envelope_templates"]
+    for alias, (config_id, region) in expected.items():
+        provider = {"aws_failure": "aws", "azure_failure": "azure", "gcp_failure": "gcp"}[alias]
+        assert region in prices[config_id][provider]["regions"]
+    assert {yaml.safe_load(Path(row["config_path"]).read_text())["admission"]["lifetime_cap_seconds"]
+        for row in stage["entries"] if row["entry_id"] in {"V-S1", "V-S3"}} == {4200}
+    assert {yaml.safe_load(Path(row["config_path"]).read_text())["admission"]["lifetime_cap_seconds"]
+        for row in stage["entries"] if row["entry_id"].endswith("FAIL")} == {3900}
+    assert yaml.safe_load(Path(calibration["entries"][0]["config_path"]).read_text())[
+        "admission"]["lifetime_cap_seconds"] == 5100
+    assert all(row["requires_supervision"] for row in stage["entries"] if row["entry_id"].endswith("FAIL"))
+    assert all(not Path(path).exists() for path in stage["approval_refs"].values())
+
+
 def test_generated_calibration_binds_runtime_observer_without_changing_workload(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     clock = Clock()
