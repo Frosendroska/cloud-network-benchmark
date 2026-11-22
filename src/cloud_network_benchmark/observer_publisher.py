@@ -396,12 +396,23 @@ def publish_runtime_observer_snapshot(config: Mapping[str, Any], *, deployment: 
             receipt_participants = {tuple(json.loads(row)): state["owned"][row] for row in sorted(expected)}
             receipt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             receipt_value = {"stage_id": config["stage_id"], "participants": {
-                _participant_key(*identity): roles for identity, roles in receipt_participants.items()}}
+                _participant_key(*identity): {role: {"vm_id": value["vm_id"],
+                    "connection": value["connection"]} for role, value in roles.items()}
+                for identity, roles in receipt_participants.items()}}
             receipt_raw = _json_bytes(receipt_value)
             receipt_path = receipt_root / f"launch-{hashlib.sha256(receipt_raw).hexdigest()}.json"
-            receipt_sha256 = write_launch_receipt(receipt_path, stage_id=config["stage_id"],
-                participants=receipt_participants)
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+            if receipt_path.exists() or receipt_path.is_symlink():
+                existing_receipt = receipt_path.read_bytes() if receipt_path.is_file() and not receipt_path.is_symlink() else b""
+                if (not existing_receipt or existing_receipt != receipt_raw
+                        or hashlib.sha256(existing_receipt).hexdigest() != receipt_sha256):
+                    raise ValueError("occupied immutable launch receipt differs from the exact owned identities")
+            else:
+                saved_sha256 = write_launch_receipt(receipt_path, stage_id=config["stage_id"],
+                    participants=receipt_participants)
+                if saved_sha256 != receipt_sha256:
+                    raise ValueError("immutable launch receipt hash differs from its owned identity projection")
+            receipt = json.loads(receipt_raw)
             participants = [state["participants"][row] for row in sorted(expected)]
             bindings = build_bindings(stage_id=config["stage_id"], campaign_id=config["campaign_id"],
                 participants=participants, launch_receipt=receipt)

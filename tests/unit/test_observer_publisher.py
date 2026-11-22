@@ -164,9 +164,8 @@ def test_production_process_hook_publishes_atomic_observed_rotation(tmp_path, mo
 
 def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from cloud_network_benchmark.observer_publisher import publish_runtime_observer_snapshot
-
-    runner, handle, progress, _writer, _proc_root, _exe, _workspace = _actual_sockperf_progress(tmp_path, monkeypatch)
+    from cloud_network_benchmark.contracts.execution import CommandRequest
+    runner, handle, progress, progress_writer, proc_root, executable, workspace_path = _actual_sockperf_progress(tmp_path, monkeypatch)
     stage_id, entry_id = "day-stage", "DAY"
     root = tmp_path / "stage"
     root.mkdir()
@@ -191,6 +190,8 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     journal_path.write_text(json.dumps({"stage_id": stage_id, "entries": {entry_id: {"state": "running"}}}))
     workspace = WORKSPACE
     reports = []
+    callbacks = {}
+    from cloud_network_benchmark.lifecycle_runtime import _observer_progress_callback
     for index, provider in enumerate(run_ids):
         run_id = run_ids[provider]
         deployment_id = run_id + "-deployment"
@@ -215,10 +216,11 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
             "workspace": workspace, "state_path": str(root / "observer-state.json"),
             "journal_path": str(journal_path), "prepared_stage_path": str(prepared_path),
             "bindings_path": str(bindings_path), "launch_receipt_root": str(launch_root)}
-        reports.append(publish_runtime_observer_snapshot(config, deployment=deployment,
-            pair=pair, connection=connection, bootstrap=bootstrap, diagnostics=diagnostics,
-            progress=progress))
-    assert [item["status"] for item in reports] == ["incomplete", "incomplete", "published"]
+        callback = _observer_progress_callback(config)
+        assert callable(callback)
+        reports.append(callback(deployment, pair, connection, bootstrap, diagnostics, progress))
+        callbacks[provider] = (callback, deployment, pair, connection, bootstrap, diagnostics)
+    assert [item["status"] for item in reports] == ["incomplete", "incomplete", "published"], reports
     stage = json.loads(prepared_path.read_text())
     assert _stage_digest(stage) == frozen_stage_digest
     def probe(_role, payload):
@@ -230,12 +232,51 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     observed = observe_bindings(stage, bindings_path, now=time.time(), probe=probe)
     assert observed["health"] == "healthy"
     assert len(observed["entries"]) == 3
+
+    runner.stop(handle, time.monotonic() + 2)
+    (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
+    rotated_command = CommandRequest(action_id="f03-sockperf-rotate", action_type="measurement",
+        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-002.csv")],
+        cwd=str(workspace_path), timeout_seconds=10)
+    rotated_handle = runner.start(rotated_command, stdout_path=workspace_path / "out-rotate",
+        stderr_path=workspace_path / "err-rotate")
+    rotated_progress = json.loads(progress_writer.path.read_text())
+    callback, deployment, pair, connection, bootstrap, diagnostics = callbacks["aws"]
+    second = callback(deployment, pair, connection, bootstrap, diagnostics, rotated_progress)
+    assert second["status"] == "published"
+    refreshed_stage = json.loads(prepared_path.read_text())
+    refreshed = observe_bindings(refreshed_stage, bindings_path, now=time.time(), probe=probe)
+    assert refreshed["health"] == "healthy"
+    aws_binding = next(item for item in json.loads(bindings_path.read_text())["entries"]
+        if item["provider"] == "aws")
+    aws_producer = next(item for item in aws_binding["roles"]["vm_a"]["processes"]
+        if item["kind"] == "producer")
+    assert aws_producer["start_ticks"] == 7654322
+
+    receipt_path = Path(refreshed_stage["observer_launch_receipt_path"])
+    tampered = json.loads(receipt_path.read_text())
+    first_owned = next(iter(tampered["participants"].values()))
+    first_owned["vm_a"]["vm_id"] = "foreign-vm"
+    receipt_path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n")
+    runner.stop(rotated_handle, time.monotonic() + 2)
+    (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654323\n")
+    third_command = CommandRequest(action_id="f03-sockperf-rotate-3", action_type="measurement",
+        argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-003.csv")],
+        cwd=str(workspace_path), timeout_seconds=10)
+    third_handle = runner.start(third_command, stdout_path=workspace_path / "out-rotate-3",
+        stderr_path=workspace_path / "err-rotate-3")
+    third_progress = json.loads(progress_writer.path.read_text())
+    rejected = callback(deployment, pair, connection, bootstrap, diagnostics, third_progress)
+    assert rejected["status"] == "incomplete" and rejected["error_type"] == "ValueError"
+    from concurrent.futures import ThreadPoolExecutor
     from cloud_network_benchmark.observer_publisher import invalidate_runtime_observer_snapshot
-    invalidate_runtime_observer_snapshot(config)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda _index: invalidate_runtime_observer_snapshot(config), range(3)))
     invalidated_stage = json.loads(prepared_path.read_text())
+    assert hashlib.sha256(bindings_path.read_bytes()).hexdigest() == invalidated_stage["observer_bindings_sha256"]
     invalidated = observe_bindings(invalidated_stage, bindings_path, now=time.time(), probe=probe)
     assert invalidated == {"health": "unknown", "errors": ["active_guest_binding_set_mismatch"]}
-    runner.stop(handle, time.monotonic() + 2)
+    runner.stop(third_handle, time.monotonic() + 2)
 
 def test_guest_progress_rejects_partial_or_inconsistent_rotation():
     from cloud_network_benchmark.observer_publisher import validate_guest_progress

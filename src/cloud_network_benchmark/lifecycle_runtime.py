@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import hashlib
 import math
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,28 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _observer_progress_callback(observer_config: dict[str, Any] | None):
+    if observer_config is None:
+        return None
+    from .observer_publisher import (invalidate_runtime_observer_snapshot,
+        publish_runtime_observer_snapshot)
+
+    def publish(deployment, pair, connection, bootstrap, diagnostics, progress):
+        try:
+            return publish_runtime_observer_snapshot(observer_config, deployment=deployment,
+                pair=pair, connection=connection, bootstrap=bootstrap,
+                diagnostics=diagnostics, progress=progress)
+        except Exception as exc:
+            # Observer publication is read-only side evidence. An incomplete
+            # receipt invalidates the snapshot and leaves health unknown.
+            try:
+                invalidate_runtime_observer_snapshot(observer_config)
+            except Exception:
+                pass
+            return {"status": "incomplete", "error_type": type(exc).__name__}
+    return publish
 
 
 def _post_provision_seconds(allowance: Any) -> float:
@@ -682,28 +703,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         actual_stages = stages
         if actual_stages is None:
             from .lifecycle_remote import build_provider_remote_stages
-            observer_callback = None
-            if "observer" in runtime:
-                from .observer_publisher import (invalidate_runtime_observer_snapshot,
-                    publish_runtime_observer_snapshot)
-                observer_config = runtime["observer"]
-                def observer_callback(deployment, pair, connection, bootstrap, diagnostics, progress):
-                    try:
-                        publish_runtime_observer_snapshot(observer_config, deployment=deployment,
-                            pair=pair, connection=connection, bootstrap=bootstrap,
-                            diagnostics=diagnostics, progress=progress)
-                    except Exception as exc:
-                        # Observer publication is read-only side evidence. A
-                        # missing receipt leaves guest health unknown and does
-                        # not alter measurement or cleanup execution.
-                        invalidate_runtime_observer_snapshot(observer_config)
-                        error_path = Path(observer_config["state_path"]).with_suffix(".error.json")
-                        payload = json.dumps({"stage_id": observer_config["stage_id"],
-                            "entry_id": observer_config["entry_id"],
-                            "error_type": type(exc).__name__}, sort_keys=True) + "\n"
-                        temp = error_path.with_suffix(error_path.suffix + ".tmp")
-                        temp.write_text(payload, encoding="utf-8")
-                        os.replace(temp, error_path)
+            observer_callback = _observer_progress_callback(runtime.get("observer"))
             actual_stages = {}
             for provider, child in children.items():
                 actual_stages[provider] = build_provider_remote_stages(provider=provider,
