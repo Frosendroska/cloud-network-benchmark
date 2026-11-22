@@ -87,6 +87,30 @@ COST_COMPONENTS = (
     "compute", "disks", "addresses", "traffic_export", "tax", "uncertainty", "expiry_cleanup_support",
 )
 
+AZURE_EXP901_TIMING_PROFILE = "azure_exp901_sweden_acceptance_v1"
+AZURE_EXP901_ALLOWANCE = {
+    "registration_seconds": 180, "provision_seconds": 240,
+    "readiness_seconds": 180, "stabilization_seconds": 60,
+    "measurement_seconds": 100, "measurement_shutdown_seconds": 15,
+    "retrieval_seconds": 45, "cleanup_seconds": 660,
+}
+AZURE_EXP901_PROVIDER_LEAD_SECONDS = 120
+
+
+def validate_timing_profile_allowance(profile: str | None, allowance: Any,
+                                      providers: set[str] | None = None) -> None:
+    """Enforce the approved full profile vector at the admission boundary."""
+    if profile is None:
+        return
+    if profile != AZURE_EXP901_TIMING_PROFILE:
+        raise ValueError("unsupported timing profile")
+    if providers is not None and providers != {"azure"}:
+        raise ValueError("Azure EXP-901 timing profile requires Azure only")
+    if any(getattr(allowance, key, None) != value for key, value in AZURE_EXP901_ALLOWANCE.items()):
+        raise ValueError("Azure EXP-901 timing profile requires the exact full workflow allowance vector")
+    if getattr(allowance, "provider_leads_seconds", None) != {"azure": AZURE_EXP901_PROVIDER_LEAD_SECONDS}:
+        raise ValueError("Azure EXP-901 timing profile requires the exact 120-second provider lead")
+
 
 def _validated_cost_inputs(inputs: CostInputs) -> CostInputs:
     """Re-read the declared source so a copied CostInputs object cannot forge saved bytes."""
@@ -722,8 +746,23 @@ class BudgetLedger:
 
     def reserve(self, request: ReservationRequest, *, plan: AdmissionPlan) -> AdmissionDecision:
         campaign = plan.resolved_campaign
+        if request.timing_profile != campaign.admission.timing_profile:
+            return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
+        try:
+            validate_timing_profile_allowance(request.timing_profile, plan.allowance,
+                {Provider(p).value for p in request.selected_providers})
+        except ValueError:
+            return AdmissionDecision("rejected", False, None, ("workflow_time_insufficient",), 0)
         if request.config_id != campaign.config_id or request.mode != campaign.mode or request.priority != campaign.admission.priority:
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
+        if request.lifetime_cap_seconds != campaign.admission.lifetime_cap_seconds or request.timing_profile != campaign.admission.timing_profile:
+            return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
+        if request.timing_profile:
+            if (request.experiment_id != campaign.experiment_id or request.context != campaign.context
+                    or request.scenario != campaign.scenario
+                    or request.config_sha256 != campaign.config_source.sha256
+                    or request.resolved_sha256 != campaign.resolved_sha256):
+                return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
         if {Provider(p) for p in request.selected_providers} != {Provider(p) for p in campaign.selected_providers}:
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
         if campaign.admission.cost_input_id != plan.costs.cost_input_id:
@@ -953,6 +992,7 @@ class BudgetLedger:
                 return AdmissionDecision("rejected", False, None, ("workflow_time_insufficient",), state["revision"])
             rid = hashlib.sha256(f"{self.scope_id}:{key}:{fingerprint}".encode()).hexdigest()[:32]
             evidence = ReservationEvidence(schema_version=2, campaign_id=request.campaign_id,
+                timing_profile=request.timing_profile,
                 reservation_id=Evidence[str](value=rid), state="reserved", reserved_cost_usd=Evidence[float](value=float(price)),
                 cap_started_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=now+timedelta(seconds=request.lifetime_cap_seconds)),
                 cap_start_policy_id=StringEvidence(value="reservation-activation-before-provider-expiry"), source_path=request.source_path,
@@ -1178,12 +1218,39 @@ class BudgetLedger:
             clock_discrepancy_added = False
             for name in providers:
                 req, ev = reqs[name], evs[name]
+                requested_expiry = _utc(req.expires_at.value) if req.expires_at.value is not None else None
+                effective_expiry = _utc(ev.expires_at.value) if ev.expires_at.value is not None else None
                 if (ev.state != "registered" or ev.run_id != req.run_id or ev.deployment_id != req.deployment_id
-                    or ev.provider != req.provider or ev.action != req.action or ev.expires_at.value != req.expires_at.value
+                    or ev.provider != req.provider or ev.action != req.action
                     or ev.target_selector != req.target_selector or req.reservation_id.value != reservation_id
                     or req.resource_namespace != rec["plan"]["namespaces"].get(name)
                     or req.run_id != rec["child_identities"].get(name)):
                     return StageDecision(False,("expiry_mismatch",),None)
+                if effective_expiry != requested_expiry:
+                    # Azure Automation OneTime schedules have minute precision. Accept
+                    # only its exact UTC floor, with provider metadata binding that
+                    # effective instant to this unmodified source-bound request.
+                    if name != Provider.AZURE.value or requested_expiry is None or effective_expiry is None:
+                        return StageDecision(False,("expiry_mismatch",),None)
+                    metadata = ev.provider_metadata.value
+                    try:
+                        metadata_requested = datetime.fromisoformat(metadata["requested_trigger"].replace("Z", "+00:00"))
+                        metadata_effective = datetime.fromisoformat(metadata["trigger"].replace("Z", "+00:00"))
+                        from .azure_provider import _azure_schedule_trigger
+                        exact_floor = (metadata.get("mechanism") == "azure_automation_once_deallocate"
+                            and metadata.get("reservation_id") == reservation_id
+                            and metadata.get("source_sha256") == evidence_now.source_sha256
+                            and metadata.get("resource_group") == req.resource_namespace
+                            and metadata.get("target_ids") == req.target_selector.split(";")
+                            and metadata_requested.utcoffset() == timedelta(0)
+                            and metadata_effective.utcoffset() == timedelta(0)
+                            and _utc(metadata_requested) == requested_expiry
+                            and _utc(metadata_effective) == effective_expiry
+                            and _azure_schedule_trigger(requested_expiry) == effective_expiry)
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        exact_floor = False
+                    if not exact_floor:
+                        return StageDecision(False,("expiry_mismatch",),None)
                 cap_start = ReservationEvidence.model_validate(rec["evidence"]).cap_started_at.value
                 if (ev.registered_at.value is None or _utc(ev.registered_at.value) < _utc(cap_start)
                     or (_utc(ev.registered_at.value) > utc_now and not previously_accepted_expiry) or req.expires_at.value is None
@@ -1200,12 +1267,29 @@ class BudgetLedger:
                         if discrepancy not in discrepancies:
                             discrepancies.append(discrepancy)
                             clock_discrepancy_added = True
-            deadline = min([ReservationEvidence.model_validate(rec["evidence"]).expires_at.value] + [_utc(r.expires_at.value) for r in reqs.values()])
+            # Use the registered provider's effective instant (which may be an
+            # Azure minute floor) for every subsequent deadline and monotonic fit.
+            effective_expiries = [_utc(evs[name].expires_at.value) for name in sorted(evs)]
+            deadline = min([ReservationEvidence.model_validate(rec["evidence"]).expires_at.value] + effective_expiries)
             for name, req in reqs.items():
                 lead = _duration(rec["provider_leads"].get(name, -1), "provider lead")
                 cap_end = ReservationEvidence.model_validate(rec["evidence"]).expires_at.value
                 if _utc(req.expires_at.value) != cap_end - timedelta(seconds=lead):
                     return StageDecision(False,("expiry_mismatch",),deadline)
+            # The original request/cap lead check above stays exact. Clamp the
+            # durable monotonic trigger to the earlier registered provider instant.
+            cap_evidence = ReservationEvidence.model_validate(rec["evidence"])
+            effective_trigger_mono = rec["cap_start_monotonic"] + (
+                deadline - cap_evidence.cap_started_at.value
+            ).total_seconds()
+            rec["provider_trigger_monotonic"] = min(
+                rec.get("provider_trigger_monotonic", effective_trigger_mono),
+                effective_trigger_mono,
+            )
+            live = min(rec.get("cap_seconds", rec["allowance"]),
+                rec["provider_trigger_monotonic"] - rec["cap_start_monotonic"]) - elapsed
+            if live <= 0 or required_fit > live:
+                return StageDecision(False,("workflow_time_insufficient",),deadline)
             # The locked mode-specific remaining-work fit above is compared against the
             # immutable monotonic cap/trigger; do not subtract elapsed time from the
             # original workflow estimate or consult wall-clock UTC for eligibility.

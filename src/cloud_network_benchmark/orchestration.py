@@ -122,6 +122,8 @@ class SavedProviderRecovery(StrictModel):
     creation_may_have_started: bool
     cleanup_open: bool
     cleanup_settings_reference: str | None = None
+    cleanup_timing_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    cleanup_timing_failure: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SavedLifecycleRecovery(StrictModel):
@@ -318,6 +320,11 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
         raise ValueError("current controller session is required for cleanup")
     outcomes: dict[str, dict[str, Any]] = {}
     for record in recovery.providers:
+        cleanup_timing = {
+            "cleanup_timing_status": record.cleanup_timing_status,
+            "cleanup_timing_failure": record.cleanup_timing_failure,
+            "acceptance_failed": record.cleanup_timing_status in {"late", "unknown"},
+        }
         liability = record.cleanup_open or record.expiry_registered or record.creation_may_have_started
         ledger_reservation = None
         if ledger is not None and callable(getattr(ledger, "inspect", None)) and recovery.reservation_id is not None:
@@ -327,7 +334,7 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                 receipt_reconciled = replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
             except (RuntimeError, ValueError, OSError) as exc:
                 outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
-                    "errors": [str(exc)], "launch_blocked": True}
+                    "errors": [str(exc)], "launch_blocked": True, **cleanup_timing}
                 continue
             if receipt_reconciled:
                 try:
@@ -335,12 +342,12 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                     outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
                         "absence_proved": True, "billable_resources_present": False,
                         "reason": "saved source receipt acknowledged by the original F11 ledger",
-                        "launch_blocked": False}
+                        "launch_blocked": False, **cleanup_timing}
                     continue
                 except BaseException as exc:
                     outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
                         "errors": [f"recovery journal update failed ({type(exc).__name__})"],
-                        "launch_blocked": True}
+                        "launch_blocked": True, **cleanup_timing}
                     continue
             if isinstance(ledger_reservation, Mapping):
                 # A local journal flag or stale receipt cannot override an open
@@ -348,7 +355,8 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                 liability = True
         if not liability:
             outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
-                                         "reason": "journal proves no safety or compute allocation began"}
+                                         "reason": "journal proves no safety or compute allocation began",
+                                         **cleanup_timing}
             continue
         cleanup_result: Any = None
         errors: list[str] = []
@@ -410,16 +418,16 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                                          if not isinstance(reconciliation, Mapping) else reconciliation.get("incurred_usd")),
                                      "cleanup_result": cleanup_result,
                                      "reconciliation": reconciliation, "errors": errors,
-                                     "launch_blocked": not reconciled}
+                                     "launch_blocked": not reconciled, **cleanup_timing}
     complete = all(item.get("cleanup") in {"succeeded", "not_required"} and item.get("reconciled", True)
-                   for item in outcomes.values())
+                   and not item.get("acceptance_failed", False) for item in outcomes.values())
     # Cleanup callbacks do not get to claim success from a requested delete;
     # the reconciliation adapter must independently prove absence.
     for row in outcomes.values():
         if row.get("cleanup") == "attempted" and row.get("reconciled"):
             row["cleanup"] = "succeeded"
     complete = all(item.get("cleanup") in {"succeeded", "not_required"} and item.get("reconciled", True)
-                   for item in outcomes.values())
+                   and not item.get("acceptance_failed", False) for item in outcomes.values())
     return CleanupLifecycleResult(recovery.attempt_id, recovery.controller_session_id,
                                   current_session_id, outcomes, complete)
 

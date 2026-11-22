@@ -166,10 +166,159 @@
       ],
       "title": "Provider",
       "type": "string"
+    },
+    "Scenario": {
+      "enum": [
+        "same_zone",
+        "cross_zone",
+        "placement_optimization",
+        "inter_region"
+      ],
+      "title": "Scenario",
+      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "timing_profile": {
+            "const": "azure_exp901_sweden_acceptance_v1"
+          }
+        },
+        "required": [
+          "timing_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "config_sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "context": {
+            "const": "failure_check"
+          },
+          "experiment_id": {
+            "const": "EXP-901"
+          },
+          "lifetime_cap_seconds": {
+            "const": 1800
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "resolved_sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "scenario": {
+            "const": "same_zone"
+          },
+          "selected_providers": {
+            "const": [
+              "azure"
+            ]
+          }
+        },
+        "required": [
+          "experiment_id",
+          "context",
+          "scenario",
+          "config_sha256",
+          "resolved_sha256"
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "properties": {
+            "timing_profile": {
+              "const": "azure_exp901_sweden_acceptance_v1"
+            }
+          },
+          "required": [
+            "timing_profile"
+          ]
+        },
+        "properties": {
+          "mode": {
+            "const": "acceptance"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "lifetime_cap_seconds": {
+            "const": 1200
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "short_study"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "lifetime_cap_seconds": {
+            "const": 1200
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "calibration"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "lifetime_cap_seconds": {
+            "const": 1800
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "diagnostic_day"
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "lifetime_cap_seconds": {
+            "const": 87600
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "active_reserved_usd": {
       "$ref": "#/$defs/Evidence_float_"
@@ -184,8 +333,50 @@
       "title": "Config Id",
       "type": "string"
     },
+    "config_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Config Sha256"
+    },
+    "context": {
+      "anyOf": [
+        {
+          "enum": [
+            "standard",
+            "failure_check",
+            "replacement"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Context"
+    },
     "estimated_cost_usd": {
       "$ref": "#/$defs/Evidence_float_"
+    },
+    "experiment_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Experiment Id"
     },
     "incurred_cost_usd": {
       "$ref": "#/$defs/Evidence_float_"
@@ -216,6 +407,30 @@
       "title": "Priority",
       "type": "string"
     },
+    "resolved_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resolved Sha256"
+    },
+    "scenario": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Scenario"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "schedule_entry_id": {
       "$ref": "#/$defs/Evidence_str_"
     },
@@ -241,6 +456,19 @@
       "pattern": "^[a-f0-9]{64}$",
       "title": "Source Sha256",
       "type": "string"
+    },
+    "timing_profile": {
+      "anyOf": [
+        {
+          "const": "azure_exp901_sweden_acceptance_v1",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Timing Profile"
     }
   },
   "required": [

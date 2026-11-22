@@ -700,6 +700,23 @@ def test_claim_creation_uses_durable_mode_allowance(tmp_path, config_name, mode,
     decision = book.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert decision.eligible and decision.creation_granted
     assert decision.effective_deadline == min(item.expires_at.value for item in expiry_requests)
+    if Provider.AZURE in providers:
+        azure_claim = book.claim_creation(rid, provider=Provider.AZURE,
+            expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+        assert azure_claim.eligible and azure_claim.creation_granted
+        azure_row = book.inspect()["reservations"][rid]
+        original_trigger_mono = azure_row["provider_trigger_monotonic"]
+        original_deadline = azure_row["provider_deadline"]
+        utc_clock[0] = now-timedelta(seconds=1)
+        azure_replay = book.claim_creation(rid, provider=Provider.AZURE,
+            expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
+        assert azure_replay.eligible and not azure_replay.creation_granted
+        assert "creation_already_claimed" in azure_replay.reason_codes
+        assert azure_replay.effective_deadline == azure_claim.effective_deadline
+        replay_row = book.inspect()["reservations"][rid]
+        assert replay_row["provider_trigger_monotonic"] == original_trigger_mono
+        assert replay_row["provider_deadline"] == original_deadline
+        utc_clock[0] = now
     late = BudgetLedger(tmp_path / f"{mode}.json", scope_id="offline-scope", utc_now=lambda:now,
         monotonic_now=lambda:100.0 + request.lifetime_cap_seconds + 1, controller_session_id="session-1")
     expired = late.claim_creation(rid, provider=providers[0], expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
@@ -1031,6 +1048,14 @@ def test_same_session_can_hold_two_independent_primary_reservations(tmp_path):
     wrong_requests[0]=wrong_requests[0].model_copy(update={"action":"deallocate"})
     wrong=book.claim_creation(rid,provider=Provider.AWS,expiry_requests=wrong_requests,expiry_evidence=expiry_evidence)
     assert not wrong.eligible and wrong.reason_codes == ("expiry_mismatch",)
+    for provider in (Provider.AWS, Provider.GCP):
+        index = next(i for i, item in enumerate(expiry_requests) if item.provider == provider)
+        changed_evidence = list(expiry_evidence)
+        changed_evidence[index] = changed_evidence[index].model_copy(update={
+            "expires_at": Evidence[datetime](value=expiry_evidence[index].expires_at.value+timedelta(seconds=1))})
+        strict = book.claim_creation(rid, provider=provider,
+            expiry_requests=expiry_requests, expiry_evidence=changed_evidence)
+        assert not strict.eligible and strict.reason_codes == ("expiry_mismatch",)
     grant = book.claim_creation(rid, provider=Provider.AWS, expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     duplicate_grant = book.claim_creation(rid, provider=Provider.AWS, expiry_requests=expiry_requests, expiry_evidence=expiry_evidence)
     assert grant.eligible and grant.creation_granted
