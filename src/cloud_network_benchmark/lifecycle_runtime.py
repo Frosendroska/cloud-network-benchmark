@@ -226,8 +226,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
                     or window_end.tzinfo is None or window_end.utcoffset() is None
                     or window_start.utcoffset().total_seconds() != 0
                     or window_end.utcoffset().total_seconds() != 0
-                    or window_end <= window_start
-                    or (window_end-window_start).total_seconds() > 21600):
+                    or window_end <= window_start):
                 raise ValueError("ready-triggered barrier execution window is invalid")
         expected_entries = {"CAL-S1"} if calibration_entry else {"V-S1", "V-S3"}
         expected_pairs = {(entry, provider) for entry in expected_entries for provider in {"aws", "azure", "gcp"}}

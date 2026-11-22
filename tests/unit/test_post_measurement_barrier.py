@@ -161,3 +161,12 @@ def test_ready_triggered_barrier_freezes_window_and_policy_digest(tmp_path):
     changed["execution_window"]["not_after_utc"] = "2026-11-22T11:30:00+00:00"
     with pytest.raises(ValueError, match="conflicts"):
         PostMeasurementBarrier(changed)
+
+
+def test_ready_triggered_barrier_accepts_finite_window_over_six_hours(tmp_path):
+    spec = _ready_spec(tmp_path / "wide", 3)
+    spec["barrier_root"] = str(tmp_path / "wide" / "barrier")
+    spec["barrier_id"] = "validation-ready-wide-001"
+    spec["execution_window"]["not_after_utc"] = "2026-11-23T10:00:00+00:00"
+    barrier = PostMeasurementBarrier(spec)
+    assert barrier.spec["execution_window"]["not_after_utc"] == "2026-11-23T10:00:00+00:00"

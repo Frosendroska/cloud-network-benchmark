@@ -211,8 +211,8 @@ def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
         raise ValueError(f"{stage}.execution_window_utc requires not_before_utc and not_after_utc for ready-triggered validation")
     start = _utc(window["not_before_utc"], f"{stage}.execution_window_utc.not_before_utc")
     end = _utc(window["not_after_utc"], f"{stage}.execution_window_utc.not_after_utc")
-    if end <= start or (end-start).total_seconds() > 21600:
-        raise ValueError("validation execution window must be positive and no wider than six hours")
+    if end <= start:
+        raise ValueError("validation execution window must be positive")
     return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
 
 

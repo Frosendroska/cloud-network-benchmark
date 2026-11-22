@@ -53,15 +53,19 @@ def test_profile_rejects_contradictory_operator_vector_and_unknown_profile():
         _allowance(settings, "acceptance", {"aws", "azure", "gcp"}, entry_id="V-S1")
 
 
-def test_ready_trigger_window_requires_exact_bounded_utc_interval():
+def test_ready_trigger_window_requires_exact_positive_utc_interval():
     window = _profile_execution_window({"execution_window_utc": {
         "not_before_utc": "2026-11-22T10:00:00Z",
         "not_after_utc": "2026-11-22T11:00:00Z"}}, "acceptance")
     assert window["not_before_utc"] == "2026-11-22T10:00:00+00:00"
-    with pytest.raises(ValueError, match="no wider than six hours"):
+    wider = _profile_execution_window({"execution_window_utc": {
+        "not_before_utc": "2026-11-22T10:00:00Z",
+        "not_after_utc": "2026-11-23T10:00:00Z"}}, "acceptance")
+    assert wider["not_after_utc"] == "2026-11-23T10:00:00+00:00"
+    with pytest.raises(ValueError, match="must be positive"):
         _profile_execution_window({"execution_window_utc": {
             "not_before_utc": "2026-11-22T10:00:00Z",
-            "not_after_utc": "2026-11-22T16:00:01Z"}}, "acceptance")
+            "not_after_utc": "2026-11-22T10:00:00Z"}}, "acceptance")
 
 
 def test_cost_input_accepts_only_exact_fixed_profile_binding(tmp_path):
