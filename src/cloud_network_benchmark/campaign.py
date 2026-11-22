@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import os
 import shutil
 import subprocess
@@ -17,6 +18,9 @@ from typing import Any, Callable, Mapping
 import yaml
 
 from .campaign_inputs import load_operator_settings, prepare_stage, validate_stage_inputs
+from .campaign_draft import (ACTIVATED_STATUS, create_draft_bundle,
+    load_and_verify_draft, mark_consumed, validate_fixed_batch_scope, _stage_identity,
+    verify_activation)
 
 
 def _utc(value: Any) -> datetime:
@@ -62,7 +66,9 @@ def _validate_week_dispatch_policy(policy: Any) -> None:
 
 def _validate_acceptance_dispatch_policy(policy: Any) -> None:
     """Recheck the separately registered, finite acceptance pair admission."""
-    if (not isinstance(policy, dict) or policy.get("policy_id") != "acceptance-paired-s1-s3-v1"
+    ready = isinstance(policy, dict) and policy.get("policy_id") == "acceptance-paired-s1-s3-ready-v1"
+    if (not isinstance(policy, dict) or policy.get("policy_id") not in {
+                "acceptance-paired-s1-s3-v1", "acceptance-paired-s1-s3-ready-v1"}
             or policy.get("group_by") != "acceptance_slot"
             or policy.get("scenarios") != ["S1", "S3"]
             or policy.get("max_parallel_entries") != 2):
@@ -79,13 +85,20 @@ def _validate_acceptance_dispatch_policy(policy: Any) -> None:
         raise ValueError("acceptance paired admission evidence must be an object")
     source = Path(admission.get("source_path", ""))
     source_hash = admission.get("source_sha256")
+    policy_bound = (admission.get("execution_window_utc") == policy.get("execution_window")
+        if ready else admission.get("start_utc") == policy.get("start_utc"))
     if (admission.get("mode") != "paired_acceptance_s1_s3" or admission.get("max_parallel_entries") != 2
-            or admission.get("start_utc") != policy.get("start_utc")
+            or not policy_bound
             or not isinstance(source_hash, str) or len(source_hash) != 64
             or any(char not in "0123456789abcdef" for char in source_hash)
             or not source.is_absolute() or ".." in source.parts or not source.is_file() or source.is_symlink()
             or any(parent.is_symlink() for parent in source.parents) or _digest(source) != source_hash):
         raise ValueError("acceptance admission evidence does not authorize the bounded S1/S3 pair")
+    if ready and (policy.get("start_policy") != "all_ready"
+            or type(policy.get("ready_window_seconds")) is not int
+            or not 1 <= policy["ready_window_seconds"] <= 600
+            or not isinstance(policy.get("execution_window"), dict)):
+        raise ValueError("ready-triggered acceptance requires a bounded all_ready policy and frozen execution window")
 
 
 def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -116,19 +129,41 @@ def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
             or barrier.get("barrier_root") != str(expected_root)
             or not isinstance(participants, list) or len(participants) != 6 or observed != expected):
         raise ValueError("paired acceptance requires a shared terminal-measurement barrier for its exact six normal children")
-    scheduled = {_utc(row.get("scheduled_start")) for row in pair}
     launches = {_utc(row.get("launch_at")) for row in pair}
     start_barrier = stage.get("measurement_start_barrier")
     start_participants = start_barrier.get("expected_participants") if isinstance(start_barrier, dict) else None
-    if (len(scheduled) != 1 or len(launches) != 1
-            or not isinstance(start_barrier, dict) or start_barrier.get("schema_version") != 1
+    common_invalid = (not isinstance(start_barrier, dict) or start_barrier.get("schema_version") != 1
             or start_barrier.get("barrier_id") != f"{stage['stage_id']}-normal-measurement-start"
             or start_barrier.get("barrier_root") != str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-start")
-            or _utc(start_barrier.get("start_utc")) not in scheduled
-            or _utc(start_barrier.get("start_utc")) != _utc(stage["dispatch_policy"].get("start_utc"))
             or start_barrier.get("expected_participants") != participants
-            or not isinstance(start_participants, list) or len(start_participants) != 6):
-        raise ValueError("paired acceptance requires one fixed UTC start and a shared six-child readiness barrier")
+            or not isinstance(start_participants, list) or len(start_participants) != 6)
+    if common_invalid:
+        raise ValueError("paired acceptance requires a shared six-child readiness barrier")
+    if stage["dispatch_policy"].get("start_policy") == "all_ready":
+        window = stage["dispatch_policy"].get("execution_window")
+        ready_window_seconds = stage["dispatch_policy"].get("ready_window_seconds")
+        if (type(ready_window_seconds) is not int or not 1 <= ready_window_seconds <= 600
+                or not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}
+                or start_barrier.get("start_policy") != "all_ready"
+                or start_barrier.get("execution_window") != window
+                or start_barrier.get("ready_window_seconds") != ready_window_seconds
+                or any(row.get("scheduled_start") is not None for row in pair)
+                or len(launches) != 1 or _utc(pair[0].get("launch_at")) != _utc(window.get("not_before_utc"))):
+            raise ValueError("ready-triggered acceptance requires null scheduled starts and the frozen all-ready window")
+        try:
+            lower, upper = _utc(window.get("not_before_utc")), _utc(window.get("not_after_utc"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ready-triggered acceptance window bounds must be UTC timestamps") from exc
+        if upper <= lower:
+            raise ValueError("ready-triggered acceptance execution window must be positive")
+    else:
+        scheduled = {_utc(row.get("scheduled_start")) for row in pair}
+        if (len(scheduled) != 1 or len(launches) != 1
+                or start_barrier.get("start_policy") is not None
+                or start_barrier.get("execution_window") is not None
+                or _utc(start_barrier.get("start_utc")) not in scheduled
+                or _utc(start_barrier.get("start_utc")) != _utc(stage["dispatch_policy"].get("start_utc"))):
+            raise ValueError("legacy paired acceptance requires one frozen UTC start; null starts are invalid")
     return pair
 
 
@@ -227,6 +262,8 @@ class CampaignDriver:
 
     def __init__(self, *, prepare: Callable[..., dict[str, Any]] = prepare_stage,
                  validate: Callable[..., list[str]] = validate_stage_inputs,
+                 activate_prepared: Callable[..., dict[str, Any]] | None = None,
+                 financial_preflight: Callable[..., dict[str, Any]] | None = None,
                  settings_loader: Callable[[Path], dict[str, Any]] = load_operator_settings,
                  launch: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
                  dispatch: Callable[[dict[str, Any]], Any] | None = None,
@@ -235,6 +272,8 @@ class CampaignDriver:
                  clock: Any = None, sleep: Callable[[float], None] = time.sleep):
         self.prepare = prepare
         self.validate = validate
+        self.activate_prepared = activate_prepared
+        self.financial_preflight = financial_preflight
         self.settings_loader = settings_loader
         self.launch = launch or self._launch_lifecycle
         self.pre_admit = pre_admit if pre_admit is not None else (self._pre_admit_acceptance_pair if launch is None else None)
@@ -257,6 +296,253 @@ class CampaignDriver:
                 "plan": str(plan_path), "settings": str(selected_settings),
                 "blockers": list(problems), "resource_creating_calls": 0,
                 "identity_checks": "read_only"}
+
+    def draft(self, plan_paths: list[Path], *, settings_path: Path | None = None,
+              output_path: Path, root: Path | None = None) -> dict[str, Any]:
+        """Freeze the supported acceptance + calibration batch through prepare_stage."""
+        if len(plan_paths) != 2:
+            raise ValueError("fixed pre-DAY draft requires exactly one acceptance plan and one calibration plan")
+        root = (root or Path.cwd()).resolve()
+        plans: list[dict[str, Any]] = []
+        stages: list[dict[str, Any]] = []
+        missing: dict[str, list[str]] = {}
+        state_root = results_root = selected_settings = None
+        for plan_path in plan_paths:
+            plan_file = Path(plan_path).resolve(strict=True)
+            plan = _load_plan(plan_file)
+            selected = Path(settings_path or plan.get("settings", "/etc/cloud-network-benchmark/operator.yaml"))
+            if not selected.is_absolute():
+                selected = (plan_file.parent / selected).resolve()
+            selected = selected.resolve(strict=True)
+            if selected_settings is not None and selected != selected_settings:
+                raise ValueError("the fixed batch must use one shared operator settings file")
+            selected_settings = selected
+            settings = self.settings_loader(selected)
+            current_state, current_results = Path(settings["state_root"]), Path(settings["results_root"])
+            if state_root is not None and (current_state != state_root or current_results != results_root):
+                raise ValueError("the fixed batch must use one shared private state root and results root")
+            state_root, results_root = current_state, current_results
+            plans.append({"path": str(plan_file), "stage": plan.get("stage"), "plan": plan})
+            parameters = inspect.signature(self.prepare).parameters.values()
+            if not any(parameter.name == "draft" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                       for parameter in parameters):
+                raise ValueError("production prepare_stage draft hook is not installed")
+            stage = self.prepare(plan, settings, root, state_root, results_root, self.clock, draft=True)
+            if not isinstance(stage, dict) or stage.get("status") != "DRAFT_UNAPPROVED":
+                raise ValueError("production prepare_stage did not return a DRAFT_UNAPPROVED stage")
+            if stage.get("stage") != plan.get("stage"):
+                raise ValueError("production preparer returned a stage different from its plan")
+            stage_id = str(stage.get("stage_id"))
+            stages.append(stage)
+            missing[stage_id] = stage.get("pending_prerequisites", [])
+        if {item["stage"] for item in plans} != {"acceptance", "calibration"}:
+            raise ValueError("fixed pre-DAY batch contains only acceptance and calibration stages")
+        validate_fixed_batch_scope(stages)
+        if len({stage["stage_id"] for stage in stages}) != 2:
+            raise ValueError("production preparer must allocate distinct stable stage IDs")
+        return create_draft_bundle(plan={"plans": plans, "batch_id": "fixed-pre-day-v1"},
+            stages=stages, output_path=output_path, missing_prerequisites=missing,
+            preparer=self.prepare)
+
+    def activate_frozen_draft(self, draft_path: Path, *, stage_id: str,
+                              settings_path: Path | None = None,
+                              root: Path | None = None,
+                              execute: bool = False) -> dict[str, Any]:
+        """Preflight then activate one frozen stage; preparation is never repeated.
+
+        The production activation hook must invoke the supplied ``preflight``
+        callback with its in-memory validated runtime DTOs before writing any
+        approval evidence or READY state.
+        """
+        draft_path = Path(draft_path).absolute()
+        draft = load_and_verify_draft(draft_path)
+        if any(Path(draft_path).with_suffix(Path(draft_path).suffix + f".{sid}.consumed.json").exists()
+               for sid in [stage_id]):
+            raise ValueError(f"campaign draft stage was already activated or dispatched: {stage_id}")
+        stage = next((row for row in draft["stages"] if row.get("stage_id") == stage_id), None)
+        if stage is None:
+            raise ValueError("stage_id is not part of this fixed batch draft")
+        settings_file = Path(settings_path or "/etc/cloud-network-benchmark/operator.yaml").resolve(strict=True)
+        settings = self.settings_loader(settings_file)
+        if not execute:
+            return {"status": "blocked", "stage_id": stage_id,
+                    "blockers": list(draft["missing_prerequisites"].get(stage_id, [])),
+                    "execution_requested": False, "resource_creating_calls": 0}
+        if self.activate_prepared is None:
+            try:
+                from .campaign_inputs import activate_prepared_stage
+            except ImportError as exc:
+                raise ValueError("production frozen-stage activation hook is not installed") from exc
+            activate = activate_prepared_stage
+        else:
+            activate = self.activate_prepared
+        try:
+            activation_parameters = inspect.signature(activate).parameters.values()
+        except (TypeError, ValueError):
+            activation_parameters = ()
+        if not any(parameter.name == "preflight" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                   for parameter in activation_parameters):
+            raise ValueError("production activation hook must support financial preflight before publishing approval evidence")
+        root = (root or Path.cwd()).resolve()
+        state_root = Path(stage["state_root"]).resolve(strict=True)
+        journal_path = state_root / stage_id / "campaign-journal.json"
+        with _file_lock(state_root / ".campaign-driver.lock", blocking=False):
+            for previous in self.status(state_root):
+                if previous["entries"] and any(row["state"] in {"scheduled", "starting", "running", "archive_pending_validation"}
+                                                 for row in previous["entries"].values()):
+                    raise RuntimeError("another campaign stage is still active or awaiting operator action")
+            draft = load_and_verify_draft(draft_path)
+            if self.financial_preflight is None:
+                self._financial_card_source(draft, settings, stage)
+            preflight_result: dict[str, Any] | None = None
+            preflight_calls = 0
+
+            def preflight(candidate: dict[str, Any], runtime_configs: dict[str, dict[str, Any]] | None = None):
+                nonlocal preflight_result, preflight_calls
+                preflight_calls += 1
+                if preflight_calls != 1:
+                    raise ValueError("activation must run financial preflight exactly once before publishing evidence")
+                for evidence_path in draft.get("pending_evidence_paths", {}).get(stage_id, []):
+                    evidence = Path(evidence_path)
+                    if evidence.exists() or evidence.is_symlink():
+                        raise ValueError("approval evidence was published before financial preflight")
+                if not isinstance(candidate, dict) or _stage_identity(candidate) != draft["stage_identities"][
+                        next(i for i, row in enumerate(draft["stages"]) if row["stage_id"] == stage_id)]:
+                    raise ValueError("activation preflight candidate changed the frozen draft identity")
+                preflight_result = self._validate_activated_stage_finances(
+                    candidate, draft, settings, root, runtime_configs=runtime_configs)
+                return dict(preflight_result)
+
+            activated = activate(prepared=stage, settings=settings, root=root, preflight=preflight)
+            if preflight_calls != 1 or preflight_result is None:
+                raise ValueError("production activation did not complete financial preflight before evidence publication")
+            revalidated = load_and_verify_draft(draft_path, allow_evidence_for=stage_id)
+            if revalidated["draft_sha256"] != draft["draft_sha256"]:
+                raise ValueError("frozen draft changed while activation was being checked")
+            if not isinstance(activated, dict):
+                raise ValueError("production activation hook must return the activated frozen stage")
+            stage = activated
+            verify_activation(draft, stage_id, stage)
+            if draft.get("expected_dispatch_policies", {}).get(stage_id) is not None:
+                _validate_acceptance_dispatch_policy(stage.get("dispatch_policy"))
+            finance = preflight_result
+            if Path(stage["state_root"]).resolve(strict=True) != state_root or stage["stage_id"] != stage_id:
+                raise ValueError("activation changed the frozen private state root or stage ID")
+            stage["authorization_binding_sha256"] = finance["financial_binding_sha256"]
+            stage["authorization_source_sha256"] = finance["authorization_source_sha256"]
+            stage["repository_root"] = str(root)
+            stage["operator_log_path"] = str(settings.get("operator_log_path") or state_root / "campaign.log")
+            _write_json(state_root / stage_id / "activated-stage.json", stage)
+            journal = self._load_or_create_journal(stage, journal_path)
+            pointer = state_root / "active-stage.json"
+            _write_json(pointer, {"stage_id": stage_id,
+                "stage_path": str(journal_path.parent / "prepared-stage.json"),
+                "activation_status": ACTIVATED_STATUS,
+                "authorization_binding_sha256": stage["authorization_binding_sha256"]})
+            mark_consumed(draft_path, draft, stage_id=stage_id,
+                          activated_stage_digest=_stage_digest(stage))
+        dispatched = self.dispatch(stage)
+        _append_log(stage, f"frozen stage {stage_id} dispatched; {len(stage['entries'])} planned entries")
+        return {"status": "dispatched", "stage_id": stage_id,
+                "journal": str(journal_path), "entries": len(journal["entries"]),
+                "supervisor": dispatched.get("supervisor", "unknown"), "dispatch": dispatched,
+                "frozen_draft_sha256": draft["draft_sha256"]}
+
+    @staticmethod
+    def _financial_card_source(draft: dict[str, Any], settings: dict[str, Any],
+                               stage: dict[str, Any]):
+        from .financial_controls import FinancialAuthorization
+
+        declarations = {**settings.get("approvals", {}),
+                        **settings.get("stage_inputs", {}).get(stage["stage"], {}).get("approvals", {})}
+        declaration = declarations.get("paid_authorization")
+        if not isinstance(declaration, dict) or declaration.get("confirmed") is not True:
+            raise ValueError("a genuine paid_authorization source is required before stage activation")
+        authority_path = Path(declaration.get("source", ""))
+        if (not authority_path.is_absolute() or ".." in authority_path.parts
+                or any(parent.is_symlink() for parent in (authority_path, *authority_path.parents))
+                or not authority_path.is_file()):
+            raise ValueError("paid_authorization source must be a real non-symlink file")
+        authority_bytes = authority_path.read_bytes()
+        authority_sha256 = hashlib.sha256(authority_bytes).hexdigest()
+        card = FinancialAuthorization.model_validate_json(authority_bytes)
+        expected_by_campaign: dict[str, dict[str, str]] = {}
+        expected_run_ids: set[str] = set()
+        for frozen_stage in draft["stages"]:
+            for entry in frozen_stage["entries"]:
+                parent = json.loads(Path(entry["parent_manifest_path"]).read_text(encoding="utf-8"))
+                campaign_id = parent.get("campaign_id")
+                run_ids = dict(entry.get("run_ids", {}))
+                if (not isinstance(campaign_id, str) or not run_ids
+                        or campaign_id in expected_by_campaign):
+                    raise ValueError("frozen financial batch contains duplicate or incomplete parent identities")
+                expected_by_campaign[campaign_id] = run_ids
+                expected_run_ids.update(run_ids.values())
+        card_by_campaign = {row.get("campaign_id"): row for row in card.entries}
+        if (len(card.entries) != len(expected_by_campaign)
+                or set(card_by_campaign) != set(expected_by_campaign)
+                or any(card_by_campaign[campaign_id].get("run_ids") != run_ids
+                       for campaign_id, run_ids in expected_by_campaign.items())
+                or card.approved_run_count != len(expected_run_ids)
+                or {run for row in card.entries for run in row.get("run_ids", {}).values()} != expected_run_ids
+                or card.ledger_scope_id != stage.get("scope_id")
+                or card.batch_id != draft.get("plan", {}).get("batch_id")):
+            raise ValueError("FinancialAuthorization entries do not cover the exact frozen fixed batch")
+        return authority_path, authority_sha256
+
+    def _validate_activated_stage_finances(self, stage: dict[str, Any], draft: dict[str, Any],
+                                           settings: dict[str, Any], root: Path, *,
+                                           runtime_configs: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        if self.financial_preflight is not None:
+            return self.financial_preflight(stage=stage, draft=draft, settings=settings, root=root)
+        from .admission import load_cost_inputs
+        from .config import resolve_campaign
+        from .financial_controls import digest, validate_paid_financial_plan
+        from .lifecycle_runtime import build_admission_request, load_initialized_campaign
+        from .scheduling import load_schedule
+
+        authority_path, authority_sha256 = self._financial_card_source(draft, settings, stage)
+        if not isinstance(runtime_configs, dict) or set(runtime_configs) != {
+                entry["entry_id"] for entry in stage.get("entries", [])}:
+            raise ValueError("activation preflight requires in-memory runtime configs for every frozen entry")
+        validated_bindings = []
+        authorization_ref = {"source_path": str(authority_path), "source_sha256": authority_sha256}
+        for entry in stage["entries"]:
+            config_path = Path(entry["config_path"])
+            config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            schedule_entry = None
+            schedule_path = Path(entry["schedule_path"]) if entry.get("schedule_path") else None
+            if schedule_path:
+                rows = load_schedule(schedule_path, config_paths={config_data["config_id"]: config_path},
+                                     repository_root=root)
+                matches = [row for row in rows if row.entry_id == entry.get("row_id")]
+                if len(matches) != 1:
+                    raise ValueError(f"{entry['entry_id']} has no unique frozen schedule row")
+                schedule_entry = matches[0]
+            campaign, _ = resolve_campaign(config_path, root, schedule_entry=schedule_entry)
+            parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+                repository_root=root, config_path=config_path, schedule_path=schedule_path)
+            runtime = runtime_configs[entry["entry_id"]]
+            if not isinstance(runtime, dict):
+                raise ValueError(f"{entry['entry_id']} in-memory preflight runtime is invalid")
+            runtime_source = runtime.get("runtime_source", {})
+            if (runtime_source.get("path") != str(Path(entry["runtime_config_path"]).resolve())
+                    or runtime_source.get("sha256") != entry.get("runtime_config_sha256")):
+                raise ValueError(f"{entry['entry_id']} preflight runtime does not match its frozen runtime source")
+            runtime["approval_evidence"] = {"paid_authorization": authorization_ref}
+            costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
+            request, plan = build_admission_request(campaign=campaign, parent=parent, children=children,
+                costs=costs, runtime=runtime, controller_session_id=stage["controller_session_id"])
+            snapshot = validate_paid_financial_plan(plan, request, scope_id=stage["scope_id"],
+                                                     now=_now(self.clock))
+            if snapshot is None:
+                raise ValueError(f"{entry['entry_id']} is not a paid-request financial plan")
+            validated_bindings.append({"entry_id": entry["entry_id"],
+                "campaign_id": request.campaign_id, "binding_sha256": digest(snapshot["binding"]),
+                "authority_sha256": snapshot["authority"]["sha256"]})
+        return {"financial_binding_sha256": digest(validated_bindings),
+                "authorization_source_sha256": authority_sha256,
+                "validated_entries": validated_bindings}
 
     def start(self, plan_path: Path, *, settings_path: Path | None = None,
               root: Path | None = None, execute: bool = False) -> dict[str, Any]:
@@ -291,6 +577,8 @@ class CampaignDriver:
                 "supervisor": dispatch_result.get("supervisor", "unknown"), "dispatch": dispatch_result}
 
     def run(self, stage: dict[str, Any]) -> dict[str, Any]:
+        if stage.get("status") == "DRAFT_UNAPPROVED":
+            raise ValueError("an unapproved draft cannot enter the campaign runner")
         state_root = Path(stage["state_root"]).resolve()
         weekly_slots = _week_slot_groups(stage) if stage.get("stage") == "week" else None
         acceptance_pair = None
@@ -729,6 +1017,13 @@ class CampaignDriver:
         stage = json.loads(Path(pointer["stage_path"]).read_text(encoding="utf-8"))
         if stage.get("stage_id") != pointer.get("stage_id"):
             raise ValueError("active campaign pointer does not match its prepared stage")
+        if stage.get("status") == "DRAFT_UNAPPROVED":
+            raise ValueError("an unapproved campaign draft cannot be resumed or dispatched")
+        if pointer.get("activation_status") is not None and (
+                pointer.get("activation_status") != ACTIVATED_STATUS
+                or stage.get("status") != ACTIVATED_STATUS
+                or pointer.get("authorization_binding_sha256") != stage.get("authorization_binding_sha256")):
+            raise ValueError("active frozen stage activation binding is missing or changed")
         if pointer.get("supervised_entry_id"):
             journal_path = Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json"
             if not journal_path.is_file() or journal_path.is_symlink():

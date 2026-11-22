@@ -21,6 +21,17 @@ def _parser() -> argparse.ArgumentParser:
         item.add_argument("--plan", required=True, type=Path)
         item.add_argument("--settings", type=Path)
         item.add_argument("--execute", action="store_true", help="required to detach the user-space campaign supervisor")
+    draft = commands.add_parser("draft", help="freeze the fixed acceptance/calibration batch for review; does not authorize execution")
+    draft.add_argument("--plan", required=True, action="append", type=Path,
+                       help="provide one acceptance and one calibration plan")
+    draft.add_argument("--settings", type=Path)
+    draft.add_argument("--output", required=True, type=Path)
+    activate = commands.add_parser("activate", help="recheck and dispatch one stage from an authorized frozen draft")
+    activate.add_argument("--draft", required=True, type=Path)
+    activate.add_argument("--stage-id", required=True)
+    activate.add_argument("--settings", type=Path)
+    activate.add_argument("--execute", action="store_true",
+                          help="required to activate and dispatch after genuine approval and all gates pass")
     status = commands.add_parser("status")
     status.add_argument("--settings", type=Path)
     resume = commands.add_parser("resume", help="read current durable state without starting or dispatching work")
@@ -51,6 +62,11 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
         if args.action in {"check", "start"}:
             result = (campaign.check(args.plan, settings_path=args.settings) if args.action == "check"
                       else campaign.start(args.plan, settings_path=args.settings, execute=args.execute))
+        elif args.action == "draft":
+            result = campaign.draft(args.plan, settings_path=args.settings, output_path=args.output)
+        elif args.action == "activate":
+            result = campaign.activate_frozen_draft(args.draft, stage_id=args.stage_id,
+                settings_path=args.settings, execute=args.execute)
         elif args.action == "run":
             result = campaign.run_active(args.state_root)
         else:
@@ -81,7 +97,8 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
             # terminal failed/missed observation must not loop the service.
             return 0
         status = result.get("status") if isinstance(result, dict) else None
-        return 0 if status in {"ready", "dispatched", "complete", "active", "awaiting_operator"} else 1
-    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        return 0 if status in {"ready", "dispatched", "complete", "active", "awaiting_operator",
+                               "DRAFT_UNAPPROVED"} else 1
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(f"Campaign error: {exc}", file=sys.stderr)
         return 2
