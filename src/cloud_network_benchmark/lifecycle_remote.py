@@ -448,15 +448,24 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             raise ValueError("archive status root cannot be a symlink")
                         archive_root.mkdir(parents=True, exist_ok=True)
                         status_path = archive_root / f"{provider}-{pair_of(provision).identity.run_id}.status.json"
+                        credential_evidence = {"credential_mode": "impersonated_adc",
+                            "credential_status": "configured_not_live_qualified",
+                            "source_principal": archive_sink["expected_source_principal"],
+                            "target_project_id": archive_sink["expected_project_id"],
+                            "target_service_account": archive_sink["expected_service_account_email"],
+                            "target_scope": "https://www.googleapis.com/auth/devstorage.read_write",
+                            "token_lifetime_seconds": 900}
                         def report_archive_progress(status):
                             safe = {key: status[key] for key in ("status", "verified", "verified_parts",
                                 "verified_bytes", "manifest_sha256", "completion_generation",
                                 "archive_bytes", "error", "partial_object_count") if key in status}
+                            safe.update(credential_evidence)
                             temporary = status_path.with_suffix(".partial")
                             temporary.write_text(json.dumps(safe, sort_keys=True) + "\n", encoding="utf-8")
                             temporary.replace(status_path)
                         backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket,
-                            credentials_file=archive_sink["credentials_file"],
+                            source_credentials_file=archive_sink["source_credentials_file"],
+                            expected_source_principal=archive_sink["expected_source_principal"],
                             expected_project_id=archive_sink.get("expected_project_id"),
                             expected_service_account_email=archive_sink.get("expected_service_account_email"))
                         archive_status = relay_closed_native_tree(item.result_root,
@@ -468,6 +477,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             minimum_controller_free_bytes=minimum_free,
                             staging_directory=staging_root, deadline=item.deadline,
                             clock=clock.monotonic, status_callback=report_archive_progress)
+                        archive_status.update(credential_evidence)
                         item.retrieval = item.retrieval.model_copy(update={"archive_status": archive_status})
                     except Exception as exc:
                         if status_path is not None:
