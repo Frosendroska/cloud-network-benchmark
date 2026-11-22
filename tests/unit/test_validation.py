@@ -337,13 +337,14 @@ def test_f08_replays_sockperf_acquisition_window_from_verified_materialized_sour
 
 
 @pytest.mark.parametrize(("config_name", "mode", "units"), [
-    ("exp-001-multi-provider.yaml", "acceptance", 3),
+    ("exp-903-three-provider-smoke.yaml", "acceptance", 3),
     ("exp-001-multi-provider.yaml", "short_study", 3),
     ("exp-001-calibration.yaml", "calibration", 12),
     ("exp-001-diagnostic-day.yaml", "diagnostic_day", 1),
 ])
 def test_all_modes_keep_their_declared_unit_shape(repository_root, config_name, mode, units):
-    value = make_input(repository_root, config_name=config_name,
+    config_path = repository_root / "configs" / ("tests" if mode == "acceptance" else "experiments") / config_name
+    value = make_input(repository_root, config_name=config_name, config_path=config_path,
                        mode_override="acceptance" if mode == "acceptance" else None)
     result = validate_bundle(value, evaluated_at=NOW)
     observed = result.metrics.value["units"]

@@ -437,6 +437,9 @@ class GcpProviderDriver:
                     and deployment.scenario in {"same_zone", "placement_optimization"})
         northern_research = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
                     and deployment.mode in {"short_study", "calibration", "diagnostic_day"} and deployment.context == "standard")
+        northern_replacement = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
+                    and deployment.mode == "short_study" and deployment.context == "replacement"
+                    and deployment.replaces_run_id is not None and deployment.replaces_run_id.endswith("-gcp"))
         northern_acceptance = (northern and deployment.mode == "acceptance"
                     and ((deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-902" and deployment.context == "failure_check")
                          or (deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
@@ -446,9 +449,9 @@ class GcpProviderDriver:
                           or (deployment.mode == "acceptance" and
                               ((deployment.experiment_id == "EXP-903" and deployment.scenario == "same_zone")
                                or (deployment.experiment_id == "EXP-003" and deployment.scenario == "placement_optimization"))))
-        if required_north and not (northern_research or northern_acceptance):
+        if required_north and not (northern_research or northern_replacement or northern_acceptance):
             raise GcpProviderError("primary S1/S3 cannot fall back from Finland without a reviewed region-specific exception", category="scenario_unsupported")
-        if northern and not (northern_research or northern_acceptance):
+        if northern and not (northern_research or northern_replacement or northern_acceptance):
             raise GcpProviderError("Finland locality is outside the registered S1/S3 research or acceptance scope", category="scenario_unsupported")
         if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
             raise GcpProviderError("only the selected baseline topology or Finland same-zone S1/S3 pair is supported", category="scenario_unsupported")

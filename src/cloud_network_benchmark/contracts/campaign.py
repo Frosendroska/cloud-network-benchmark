@@ -402,6 +402,8 @@ class CampaignConfiguration(StrictModel):
         all_clouds = providers == {Provider.AWS, Provider.AZURE, Provider.GCP}
         _validate_protocol_scope(mode, self.context, self.replacement_context, providers, self.scenario,
                                  complete_campaign=True)
+        _validate_registered_acceptance_identity(mode, self.context, self.experiment_id,
+                                                 providers, self.scenario)
         profile = self.admission.timing_profile
         admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario), profile)
         if profile == "azure_exp901_sweden_acceptance_v1":
@@ -479,13 +481,19 @@ class CampaignConfiguration(StrictModel):
                         and self.context == "standard" and research_identity
                         and scenario in {Scenario.SAME_ZONE, Scenario.PLACEMENT_OPTIMIZATION}
                         and (scenario != Scenario.PLACEMENT_OPTIMIZATION or item.placement.kind != "none"))
+            replacement = (mode == ExperimentMode.SHORT_STUDY and self.context == "replacement"
+                           and providers == {provider} and research_identity
+                           and self.replacement_context is not None
+                           and self.replacement_context.replaces_run_id.endswith(f"-{provider.value}")
+                           and scenario in {Scenario.SAME_ZONE, Scenario.PLACEMENT_OPTIMIZATION}
+                           and (scenario != Scenario.PLACEMENT_OPTIMIZATION or item.placement.kind != "none"))
             acceptance = (mode == ExperimentMode.ACCEPTANCE
                 and ((scenario == Scenario.SAME_ZONE and self.context == "failure_check" and providers == {provider}
                       and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}[provider])
                      or (self.context == "standard" and providers == {Provider.AWS, Provider.AZURE, Provider.GCP}
                          and ((scenario == Scenario.SAME_ZONE and self.experiment_id == "EXP-903")
                               or (scenario == Scenario.PLACEMENT_OPTIMIZATION and self.experiment_id == "EXP-003")))))
-            northern_supported = locality == northern_localities and (research or acceptance)
+            northern_supported = locality == northern_localities and (research or replacement or acceptance)
             if locality != expected_locality and not northern_supported:
                 raise ValueError(f"{provider.value} regions/zones do not match the registered {scenario.value} design")
             expected_collocated = provider == Provider.GCP and scenario == Scenario.PLACEMENT_OPTIMIZATION
@@ -764,6 +772,28 @@ def _validate_protocol_scope(
         raise ValueError("replacement context must select only the replaced provider")
 
 
+def _validate_registered_acceptance_identity(
+    mode: ExperimentMode, context: str, experiment_id: str,
+    providers: set[Provider] | list[Provider], scenario: Scenario,
+) -> None:
+    mode = ExperimentMode(mode)
+    context = str(getattr(context, "value", context))
+    scenario = Scenario(scenario)
+    if mode != ExperimentMode.ACCEPTANCE:
+        return
+    if context == "failure_check":
+        expected = {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}
+        if scenario != Scenario.SAME_ZONE or len(providers) != 1:
+            raise ValueError("failure_check requires one registered provider-specific same_zone acceptance identity")
+        provider = next(iter(providers))
+        if experiment_id != expected[Provider(provider)]:
+            raise ValueError("failure_check experiment identity must match its registered provider")
+    elif context == "standard":
+        expected = {Scenario.SAME_ZONE: "EXP-903", Scenario.PLACEMENT_OPTIMIZATION: "EXP-003"}
+        if scenario in expected and experiment_id != expected[scenario]:
+            raise ValueError("standard S1/S3 acceptance requires its registered experiment identity")
+
+
 def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = False) -> None:
     same_zone = {"if": {"properties": {"mode": {"enum": ["calibration", "diagnostic_day"]}},
                          "required": ["mode"]},
@@ -786,11 +816,31 @@ def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = Fa
         "else": {"properties": {"replacement_context": {"type": "null"}}},
     }
     failure_check = {"if": {"properties": {"context": {"const": "failure_check"}}, "required": ["context"]},
-                     "then": {"properties": {"mode": {"const": "acceptance"}}}}
+                     "then": {"properties": {"mode": {"const": "acceptance"},
+                         "scenario": {"const": "same_zone"}}}}
     schema.setdefault("allOf", []).extend([same_zone, replacement, failure_check])
     if observation:
         # Provider-specific suffix validation is emitted as one conditional per provider.
         for provider in ("aws", "azure", "gcp"):
+            acceptance_id = {"aws": "EXP-900", "azure": "EXP-901", "gcp": "EXP-902"}[provider]
+            schema["allOf"].append({
+                "if": {"properties": {"context": {"const": "failure_check"}, "provider": {"const": provider}},
+                      "required": ["context", "provider"]},
+                "then": {"properties": {"experiment_id": {"const": acceptance_id},
+                                             "scenario": {"const": "same_zone"}}},
+            })
+            schema["allOf"].append({
+                "if": {"properties": {"mode": {"const": "acceptance"}, "context": {"const": "standard"},
+                        "scenario": {"const": "same_zone"}},
+                      "required": ["mode", "context", "scenario"]},
+                "then": {"properties": {"experiment_id": {"const": "EXP-903"}}},
+            })
+            schema["allOf"].append({
+                "if": {"properties": {"mode": {"const": "acceptance"}, "context": {"const": "standard"},
+                        "scenario": {"const": "placement_optimization"}},
+                      "required": ["mode", "context", "scenario"]},
+                "then": {"properties": {"experiment_id": {"const": "EXP-003"}}},
+            })
             schema["allOf"].append({
                 "if": {"properties": {"provider": {"const": provider}, "context": {"const": "replacement"}},
                       "required": ["provider", "context"]},
@@ -800,6 +850,10 @@ def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = Fa
             })
     else:
         schema["allOf"].append({
+            "if": {"properties": {"context": {"const": "failure_check"}}, "required": ["context"]},
+            "then": {"properties": {"selected_providers": {"minItems": 1, "maxItems": 1}}},
+        })
+        schema["allOf"].append({
             "if": {"not": {"properties": {"context": {"enum": ["failure_check", "replacement"]}},
                              "required": ["context"]}},
             "then": {"properties": {"selected_providers": {
@@ -808,6 +862,25 @@ def _add_protocol_scope_schema(schema: Dict[str, Any], *, observation: bool = Fa
             }}}
         })
         for provider in ("aws", "azure", "gcp"):
+            acceptance_id = {"aws": "EXP-900", "azure": "EXP-901", "gcp": "EXP-902"}[provider]
+            schema["allOf"].append({
+                "if": {"properties": {"context": {"const": "failure_check"},
+                        "selected_providers": {"contains": {"const": provider}}},
+                      "required": ["context", "selected_providers"]},
+                "then": {"properties": {"experiment_id": {"const": acceptance_id}}},
+            })
+            schema["allOf"].append({
+                "if": {"properties": {"mode": {"const": "acceptance"}, "context": {"const": "standard"},
+                        "scenario": {"const": "same_zone"}},
+                      "required": ["mode", "context", "scenario"]},
+                "then": {"properties": {"experiment_id": {"const": "EXP-903"}}},
+            })
+            schema["allOf"].append({
+                "if": {"properties": {"mode": {"const": "acceptance"}, "context": {"const": "standard"},
+                        "scenario": {"const": "placement_optimization"}},
+                      "required": ["mode", "context", "scenario"]},
+                "then": {"properties": {"experiment_id": {"const": "EXP-003"}}},
+            })
             schema["allOf"].append({
                 "if": {"properties": {"context": {"const": "replacement"}, "replacement_context": {
                     "properties": {"replaces_run_id": {"pattern": f"-{provider}$"}}, "required": ["replaces_run_id"]}},
@@ -840,6 +913,8 @@ def _validate_resolved_protocol(
     _validate_protocol_scope(normalized_mode, context, replacement_context, provider_set, scenario,
                              observation_provider=observation_provider,
                              complete_campaign=observation_provider is None)
+    _validate_registered_acceptance_identity(normalized_mode, context, experiment_id,
+                                             provider_set, scenario)
     if measurement_units != derive_measurement_units(normalized_mode, benchmark):
         raise ValueError("resolved measurement units must be derived from benchmark mode and N state")
     for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario, profile).items():

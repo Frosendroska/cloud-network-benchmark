@@ -77,13 +77,11 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
                                 mode_override=None, provider="aws", frozen_n=False, shared_slot=False):
     from tests.unit.test_validation import NOW, make_input
 
-    config_path=repository_root/"configs/experiments"/config_name
+    config_folder = "tests" if mode_override == "acceptance" else "experiments"
+    if mode_override == "acceptance" and config_name == "exp-001-multi-provider.yaml":
+        config_name = "exp-903-three-provider-smoke.yaml"
+    config_path=repository_root/"configs"/config_folder/config_name
     config_data=yaml.safe_load(config_path.read_text())
-    if mode_override == "acceptance":
-        config_data["mode"]="acceptance"
-        config_data["benchmark"]["measured_seconds"]=10
-        config_data["admission"]["requires_common_n"]=False
-        config_data["admission"]["requires_schedule"]=False
     if frozen_n:
         config_data["benchmark"]["common_n"]={"state":"frozen","common_n":4,
             "source_campaign_id":"prior-calibration-campaign","source_sha256":"d"*64,"plateau_found":True}
@@ -530,6 +528,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     summary=summarize_validation(result)
     assert config_data["experiment_id"] in summary
+    assert value.identity.experiment_id in summary
     assert "Valid interval bounds (iperf3_server_log;" in summary
     assert validate_bundle(complete,evaluated_at=NOW).model_dump(mode="json")==result.model_dump(mode="json")
     assert evaluate_comparison([complete],[result])[run_id].validation_status.comparison_eligibility=="ineligible"

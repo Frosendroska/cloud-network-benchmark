@@ -27,8 +27,19 @@ SCENARIOS = (
 )
 
 
-def _source_case(repository_root, filename, mode, context, scenario):
-    data = yaml.safe_load((repository_root / "configs/experiments" / filename).read_text())
+def _source_case(repository_root, filename, mode, context, scenario, provider=None):
+    source = repository_root / "configs/experiments" / filename
+    if mode == "acceptance" and scenario == "same_zone":
+        if context == "standard":
+            source = repository_root / "configs/tests/exp-903-three-provider-smoke.yaml"
+        elif context == "failure_check":
+            failure_configs = {
+                "aws": "exp-900-single-provider-north.yaml",
+                "azure": "azure-901-single-provider-north.yaml",
+                "gcp": "exp-902-gcp-single-provider-north.yaml",
+            }
+            source = repository_root / "configs/tests" / failure_configs[provider or "aws"]
+    data = yaml.safe_load(source.read_text())
     data["scenario"] = scenario
     data["mode"] = mode
     data["benchmark"]["measured_seconds"] = {"acceptance": 10, "short_study": 60,
@@ -37,18 +48,20 @@ def _source_case(repository_root, filename, mode, context, scenario):
     data["benchmark"]["probe_chunk_seconds"] = 300 if mode == "diagnostic_day" else None
     data["context"] = context
     if context != "standard":
-        data["selected_providers"] = ["aws"]
-        data["provider_configs"] = {"aws": data["provider_configs"]["aws"]}
+        provider = provider or "aws"
+        data["selected_providers"] = [provider]
+        data["provider_configs"] = {provider: data["provider_configs"][provider]}
     if context == "replacement":
-        data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "prior-aws"}
+        data["replacement_context"] = {"observation_id": "stable-observation",
+            "replaces_run_id": f"prior-{provider or 'aws'}"}
     else:
         data["replacement_context"] = None
     data["admission"].update(AdmissionRequirements.expected_for(mode, scenario))
     return data
 
 
-def _resolved_case(repository_root, tmp_path, filename, mode, scenario):
-    data = _source_case(repository_root, filename, mode, "standard", scenario)
+def _resolved_case(repository_root, tmp_path, filename, mode, scenario, context="standard", provider=None):
+    data = _source_case(repository_root, filename, mode, context, scenario, provider=provider)
     root = tmp_path / f"{mode}-{scenario}"
     folder = "tests" if mode == "acceptance" else "experiments"
     path = root / "configs" / folder / filename
@@ -114,9 +127,10 @@ def test_probe_chunk_rejects_duration_above_documented_maximum():
 @pytest.mark.parametrize("context", ["standard", "failure_check", "replacement"])
 def test_source_mode_scenario_context_matrix(repository_root, mode, scenario, context):
     filename = dict((scenario_name, name) for name, scenario_name in SCENARIOS)[scenario]
-    data = _source_case(repository_root, filename, mode, context, scenario)
+    data = _source_case(repository_root, filename, mode, context, scenario,
+                        provider="aws" if context != "standard" else None)
     valid = ((mode not in {"calibration", "diagnostic_day"} or scenario == "same_zone")
-             and (context == "standard" or context == "failure_check" and mode == "acceptance"
+             and (context == "standard" or context == "failure_check" and mode == "acceptance" and scenario == "same_zone"
                   or context == "replacement" and mode == "short_study"))
     schema = Draft202012Validator(CampaignConfiguration.model_json_schema())
     if valid:
@@ -141,10 +155,16 @@ def test_source_replacement_link_must_name_the_selected_provider(repository_root
 def test_source_provider_scope_defaults_match_runtime_schema(repository_root, context_case, provider_count):
     mode = "short_study" if context_case == "replacement" else "acceptance"
     explicit_context = None if context_case == "omitted" else context_case
-    data = _source_case(repository_root, "exp-001-multi-provider.yaml", mode, "standard", "same_zone")
+    providers = ["aws", "azure", "gcp"][:provider_count]
+    if context_case == "failure_check" and provider_count == 1:
+        data = _source_case(repository_root, "exp-001-multi-provider.yaml", mode,
+                            "failure_check", "same_zone", provider=providers[0])
+    else:
+        data = _source_case(repository_root, "exp-001-multi-provider.yaml",
+                            "short_study" if context_case == "replacement" else "acceptance",
+                            "standard", "same_zone")
     if explicit_context is not None:
         data["context"] = explicit_context
-    providers = ["aws", "azure", "gcp"][:provider_count]
     data["selected_providers"] = providers
     data["provider_configs"] = {provider: data["provider_configs"][provider] for provider in providers}
     if context_case == "omitted":
@@ -152,7 +172,7 @@ def test_source_provider_scope_defaults_match_runtime_schema(repository_root, co
     if context_case == "replacement":
         data["replacement_context"] = {"observation_id": "stable-observation", "replaces_run_id": "prior-aws"}
     expected_valid = (context_case in {"omitted", "standard"} and provider_count == 3) or (
-        context_case == "failure_check") or (context_case == "replacement" and provider_count == 1)
+        context_case == "failure_check" and provider_count == 1) or (context_case == "replacement" and provider_count == 1)
     schema = Draft202012Validator(CampaignConfiguration.model_json_schema())
     if expected_valid:
         CampaignConfiguration.model_validate(data)
@@ -183,11 +203,8 @@ def test_replacement_metadata_presence_matches_source_and_resolved_schemas(
 ):
     mode = "acceptance" if context == "failure_check" else "short_study"
     scenario_file = "exp-001-multi-provider.yaml"
-    source_data = _source_case(repository_root, scenario_file, mode, "standard", "same_zone")
-    source_data["context"] = context
-    if context != "standard":
-        source_data["selected_providers"] = [provider]
-        source_data["provider_configs"] = {provider: source_data["provider_configs"][provider]}
+    source_data = _source_case(repository_root, scenario_file, mode, context, "same_zone",
+                               provider=provider if context != "standard" else None)
     replacement = {"observation_id": "stable-observation", "replaces_run_id": f"prior-{provider}"}
     supplied = {
         "null": None,
@@ -211,7 +228,8 @@ def test_replacement_metadata_presence_matches_source_and_resolved_schemas(
             CampaignConfiguration.model_validate(source_data)
         assert not source_schema.is_valid(source_data)
 
-    resolved = _resolved_case(repository_root, tmp_path, scenario_file, mode, "same_zone")
+    resolved = _resolved_case(repository_root, tmp_path, scenario_file, mode, "same_zone",
+                              context=context, provider=provider if context != "standard" else None)
     target = next(item for item in resolved.observations if item.provider == provider)
     observation_data = json.loads(target.model_dump_json())
     observation_data["context"] = context
@@ -295,10 +313,12 @@ def test_replacement_provider_must_match_selection_and_observation(repository_ro
 @pytest.mark.parametrize("mode", ["acceptance", "short_study"])
 @pytest.mark.parametrize("context", ["failure_check", "replacement"])
 def test_resolved_mode_context_matrix(repository_root, tmp_path, filename, scenario, mode, context):
-    resolved = _resolved_case(repository_root, tmp_path, filename, mode, scenario)
-    aws = next(item for item in resolved.observations if item.provider == "aws")
-    expected_valid = (context == "failure_check" and mode == "acceptance") or (
+    expected_valid = (context == "failure_check" and mode == "acceptance" and scenario == "same_zone") or (
         context == "replacement" and mode == "short_study")
+    source_context = context if expected_valid else "standard"
+    resolved = _resolved_case(repository_root, tmp_path, filename, mode, scenario,
+                              context=source_context, provider="aws")
+    aws = next(item for item in resolved.observations if item.provider == "aws")
     observation_data = json.loads(aws.model_dump_json())
     observation_data["context"] = context
     observation_data["replacement_context"] = (

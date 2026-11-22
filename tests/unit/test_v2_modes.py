@@ -18,9 +18,9 @@ def test_registered_configs_cover_four_modes_and_complete_scenario_matrix(reposi
     experiment_paths = sorted((repository_root / "configs/experiments").glob("*.yaml"))
     test_paths = sorted((repository_root / "configs/tests").glob("*.yaml"))
     paths = experiment_paths + test_paths
-    assert len(paths) == 12
+    assert len(paths) == 13
     configs = [CampaignConfiguration.model_validate(yaml.safe_load(path.read_text())) for path in paths]
-    assert len({config.config_id for config in configs}) == 12
+    assert len({config.config_id for config in configs}) == 13
     expected_ids = {
         "exp-001-multi-provider.yaml": "exp-001-short",
         "exp-002-cross-zone.yaml": "exp-002-short",
@@ -31,6 +31,7 @@ def test_registered_configs_cover_four_modes_and_complete_scenario_matrix(reposi
         "exp-900-single-provider.yaml": "exp-900-acceptance",
         "exp-900-single-provider-north.yaml": "exp-900-north-acceptance",
         "exp-901-azure-single-provider.yaml": "exp-901-acceptance",
+        "azure-901-single-provider-north.yaml": "exp-901-north-acceptance",
         "exp-902-gcp-single-provider.yaml": "exp-902-acceptance",
         "exp-902-gcp-single-provider-north.yaml": "exp-902-north-acceptance",
         "exp-903-three-provider-smoke.yaml": "exp-903-acceptance",

@@ -1394,11 +1394,16 @@ class AwsProviderDriver:
                         and deployment.context == "standard"
                         and ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
                              or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003")))
+            replacement = (deployment.mode == "short_study" and deployment.context == "replacement"
+                           and ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                                or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+                           and deployment.replaces_run_id is not None
+                           and deployment.replaces_run_id.endswith("-aws"))
             acceptance = (deployment.mode == "acceptance"
                           and ((scenario == "same_zone" and deployment.experiment_id == "EXP-900" and deployment.context == "failure_check")
                                or (scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
                                or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
-            if not (research or acceptance):
+            if not (research or replacement or acceptance):
                 raise AwsProviderError("Stockholm locality is outside the registered S1/S3 research or acceptance scope", category="scenario_mismatch")
         return list(dict.fromkeys(actual[0]))
 

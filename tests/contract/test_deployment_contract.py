@@ -342,7 +342,12 @@ def test_complete_provider_output_has_scenario_and_no_unavailable_marker() -> No
 def test_deployment_input_serializes_provider_native_purchase_options(
     repository_root: Path, tmp_path: Path, provider: str, provider_options: dict[str, object], allowed: bool
 ) -> None:
-    data = yaml.safe_load((repository_root / "configs/tests/exp-903-three-provider-smoke.yaml").read_text())
+    failure_configs = {
+        "aws": "exp-900-single-provider-north.yaml",
+        "azure": "azure-901-single-provider-north.yaml",
+        "gcp": "exp-902-gcp-single-provider-north.yaml",
+    }
+    data = yaml.safe_load((repository_root / "configs/tests" / failure_configs[provider]).read_text())
     data["selected_providers"] = [provider]
     data["context"] = "failure_check"
     data["provider_configs"] = {provider: data["provider_configs"][provider]}

@@ -225,6 +225,10 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         and d.mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
         and d.context == "standard"
         and got == (sweden_placement if d.scenario == Scenario.PLACEMENT_OPTIMIZATION else sweden_locality))
+    sweden_replacement = (d.experiment_id in {"EXP-001", "EXP-003"}
+        and d.mode == ExperimentMode.SHORT_STUDY and d.context == "replacement"
+        and d.replaces_run_id is not None and d.replaces_run_id.endswith("-azure")
+        and got == (sweden_placement if d.scenario == Scenario.PLACEMENT_OPTIMIZATION else sweden_locality))
     sweden_acceptance = (d.mode == ExperimentMode.ACCEPTANCE
         and ((d.experiment_id == "EXP-901" and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
              or (d.experiment_id == "EXP-903" and d.context == "standard" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
@@ -234,9 +238,9 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
                       or (d.mode == ExperimentMode.ACCEPTANCE and
                           ((d.experiment_id == "EXP-903" and d.scenario == Scenario.SAME_ZONE)
                            or (d.experiment_id == "EXP-003" and d.scenario == Scenario.PLACEMENT_OPTIMIZATION))))
-    if required_north and not (sweden_research or sweden_acceptance):
+    if required_north and not (sweden_research or sweden_replacement or sweden_acceptance):
         raise ValueError("primary S1/S3 cannot fall back from Sweden Central without a reviewed region-specific exception")
-    if got != expected and not (sweden_research or sweden_acceptance):
+    if got != expected and not (sweden_research or sweden_replacement or sweden_acceptance):
         raise ValueError(f"scenario locality/placement mismatch: expected {expected}, got {got}")
     if d.scenario == Scenario.PLACEMENT_OPTIMIZATION and not d.placement.name:
         raise ValueError("placement optimization requires a named PPG")

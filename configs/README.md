@@ -16,6 +16,7 @@ configurations describe intent only and do not authorize admission or resource c
 | `tests/exp-900-single-provider.yaml` | `exp-900-acceptance` | `EXP-900` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-900-single-provider-north.yaml` | `exp-900-north-acceptance` | `EXP-900` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-901-azure-single-provider.yaml` | `exp-901-acceptance` | `EXP-901` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/azure-901-single-provider-north.yaml` | `exp-901-north-acceptance` | `EXP-901` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-902-gcp-single-provider.yaml` | `exp-902-acceptance` | `EXP-902` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-902-gcp-single-provider-north.yaml` | `exp-902-north-acceptance` | `EXP-902` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-903-three-provider-smoke.yaml` | `exp-903-acceptance` | `EXP-903` | acceptance / standard | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
