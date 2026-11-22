@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Optional, Protocol, Sequence
+from typing import BinaryIO, Callable, Mapping, Optional, Protocol, Sequence
 
 from .contracts import CommandOutcome, CommandRequest, CommandResult
 
@@ -52,6 +52,9 @@ class LocalProcess:
     stderr_file: BinaryIO
     events: "queue.Queue[ProcessEvent]"
     preview_limit: int
+    observer_record: Mapping[str, object] | None = None
+    observer_callback: Callable[[Mapping[str, object]], None] | None = None
+    observer_errors: list[str] = field(default_factory=list)
     preview: dict[str, bytearray] = field(default_factory=lambda: {"stdout": bytearray(), "stderr": bytearray()})
     stream_errors: list[str] = field(default_factory=list)
     threads: list[threading.Thread] = field(default_factory=list)
@@ -70,9 +73,13 @@ class MeasurementProcesses(Protocol):
 class LocalMeasurementProcesses:
     """Shell-free Popen runner which saves full streams while retaining bounded previews."""
 
-    def __init__(self, clock: MeasurementClock, *, preview_bytes: int = 8192) -> None:
+    def __init__(self, clock: MeasurementClock, *, preview_bytes: int = 8192,
+                 observer_callback: Callable[[Mapping[str, object]], None] | None = None,
+                 proc_root: Path = Path("/proc")) -> None:
         self.clock = clock
         self.preview_bytes = preview_bytes
+        self.observer_callback = observer_callback
+        self.proc_root = Path(proc_root)
         self._events: "queue.Queue[ProcessEvent]" = queue.Queue(maxsize=32)
 
     def start(self, request: CommandRequest, *, stdout_path: Path, stderr_path: Path) -> LocalProcess:
@@ -96,7 +103,25 @@ class LocalMeasurementProcesses:
             out.close()
             err.close()
             raise
-        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events, self.preview_bytes)
+        try:
+            observer_record = self._observer_record(request, proc.pid, proc_root=self.proc_root) if self.observer_callback else None
+        except BaseException:
+            proc.terminate()
+            proc.wait()
+            out.close()
+            err.close()
+            raise
+        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events,
+                              self.preview_bytes, observer_record, self.observer_callback)
+        if observer_record is not None:
+            try:
+                self.observer_callback({"event": "started", **observer_record})
+            except BaseException:
+                proc.terminate()
+                proc.wait()
+                out.close()
+                err.close()
+                raise
         if request.stdin is not None and proc.stdin is not None:
             try:
                 proc.stdin.write(request.stdin.encode())
@@ -114,6 +139,11 @@ class LocalMeasurementProcesses:
 
     def _watch_exit(self, handle: LocalProcess) -> None:
         handle.process.wait()
+        if handle.observer_record is not None and handle.observer_callback is not None:
+            try:
+                handle.observer_callback({"event": "completed", **handle.observer_record})
+            except BaseException as exc:
+                handle.observer_errors.append(f"observer progress update failed: {type(exc).__name__}")
         event = ProcessEvent(handle, "exit", "", self.clock.monotonic(), self.clock.utc_now())
         while True:
             try:
@@ -122,6 +152,29 @@ class LocalMeasurementProcesses:
             except queue.Full:
                 # The event is only a wake-up; process state is available from poll().
                 return
+
+    @staticmethod
+    def _observer_record(request: CommandRequest, pid: int, *, proc_root: Path = Path("/proc")) -> Mapping[str, object] | None:
+        """Capture only the actual Sockperf process and its actual --full-log path."""
+        if not request.argv or Path(request.argv[0]).name != "sockperf":
+            return None
+        try:
+            index = request.argv.index("--full-log")
+            output = Path(request.argv[index + 1])
+            workspace = Path(request.cwd).resolve(strict=True)
+            output = output.resolve(strict=False)
+            relative = output.relative_to(workspace).as_posix()
+            stat = proc_root / str(pid) / "stat"
+            stat = stat.read_text(encoding="ascii")
+            fields = stat[stat.rfind(")") + 2:].split()
+            ticks = int(fields[19])
+            boot_id = (proc_root / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except (OSError, ValueError, IndexError, TypeError) as exc:
+            raise RuntimeError("actual Sockperf observer process identity/path is unavailable") from exc
+        if not relative or relative.startswith("../") or ticks <= 0 or len(boot_id) != 36:
+            raise RuntimeError("actual Sockperf observer process identity/path is invalid")
+        return {"kind": "producer", "pid": pid, "boot_id": boot_id,
+                "start_ticks": ticks, "path": relative}
 
     def _drain(self, handle: LocalProcess, channel: str, pipe: object, target: BinaryIO) -> None:
         try:
@@ -263,8 +316,9 @@ class LocalMeasurementProcesses:
         stderr = bytes(item.preview["stderr"]).decode("utf-8", errors="replace")
         item.finished_at = finished_at
         item.finished_monotonic = finished_monotonic
-        if item.stream_errors:
-            stderr = (stderr + "\n" + "\n".join(item.stream_errors))[-self.preview_bytes:]
+        errors = [*item.stream_errors, *item.observer_errors]
+        if errors:
+            stderr = (stderr + "\n" + "\n".join(errors))[-self.preview_bytes:]
             if outcome != CommandOutcome.FAILED:
                 outcome, code = CommandOutcome.FAILED, 125
         for secret in sorted((s for s in item.request.redactions if s), key=len, reverse=True):

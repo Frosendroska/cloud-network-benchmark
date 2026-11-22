@@ -243,7 +243,8 @@ def prepare_remote_pair(connection: Any, *, bootstrap_config: Any, readiness_con
 def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: GuestRuntimeEvidence,
                    deadline: Any, clock: Callable[[], float] = __import__("time").monotonic,
                    cancel_event: Any = None, sleep: Callable[[float], None] = __import__("time").sleep,
-                   on_process_record: Callable[[dict[str, Any]], None] | None = None) -> RemoteGuestExecution:
+                   on_process_record: Callable[[dict[str, Any]], None] | None = None,
+                   on_observer_progress: Callable[[dict[str, Any]], None] | None = None) -> RemoteGuestExecution:
     """Run the existing F03 entry on VM A and strictly retrieve its outcome.
 
     Request and response files use unique per-invocation names under the
@@ -340,6 +341,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
             module_root = str(PurePosixPath(runtime.remote_root) / "source")
             status_path = root / f"{invocation}.status"
             process_path = root / f"{invocation}.process.json"
+            observer_progress_path = Path(request.output_root) / ".observer-progress.json"
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("controller cancellation arrived before F03 launch")
             guest_argv = (f"PYTHONPATH={shlex.quote(module_root)} {shlex.quote(python)} -m "
@@ -387,6 +389,7 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                 on_process_record(process_record)
             status = None
             stage = "guest status polling"
+            observer_progress_sha256 = None
             while status is None:
                 remaining = deadline.remaining(clock)
                 if remaining <= 0:
@@ -394,23 +397,46 @@ def run_remote_f03(connection: Any, request: Any, *, runner: Any, runtime: Guest
                         process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)
                     return interrupted_execution(f"F03 active cap expired; {cancellation_status}",
                         retrieve=cancellation_status == "process_group_stopped", preserve_cleanup=True)
-                poll = _request(f"f09-guest-status-{invocation}", vm,
-                    ["sh", "-c", "if test -s " + shlex.quote(str(status_path))
-                     + "; then printf 'exited '; cat " + shlex.quote(str(status_path))
+                poll_script = ("if test -s " + shlex.quote(str(status_path))
+                     + "; then printf 'CNB_STATUS=exited '; cat " + shlex.quote(str(status_path))
                      + "; elif kill -0 -- -" + str(process_record["process_group"])
-                     + " 2>/dev/null; then printf 'running\\n'; else printf 'absent\\n'; fi"],
+                     + " 2>/dev/null; then printf 'CNB_STATUS=running\\n'; else printf 'CNB_STATUS=absent\\n'; fi; "
+                     + "if test -s " + shlex.quote(str(observer_progress_path))
+                     + "; then printf 'CNB_OBSERVER_PROGRESS='; cat "
+                     + shlex.quote(str(observer_progress_path)) + "; fi")
+                poll = _request(f"f09-guest-status-{invocation}", vm,
+                    ["sh", "-c", poll_script],
                     min(connection.timeouts.command_seconds, remaining))
                 poll_result = _execute(runner, poll)
                 actions.append(_action(poll.action_id, poll.action_type, vm, poll, poll_result))
                 if poll_result.outcome != CommandOutcome.SUCCEEDED:
                     raise RuntimeError("VM-A F03 authenticated status poll failed")
-                line = poll_result.stdout.strip()
-                if line.startswith("exited "):
-                    code = line.removeprefix("exited ").strip()
+                lines = poll_result.stdout.splitlines()
+                status_line = next((line for line in lines if line.startswith("CNB_STATUS=")), "")
+                if not status_line:
+                    legacy_line = next((line for line in lines if line == "running" or line == "absent"
+                                        or line.startswith("exited ")), "")
+                    status_line = ("CNB_STATUS=" + legacy_line) if legacy_line else ""
+                if on_observer_progress is not None:
+                    progress_line = next((line for line in lines if line.startswith("CNB_OBSERVER_PROGRESS=")), None)
+                    if progress_line is not None:
+                        progress_bytes = progress_line.removeprefix("CNB_OBSERVER_PROGRESS=").encode("utf-8")
+                        progress_sha256 = hashlib.sha256(progress_bytes).hexdigest()
+                        try:
+                            progress = json.loads(progress_bytes)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError("VM-A observer progress record is malformed") from exc
+                        from .observer_publisher import validate_guest_progress
+                        progress = validate_guest_progress(progress, deployment_id=connection.deployment_id)
+                        if progress_sha256 != observer_progress_sha256:
+                            on_observer_progress(progress)
+                            observer_progress_sha256 = progress_sha256
+                if status_line.startswith("CNB_STATUS=exited "):
+                    code = status_line.removeprefix("CNB_STATUS=exited ").strip()
                     if not code.isdigit():
                         raise ValueError("VM-A F03 guest exit status is malformed")
                     status = int(code)
-                elif line == "running":
+                elif status_line == "CNB_STATUS=running":
                     if cancel_event is not None and cancel_event.is_set():
                         cancellation_status = _stop_remote_f03(connection, process_record, invocation,
                             process_path=str(process_path), runner=runner, deadline=deadline, clock=clock, actions=actions)

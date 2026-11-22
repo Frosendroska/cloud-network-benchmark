@@ -105,6 +105,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         runtime: dict[str, Any], ledger: Any, reservation: Any, runner: Any,
         clock: Any, repository_root: Path, recovery_path: Path,
         archive_sink: dict[str, Any] | None = None,
+        observer_progress_callback: Callable[[Any, Any, Any, Any, Mapping[str, Any], dict[str, Any]], None] | None = None,
         sleep: Callable[[float], None] = time.sleep):
     """Bind real F02/F03/F04/retrieval adapters to one accepted reservation.
 
@@ -465,7 +466,10 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             item.guest = run_remote_f03(connection, guest_request, runner=runner,
                 runtime=guest_runtime, deadline=item.deadline, clock=clock.monotonic,
                 cancel_event=cancel_event, sleep=sleep,
-                on_process_record=lambda record: _record_f03_process(record, control, control_lock, item))
+                on_process_record=lambda record: _record_f03_process(record, control, control_lock, item),
+                on_observer_progress=(lambda progress: observer_progress_callback(
+                    deployment, pair, connection, bootstrap, item.diagnostics or {}, progress)
+                    if observer_progress_callback is not None and mode == "diagnostic_day" else None))
             if item.guest.failure and "process_group_stopped" in item.guest.failure:
                 item.f03_process_absent_at = clock.utc_now()
                 control["verified_absent_at"] = item.f03_process_absent_at
