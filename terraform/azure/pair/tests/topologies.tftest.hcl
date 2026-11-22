@@ -160,15 +160,15 @@ run "sweden_component" {
 run "sweden_s3_standard_ppg" {
   command = plan
   variables {
-    scenario       = "placement_optimization"
-    location       = "swedencentral"
-    region_a       = "swedencentral"
-    region_b       = "swedencentral"
-    zone_a         = "1"
-    zone_b         = "1"
-    selected_image = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
-    admin_username = "azureuser"
-    create_ppg     = true
+    scenario             = "placement_optimization"
+    location             = "swedencentral"
+    region_a             = "swedencentral"
+    region_b             = "swedencentral"
+    zone_a               = "1"
+    zone_b               = "1"
+    selected_image       = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
+    admin_username       = "azureuser"
+    create_ppg           = true
     placement_group_name = "sweden-s3-standard-ppg"
   }
   assert {
