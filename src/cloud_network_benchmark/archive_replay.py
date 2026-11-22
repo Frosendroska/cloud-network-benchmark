@@ -29,6 +29,8 @@ def _jsonable(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, SimpleNamespace):
+        return {str(key): _jsonable(item) for key, item in vars(value).items()}
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     return value
@@ -40,6 +42,11 @@ def _replay_provider_result(result: Any) -> dict[str, Any]:
     values = {}
     for name, outcome in result.values.items():
         evidence = getattr(outcome, "evidence", None)
+        if evidence is None:
+            if name == "protect":
+                evidence = SimpleNamespace(expiry=outcome)
+            elif name in {"create", "prepare", "measure"}:
+                evidence = outcome
         saved = None
         if name == "measure" and evidence is not None:
             saved = {"outcome": _jsonable(getattr(evidence, "outcome", None)),
@@ -57,7 +64,8 @@ def _replay_provider_result(result: Any) -> dict[str, Any]:
         elif name == "prepare":
             bootstrap = evidence.get("bootstrap") if isinstance(evidence, Mapping) else None
             saved = {"bootstrap": {"builds": _jsonable(getattr(bootstrap, "builds", ()))}}
-        values[name] = {"stage": outcome.stage, "succeeded": bool(outcome.succeeded), "evidence": saved}
+        values[name] = {"stage": getattr(outcome, "stage", name),
+            "succeeded": bool(getattr(outcome, "succeeded", True)), "evidence": saved}
     return {"provider": result.provider, "execution_state": result.execution_state,
         "cleanup_state": result.cleanup_state, "values": values,
         "stage_times": _jsonable(result.stage_times), "primary_failure": result.primary_failure,
@@ -142,7 +150,7 @@ def write_batch_replay_capsule(path: Path, *, archives: Mapping[str, Mapping[str
         context_rows[provider] = _inventory(result_root)
         # No remote artifact bytes may already have been staged on the controller.
         if set(row["path"] for row in context_rows[provider]) & {
-                row["destination_path"] for row in closed.items}:
+                item.destination_path for item in closed.items}:
             raise ValueError("native guest artifact bytes are already present in the controller result tree")
     document = {"schema_version": 2, "status": "archive_pending_replay",
         "parent_path": parent_relative, "parent_manifest": parent_manifest,
@@ -263,9 +271,16 @@ def _restore_lifecycle(provider: str, document: Mapping[str, Any], reservation: 
         elif name == "prepare" and isinstance(evidence, dict):
             bootstrap = evidence.get("bootstrap")
             if isinstance(bootstrap, dict):
-                evidence["bootstrap"] = SimpleNamespace(builds=bootstrap.get("builds", ()))
+                from .bootstrap import BuildObservation
+                evidence["bootstrap"] = SimpleNamespace(builds=[BuildObservation.model_validate(item)
+                    for item in bootstrap.get("builds", ())])
         elif name == "create" and isinstance(evidence, dict):
-            evidence = SimpleNamespace(provider_metadata=evidence.get("provider_metadata"))
+            if evidence.get("provider_metadata") is not None:
+                from .contracts.common import StructuredEvidence
+                evidence = SimpleNamespace(provider_metadata=StructuredEvidence.model_validate(
+                    evidence["provider_metadata"]))
+            else:
+                evidence = SimpleNamespace()
         elif name == "protect" and isinstance(evidence, dict) and isinstance(evidence.get("expiry"), dict):
             evidence = SimpleNamespace(expiry=ExpiryEvidence.model_validate(evidence["expiry"]))
         values[name] = ProviderStageOutcome(stage=row["stage"], succeeded=row["succeeded"], evidence=evidence)
@@ -384,6 +399,7 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     from .manifests import CampaignManifest, ChildRunManifest
     from .orchestration import LifecycleResult, ProviderStageOutcome
     from .retrieval import RetrievalManifest, RetrievalResult
+    from .gcs_archive import materialize_verified_guest_archives
 
     capsule_path = Path(capsule_path)
     if capsule_path.is_symlink() or not capsule_path.is_file():
@@ -533,7 +549,8 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
         raise ValueError("validated restored batch did not produce a deterministic export selection")
     from .analysis import analyze_selection
     first_child = next(iter(children.values()))
-    report = analyze_selection(selection, analysis_git=first_child.implementation_git)
+    report = analyze_selection(selection,
+        analysis_git=first_child.config_provenance.implementation_git)
     report_path = export_root / "analysis-report.json"
     fd = os.open(report_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "wb") as stream:

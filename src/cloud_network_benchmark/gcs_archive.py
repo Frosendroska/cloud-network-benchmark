@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
 from .closed_archive import FAT32_FILE_LIMIT

@@ -836,14 +836,172 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region"), [
-    ("failure_check", False, False, "partial", "eu-central-1"),
-    ("failure_check", True, False, "partial", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-north-1"),
+def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, child,
+        child_ref, parent, lifecycle, runner, clock, fault=None):
+    """Capture the actual F09 fake lifecycle outputs, then exercise capsule replay."""
+    import shutil
+    from cloud_network_benchmark.archive_replay import (write_batch_replay_capsule,
+        restore_and_finalize_batch_capsule)
+    from cloud_network_benchmark.closed_archive import create_closed_archive
+    from cloud_network_benchmark.gcs_archive import publish_guest_archive_parts
+    from cloud_network_benchmark.lifecycle_bundle import build_closed_inventory, lifecycle_declarations
+    from cloud_network_benchmark.diagnostics import _declarations as diagnostic_declarations
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    provider = "aws"
+    provider_result = lifecycle.provider_results[provider]
+    root = (repository_root / child_ref.result_path).resolve()
+    child_path = repository_root / child_ref.manifest_path
+    outcome = provider_result.values["measure"].evidence.outcome
+    builds = provider_result.values["prepare"].evidence["bootstrap"].builds
+    declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
+        measurement_units=child.measurement_units,
+        schedule_supplied=child.schedule_entry.value is not None, build_observations=builds)
+    declared_ids = {item.artifact_id for item in declarations}
+    for role in ("vm_a", "vm_b"):
+        for item in diagnostic_declarations(role):
+            if item.artifact_id not in declared_ids:
+                declarations.append(item)
+                declared_ids.add(item.artifact_id)
+    declarations = [item for item in declarations if item.kind != "build-identity"]
+    if fault == "invalid_native":
+        sockperf_csv = next(item for item in declarations
+            if item.producer == "vm_a" and item.kind == "sockperf-csv")
+        (runner.workspace_roots["vm_a"] / sockperf_csv.path).write_text(
+            "this is not a Sockperf CSV\n", encoding="utf-8")
+    create = provider_result.values["create"]
+    deployment = getattr(create, "deployment", create)
+    vm_ids = {"vm_a": deployment.vm_a.resource_id, "vm_b": deployment.vm_b.resource_id}
+    close_evidence = provider_result.values["close"].evidence
+    close_times = {role: close_evidence["diagnostics"][role].closed_at for role in ("vm_a", "vm_b")}
+    closed = build_closed_inventory(identity={"experiment_id": child.experiment_id,
+            "config_id": child.config_id, "campaign_id": child.campaign_id,
+            "observation_id": child.observation_id, "run_id": child.run_id,
+            "deployment_id": child.deployment_id, "provider": provider,
+            "replaces_run_id": child.replaces_run_id},
+        deployment_id=child.deployment_id, remote_workspace="/var/lib/cnb/work",
+        declarations=declarations, source_roots=runner.workspace_roots, source_vm_ids=vm_ids,
+        measurement_ended_at=outcome.guest_finished_at, closure=close_times)
+    assert not closed.unavailable_items, closed.unavailable_items
+    retrieved = provider_result.values["retrieve"].evidence.records
+    retrieved_native = {(record.artifact_id, record.path, record.unit_id)
+        for record in retrieved if str(record.producer) in {"vm_a", "vm_b"}
+        and record.kind != "build-identity"}
+    inventoried_native = {(item.artifact_id, item.destination_path, item.unit_id) for item in closed.items}
+    assert inventoried_native == retrieved_native, {
+        "missing_from_inventory": sorted(retrieved_native - inventoried_native),
+        "not_retrieved": sorted(inventoried_native - retrieved_native)}
+    guest_archives = []
+    archive_root = tmp_path / "capsule-guest-archives"
+    selected_root = tmp_path / "capsule-selected-native"
+    for item in closed.items:
+        relative = Path(item.destination_path)
+        source = runner.workspace_roots[item.source_role] / relative
+        target = selected_root / item.source_role / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    for role in ("vm_a", "vm_b"):
+        source_root = selected_root / role
+        destination = archive_root / role
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        guest_archives.append({"role": role, "archive_directory": str(destination),
+            "manifest": create_closed_archive(source_root, destination, max_part_bytes=2_000_000)})
+
+    capsule_closed = closed.model_copy(update={"measurement_ended_at": outcome.guest_finished_at,
+        "producers_closed_at": max(close_times.values()),
+        "closure_evidence": "F09 fake guest close and flush evidence"})
+    backend, staging = FakeGCS(), tmp_path / "capsule-upload-staging"
+    staging.mkdir()
+    def fetch(role, part):
+        source = Path(next(row["archive_directory"] for row in guest_archives if row["role"] == role)) / part["path"]
+        target = staging / f"{role}-{part['path']}"
+        shutil.copyfile(source, target)
+        return target
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="f09-fixture-archive",
+        provider=provider, experiment_id=child.experiment_id, run_id=child.run_id,
+        closed_inventory=capsule_closed.model_dump(mode="json"), maximum_part_bytes=2_000_000,
+        maximum_archive_bytes=16_000_000, minimum_controller_free_bytes=0,
+        controller_quota_free_bytes=32_000_000,
+        deadline=type("Deadline", (), {"remaining": lambda self, _clock, **_kwargs: 600.0})(),
+        clock=clock.monotonic)
+
+    # Model the real archive-pending controller state: retain initialized
+    # context, but leave all producer bytes to be materialized from the archive.
+    original_context = {path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
+    original_child = child_path.read_bytes()
+    original_parent = parent_path.read_bytes()
+    for item in closed.items:
+        (root / item.destination_path).unlink(missing_ok=True)
+    child_doc = json.loads(child_path.read_text(encoding="utf-8"))
+    child_doc["artifact_records"] = []
+    child_path.write_text(json.dumps(child_doc, sort_keys=True), encoding="utf-8")
+    reservation = lifecycle.reservation_evidence
+    capsule_path = tmp_path / "archive-pending.json"
+    capsule = write_batch_replay_capsule(capsule_path, archives={provider: receipt},
+        parent_manifest_path=parent_path, child_manifest_paths={provider: child_path},
+        result_roots={provider: root}, provider_results={provider: provider_result},
+        reservation=reservation, repository_root=repository_root, maximum_capsule_bytes=8_000_000)
+    restore_staging, materialized = tmp_path / "capsule-restore-staging", tmp_path / "capsule-native"
+    restore_staging.mkdir(); materialized.mkdir()
+    integrity_faults = {"missing_part", "mutated_part", "wrong_generation"}
+    if fault in integrity_faults:
+        import pytest
+        object_ref = receipt["objects"][0]
+        stored = backend.objects[object_ref["key"]]
+        if fault == "missing_part":
+            del backend.objects[object_ref["key"]]
+        elif fault == "mutated_part":
+            backend.objects[object_ref["key"]] = (stored[0] + b"tampered", stored[1])
+        else:
+            backend.objects[object_ref["key"]] = (stored[0], "different-generation")
+        with pytest.raises((ValueError, RuntimeError, FileNotFoundError)):
+            restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+                expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+                archive_staging_root=restore_staging, materialization_root=materialized,
+                repository_root=repository_root, maximum_part_bytes=2_000_000,
+                evaluated_at=clock.utc_now() + timedelta(minutes=1))
+        restored = {"status": "archive_integrity_rejected"}
+    else:
+        restored = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+            expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+            archive_staging_root=restore_staging, materialization_root=materialized,
+            repository_root=repository_root, maximum_part_bytes=2_000_000,
+            evaluated_at=clock.utc_now() + timedelta(minutes=1))
+    if fault is None:
+        assert restored["status"] == "replayed", restored.get("validation")
+        assert restored["validation"][provider]["status"]["data_validity"] == "valid"
+        assert Path(restored["analysis"]["report_path"]).is_file()
+        assert Path(restored["replay_receipt"]["path"]).is_file()
+    elif fault == "invalid_native":
+        assert restored["status"] == "replayed_invalid", restored.get("validation")
+        assert restored["validation"][provider]["status"]["data_validity"] == "invalid"
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink() and path.relative_to(root) not in original_context:
+            path.unlink()
+    for relative, data in original_context.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    child_path.write_bytes(original_child)
+    parent_path.write_bytes(original_parent)
+    return restored
+
+
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "archive_fault"), [
+    ("failure_check", False, False, "partial", "eu-central-1", None),
+    ("failure_check", True, False, "partial", "eu-central-1", None),
+    ("failure_check", True, True, "valid", "eu-central-1", None),
+    ("failure_check", True, True, "valid", "eu-north-1", None),
+    ("failure_check", True, True, "valid", "eu-north-1", "invalid_native"),
+    ("failure_check", True, True, "valid", "eu-north-1", "missing_part"),
+    ("failure_check", True, True, "valid", "eu-north-1", "mutated_part"),
+    ("failure_check", True, True, "valid", "eu-north-1", "wrong_generation"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail, expected_validity, region):
+        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail,
+        expected_validity, region, archive_fault):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -857,7 +1015,24 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     # Keep real implementation identity for the staged-source guard. Only the
     # design identity belongs to this explicitly synthetic, cloud-free fixture.
     from cloud_network_benchmark.manifests import StaticGitProvenance
-    initialized = initialize_campaign(config, repository_root, tmp_path / "results",
+    archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
+        and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
+            "mutated_part", "wrong_generation"})
+    if archive_roundtrip:
+        import shutil
+        results_root = repository_root / "results"
+        existing_results = set(results_root.rglob("*")) if results_root.exists() else set()
+        def cleanup_test_results():
+            for path in sorted(set(results_root.rglob("*")) - existing_results,
+                    key=lambda item: len(item.parts), reverse=True):
+                if path.is_dir() and not path.is_symlink():
+                    path.rmdir()
+                else:
+                    path.unlink(missing_ok=True)
+        request.addfinalizer(cleanup_test_results)
+    else:
+        results_root = tmp_path / "results"
+    initialized = initialize_campaign(config, repository_root, results_root,
         clock=lambda: NOW, token_source=lambda: "campaign",
         design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
@@ -951,6 +1126,11 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
     from cloud_network_benchmark.contracts.validation import ValidatorInput
     from cloud_network_benchmark.validation import validate_bundle
+    if archive_roundtrip:
+        child_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+        _roundtrip_f09_archive_capsule(tmp_path=tmp_path, repository_root=repository_root,
+            parent_path=parent_path, child=child, child_ref=child_ref, parent=parent,
+            lifecycle=result, runner=runner, clock=clock, fault=archive_fault)
     finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
         parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=NOW + timedelta(minutes=1))
     result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")

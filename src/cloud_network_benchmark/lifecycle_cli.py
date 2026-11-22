@@ -209,7 +209,7 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                                 archives[provider] = receipt
                                 child_ref = next(row for row in initialized.child_runs
                                     if str(row.provider) == provider)
-                                child_path = Path(child_ref.child_manifest_path)
+                                child_path = Path(child_ref.manifest_path)
                                 result_root = Path(child_ref.result_path)
                                 if not child_path.is_absolute(): child_path = Path.cwd() / child_path
                                 if not result_root.is_absolute(): result_root = Path.cwd() / result_root
