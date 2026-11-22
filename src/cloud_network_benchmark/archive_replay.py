@@ -559,6 +559,12 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     output["analysis"] = {"status": "completed", "selection_path": str(selection),
         "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest(),
         "report_path": str(report_path), "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
+    output["replayed_manifests"] = {
+        "parent": {"path": capsule["parent_path"],
+            "sha256": hashlib.sha256(parent_path.read_bytes()).hexdigest()},
+        "children": {provider: {"path": capsule["child_paths"][provider],
+            "sha256": hashlib.sha256(child_paths[provider].read_bytes()).hexdigest()}
+            for provider in sorted(child_paths)}}
     receipt_root = archive_staging_root / "replay-receipts"
     if receipt_root.exists() and (receipt_root.is_symlink() or not receipt_root.is_dir()):
         raise ValueError("replay receipt destination is not a real directory")

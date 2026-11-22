@@ -531,12 +531,30 @@ class CampaignDriver:
                     or _digest(parent_path) != _digest(entry.get("parent_manifest_path"))):
                 raise ValueError("source parent manifest is missing or differs from the prepared entry")
             parent_doc = json.loads(parent_path.read_text(encoding="utf-8"))
-            if parent_doc != capsule_doc.get("parent_manifest"):
-                raise ValueError("capsule parent manifest differs from its source")
+            replayed_manifests = payload.get("replayed_manifests")
+            if not isinstance(replayed_manifests, dict) or set(replayed_manifests) != {"parent", "children"}:
+                raise ValueError("replay receipt does not bind the post-replay manifests")
+            parent_binding = replayed_manifests["parent"]
+            if (not isinstance(parent_binding, dict) or parent_binding.get("path") != parent_rel.as_posix()
+                    or parent_binding.get("sha256") != _digest(parent_path)):
+                raise ValueError("replay receipt parent manifest binding is missing or changed")
+            capsule_parent = CampaignManifest.model_validate(capsule_doc.get("parent_manifest", {}))
             parent = CampaignManifest.model_validate(parent_doc)
+            immutable_parent_fields = ("campaign_id", "config_id", "experiment_id", "mode", "context",
+                "configuration_role", "scheduled_start", "schedule_entry", "admission", "selected_providers",
+                "scenario", "config_provenance", "tool_versions", "child_runs", "created_at")
+            changed_parent_fields = [field for field in immutable_parent_fields
+                if getattr(parent, field) != getattr(capsule_parent, field)]
+            if changed_parent_fields:
+                raise ValueError("replayed parent manifest changed capsule identity fields: "
+                    + ", ".join(changed_parent_fields))
+            if parent.aggregate_state != "succeeded":
+                raise ValueError("replayed parent manifest changed its capsule identity or lacks successful finalization")
             if (set(run_ids) != set(capsule_doc.get("archives", {}))
                     or set(run_ids) != set(capsule_doc.get("child_manifests", {}))
-                    or set(run_ids) != set(capsule_doc.get("provider_results", {}))):
+                    or set(run_ids) != set(capsule_doc.get("provider_results", {}))
+                    or not isinstance(replayed_manifests.get("children"), dict)
+                    or set(run_ids) != set(replayed_manifests["children"])):
                 raise ValueError("capsule provider set differs from the prepared campaign")
             if parent.campaign_id != reservation.campaign_id:
                 raise ValueError("capsule reservation campaign identity differs from its parent")
@@ -549,9 +567,26 @@ class CampaignDriver:
                 if child_path.is_symlink() or not child_path.is_file():
                     raise ValueError("source child manifest is missing")
                 child_doc = json.loads(child_path.read_text(encoding="utf-8"))
-                if child_doc != capsule_doc["child_manifests"][provider]:
-                    raise ValueError("capsule child manifest differs from its source")
+                child_binding = replayed_manifests["children"][provider]
+                if (not isinstance(child_binding, dict) or child_binding.get("path") != rel.as_posix()
+                        or child_binding.get("sha256") != _digest(child_path)):
+                    raise ValueError("replay receipt child manifest binding is missing or changed")
+                capsule_child = ChildRunManifest.model_validate(capsule_doc["child_manifests"][provider])
                 child = ChildRunManifest.model_validate(child_doc)
+                immutable_child_fields = ("config_id", "mode", "context", "run_id", "campaign_id",
+                    "experiment_id", "provider", "scenario", "observation_id", "deployment_id",
+                    "replaces_run_id", "scheduled_start", "schedule_entry", "measurement_units",
+                    "config_provenance", "resolved_observation", "artifacts", "created_at")
+                changed_child_fields = [field for field in immutable_child_fields
+                    if getattr(child, field) != getattr(capsule_child, field)]
+                if changed_child_fields:
+                    raise ValueError("replayed child manifest changed capsule identity fields: "
+                        + ", ".join(changed_child_fields))
+                if child.reservation.value != reservation:
+                    raise ValueError("replayed child manifest reservation differs from the capsule")
+                if (child.execution_state != "succeeded" or child.cleanup_state != "succeeded"
+                        or child.validation_status.data_validity != "valid"):
+                    raise ValueError("replayed child manifest lacks successful cleanup and validation")
                 archive = capsule_doc["archives"][provider]
                 if child.run_id != run_id or archive.get("run_id") != run_id or str(child.provider) != provider:
                     raise ValueError("capsule run/provider identity differs from the prepared campaign")
@@ -610,8 +645,20 @@ class CampaignDriver:
                     capsule_doc["archives"][provider]["manifest"]["closed_inventory"])
                 expected_inventory = {item.destination_path: item for item in closed_inventory.items}
                 observed_records = {item.path: item for item in validator_input.artifact_records}
-                if set(observed_records) != set(expected_inventory):
-                    raise ValueError("typed validator artifact set differs from the frozen remote inventory")
+                if not set(expected_inventory) <= set(observed_records):
+                    raise ValueError("typed validator artifact set omits frozen remote inventory items")
+                context_rows = capsule_doc.get("controller_context_inventory", {}).get(provider)
+                if not isinstance(context_rows, list):
+                    raise ValueError("capsule lacks its frozen controller context inventory")
+                context_inventory = {item.get("path"): item for item in context_rows if isinstance(item, dict)}
+                extra_records = set(observed_records) - set(expected_inventory)
+                for relative in extra_records:
+                    artifact = observed_records[relative]
+                    context_item = context_inventory.get(relative)
+                    if context_item is not None and (artifact.size_bytes.value != context_item.get("size_bytes")
+                            or artifact.sha256.value != context_item.get("sha256")):
+                        raise ValueError("controller-context artifact differs from its frozen capsule inventory")
+                    artifact.verify_materialized_file(bundle)
                 for relative, expected in expected_inventory.items():
                     artifact = observed_records[relative]
                     if (artifact.artifact_id != expected.artifact_id
@@ -630,9 +677,18 @@ class CampaignDriver:
             for provider, value in inputs.items():
                 run_id = value.identity.run_id
                 stated = ValidationResult.model_validate(validations[provider].get("result", {}))
-                if (replayed[run_id] != saved_results[provider] or stated != saved_results[provider]
-                        or validations[provider].get("status") != saved_results[provider].validation_status.model_dump(mode="json")):
-                    raise ValueError("receipt validation differs from canonical replay of saved native evidence")
+                replayed_payload = replayed[run_id].model_dump(mode="json")
+                saved_payload = saved_results[provider].model_dump(mode="json")
+                differences = []
+                if replayed_payload != saved_payload:
+                    differences.append("canonical replay")
+                if stated.model_dump(mode="json") != saved_payload:
+                    differences.append("receipt result")
+                if validations[provider].get("status") != saved_results[provider].validation_status.model_dump(mode="json"):
+                    differences.append("receipt status")
+                if differences:
+                    raise ValueError("receipt validation differs from canonical replay of saved native evidence: "
+                        + ", ".join(differences))
             analysis = payload["analysis"]
             for path_key, hash_key in (("selection_path", "selection_sha256"), ("report_path", "report_sha256")):
                 artifact = Path(analysis.get(path_key, ""))
@@ -640,7 +696,7 @@ class CampaignDriver:
                     raise ValueError("replay analysis artifact is missing or differs from its bound digest")
             from .analysis import analyze_selection
             analysis_result = analyze_selection(Path(analysis["selection_path"]),
-                analysis_git=next(iter(children.values())).config_provenance.implementation_git_commit.value)
+                analysis_git=next(iter(children.values())).config_provenance.implementation_git)
             report_payload = json.loads(Path(analysis["report_path"]).read_text(encoding="utf-8"))
             if report_payload != analysis_result.payload:
                 raise ValueError("analysis report differs from deterministic analysis of the bound selection")

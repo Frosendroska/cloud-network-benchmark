@@ -543,16 +543,11 @@ def test_google_backend_download_shares_one_monotonic_timeout(
         def blob(self, _key, **_kwargs): return Blob()
     class Client:
         def bucket(self, _name): return Bucket()
-    google = types.ModuleType("google")
-    cloud = types.ModuleType("google.cloud")
-    cloud.storage = types.SimpleNamespace(Client=Client)
-    google.cloud = cloud
-    monkeypatch.setitem(sys.modules, "google", google)
-    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
     import cloud_network_benchmark.gcs_archive as archive_sink
     monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
     from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
-    backend = GoogleCloudStorageBackend("valid-bucket")
+    backend = object.__new__(GoogleCloudStorageBackend)
+    backend._bucket = Bucket()
     target = tmp_path / "remote-part"
     if expect_download:
         backend.download("key", target, maximum_bytes=10, timeout_seconds=10, generation="7")

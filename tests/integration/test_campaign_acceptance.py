@@ -31,6 +31,7 @@ def _materialize_review(repository_root, tmp_path, frozen_clock, deterministic_t
     config = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
     config["selected_providers"] = ["aws"]
     config["context"] = "failure_check"
+    config["experiment_id"] = "EXP-900"
     config["provider_configs"] = {"aws": config["provider_configs"]["aws"]}
     config_path.write_text(yaml.safe_dump(config))
     request.addfinalizer(lambda: config_path.unlink(missing_ok=True))

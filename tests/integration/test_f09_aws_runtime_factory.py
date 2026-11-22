@@ -837,7 +837,7 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
 
 
 def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, child,
-        child_ref, parent, lifecycle, runner, clock, fault=None):
+        child_ref, parent, lifecycle, runner, clock, recovery_path, fault=None):
     """Capture the actual F09 fake lifecycle outputs, then exercise capsule replay."""
     import shutil
     from cloud_network_benchmark.archive_replay import (write_batch_replay_capsule,
@@ -974,6 +974,39 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
         assert restored["validation"][provider]["status"]["data_validity"] == "valid"
         assert Path(restored["analysis"]["report_path"]).is_file()
         assert Path(restored["replay_receipt"]["path"]).is_file()
+    if fault == "reconcile_campaign":
+        from cloud_network_benchmark.campaign import CampaignDriver
+        from tests.integration.test_campaign_driver import FakeClock as CampaignClock, stage_fixture
+        campaign_clock = CampaignClock()
+        stage = stage_fixture(tmp_path, slots=1)
+        stage.update(stage_id="archive-positive-reconcile", stage="calibration",
+            repository_root=str(repository_root), results_root=str(repository_root / "results"),
+            controller_session_id="fake-session")
+        entry = stage["entries"][0]
+        entry.update(run_ids={provider: child.run_id}, parent_manifest_path=str(parent_path),
+            private_root=str(Path(recovery_path).parent),
+            result_path=str(repository_root / child_ref.result_path))
+        stage["entries"] = [entry]
+        stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        prepared_path = stage_dir / "prepared-stage.json"
+        prepared_path.write_text(json.dumps(stage), encoding="utf-8")
+        driver = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+            launch=lambda *_: pytest.fail("archive reconciliation must not launch"),
+            clock=campaign_clock, sleep=campaign_clock.sleep)
+        journal_path = stage_dir / "campaign-journal.json"
+        saved = driver._load_or_create_journal(stage, journal_path)
+        capsule_bytes = capsule_path.read_bytes()
+        saved["entries"][entry["entry_id"]].update(state="archive_pending_validation",
+            finished_at=campaign_clock.utc_now().isoformat(), result={
+                "cleanup_open": False, "run_ids": entry["run_ids"],
+                "replay_capsule": {"status": "archive_pending_replay", "path": str(capsule_path),
+                    "sha256": hashlib.sha256(capsule_bytes).hexdigest()}})
+        journal_path.write_text(json.dumps(saved), encoding="utf-8")
+        reconciled = driver.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], Path(restored["replay_receipt"]["path"]))
+        assert reconciled["counts"]["complete"] == 1
+        assert reconciled["entries"][entry["entry_id"]]["result"]["archive_validation"] == "valid"
     elif fault == "invalid_native":
         assert restored["status"] == "replayed_invalid", restored.get("validation")
         assert restored["validation"][provider]["status"]["data_validity"] == "invalid"
@@ -998,6 +1031,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     ("failure_check", True, True, "valid", "eu-north-1", "missing_part"),
     ("failure_check", True, True, "valid", "eu-north-1", "mutated_part"),
     ("failure_check", True, True, "valid", "eu-north-1", "wrong_generation"),
+    ("failure_check", True, True, "valid", "eu-north-1", "reconcile_campaign"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
         tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail,
@@ -1017,7 +1051,7 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.manifests import StaticGitProvenance
     archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
         and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
-            "mutated_part", "wrong_generation"})
+            "mutated_part", "wrong_generation", "reconcile_campaign"})
     if archive_roundtrip:
         import shutil
         results_root = repository_root / "results"
@@ -1130,7 +1164,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
         child_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
         _roundtrip_f09_archive_capsule(tmp_path=tmp_path, repository_root=repository_root,
             parent_path=parent_path, child=child, child_ref=child_ref, parent=parent,
-            lifecycle=result, runner=runner, clock=clock, fault=archive_fault)
+            lifecycle=result, runner=runner, clock=clock, recovery_path=built["recovery_path"],
+            fault=archive_fault)
     finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
         parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=NOW + timedelta(minutes=1))
     result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")

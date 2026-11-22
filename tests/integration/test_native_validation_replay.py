@@ -529,7 +529,7 @@ def _materialize_complete_bundle(repository_root, tmp_path, frozen_clock, determ
     assert result.validation_status.data_validity == expected_validity, [(item.code,item.unit_id,item.artifact_id,item.message) for item in result.findings]
     assert result.metrics.value["execution"]["bundle_complete"] is (expected_validity=="valid")
     summary=summarize_validation(result)
-    assert "EXP-001" in summary
+    assert config_data["experiment_id"] in summary
     assert "Valid interval bounds (iperf3_server_log;" in summary
     assert validate_bundle(complete,evaluated_at=NOW).model_dump(mode="json")==result.model_dump(mode="json")
     assert evaluate_comparison([complete],[result])[run_id].validation_status.comparison_eligibility=="ineligible"

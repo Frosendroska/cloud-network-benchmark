@@ -235,7 +235,8 @@ def _build(tool: str, producer: VmRole, artifact_id: str):
         upstream_commit=commit, patch_sha256=patch, binary_sha256="b" * 64,
         binary_path=f"/opt/cnb/bin/{tool}", binary_version=binary_version,
         capabilities=_required_capabilities(tool),
-        build_configuration=build_configuration, compiler_version=compiler_version, identity_bytes=identity_bytes)
+        build_configuration=build_configuration, compiler_version=compiler_version, identity_bytes=identity_bytes,
+        build_origin="source", origin_artifact_id=None, origin_proof_bytes=None)
 
 
 def _build_records(root, deployment, builds):
