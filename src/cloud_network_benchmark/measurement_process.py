@@ -197,13 +197,17 @@ class LocalMeasurementProcesses:
                         if handle.process.poll() is not None:
                             # Keep the durable file complete; event pressure must not block reaping.
                             break
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             handle.stream_errors.append(f"{channel} stream write/read failed: {type(exc).__name__}: {exc}")
         finally:
             try:
                 pipe.close()  # type: ignore[attr-defined]
-            finally:
+            except (OSError, ValueError) as exc:
+                handle.stream_errors.append(f"{channel} pipe close failed: {type(exc).__name__}: {exc}")
+            try:
                 target.flush()
+            except (OSError, ValueError) as exc:
+                handle.stream_errors.append(f"{channel} output flush failed: {type(exc).__name__}: {exc}")
 
     def next_event(self, handles: Sequence[object], deadline_monotonic: float) -> Optional[ProcessEvent]:
         del handles  # events are tagged by their owning handle
@@ -236,9 +240,13 @@ class LocalMeasurementProcesses:
                     proc.terminate()
                 except BaseException as exc:
                     shutdown_errors.append(f"terminate failed: {type(exc).__name__}: {exc}")
-            remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
+            # Keep explicit portions of the original command window for SIGKILL,
+            # reap, and draining. A stopped or TERM-resistant process must not
+            # consume the entire window before escalation can run.
+            available = max(0.0, deadline_monotonic - self.clock.monotonic())
+            term_budget = available / 3.0
             try:
-                proc.wait(timeout=remaining)
+                proc.wait(timeout=term_budget)
             except subprocess.TimeoutExpired:
                 pass
             except BaseException as exc:
@@ -250,9 +258,9 @@ class LocalMeasurementProcesses:
                 except BaseException as exc:
                     shutdown_errors.append(f"kill failed: {type(exc).__name__}: {exc}")
             if kill_attempted:
-                remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
+                reap_budget = max(0.0, deadline_monotonic - self.clock.monotonic()) / 2.0
                 try:
-                    proc.wait(timeout=remaining)
+                    proc.wait(timeout=reap_budget)
                 except subprocess.TimeoutExpired as exc:
                     shutdown_errors.append(f"reap failed: {type(exc).__name__}: {exc}")
                 except BaseException as exc:
