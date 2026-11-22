@@ -204,6 +204,65 @@ def test_expiry_start_uses_one_request_and_returns_execution_identity(tmp_path):
     assert runner.actions == ["aws-expiry-start-eu-central-1"]
 
 
+@pytest.mark.parametrize("arn", [
+    "arn:aws:iam::123456789012:policy/team/ExpiryBoundary",
+    "arn:aws:iam::123456789012:policy/ExpiryBoundary",
+])
+def test_expiry_permissions_boundary_readback_requires_exact_arn(tmp_path, arn):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    settings = settings.model_copy(update={"expiry_role_permissions_boundary_arn": arn})
+    runner = QueueRunner([(0, json.dumps({"Role": {"RoleName": "cnb-expiry-test",
+        "PermissionsBoundary": {"PermissionsBoundaryArn": arn}}}), "")])
+    AwsProviderDriver(runner, settings, clock=lambda: NOW)._verify_expiry_role_boundary("cnb-expiry-test")
+    assert runner.actions == ["aws-get-role---role-name"]
+
+
+@pytest.mark.parametrize("body", [
+    {"Role": {}},
+    {"Role": {"RoleName": "cnb-expiry-test",
+        "PermissionsBoundary": {"PermissionsBoundaryArn": "arn:aws:iam::123456789012:policy/Other"}}},
+])
+def test_expiry_permissions_boundary_readback_rejects_missing_or_wrong_arn(tmp_path, body):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    boundary = "arn:aws:iam::123456789012:policy/team/ExpiryBoundary"
+    settings = settings.model_copy(update={"expiry_role_permissions_boundary_arn": boundary})
+    runner = QueueRunner([(0, json.dumps(body), "")])
+    with pytest.raises(AwsProviderError, match="permissions boundary readback"):
+        AwsProviderDriver(runner, settings, clock=lambda: NOW)._verify_expiry_role_boundary("cnb-expiry-test")
+
+
+def test_expiry_permissions_boundary_is_optional_for_legacy_settings(tmp_path):
+    _, settings = make_inter_region_attempt(tmp_path)
+    assert settings.expiry_role_permissions_boundary_arn is None
+
+
+def test_legacy_safety_inputs_without_boundary_remain_valid_when_option_is_configured(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    settings = settings.model_copy(update={
+        "expiry_role_permissions_boundary_arn": "arn:aws:iam::123456789012:policy/team/ExpiryBoundary"})
+    driver = AwsProviderDriver(QueueRunner([]), settings, clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    namespace = attempt.parent.parent.name
+    variables = {"account_id": settings.account_id, "region": "eu-central-1",
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "resource_namespace": namespace}
+    (attempt / "safety-eu-central-1.tfvars.json").write_text(json.dumps(variables))
+    safety = driver._prospective_safety(deployment, "eu-central-1", attempt, {})
+    assert safety["role_arn"].startswith(f"arn:aws:iam::{settings.account_id}:role/cnb-expiry-")
+
+
+@pytest.mark.parametrize("arn", [
+    "arn:aws:iam::999999999999:policy/team/ExpiryBoundary",
+    "arn:aws:iam::123456789012:role/team/ExpiryBoundary",
+    "arn:aws:iam::123456789012:policy/team//ExpiryBoundary",
+    "arn:aws-us-gov:iam::123456789012:policy/team/ExpiryBoundary",
+])
+def test_expiry_permissions_boundary_settings_reject_invalid_arn_or_account(tmp_path, arn):
+    _, settings = make_inter_region_attempt(tmp_path)
+    with pytest.raises(ValueError, match="boundary"):
+        AwsRuntimeSettings.model_validate({**settings.model_dump(), "expiry_role_permissions_boundary_arn": arn})
+
+
 def test_lost_expiry_start_recovers_only_one_exact_inprogress_match(tmp_path):
     params = {"RunId": ["campaign-aws"], "DeploymentId": ["campaign-aws-deployment"]}
     execution = {

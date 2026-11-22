@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ExpiryRoleMayDiscoverInstancesAndStopOnlyTaggedRunInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "eu-north-1"
+        }
+      }
+    },
+    {
+      "Sid": "ExpiryRoleMayStopOnlyItsTaggedRunInstances",
+      "Effect": "Allow",
+      "Action": "ec2:StopInstances",
+      "Resource": "arn:aws:ec2:eu-north-1:238360820461:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/cnb_run_id": "${aws:PrincipalTag/cnb_run_id}",
+          "ec2:ResourceTag/cnb_deployment_id": "${aws:PrincipalTag/cnb_deployment_id}",
+          "aws:RequestedRegion": "eu-north-1"
+        }
+      }
+    }
+  ]
+}

@@ -130,7 +130,8 @@ def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repositor
         "options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
             "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"},
             "public_key_path": public_key, "authentication_reference": "test-key-ref",
-            "plan_review_timeout_seconds": 30},
+            "plan_review_timeout_seconds": 30,
+            "expiry_role_permissions_boundary_arn": "arn:aws:iam::123456789012:policy/team/ExpiryBoundary"},
         "bootstrap_template": repository_root / "terraform/aws/bootstrap.yaml",
         "terraform_directory": repository_root / "terraform/aws",
         "sources": {"expiry_cost_path": provider_root / "aws-ssm-automation-public-2026-10-22.json",
@@ -159,3 +160,5 @@ def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repositor
     assert captured["request"].expires_at.value == reservation.expires_at.value - timedelta(seconds=360)
     assert captured["driver"].settings.cost_input_sha256 == digest
     assert captured["driver"].settings.plan_review_timeout_seconds == 30
+    assert captured["driver"].settings.expiry_role_permissions_boundary_arn == (
+        "arn:aws:iam::123456789012:policy/team/ExpiryBoundary")

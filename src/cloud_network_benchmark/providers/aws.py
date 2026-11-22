@@ -76,6 +76,7 @@ TERMINAL_AUTOMATION_STATES = {"Success", "Cancelled", "TimedOut", "Failed"}
 
 class AwsRuntimeSettings(StrictModel):
     account_id: str = Field(pattern=r"^[0-9]{12}$")
+    expiry_role_permissions_boundary_arn: Optional[str] = None
     controller_cidr: str
     ami_ids: dict[str, str]
     public_key: str = Field(min_length=1)
@@ -118,6 +119,13 @@ class AwsRuntimeSettings(StrictModel):
             raise ValueError("ami_ids must contain pinned AWS AMI IDs")
         if not self.authentication_reference.strip():
             raise ValueError("authentication_reference must be a non-secret runtime reference")
+        if self.expiry_role_permissions_boundary_arn is not None:
+            arn = self.expiry_role_permissions_boundary_arn
+            match = re.fullmatch(r"arn:aws:iam::([0-9]{12}):policy/((?:[A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+)", arn)
+            if match is None:
+                raise ValueError("expiry_role_permissions_boundary_arn must be a customer-managed IAM policy ARN with a valid path")
+            if match.group(1) != self.account_id:
+                raise ValueError("expiry role permissions boundary account must match the configured AWS account")
         return self
 
 
@@ -612,6 +620,8 @@ class AwsProviderDriver:
             original = json.loads(variables.read_text())
             expected = {"account_id":self.settings.account_id,"region":region,
                 "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,"resource_namespace":namespace}
+            if "expiry_role_permissions_boundary_arn" in original:
+                expected["expiry_role_permissions_boundary_arn"] = original["expiry_role_permissions_boundary_arn"]
             if original != expected: raise AwsProviderError("original safety inputs differ from owned recovery scope",category="scope_mismatch")
         elif journal.get("deployment_scope",{}).get("resource_namespace",namespace) != namespace:
             raise AwsProviderError("original safety namespace is missing or mismatched",category="scope_mismatch")
@@ -754,6 +764,8 @@ class AwsProviderDriver:
             "run_id": deployment.run_id,
             "deployment_id": deployment.deployment_id,
         }
+        if self.settings.expiry_role_permissions_boundary_arn is not None:
+            values["expiry_role_permissions_boundary_arn"] = self.settings.expiry_role_permissions_boundary_arn
         self._write_private(vars_path, json.dumps(values, sort_keys=True).encode())
         state_path = attempt / f"safety-{region}.tfstate"
         result = self._run(
@@ -780,7 +792,18 @@ class AwsProviderDriver:
             raise AwsProviderError(f"AWS safety Terraform outputs malformed in {region}", category="safety_output_invalid") from exc
         if not all(isinstance(value, str) and value for value in values.values()):
             raise AwsProviderError(f"AWS safety output identity missing in {region}", category="safety_output_invalid")
+        if self.settings.expiry_role_permissions_boundary_arn is not None:
+            role_name = values["role_arn"].rsplit("/", 1)[-1]
+            self._verify_expiry_role_boundary(role_name)
         return values
+
+    def _verify_expiry_role_boundary(self, role_name: str) -> None:
+        role = self._aws_json("iam", "get-role", "--role-name", role_name, "--output", "json")
+        role_info = role.get("Role")
+        boundary = role_info.get("PermissionsBoundary", {}).get("PermissionsBoundaryArn") if isinstance(role_info, dict) else None
+        if (not isinstance(role_info, dict) or role_info.get("RoleName") != role_name
+                or boundary != self.settings.expiry_role_permissions_boundary_arn):
+            raise AwsProviderError("AWS expiry role permissions boundary readback is missing or mismatched", category="safety_boundary_mismatch")
 
     def _automation_parameters(self, deployment: ProviderDeploymentInput, region: str, trigger: datetime, role_arn: str) -> dict[str, list[str]]:
         return {
