@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import os
+import fcntl
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -130,6 +132,15 @@ def _aws_scope(r: dict, root: Path, v: dict) -> None:
         name = f"cnb-expiry-{v['resource_namespace'].replace('.', '-')[:24]}-{digest}"
         role = r["aws_iam_role.expiry"]
         _same(role.get("name"), name, "expiry role name")
+        boundary = v.get("expiry_role_permissions_boundary_arn")
+        if boundary is not None:
+            if (not isinstance(boundary, str)
+                    or not re.fullmatch(rf"arn:aws:iam::{re.escape(v['account_id'])}:policy/(?:[A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+", boundary)):
+                raise PlanReviewError("AWS expiry permissions boundary must be a customer-managed policy in the configured account")
+        _same(role.get("permissions_boundary"), boundary, "expiry role permissions boundary")
+        expected_role_tags = ({} if boundary is None else {
+            "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]})
+        _same(role.get("tags") or {}, expected_role_tags, "expiry role identity tags")
         _same(json.loads(role["assume_role_policy"]), {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ssm.amazonaws.com"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"aws:SourceAccount": v["account_id"]}, "ArnLike": {"aws:SourceArn": f"arn:aws:ssm:{v['region']}:{v['account_id']}:automation-execution/*"}}}]}, "expiry trust")
         policy = r["aws_iam_role_policy.expiry"]
         _same(policy.get("name"), "cnb-expiry-stop-owned-instances", "expiry policy name")
@@ -224,6 +235,8 @@ def await_review(directory: Path, binding: dict, deadline: float) -> dict:
     """Operator writes receipt atomically from a separate controller session."""
     receipt_path = directory / "operator-review.json"
     while True:
+        if time.monotonic() >= deadline:
+                raise PlanReviewError(f"operator inspection required before saved-plan apply; deadline expired at {directory}")
         if receipt_path.exists() or receipt_path.is_symlink():
             _hash(receipt_path)
             receipt = json.loads(receipt_path.read_bytes())
@@ -233,14 +246,35 @@ def await_review(directory: Path, binding: dict, deadline: float) -> dict:
                 raise PlanReviewError("operator review rejected or bound to different plan/source/input/state bytes")
             os.chmod(receipt_path, 0o600)
             return receipt
-        if time.monotonic() >= deadline:
-            raise PlanReviewError(f"operator saved-plan inspection required at {directory}")
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 
-def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 0,
+def _review_admission_lock(path: Path, deadline: float):
+    """Acquire the campaign-wide review slot before publishing a review request."""
+    path = Path(path)
+    if not path.is_absolute() or any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise PlanReviewError("shared review admission path must be absolute and symlink-free")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise PlanReviewError("shared review admission lock is unavailable") from exc
+    os.fchmod(fd, 0o600)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise PlanReviewError("shared review admission window expired before publication")
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
+def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 60,
                    apply_timeout_seconds: float | None = None,
-                   before_apply: Callable[[], float] | None = None) -> CommandResult:
+                   before_apply: Callable[[], float] | None = None,
+                   review_admission_path: Path | None = None) -> CommandResult:
     """Plan -> JSON/scope -> bounded operator inspection -> same saved-plan apply."""
     if (apply_timeout_seconds is None) != (before_apply is None):
         raise PlanReviewError("split saved-apply deadlines require both a stage ceiling and a fresh-fit callback")
@@ -251,7 +285,12 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
             or not isinstance(apply_timeout_seconds, (int, float))
             or not math.isfinite(apply_timeout_seconds) or apply_timeout_seconds <= 0)):
         raise PlanReviewError("saved-apply stage ceiling must be finite and positive")
-    deadline = time.monotonic() + request.timeout_seconds
+    started = time.monotonic()
+    deadline = started + request.timeout_seconds
+    # The shared queue consumes only the original command/stage budget. A
+    # fresh operator window begins after this request actually owns the slot.
+    review_runtime_deadline = deadline if review_admission_path is not None else None
+    review_deadline = None
     argv = request.argv
     root = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-chdir=")))
     provider = root.parent.name
@@ -271,6 +310,7 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         if remaining <= 0: raise PlanReviewError("original apply deadline elapsed during plan review")
         return run(request.model_copy(update={"action_id": action, "argv": command, "timeout_seconds": remaining}))
 
+    lock_fd = None
     try:
         prefix = argv[:2]
         plan = execute(request.action_id + "-plan", [*prefix, "plan", "-input=false", "-no-color", f"-state={state}", f"-var-file={variables}", f"-out={binary}"])
@@ -288,11 +328,22 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         binding = {"action_id": request.action_id, "root": str(root), "state": str(state), "state_sha256": state_hash,
                    "plan_sha256": binary_hash, "json_sha256": _hash(json_path), "variables_sha256": inputs_hash,
                    "source_sha256": sources_hash, "scope": scope}
+        if review_admission_path is not None:
+            lock_fd = _review_admission_lock(review_admission_path, review_runtime_deadline)
+            review_deadline = min(review_runtime_deadline, time.monotonic() + (review_seconds if review_seconds > 0 else request.timeout_seconds))
+        else:
+            review_deadline = min(deadline, time.monotonic() + review_seconds)
+        if review_admission_path is not None and time.monotonic() >= review_deadline:
+            raise PlanReviewError("saved-plan review window expired before request publication")
         _private(directory / "review-request.json", _json(binding))
-        receipt = await_review(directory, binding, min(deadline, time.monotonic() + review_seconds))
+        receipt = await_review(directory, binding, review_deadline)
         _private(directory / "accepted-review.json", _json(receipt))
         _same((_hash(binary), _hash(json_path), _hash(variables), source_hash(root), _hash(state) if state.exists() or state.is_symlink() else None),
               (binary_hash, binding["json_sha256"], inputs_hash, sources_hash, state_hash), "reviewed artifact hashes")
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_fd = None
         # The legacy local -state override is not carried into a saved plan's
         # backend configuration. Keep apply on the original attempt state too.
         if time.monotonic() >= deadline:
@@ -316,7 +367,14 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         return result
     except BaseException as exc:
         _private(directory / "failure.json", _json({"category": "terraform_plan_review", "error_type": type(exc).__name__}))
+        if (lock_fd is not None and (directory / "review-request.json").exists()):
+            _private(directory / "review-cancelled.json", _json({"reason": "review deadline expired or operation failed",
+                "action_id": request.action_id, "cancelled_at_monotonic": time.monotonic()}))
         raise
+    finally:
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
 def record_operator_review(directory: Path, request_sha256: str, reviewer: str, inspection: str) -> Path:

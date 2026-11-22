@@ -31,6 +31,7 @@ from .contracts.common import Evidence, ExperimentMode, Provider, StringEvidence
 from .scheduling import assess_provider_skew, inspect_schedule, load_schedule
 from .financial_controls import (FinancialError, validate_paid_financial_plan,
     check_shared_finances, revalidate_financial_record, validate_stored_commitment, transfer_terms)
+from .validation_profiles import PROFILE_SPECS, validate_profile_allowance
 
 
 def _decimal(value: Any, name: str = "money") -> Decimal:
@@ -110,6 +111,11 @@ def validate_timing_profile_allowance(profile: str | None, allowance: Any,
         raise ValueError("Azure EXP-901 timing profile requires the exact full workflow allowance vector")
     if getattr(allowance, "provider_leads_seconds", None) != {"azure": AZURE_EXP901_PROVIDER_LEAD_SECONDS}:
         raise ValueError("Azure EXP-901 timing profile requires the exact 120-second provider lead")
+
+
+def validate_workflow_profile_allowance(profile: str | None, allowance: Any,
+                                        providers: set[str]) -> None:
+    validate_profile_allowance(profile, allowance, providers)
 
 
 def _validated_cost_inputs(inputs: CostInputs) -> CostInputs:
@@ -267,7 +273,7 @@ def load_cost_inputs(path: Path) -> CostInputs:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid cost input JSON") from exc
     required = {"schema_version", "cost_input_id", "prices_checked_on", "source_scope", "source_sha256", "source_identity_kind", "currency", "funding"}
-    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support", "provider_run_envelopes", "provider_run_envelope_templates"}) or not required <= set(data):
+    if not isinstance(data, dict) or set(data) - (required | {"acquired_on", "continuation_sha256", "normalization", "rows", "refresh_required_before_paid_execution", "live_quote", "provider_support", "provider_run_envelopes", "provider_run_envelope_templates", "workflow_profiles"}) or not required <= set(data):
         raise ValueError("invalid cost input fields")
     if data["schema_version"] != 1 or data["currency"] != "USD":
         raise ValueError("unsupported cost input scope")
@@ -295,6 +301,22 @@ def load_cost_inputs(path: Path) -> CostInputs:
         raise ValueError("price refresh status must be boolean")
     if not isinstance(data.get("live_quote",False),bool):
         raise ValueError("live quote status must be boolean")
+    if "workflow_profiles" in data:
+        from .validation_profiles import PROFILE_SPECS
+        bindings = data["workflow_profiles"]
+        if not isinstance(bindings, list):
+            raise ValueError("workflow_profiles must be a list of fixed profile bindings")
+        seen = set()
+        for row in bindings:
+            if not isinstance(row, Mapping) or set(row) != {"profile_id", "stage", "lifetime_cap_seconds", "allowance"}:
+                raise ValueError("workflow profile cost binding has an invalid shape")
+            profile = row["profile_id"]
+            spec = PROFILE_SPECS.get(profile)
+            if (spec is None or profile in seen or row["stage"] != spec["stage"]
+                    or row["lifetime_cap_seconds"] != spec["cap_seconds"]
+                    or row["allowance"] != spec["allowance"]):
+                raise ValueError("workflow profile cost binding differs from the fixed registered profile")
+            seen.add(profile)
     scope_identity_kind=data["source_identity_kind"]
     if not isinstance(scope_identity_kind,str) or not scope_identity_kind.strip():
         raise ValueError("source identity kind must be nonblank")
@@ -746,16 +768,21 @@ class BudgetLedger:
 
     def reserve(self, request: ReservationRequest, *, plan: AdmissionPlan) -> AdmissionDecision:
         campaign = plan.resolved_campaign
-        if request.timing_profile != campaign.admission.timing_profile:
+        if (request.timing_profile != campaign.admission.timing_profile
+                or request.workflow_profile != campaign.admission.workflow_profile):
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
         try:
             validate_timing_profile_allowance(request.timing_profile, plan.allowance,
+                {Provider(p).value for p in request.selected_providers})
+            validate_workflow_profile_allowance(request.workflow_profile, plan.allowance,
                 {Provider(p).value for p in request.selected_providers})
         except ValueError:
             return AdmissionDecision("rejected", False, None, ("workflow_time_insufficient",), 0)
         if request.config_id != campaign.config_id or request.mode != campaign.mode or request.priority != campaign.admission.priority:
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
-        if request.lifetime_cap_seconds != campaign.admission.lifetime_cap_seconds or request.timing_profile != campaign.admission.timing_profile:
+        if (request.lifetime_cap_seconds != campaign.admission.lifetime_cap_seconds
+                or request.timing_profile != campaign.admission.timing_profile
+                or request.workflow_profile != campaign.admission.workflow_profile):
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
         if request.timing_profile:
             if (request.experiment_id != campaign.experiment_id or request.context != campaign.context
@@ -767,6 +794,11 @@ class BudgetLedger:
             return AdmissionDecision("rejected", False, None, ("identity_mismatch",), 0)
         if campaign.admission.cost_input_id != plan.costs.cost_input_id:
             return AdmissionDecision("rejected", False, None, ("source_mismatch",), 0)
+        if request.workflow_profile is not None:
+            profile_bindings = plan.costs.payload.get("workflow_profiles", [])
+            if not any(isinstance(row, Mapping) and row.get("profile_id") == request.workflow_profile
+                    for row in profile_bindings):
+                return AdmissionDecision("rejected", False, None, ("source_mismatch",), 0)
         source_entry = campaign.schedule_entry.value
         if campaign.admission.requires_schedule:
             if source_entry is None or request.schedule_entry_id.value != source_entry.entry_id:
@@ -993,6 +1025,7 @@ class BudgetLedger:
             rid = hashlib.sha256(f"{self.scope_id}:{key}:{fingerprint}".encode()).hexdigest()[:32]
             evidence = ReservationEvidence(schema_version=2, campaign_id=request.campaign_id,
                 timing_profile=request.timing_profile,
+                workflow_profile=request.workflow_profile,
                 reservation_id=Evidence[str](value=rid), state="reserved", reserved_cost_usd=Evidence[float](value=float(price)),
                 cap_started_at=Evidence[datetime](value=now), expires_at=Evidence[datetime](value=now+timedelta(seconds=request.lifetime_cap_seconds)),
                 cap_start_policy_id=StringEvidence(value="reservation-activation-before-provider-expiry"), source_path=request.source_path,

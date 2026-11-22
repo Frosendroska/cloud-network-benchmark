@@ -8,7 +8,7 @@ import json
 import time
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -34,6 +34,20 @@ class _Attempt:
     retrieval: Any = None
     f03_process_record: dict[str, Any] | None = None
     f03_process_absent_at: datetime | None = None
+
+
+def _latest_common_measurement_start(cap_expires_at: datetime, allowance: Any, provider: str) -> datetime:
+    """Latest UTC start preserving this participant's immutable STOP/cap and full close budget."""
+    if cap_expires_at.tzinfo is None or cap_expires_at.utcoffset() is None:
+        raise ValueError("original cap expiry must be timezone-aware")
+    if provider not in allowance.provider_leads_seconds:
+        raise ValueError("provider is outside the frozen ready-trigger allowance")
+    required = (float(allowance.measurement_seconds)
+        + float(allowance.measurement_shutdown_seconds)
+        + float(allowance.retrieval_seconds)
+        + float(allowance.cleanup_seconds)
+        + float(allowance.provider_leads_seconds[provider]))
+    return (cap_expires_at.astimezone(timezone.utc) - timedelta(seconds=required))
 
 
 def _fetch_bounded_guest_archive_part(*, runner: Any, connection: Any, role: str,
@@ -165,20 +179,29 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         barrier_participant = matches[0]
     measurement_start_barrier = None
     measurement_start_participant = None
+    ready_triggered_start = False
     start_spec = runtime.get("measurement_start_barrier")
     if start_spec is not None:
         measurement_start_barrier = PostMeasurementBarrier(start_spec)
-        if len(measurement_start_barrier.spec["participants"]) != 6:
-            raise ValueError("measurement-start barrier must bind the exact six paired participants")
+        ready_triggered_start = measurement_start_barrier.spec.get("start_policy") == "all_ready"
+        expected_count = 3 if runtime.get("workflow_profile") == "all_cloud_calibration_v1" else 6
+        if len(measurement_start_barrier.spec["participants"]) != expected_count:
+            raise ValueError("measurement-start barrier has the wrong validation participant count")
         schedule_entry = getattr(observation, "schedule_entry", None)
         schedule_entry = getattr(schedule_entry, "value", None)
-        entry_id = getattr(schedule_entry, "entry_id", None) or child.run_id
+        entry_id = getattr(schedule_entry, "entry_id", None)
+        if entry_id is None and ready_triggered_start:
+            entry_id = runtime.get("observer", {}).get("entry_id")
+            expected_entries = {"CAL-S1"} if runtime.get("workflow_profile") == "all_cloud_calibration_v1" else {"V-S1", "V-S3"}
+            if entry_id not in expected_entries:
+                raise ValueError("ready-triggered barrier requires exact prepared runtime entry identity")
+        entry_id = entry_id or child.run_id
         matches = [row for row in measurement_start_barrier.spec["participants"]
             if row["entry_id"] == entry_id and row["provider"] == provider
             and row["run_id"] == child.run_id]
         if len(matches) != 1:
             raise ValueError("prepared measurement-start barrier does not contain this exact child")
-        if not measurement_start_barrier.spec.get("start_utc"):
+        if not ready_triggered_start and not measurement_start_barrier.spec.get("start_utc"):
             raise ValueError("measurement-start barrier requires one frozen UTC start")
         measurement_start_participant = matches[0]
     revision = child.config_provenance.implementation_git_commit.value
@@ -271,21 +294,27 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     def stabilize(deployment: Any, provision: Any):
         try:
             if cancel_event.is_set():
+                if ready_triggered_start and measurement_start_barrier is not None:
+                    measurement_start_barrier.abort("participant_cancelled_during_stabilization", nonblocking=True)
                 return ProviderStageOutcome("stabilize", False, {"failure": "controller cancellation was requested"})
             item = attempt(deployment, provision)
             prepared = item.prepared
             if prepared is None or not prepared.succeeded:
+                if ready_triggered_start and measurement_start_barrier is not None:
+                    measurement_start_barrier.abort("participant_preparation_failed", nonblocking=True)
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "successful F02 bootstrap, readiness and runtime staging are required"})
             allowance = _remaining_f11_allowance(runtime["allowance"], "measurement")
             fit = ledger.check_stage_fit(reservation.reservation_id.value,
                 stage="measurement", remaining=allowance)
             if not fit.eligible:
+                if ready_triggered_start and measurement_start_barrier is not None:
+                    measurement_start_barrier.abort("participant_original_deadline_cannot_fit", nonblocking=True)
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "F11 measurement remainder is insufficient", "reasons": fit.reason_codes})
             start_mono, start_utc = clock.monotonic(), clock.utc_now()
             slot = item.observation.scheduled_start
-            if measurement_start_barrier is not None:
+            if measurement_start_barrier is not None and not ready_triggered_start:
                 frozen_start = datetime.fromisoformat(
                     measurement_start_barrier.spec["start_utc"].replace("Z", "+00:00"))
                 if slot is None or abs((slot - frozen_start).total_seconds()) > 1e-6:
@@ -313,18 +342,55 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 "elapsed_seconds": end_mono-start_mono, "scheduled_start": slot}
             return ProviderStageOutcome("stabilize", end_mono-start_mono >= 60.0, item.stable)
         except Exception as exc:
+            if ready_triggered_start and measurement_start_barrier is not None:
+                try:
+                    measurement_start_barrier.abort("participant_stabilization_failed", nonblocking=True)
+                except Exception:
+                    pass
             return ProviderStageOutcome("stabilize", False,
                 {"failure": f"{type(exc).__name__}: stabilization failed"})
 
     def measure(deployment: Any, provision: Any):
         try:
             if cancel_event.is_set():
+                if ready_triggered_start and measurement_start_barrier is not None:
+                    measurement_start_barrier.abort("participant_cancelled_before_measurement", nonblocking=True)
                 return ProviderStageOutcome("measure", False, {"failure": "controller cancellation was requested"})
             item = attempt(deployment, provision)
             if item.stable is None or item.prepared is None or not item.prepared.succeeded:
                 return ProviderStageOutcome("measure", False,
                     {"failure": "successful preparation and stabilization are required"})
-            if measurement_start_barrier is not None:
+            if measurement_start_barrier is not None and ready_triggered_start:
+                allowance = runtime["allowance"]
+                latest = _latest_common_measurement_start(item.deadline.cap_expires_at, allowance, provider)
+                measurement_start_barrier.signal_ready(measurement_start_participant,
+                    latest.astimezone(timezone.utc).isoformat(), deadline=item.deadline,
+                    clock=clock.monotonic, utc_now=clock.utc_now)
+                released = measurement_start_barrier.wait_released(deadline=item.deadline,
+                    clock=clock.monotonic, cancelled=cancel_event.is_set, sleep=sleep,
+                    utc_now=clock.utc_now)
+                release_utc = datetime.fromisoformat(released["release_utc"])
+                release_delay = (release_utc - clock.utc_now()).total_seconds()
+                required_after_start = (float(allowance.measurement_seconds)
+                    + float(allowance.measurement_shutdown_seconds)
+                    + float(allowance.retrieval_seconds) + float(allowance.cleanup_seconds))
+                if release_delay + required_after_start > item.deadline.remaining(clock.monotonic):
+                    measurement_start_barrier.abort("common_release_outside_original_deadline",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("common ready-triggered start no longer fits the original cap")
+                if release_delay > 0:
+                    target_mono = clock.monotonic() + release_delay
+                    while clock.monotonic() < target_mono:
+                        if cancel_event.is_set():
+                            measurement_start_barrier.abort("participant_cancelled_before_common_start",
+                                deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                            raise InterruptedError("cancelled before common ready-triggered start")
+                        sleep(min(0.25, target_mono - clock.monotonic()))
+                if clock.utc_now().astimezone(timezone.utc) < release_utc.astimezone(timezone.utc):
+                    measurement_start_barrier.abort("utc_monotonic_start_mapping_was_early",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("monotonic ready-trigger start preceded the persisted UTC release")
+            elif measurement_start_barrier is not None:
                 measurement_start_barrier.signal_terminal(measurement_start_participant,
                     succeeded=True, deadline=item.deadline, clock=clock.monotonic)
                 measurement_start_barrier.wait_released(deadline=item.deadline,

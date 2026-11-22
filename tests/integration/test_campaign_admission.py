@@ -171,6 +171,32 @@ def test_generated_calibration_binds_runtime_observer_without_changing_workload(
     assert all(child.mode == "calibration" for child in children.values())
 
 
+def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.campaign_inputs import activate_prepared_stage
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+    observed = {}
+
+    def preflight(candidate, *, runtime_configs):
+        observed["candidate"] = candidate
+        observed["runtimes"] = runtime_configs
+        for entry in stage["entries"]:
+            runtime = runtime_configs[entry["entry_id"]]
+            assert runtime["runtime_source"] == {"path": entry["runtime_config_path"],
+                "sha256": entry["runtime_config_sha256"]}
+            assert runtime["approval_evidence"] == {}
+        raise ValueError("synthetic financial preflight rejection")
+
+    with pytest.raises(ValueError, match="synthetic financial preflight rejection"):
+        activate_prepared_stage(stage, settings, repository_root, preflight=preflight)
+    assert observed["candidate"]["status"] == "READY_FOR_ADMISSION"
+    assert set(observed["runtimes"]) == {entry["entry_id"] for entry in stage["entries"]}
+    assert all(not Path(path).exists() for path in stage["approval_refs"].values())
+
+
 def test_generated_week_freezes_the_bounded_source_hashed_pair_policy(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     stage = prepare_stage({"stage": "week"}, settings, repository_root,

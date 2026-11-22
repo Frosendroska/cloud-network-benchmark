@@ -77,6 +77,9 @@ pricing:
     working_limit: 250
     protected_buffer: 50
     total_limit: 300
+  # Finite validation profiles require a fresh priced source bound to the
+  # exact profile IDs. Leave empty to retain standard stage limits.
+  workflow_profiles: []
   expiry:
     aws: {automation_step_price: null, script_second_price: null}
     azure: {automation_rate_per_job_minute: null, job_minutes_bound: null}
@@ -115,6 +118,10 @@ pricing:
       gcp: *pending_components
 stage_inputs:
   acceptance:
+    # Explicit opt-in only. These profiles do not grant paid authority.
+    workflow_profile: null # all_cloud_acceptance_v1 for the paired S1/S3 parents
+    failure_workflow_profile: null # all_cloud_failure_acceptance_v1 for the three registered checks
+    execution_window_utc: null # {not_before_utc: ..., not_after_utc: ...} bound by paired_acceptance approval
     # Fill ONLY after physically supervising each registered attempt.
     failure_checks:
       V-A-FAIL:
@@ -144,6 +151,8 @@ stage_inputs:
       cleanup_seconds: null
       provider_leads_seconds: {aws: 360, azure: null, gcp: 30}
   calibration:
+    workflow_profile: null # all_cloud_calibration_v1 for retained calibration
+    execution_window_utc: null # {not_before_utc: ..., not_after_utc: ...} bound by calibration approval
     start_utc: null
     allowance:
       source_id: null

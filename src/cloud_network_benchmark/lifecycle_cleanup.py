@@ -145,10 +145,16 @@ def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
 def _validate_request(saved: SavedProviderCleanupSettings) -> None:
     d, r, reservation = saved.deployment, saved.expiry_request, saved.reservation
     from datetime import timedelta
+    from .validation_profiles import provider_lead_seconds
+    defaults = {Provider.AWS: 360, Provider.AZURE: 120, Provider.GCP: 30}
+    expected_lead = provider_lead_seconds(d.admission.workflow_profile,
+        str(saved.provider.value if hasattr(saved.provider, "value") else saved.provider), defaults[saved.provider])
     if r.expires_at.value != reservation.expires_at.value - timedelta(seconds=saved.provider_lead_seconds):
         raise ValueError("saved provider expiry request no longer matches its original F11 lead")
+    if saved.provider_lead_seconds != expected_lead:
+        raise ValueError("saved provider expiry lead differs from the fixed workflow profile")
     if saved.provider == Provider.AWS:
-        from .providers.aws import AwsProviderDriver, AwsRuntimeSettings, SAFETY_LEAD_SECONDS
+        from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
         settings = AwsRuntimeSettings.model_validate(saved.settings)
         driver = AwsProviderDriver.__new__(AwsProviderDriver); driver.settings = settings
         from .providers.aws import _namespace, _legacy_namespace
@@ -157,16 +163,14 @@ def _validate_request(saved: SavedProviderCleanupSettings) -> None:
         expected_action = "stop"
         from .contracts.common import Provider as P
         if (r.resource_namespace not in expected_namespaces or r.target_selector != expected_target
-                or r.action != expected_action or saved.provider_lead_seconds != SAFETY_LEAD_SECONDS
-                or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)):
+                or r.action != expected_action or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=expected_lead)):
             raise ValueError("saved AWS request target differs from the original deployment")
     elif saved.provider == Provider.GCP:
-        from .providers.gcp import GcpRuntimeSettings, SAFETY_LEAD_SECONDS
+        from .providers.gcp import GcpRuntimeSettings
         settings = GcpRuntimeSettings.model_validate(saved.settings)
         expected = f"project={settings.project_id};run_id={d.run_id};deployment_id={d.deployment_id};roles=vm_a,vm_b"
         if (r.resource_namespace != d.run_id or r.target_selector != expected or r.action != "stop"
-                or saved.provider_lead_seconds != SAFETY_LEAD_SECONDS
-                or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)):
+                or r.expires_at.value != reservation.expires_at.value - timedelta(seconds=expected_lead)):
             raise ValueError("saved GCP request target differs from the original deployment")
     else:
         from . import azure_provider

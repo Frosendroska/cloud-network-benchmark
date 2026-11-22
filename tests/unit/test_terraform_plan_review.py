@@ -75,6 +75,29 @@ def test_all_four_roots_have_exact_fresh_scope(provider, root):
     assert len(checked) == len(resources)
 
 
+def test_aws_expiry_scope_binds_optional_permissions_boundary_to_configured_account():
+    v, resources = scope("aws", "safety")
+    boundary = f"arn:aws:iam::{v['account_id']}:policy/cnb/ExpiryBoundary"
+    v["expiry_role_permissions_boundary_arn"] = boundary
+    resources["aws_iam_role.expiry"]["permissions_boundary"] = boundary
+    resources["aws_iam_role.expiry"]["tags"] = {
+        "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]}
+    plan = plan_document(v, resources, "aws")
+    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == 3
+
+    changed = deepcopy(resources)
+    changed["aws_iam_role.expiry"]["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/Other"
+    with pytest.raises(tp.PlanReviewError, match="permissions boundary"):
+        tp.validate_scope(plan_document(v, changed, "aws"), "aws", ROOT/"terraform/aws/safety", v)
+
+    foreign = deepcopy(v)
+    foreign["expiry_role_permissions_boundary_arn"] = "arn:aws:iam::111122223333:policy/Other"
+    foreign_resources = deepcopy(resources)
+    foreign_resources["aws_iam_role.expiry"]["permissions_boundary"] = foreign["expiry_role_permissions_boundary_arn"]
+    with pytest.raises(tp.PlanReviewError, match="configured account"):
+        tp.validate_scope(plan_document(foreign, foreign_resources, "aws"), "aws", ROOT/"terraform/aws/safety", foreign)
+
+
 @pytest.mark.parametrize("scenario,count", [("same_zone",8),("cross_zone",8),("placement_optimization",9),("inter_region",9)])
 def test_gcp_protection_scenario_scope(scenario,count):
     v,r = scope("gcp","protection",scenario)

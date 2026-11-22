@@ -61,6 +61,31 @@ class PostMeasurementBarrier:
             if start.tzinfo is None or start.utcoffset() is None:
                 raise ValueError("barrier frozen start UTC must include timezone")
             self.spec["start_utc"] = start.astimezone(__import__("datetime").timezone.utc).isoformat()
+        if spec.get("start_policy") is not None:
+            if spec.get("start_policy") != "all_ready":
+                raise ValueError("unsupported measurement start release policy")
+            window = spec.get("ready_window_seconds")
+            if type(window) is not int or not 1 <= window <= 600:
+                raise ValueError("ready-triggered barrier requires a bounded 1..600 second readiness window")
+            execution_window = spec.get("execution_window")
+            if not isinstance(execution_window, Mapping) or set(execution_window) != {"not_before_utc", "not_after_utc"}:
+                raise ValueError("ready-triggered barrier requires a frozen execution window")
+            from datetime import datetime, timezone
+            normalized_window = {}
+            for name, value in execution_window.items():
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("execution window bounds must be timezone-aware UTC") from exc
+                if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+                    raise ValueError("execution window bounds must be timezone-aware UTC")
+                normalized_window[name] = parsed.astimezone(timezone.utc).isoformat()
+            if (datetime.fromisoformat(normalized_window["not_after_utc"])
+                    <= datetime.fromisoformat(normalized_window["not_before_utc"])):
+                raise ValueError("execution window must be positive")
+            self.spec["start_policy"] = spec["start_policy"]
+            self.spec["execution_window"] = normalized_window
+            self.spec["ready_window_seconds"] = window
         self.digest = hashlib.sha256(_canonical(self.spec)).hexdigest()
         self.path = root / f"{barrier_id}.state.json"
         self.lock_path = root / f"{barrier_id}.lock"
@@ -137,7 +162,8 @@ class PostMeasurementBarrier:
             else:
                 self._write({"schema_version": 1, "barrier_id": self.spec["barrier_id"],
                     "spec_sha256": self.digest, "spec": self.spec, "state": "waiting",
-                    "terminal": {}, "abort_reason": None})
+                    "terminal": {}, "ready": {}, "first_ready_utc": None,
+                    "release_utc": None, "abort_reason": None})
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
@@ -166,6 +192,64 @@ class PostMeasurementBarrier:
             return dict(state)
         return self._locked(apply, deadline=deadline, clock=clock)
 
+    def signal_ready(self, participant: Mapping[str, str], latest_start_utc: str, *,
+            deadline: Any, clock: Callable[[], float] = time.monotonic,
+            utc_now: Callable[[], Any]) -> dict:
+        """Persist one ready participant and atomically release at the first valid common instant."""
+        if self.spec.get("start_policy") != "all_ready":
+            raise ValueError("barrier is not configured for ready-triggered release")
+        from datetime import datetime, timezone
+        key = _canonical(dict(participant)).decode()
+        identities = {_canonical(row).decode() for row in self.spec["participants"]}
+        if key not in identities:
+            raise ValueError("ready signal is outside the prepared participant set")
+        try:
+            latest = datetime.fromisoformat(latest_start_utc.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("latest permissible start must be timezone-aware UTC") from exc
+        if latest.tzinfo is None or latest.utcoffset() is None or latest.utcoffset().total_seconds() != 0:
+            raise ValueError("latest permissible start must be timezone-aware UTC")
+        latest = latest.astimezone(timezone.utc)
+        now = utc_now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("ready-triggered barrier clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        window_start = datetime.fromisoformat(self.spec["execution_window"]["not_before_utc"])
+        window_end = datetime.fromisoformat(self.spec["execution_window"]["not_after_utc"])
+        def apply(state: dict) -> dict:
+            if state["state"] in {"aborted", "released"}:
+                return dict(state)
+            if now > window_end:
+                state.update(state="aborted", abort_reason="execution_window_expired")
+                self._write(state)
+                return dict(state)
+            first = datetime.fromisoformat(state["first_ready_utc"]) if state["first_ready_utc"] else now
+            if state["first_ready_utc"] is None:
+                state["first_ready_utc"] = first.isoformat()
+            if now > first + __import__("datetime").timedelta(seconds=self.spec["ready_window_seconds"]):
+                state.update(state="aborted", abort_reason="ready_window_expired")
+                self._write(state)
+                return dict(state)
+            previous = state["ready"].get(key)
+            if previous is not None:
+                if previous != latest.isoformat():
+                    raise ValueError("participant ready signal conflicts with its immutable first signal")
+                return dict(state)
+            state["ready"][key] = latest.isoformat()
+            if len(state["ready"]) == len(self.spec["participants"]):
+                common_latest = min(datetime.fromisoformat(value) for value in state["ready"].values())
+                release_at = max(now, window_start)
+                if release_at > common_latest:
+                    state.update(state="aborted", abort_reason="original_deadline_cannot_fit_measurement")
+                elif release_at > window_end:
+                    state.update(state="aborted", abort_reason="execution_window_expired")
+                else:
+                    state.update(state="released", release_utc=release_at.isoformat(),
+                        latest_permissible_start_utc=common_latest.isoformat())
+            self._write(state)
+            return dict(state)
+        return self._locked(apply, deadline=deadline, clock=clock)
+
     def abort(self, reason: str, *, deadline: Any = None,
             clock: Callable[[], float] = time.monotonic, nonblocking: bool = False) -> dict:
         if not isinstance(reason, str) or not reason.strip():
@@ -181,7 +265,8 @@ class PostMeasurementBarrier:
 
     def wait_released(self, *, deadline: Any, clock: Callable[[], float] = time.monotonic,
             cancelled: Callable[[], bool] = lambda: False,
-            sleep: Callable[[float], None] = time.sleep) -> dict:
+            sleep: Callable[[float], None] = time.sleep,
+            utc_now: Callable[[], Any] | None = None) -> dict:
         while True:
             if cancelled():
                 try:
@@ -203,4 +288,14 @@ class PostMeasurementBarrier:
                 return snapshot
             if snapshot["state"] == "aborted":
                 raise RuntimeError("post-measurement barrier aborted: " + str(snapshot.get("abort_reason")))
+            if (self.spec.get("start_policy") == "all_ready"
+                    and snapshot.get("first_ready_utc")):
+                from datetime import datetime, timedelta, timezone
+                first = datetime.fromisoformat(snapshot["first_ready_utc"])
+                now_utc = (utc_now or (lambda: datetime.now(timezone.utc)))()
+                if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+                    raise ValueError("ready-triggered barrier clock must be timezone-aware")
+                if now_utc.astimezone(timezone.utc) > first + timedelta(seconds=self.spec["ready_window_seconds"]):
+                    self.abort("ready_window_expired", deadline=deadline, clock=clock, nonblocking=True)
+                    raise TimeoutError("ready-triggered barrier readiness window expired")
             sleep(min(0.25, remaining))

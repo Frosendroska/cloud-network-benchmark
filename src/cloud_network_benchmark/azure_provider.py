@@ -69,7 +69,10 @@ class AzureRuntimeOptions(StrictModel):
     command_timeout_seconds: float = Field(gt=0)
     expiry_cost_input: dict[str, Any]
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    plan_review_admission_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
+    workflow_profile: Optional[Literal["all_cloud_acceptance_v1", "all_cloud_calibration_v1", "all_cloud_failure_acceptance_v1"]] = Field(
         default=None, exclude_if=lambda value: value is None)
     cleanup_timing_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     cleanup_timing_active: bool = Field(default=False, exclude_if=lambda value: value is False)
@@ -125,11 +128,13 @@ class AzureRuntimeOptions(StrictModel):
         if not self.authentication_reference.strip() or not self.ssh_public_key.strip():
             raise ValueError("private authentication reference and public key are required")
         _key_material(self.ssh_public_key)
-        if self.timing_profile and (self.cleanup_timing_path is None or not self.cleanup_timing_path.is_absolute()):
+        if self.timing_profile and self.workflow_profile:
+            raise ValueError("Azure workflow and EXP-901 timing profiles cannot be combined")
+        if (self.timing_profile or self.workflow_profile) and (self.cleanup_timing_path is None or not self.cleanup_timing_path.is_absolute()):
             raise ValueError("profile cleanup requires an absolute external timing-state path")
-        if self.timing_profile and self.cleanup_timing_path.is_relative_to(self.attempt_root):
+        if (self.timing_profile or self.workflow_profile) and self.cleanup_timing_path.is_relative_to(self.attempt_root):
             raise ValueError("profile cleanup timing state must survive provider attempt-root deletion")
-        if self.timing_profile and self.command_timeout_seconds > 180:
+        if (self.timing_profile or self.workflow_profile) and self.command_timeout_seconds > 180:
             raise ValueError("profile Azure commands are capped at 180 seconds")
         if not self.admission_evidence.get("priority_review_reference") and self.admission_evidence.get("priority") in {"P2", "P3"}:
             raise ValueError("P2/P3 requires explicit priority review evidence")
@@ -258,7 +263,8 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         raise ValueError("Azure runtime timing profile differs from source-bound deployment")
     if d.reservation.value.timing_profile != profile:
         raise ValueError("Azure reservation timing profile differs from deployment")
-    mode_cap=int(AdmissionRequirements.expected_for(d.mode,d.scenario,profile)["lifetime_cap_seconds"])
+    workflow_profile=d.admission.workflow_profile
+    mode_cap=int(AdmissionRequirements.expected_for(d.mode,d.scenario,profile,workflow_profile)["lifetime_cap_seconds"])
     if d.admission.lifetime_cap_seconds != mode_cap:
         raise ValueError("admitted lifetime cap does not match the selected mode")
     if profile:
@@ -356,8 +362,12 @@ def _profile_timing_digest(value: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _profile_name(deployment: ProviderDeploymentInput) -> str | None:
+    return deployment.admission.timing_profile or deployment.admission.workflow_profile
+
+
 def _profile_timing_identity(deployment: ProviderDeploymentInput) -> dict[str,str]:
-    return {"profile":deployment.admission.timing_profile or "",
+    return {"profile":_profile_name(deployment) or "",
         "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,
         "reservation_id":deployment.reservation.value.reservation_id.value or "",
         "config_sha256":deployment.config_sha256}
@@ -411,14 +421,15 @@ def _profile_timing_mutate(options: AzureRuntimeOptions, update: Callable[[dict[
 
 def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
                                *, clock: Callable[[], float], utc_now: Callable[[], datetime]) -> None:
-    if deployment.admission.timing_profile != "azure_exp901_sweden_acceptance_v1":
+    profile_name = _profile_name(deployment)
+    if profile_name is None:
         return
     mono = float(clock()); wall = utc_now().astimezone(UTC)
     if (options.cleanup_timing_path is not None and not options.cleanup_timing_path.exists()
             and (options.attempt_root / "recovery.json").exists()):
         raise ValueError("missing profile timing anchor cannot be recreated after provider recovery state exists")
     reservation = deployment.reservation.value
-    body = {"schema_version": 1, "profile": deployment.admission.timing_profile,
+    body = {"schema_version": 1, "profile": profile_name,
         "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
         "reservation_id": reservation.reservation_id.value,
         "config_sha256": deployment.config_sha256,
@@ -447,7 +458,7 @@ def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: Azu
 
 def _bind_profile_stop(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
                        stop_at: datetime) -> None:
-    if deployment.admission.timing_profile != "azure_exp901_sweden_acceptance_v1":
+    if _profile_name(deployment) is None:
         return
     stop = stop_at.astimezone(UTC)
     def bind(state):
@@ -467,10 +478,11 @@ def _bind_profile_stop(deployment: ProviderDeploymentInput, options: AzureRuntim
 
 def _require_profile_timing_anchor(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
                                    *, require_stop: bool) -> dict[str, Any] | None:
-    if deployment.admission.timing_profile is None:
+    profile_name = _profile_name(deployment)
+    if profile_name is None:
         return None
     def check(state):
-        if (state.get("profile") != deployment.admission.timing_profile
+        if (state.get("profile") != profile_name
                 or state.get("run_id") != deployment.run_id
                 or state.get("deployment_id") != deployment.deployment_id
                 or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
@@ -484,7 +496,7 @@ def _require_profile_timing_anchor(deployment: ProviderDeploymentInput, options:
 
 def _observe_profile_cleanup_clock(options: AzureRuntimeOptions, *, clock: Callable[[], float],
                                    utc_now: Callable[[], datetime], phase: str = "routine") -> dict[str, Any] | None:
-    if options.timing_profile is None:
+    if options.timing_profile is None and options.workflow_profile is None:
         return None
     mono = float(clock()); wall = utc_now().astimezone(UTC)
     def observe(state):
@@ -520,12 +532,20 @@ def _begin_profile_cleanup(deployment: ProviderDeploymentInput, options: AzureRu
                            clock: Callable[[], float], utc_now: Callable[[], datetime],
                            invocation_seconds: float) -> tuple[float, dict[str, Any] | None, str | None]:
     now_mono = float(clock()); now_utc = utc_now().astimezone(UTC)
-    if deployment.admission.timing_profile is None:
+    profile_name = _profile_name(deployment)
+    if profile_name is None:
         return now_mono + max(1.0, invocation_seconds), None, None
-    fallback = now_mono + min(300.0, max(1.0, invocation_seconds))
+    if deployment.admission.timing_profile:
+        fallback = now_mono + min(300.0, max(1.0, invocation_seconds))
+    else:
+        fallback_end = min(options.cap_deadline_monotonic, now_mono + min(660.0, max(1.0, invocation_seconds)))
+        if deployment.expiry.value is not None and deployment.expiry.value.expires_at.value is not None:
+            stop_remaining = (deployment.expiry.value.expires_at.value.astimezone(UTC)-now_utc).total_seconds()
+            fallback_end = min(fallback_end, now_mono + max(0.0, stop_remaining))
+        fallback = fallback_end
     try:
         def begin(state):
-            if (state.get("profile") != deployment.admission.timing_profile
+            if (state.get("profile") != profile_name
                     or state.get("run_id") != deployment.run_id
                     or state.get("deployment_id") != deployment.deployment_id
                     or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
@@ -611,7 +631,7 @@ def _begin_profile_cleanup(deployment: ProviderDeploymentInput, options: AzureRu
 
 def _finish_profile_timing(options: AzureRuntimeOptions, *, clock: Callable[[], float],
                            utc_now: Callable[[], datetime], absence_verified: bool) -> dict[str, Any] | None:
-    if options.timing_profile is None:
+    if options.timing_profile is None and options.workflow_profile is None:
         return None
     mono = float(clock()); wall = utc_now().astimezone(UTC)
     def finish(state):
@@ -674,7 +694,7 @@ def _finish_profile_timing(options: AzureRuntimeOptions, *, clock: Callable[[], 
 
 def _mark_profile_absence_started(options: AzureRuntimeOptions, *, clock: Callable[[], float],
                                   utc_now: Callable[[], datetime]) -> dict[str, Any] | None:
-    if options.timing_profile is None:
+    if options.timing_profile is None and options.workflow_profile is None:
         return None
     mono = float(clock()); wall = utc_now().astimezone(UTC)
     try:
@@ -1001,7 +1021,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         from .terraform_plan import reviewed_apply
         req = req.model_copy(update={"cwd": str(root)})
         result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds,
-            apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply)
+            apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply,
+            review_admission_path=options.plan_review_admission_path)
     else:
         result = execute(req)
     accepted_absence = (allow_not_found and _is_exact_not_found(result)) or (
@@ -1259,7 +1280,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
                     sleep: Callable[[float], None]) -> ExpiryEvidence:
     """Prepare/read back Automation and bind one UTC job before pair creation."""
     now = utc_now().astimezone(UTC); mono = clock()
-    if deployment.admission.timing_profile:
+    if _profile_name(deployment):
         # Factory preparation owns the original anchor. Registration must never
         # recreate it after the attempt has begun or make provider calls first.
         anchor = _require_profile_timing_anchor(deployment, options, require_stop=False)
@@ -1927,26 +1948,27 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
             clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureCleanupResult:
     start=utc_now().astimezone(UTC)
     configured_timeout = float(deployment.cleanup_timeout_seconds or options.command_timeout_seconds)
-    invocation_seconds=(min(300.0, configured_timeout) if deployment.admission.timing_profile else configured_timeout)
+    invocation_seconds=(min(300.0, configured_timeout) if deployment.admission.timing_profile
+        else min(660.0, configured_timeout) if deployment.admission.workflow_profile else configured_timeout)
     invocation_start=float(clock())
     invocation_deadline, timing_state, timing_note = _begin_profile_cleanup(deployment, options,
         clock=clock, utc_now=utc_now, invocation_seconds=invocation_seconds)
-    if deployment.admission.timing_profile and timing_state is not None and timing_note is None:
+    if _profile_name(deployment) and timing_state is not None and timing_note is None:
         absence_bound=(timing_state.get("fresh_absence_deadline_monotonic")
             if timing_state.get("absence_started_at") is not None
             else timing_state.get("absence_deadline_monotonic"))
         if isinstance(absence_bound,(int,float)):
             invocation_deadline=min(invocation_start+invocation_seconds,float(absence_bound))
     options = options.model_copy(update={"cap_deadline_monotonic": invocation_deadline,
-        "cleanup_timing_active": deployment.admission.timing_profile is not None and timing_state is not None,
+        "cleanup_timing_active": _profile_name(deployment) is not None and timing_state is not None,
         "cleanup_timing_phase": ("emergency" if timing_note else "routine")
-            if deployment.admission.timing_profile else None})
+            if _profile_name(deployment) else None})
     root=options.attempt_root; journal=root/"recovery.json"; actions=[]; failures=[]; resources=[]
     if not journal.is_file() or journal.is_symlink():
         failures.append(FailureEvidence(category="recovery_missing",message="private recovery journal unavailable",occurred_at=start))
         if timing_state is not None:
             timing_state = _finish_profile_timing(options, clock=clock, utc_now=utc_now, absence_verified=False) or timing_state
-        status = timing_state.get("timing_status") if timing_state else ("unknown" if deployment.admission.timing_profile else None)
+        status = timing_state.get("timing_status") if timing_state else ("unknown" if _profile_name(deployment) else None)
         timing_failure = _timing_failure(status, timing_note or (timing_state or {}).get("timing_failure"), utc_now())
         return AzureCleanupResult(identity=_identity(deployment),cleanup_state=CleanupState.FAILED,attempted_at=start,
             finished_at=utc_now(),failures=failures,launch_blocked=True,timing_status=status,timing_failure=timing_failure)
@@ -1958,7 +1980,7 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
     expected_vm_ids=[f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}/providers/Microsoft.Compute/virtualMachines/{_slug(deployment)}-{role}" for role in ("a","b")]
     if state.get("vm_ids") != expected_vm_ids:
         raise ValueError("recovery journal contains foreign target identities; refusing cleanup")
-    if (deployment.admission.timing_profile and timing_state
+    if (_profile_name(deployment) and timing_state
             and timing_state.get("absence_started_at") is not None
             and timing_note is None):
         expected_group=f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}"
@@ -2133,7 +2155,7 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
         if definitions:
             raise RuntimeError("custom role definition inventory contains an unexpected identity")
         actions.append(_safe_cleanup_action(options,residual_defs))
-        if deployment.admission.timing_profile:
+        if _profile_name(deployment):
             phase="emergency"
             if timing_state is not None:
                 try:
@@ -2158,10 +2180,10 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
         state=json.loads(journal.read_text(encoding="utf-8"))
         state["failures"].append({"category":"azure_cleanup","message":_redact(options,exc)[:1000]}); _atomic_private(journal,state)
         cleanup=CleanupState.FAILED; blocked=True
-    if deployment.admission.timing_profile and timing_state is not None:
+    if _profile_name(deployment) and timing_state is not None:
         timing_state = _finish_profile_timing(options, clock=clock, utc_now=utc_now,
             absence_verified=cleanup == CleanupState.SUCCEEDED)
-    timing_status = timing_state.get("timing_status") if timing_state else ("unknown" if deployment.admission.timing_profile else None)
+    timing_status = timing_state.get("timing_status") if timing_state else ("unknown" if _profile_name(deployment) else None)
     timing_failure = _timing_failure(timing_status,
         timing_note or (timing_state or {}).get("timing_failure"), utc_now())
     return AzureCleanupResult(identity=_identity(deployment),cleanup_state=cleanup,attempted_at=start,finished_at=utc_now(),

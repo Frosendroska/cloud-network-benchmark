@@ -174,7 +174,8 @@ class ProviderDeploymentInput(StrictModel):
         if self.context == "replacement" and ExperimentMode(self.mode) != ExperimentMode.SHORT_STUDY:
             raise ValueError("replacement deployments are only valid for short_study mode")
         profile = self.admission.timing_profile
-        for name, expected in AdmissionRequirements.expected_for(self.mode, self.scenario, profile).items():
+        workflow_profile = self.admission.workflow_profile
+        for name, expected in AdmissionRequirements.expected_for(self.mode, self.scenario, profile, workflow_profile).items():
             if getattr(self.admission, name) != expected:
                 raise ValueError(f"admission.{name} must match deployment mode and scenario")
         if profile == "azure_exp901_sweden_acceptance_v1":
@@ -187,6 +188,17 @@ class ProviderDeploymentInput(StrictModel):
                 raise ValueError("deployment timing profile identity/scope mismatch")
         elif profile is not None:
             raise ValueError("unsupported timing profile")
+        workflow_profile = self.admission.workflow_profile
+        if workflow_profile is not None:
+            failure_provider = {"EXP-900": Provider.AWS, "EXP-901": Provider.AZURE, "EXP-902": Provider.GCP}.get(self.experiment_id)
+            valid = ((workflow_profile == "all_cloud_acceptance_v1" and self.experiment_id in {"EXP-903", "EXP-003"}
+                      and self.mode == ExperimentMode.ACCEPTANCE and self.context == "standard")
+                     or (workflow_profile == "all_cloud_calibration_v1" and self.experiment_id == "EXP-001"
+                         and self.mode == ExperimentMode.CALIBRATION and self.context == "standard")
+                     or (workflow_profile == "all_cloud_failure_acceptance_v1" and failure_provider == self.provider
+                         and self.mode == ExperimentMode.ACCEPTANCE and self.context == "failure_check"))
+            if not valid:
+                raise ValueError("deployment workflow profile identity/scope mismatch")
         if self.vm_a.role != VmRole.VM_A.value or self.vm_b.role != VmRole.VM_B.value:
             raise ValueError("deployment requires VM A and VM B roles")
         if self.vm_a.function != "client_traffic_generator" or self.vm_b.function != "server_receiver":

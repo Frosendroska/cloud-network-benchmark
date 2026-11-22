@@ -43,6 +43,9 @@
           "enum": [
             1200,
             1800,
+            3900,
+            4200,
+            5100,
             87600
           ],
           "title": "Lifetime Cap Seconds",
@@ -97,6 +100,23 @@
           ],
           "default": null,
           "title": "Timing Profile"
+        },
+        "workflow_profile": {
+          "anyOf": [
+            {
+              "enum": [
+                "all_cloud_acceptance_v1",
+                "all_cloud_calibration_v1",
+                "all_cloud_failure_acceptance_v1"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workflow Profile"
         }
       },
       "required": [

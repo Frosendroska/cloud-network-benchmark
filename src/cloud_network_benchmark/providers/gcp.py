@@ -23,6 +23,7 @@ from ..contracts.admission import ExpiryEvidence, ExpiryRequest, ReservationEvid
 from ..contracts.common import CleanupState, Evidence, FailureEvidence, StrictModel, StructuredEvidence, StringEvidence
 from ..contracts.deployment import ProviderDeploymentInput, ProviderDeploymentOutput, ProviderVmOutput, RemoteConnectionData, IdentityContext
 from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
+from ..validation_profiles import provider_lead_seconds
 
 SAFETY_LEAD_SECONDS = 30
 CONTROLLER_SESSION_ID = str(uuid.uuid4())
@@ -67,6 +68,7 @@ class GcpRuntimeSettings(StrictModel):
     complete_workflow_remaining_seconds: float = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    plan_review_admission_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=180, gt=0, le=600)
 
@@ -179,11 +181,12 @@ class GcpProviderDriver:
         reservation = self._validate(deployment, request)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=lead)
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(deployment, reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         if journal.get("registered"):
             if journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
                 raise GcpProviderError("an earlier controller session cannot reuse registered protection; resolve the attempt through cleanup", category="cleanup_open")
@@ -223,7 +226,7 @@ class GcpProviderDriver:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise GcpProviderError("registration clock must be timezone-aware", category="cap_order")
             now = now.astimezone(timezone.utc)
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(deployment, reservation, trigger, self.settings.complete_workflow_remaining_seconds)
             if not reservation.cap_started_at.value <= now <= trigger:
                 raise GcpProviderError("expiry registration is outside the original reservation window", category="cap_order")
             cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
@@ -275,19 +278,20 @@ class GcpProviderDriver:
         if reservation.reservation_id.value != journal.get("reservation_id") or reservation.source_sha256 != self.settings.cost_input_sha256 or reservation.source_path != self.settings.cost_source_path:
             raise GcpProviderError("reservation, project or cost-source identity changed after registration", category="state_identity_mismatch")
         self._assert_no_open_cleanup(deployment)
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+            deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
+        self._fit(deployment, reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         self._verify_registered_templates(journal, trigger, deployment)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(deployment, reservation, trigger, self.settings.complete_workflow_remaining_seconds)
         self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds), time.monotonic() + max(0.0, (trigger-self.clock()).total_seconds()))
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
         try:
             templates = journal["templates"]
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(deployment, reservation, trigger, self.settings.complete_workflow_remaining_seconds)
             pair = self._terraform(attempt, "pair", "apply", deployment, {"template_a": templates["vm_a"]["self_link_unique"], "template_b": templates["vm_b"]["self_link_unique"]})
             values = self._outputs(pair).get("instances", {})
             if set(values) != {"vm_a", "vm_b"} or len({str(item.get("id")) for item in values.values()}) != 2 or len({item.get("name") for item in values.values()}) != 2:
@@ -343,8 +347,22 @@ class GcpProviderDriver:
         self._deadline = None
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
-        self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
         journal = self._load(attempt, deployment)
+        cleanup_now = self.clock().astimezone(timezone.utc)
+        if deployment.admission.workflow_profile:
+            started_at = journal.get("cleanup_started_at")
+            if started_at is None:
+                started_at = cleanup_now.isoformat()
+                journal["cleanup_started_at"] = started_at
+                self._save(attempt, journal)
+            started_utc = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+            from ..validation_profiles import provider_lead_seconds
+            lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
+            routine_end = min(started_utc+timedelta(seconds=600),
+                deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead+60))
+            self._deadline = time.monotonic()+max(0.0, (routine_end-cleanup_now).total_seconds())
+        else:
+            self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
         if journal.get("cleanup_state") == "succeeded":
             return GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=journal["inventory"]), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])) if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"), primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None)
         failure = None
@@ -359,6 +377,16 @@ class GcpProviderDriver:
                 raise GcpProviderError("owned compute remains; protection must stay installed", category="residual_compute")
             if journal.get("registered") or journal.get("registration_may_have_started"):
                 self._terraform(attempt, "protection", "destroy", deployment, {})
+            if deployment.admission.workflow_profile:
+                absence_started = journal.get("cleanup_absence_started_at")
+                if absence_started is None:
+                    absence_started = self.clock().astimezone(timezone.utc).isoformat()
+                    journal["cleanup_absence_started_at"] = absence_started
+                    self._save(attempt, journal)
+                absence_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
+                cap_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead)
+                absence_end = min(absence_utc+timedelta(seconds=60), cap_end)
+                self._deadline = time.monotonic()+max(0.0, (absence_end-self.clock().astimezone(timezone.utc)).total_seconds())
             inventory = self._inventory(deployment)
             if not inventory["pages_complete"] or inventory["resources"]:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
@@ -391,7 +419,8 @@ class GcpProviderDriver:
         reservation = deployment.reservation.value
         if reservation is None or reservation.state != "reserved":
             raise GcpProviderError("active reservation evidence is required", category="reservation_required")
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+            deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
         if request.provider != "gcp" or request.action != "stop" or request.run_id != deployment.run_id or request.deployment_id != deployment.deployment_id:
             raise GcpProviderError("expiry request identity/action does not match GCP deployment", category="identity_mismatch")
         if request.reservation_id.value != reservation.reservation_id.value or request.expires_at.value != trigger:
@@ -650,7 +679,7 @@ class GcpProviderDriver:
             raise GcpProviderError("template creation must fall after reservation activation and before registration", category="cap_order")
         return created
 
-    def _fit(self, reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
+    def _fit(self, deployment: ProviderDeploymentInput, reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None or trigger.tzinfo is None or trigger.utcoffset() is None:
             raise GcpProviderError("reservation and trigger times must be timezone-aware", category="cap_order")
@@ -660,7 +689,8 @@ class GcpProviderDriver:
         cap_end = reservation.expires_at.value.astimezone(timezone.utc)
         if not isfinite(seconds) or seconds <= 0:
             raise GcpProviderError("complete remaining workflow estimate must be positive and finite", category="cap_insufficient")
-        if trigger != cap_end - timedelta(seconds=SAFETY_LEAD_SECONDS):
+        if trigger != cap_end - timedelta(seconds=provider_lead_seconds(
+                deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)):
             raise GcpProviderError("native STOP trigger must remain tied to the original reservation cap", category="cap_mismatch")
         if cap_start > now or now > trigger or now + timedelta(seconds=seconds) > trigger:
             raise GcpProviderError("whole remaining workflow must fit before original native STOP initiation lead", category="cap_insufficient")
@@ -837,7 +867,8 @@ class GcpProviderDriver:
             return result
         if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
             from ..terraform_plan import reviewed_apply
-            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
     def _record_command(self, request: CommandRequest, result: CommandResult) -> None:
@@ -902,7 +933,8 @@ class GcpProviderDriver:
             self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         if root == "pair" and action == "apply":
-            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=provider_lead_seconds(
+                deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
             slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
             self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)

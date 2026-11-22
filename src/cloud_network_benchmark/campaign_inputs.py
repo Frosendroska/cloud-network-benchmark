@@ -31,6 +31,8 @@ from .paths import atomic_write_json
 from .scheduling import load_schedule
 from .campaign_identity import check_provider_identities
 from .storage_admission import validate_storage_review
+from .validation_profiles import (ACCEPTANCE_PROFILE, CALIBRATION_PROFILE,
+    FAILURE_PROFILE, PROFILE_SPECS, profile_allowance, profile_spec)
 
 STAGES = {"acceptance", "calibration", "day", "week"}
 CONFIGS = {
@@ -123,11 +125,38 @@ def _selected(plan):
             for day in range(1, 8) for window in WINDOWS for scenario in (1, 3)]
 
 
-def _allowance(settings, stage, providers):
-    try:
-        row = copy.deepcopy(settings["stage_inputs"][stage]["allowance"])
-    except KeyError as exc:
-        raise ValueError(f"set stage_inputs.{stage}.allowance from measured setup/copy/cleanup times") from exc
+def _allowance(settings, stage, providers, *, entry_id=None):
+    stage_inputs = settings.get("stage_inputs", {}).get(stage, {})
+    configured_profile = stage_inputs.get("workflow_profile")
+    if stage == "acceptance" and entry_id in {"V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"}:
+        profile = stage_inputs.get("failure_workflow_profile")
+    else:
+        profile = configured_profile
+    if profile is not None:
+        spec = profile_spec(profile)
+        if spec is None or spec["stage"] != stage:
+            raise ValueError(f"unsupported workflow_profile for {stage}")
+        row = profile_allowance(profile, set(providers))
+        supplied = stage_inputs.get("allowance")
+        if supplied is not None:
+            normalized = copy.deepcopy(supplied)
+            normalized["provider_leads_seconds"] = {p: normalized.get("provider_leads_seconds", {}).get(p) for p in sorted(providers)}
+            normalized.pop("source_id", None)
+            normalized.pop("completed_stages", None)
+            expected = {k: v for k, v in row.items() if k != "completed_stages"}
+            def contradicts(value, wanted):
+                if value is None:
+                    return False
+                if isinstance(value, dict) and isinstance(wanted, dict):
+                    return any(key not in wanted or contradicts(item, wanted[key]) for key, item in value.items())
+                return value != wanted
+            if any(contradicts(value, expected.get(key)) for key, value in normalized.items()):
+                raise ValueError(f"{profile} requires its complete fixed stage vector")
+    else:
+        try:
+            row = copy.deepcopy(stage_inputs["allowance"])
+        except KeyError as exc:
+            raise ValueError(f"set stage_inputs.{stage}.allowance from measured setup/copy/cleanup times") from exc
     row["provider_leads_seconds"] = {p: row["provider_leads_seconds"][p] for p in providers}
     row["completed_stages"] = []
     allowance = WorkflowAllowance(**row)
@@ -135,23 +164,31 @@ def _allowance(settings, stage, providers):
             "day": "diagnostic_day", "week": "short_study"}[stage]
     if allowance.measurement_seconds < minimum_protocol_seconds(ExperimentMode(mode)) + allowance.measurement_shutdown_seconds:
         raise ValueError(f"{stage} allowance.measurement_seconds does not cover the complete protocol")
-    cap = {"acceptance": 1200, "calibration": 1800, "day": 87600, "week": 1200}[stage]
-    if allowance.total_seconds + max(allowance.provider_leads_seconds.values()) > cap:
+    cap = profile_spec(profile)["cap_seconds"] if profile else {"acceptance": 1200, "calibration": 1800, "day": 87600, "week": 1200}[stage]
+    barrier = profile_spec(profile)["barrier_seconds"] if profile else 0
+    if allowance.total_seconds + barrier + max(allowance.provider_leads_seconds.values()) > cap:
         raise ValueError(f"{stage} complete workflow plus provider expiry lead exceeds registered {cap}s cap")
     if allowance.stabilization_seconds != 60:
         raise ValueError("allowance must preserve 60-second stabilization")
     return row
 
 
-def _gate_rows(settings, stage):
-    declarations = {**settings.get("approvals", {}),
-                    **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
+def _required_gate_keys(stage):
     required = {"f10_offline", "paid_authorization", "quota_review"}
     if stage != "acceptance":
         required.add("paid_acceptance")
     required |= {"acceptance": {"paired_acceptance"}, "calibration": {"calibration_authorized"},
                  "day": {"common_n", "diagnostic_day_authorized", "size_export_review"},
                  "week": {"common_n", "study_window", "weekly_concurrency", "size_export_review"}}[stage]
+    return required
+
+
+def _gate_rows(settings, stage, *, draft=False):
+    declarations = {**settings.get("approvals", {}),
+                    **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
+    required = _required_gate_keys(stage)
+    if draft:
+        return {key: declarations.get(key, {}) for key in required}
     for key in sorted(required):
         row = declarations.get(key)
         if not isinstance(row, dict) or row.get("confirmed") is not True:
@@ -162,16 +199,42 @@ def _gate_rows(settings, stage):
     return {key: declarations[key] for key in required}
 
 
+def _approval_paths(directory: Path, stage: str) -> dict[str, str]:
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    return {key: str(directory / f"{key}.json") for key in sorted(_required_gate_keys(stage))}
+
+
+def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
+    window = inputs.get("execution_window_utc")
+    if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
+        raise ValueError(f"{stage}.execution_window_utc requires not_before_utc and not_after_utc for ready-triggered validation")
+    start = _utc(window["not_before_utc"], f"{stage}.execution_window_utc.not_before_utc")
+    end = _utc(window["not_after_utc"], f"{stage}.execution_window_utc.not_after_utc")
+    if end <= start or (end-start).total_seconds() > 21600:
+        raise ValueError("validation execution window must be positive and no wider than six hours")
+    return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
+
+
 def _acceptance_dispatch_policy(settings, approval_refs):
     declaration = {**settings.get("approvals", {}),
                    **settings.get("stage_inputs", {}).get("acceptance", {}).get("approvals", {})}["paired_acceptance"]
     fields = declaration.get("fields", {})
-    start_utc = _utc(settings.get("stage_inputs", {}).get("acceptance", {}).get("start_utc"),
-        "stage_inputs.acceptance.start_utc").isoformat()
+    inputs = settings.get("stage_inputs", {}).get("acceptance", {})
+    ready_triggered = inputs.get("workflow_profile") == ACCEPTANCE_PROFILE
+    window = _profile_execution_window(inputs, "acceptance") if ready_triggered else None
     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-            or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc").isoformat() != start_utc):
-        raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
+            or (ready_triggered and fields.get("execution_window_utc") != window)
+            or (not ready_triggered and _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc").isoformat()
+                != _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat())):
+        raise ValueError("paired_acceptance must bind the pair and exact approved validation timing policy")
     evidence_path = _path(approval_refs["paired_acceptance"], "paired_acceptance evidence", file=True)
+    if ready_triggered:
+        return {"policy_id": "acceptance-paired-s1-s3-ready-v1", "group_by": "acceptance_slot",
+            "scenarios": ["S1", "S3"], "max_parallel_entries": 2,
+            "start_policy": "all_ready", "execution_window": window,
+            "ready_window_seconds": 60, "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
+    start_utc = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat()
     return {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
         "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_utc": start_utc,
         "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
@@ -212,7 +275,8 @@ def _common_n(settings):
     return CommonNState.model_validate(frozen).model_dump(mode="json")
 
 
-def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_preparation: bool = False) -> list[str]:
+def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_preparation: bool = False,
+                          draft: bool = False) -> list[str]:
     """Read-only preflight; an empty list is local readiness, not cloud acceptance."""
     errors = []
     try:
@@ -284,17 +348,28 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 raise ValueError("private state and exportable results cannot contain one another")
         if sys.version_info < (3, 12):
             raise ValueError("deploy the campaign driver with Python 3.12 or newer")
-        gates = _gate_rows(settings, stage)
+        gates = _gate_rows(settings, stage, draft=draft)
+        if (stage == "acceptance"
+                and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") == ACCEPTANCE_PROFILE
+                and settings.get("stage_inputs", {}).get(stage, {}).get("failure_workflow_profile") != FAILURE_PROFILE):
+            raise ValueError("the paired acceptance profile requires its separate finite registered-failure profile")
         if stage == "week":
             _validate_weekly_concurrency(gates["weekly_concurrency"])
-        elif stage == "acceptance":
+        elif stage == "acceptance" and not draft:
             declaration = gates.get("paired_acceptance")
             if declaration is not None and "acceptance" in settings.get("stage_inputs", {}):
                 fields = declaration.get("fields", {})
-                start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
-                if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-                        or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
-                    raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
+                inputs = settings["stage_inputs"][stage]
+                if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
+                    window = _profile_execution_window(inputs, "acceptance")
+                    if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+                            or fields.get("execution_window_utc") != window):
+                        raise ValueError("paired_acceptance must bind the exact ready-triggered validation window")
+                else:
+                    start = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc")
+                    if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+                            or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
+                        raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
         _cost_payload(settings, root)
         if stage in {"day", "week"}:
             _common_n(settings)
@@ -305,15 +380,17 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 raise ValueError("WEEK needs four distinct reviewed UTC windows after DAY analysis")
             for window, time in windows.items():
                 _utc(f"{start}T{time}+00:00", f"windows_utc.{window}")
+        elif stage == "calibration" and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") == CALIBRATION_PROFILE:
+            _profile_execution_window(settings["stage_inputs"][stage], "calibration")
         elif stage != "acceptance":
             _utc(settings["stage_inputs"][stage].get("start_utc"), f"stage_inputs.{stage}.start_utc")
-        elif entries:
+        elif entries and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") != ACCEPTANCE_PROFILE:
             _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
-        for _, alias in entries:
+        for entry_id, alias in entries:
             path = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
             data = yaml.safe_load(path.read_text())
             providers = data["selected_providers"]
-            _allowance(settings, stage, providers)
+            _allowance(settings, stage, providers, entry_id=entry_id)
             for provider in providers:
                 options = settings["providers"][provider]
                 for name in ("authentication_reference", "public_key_path" if provider != "azure" else "ssh_public_key_path"):
@@ -355,12 +432,20 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         _path(refresh.get("source"), "credential_refresh.source", file=True)
         valid_through = _utc(refresh["valid_through_utc"], "credential_refresh.valid_through_utc")
         now = datetime.now(timezone.utc)
-        horizon = now + timedelta(seconds={"acceptance": 6000, "calibration": 1800, "day": 87600, "week": 1200}[stage])
+        selected_profiles = [settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile")]
+        if stage == "acceptance":
+            selected_profiles.append(settings.get("stage_inputs", {}).get(stage, {}).get("failure_workflow_profile"))
+        selected_caps = [profile_spec(profile)["cap_seconds"] for profile in selected_profiles if profile is not None]
+        stage_horizon = max(selected_caps) if selected_caps else {"acceptance": 6000, "calibration": 1800, "day": 87600, "week": 1200}[stage]
+        horizon = now + timedelta(seconds=stage_horizon)
         if stage == "week":
             last = max(_utc(f"{start + timedelta(days=6)}T{time}+00:00", "WEEK final slot") for time in windows.values())
             horizon = last + timedelta(seconds=1200)
+        elif stage in {"acceptance", "calibration"} and selected_caps:
+            horizon = _utc(_profile_execution_window(settings["stage_inputs"][stage], stage)["not_after_utc"],
+                f"{stage}.execution_window_utc.not_after_utc") + timedelta(seconds=stage_horizon)
         elif stage in {"calibration", "day"}:
-            horizon = _utc(settings["stage_inputs"][stage]["start_utc"], "start_utc") + timedelta(seconds=1800 if stage == "calibration" else 87600)
+            horizon = _utc(settings["stage_inputs"][stage]["start_utc"], "start_utc") + timedelta(seconds=stage_horizon if selected_caps else 1800 if stage == "calibration" else 87600)
         if valid_through < horizon:
             raise ValueError(f"credential_refresh evidence must remain valid through stage cleanup ({horizon.isoformat()})")
         missing_tools = [name for name in ("terraform", "aws", "az", "gcloud", "ssh", "scp") if shutil.which(name) is None]
@@ -383,7 +468,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         minimum = settings.get("minimum_free_bytes")
         if type(minimum) is not int or minimum <= 0:
             raise ValueError("set positive minimum_free_bytes from measured stage storage needs")
-        if stage in {"day", "week"}:
+        if stage in {"day", "week"} and not draft:
             review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
             remote_archive = archive_sink is not None
             if remote_archive and review.get("capsule_state_manifest_bytes", 0) < archive_sink["maximum_capsule_bytes"]:
@@ -429,8 +514,37 @@ def _cost_payload(settings, root):
     checked = str(pricing.get("checked_on", ""))
     if date.fromisoformat(checked) > datetime.now(timezone.utc).date():
         raise ValueError("pricing.checked_on cannot be future-dated")
+    workflow_profiles = set()
+    for stage, inputs in settings.get("stage_inputs", {}).items():
+        if stage not in STAGES or not isinstance(inputs, dict):
+            continue
+        for name in ("workflow_profile", "failure_workflow_profile"):
+            profile = inputs.get(name)
+            if profile is not None:
+                workflow_profiles.add(profile)
+    declared_profiles = pricing.get("workflow_profiles", [])
+    if (not isinstance(declared_profiles, list) or len(set(declared_profiles)) != len(declared_profiles)
+            or set(declared_profiles) != workflow_profiles):
+        if workflow_profiles:
+            raise ValueError("pricing.workflow_profiles must exactly bind every selected finite workflow profile")
+        if declared_profiles:
+            raise ValueError("pricing.workflow_profiles must be empty when no validation profile is selected")
     templates = {}
+    if workflow_profiles:
+        selected_aliases = set()
+        if ACCEPTANCE_PROFILE in workflow_profiles:
+            selected_aliases.update({"s1_acceptance", "s3_acceptance"})
+        if FAILURE_PROFILE in workflow_profiles:
+            selected_aliases.update({"aws_failure", "azure_failure", "gcp_failure"})
+        if CALIBRATION_PROFILE in workflow_profiles:
+            selected_aliases.add("calibration")
+        if not selected_aliases:
+            raise ValueError("selected validation workflow profiles do not bind a finite priced config set")
+    else:
+        selected_aliases = set(CONFIGS)
     for alias, path in CONFIGS.items():
+        if alias not in selected_aliases:
+            continue
         data = yaml.safe_load((root / path).read_text())
         config_id = "exp-003-acceptance" if alias == "s3_acceptance" else data["config_id"]
         category = "acceptance" if "acceptance" in alias or "failure" in alias else alias
@@ -484,13 +598,21 @@ def _cost_payload(settings, root):
         raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
     support = _support_payloads(settings)
     aws_raw = (json.dumps(support["aws"], indent=2, sort_keys=True) + "\n").encode()
-    return {"schema_version": 1, "cost_input_id": pricing.get("id") or f"operator-prices-{checked}",
+    profile_bindings = [{"profile_id": profile, "stage": PROFILE_SPECS[profile]["stage"],
+        "lifetime_cap_seconds": PROFILE_SPECS[profile]["cap_seconds"],
+        "allowance": PROFILE_SPECS[profile]["allowance"]} for profile in sorted(workflow_profiles)]
+    result = {"schema_version": 1, "cost_input_id": pricing.get("id") or f"operator-prices-{checked}",
         "prices_checked_on": checked, "source_scope": [str(source)], "source_sha256": _sha(source),
         "source_identity_kind": "operator-reviewed-dated-price-source", "currency": "USD",
-        "funding": funding, "refresh_required_before_paid_execution": False, "live_quote": False,
+        "funding": funding,
+        "live_quote": False,
         "provider_support": {"aws": {"sha256": hashlib.sha256(aws_raw).hexdigest(),
             "per_region_usd": str(support["aws"]["worst_planned_cost_per_region"])}},
         "provider_run_envelope_templates": templates}
+    if workflow_profiles:
+        result["workflow_profiles"] = profile_bindings
+        result["refresh_required_before_paid_execution"] = False
+    return result
 
 
 def _support_payloads(settings):
@@ -687,9 +809,11 @@ def _frozen_config(data, alias, settings, entry_id):
 
 
 def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
-                  results_root: Path, clock) -> dict[str, Any]:
+                  results_root: Path, clock, *, draft: bool = False) -> dict[str, Any]:
     """Prepare identities durably; only read-only identity commands may run."""
-    errors = validate_stage_inputs(plan, settings, root, local_preparation=True)
+    if draft and plan.get("stage") not in {"acceptance", "calibration"}:
+        raise ValueError("unapproved drafts are currently supported only for acceptance and calibration")
+    errors = validate_stage_inputs(plan, settings, root, local_preparation=True, draft=draft)
     if errors:
         raise ValueError("; ".join(errors))
     root = Path(root).resolve()
@@ -699,6 +823,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     private = Path(state_root) / stage_id
     private.mkdir(parents=True, mode=0o700)
     private.chmod(0o700)
+    stage_private = private
     result = Path(results_root) / stage_id
     result.mkdir(parents=True)
     inputs = settings["stage_inputs"][stage]
@@ -713,7 +838,10 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     ledger_path = _path(ledger.get("path"), "ledger.path")
     if not ledger.get("scope_id"):
         raise ValueError("ledger.scope_id must identify one shared thesis budget")
-    approvals = _write_evidence(private / "approvals", _gate_rows(settings, stage), provider_scope(settings["providers"]), settings)
+    if draft:
+        approvals = _approval_paths(private / "approvals", stage)
+    else:
+        approvals = _write_evidence(private / "approvals", _gate_rows(settings, stage), provider_scope(settings["providers"]), settings)
     support_dir = Path(state_root) / "support-inputs"
     support_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     support_paths = {}
@@ -737,6 +865,23 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     for index, (entry_id, alias) in enumerate(_selected(plan)):
         template = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
         data = _frozen_config(yaml.safe_load(template.read_text()), alias, settings, entry_id)
+        if stage == "acceptance" and entry_id.endswith("FAIL"):
+            profile = settings.get("stage_inputs", {}).get(stage, {}).get("failure_workflow_profile")
+        else:
+            profile = settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile")
+        if profile is not None:
+            spec = profile_spec(profile)
+            if spec is None or spec["stage"] != stage:
+                raise ValueError(f"unsupported workflow_profile for {stage}")
+            data["admission"]["workflow_profile"] = profile
+            data["admission"]["lifetime_cap_seconds"] = spec["cap_seconds"]
+            data["admission"]["requires_schedule"] = False
+            provider_registration = spec["provider_registration_seconds"]
+            data["options"]["provisioning_timeout_seconds"] = spec["allowance"]["provision_seconds"]
+            data["options"]["readiness_timeout_seconds"] = spec["allowance"]["readiness_seconds"]
+            data["options"]["cleanup_timeout_seconds"] = spec["allowance"]["cleanup_seconds"]
+        else:
+            provider_registration = None
         priced_rows = cost_payload["provider_run_envelope_templates"][data["config_id"]]
         estimated = sum(Decimal(str(component["amount_usd"]))
             for provider in data["selected_providers"] for component in priced_rows[provider]["components"].values())
@@ -750,16 +895,21 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         source_configs[entry_id] = (config_path, data)
         config_paths[data["config_id"]] = config_path
         providers = data["selected_providers"]
-        allowance = _allowance(settings, stage, providers)
+        allowance = _allowance(settings, stage, providers, entry_id=entry_id)
         prep = sum(allowance[k] for k in ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"))
+        if profile:
+            prep += profile_spec(profile)["barrier_seconds"]
         if stage == "week":
             parts = entry_id.split("-")
             day = int(parts[2][1:])
             window = parts[3].lower()
             date_utc = date.fromisoformat(str(inputs["first_day_utc"])) + timedelta(days=day - 1)
             scheduled = _utc(f"{date_utc}T{inputs['windows_utc'][window]}+00:00", "WEEK window")
-        elif stage == "acceptance" and entry_id in {"V-S1", "V-S3"}:
+        elif stage == "acceptance" and entry_id in {"V-S1", "V-S3"} and profile != ACCEPTANCE_PROFILE:
             scheduled = _utc(inputs["start_utc"], "acceptance.start_utc")
+            window = None
+        elif stage == "calibration" and profile == CALIBRATION_PROFILE:
+            scheduled = None
             window = None
         elif stage != "acceptance":
             scheduled = _utc(inputs["start_utc"], f"{stage}.start_utc")
@@ -776,12 +926,13 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         if scheduled:
             schedule_rows.append([entry_id, data["config_id"], data["experiment_id"], scheduled.isoformat(), window, data["admission"]["priority"]])
         scenario = "S1" if alias in {"s1", "s1_acceptance"} else "S3" if alias in {"s3", "s3_acceptance"} else None
-        entries.append({"entry_id": entry_id, "scenario": scenario,
+        entries.append({"entry_id": entry_id, "config_alias": alias, "scenario": scenario,
             "priority": data["admission"]["priority"], "config_path": str(config_path), "scheduled_start": scheduled.isoformat() if scheduled else None,
             "launch_at": launch_at.isoformat(), "private_root": str(private / entry_id),
             "requires_supervision": entry_id.endswith("FAIL"),
             "acceptance_check": "server_and_controller_loss" if entry_id.endswith("FAIL") else None,
-            "config_sha256": _sha(config_path), "source_config_sha256": _sha(template)})
+            "config_sha256": _sha(config_path), "source_config_path": str(template),
+            "source_config_sha256": _sha(template)})
     # Each row must resolve against its exact per-entry config, not the last P0/P1 config.
     for entry in entries:
         config_path, data = source_configs[entry["entry_id"]]
@@ -802,7 +953,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         if not parent_path.is_absolute():
             parent_path = root / parent_path
         providers = data["selected_providers"]
-        allowance = _allowance(settings, stage, providers)
+        allowance = _allowance(settings, stage, providers, entry_id=entry["entry_id"])
         provider_runtime = {}
         for provider in providers:
             row = copy.deepcopy(settings["providers"][provider])
@@ -827,13 +978,18 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 "terraform_directory": str(tf), "sources": sources}
         runtime = {"schema_version": 1, "initialized_campaign_manifest": str(parent_path),
             "ledger": {"path": str(ledger_path), "scope_id": ledger["scope_id"], "initialize_if_missing": True},
-            "allowance": allowance, "copy_retry_seconds": inputs.get("copy_retry_seconds", 30),
+                "allowance": allowance,
+                "copy_retry_seconds": inputs.get("copy_retry_seconds", 30),
             "access": {"timeouts": settings.get("timeouts", {"ssh_seconds": 30, "command_seconds": 120,
                 "cloud_init_seconds": 300, "private_path_seconds": 60, "server_seconds": 60, "transfer_seconds": 300}),
                 "readiness": {"poll_interval_seconds": 2, "attempt_ceiling": 150},
                 "bootstrap": _bootstrap(settings.get("prebuilt_bundle")), "guest_remote_root": "/var/lib/cnb/work",
                 "diagnostic_interfaces": {p: settings["providers"][p]["diagnostic_interfaces"] for p in providers}},
             "providers": provider_runtime, "approval_refs": approvals}
+        if data["admission"].get("workflow_profile"):
+            runtime.update(workflow_profile=data["admission"]["workflow_profile"],
+                provider_registration_timeout_seconds=provider_registration,
+                plan_review_admission_path=str(stage_private / "plan-review-admission.lock"))
         if stage in {"day", "acceptance", "calibration"}:
             stage_private = Path(state_root) / stage_id
             runtime["observer"] = {"stage_id": stage_id, "campaign_id": stage_id,
@@ -855,9 +1011,11 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         atomic_write_json(runtime_path, runtime)
         entry.update(schedule_path=str(schedule_path) if schedule_path else None,
             row_id=entry["entry_id"] if scheduled else None, runtime_config_path=str(runtime_path),
+            runtime_config_sha256=_sha(runtime_path),
             cost_inputs_path=str(cost_path), parent_manifest_path=str(parent_path),
             run_ids={str(child.provider): child.run_id for child in initialized.children})
     stage_data = {"stage_id": stage_id, "stage": stage, "controller_session_id": session,
+        "status": "DRAFT_UNAPPROVED" if draft else "PREPARED",
         "ledger_path": str(ledger_path), "scope_id": ledger["scope_id"], "state_root": str(state_root),
         "results_root": str(result), "repository_root": str(root), "entries": entries,
         "minimum_free_bytes": int(settings.get("minimum_free_bytes", 0)),
@@ -866,15 +1024,18 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             ({"aws": ("account_id",), "azure": ("subscription_id", "tenant_id"),
              "gcp": ("project_id",)}[provider])} for provider in sorted(settings["providers"])},
         "credential_valid_through_utc": settings["credential_refresh"]["valid_through_utc"],
+        "approval_refs": approvals, "cost_input_path": str(cost_path),
+        "cost_input_sha256": _sha(cost_path),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
     if stage in {"day", "acceptance", "calibration"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),
             observer_launch_receipt_root=str(private / "observer-launch-receipts"))
-    if stage == "week":
+    if stage == "week" and not draft:
         stage_data["dispatch_policy"] = _weekly_dispatch_policy(settings, approvals)
     elif stage == "acceptance":
-        stage_data["dispatch_policy"] = _acceptance_dispatch_policy(settings, approvals)
+        if not draft:
+            stage_data["dispatch_policy"] = _acceptance_dispatch_policy(settings, approvals)
         normal = [entry for entry in entries if entry["entry_id"] in {"V-S1", "V-S3"}]
         participants = [{"entry_id": entry["entry_id"], "provider": provider, "run_id": run_id}
             for entry in normal for provider, run_id in sorted(entry["run_ids"].items())]
@@ -885,8 +1046,12 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-terminal")}
         start_barrier = {"schema_version": 1, "barrier_id": f"{stage_id}-normal-measurement-start",
             "expected_participants": participants,
-            "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start"),
-            "start_utc": _utc(inputs["start_utc"], "acceptance.start_utc").isoformat()}
+            "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start")}
+        if runtime.get("workflow_profile") == ACCEPTANCE_PROFILE:
+            start_barrier.update(start_policy="all_ready",
+                execution_window=_profile_execution_window(inputs, "acceptance"), ready_window_seconds=600)
+        else:
+            start_barrier["start_utc"] = _utc(inputs["start_utc"], "acceptance.start_utc").isoformat()
         stage_data["post_measurement_barrier"] = barrier
         stage_data["measurement_start_barrier"] = start_barrier
         for entry in normal:
@@ -921,5 +1086,94 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 raise ValueError(f"reused {entry['entry_id']} failure evidence does not match the exact prepared config/runtime sources")
             entry["reused_failure_check"] = {"source_path": str(source), "source_sha256": source_hash,
                 "attempt_id": old["attempt_id"]}
+    elif stage == "calibration":
+        entry = entries[0]
+        participants = [{"entry_id": entry["entry_id"], "provider": provider, "run_id": run_id}
+            for provider, run_id in sorted(entry["run_ids"].items())]
+        if len(participants) != 3:
+            raise ValueError("calibration start barrier requires exactly three all-cloud children")
+        start_barrier = {"schema_version": 1, "barrier_id": f"{stage_id}-calibration-measurement-start",
+            "expected_participants": participants,
+            "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "calibration-start")}
+        if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
+            start_barrier.update(start_policy="all_ready",
+                execution_window=_profile_execution_window(inputs, "calibration"), ready_window_seconds=600)
+        else:
+            start_barrier["start_utc"] = _utc(inputs["start_utc"], "calibration.start_utc").isoformat()
+        stage_data["measurement_start_barrier"] = start_barrier
+        runtime_path = Path(entry["runtime_config_path"])
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime["measurement_start_barrier"] = start_barrier
+        atomic_write_json(runtime_path, runtime)
+        entry["runtime_config_sha256"] = _sha(runtime_path)
+    if draft:
+        stage_data["pending_prerequisites"] = [
+            f"source-bound approval evidence: {key}" for key in sorted(approvals)]
+        stage_data["approval_files_created"] = False
     atomic_write_json(private / "prepared.json", stage_data)
     return stage_data
+
+
+def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, preflight) -> dict:
+    """Bind genuine approval sources to an existing draft without regenerating entries."""
+    if not isinstance(prepared, dict) or prepared.get("status") != "DRAFT_UNAPPROVED":
+        raise ValueError("only an explicitly unapproved prepared-stage draft can be activated")
+    stage, stage_id = prepared.get("stage"), prepared.get("stage_id")
+    if stage not in {"acceptance", "calibration"} or not isinstance(stage_id, str) or not stage_id:
+        raise ValueError("prepared draft identity is incomplete")
+    entries = prepared.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("prepared draft has no frozen entries")
+    for entry in entries:
+        for path_key, digest_key in (("config_path", "config_sha256"), ("source_config_path", "source_config_sha256"),
+                                     ("runtime_config_path", "runtime_config_sha256")):
+            path = _path(entry.get(path_key), f"prepared {path_key}", file=True)
+            if _sha(path) != entry.get(digest_key):
+                raise ValueError(f"prepared frozen source changed: {entry.get('entry_id')} {path_key}")
+    cost_path = _path(prepared.get("cost_input_path"), "prepared cost input", file=True)
+    if _sha(cost_path) != prepared.get("cost_input_sha256"):
+        raise ValueError("prepared cost input changed")
+    aliases = {entry["config_alias"]: entry["source_config_path"] for entry in entries}
+    errors = validate_stage_inputs({"stage": stage, "configs": aliases}, settings, Path(root),
+        local_preparation=True, draft=False)
+    if errors:
+        raise ValueError("draft prerequisites remain incomplete: " + "; ".join(errors))
+    private = _path(prepared.get("state_root"), "prepared state root") / stage_id
+    refs = prepared.get("approval_refs")
+    if not isinstance(refs, dict) or any(Path(path).exists() for path in refs.values()):
+        raise ValueError("draft approval destinations must remain absent until financial preflight succeeds")
+    if not callable(preflight):
+        raise ValueError("activation requires a read-only financial preflight callback")
+    runtime_configs = {}
+    for entry in entries:
+        runtime_path = _path(entry.get("runtime_config_path"), "prepared runtime config", file=True)
+        if _sha(runtime_path) != entry.get("runtime_config_sha256"):
+            raise ValueError(f"prepared frozen runtime changed: {entry.get('entry_id')}")
+        from .lifecycle_runtime import load_runtime_config
+        runtime_configs[entry["entry_id"]] = load_runtime_config(runtime_path,
+            selected_providers=set(entry.get("run_ids", {})), allow_missing_approval_evidence=True)
+    candidate = copy.deepcopy(prepared)
+    candidate["status"] = "READY_FOR_ADMISSION"
+    candidate["approval_files_created"] = True
+    preflight(candidate, runtime_configs=runtime_configs)
+    # The callback is read-only; rebind all frozen sources before publishing
+    # evidence in case an input changed during validation.
+    for entry in entries:
+        for path_key, digest_key in (("config_path", "config_sha256"), ("source_config_path", "source_config_sha256"),
+                                     ("runtime_config_path", "runtime_config_sha256")):
+            path = _path(entry.get(path_key), f"prepared {path_key}", file=True)
+            if _sha(path) != entry.get(digest_key):
+                raise ValueError(f"prepared frozen source changed during activation: {entry.get('entry_id')} {path_key}")
+    refs = _write_evidence(private / "approvals", _gate_rows(settings, stage),
+        provider_scope(settings["providers"]), settings)
+    if refs != prepared.get("approval_refs"):
+        raise ValueError("activated approval paths differ from preallocated draft references")
+    activated = copy.deepcopy(prepared)
+    if stage == "acceptance":
+        activated["dispatch_policy"] = _acceptance_dispatch_policy(settings, refs)
+    activated["status"] = "READY_FOR_ADMISSION"
+    activated["approval_files_created"] = True
+    activated["pending_prerequisites"] = []
+    activated["activated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(private / "prepared.json", activated)
+    return activated

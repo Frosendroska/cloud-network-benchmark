@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -81,3 +82,82 @@ def test_barrier_rejects_foreign_participant_and_conflicting_duplicate(tmp_path)
     barrier.signal_terminal(participant, succeeded=True)
     with pytest.raises(ValueError, match="conflicts"):
         barrier.signal_terminal(participant, succeeded=False)
+
+
+def _ready_spec(root: Path, count=6):
+    spec = _spec(root, count)
+    spec.pop("barrier_id")
+    spec["barrier_id"] = "validation-ready-001"
+    spec["start_policy"] = "all_ready"
+    spec["execution_window"] = {
+        "not_before_utc": "2026-11-22T10:00:00+00:00",
+        "not_after_utc": "2026-11-22T11:00:00+00:00"}
+    spec["ready_window_seconds"] = 600
+    if count == 3:
+        for index, row in enumerate(spec["participants"]):
+            row["entry_id"] = "CAL-S1"
+            row["provider"] = ("aws", "azure", "gcp")[index]
+    else:
+        for index, row in enumerate(spec["participants"]):
+            row["entry_id"] = "V-S1" if index < 3 else "V-S3"
+            row["provider"] = ("aws", "azure", "gcp")[index % 3]
+    return spec
+
+
+@pytest.mark.parametrize("count", [3, 6])
+def test_ready_triggered_release_persists_one_common_utc_and_exact_identity_set(tmp_path, count):
+    now = datetime(2026, 11, 22, 10, 1, tzinfo=timezone.utc)
+    spec = _ready_spec(tmp_path, count)
+    barrier = PostMeasurementBarrier(spec)
+    latest = (now + timedelta(minutes=5)).isoformat()
+    for participant in barrier.spec["participants"]:
+        barrier.signal_ready(participant, latest, deadline=Deadline(), clock=lambda: 0,
+            utc_now=lambda: now)
+    state = barrier.wait_released(deadline=Deadline(), clock=lambda: 0, utc_now=lambda: now)
+    assert state["state"] == "released"
+    assert state["release_utc"] == now.isoformat()
+    assert len(state["ready"]) == count
+    resumed = PostMeasurementBarrier(spec)
+    assert resumed.wait_released(deadline=Deadline(), clock=lambda: 0,
+        utc_now=lambda: now)["release_utc"] == now.isoformat()
+
+
+def test_ready_triggered_barrier_aborts_when_original_cap_cannot_fit_and_cannot_reset(tmp_path):
+    now = datetime(2026, 11, 22, 10, 1, tzinfo=timezone.utc)
+    spec = _ready_spec(tmp_path, 3)
+    barrier = PostMeasurementBarrier(spec)
+    participants = barrier.spec["participants"]
+    latest = now - timedelta(seconds=1)
+    for participant in participants:
+        result = barrier.signal_ready(participant, latest.isoformat(), deadline=Deadline(),
+            clock=lambda: 0, utc_now=lambda: now)
+    assert result["state"] == "aborted"
+    assert result["abort_reason"] == "original_deadline_cannot_fit_measurement"
+    with pytest.raises(RuntimeError, match="aborted"):
+        barrier.wait_released(deadline=Deadline(), utc_now=lambda: now)
+
+
+def test_ready_triggered_barrier_allows_readiness_spread_within_original_bound(tmp_path):
+    first = datetime(2026, 11, 22, 10, 0, tzinfo=timezone.utc)
+    last = first + timedelta(minutes=5)
+    barrier = PostMeasurementBarrier(_ready_spec(tmp_path, 6))
+    participants = barrier.spec["participants"]
+    latest = (last + timedelta(minutes=10)).isoformat()
+    for participant in participants[:3]:
+        barrier.signal_ready(participant, latest, deadline=Deadline(), clock=lambda: 0,
+            utc_now=lambda: first)
+    for participant in participants[3:]:
+        state = barrier.signal_ready(participant, latest, deadline=Deadline(), clock=lambda: 0,
+            utc_now=lambda: last)
+    assert state["state"] == "released"
+    assert state["first_ready_utc"] == first.isoformat()
+    assert state["release_utc"] == last.isoformat()
+
+
+def test_ready_triggered_barrier_freezes_window_and_policy_digest(tmp_path):
+    spec = _ready_spec(tmp_path, 3)
+    PostMeasurementBarrier(spec)
+    changed = _ready_spec(tmp_path, 3)
+    changed["execution_window"]["not_after_utc"] = "2026-11-22T11:30:00+00:00"
+    with pytest.raises(ValueError, match="conflicts"):
+        PostMeasurementBarrier(changed)

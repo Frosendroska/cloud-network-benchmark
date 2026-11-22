@@ -37,6 +37,7 @@ from ..contracts.deployment import (
     RemoteConnectionData,
 )
 from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
+from ..validation_profiles import provider_lead_seconds
 
 
 SAFETY_LEAD_SECONDS = 360
@@ -102,8 +103,11 @@ class AwsRuntimeSettings(StrictModel):
     post_provision_workflow_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    plan_review_admission_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=90, gt=0, le=600)
+    cleanup_routine_seconds: Optional[int] = Field(default=None, gt=0, le=600, exclude_if=lambda value: value is None)
+    cleanup_absence_seconds: Optional[int] = Field(default=None, gt=0, le=60, exclude_if=lambda value: value is None)
     iam_settle_seconds: int = Field(default=0, ge=0, le=60)
 
     @field_validator("controller_cidr")
@@ -138,6 +142,8 @@ class AwsRuntimeSettings(StrictModel):
                 raise ValueError("expiry_role_permissions_boundary_arn must be a customer-managed IAM policy ARN with a valid path")
             if match.group(1) != self.account_id:
                 raise ValueError("expiry role permissions boundary account must match the configured AWS account")
+        if (self.cleanup_routine_seconds is None) != (self.cleanup_absence_seconds is None):
+            raise ValueError("AWS routine cleanup and independent absence allowances must be supplied together")
         return self
 
 
@@ -509,7 +515,24 @@ class AwsProviderDriver:
             failure = _failure(AwsProviderError("cleanup account or regions differ from registered AWS scope", category="scope_mismatch"), self.clock())
             return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
         self._registration_deadline = None
-        self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
+        routine_seconds = self.settings.cleanup_routine_seconds or self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
+        cleanup_now = self.clock().astimezone(timezone.utc)
+        started_at = journal.get("cleanup_started_at")
+        if started_at is None:
+            started_at = cleanup_now.isoformat()
+            journal["cleanup_started_at"] = started_at
+            try:
+                self._save_journal(attempt, journal)
+            except Exception as exc:
+                failure = _failure(exc, self.clock())
+                return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
+        started_utc = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+        cap_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)
+        from ..validation_profiles import provider_lead_seconds
+        lead = provider_lead_seconds(deployment.admission.workflow_profile, "aws", SAFETY_LEAD_SECONDS)
+        cleanup_end = min(cap_end - timedelta(seconds=lead), started_utc + timedelta(seconds=routine_seconds))
+        routine_end = min(cleanup_end, cap_end - timedelta(seconds=self.settings.cleanup_absence_seconds or 0))
+        self._cleanup_deadline = time.monotonic() + max(0.0, (routine_end-cleanup_now).total_seconds())
 
         try:
             identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
@@ -591,6 +614,17 @@ class AwsProviderDriver:
         if failures:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
+        if self.settings.cleanup_absence_seconds is not None:
+            absence_started = journal.get("cleanup_absence_started_at")
+            if absence_started is None:
+                absence_started = self.clock().astimezone(timezone.utc).isoformat()
+                journal["cleanup_absence_started_at"] = absence_started
+                self._save_journal(attempt, journal)
+            absence_started_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
+            absence_end = min(cap_end-timedelta(seconds=lead),
+                absence_started_utc+timedelta(seconds=self.settings.cleanup_absence_seconds))
+            absence_now = self.clock().astimezone(timezone.utc)
+            self._cleanup_deadline = time.monotonic() + max(0.0, (absence_end-absence_now).total_seconds())
         safety_absent: dict[str, bool] = {}
         safety_targets: dict[str, Any] = {}
         for region in regions:
@@ -716,12 +750,13 @@ class AwsProviderDriver:
         self._validate_expiry_cost_coverage(reservation, regions)
         if request.reservation_id.value != reservation.reservation_id.value:
             raise AwsProviderError("expiry reservation identity does not match active reservation", category="reservation_mismatch")
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        lead_seconds = provider_lead_seconds(deployment.admission.workflow_profile, "aws", SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=lead_seconds)
         selector = self._target_selector(deployment, regions)
         if request.target_selector != selector or request.resource_namespace != _namespace(deployment):
             raise AwsProviderError("expiry target selector or isolated namespace is not exact", category="selector_mismatch")
         if request.expires_at.value != trigger:
-            raise AwsProviderError("expiry trigger must equal reserved cap end minus the 360-second safety lead", category="trigger_mismatch")
+            raise AwsProviderError("expiry trigger must equal the admitted cap end minus its registered provider lead", category="trigger_mismatch")
         now = self.clock().astimezone(timezone.utc)
         if reservation.cap_started_at.value > now:
             raise AwsProviderError("reservation cap start has not occurred", category="cap_not_started")
@@ -1517,10 +1552,10 @@ class AwsProviderDriver:
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
-        if self._cleanup_deadline is not None and action_id.startswith("aws-expiry-"):
+        if self._cleanup_deadline is not None:
             remaining = int(self._cleanup_deadline - time.monotonic())
             if remaining <= 0:
-                raise AwsProviderError("AWS expiry cleanup exceeded its bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
+                raise AwsProviderError("AWS cleanup exceeded its original bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
         if self._precreate_deadline is not None and action_id == "aws-pair-apply":
             remaining = int(self._precreate_deadline - time.monotonic())
@@ -1582,7 +1617,8 @@ class AwsProviderDriver:
             return result
         if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
             from ..terraform_plan import reviewed_apply
-            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
     def _aws_json(self, *argv: str) -> dict[str, Any]:

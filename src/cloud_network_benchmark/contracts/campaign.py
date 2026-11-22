@@ -22,6 +22,7 @@ from .common import (
     StrictModel,
     VmRole,
 )
+from ..validation_profiles import PROFILE_SPECS
 
 
 Scalar = Union[str, int, float, bool]
@@ -405,7 +406,8 @@ class CampaignConfiguration(StrictModel):
         _validate_registered_acceptance_identity(mode, self.context, self.experiment_id,
                                                  providers, self.scenario)
         profile = self.admission.timing_profile
-        admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario), profile)
+        workflow_profile = self.admission.workflow_profile
+        admission_expected = AdmissionRequirements.expected_for(mode, Scenario(self.scenario), profile, workflow_profile)
         if profile == "azure_exp901_sweden_acceptance_v1":
             azure = self.provider_configs.get(Provider.AZURE)
             if (self.experiment_id != "EXP-901" or mode != ExperimentMode.ACCEPTANCE
@@ -418,6 +420,23 @@ class CampaignConfiguration(StrictModel):
                 raise ValueError("Azure EXP-901 timing profile requires the exact reviewed Sweden Central zone 1 acceptance scope")
         elif profile is not None:
             raise ValueError("unsupported timing profile")
+        if workflow_profile is not None:
+            from ..validation_profiles import PROFILE_SPECS
+            spec = PROFILE_SPECS.get(workflow_profile)
+            expected_providers = {Provider.AWS, Provider.AZURE, Provider.GCP}
+            failure_providers = {"EXP-900": {Provider.AWS}, "EXP-901": {Provider.AZURE}, "EXP-902": {Provider.GCP}}
+            allowed = ((workflow_profile == "all_cloud_acceptance_v1" and self.experiment_id in {"EXP-903", "EXP-003"}
+                        and mode == ExperimentMode.ACCEPTANCE and self.context == "standard"
+                        and providers == expected_providers)
+                       or (workflow_profile == "all_cloud_calibration_v1" and self.experiment_id == "EXP-001"
+                           and mode == ExperimentMode.CALIBRATION and self.context == "standard"
+                           and providers == expected_providers)
+                       or (workflow_profile == "all_cloud_failure_acceptance_v1"
+                           and self.experiment_id in failure_providers
+                           and mode == ExperimentMode.ACCEPTANCE and self.context == "failure_check"
+                           and providers == failure_providers[self.experiment_id]))
+            if spec is None or not allowed:
+                raise ValueError("workflow profile requires the registered all-cloud S1/S3 or calibration scope")
         for name, expected in admission_expected.items():
             if getattr(self.admission, name) != expected:
                 raise ValueError(f"admission.{name} does not match mode/scenario")
@@ -901,6 +920,7 @@ def _validate_resolved_protocol(
     normalized_mode = ExperimentMode(mode)
     normalized_context = str(getattr(context, "value", context))
     profile = admission.timing_profile
+    workflow_profile = admission.workflow_profile
     if profile == "azure_exp901_sweden_acceptance_v1":
         if (experiment_id != "EXP-901" or normalized_mode != ExperimentMode.ACCEPTANCE
                 or normalized_context != "failure_check" or set(map(Provider, provider_set)) != {Provider.AZURE}
@@ -909,6 +929,19 @@ def _validate_resolved_protocol(
             raise ValueError("resolved Azure EXP-901 timing profile identity mismatch")
     elif profile is not None:
         raise ValueError("unsupported timing profile")
+    if workflow_profile is not None:
+        failure_scope = {"EXP-900": {Provider.AWS}, "EXP-901": {Provider.AZURE}, "EXP-902": {Provider.GCP}}
+        valid = ((workflow_profile == "all_cloud_acceptance_v1" and normalized_mode == ExperimentMode.ACCEPTANCE
+                  and experiment_id in {"EXP-903", "EXP-003"} and normalized_context == "standard"
+                  and set(map(Provider, provider_set)) == {Provider.AWS, Provider.AZURE, Provider.GCP})
+                 or (workflow_profile == "all_cloud_calibration_v1" and normalized_mode == ExperimentMode.CALIBRATION
+                     and experiment_id == "EXP-001" and normalized_context == "standard"
+                     and set(map(Provider, provider_set)) == {Provider.AWS, Provider.AZURE, Provider.GCP})
+                 or (workflow_profile == "all_cloud_failure_acceptance_v1" and normalized_mode == ExperimentMode.ACCEPTANCE
+                     and experiment_id in failure_scope and normalized_context == "failure_check"
+                     and set(map(Provider, provider_set)) == failure_scope[experiment_id]))
+        if not valid:
+            raise ValueError("resolved workflow profile identity/scope mismatch")
     benchmark.validate_mode(normalized_mode)
     _validate_protocol_scope(normalized_mode, context, replacement_context, provider_set, scenario,
                              observation_provider=observation_provider,
@@ -917,7 +950,7 @@ def _validate_resolved_protocol(
                                              provider_set, scenario)
     if measurement_units != derive_measurement_units(normalized_mode, benchmark):
         raise ValueError("resolved measurement units must be derived from benchmark mode and N state")
-    for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario, profile).items():
+    for name, expected in AdmissionRequirements.expected_for(normalized_mode, scenario, profile, workflow_profile).items():
         if getattr(admission, name) != expected:
             raise ValueError(f"resolved identity admission.{name} must match mode and scenario")
     if scheduled_start is not None and (scheduled_start.tzinfo is None or scheduled_start.utcoffset() is None):
@@ -1027,8 +1060,15 @@ def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
                 "requires_primary_review": scheduled and priority in {"P2", "P3"},
                 "requires_expiry": True,
             }
+            schema_if = {"allOf": [mode_condition["if"], {"properties": {"scenario": {"const": scenario}}, "required": ["scenario"]}]}
+            profile_ids = {"acceptance": ("all_cloud_acceptance_v1", "all_cloud_failure_acceptance_v1"),
+                           "calibration": ("all_cloud_calibration_v1",)}.get(mode, ())
+            if profile_ids:
+                schema_if["not"] = {"anyOf": [{"properties": {"admission": {"properties": {
+                    "workflow_profile": {"const": profile_id}}, "required": ["workflow_profile"]}}, "required": ["admission"]}
+                    for profile_id in profile_ids]}
             schema_constraints.append({
-                "if": {"allOf": [mode_condition["if"], {"properties": {"scenario": {"const": scenario}}, "required": ["scenario"]}]},
+                "if": schema_if,
                 "then": {"properties": {"admission": {"properties": {
                     key: {"const": value} for key, value in admission_values.items()
                 }}}},
@@ -1068,10 +1108,24 @@ def _resolved_protocol_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     schema_constraints.append({
         "if": {"properties": {"mode": {"const": "acceptance"}, "scenario": {"const": "same_zone"}},
                "required": ["mode", "scenario"],
-               "not": {"properties": {"admission": {"properties": {"timing_profile": {
-                   "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}}}},
+               "not": {"anyOf": [
+                   {"properties": {"admission": {"properties": {"timing_profile": {
+                       "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}}},
+                   {"properties": {"admission": {"properties": {"workflow_profile": {
+                       "const": "all_cloud_acceptance_v1"}}, "required": ["workflow_profile"]}}},
+                   {"properties": {"admission": {"properties": {"workflow_profile": {
+                       "const": "all_cloud_failure_acceptance_v1"}}, "required": ["workflow_profile"]}}}] }},
         "then": {"properties": {"admission": {"properties": {"lifetime_cap_seconds": {"const": 1200}}}}}
     })
+    for workflow_profile, spec in PROFILE_SPECS.items():
+        profile_context = "failure_check" if workflow_profile == "all_cloud_failure_acceptance_v1" else "standard"
+        schema_constraints.append({
+            "if": {"properties": {"admission": {"properties": {"workflow_profile": {"const": workflow_profile}},
+                "required": ["workflow_profile"]}}, "required": ["admission"]},
+            "then": {"properties": {"mode": {"const": spec["mode"]},
+                "context": {"const": profile_context},
+                "admission": {"properties": {"lifetime_cap_seconds": {"const": spec["cap_seconds"]}}}}}
+        })
     schema.setdefault("allOf", []).extend(schema_constraints)
     profile_then = {"properties": {
         "experiment_id": {"const": "EXP-901"}, "mode": {"const": "acceptance"},

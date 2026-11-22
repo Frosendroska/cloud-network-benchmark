@@ -43,6 +43,9 @@
           "enum": [
             1200,
             1800,
+            3900,
+            4200,
+            5100,
             87600
           ],
           "title": "Lifetime Cap Seconds",
@@ -97,6 +100,23 @@
           ],
           "default": null,
           "title": "Timing Profile"
+        },
+        "workflow_profile": {
+          "anyOf": [
+            {
+              "enum": [
+                "all_cloud_acceptance_v1",
+                "all_cloud_calibration_v1",
+                "all_cloud_failure_acceptance_v1"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workflow Profile"
         }
       },
       "required": [
@@ -1918,7 +1938,45 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_failure_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -1967,7 +2025,45 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_failure_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -2019,7 +2115,45 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_failure_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -2071,7 +2205,45 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_failure_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -3408,7 +3580,28 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_calibration_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -3460,7 +3653,28 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_calibration_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -3512,7 +3726,28 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_calibration_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -3564,7 +3799,28 @@
                   "scenario"
                 ]
               }
-            ]
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_calibration_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "admission"
+                  ]
+                }
+              ]
+            }
           },
           "then": {
             "properties": {
@@ -4154,18 +4410,50 @@
         {
           "if": {
             "not": {
-              "properties": {
-                "admission": {
+              "anyOf": [
+                {
                   "properties": {
-                    "timing_profile": {
-                      "const": "azure_exp901_sweden_acceptance_v1"
+                    "admission": {
+                      "properties": {
+                        "timing_profile": {
+                          "const": "azure_exp901_sweden_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "timing_profile"
+                      ]
                     }
-                  },
-                  "required": [
-                    "timing_profile"
-                  ]
+                  }
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "properties": {
+                    "admission": {
+                      "properties": {
+                        "workflow_profile": {
+                          "const": "all_cloud_failure_acceptance_v1"
+                        }
+                      },
+                      "required": [
+                        "workflow_profile"
+                      ]
+                    }
+                  }
                 }
-              }
+              ]
             },
             "properties": {
               "mode": {
@@ -4188,6 +4476,114 @@
                     "const": 1200
                   }
                 }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "workflow_profile": {
+                    "const": "all_cloud_acceptance_v1"
+                  }
+                },
+                "required": [
+                  "workflow_profile"
+                ]
+              }
+            },
+            "required": [
+              "admission"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 4200
+                  }
+                }
+              },
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "workflow_profile": {
+                    "const": "all_cloud_calibration_v1"
+                  }
+                },
+                "required": [
+                  "workflow_profile"
+                ]
+              }
+            },
+            "required": [
+              "admission"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 5100
+                  }
+                }
+              },
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "calibration"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "workflow_profile": {
+                    "const": "all_cloud_failure_acceptance_v1"
+                  }
+                },
+                "required": [
+                  "workflow_profile"
+                ]
+              }
+            },
+            "required": [
+              "admission"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "properties": {
+                  "lifetime_cap_seconds": {
+                    "const": 3900
+                  }
+                }
+              },
+              "context": {
+                "const": "failure_check"
+              },
+              "mode": {
+                "const": "acceptance"
               }
             }
           }
@@ -5356,7 +5752,45 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_failure_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -5405,7 +5839,45 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_failure_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -5457,7 +5929,45 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_failure_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -5509,7 +6019,45 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_failure_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -6846,7 +7394,28 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_calibration_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -6898,7 +7467,28 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_calibration_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -6950,7 +7540,28 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_calibration_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -7002,7 +7613,28 @@
               "scenario"
             ]
           }
-        ]
+        ],
+        "not": {
+          "anyOf": [
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_calibration_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              },
+              "required": [
+                "admission"
+              ]
+            }
+          ]
+        }
       },
       "then": {
         "properties": {
@@ -7592,18 +8224,50 @@
     {
       "if": {
         "not": {
-          "properties": {
-            "admission": {
+          "anyOf": [
+            {
               "properties": {
-                "timing_profile": {
-                  "const": "azure_exp901_sweden_acceptance_v1"
+                "admission": {
+                  "properties": {
+                    "timing_profile": {
+                      "const": "azure_exp901_sweden_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "timing_profile"
+                  ]
                 }
-              },
-              "required": [
-                "timing_profile"
-              ]
+              }
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "admission": {
+                  "properties": {
+                    "workflow_profile": {
+                      "const": "all_cloud_failure_acceptance_v1"
+                    }
+                  },
+                  "required": [
+                    "workflow_profile"
+                  ]
+                }
+              }
             }
-          }
+          ]
         },
         "properties": {
           "mode": {
@@ -7626,6 +8290,114 @@
                 "const": 1200
               }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "workflow_profile": {
+                "const": "all_cloud_acceptance_v1"
+              }
+            },
+            "required": [
+              "workflow_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 4200
+              }
+            }
+          },
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "workflow_profile": {
+                "const": "all_cloud_calibration_v1"
+              }
+            },
+            "required": [
+              "workflow_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 5100
+              }
+            }
+          },
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "calibration"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "workflow_profile": {
+                "const": "all_cloud_failure_acceptance_v1"
+              }
+            },
+            "required": [
+              "workflow_profile"
+            ]
+          }
+        },
+        "required": [
+          "admission"
+        ]
+      },
+      "then": {
+        "properties": {
+          "admission": {
+            "properties": {
+              "lifetime_cap_seconds": {
+                "const": 3900
+              }
+            }
+          },
+          "context": {
+            "const": "failure_check"
+          },
+          "mode": {
+            "const": "acceptance"
           }
         }
       }
