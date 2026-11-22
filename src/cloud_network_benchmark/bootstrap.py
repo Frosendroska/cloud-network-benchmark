@@ -301,6 +301,18 @@ class ListenerObservation(StrictModel):
     stderr_path: str
     allowed_source: str
     state: Literal["prepared", "active", "mismatch", "failed"]
+    pid: int | None = Field(default=None, gt=1)
+    boot_id: str | None = None
+    start_ticks: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def process_identity_complete_or_unavailable(self):
+        fields = (self.pid, self.boot_id, self.start_ticks)
+        if any(value is not None for value in fields) and not all(value is not None for value in fields):
+            raise ValueError("listener process identity must be complete or unavailable")
+        if self.boot_id is not None and not re.fullmatch(r"[a-f0-9-]{36}", self.boot_id):
+            raise ValueError("listener boot ID must be a Linux boot UUID")
+        return self
 
 
 class BootstrapResult(StrictModel):
@@ -408,15 +420,36 @@ def _process_identity_command(unit: str, binary: str) -> list[str]:
     script = (f"pid=$(systemctl show --property=MainPID --value {unit_q}) || exit 1; "
               f"case $pid in ''|*[!0-9]*) exit 1;; esac; [ \"$pid\" -gt 0 ] || exit 1; "
               f"actual=$(readlink -f /proc/$pid/exe) || exit 1; [ \"$actual\" = {binary_q} ] || exit 1; "
-              "printf '%s\\n' \"$actual\"; sha256sum /proc/$pid/exe")
+              "printf '%s\\n' \"$actual\"; sha256sum /proc/$pid/exe; "
+              "python3 -c 'import json,pathlib,sys; p=int(sys.argv[1]); s=pathlib.Path(f\"/proc/{p}/stat\").read_text(); f=s[s.rfind(\")\")+2:].split(); "
+              "print(json.dumps({\"pid\":p,\"boot_id\":pathlib.Path(\"/proc/sys/kernel/random/boot_id\").read_text().strip(),\"start_ticks\":int(f[19])},sort_keys=True))' \"$pid\"")
     return ["sudo", "sh", "-c", script]
 
 
 def _process_identity_matches(text: str, binary: str, expected_sha256: str) -> bool:
     lines = text.strip().splitlines()
-    return (len(lines) == 2 and lines[0] == binary
+    return (len(lines) in {2, 3} and lines[0] == binary
             and re.fullmatch(r"[a-f0-9]{64}\s+/proc/[1-9][0-9]*/exe", lines[1]) is not None
             and lines[1].split()[0] == expected_sha256)
+
+
+def _process_identity_receipt(text: str, binary: str, expected_sha256: str) -> dict[str, Any] | None:
+    if not _process_identity_matches(text, binary, expected_sha256):
+        return None
+    lines = text.strip().splitlines()
+    if len(lines) == 2:
+        return None
+    try:
+        record = json.loads(lines[2])
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(record, dict) or set(record) != {"pid", "boot_id", "start_ticks"}
+            or type(record.get("pid")) is not int or record["pid"] <= 1
+            or type(record.get("start_ticks")) is not int or record["start_ticks"] <= 0
+            or not isinstance(record.get("boot_id"), str)
+            or not re.fullmatch(r"[a-f0-9-]{36}", record["boot_id"])):
+        return None
+    return record
 
 
 def _acl_matches(text: str, source: str, address: str, chain: str | None = None) -> bool:
@@ -1169,9 +1202,11 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
                         if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
                             return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
+                        process_identity = _process_identity_receipt(proc_result.stdout, build.binary_path, build.binary_sha256)
                         listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
                             unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=f"{config.workspace}/{stdout_path}",
-                            stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
+                            stderr_path=f"{config.workspace}/{stderr_path}", allowed_source=f"{connection.private_ipv4_a}/32", state="active",
+                            **(process_identity or {})))
                         continue
                 elif inspect_result.outcome != CommandOutcome.FAILED or not any(text in (inspect_result.stdout + inspect_result.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, inspect_result, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
@@ -1225,9 +1260,11 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
                 if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
                     return _failure_result(connection, actions, vm, proc_request, proc_result, "listener_process_mismatch", f"live {tool} executable did not match its recorded binary", builds, listeners)
+                process_identity = _process_identity_receipt(proc_result.stdout, build.binary_path, build.binary_sha256)
                 listeners.append(ListenerObservation(tool=tool, address=address, protocol=protocol, port=port,
                     unit=unit, binary_path=f"{prefix}/bin/{tool}", stdout_path=stdout_abs,
-                    stderr_path=stderr_abs, allowed_source=f"{connection.private_ipv4_a}/32", state="active"))
+                    stderr_path=stderr_abs, allowed_source=f"{connection.private_ipv4_a}/32", state="active",
+                    **(process_identity or {})))
             chain = f"cnb_{re.sub(r'[^A-Za-z0-9_]', '_', connection.deployment_id)[:32]}"
             inspect_id = "f02r-vm_b-acl-inspect"
             remaining = deadline.remaining(clock, readiness=True)

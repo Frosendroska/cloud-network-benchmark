@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
+import subprocess
+import threading
+import time
 
 import pytest
 
@@ -41,13 +45,69 @@ def _probe(_role, payload):
     return {"processes": {item["kind"]: {"pid": item["pid"], "boot_id": item["boot_id"],
         "start_ticks": item["start_ticks"], "state": "S", "alive": True}
         for item in payload["processes"]},
-        "files": {item["path"]: {"size": 10, "mtime": 990, "kind": item["kind"]}
+        "files": {item["path"]: {"size": 10, "mtime": time.time() - 1, "kind": item["kind"]}
                   for item in payload["files"]}}
 
 
-def test_actual_receipt_and_runtime_records_are_hash_pinned_and_consumable(tmp_path):
+def _actual_sockperf_progress(tmp_path, monkeypatch):
+    from cloud_network_benchmark.contracts.execution import CommandRequest
+    from cloud_network_benchmark.measurement_process import LocalMeasurementProcesses, SystemMeasurementClock
+    from cloud_network_benchmark.observer_publisher import GuestObserverProgress
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executable = tmp_path / "sockperf"
+    executable.write_text("source-shaped sockperf executable")
+    proc_root = tmp_path / "proc"
+    (proc_root / "3501").mkdir(parents=True)
+    (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654321\n")
+    (proc_root / "sys/kernel/random").mkdir(parents=True)
+    (proc_root / "sys/kernel/random/boot_id").write_text("01234567-89ab-cdef-0123-456789abcdef\n")
+    class FakePopen:
+        def __init__(self, argv, **_kwargs):
+            self.pid, self.returncode = 3501, None
+            self.stdout, self.stderr = BytesIO(), BytesIO()
+            self.stdin = None
+            self._done = threading.Event()
+            Path(argv[argv.index("--full-log") + 1]).write_text("native-shaped output")
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            if not self._done.wait(timeout):
+                raise subprocess.TimeoutExpired("sockperf", timeout)
+            return self.returncode
+        def terminate(self):
+            self.returncode = -15
+            self._done.set()
+        def kill(self):
+            self.terminate()
+    monkeypatch.setattr("cloud_network_benchmark.measurement_process.subprocess.Popen", FakePopen)
+    progress = GuestObserverProgress(workspace / ".observer-progress.json", deployment_id="run-aws-deployment")
+    runner = LocalMeasurementProcesses(SystemMeasurementClock(), observer_callback=progress, proc_root=proc_root)
+    csv = workspace / "measurements" / "probe.csv"
+    csv.parent.mkdir()
+    request = CommandRequest(action_id="f03-sockperf-probe", action_type="measurement",
+        argv=[str(executable), "--full-log", str(csv)], cwd=str(workspace), timeout_seconds=10)
+    handle = runner.start(request, stdout_path=workspace / "out", stderr_path=workspace / "err")
+    deadline = time.monotonic() + 2
+    while not progress.path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    snapshot = json.loads(progress.path.read_text())
+    assert snapshot["producer"]["pid"] == 3501
+    assert snapshot["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "current"}]
+    assert csv.stat().st_size > 0
+    return runner, handle, snapshot, progress, proc_root, executable, workspace
+
+
+def test_actual_receipt_and_runtime_records_are_hash_pinned_and_consumable(tmp_path, monkeypatch):
     entries = [_participant("e1", "aws", "run-aws"), _participant("e1", "gcp", "run-gcp"),
                _participant("e2", "azure", "run-azure")]
+    process_runner, process_handle, progress, _progress_writer, _proc_root, _executable, _workspace = _actual_sockperf_progress(tmp_path, monkeypatch)
+    entries[0]["roles"]["vm_a"]["processes"] = [progress["producer"],
+        entries[0]["roles"]["vm_a"]["processes"][1]]
+    entries[0]["roles"]["vm_a"]["files"] = [
+        {"kind": "sockperf_chunk", **progress["sockperf_chunks"][0]},
+        entries[0]["roles"]["vm_a"]["files"][1]]
     owned = {(e["entry_id"], e["provider"], e["run_id"]): {
         role: {"vm_id": e["roles"][role]["vm_id"], "connection": e["roles"][role]["connection"]}
         for role in ("vm_a", "vm_b")} for e in entries}
@@ -73,10 +133,63 @@ def test_actual_receipt_and_runtime_records_are_hash_pinned_and_consumable(tmp_p
     stage = {"stage_id": "stage", "campaign_id": "campaign", "entries": runtimes,
         "observer_bindings_sha256": digest, "observer_launch_receipt_path": str(receipt_path),
         "observer_launch_receipt_sha256": receipt_sha}
-    result = observe_bindings(stage, binding_path, now=1000, probe=_probe,
+    result = observe_bindings(stage, binding_path, now=time.time(), probe=_probe,
                               run=lambda *_a, **_k: pytest.fail("unexpected SSH"))
     assert result["health"] == "healthy"
     assert len(result["entries"]) == 3
+    process_runner.stop(process_handle, time.monotonic() + 2)
+
+
+def test_production_process_hook_publishes_atomic_observed_rotation(tmp_path, monkeypatch):
+    from cloud_network_benchmark.contracts.execution import CommandRequest
+
+    runner, handle, first, progress, proc_root, executable, workspace = _actual_sockperf_progress(tmp_path, monkeypatch)
+    runner.stop(handle, time.monotonic() + 2)
+    closed = json.loads(progress.path.read_text())
+    assert closed["producer"] is None
+    assert closed["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "completed"}]
+
+    stat_path = proc_root / "3501/stat"
+    stat_path.write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
+    second_csv = workspace / "measurements" / "probe-002.csv"
+    second = CommandRequest(action_id="f03-sockperf-probe-2", action_type="measurement",
+        argv=[str(executable), "--full-log", str(second_csv)], cwd=str(workspace), timeout_seconds=10)
+    next_handle = runner.start(second, stdout_path=workspace / "out-2", stderr_path=workspace / "err-2")
+    rotated = json.loads(progress.path.read_text())
+    assert rotated["producer"]["start_ticks"] == 7654322
+    assert rotated["sockperf_chunks"] == [
+        {"path": "measurements/probe.csv", "state": "completed"},
+        {"path": "measurements/probe-002.csv", "state": "current"}]
+    runner.stop(next_handle, time.monotonic() + 2)
+
+
+def test_guest_progress_rejects_partial_or_inconsistent_rotation():
+    from cloud_network_benchmark.observer_publisher import validate_guest_progress
+    valid = {"deployment_id": "deploy", "producer": {"pid": 301, "boot_id": BOOT,
+        "start_ticks": 990}, "sockperf_chunks": [{"path": "measurements/current.csv", "state": "current"}]}
+    normalized = validate_guest_progress(valid, deployment_id="deploy")
+    assert normalized["producer"] == {"kind": "producer", **valid["producer"]}
+    with pytest.raises(ValueError, match="inconsistent"):
+        validate_guest_progress({**valid, "producer": None}, deployment_id="deploy")
+    with pytest.raises(ValueError, match="inconsistent"):
+        validate_guest_progress({**valid, "sockperf_chunks": [
+            {"path": "measurements/one.csv", "state": "current"},
+            {"path": "measurements/two.csv", "state": "current"}]}, deployment_id="deploy")
+    with pytest.raises(ValueError, match="deployment/schema"):
+        validate_guest_progress(valid, deployment_id="foreign")
+
+
+def test_f02_listener_process_receipt_parses_real_identity_and_rejects_reuse():
+    from cloud_network_benchmark.bootstrap import _process_identity_receipt
+    output = ("/opt/cnb/bin/iperf3\n" + "a" * 64 + " /proc/501/exe\n" +
+              json.dumps({"pid": 501, "boot_id": BOOT, "start_ticks": 12001}))
+    assert _process_identity_receipt(output, "/opt/cnb/bin/iperf3", "a" * 64) == {
+        "pid": 501, "boot_id": BOOT, "start_ticks": 12001}
+    assert _process_identity_receipt(output.replace('"pid": 501', '"pid": 502'),
+                                     "/opt/cnb/bin/iperf3", "a" * 64) == {
+        "pid": 502, "boot_id": BOOT, "start_ticks": 12001}
+    assert _process_identity_receipt(output.replace('"start_ticks": 12001', '"start_ticks": 0'),
+                                     "/opt/cnb/bin/iperf3", "a" * 64) is None
 
 
 def test_missing_actual_roles_foreign_vm_and_bad_process_identity_fail_closed(tmp_path):

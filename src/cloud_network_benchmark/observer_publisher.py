@@ -10,6 +10,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
@@ -203,3 +204,67 @@ def publish_bindings(path: Path, bindings: Mapping[str, Any]) -> str:
     raw = _json_bytes(bindings)
     _atomic_bytes(Path(path), raw, replace=True)
     return hashlib.sha256(raw).hexdigest()
+
+
+def validate_guest_progress(value: Mapping[str, Any], *, deployment_id: str) -> dict[str, Any]:
+    """Validate the bounded VM-A progress receipt before controller callbacks."""
+    if (not isinstance(value, Mapping) or set(value) != {"deployment_id", "producer", "sockperf_chunks"}
+            or value.get("deployment_id") != deployment_id):
+        raise ValueError("guest observer progress deployment/schema mismatch")
+    chunks = value.get("sockperf_chunks")
+    if not isinstance(chunks, list) or len(chunks) > 288:
+        raise ValueError("guest observer Sockperf chunk list is invalid")
+    normalized = []
+    seen = set()
+    current = []
+    for chunk in chunks:
+        if not isinstance(chunk, Mapping):
+            raise ValueError("guest observer Sockperf chunk receipt is malformed")
+        row = _file({"kind": "sockperf_chunk", **chunk}, "sockperf_chunk")
+        if set(chunk) != {"path", "state"} or row["path"] in seen:
+            raise ValueError("guest observer Sockperf chunk is duplicated or malformed")
+        seen.add(row["path"])
+        normalized.append({"path": row["path"], "state": row["state"]})
+        if row["state"] == "current":
+            current.append(row["path"])
+    producer = value.get("producer")
+    if producer is not None:
+        producer = _process({"kind": "producer", **producer}, "producer")
+    if ((producer is None and current) or (producer is not None and len(current) != 1)
+            or (producer is not None and normalized[-1]["path"] != current[0])):
+        raise ValueError("Sockperf producer and current chunk state are inconsistent")
+    return {"deployment_id": deployment_id, "producer": producer, "sockperf_chunks": normalized}
+
+
+class GuestObserverProgress:
+    """Durably record the real DAY Sockperf producer and chunk rotations on VM A."""
+
+    def __init__(self, path: Path, *, deployment_id: str) -> None:
+        self.path = Path(path)
+        self.deployment_id = _required_text(deployment_id, "deployment_id")
+        self._lock = threading.Lock()
+        self._current_process: dict[str, Any] | None = None
+        self._current_path: str | None = None
+        self._completed: list[str] = []
+
+    def __call__(self, event: Mapping[str, Any]) -> None:
+        if not isinstance(event, Mapping) or event.get("event") not in {"started", "completed"}:
+            raise ValueError("unknown guest observer process event")
+        process = _process(event, "producer")
+        path = _file({"kind": "sockperf_chunk", "path": event.get("path"),
+                      "state": "current"}, "sockperf_chunk")["path"]
+        with self._lock:
+            if event["event"] == "started":
+                if self._current_process is not None:
+                    raise ValueError("Sockperf rotation began before the previous process completed")
+                self._current_process, self._current_path = process, path
+            else:
+                if self._current_process != process or self._current_path != path:
+                    raise ValueError("Sockperf completion does not match its captured launch")
+                self._completed.append(path)
+                self._current_process, self._current_path = None, None
+            snapshot = {"deployment_id": self.deployment_id,
+                "producer": self._current_process,
+                "sockperf_chunks": ([{"path": item, "state": "completed"} for item in self._completed]
+                    + ([{"path": self._current_path, "state": "current"}] if self._current_path else []))}
+            _atomic_bytes(self.path, _json_bytes(snapshot), replace=True)
