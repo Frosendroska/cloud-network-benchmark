@@ -30,7 +30,7 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {
     "europe-west3": ("europe-west3-a", "europe-west3-b"),
     "europe-west2": ("europe-west2-a",),
-    "europe-north1": ("europe-north1-a",),
+    "europe-north1": ("europe-north1-c",),
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
@@ -432,13 +432,26 @@ class GcpProviderDriver:
     def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
-        northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
-                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
-        if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
-                            and deployment.experiment_id == "EXP-902"):
-            raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
+        northern = (deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
+                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-c"
+                    and deployment.scenario in {"same_zone", "placement_optimization"})
+        northern_research = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
+                    and deployment.mode in {"short_study", "calibration", "diagnostic_day"} and deployment.context == "standard")
+        northern_acceptance = (northern and deployment.mode == "acceptance"
+                    and ((deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-902" and deployment.context == "failure_check")
+                         or (deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
+                         or (deployment.scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
+        required_north = ((deployment.experiment_id in {"EXP-001", "EXP-003"}
+                           and deployment.mode in {"short_study", "calibration", "diagnostic_day"})
+                          or (deployment.mode == "acceptance" and
+                              ((deployment.experiment_id == "EXP-903" and deployment.scenario == "same_zone")
+                               or (deployment.experiment_id == "EXP-003" and deployment.scenario == "placement_optimization"))))
+        if required_north and not (northern_research or northern_acceptance):
+            raise GcpProviderError("primary S1/S3 cannot fall back from Finland without a reviewed region-specific exception", category="scenario_unsupported")
+        if northern and not (northern_research or northern_acceptance):
+            raise GcpProviderError("Finland locality is outside the registered S1/S3 research or acceptance scope", category="scenario_unsupported")
         if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
-            raise GcpProviderError("only the selected Frankfurt/London topology or Finland same-zone pair is supported", category="scenario_unsupported")
+            raise GcpProviderError("only the selected baseline topology or Finland same-zone S1/S3 pair is supported", category="scenario_unsupported")
         if deployment.vm_a.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"} or deployment.vm_b.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"}:
             raise GcpProviderError("GCP roles must use selected n2-standard-4 shape", category="shape_unsupported")
         if deployment.vm_a.role != "vm_a" or deployment.vm_b.role != "vm_b" or deployment.vm_a.function != "client_traffic_generator" or deployment.vm_b.function != "server_receiver":

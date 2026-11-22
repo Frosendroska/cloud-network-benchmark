@@ -460,24 +460,58 @@ class CampaignConfiguration(StrictModel):
                 },
             }[provider][scenario]
             locality = (tuple(item.regions.model_dump().values()), tuple(item.zones.model_dump().values()))
-            northern_locality = {
-                Provider.AZURE: (("swedencentral", "swedencentral"), ("1", "1")),
-                Provider.AWS: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
-                Provider.GCP: (("europe-north1", "europe-north1"), ("europe-north1-a", "europe-north1-a")),
-            }.get(provider)
-            northern_acceptance = (
-                scenario == Scenario.SAME_ZONE
-                and mode == ExperimentMode.ACCEPTANCE
-                and self.context == "failure_check"
-                and providers == {provider}
-                and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}.get(provider)
-                and locality == northern_locality
-            )
-            if locality != expected_locality and not northern_acceptance:
+            northern_localities = {
+                Provider.AZURE: {
+                    Scenario.SAME_ZONE: (("swedencentral", "swedencentral"), ("1", "1")),
+                    Scenario.PLACEMENT_OPTIMIZATION: (("swedencentral", "swedencentral"), ("1", "1")),
+                },
+                Provider.AWS: {
+                    Scenario.SAME_ZONE: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
+                    Scenario.PLACEMENT_OPTIMIZATION: (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
+                },
+                Provider.GCP: {
+                    Scenario.SAME_ZONE: (("europe-north1", "europe-north1"), ("europe-north1-c", "europe-north1-c")),
+                    Scenario.PLACEMENT_OPTIMIZATION: (("europe-north1", "europe-north1"), ("europe-north1-c", "europe-north1-c")),
+                },
+            }[provider].get(scenario)
+            research_identity = self.experiment_id == ("EXP-001" if scenario == Scenario.SAME_ZONE else "EXP-003")
+            research = (mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+                        and self.context == "standard" and research_identity
+                        and scenario in {Scenario.SAME_ZONE, Scenario.PLACEMENT_OPTIMIZATION}
+                        and (scenario != Scenario.PLACEMENT_OPTIMIZATION or item.placement.kind != "none"))
+            acceptance = (mode == ExperimentMode.ACCEPTANCE
+                and ((scenario == Scenario.SAME_ZONE and self.context == "failure_check" and providers == {provider}
+                      and self.experiment_id == {Provider.AWS: "EXP-900", Provider.AZURE: "EXP-901", Provider.GCP: "EXP-902"}[provider])
+                     or (self.context == "standard" and providers == {Provider.AWS, Provider.AZURE, Provider.GCP}
+                         and ((scenario == Scenario.SAME_ZONE and self.experiment_id == "EXP-903")
+                              or (scenario == Scenario.PLACEMENT_OPTIMIZATION and self.experiment_id == "EXP-003")))))
+            northern_supported = locality == northern_localities and (research or acceptance)
+            if locality != expected_locality and not northern_supported:
                 raise ValueError(f"{provider.value} regions/zones do not match the registered {scenario.value} design")
             expected_collocated = provider == Provider.GCP and scenario == Scenario.PLACEMENT_OPTIMIZATION
             if item.placement.collocated != expected_collocated:
                 raise ValueError("GCP placement intent must use COLLOCATED only for placement_optimization")
+        primary_study = (
+            self.context == "standard"
+            and ((mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+                  and self.experiment_id in {"EXP-001", "EXP-003"})
+                 or (mode == ExperimentMode.ACCEPTANCE and
+                     ((scenario == Scenario.SAME_ZONE and self.experiment_id == "EXP-903")
+                      or (scenario == Scenario.PLACEMENT_OPTIMIZATION and self.experiment_id == "EXP-003"))))
+        )
+        if primary_study:
+            expected_north = {
+                Provider.AWS: {"eu-north-1": "eu-north-1a"},
+                Provider.AZURE: {"swedencentral": "1"},
+                Provider.GCP: {"europe-north1": "europe-north1-c"},
+            }
+            for provider in providers:
+                item = self.provider_configs[provider]
+                selected = expected_north[provider]
+                if any(item.regions.model_dump()[role] not in selected
+                       or item.zones.model_dump()[role] != selected[item.regions.model_dump()[role]]
+                       for role in ("vm_a", "vm_b")):
+                    raise ValueError("primary S1/S3 configs must use the exercised northern regions; Frankfurt needs an explicit reviewed fallback")
         return self
 
     @classmethod

@@ -22,7 +22,7 @@ def result(req, stdout="", failed=False):
 
 def scope(provider, root, scenario="same_zone"):
     if provider == "gcp":
-        v = dict(project_id="review-project", zone_a="europe-north1-a", zone_b="europe-north1-a")
+        v = dict(project_id="review-project", zone_a="europe-north1-c", zone_b="europe-north1-c")
         if root == "pair":
             v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102")
             r = {"terraform_data.scope_guard": {"input": v["project_id"]}}

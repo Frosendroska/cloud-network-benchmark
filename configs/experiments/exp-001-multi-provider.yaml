@@ -32,11 +32,11 @@ provider_configs:
   aws:
     provider: aws
     regions:
-      vm_a: eu-central-1
-      vm_b: eu-central-1
+      vm_a: eu-north-1
+      vm_b: eu-north-1
     zones:
-      vm_a: eu-central-1a
-      vm_b: eu-central-1a
+      vm_a: eu-north-1a
+      vm_b: eu-north-1a
     vm_shape: m7i.xlarge
     image: ubuntu-24.04
     connection_user: ubuntu
@@ -62,9 +62,9 @@ provider_configs:
       ecn: false
       default_offloads: true
       address_spaces:
-        eu-central-1: 10.60.0.0/16
+        eu-north-1: 10.60.0.0/16
       subnets:
-        eu-central-1:
+        eu-north-1:
         - 10.60.1.0/24
     security:
       controller_cidr:
@@ -80,8 +80,8 @@ provider_configs:
   azure:
     provider: azure
     regions:
-      vm_a: germanywestcentral
-      vm_b: germanywestcentral
+      vm_a: swedencentral
+      vm_b: swedencentral
     zones:
       vm_a: '1'
       vm_b: '1'
@@ -112,9 +112,9 @@ provider_configs:
       ecn: false
       default_offloads: true
       address_spaces:
-        germanywestcentral: 10.70.0.0/16
+        swedencentral: 10.70.0.0/16
       subnets:
-        germanywestcentral:
+        swedencentral:
         - 10.70.0.0/24
     security:
       controller_cidr:
@@ -130,11 +130,11 @@ provider_configs:
   gcp:
     provider: gcp
     regions:
-      vm_a: europe-west3
-      vm_b: europe-west3
+      vm_a: europe-north1
+      vm_b: europe-north1
     zones:
-      vm_a: europe-west3-a
-      vm_b: europe-west3-a
+      vm_a: europe-north1-c
+      vm_b: europe-north1-c
     vm_shape: n2-standard-4
     image: ubuntu-2404-lts-amd64
     connection_user: ubuntu
@@ -163,9 +163,9 @@ provider_configs:
       ecn: false
       default_offloads: true
       address_spaces:
-        europe-west3: 10.80.1.0/24
+        europe-north1: 10.80.1.0/24
       subnets:
-        europe-west3:
+        europe-north1:
         - 10.80.1.0/24
     security:
       controller_cidr:
