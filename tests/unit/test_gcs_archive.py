@@ -70,6 +70,48 @@ class FakeGCS:
             del self.objects[key]
 
 
+def _guest_archive_pair(tmp_path, *, max_part_bytes=128 * 1024):
+    from cloud_network_benchmark.guest_archive import create_guest_archive
+    archives = []
+    (tmp_path / "guest-archive").mkdir()
+    payload = hashlib.shake_256(b"closed-archive-test-payload").digest(512 * 1024)
+    for role in ("vm_a", "vm_b"):
+        source = tmp_path / "native" / role
+        source.mkdir(parents=True)
+        item = source / "native.bin"
+        item.write_bytes(payload)
+        row = {"path": "native.bin", "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest()}
+        destination = tmp_path / "guest-archive" / role
+        archives.append({"role": role, "archive_directory": str(destination),
+            "manifest": create_guest_archive(source, destination,
+                maximum_part_bytes=max_part_bytes, maximum_archive_bytes=2_000_000,
+                minimum_free_bytes=0, expected_inventory=[row])})
+    return archives, {"items": [{"path": "native.bin"}]}
+
+
+def _publish_guest_pair(tmp_path, backend, archives=None, object_progress=None):
+    if archives is None:
+        archives, closed = _guest_archive_pair(tmp_path)
+    else:
+        closed = {"items": [{"path": "native.bin"}]}
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    counter = [0]
+    def fetch(role, part):
+        counter[0] += 1
+        source = Path(next(row["archive_directory"] for row in archives if row["role"] == role)) / part["path"]
+        target = staging / f"part-{counter[0]:04d}"
+        target.write_bytes(source.read_bytes())
+        return target
+    return publish_guest_archive_parts(guest_archives=archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="valid-bucket", provider="aws",
+        experiment_id="exp-partial", run_id="run-partial", closed_inventory=closed,
+        maximum_part_bytes=128 * 1024, maximum_archive_bytes=2_000_000,
+        minimum_controller_free_bytes=0, controller_quota_free_bytes=1_000_000,
+        deadline=Deadline(), object_progress=object_progress), staging
+
+
 def _archive(tmp_path, *, max_part_bytes=4096):
     source = tmp_path / "native"
     source.mkdir()
@@ -122,6 +164,49 @@ def test_guest_parts_publish_generation_bound_manifest_and_completion(tmp_path):
     assert [row["role"] for row in receipt["manifest"]["roles"]] == ["vm_a", "vm_b"]
     assert receipt["completion_generation"]
     assert not list(staging.iterdir())
+
+
+def test_guest_archive_second_part_readback_failure_retains_each_object_identity(tmp_path):
+    backend = FakeGCS()
+    archives, _closed = _guest_archive_pair(tmp_path)
+    first, second = archives[0]["manifest"]["parts"][:2]
+    prefix = "cnb/v1/aws/exp-partial/run-partial/parts/vm_a/"
+    first_key = f"{prefix}{first['path']}-{first['sha256']}"
+    second_key = f"{prefix}{second['path']}-{second['sha256']}"
+    backend.download_fail.add(second_key)
+    progress = []
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure
+    with pytest.raises(GCSArchiveFailure) as failure:
+        _publish_guest_pair(tmp_path, backend, archives, object_progress=progress.append)
+    partial = failure.value.partial_objects
+    assert [row["key"] for row in partial] == [first_key, second_key]
+    assert partial[0]["generation"] == "1" and partial[0]["verification_state"] == "verified"
+    assert partial[1]["generation"] == "2" and partial[1]["create_outcome"] == "created"
+    assert partial[1]["verification_state"] == "failed_or_unknown"
+    assert set(backend.objects) == {first_key, second_key}
+    assert backend.deleted == []
+    assert progress[0]["status"] == "uploading"
+    assert progress[0]["partial_objects"][0]["generation"] == "unknown"
+    assert any(snapshot["partial_objects"][-1]["generation"] == "2"
+        for snapshot in progress if snapshot["partial_objects"])
+    assert progress[-1]["status"] == "failed"
+    assert not list((tmp_path / "staging").iterdir())
+
+
+def test_guest_archive_unknown_create_outcome_is_reported_without_retry_or_delete(tmp_path):
+    backend = FakeGCS()
+    backend.interrupt_after = 1
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure
+    with pytest.raises(GCSArchiveFailure) as failure:
+        _publish_guest_pair(tmp_path, backend)
+    partial = failure.value.partial_objects
+    assert len(partial) == 1
+    assert partial[0]["generation"] == "unknown"
+    assert partial[0]["create_outcome"] == "unknown"
+    assert partial[0]["verification_state"] == "failed_or_unknown"
+    assert len(backend.objects) == 1
+    assert backend.deleted == []
+    assert not list((tmp_path / "staging").iterdir())
 
 
 def test_guest_part_publish_preflights_occupied_prefix_without_mutation(tmp_path):
@@ -370,22 +455,42 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
         "quota_project_id": "project-a70f8497-3463-4ef2-9cd", "universe_domain": "googleapis.com"}))
     source_file.chmod(0o600)
 
+    response = type("Response", (), {"json": lambda self: {"generation": "8", "size": "4"}})()
+    class Upload:
+        finished = False
+        def transmit_next_chunk(self, _transport, *, timeout):
+            calls.append(("upload_chunk", timeout))
+            self.finished = True
+            return response
     class Blob:
-        generation, size = 7, 4
+        def __init__(self, bucket):
+            self.bucket = bucket
+            self._properties = {"generation": 7, "size": 4}
+            self.metadata = None
+        @property
+        def generation(self): return self._properties.get("generation")
+        @property
+        def size(self): return self._properties.get("size")
         def reload(self, **kwargs): calls.append(("reload", kwargs))
-        def download_to_filename(self, path, **kwargs):
-            calls.append(("download", kwargs))
-            Path(path).write_bytes(b"data")
-        def upload_from_filename(self, _path, **kwargs): calls.append(("upload", kwargs))
+        def _get_download_url(self, _client, **kwargs):
+            calls.append(("url", kwargs))
+            return "https://storage.invalid/object"
+        def _initiate_resumable_upload(self, client, stream, content_type, size, **kwargs):
+            assert client is self.bucket.client and stream.read() == b"data"
+            calls.append(("initiate", content_type, size, kwargs))
+            self._properties = {}
+            return Upload(), object()
         def delete(self, **kwargs): calls.append(("delete", kwargs))
 
     class Bucket:
-        def get_blob(self, key, **kwargs): calls.append(("stat", key, kwargs)); return Blob()
-        def blob(self, key, **kwargs): calls.append(("blob", key, kwargs)); return Blob()
+        def __init__(self, client): self.client = client
+        def get_blob(self, key, **kwargs): calls.append(("stat", key, kwargs)); return Blob(self)
+        def blob(self, key, **kwargs): calls.append(("blob", key, kwargs)); return Blob(self)
 
     class Client:
+        _http = object()
         def __init__(self, **kwargs): client_options.append(kwargs)
-        def bucket(self, _name): return Bucket()
+        def bucket(self, _name): return Bucket(self)
 
     class SourceCredentials:
         def __init__(self): self.refresh_count = 0
@@ -410,11 +515,29 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     impersonated.Credentials = Credentials
     auth.load_credentials_from_file = load_credentials
     auth.impersonated_credentials = impersonated
-    cloud.storage = types.SimpleNamespace(Client=Client)
+    storage = types.ModuleType("google.cloud.storage")
+    storage.Client = Client
+    media = types.ModuleType("google.cloud.storage._media")
+    requests_media = types.ModuleType("google.cloud.storage._media.requests")
+    class ChunkedDownload:
+        def __init__(self, _url, _chunk_size, stream, **kwargs):
+            self.stream, self.finished = stream, False
+            calls.append(("chunked_init", kwargs))
+        def consume_next_chunk(self, _transport, *, timeout):
+            calls.append(("download_chunk", timeout))
+            self.stream.write(b"data")
+            self.finished = True
+    requests_media.ChunkedDownload = ChunkedDownload
+    media.requests = requests_media
+    storage._media = media
+    cloud.storage = storage
     google.cloud = cloud
     google.auth = auth
     monkeypatch.setitem(sys.modules, "google", google)
     monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", storage)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media", media)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media.requests", requests_media)
     monkeypatch.setitem(sys.modules, "google.auth", auth)
     monkeypatch.setitem(sys.modules, "google.auth.impersonated_credentials", impersonated)
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "human-adc.json")
@@ -445,10 +568,18 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     target = tmp_path / "remote"
     backend.download("key", target, maximum_bytes=10, timeout_seconds=8, generation="7")
     assert target.read_bytes() == b"data"
+    source = tmp_path / "upload"
+    source.write_bytes(b"data")
+    assert backend.upload("key", source, size_bytes=4, sha256="a" * 64,
+        if_generation_match=0, chunk_bytes=262144, timeout_seconds=9) == {
+            "generation": "8", "size_bytes": 4}
     assert calls[0] == ("stat", "key", {"timeout": 9, "retry": None})
     assert calls[1] == ("blob", "key", {"generation": 7})
-    assert calls[2][1]["if_generation_match"] == 7 and calls[2][1]["retry"] is None
-    assert calls[3][1]["if_generation_match"] == 7 and calls[3][1]["retry"] is None
+    assert next(row for row in calls if row[0] == "reload")[1]["if_generation_match"] == 7
+    initiate = next(row for row in calls if row[0] == "initiate")
+    assert initiate[3]["if_generation_match"] == 0 and initiate[3]["retry"] is None
+    assert initiate[3]["checksum"] == "crc32c"
+    assert not any(row[0] == "delete" for row in calls)
 
 
 def test_production_archive_backend_requires_complete_explicit_adc_identity():
@@ -540,16 +671,41 @@ def test_google_backend_download_shares_one_monotonic_timeout(
     now = [100.0]
     class Blob:
         generation, size = 7, 4
+        class Bucket:
+            client = type("ClientInstance", (), {"_http": object()})()
+        bucket = Bucket()
+        def _get_download_url(self, _client, **_kwargs): return "https://storage.invalid/object"
         def reload(self, **kwargs):
             calls.append(("reload", kwargs))
             now[0] += reload_elapsed
-        def download_to_filename(self, path, **kwargs):
-            calls.append(("download", kwargs))
-            Path(path).write_bytes(b"data")
     class Bucket:
         def blob(self, _key, **_kwargs): return Blob()
     class Client:
         def bucket(self, _name): return Bucket()
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    storage = types.ModuleType("google.cloud.storage")
+    storage.Client = Client
+    google.cloud = cloud
+    media = types.ModuleType("google.cloud.storage._media")
+    requests_media = types.ModuleType("google.cloud.storage._media.requests")
+    class ChunkedDownload:
+        def __init__(self, _url, _chunk_size, stream, **kwargs):
+            self.stream, self.finished = stream, False
+            calls.append(("chunked", kwargs))
+        def consume_next_chunk(self, _transport, *, timeout):
+            calls.append(("download", {"timeout": timeout, "retry": None}))
+            self.stream.write(b"data")
+            self.finished = True
+    requests_media.ChunkedDownload = ChunkedDownload
+    media.requests = requests_media
+    storage._media = media
+    cloud.storage = storage
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", storage)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media", media)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media.requests", requests_media)
     import cloud_network_benchmark.gcs_archive as archive_sink
     monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
     from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
@@ -559,14 +715,126 @@ def test_google_backend_download_shares_one_monotonic_timeout(
     if expect_download:
         backend.download("key", target, maximum_bytes=10, timeout_seconds=10, generation="7")
         assert target.read_bytes() == b"data"
-        assert calls[1][0] == "download"
-        assert calls[1][1]["timeout"] == pytest.approx(expected_timeout)
-        assert calls[1][1]["retry"] is None
+        download = next(row for row in calls if row[0] == "download")
+        assert download[1]["timeout"] == pytest.approx(expected_timeout)
+        assert download[1]["retry"] is None
     else:
         with pytest.raises(TimeoutError, match="shared timeout"):
             backend.download("key", target, maximum_bytes=10, timeout_seconds=10, generation="7")
-        assert [kind for kind, _ in calls] == ["reload"]
+        assert [kind for kind, _ in calls] == ["reload", "chunked"]
+        assert not any(kind == "download" for kind, _ in calls)
         assert not target.exists()
+
+
+@pytest.mark.parametrize("fault", ["deadline", "crc"])
+def test_google_backend_upload_refreshes_timeout_and_never_deletes_on_crc(
+        monkeypatch, tmp_path, fault):
+    import cloud_network_benchmark.gcs_archive as archive_sink
+    calls, now, deleted = [], [20.0], []
+    response = type("Response", (), {"json": lambda self: {"generation": "9", "size": "4"}})()
+    class Upload:
+        def __init__(self): self.sent = 0
+        @property
+        def finished(self): return self.sent >= 3
+        def transmit_next_chunk(self, _transport, *, timeout):
+            calls.append(timeout)
+            if fault == "crc":
+                raise RuntimeError("synthetic DataCorruption")
+            now[0] += min(4.0, timeout)
+            self.sent += 1
+            return response
+    class Blob:
+        def __init__(self, bucket):
+            self.bucket, self._properties = bucket, {}
+        @property
+        def generation(self): return self._properties.get("generation")
+        @property
+        def size(self): return self._properties.get("size")
+        def _initiate_resumable_upload(self, _client, _stream, _content_type, _size, **kwargs):
+            calls.append(("initiate", kwargs["timeout"]))
+            if fault == "deadline": now[0] += 2.0
+            return Upload(), object()
+        def delete(self, **kwargs): deleted.append(kwargs)
+    class Bucket:
+        def __init__(self, client): self.client = client
+        def blob(self, _key, **_kwargs): return Blob(self)
+    class Client:
+        def bucket(self, _name): return Bucket(self)
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    storage = types.ModuleType("google.cloud.storage")
+    storage.Client = Client
+    cloud.storage = storage
+    google.cloud = cloud
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
+    backend = object.__new__(archive_sink.GoogleCloudStorageBackend)
+    backend._bucket = Bucket(Client())
+    source = tmp_path / "upload-source"
+    source.write_bytes(b"data")
+    if fault == "deadline":
+        with pytest.raises(TimeoutError, match="shared timeout"):
+            backend.upload("key", source, size_bytes=4, sha256="a" * 64,
+                if_generation_match=0, chunk_bytes=262144, timeout_seconds=10)
+        assert calls == [("initiate", 10), 8, 4]
+    else:
+        with pytest.raises(RuntimeError, match="DataCorruption"):
+            backend.upload("key", source, size_bytes=4, sha256="a" * 64,
+                if_generation_match=0, chunk_bytes=262144, timeout_seconds=10)
+        assert calls == [("initiate", 10), 10]
+        assert deleted == []
+
+
+def test_google_backend_download_refreshes_timeout_for_each_chunk(monkeypatch, tmp_path):
+    import cloud_network_benchmark.gcs_archive as archive_sink
+    calls, now = [], [50.0]
+    class Blob:
+        generation, size = 7, 16
+        class Bucket:
+            client = type("ClientInstance", (), {"_http": object()})()
+        bucket = Bucket()
+        def reload(self, **kwargs):
+            calls.append(("reload", kwargs["timeout"]))
+            now[0] += 1
+        def _get_download_url(self, _client, **_kwargs): return "https://storage.invalid/object"
+    class Bucket:
+        def blob(self, _key, **_kwargs): return Blob()
+    class Client:
+        def bucket(self, _name): return Bucket()
+    class ChunkedDownload:
+        def __init__(self, _url, _chunk_size, stream, **_kwargs):
+            self.stream, self.finished, self.index = stream, False, 0
+        def consume_next_chunk(self, _transport, *, timeout):
+            calls.append(("chunk", timeout))
+            now[0] += min(5.0, timeout)
+            self.stream.write(b"data!!")
+            self.index += 1
+            self.finished = self.index == 3
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    storage = types.ModuleType("google.cloud.storage")
+    storage.Client = Client
+    cloud.storage = storage
+    google.cloud = cloud
+    media = types.ModuleType("google.cloud.storage._media")
+    requests_media = types.ModuleType("google.cloud.storage._media.requests")
+    requests_media.ChunkedDownload = ChunkedDownload
+    media.requests = requests_media
+    storage._media = media
+    cloud.storage = storage
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", storage)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media", media)
+    monkeypatch.setitem(sys.modules, "google.cloud.storage._media.requests", requests_media)
+    monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
+    backend = object.__new__(archive_sink.GoogleCloudStorageBackend)
+    backend._bucket = Bucket()
+    destination = tmp_path / "download"
+    with pytest.raises(TimeoutError, match="shared timeout"):
+        backend.download("key", destination, maximum_bytes=32, timeout_seconds=11, generation="7")
+    assert [timeout for kind, timeout in calls if kind == "chunk"] == [10, 5]
 
 
 def test_bounded_relay_reconstructs_archive_and_never_stages_full_bundle(tmp_path):

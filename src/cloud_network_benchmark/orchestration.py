@@ -124,6 +124,7 @@ class SavedProviderRecovery(StrictModel):
     cleanup_settings_reference: str | None = None
     cleanup_timing_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
     cleanup_timing_failure: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    archive_status: dict[str, Any] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SavedLifecycleRecovery(StrictModel):
@@ -222,6 +223,28 @@ def update_provider_recovery(recovery_path: Path, provider: str, stage: str, sta
                 if stage == "cleanup" and status == "succeeded":
                     payload.update(expiry_registered=False, creation_may_have_started=False, cleanup_open=False)
             rows.append(payload)
+        return SavedLifecycleRecovery.model_validate({**recovery.model_dump(), "providers": rows}), None
+    _mutate_recovery_journal(recovery_path, update)
+
+
+def update_archive_recovery(recovery_path: Path, provider: str, archive_status: Mapping[str, Any]) -> None:
+    """Persist exact archive object liabilities without changing cleanup authority."""
+    if provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive recovery provider is invalid")
+    partial = archive_status.get("partial_objects")
+    if archive_status.get("status") not in {"uploading", "failed"} or not isinstance(partial, list) or not partial:
+        return
+    def update(recovery: SavedLifecycleRecovery):
+        rows = []
+        found = False
+        for item in recovery.providers:
+            payload = item.model_dump()
+            if item.provider == provider:
+                payload["archive_status"] = dict(archive_status)
+                found = True
+            rows.append(payload)
+        if not found:
+            raise ValueError("archive recovery provider is missing or ambiguous")
         return SavedLifecycleRecovery.model_validate({**recovery.model_dump(), "providers": rows}), None
     _mutate_recovery_journal(recovery_path, update)
 
@@ -701,6 +724,11 @@ def execute_provider_workflows(
                 def after(_value, success):
                     update_provider_recovery(recovery_path, provider, stage,
                                              "succeeded" if success else "failed")
+                    if stage == "retrieve":
+                        evidence = getattr(_value, "evidence", None)
+                        archive_status = getattr(evidence, "archive_status", None)
+                        if isinstance(archive_status, Mapping):
+                            update_archive_recovery(recovery_path, provider, archive_status)
             else:
                 after = None
             succeeded = _call(provider, stage, action, results[provider], before=before,

@@ -1191,6 +1191,219 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert (result_file.parent.parent / "checksums.sha256").is_file()
 
 
+@pytest.mark.parametrize("receive_fault", [None, "overflow", "cancelled", "readback", "unknown_create"])
+def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_only(
+        tmp_path, repository_root, fake_git_commits, request, receive_fault):
+    """Exercise the production retrieve callback with an injected transport and GCS backend."""
+    import shutil
+    from cloud_network_benchmark.archive_replay import (
+        restore_and_finalize_batch_capsule, write_batch_replay_capsule)
+    from cloud_network_benchmark.guest_archive import create_guest_archive
+    from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+    from cloud_network_benchmark.manifests import StaticGitProvenance, initialize_campaign
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    config_data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider-north.yaml").read_text())
+    config_data["context"] = "failure_check"
+    config = repository_root / "configs/tests" / f"{tmp_path.name}-archive-sink-f09.yaml"
+    request.addfinalizer(lambda: config.unlink(missing_ok=True))
+    config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    campaign_token = "archive-sink-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    isolated_results = repository_root / "results" / f"archive-sink-test-{hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]}"
+    initialized = initialize_campaign(config, repository_root, repository_root / "results",
+        clock=lambda: NOW, token_source=lambda: campaign_token,
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
+    parent_path = Path(initialized.parent_manifest_path)
+    parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
+        config_path=config)
+    owned_result_paths = [parent_path]
+    owned_result_paths.extend(Path(row.manifest_path) for row in parent.child_runs)
+    owned_result_paths.extend(Path(row.result_path) for row in parent.child_runs)
+    def cleanup_archive_sink_workspace():
+        for path in owned_result_paths:
+            candidate = path if path.is_absolute() else repository_root / path
+            try:
+                candidate.resolve(strict=False).relative_to((repository_root / "results").resolve())
+            except ValueError:
+                continue
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink(missing_ok=True)
+        if isolated_results.is_dir() and not isolated_results.is_symlink():
+            shutil.rmtree(isolated_results)
+        replay_root = repository_root / "results" / "analysis" / "archive-replays"
+        if replay_root.is_dir():
+            for replay_path in replay_root.glob(f"*{campaign_token.replace('-', '')}*"):
+                if replay_path.is_dir() and not replay_path.is_symlink():
+                    shutil.rmtree(replay_path)
+    request.addfinalizer(cleanup_archive_sink_workspace)
+    child = children["aws"]
+    if receive_fault == "readback":
+        class ReadbackFailureGCS(FakeGCS):
+            def download(self, key, destination, **kwargs):
+                if "/parts/" in key:
+                    raise TimeoutError("synthetic archive part readback timeout")
+                return super().download(key, destination, **kwargs)
+        backend = ReadbackFailureGCS()
+    else:
+        backend = FakeGCS()
+    if receive_fault == "unknown_create":
+        backend.interrupt_after = 1
+
+    class ArchiveSinkAwsRunner(FakePreparedAwsRunner):
+        def __init__(self):
+            super().__init__()
+            self.archive_roots = {role: tmp_path / "remote-archives" / role for role in ("vm_a", "vm_b")}
+            self.archive_helpers = {role: tmp_path / "remote-helpers" / role for role in ("vm_a", "vm_b")}
+            self.archive_receive_ids = []
+
+        def _archive_role(self, action_id):
+            role = next((candidate for candidate in ("vm_a", "vm_b") if f"-{candidate}" in action_id), None)
+            assert role is not None, action_id
+            return role
+
+        def _mapped_guest_path(self, role, remote_path):
+            helper_prefix = f"/tmp/cnb-guest-archive-{self.deployment_id}-{role}"
+            archive_prefix = f"/tmp/cnb-closed-{self.deployment_id}-{role}"
+            if remote_path == helper_prefix or remote_path.startswith(helper_prefix + "/"):
+                return self.archive_helpers[role] / remote_path.removeprefix(helper_prefix).lstrip("/")
+            if remote_path == archive_prefix or remote_path.startswith(archive_prefix + "/"):
+                return self.archive_roots[role] / remote_path.removeprefix(archive_prefix).lstrip("/")
+            raise AssertionError(f"unexpected archive guest path: {remote_path}")
+
+        def run(self, request):
+            action = request.action_id
+            if action.startswith("f09-guest-archive-"):
+                self.actions.append(action)
+                role = self._archive_role(action)
+                if "-mkdir-" in action:
+                    self.archive_helpers[role].mkdir(parents=True, exist_ok=True)
+                    self.archive_roots[role].parent.mkdir(parents=True, exist_ok=True)
+                    return _aws_command_result(self, request)
+                if request.action_type == "scp":
+                    source = Path(request.argv[-2])
+                    destination = self._mapped_guest_path(role, request.argv[-1].split(":", 1)[1])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination)
+                    return _aws_command_result(self, request)
+                remote_argv = shlex.split(shlex.split(request.argv[-1])[-1])
+                def option(name): return remote_argv[remote_argv.index(name) + 1]
+                inventory_path = self._mapped_guest_path(role, option("--inventory"))
+                manifest = create_guest_archive(self.workspace_roots[role], self.archive_roots[role],
+                    maximum_part_bytes=int(option("--maximum-part-bytes")),
+                    maximum_archive_bytes=int(option("--maximum-archive-bytes")),
+                    minimum_free_bytes=int(option("--minimum-free-bytes")),
+                    expected_inventory=json.loads(inventory_path.read_text(encoding="utf-8")))
+                return _aws_command_result(self, request, stdout=json.dumps(manifest, sort_keys=True))
+            return super().run(request)
+
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            if not request.action_id.startswith("f09-guest-part-"):
+                return super().run_bounded_copy(request, destination, maximum_payload_bytes)
+            self.actions.append(request.action_id)
+            self.archive_receive_ids.append(request.action_id)
+            role_by_host = {self.public_a: "vm_a", self.public_b: "vm_b"}
+            role = role_by_host[request.argv[-2].rsplit("@", 1)[-1]]
+            remote_argv = shlex.split(request.argv[-1])
+            script = remote_argv[-1]
+            match = re.search(r"exec 3< (.*?) \|\| exit 1;", script)
+            assert match is not None, script
+            guest_path = shlex.split(match.group(1))[0]
+            source = self._mapped_guest_path(role, guest_path)
+            payload = source.read_bytes()
+            if receive_fault == "cancelled":
+                raise KeyboardInterrupt()
+            if receive_fault == "overflow":
+                Path(destination).write_bytes(payload[:maximum_payload_bytes])
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=1, stdout="", stderr="source grew")
+            Path(destination).write_bytes(payload)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="",
+                stderr=BOUNDED_COPY_EOF_MARKER + "\n")
+
+    def _aws_command_result(runner, request, *, stdout=""):
+        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=runner._now(),
+            finished_at=runner._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+
+    runner = ArchiveSinkAwsRunner()
+    runner.region, runner.zone, runner.complete_cleanup = "eu-north-1", "eu-north-1a", True
+    runner.full_native, runner.late_tail = True, True
+    runner.workspace_roots = {"vm_a": tmp_path / "remote-vm-a", "vm_b": tmp_path / "remote-vm-b"}
+    runner.native_root = runner.workspace_roots["vm_a"]
+    runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
+    cost_path = tmp_path / "refreshed-costs.json"
+    campaign, _ = resolve_campaign(config, repository_root)
+    _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id, region="eu-north-1")
+    costs = load_cost_inputs(cost_path)
+    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256,
+        full_native=True, region="eu-north-1")
+    staging_root = tmp_path / "archive-staging"
+    archive_root = tmp_path / "archive-root"
+    staging_root.mkdir()
+    archive_root.mkdir()
+    runtime["archive_sink"] = {"bucket": "f09-fixture-archive", "maximum_staging_bytes": 2_000_000,
+        "maximum_archive_bytes": 16_000_000, "minimum_controller_free_bytes": 0,
+        "minimum_guest_free_bytes": 0, "controller_quota_free_bytes": 32_000_000,
+        "staging_directory": staging_root, "archive_root": archive_root,
+        "maximum_capsule_bytes": 8_000_000}
+    clock = FakeClock()
+    runtime["sleep"] = clock.sleep
+    built = build_runtime(campaign=campaign, parent=parent, children={"aws": child}, costs=costs,
+        runtime=runtime, controller_session_id="archive-sink-session", runner=runner, clock=clock,
+        private_root=tmp_path / "private", repository_root=repository_root)
+    runtime["archive_sink"]["backend"] = backend
+    lifecycle = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
+        admission_plan=built["plan"], allowance=built["allowance"],
+        workflow_factory=built["workflow_factory"], clock=clock,
+        recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    provider_result = lifecycle.provider_results["aws"]
+    retrieval = provider_result.values["retrieve"]
+    assert "f09-guest-part-" in " ".join(runner.archive_receive_ids)
+    assert provider_result.values["cleanup"] is not None
+    assert provider_result.cleanup_state == "succeeded"
+    if receive_fault:
+        assert retrieval.succeeded is False
+        assert not list(staging_root.iterdir())
+        if receive_fault in {"readback", "unknown_create"}:
+            archive_status = retrieval.evidence.archive_status
+            assert archive_status["status"] == "failed"
+            assert archive_status["partial_objects"]
+            saved = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+            saved_status = saved["providers"][0]["archive_status"]
+            assert saved_status["partial_objects"] == archive_status["partial_objects"]
+            if receive_fault == "unknown_create":
+                assert saved_status["partial_objects"][0]["create_outcome"] == "unknown"
+                assert saved_status["partial_objects"][0]["generation"] == "unknown"
+            assert backend.deleted == []
+        else:
+            assert not backend.objects
+        return
+
+    receipt = retrieval.evidence.archive_status
+    assert receipt["status"] == "verified"
+    assert receipt["validation_state"] == "archive_pending_validation"
+    child_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+    child_path = Path(child_ref.manifest_path)
+    result_root = Path(child_ref.result_path)
+    capsule_path = archive_root / "replay-capsules" / "archive-sink-capsule.json"
+    capsule = write_batch_replay_capsule(capsule_path, archives={"aws": receipt},
+        parent_manifest_path=parent_path, child_manifest_paths={"aws": child_path},
+        result_roots={"aws": result_root}, provider_results=lifecycle.provider_results,
+        reservation=lifecycle.reservation_evidence, repository_root=repository_root,
+        maximum_capsule_bytes=runtime["archive_sink"]["maximum_capsule_bytes"])
+    materialization_root = tmp_path / "restored-results"
+    materialization_root.mkdir()
+    replay = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+        expected_capsule_sha256=capsule["sha256"], backend=backend,
+        bucket=runtime["archive_sink"]["bucket"], archive_staging_root=staging_root,
+        materialization_root=materialization_root, repository_root=repository_root,
+        maximum_part_bytes=runtime["archive_sink"]["maximum_staging_bytes"],
+        evaluated_at=clock.utc_now() + timedelta(minutes=1))
+    assert replay["status"] == "replayed", replay
+
+
 def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, repository_root, monkeypatch):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign

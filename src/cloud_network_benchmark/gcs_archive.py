@@ -68,7 +68,7 @@ class GCSObjectBackend(Protocol):
 
 
 class GCSArchiveFailure(RuntimeError):
-    def __init__(self, message: str, *, partial_objects: list[dict[str, str]]):
+    def __init__(self, message: str, *, partial_objects: list[dict[str, Any]]):
         super().__init__(message)
         self.partial_objects = partial_objects
 
@@ -136,12 +136,31 @@ class GoogleCloudStorageBackend:
 
     def upload(self, key: str, source: Path, *, size_bytes: int, sha256: str,
                if_generation_match: int, chunk_bytes: int, timeout_seconds: float) -> dict:
+        started = time.monotonic()
+        def remaining_timeout() -> float:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("generation-bound object upload exhausted its shared timeout")
+            return remaining
         blob = self._bucket.blob(key, chunk_size=chunk_bytes)
         blob.metadata = {"cnb-sha256": sha256}
-        blob.upload_from_filename(str(source), if_generation_match=if_generation_match,
-                                  checksum="crc32c", timeout=timeout_seconds, retry=None)
-        # upload response generation is the exact create-only version; never
-        # re-read an unbound latest generation before cleanup or verification.
+        # Drive the SDK's resumable state machine directly. Blob.upload_from_file
+        # reuses one timeout for every chunk and deletes the object implicitly on
+        # DataCorruption; both behaviors violate this archive's source-bound budget.
+        with Path(source).open("rb") as stream:
+            upload, transport = blob._initiate_resumable_upload(
+                blob.bucket.client, stream, "application/octet-stream", size_bytes,
+                if_generation_match=if_generation_match, chunk_size=chunk_bytes,
+                timeout=remaining_timeout(), checksum="crc32c", retry=None)
+            response = None
+            while not upload.finished:
+                response = upload.transmit_next_chunk(transport, timeout=remaining_timeout())
+        if response is None:
+            raise RuntimeError("GCS resumable create returned no final response")
+        properties = response.json()
+        blob._properties.update(properties)
+        # The response generation is the exact create-only version; never
+        # re-read an unbound latest generation before verification.
         if blob.generation is None or blob.size is None:
             raise RuntimeError("GCS create response omitted immutable object identity")
         return {"generation": str(blob.generation), "size_bytes": int(blob.size or 0)}
@@ -158,8 +177,21 @@ class GoogleCloudStorageBackend:
         blob.reload(if_generation_match=int(generation), timeout=remaining_timeout(), retry=None)
         if blob is None or blob.size is None or blob.size > maximum_bytes:
             raise ValueError("remote part is missing or exceeds staging bound")
-        blob.download_to_filename(str(destination), checksum="crc32c", timeout=remaining_timeout(),
-                                  if_generation_match=int(generation), retry=None)
+        from google.cloud.storage._media.requests import ChunkedDownload
+        client = blob.bucket.client
+        download_url = blob._get_download_url(client, if_generation_match=int(generation))
+        try:
+            with Path(destination).open("wb") as stream:
+                download = ChunkedDownload(download_url, 8 * 1024 * 1024, stream,
+                    headers={"accept-encoding": "identity"}, start=0, end=int(blob.size) - 1,
+                    retry=None)
+                while not download.finished:
+                    download.consume_next_chunk(client._http, timeout=remaining_timeout())
+            if Path(destination).stat().st_size != int(blob.size):
+                raise ValueError("generation-bound download returned an incomplete object")
+        except Exception:
+            Path(destination).unlink(missing_ok=True)
+            raise
 
     def delete(self, key: str, *, generation: str, timeout_seconds: float) -> None:
         self._bucket.blob(key, generation=int(generation)).delete(
@@ -717,7 +749,8 @@ def publish_guest_archive_parts(*, guest_archives: list[dict], fetch_part: Calla
         maximum_part_bytes: int, maximum_archive_bytes: int, minimum_controller_free_bytes: int,
         controller_quota_free_bytes: int,
         deadline: Any, clock: Callable[[], float] = time.monotonic,
-        chunk_bytes: int = 8 * 1024 * 1024) -> dict:
+        chunk_bytes: int = 8 * 1024 * 1024,
+        object_progress: Callable[[dict], None] | None = None) -> dict:
     """Publish already guest-compressed role parts and immutable receipts.
 
     Only one controller part exists at a time. The logical manifest is
@@ -784,68 +817,115 @@ def publish_guest_archive_parts(*, guest_archives: list[dict], fetch_part: Calla
         if backend.stat(key, timeout_seconds=remaining()) is not None:
             raise ValueError("logical run prefix contains an occupied part before upload")
     objects = []
-    for role, size, part in expected_parts:
-        path = Path(fetch_part(role, part))
-        if path.parent.resolve() != staging_directory.resolve() or path.is_symlink() or not path.is_file():
-            raise ValueError("guest part fetch did not return a file in the bounded staging directory")
+    attempted_objects: list[dict[str, Any]] = []
+
+    def progress(status: str) -> None:
+        if object_progress is not None:
+            object_progress({"status": status, "verified": False, "bucket": bucket,
+                "prefix": prefix, "manifest_sha256": manifest_sha,
+                "partial_objects": [dict(row) for row in attempted_objects]})
+
+    def upload_and_verify(*, key: str, source: Path, size_bytes: int, sha256: str,
+            maximum_read_bytes: int, label: str) -> dict:
+        attempt = {"key": key, "size_bytes": size_bytes, "sha256": sha256,
+            "generation": "unknown", "create_outcome": "unknown",
+            "verification_state": "not_started"}
+        attempted_objects.append(attempt)
         try:
+            progress("uploading")
+            created = backend.upload(key, source, size_bytes=size_bytes, sha256=sha256,
+                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+            generation = str(created.get("generation", ""))
+            if generation:
+                attempt.update(generation=generation, create_outcome="created",
+                    verification_state="pending")
+                progress("uploading")
+            if not generation or created.get("size_bytes") != size_bytes:
+                raise ValueError(f"{label} create response omitted the exact immutable object identity")
+            backend.download(key, source, maximum_bytes=maximum_read_bytes,
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(source, maximum_read_bytes, lambda: remaining()) != (size_bytes, sha256):
+                raise ValueError(f"{label} generation-bound readback failed")
+            attempt["verification_state"] = "verified"
+            progress("uploading")
+            return {"key": key, "size_bytes": size_bytes, "sha256": sha256,
+                "generation": generation}
+        except Exception as exc:
+            attempt["failure_stage"] = ("readback" if attempt["create_outcome"] == "created"
+                else "create_or_response")
+            attempt["verification_state"] = "failed_or_unknown"
+            try:
+                progress("failed")
+            except Exception:
+                pass
+            raise GCSArchiveFailure(f"{label} publication failed ({type(exc).__name__})",
+                partial_objects=[dict(row) for row in attempted_objects]) from exc
+
+    for role, size, part in expected_parts:
+        path = None
+        try:
+            path = Path(fetch_part(role, part))
+            if path.parent.resolve() != staging_directory.resolve() or path.is_symlink() or not path.is_file():
+                raise ValueError("guest part fetch did not return a file in the bounded staging directory")
             if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
                 raise ValueError("guest part failed controller size/hash verification")
             key = f"{prefix}parts/{role}/{part['path']}-{part['sha256']}"
-            created = backend.upload(key, path, size_bytes=size, sha256=part["sha256"],
-                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
-            generation = str(created.get("generation", ""))
-            if not generation or created.get("size_bytes") != size:
-                raise ValueError("GCS create response omitted the exact immutable object identity")
-            backend.download(key, path, maximum_bytes=maximum_part_bytes,
-                timeout_seconds=remaining(), generation=generation)
-            if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
-                raise ValueError("GCS generation-bound part readback failed")
-            objects.append({"key": key, "size_bytes": size, "sha256": part["sha256"], "generation": generation})
+            objects.append(upload_and_verify(key=key, source=path, size_bytes=size,
+                sha256=part["sha256"], maximum_read_bytes=maximum_part_bytes,
+                label="guest part"))
+        except GCSArchiveFailure:
+            raise
+        except Exception as exc:
+            if attempted_objects:
+                try:
+                    progress("failed")
+                except Exception:
+                    pass
+                raise GCSArchiveFailure(f"guest archive staging failed ({type(exc).__name__})",
+                    partial_objects=[dict(row) for row in attempted_objects]) from exc
+            raise
         finally:
-            path.unlink(missing_ok=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
     for key, content, digest in ((manifest_key, manifest_bytes, manifest_sha),):
         if len(content) + minimum_controller_free_bytes > controller_quota_free_bytes:
-            raise OSError("measured controller user quota cannot hold the immutable archive manifest")
+            exc = OSError("measured controller user quota cannot hold the immutable archive manifest")
+            if attempted_objects:
+                progress("failed")
+                raise GCSArchiveFailure(str(exc), partial_objects=[dict(row) for row in attempted_objects]) from exc
+            raise exc
         with tempfile.TemporaryDirectory(prefix="cnb-guest-meta-", dir=staging_directory) as temp:
             source = Path(temp) / "metadata.json"
             source.write_bytes(content)
-            created = backend.upload(key, source, size_bytes=len(content), sha256=digest,
-                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
-            generation = str(created.get("generation", ""))
-            if not generation or created.get("size_bytes") != len(content):
-                raise ValueError("GCS metadata create response omitted its immutable identity")
-            readback = Path(temp) / "readback.json"
-            backend.download(key, readback, maximum_bytes=max(maximum_part_bytes, len(content)),
-                timeout_seconds=remaining(), generation=generation)
-            if _hash(readback, max(maximum_part_bytes, len(content)), lambda: remaining()) != (len(content), digest):
-                raise ValueError("GCS manifest generation-bound readback failed")
-        objects.append({"key": key, "size_bytes": len(content), "sha256": digest, "generation": generation})
+            objects.append(upload_and_verify(key=key, source=source, size_bytes=len(content),
+                sha256=digest, maximum_read_bytes=max(maximum_part_bytes, len(content)),
+                label="GCS manifest"))
     completion = {"schema_version": 2, "manifest_sha256": manifest_sha,
         "objects": objects}
     complete_bytes = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode()
     if (len(complete_bytes) > maximum_part_bytes
             or len(complete_bytes) + minimum_controller_free_bytes > controller_quota_free_bytes):
-        raise OSError("measured controller user quota cannot hold the immutable completion receipt")
+        exc = OSError("measured controller user quota cannot hold the immutable completion receipt")
+        progress("failed")
+        raise GCSArchiveFailure(str(exc), partial_objects=[dict(row) for row in attempted_objects]) from exc
     complete_sha = hashlib.sha256(complete_bytes).hexdigest()
     with tempfile.TemporaryDirectory(prefix="cnb-guest-complete-", dir=staging_directory) as temp:
         source = Path(temp) / "complete.json"
         source.write_bytes(complete_bytes)
-        created = backend.upload(completion_key, source, size_bytes=len(complete_bytes), sha256=complete_sha,
-            if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
-        completion_generation = str(created.get("generation", ""))
-        if not completion_generation or created.get("size_bytes") != len(complete_bytes):
-            raise ValueError("GCS completion create response omitted immutable identity")
-        readback = Path(temp) / "readback.json"
-        backend.download(completion_key, readback, maximum_bytes=max(maximum_part_bytes, len(complete_bytes)),
-            timeout_seconds=remaining(), generation=completion_generation)
-        if _hash(readback, max(maximum_part_bytes, len(complete_bytes)), lambda: remaining()) != (len(complete_bytes), complete_sha):
-            raise ValueError("GCS completion generation-bound readback failed")
-    for row in [*objects, {"key": completion_key, "generation": completion_generation,
-                           "size_bytes": len(complete_bytes)}]:
-        current = backend.stat(row["key"], timeout_seconds=remaining())
-        if current is None or str(current.get("generation")) != row["generation"] or current.get("size_bytes") != row["size_bytes"]:
-            raise ValueError("a verified archive generation changed before acceptance")
+        completion_object = upload_and_verify(key=completion_key, source=source,
+            size_bytes=len(complete_bytes), sha256=complete_sha,
+            maximum_read_bytes=max(maximum_part_bytes, len(complete_bytes)), label="GCS completion")
+        completion_generation = completion_object["generation"]
+    try:
+        for row in [*objects, {"key": completion_key, "generation": completion_generation,
+                               "size_bytes": len(complete_bytes)}]:
+            current = backend.stat(row["key"], timeout_seconds=remaining())
+            if current is None or str(current.get("generation")) != row["generation"] or current.get("size_bytes") != row["size_bytes"]:
+                raise ValueError("a verified archive generation changed before acceptance")
+    except Exception as exc:
+        progress("failed")
+        raise GCSArchiveFailure(f"archive acceptance check failed ({type(exc).__name__})",
+            partial_objects=[dict(row) for row in attempted_objects]) from exc
     return {"status": "verified", "verified": True, "validation_state": "archive_pending_validation",
         "bucket": bucket, "prefix": prefix, "manifest_sha256": manifest_sha,
         "manifest": manifest, "objects": objects, "completion_generation": completion_generation,
