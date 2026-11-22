@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
-import time
+import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ARCHIVE_PROJECT_ID = "project-a70f8497-3463-4ef2-9cd"
+_ARCHIVE_SERVICE_ACCOUNT = "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"
 
 
 class GCSObjectBackend(Protocol):
@@ -41,15 +45,63 @@ def valid_bucket_name(value: Any) -> bool:
         and re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value) is None)
 
 
-class GoogleCloudStorageBackend:
-    """Production backend. Construct only on the configured controller identity."""
+def valid_archive_identity(project_id: Any, service_account_email: Any) -> bool:
+    return project_id == _ARCHIVE_PROJECT_ID and service_account_email == _ARCHIVE_SERVICE_ACCOUNT
 
-    def __init__(self, bucket: str):
+
+class GoogleCloudStorageBackend:
+    """Production backend using an explicit, archive-only service account key."""
+
+    def __init__(self, bucket: str, *, credentials_file: str | Path,
+                 expected_project_id: str, expected_service_account_email: str):
+        if not isinstance(credentials_file, (str, Path)) or not str(credentials_file).strip():
+            raise ValueError("archive service-account credential path is required")
+        if (not isinstance(expected_project_id, str) or not expected_project_id.strip()
+                or not isinstance(expected_service_account_email, str)
+                or not expected_service_account_email.strip()):
+            raise ValueError("expected archive project and service-account identity are required")
+        if not valid_archive_identity(expected_project_id, expected_service_account_email):
+            raise ValueError("configured archive identity does not match the approved archive account")
+        path = Path(credentials_file)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("archive service-account credential path must be absolute and normalized")
+        if any(parent.is_symlink() for parent in (path, *path.parents)):
+            raise ValueError("archive service-account credential file is unsafe")
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ValueError
+            if os.name == "posix" and (info.st_mode & 0o077 or not info.st_mode & 0o400
+                    or info.st_uid != os.geteuid()):
+                raise ValueError
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict) or document.get("type") != "service_account":
+                raise ValueError
+            project_id, principal = document.get("project_id"), document.get("client_email")
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise ValueError
+            if not isinstance(principal, str) or not re.fullmatch(
+                    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.iam\.gserviceaccount\.com", principal):
+                raise ValueError
+            if project_id != expected_project_id:
+                raise ValueError
+            if principal != expected_service_account_email:
+                raise ValueError
+        except Exception:
+            # Keep the path, key contents and parser details out of logs/errors.
+            raise ValueError("archive service-account credential is missing, unsafe, or has the wrong identity") from None
         try:
             from google.cloud import storage
+            from google.oauth2 import service_account
         except ImportError as exc:  # pragma: no cover - optional production extra
             raise RuntimeError("install the gcs optional dependency on the controller") from exc
-        self._bucket = storage.Client().bucket(bucket)
+        try:
+            credentials = service_account.Credentials.from_service_account_info(
+                document, scopes=["https://www.googleapis.com/auth/devstorage.read_write"])
+            archive_client = storage.Client(project=project_id, credentials=credentials)
+        except Exception:
+            raise ValueError("archive service-account credential could not be loaded") from None
+        self._bucket = archive_client.bucket(bucket)
 
     def stat(self, key: str, *, timeout_seconds: float) -> dict | None:
         blob = self._bucket.get_blob(key, timeout=timeout_seconds, retry=None)

@@ -44,6 +44,9 @@ def test_archive_paths_must_not_overlap_results_or_private_state(tmp_path, monke
         "archive_sink": {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
             "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
             "archive_root": str(tmp_path / "results" / "archive"),
+            "credentials_file": str(tmp_path / "archive-key.json"),
+            "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+            "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
             "staging_directory": str(tmp_path / "stage")}}
     blockers = validate_stage_inputs({"stage": "acceptance"}, settings, tmp_path)
     assert any("must not overlap results_root" in item for item in blockers)

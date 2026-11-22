@@ -205,11 +205,20 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         stage = plan["stage"]
         archive_sink = settings.get("archive_sink")
         if archive_sink is not None:
-            from .gcs_archive import valid_bucket_name
+            from .gcs_archive import valid_archive_identity, valid_bucket_name
+            required_archive_fields = {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                "minimum_controller_free_bytes", "archive_root", "staging_directory", "credentials_file",
+                "expected_project_id", "expected_service_account_email"}
             if (not isinstance(archive_sink, dict)
-                    or set(archive_sink) != {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-                        "minimum_controller_free_bytes", "archive_root", "staging_directory"}
+                    or not required_archive_fields <= set(archive_sink)
+                    or set(archive_sink) - required_archive_fields
                     or not valid_bucket_name(archive_sink.get("bucket"))
+                    or not isinstance(archive_sink.get("credentials_file"), str)
+                    or not archive_sink["credentials_file"].strip()
+                    or any(not isinstance(archive_sink[field], str) or not archive_sink[field].strip()
+                        for field in ("expected_project_id", "expected_service_account_email"))
+                    or not valid_archive_identity(archive_sink.get("expected_project_id"),
+                        archive_sink.get("expected_service_account_email"))
                     or type(archive_sink.get("maximum_staging_bytes")) is not int
                     or archive_sink["maximum_staging_bytes"] <= 0
                     or type(archive_sink.get("maximum_archive_bytes")) is not int
@@ -219,12 +228,19 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 raise ValueError("archive_sink requires a bucket and measured archive, staging and free-space bounds")
             _path(archive_sink["archive_root"], "archive_sink.archive_root")
             _path(archive_sink["staging_directory"], "archive_sink.staging_directory")
-            for label in ("archive_root", "staging_directory"):
+            _path(archive_sink["credentials_file"], "archive_sink.credentials_file")
+            for label in ("archive_root", "staging_directory", "credentials_file"):
                 candidate = Path(archive_sink[label])
                 for base_name in ("results_root", "state_root"):
                     base = Path(settings[base_name])
                     if candidate == base or candidate in base.parents or base in candidate.parents:
                         raise ValueError(f"archive_sink.{label} must not overlap {base_name}")
+                for other_label in ("archive_root", "staging_directory", "credentials_file"):
+                    if other_label == label:
+                        continue
+                    other = Path(archive_sink[other_label])
+                    if candidate == other or candidate in other.parents or other in candidate.parents:
+                        raise ValueError(f"archive_sink.{label} must not overlap archive_sink.{other_label}")
         _path(settings.get("state_root"), "state_root")
         _path(settings.get("results_root"), "results_root")
         if Path(settings["state_root"]) == Path(settings["results_root"]):

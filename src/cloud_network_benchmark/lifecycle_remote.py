@@ -455,7 +455,10 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             temporary = status_path.with_suffix(".partial")
                             temporary.write_text(json.dumps(safe, sort_keys=True) + "\n", encoding="utf-8")
                             temporary.replace(status_path)
-                        backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket)
+                        backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket,
+                            credentials_file=archive_sink["credentials_file"],
+                            expected_project_id=archive_sink.get("expected_project_id"),
+                            expected_service_account_email=archive_sink.get("expected_service_account_email"))
                         archive_status = relay_closed_native_tree(item.result_root,
                             backend=backend, bucket=bucket, provider=provider,
                             experiment_id=child.experiment_id, run_id=pair_of(provision).identity.run_id,

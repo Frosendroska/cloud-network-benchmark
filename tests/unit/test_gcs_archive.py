@@ -315,7 +315,14 @@ def test_verification_failure_never_deletes_guest_originals_or_reports_success(t
 
 
 def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tmp_path):
-    calls = []
+    import json
+    import os
+    calls, client_options, credential_calls = [], [], []
+    key_file = tmp_path / "archive-sa.json"
+    key_file.write_text(json.dumps({"type": "service_account", "project_id": "project-a70f8497-3463-4ef2-9cd",
+        "client_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
+        "private_key": "fake-private-key"}))
+    key_file.chmod(0o600)
 
     class Blob:
         generation, size = 7, 4
@@ -331,16 +338,43 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
         def blob(self, key, **kwargs): calls.append(("blob", key, kwargs)); return Blob()
 
     class Client:
+        def __init__(self, **kwargs): client_options.append(kwargs)
         def bucket(self, _name): return Bucket()
+
+    class Credentials:
+        @classmethod
+        def from_service_account_info(cls, info, *, scopes):
+            credential_calls.append(("credentials", info["client_email"], scopes))
+            return object()
 
     google = types.ModuleType("google")
     cloud = types.ModuleType("google.cloud")
+    oauth2 = types.ModuleType("google.oauth2")
+    service_account = types.ModuleType("google.oauth2.service_account")
+    service_account.Credentials = Credentials
     cloud.storage = types.SimpleNamespace(Client=Client)
     google.cloud = cloud
+    google.oauth2 = oauth2
+    oauth2.service_account = service_account
     monkeypatch.setitem(sys.modules, "google", google)
     monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", service_account)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "human-adc.json")
+    original_environment = dict(os.environ)
     from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
-    backend = GoogleCloudStorageBackend("valid-bucket")
+    backend = GoogleCloudStorageBackend("valid-bucket", credentials_file=key_file,
+        expected_project_id="project-a70f8497-3463-4ef2-9cd",
+        expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+    assert client_options[0]["project"] == "project-a70f8497-3463-4ef2-9cd"
+    assert client_options[0]["credentials"] is not None
+    assert credential_calls[0] == ("credentials", "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
+        ["https://www.googleapis.com/auth/devstorage.read_write"])
+    assert dict(os.environ) == original_environment
+    from cloud_network_benchmark.terraform_work import private_terraform_environment
+    provider_env = private_terraform_environment(["terraform", "-chdir=/tmp/provider"], tmp_path)
+    assert provider_env["GOOGLE_APPLICATION_CREDENTIALS"] == "human-adc.json"
+    assert provider_env["GOOGLE_APPLICATION_CREDENTIALS"] != str(key_file)
     assert backend.stat("key", timeout_seconds=9)["generation"] == "7"
     target = tmp_path / "remote"
     backend.download("key", target, maximum_bytes=10, timeout_seconds=8, generation="7")
@@ -349,6 +383,66 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     assert calls[1] == ("blob", "key", {"generation": 7})
     assert calls[2][1]["if_generation_match"] == 7 and calls[2][1]["retry"] is None
     assert calls[3][1]["if_generation_match"] == 7 and calls[3][1]["retry"] is None
+
+
+def test_archive_credentials_fail_closed_before_storage_client_and_redact_details(tmp_path, monkeypatch):
+    import json
+    from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
+
+    client_calls = []
+    class Client:
+        def __init__(self, **kwargs): client_calls.append(kwargs)
+    class Credentials:
+        @classmethod
+        def from_service_account_info(cls, info, *, scopes):
+            raise AssertionError("invalid identities must fail before SDK credential parsing")
+    google = types.ModuleType("google")
+    cloud = types.ModuleType("google.cloud")
+    oauth2 = types.ModuleType("google.oauth2")
+    service_account = types.ModuleType("google.oauth2.service_account")
+    cloud.storage = types.SimpleNamespace(Client=Client)
+    service_account.Credentials = Credentials
+    google.cloud, google.oauth2 = cloud, oauth2
+    oauth2.service_account = service_account
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", service_account)
+
+    path = tmp_path / "unsafe-key.json"
+    good = {"type": "service_account", "project_id": "project-a70f8497-3463-4ef2-9cd",
+        "client_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
+        "private_key": "super-secret"}
+    with pytest.raises(ValueError) as error:
+        GoogleCloudStorageBackend("valid-bucket", credentials_file=path,
+            expected_project_id="project-a70f8497-3463-4ef2-9cd",
+            expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+    assert str(path) not in str(error.value)
+    invalid_documents = ["not-json", json.dumps({**good, "type": "authorized_user"}),
+        json.dumps({**good, "project_id": "wrong-project"}),
+        json.dumps({**good, "client_email": "other@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"})]
+    for content in invalid_documents:
+        path.write_text(content)
+        path.chmod(0o600)
+        with pytest.raises(ValueError) as error:
+            GoogleCloudStorageBackend("valid-bucket", credentials_file=path,
+                expected_project_id="project-a70f8497-3463-4ef2-9cd",
+                expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+        assert "super-secret" not in str(error.value) and str(path) not in str(error.value)
+    path.write_text(json.dumps(good))
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="unsafe"):
+        GoogleCloudStorageBackend("valid-bucket", credentials_file=path,
+            expected_project_id="project-a70f8497-3463-4ef2-9cd",
+            expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+    path.chmod(0o000)
+    with pytest.raises(ValueError, match="unsafe"):
+        GoogleCloudStorageBackend("valid-bucket", credentials_file=path,
+            expected_project_id="project-a70f8497-3463-4ef2-9cd",
+            expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+    with pytest.raises(TypeError):
+        GoogleCloudStorageBackend("valid-bucket", credentials_file=path)
+    assert client_calls == []
 
 
 def test_bounded_relay_reconstructs_archive_and_never_stages_full_bundle(tmp_path):

@@ -173,7 +173,10 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     staging_root.mkdir()
     settings["archive_sink"] = {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
         "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
-        "archive_root": str(archive_root), "staging_directory": str(staging_root)}
+        "archive_root": str(archive_root), "staging_directory": str(staging_root),
+        "credentials_file": str(tmp_path / "archive-key.json"),
+        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"}
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
     register_generated_cleanup(stage, request)
@@ -183,6 +186,8 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     assert runtime["archive_sink"]["maximum_archive_bytes"] == 1_000_000
     assert runtime["archive_sink"]["archive_root"] == archive_root
     assert runtime["archive_sink"]["staging_directory"] == staging_root
+    assert runtime["archive_sink"]["credentials_file"] == tmp_path / "archive-key.json"
+    assert runtime["archive_sink"]["expected_project_id"] == "project-a70f8497-3463-4ef2-9cd"
 
 
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):
