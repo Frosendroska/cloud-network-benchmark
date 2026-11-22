@@ -147,11 +147,17 @@ class GoogleCloudStorageBackend:
 
     def download(self, key: str, destination: Path, *, maximum_bytes: int,
                  timeout_seconds: float, generation: str) -> None:
+        started = time.monotonic()
+        def remaining_timeout() -> float:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("generation-bound object download exhausted its shared timeout")
+            return remaining
         blob = self._bucket.blob(key, generation=int(generation))
-        blob.reload(if_generation_match=int(generation), timeout=timeout_seconds, retry=None)
+        blob.reload(if_generation_match=int(generation), timeout=remaining_timeout(), retry=None)
         if blob is None or blob.size is None or blob.size > maximum_bytes:
             raise ValueError("remote part is missing or exceeds staging bound")
-        blob.download_to_filename(str(destination), checksum="crc32c", timeout=timeout_seconds,
+        blob.download_to_filename(str(destination), checksum="crc32c", timeout=remaining_timeout(),
                                   if_generation_match=int(generation), retry=None)
 
     def delete(self, key: str, *, generation: str, timeout_seconds: float) -> None:

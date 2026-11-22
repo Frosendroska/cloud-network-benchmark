@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -340,3 +341,247 @@ def test_gnu_remote_stream_probes_only_one_excess_byte(tmp_path, size, expected_
     assert completed.returncode == expected_status
     assert len(completed.stdout) == expected_size
     assert (BOUNDED_COPY_EOF_MARKER.encode() in completed.stderr) == (expected_status == 0)
+
+
+class _ArchivePartReceiver:
+    def __init__(self, payload, *, outcome="succeeded", copied_bytes=None):
+        self.payload = payload
+        self.outcome = outcome
+        self.copied_bytes = copied_bytes
+        self.calls = []
+
+    def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+        assert request.action_type == "ssh"
+        assert request.action_id.startswith("f09-guest-part-")
+        assert request.argv[:2] == ["ssh", "-T"]
+        command = shlex.split(request.argv[-1])
+        script = command[-1]
+        assert command[:2] == ["sh", "-c"]
+        assert f"count={maximum_payload_bytes} iflag=count_bytes" in script
+        assert BOUNDED_COPY_EOF_MARKER in script
+        self.calls.append((request, maximum_payload_bytes))
+        count = (maximum_payload_bytes if self.copied_bytes is None else self.copied_bytes)
+        Path(destination).write_bytes(self.payload[:count])
+        observed = result(request.action_id, success=self.outcome == "succeeded")
+        return observed.model_copy(update={"outcome": self.outcome})
+
+
+def _receive_archive_part(tmp_path, runner, *, size=6, staging_limit=6, quota=16,
+        remaining=30):
+    from cloud_network_benchmark.lifecycle_remote import _fetch_bounded_guest_archive_part
+
+    c = connection(tmp_path)
+    staging = tmp_path / "staging"
+    staging.mkdir(exist_ok=True)
+    destination = staging / "one.part"
+    captured_actions = []
+    class Deadline:
+        def remaining(self, _clock, *, cleanup=False):
+            return remaining
+    received = _fetch_bounded_guest_archive_part(runner=runner, connection=c,
+        role="vm_a", source_path="/tmp/cnb-closed/run-vm_a/archive.tar.gz.part-00001",
+        destination=destination, staging_directory=staging, size_bytes=size,
+        maximum_staging_bytes=staging_limit, minimum_free_bytes=10,
+        controller_quota_free_bytes=quota, deadline=Deadline(), clock=lambda: 100,
+        action_id="f09-guest-part-run-vm_a-1", actions=captured_actions)
+    return received, captured_actions
+
+
+def test_archive_sink_part_uses_declared_size_as_actual_ssh_receiver_cap(tmp_path):
+    payload = b"part-data"
+    runner = _ArchivePartReceiver(payload)
+    received, actions = _receive_archive_part(tmp_path, runner, size=len(payload),
+        staging_limit=len(payload), quota=len(payload) + 10)
+    request, cap = runner.calls[0]
+    assert received.read_bytes() == payload
+    assert cap == len(payload) and len(runner.calls) == 1
+    assert request.timeout_seconds == 10
+    assert len(actions) == 1
+
+
+def test_archive_sink_bounded_transport_publishes_through_injected_gcs_backend(tmp_path):
+    from cloud_network_benchmark.gcs_archive import publish_guest_archive_parts
+    from cloud_network_benchmark.lifecycle_remote import _fetch_bounded_guest_archive_part
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    payloads = {"vm_a": b"vm-a-archive-part", "vm_b": b"vm-b-archive-part"}
+    guest_archives, part_rows, runners = [], {}, {}
+    for role, payload in payloads.items():
+        digest = hashlib.sha256(payload).hexdigest()
+        part = {"path": "archive.tar.gz.part-00001", "size_bytes": len(payload), "sha256": digest}
+        part_rows[role] = part
+        guest_archives.append({"role": role, "manifest": {
+            "files": [{"path": f"{role}/native.csv", "size_bytes": len(payload), "sha256": digest}],
+            "parts": [part], "raw_bytes": len(payload), "archive_bytes": len(payload),
+            "archive_sha256": digest}})
+        runners[role] = _ArchivePartReceiver(payload)
+    c = connection(tmp_path)
+    captured_actions = []
+
+    def fetch(role, part):
+        assert part == part_rows[role]
+        return _fetch_bounded_guest_archive_part(runner=runners[role], connection=c,
+            role=role, source_path=f"/tmp/cnb-closed/run-{role}/{part['path']}",
+            destination=staging / "one.part", staging_directory=staging,
+            size_bytes=part["size_bytes"], maximum_staging_bytes=4096,
+            minimum_free_bytes=1024, controller_quota_free_bytes=16_384,
+            deadline=deadline(), clock=lambda: 100,
+            action_id=f"f09-guest-part-run-{role}-1", actions=captured_actions)
+
+    backend = FakeGCS()
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="valid-bucket", provider="aws",
+        experiment_id="EXP-001", run_id="run-archive-001", closed_inventory={"items": []},
+        maximum_part_bytes=4096, maximum_archive_bytes=8192,
+        minimum_controller_free_bytes=1024, controller_quota_free_bytes=16_384,
+        deadline=deadline(), clock=lambda: 100)
+    assert receipt["status"] == "verified"
+    assert len(captured_actions) == 2
+    assert all(len(runners[role].calls) == 1 for role in ("vm_a", "vm_b"))
+    assert not list(staging.iterdir())
+
+
+def test_remote_guest_archive_creation_and_bounded_fetch_publish_end_to_end(tmp_path):
+    import re
+    from cloud_network_benchmark.guest_archive import create_guest_archive, create_remote_guest_archive
+    from cloud_network_benchmark.gcs_archive import publish_guest_archive_parts
+    from cloud_network_benchmark.lifecycle_remote import _fetch_bounded_guest_archive_part
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    c = connection(tmp_path)
+    workspace_roots = {role: tmp_path / "guest" / role for role in ("vm_a", "vm_b")}
+    archive_roots = {role: tmp_path / "guest-archives" / role for role in ("vm_a", "vm_b")}
+    helper_roots = {role: tmp_path / "guest-helpers" / role for role in ("vm_a", "vm_b")}
+    inventories = {}
+    for role, root in workspace_roots.items():
+        target = root / "measurements" / "native.csv"
+        target.parent.mkdir(parents=True)
+        target.write_bytes((role + " native evidence\n").encode())
+        content = target.read_bytes()
+        inventories[role] = [{"path": "measurements/native.csv", "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest()}]
+
+    class RemoteArchiveTransport:
+        def __init__(self): self.calls = []
+
+        @staticmethod
+        def _role(action_id):
+            for role in ("vm_a", "vm_b"):
+                if f"-{role}" in action_id:
+                    return role
+            raise AssertionError(f"archive action does not identify a guest role: {action_id}")
+
+        def _remote_path(self, role, remote_path):
+            helper = f"/tmp/cnb-guest-archive-{c.deployment_id}-{role}"
+            archive = f"/tmp/cnb-closed-{c.deployment_id}-{role}"
+            if remote_path == archive or remote_path.startswith(archive + "/"):
+                return archive_roots[role] / remote_path.removeprefix(archive).lstrip("/")
+            if remote_path == helper or remote_path.startswith(helper + "/"):
+                return helper_roots[role] / remote_path.removeprefix(helper).lstrip("/")
+            raise AssertionError(f"unexpected fake remote path: {remote_path}")
+
+        def run(self, request):
+            self.calls.append(request.action_id)
+            role = self._role(request.action_id)
+            if "-mkdir-" in request.action_id:
+                helper_roots[role].mkdir(parents=True, exist_ok=True)
+                archive_roots[role].parent.mkdir(parents=True, exist_ok=True)
+                return result(request.action_id)
+            if request.action_type == "scp":
+                source = Path(request.argv[-2])
+                remote_path = request.argv[-1].split(":", 1)[1]
+                destination = self._remote_path(role, remote_path)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                return result(request.action_id)
+            if request.action_id.startswith("f09-guest-archive-"):
+                remote_command = shlex.split(request.argv[-1])
+                argv = shlex.split(remote_command[-1])
+                def option(name): return argv[argv.index(name) + 1]
+                inventory_path = self._remote_path(role, option("--inventory"))
+                try:
+                    manifest = create_guest_archive(workspace_roots[role], archive_roots[role],
+                        maximum_part_bytes=int(option("--maximum-part-bytes")),
+                        maximum_archive_bytes=int(option("--maximum-archive-bytes")),
+                        minimum_free_bytes=int(option("--minimum-free-bytes")),
+                        expected_inventory=json.loads(inventory_path.read_text(encoding="utf-8")))
+                except Exception as exc:
+                    raise AssertionError(
+                        f"fake guest archive creation failed: {type(exc).__name__}: {exc}") from exc
+                return result(request.action_id, json.dumps(manifest, sort_keys=True))
+            return result(request.action_id)
+
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            role = self._role(request.action_id)
+            script = shlex.split(request.argv[-1])[-1]
+            match = re.search(r"exec 3< (.*?) \|\| exit 1;", script)
+            assert match, script
+            remote_path = shlex.split(match.group(1))[0]
+            source = self._remote_path(role, remote_path)
+            payload = source.read_bytes()
+            Path(destination).write_bytes(payload[:maximum_payload_bytes])
+            within_cap = len(payload) <= maximum_payload_bytes
+            return result(request.action_id, success=within_cap,
+                stderr=(BOUNDED_COPY_EOF_MARKER + "\n") if within_cap else "source grew")
+
+    transport = RemoteArchiveTransport()
+    guest_archives = [create_remote_guest_archive(c, role=role, source_directory="/var/lib/cnb/work",
+        archive_directory=f"/tmp/cnb-closed-{c.deployment_id}-{role}",
+        expected_inventory=inventories[role], maximum_part_bytes=4096,
+        maximum_archive_bytes=2_000_000, minimum_free_bytes=0, runner=transport,
+        deadline=deadline(), clock=lambda: 100) for role in ("vm_a", "vm_b")]
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    receive_actions = []
+
+    def fetch(role, part):
+        return _fetch_bounded_guest_archive_part(runner=transport, connection=c, role=role,
+            source_path=f"/tmp/cnb-closed-{c.deployment_id}-{role}/{part['path']}",
+            destination=staging / "one.part", staging_directory=staging,
+            size_bytes=part["size_bytes"], maximum_staging_bytes=4096,
+            minimum_free_bytes=1024, controller_quota_free_bytes=16_384,
+            deadline=deadline(), clock=lambda: 100,
+            action_id=f"f09-guest-part-{c.deployment_id}-{role}-1", actions=receive_actions)
+
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=FakeGCS(), bucket="valid-bucket", provider="aws",
+        experiment_id="EXP-001", run_id="remote-archive-001", closed_inventory={"items": []},
+        maximum_part_bytes=4096, maximum_archive_bytes=2_000_000,
+        minimum_controller_free_bytes=1024, controller_quota_free_bytes=16_384,
+        deadline=deadline(), clock=lambda: 100)
+    assert receipt["status"] == "verified"
+    assert len(receive_actions) == 2
+    assert any(action.startswith("f09-guest-archive-") for action in transport.calls)
+    assert not list(staging.iterdir())
+
+
+def test_archive_sink_source_growth_is_bounded_and_not_retried(tmp_path):
+    runner = _ArchivePartReceiver(b"grown-part", outcome="failed")
+    with pytest.raises(RuntimeError, match="bounded archive part retrieval failed"):
+        _receive_archive_part(tmp_path, runner, size=6, staging_limit=6, quota=16)
+    assert len(runner.calls) == 1
+    assert runner.calls[0][1] == 6
+    assert not (tmp_path / "staging" / "one.part").exists()
+
+
+@pytest.mark.parametrize(("staging_limit", "quota", "remaining"), [
+    (5, 16, 30), (6, 15, 30), (6, 16, 0),
+])
+def test_archive_sink_overflow_and_cancelled_window_fail_before_transport(
+        tmp_path, staging_limit, quota, remaining):
+    runner = _ArchivePartReceiver(b"part-data")
+    with pytest.raises((OSError, TimeoutError)):
+        _receive_archive_part(tmp_path, runner, size=6, staging_limit=staging_limit,
+            quota=quota, remaining=remaining)
+    assert runner.calls == []
+    assert not (tmp_path / "staging" / "one.part").exists()
+
+
+def test_archive_sink_interrupted_receiver_removes_partial_and_does_not_retry(tmp_path):
+    runner = _ArchivePartReceiver(b"part-data", outcome="interrupted", copied_bytes=3)
+    with pytest.raises(RuntimeError, match="bounded archive part retrieval failed"):
+        _receive_archive_part(tmp_path, runner)
+    assert len(runner.calls) == 1
+    assert not (tmp_path / "staging" / "one.part").exists()
