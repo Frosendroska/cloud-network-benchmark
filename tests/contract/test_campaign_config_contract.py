@@ -120,7 +120,7 @@ def test_northern_locality_rejects_wrong_zone_identity_and_network(
         CampaignConfiguration.model_validate(data)
     item["zones"] = {"vm_a": zone, "vm_b": zone}
     data["experiment_id"] = wrong_experiment
-    with pytest.raises(ValueError, match="regions/zones do not match"):
+    with pytest.raises(ValueError, match="failure_check experiment identity must match its registered provider"):
         CampaignConfiguration.model_validate(data)
     data["experiment_id"] = {"aws":"EXP-900", "azure":"EXP-901", "gcp":"EXP-902"}[provider]
     item["network"]["address_spaces"][region] = "10.99.0.0/16" if provider != "gcp" else "10.99.1.0/24"

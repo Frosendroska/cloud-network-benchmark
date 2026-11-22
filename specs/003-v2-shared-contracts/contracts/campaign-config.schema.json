@@ -1237,6 +1237,29 @@
         "properties": {
           "mode": {
             "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "failure_check"
+          }
+        },
+        "required": [
+          "context"
+        ]
+      },
+      "then": {
+        "properties": {
+          "selected_providers": {
+            "maxItems": 1,
+            "minItems": 1
           }
         }
       }
@@ -1287,6 +1310,85 @@
       "if": {
         "properties": {
           "context": {
+            "const": "failure_check"
+          },
+          "selected_providers": {
+            "contains": {
+              "const": "aws"
+            }
+          }
+        },
+        "required": [
+          "context",
+          "selected_providers"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-900"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-903"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "placement_optimization"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-003"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
             "const": "replacement"
           },
           "replacement_context": {
@@ -1321,6 +1423,85 @@
       "if": {
         "properties": {
           "context": {
+            "const": "failure_check"
+          },
+          "selected_providers": {
+            "contains": {
+              "const": "azure"
+            }
+          }
+        },
+        "required": [
+          "context",
+          "selected_providers"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-901"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-903"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "placement_optimization"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-003"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
             "const": "replacement"
           },
           "replacement_context": {
@@ -1347,6 +1528,85 @@
             },
             "maxItems": 1,
             "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "failure_check"
+          },
+          "selected_providers": {
+            "contains": {
+              "const": "gcp"
+            }
+          }
+        },
+        "required": [
+          "context",
+          "selected_providers"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-902"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "same_zone"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-903"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "context": {
+            "const": "standard"
+          },
+          "mode": {
+            "const": "acceptance"
+          },
+          "scenario": {
+            "const": "placement_optimization"
+          }
+        },
+        "required": [
+          "mode",
+          "context",
+          "scenario"
+        ]
+      },
+      "then": {
+        "properties": {
+          "experiment_id": {
+            "const": "EXP-003"
           }
         }
       }

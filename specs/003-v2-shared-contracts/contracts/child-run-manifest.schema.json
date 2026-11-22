@@ -2875,6 +2875,89 @@
             "properties": {
               "mode": {
                 "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "failure_check"
+              },
+              "provider": {
+                "const": "aws"
+              }
+            },
+            "required": [
+              "context",
+              "provider"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-900"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-903"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "placement_optimization"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-003"
               }
             }
           }
@@ -2910,6 +2993,86 @@
           "if": {
             "properties": {
               "context": {
+                "const": "failure_check"
+              },
+              "provider": {
+                "const": "azure"
+              }
+            },
+            "required": [
+              "context",
+              "provider"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-901"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-903"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "placement_optimization"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-003"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
                 "const": "replacement"
               },
               "provider": {
@@ -2929,6 +3092,86 @@
                     "pattern": "-azure$"
                   }
                 }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "failure_check"
+              },
+              "provider": {
+                "const": "gcp"
+              }
+            },
+            "required": [
+              "context",
+              "provider"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-902"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "same_zone"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-903"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context": {
+                "const": "standard"
+              },
+              "mode": {
+                "const": "acceptance"
+              },
+              "scenario": {
+                "const": "placement_optimization"
+              }
+            },
+            "required": [
+              "mode",
+              "context",
+              "scenario"
+            ]
+          },
+          "then": {
+            "properties": {
+              "experiment_id": {
+                "const": "EXP-003"
               }
             }
           }
