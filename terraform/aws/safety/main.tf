@@ -9,7 +9,7 @@ locals {
 }
 
 resource "aws_iam_role" "expiry" {
-  name = local.role_name
+  name                 = local.role_name
   permissions_boundary = var.expiry_role_permissions_boundary_arn
   tags = var.expiry_role_permissions_boundary_arn == null ? {} : {
     cnb_run_id        = var.run_id
