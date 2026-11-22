@@ -44,6 +44,7 @@ def _validate_week_dispatch_policy(policy: Any) -> None:
         raise ValueError("WEEK dispatch requires the frozen paired S1/S3 two-entry policy")
     evidence = Path(policy.get("evidence_path", ""))
     if (not evidence.is_file() or evidence.is_symlink()
+            or any(parent.is_symlink() for parent in evidence.parents)
             or _digest(evidence) != policy.get("evidence_sha256")):
         raise ValueError("WEEK concurrency admission evidence is missing or changed")
     try:
@@ -57,6 +58,100 @@ def _validate_week_dispatch_policy(policy: Any) -> None:
             or any(char not in "0123456789abcdef" for char in source_hash)
             or not source.is_file() or source.is_symlink() or _digest(source) != source_hash):
         raise ValueError("WEEK concurrency admission evidence does not authorize the bounded S1/S3 pair")
+
+
+def _validate_acceptance_dispatch_policy(policy: Any) -> None:
+    """Recheck the separately registered, finite acceptance pair admission."""
+    if (not isinstance(policy, dict) or policy.get("policy_id") != "acceptance-paired-s1-s3-v1"
+            or policy.get("group_by") != "acceptance_slot"
+            or policy.get("scenarios") != ["S1", "S3"]
+            or policy.get("max_parallel_entries") != 2):
+        raise ValueError("acceptance dispatch requires the frozen paired S1/S3 two-entry policy")
+    evidence = Path(policy.get("evidence_path", ""))
+    if (not evidence.is_file() or evidence.is_symlink()
+            or _digest(evidence) != policy.get("evidence_sha256")):
+        raise ValueError("acceptance paired admission evidence is missing or changed")
+    try:
+        admission = json.loads(evidence.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("acceptance paired admission evidence is unreadable") from exc
+    if not isinstance(admission, dict):
+        raise ValueError("acceptance paired admission evidence must be an object")
+    source = Path(admission.get("source_path", ""))
+    source_hash = admission.get("source_sha256")
+    if (admission.get("mode") != "paired_acceptance_s1_s3" or admission.get("max_parallel_entries") != 2
+            or admission.get("start_utc") != policy.get("start_utc")
+            or not isinstance(source_hash, str) or len(source_hash) != 64
+            or any(char not in "0123456789abcdef" for char in source_hash)
+            or not source.is_absolute() or ".." in source.parts or not source.is_file() or source.is_symlink()
+            or any(parent.is_symlink() for parent in source.parents) or _digest(source) != source_hash):
+        raise ValueError("acceptance admission evidence does not authorize the bounded S1/S3 pair")
+
+
+def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the one normal S1/S3 pair; registered failure checks stay supervised."""
+    _validate_acceptance_dispatch_policy(stage.get("dispatch_policy"))
+    entries = stage.get("entries", [])
+    ids = [entry.get("entry_id") for entry in entries]
+    expected = ["V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]
+    if ids != expected:
+        raise ValueError("acceptance stage must contain only the five registered V-S1/S3 and failure identities in order")
+    pair = entries[:2]
+    if ([row.get("entry_id") for row in pair] != ["V-S1", "V-S3"]
+            or [row.get("scenario") for row in pair] != ["S1", "S3"]
+            or any(row.get("requires_supervision") for row in pair)
+            or any(not row.get("requires_supervision") for row in entries[2:])):
+        raise ValueError("acceptance dispatch is limited to one normal S1/S3 pair followed by supervised failures")
+    barrier = stage.get("post_measurement_barrier")
+    participants = barrier.get("expected_participants") if isinstance(barrier, dict) else None
+    expected = {(entry["entry_id"], provider, run_id)
+        for entry in pair for provider, run_id in entry.get("run_ids", {}).items()}
+    observed = {(row.get("entry_id"), row.get("provider"), row.get("run_id"))
+        for row in participants} if isinstance(participants, list) else set()
+    expected_root = Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-terminal"
+    expected_barrier_id = f"{stage['stage_id']}-normal-measurement-terminal"
+    if (any(set(entry.get("run_ids", {})) != {"aws", "azure", "gcp"} for entry in pair)
+            or not isinstance(barrier, dict) or barrier.get("schema_version") != 1
+            or barrier.get("barrier_id") != expected_barrier_id
+            or barrier.get("barrier_root") != str(expected_root)
+            or not isinstance(participants, list) or len(participants) != 6 or observed != expected):
+        raise ValueError("paired acceptance requires a shared terminal-measurement barrier for its exact six normal children")
+    scheduled = {_utc(row.get("scheduled_start")) for row in pair}
+    launches = {_utc(row.get("launch_at")) for row in pair}
+    start_barrier = stage.get("measurement_start_barrier")
+    start_participants = start_barrier.get("expected_participants") if isinstance(start_barrier, dict) else None
+    if (len(scheduled) != 1 or len(launches) != 1
+            or not isinstance(start_barrier, dict) or start_barrier.get("schema_version") != 1
+            or start_barrier.get("barrier_id") != f"{stage['stage_id']}-normal-measurement-start"
+            or start_barrier.get("barrier_root") != str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-start")
+            or _utc(start_barrier.get("start_utc")) not in scheduled
+            or _utc(start_barrier.get("start_utc")) != _utc(stage["dispatch_policy"].get("start_utc"))
+            or start_barrier.get("expected_participants") != participants
+            or not isinstance(start_participants, list) or len(start_participants) != 6):
+        raise ValueError("paired acceptance requires one fixed UTC start and a shared six-child readiness barrier")
+    return pair
+
+
+def _validate_reused_failure_entry(entry: dict[str, Any]) -> None:
+    reference = entry.get("reused_failure_check")
+    if not isinstance(reference, dict):
+        raise ValueError("reused failure receipt is missing its frozen reference")
+    path = Path(reference.get("source_path", ""))
+    if (not path.is_absolute() or not path.is_file() or path.is_symlink()
+            or _digest(path) != reference.get("source_sha256")):
+        raise ValueError("reused failure receipt source is missing or changed")
+    from .acceptance_review import _failure_review, _runtime_scope_sha256
+    _failure_review({"path": str(path), "sha256": reference["source_sha256"]},
+        required_entries={entry["entry_id"]})
+    row = yaml.safe_load(path.read_text(encoding="utf-8"))["checks"][entry["entry_id"]]
+    identity = row.get("config_identity", {})
+    parent = json.loads(Path(entry["parent_manifest_path"]).read_text(encoding="utf-8"))
+    if (row.get("attempt_id") != reference.get("attempt_id")
+            or identity.get("config_sha256") != _digest(entry.get("config_path"))
+            or identity.get("source_config_sha256") != entry.get("source_config_sha256")
+            or identity.get("runtime_scope_sha256") != _runtime_scope_sha256(entry.get("runtime_config_path"))
+            or identity.get("implementation_git_commit") != parent.get("implementation_git_commit")):
+        raise ValueError("reused failure receipt does not match the frozen attempt/config/runtime/source identity")
 
 
 def _week_slot_groups(stage: dict[str, Any]) -> dict[datetime, list[dict[str, Any]]]:
@@ -121,6 +216,12 @@ def _digest(path: Any) -> str | None:
     return digest.hexdigest()
 
 
+class _AggregateAdmissionError(ValueError):
+    def __init__(self, message: str, reservation_ids: list[str]):
+        super().__init__(message)
+        self.reservation_ids = list(reservation_ids)
+
+
 class CampaignDriver:
     """Run a prepared stage with an append-safe journal and injected boundaries."""
 
@@ -129,12 +230,14 @@ class CampaignDriver:
                  settings_loader: Callable[[Path], dict[str, Any]] = load_operator_settings,
                  launch: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
                  dispatch: Callable[[dict[str, Any]], Any] | None = None,
+                 pre_admit: Callable[[list[dict[str, Any]], dict[str, Any]], Any] | None = None,
                  reconcile: Callable[[dict[str, Any], dict[str, Any]], str | None] | None = None,
                  clock: Any = None, sleep: Callable[[float], None] = time.sleep):
         self.prepare = prepare
         self.validate = validate
         self.settings_loader = settings_loader
         self.launch = launch or self._launch_lifecycle
+        self.pre_admit = pre_admit if pre_admit is not None else (self._pre_admit_acceptance_pair if launch is None else None)
         self.dispatch = dispatch or self._dispatch_user_space
         self.reconcile = reconcile if reconcile is not None else (self._reconcile_lifecycle if launch is None else None)
         self.clock = clock or _SystemClock()
@@ -190,6 +293,7 @@ class CampaignDriver:
     def run(self, stage: dict[str, Any]) -> dict[str, Any]:
         state_root = Path(stage["state_root"]).resolve()
         weekly_slots = _week_slot_groups(stage) if stage.get("stage") == "week" else None
+        acceptance_pair = None
         journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
         lock_path = journal_path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +305,10 @@ class CampaignDriver:
             except (ImportError, BlockingIOError) as exc:
                 raise RuntimeError("campaign driver is already active for this stage") from exc
             journal = self._load_or_create_journal(stage, journal_path)
+            if stage.get("stage") == "acceptance":
+                normal_ids = {"V-S1", "V-S3"}
+                if any(journal["entries"].get(entry_id, {}).get("state") == "scheduled" for entry_id in normal_ids):
+                    acceptance_pair = _acceptance_pair(stage)
             self._reconcile_ambiguous(stage, journal, journal_path)
             blocked = any((item.get("result") or {}).get("cleanup_open")
                           or (item.get("result") or {}).get("launch_uncertain")
@@ -270,7 +378,17 @@ class CampaignDriver:
                 if stage.get("stage") == "week":
                     _validate_week_dispatch_policy(stage.get("dispatch_policy"))
                 if stage.get("stage") == "acceptance":
-                    groups = [[item] for item in pending]
+                    paired = acceptance_pair or []
+                    if (len(pending) != 2 or {item["entry_id"] for item in pending}
+                            != {item["entry_id"] for item in paired}):
+                        for item in pending:
+                            self._transition(journal, item["entry_id"], "missed",
+                                finished_at=_now(self.clock).isoformat(),
+                                error="paired acceptance slot is incomplete; no singleton dispatch is permitted")
+                        _write_json(journal_path, journal)
+                        blocked = True
+                        continue
+                    groups = [paired]
                 elif stage.get("stage") == "week":
                     admitted = (weekly_slots or {}).get(launch_at, [])
                     if len(pending) != 2 or {item["entry_id"] for item in pending} != {
@@ -286,8 +404,36 @@ class CampaignDriver:
                 else:
                     groups = [pending]
                 for group in groups:
+                    aggregate_reservation_ids: list[str] = []
+                    if stage.get("stage") == "acceptance" and self.pre_admit is not None:
+                        try:
+                            aggregate_reservation_ids = self.pre_admit(group, stage) or []
+                        except Exception as exc:
+                            message = f"aggregate pre-admission failed before provider calls: {type(exc).__name__}: {exc}"
+                            for entry in group:
+                                self._transition(journal, entry["entry_id"], "missed",
+                                    finished_at=_now(self.clock).isoformat(), error=message,
+                                    result={"cleanup_open": False, "pre_admission_failed": True,
+                                        "pre_admission_reservation_ids": getattr(exc, "reservation_ids", [])})
+                            _write_json(journal_path, journal)
+                            _append_log(stage, message)
+                            blocked = True
+                            break
+                    if any(entry.get("scheduled_start") is not None
+                            and _utc(entry["scheduled_start"]) <= _now(self.clock) for entry in group):
+                        for entry in group:
+                            self._transition(journal, entry["entry_id"], "missed",
+                                finished_at=_now(self.clock).isoformat(),
+                                error="fixed acceptance start passed during aggregate pre-admission; no start shift or backfill",
+                                result={"cleanup_open": False, "pre_admission_complete": True,
+                                    "pre_admission_reservation_ids": aggregate_reservation_ids})
+                        _write_json(journal_path, journal)
+                        blocked = True
+                        break
                     for entry in group:
-                        self._transition(journal, entry["entry_id"], "starting", started_at=_now(self.clock).isoformat())
+                        self._transition(journal, entry["entry_id"], "starting",
+                            started_at=_now(self.clock).isoformat(),
+                            aggregate_reservation_ids=aggregate_reservation_ids if stage.get("stage") == "acceptance" else [])
                     _write_json(journal_path, journal)
                     _append_log(stage, f"starting {', '.join(item['entry_id'] for item in group)}")
                     for entry in group:
@@ -420,6 +566,18 @@ class CampaignDriver:
                         _write_json(journal_path, journal)
                     if previous_record.get("export_status") != "verified":
                         raise ValueError(f"failure check {earlier['entry_id']} lacks closed cleanup and verified evidence")
+            if entry.get("reused_failure_check") is not None:
+                _validate_reused_failure_entry(entry)
+                record.update(state="failed", finished_at=_now(self.clock).isoformat(),
+                    result={"status": "failed", "cleanup_open": False,
+                        "measurement_reused": True,
+                        "reused_failure_evidence_sha256": entry["reused_failure_check"]["source_sha256"]},
+                    error="registered failure outcome reused from exact source-bound completed evidence",
+                    export_status="verified", supervision_confirmed_at=_now(self.clock).isoformat())
+                _write_json(journal_path, journal)
+                _append_log(stage, f"reused completed failure evidence for {entry_id}; no measurement relaunched")
+                return {"status": "reused", "stage_id": stage_id, "entry_id": entry_id,
+                    "source_sha256": entry["reused_failure_check"]["source_sha256"], "dispatch": None}
             record["supervision_confirmed_at"] = _now(self.clock).isoformat()
             pointer = root / "active-stage.json"
             _write_json(pointer, {"stage_id": stage_id, "stage_path": str(prepared_path),
@@ -707,6 +865,47 @@ class CampaignDriver:
     @staticmethod
     def _free_disk(stage: dict[str, Any]) -> int:
         return shutil.disk_usage(Path(stage["results_root"])).free
+
+    def _pre_admit_acceptance_pair(self, entries: list[dict[str, Any]], stage: dict[str, Any]) -> list[str]:
+        """Reserve both complete three-provider liabilities before either lifecycle starts."""
+        if [entry.get("entry_id") for entry in entries] != ["V-S1", "V-S3"]:
+            raise ValueError("acceptance pre-admission requires the complete V-S1/V-S3 pair")
+        from .admission import BudgetLedger, load_cost_inputs
+        from .config import resolve_campaign
+        from .lifecycle_runtime import build_admission_request, load_initialized_campaign, load_runtime_config
+
+        root = Path(stage["repository_root"]).resolve(strict=True)
+        reservations = []
+        ledger = None
+        for entry in entries:
+            config_path = Path(entry["config_path"])
+            runtime_path = Path(entry["runtime_config_path"])
+            parent_path = Path(entry["parent_manifest_path"])
+            runtime = load_runtime_config(runtime_path, selected_providers={"aws", "azure", "gcp"})
+            parent, children = load_initialized_campaign(parent_path, repository_root=root,
+                config_path=config_path, schedule_path=None)
+            campaign, _ = resolve_campaign(config_path, root)
+            costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
+            if ledger is None:
+                ledger = BudgetLedger(runtime["ledger"]["path"], scope_id=runtime["ledger"]["scope_id"],
+                    utc_now=lambda: _now(self.clock), monotonic_now=getattr(self.clock, "monotonic", time.monotonic),
+                    controller_session_id=stage["controller_session_id"])
+                if not ledger.path.exists():
+                    if runtime["ledger"]["initialize_if_missing"] is not True:
+                        raise ValueError("acceptance shared ledger is missing and initialization is not authorized")
+                    ledger.initialize(costs)
+            request, plan = build_admission_request(campaign=campaign, parent=parent, children=children,
+                costs=costs, runtime=runtime, ledger_state=ledger.inspect(),
+                controller_session_id=stage["controller_session_id"])
+            decision = ledger.reserve(request, plan=plan)
+            if decision.status != "reserved" or not decision.newly_reserved:
+                reasons = ", ".join(decision.reasons) or "reservation already exists for this attempt"
+                raise _AggregateAdmissionError(
+                    f"paired acceptance aggregate pre-admission blocked before provider calls: {reasons}", reservations)
+            reservations.append(decision.evidence.reservation_id.value)
+        if len(reservations) != 2 or len(set(reservations)) != 2:
+            raise _AggregateAdmissionError("paired acceptance failed to reserve two distinct complete parent liabilities", reservations)
+        return reservations
 
     @staticmethod
     def _launch_lifecycle(entry: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
