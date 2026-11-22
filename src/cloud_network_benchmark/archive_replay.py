@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -506,9 +507,10 @@ def finalize_restored_capsule(*, capsule_path: Path, native_root: Path,
 
 
 def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_sha256: str,
-        backend: Any, bucket: str, archive_staging_root: Path, materialization_root: Path,
+        backend: Any | None, bucket: str, archive_staging_root: Path, materialization_root: Path,
         repository_root: Path, maximum_part_bytes: int, minimum_free_bytes: int = 0,
         evaluated_at: datetime | None = None, prune_verified_scratch: bool = False,
+        backend_factory: Any | None = None, closed_export_entry_id: str | None = None,
         controller_quota_free_bytes: int | None = None,
         controller_quota_evidence_path: Path | None = None,
         controller_quota_evidence_sha256: str | None = None,
@@ -551,6 +553,9 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
                 or type(projected_other_growth_bytes) is not int or projected_other_growth_bytes <= 0
                 or type(minimum_free_bytes) is not int or minimum_free_bytes <= 0):
             raise ValueError("opt-in replay pruning requires fresh quota evidence, positive metadata, workspace-growth, and reserve bounds")
+        if (not isinstance(closed_export_entry_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", closed_export_entry_id)):
+            raise ValueError("opt-in replay pruning requires the registered closed-export entry id")
         _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
             evidence_path=Path(controller_quota_evidence_path),
             evidence_sha256=controller_quota_evidence_sha256,
@@ -586,6 +591,10 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
                         (materialization_root, "materialization root")):
         if path.is_symlink() or not path.is_dir() or path.resolve(strict=True) != path.absolute():
             raise ValueError(f"{label} must be an existing real directory without symlink components")
+    if backend is None:
+        if backend_factory is None:
+            raise ValueError("archive replay requires a backend or a lazy backend factory")
+        backend = backend_factory()
     native_roots = {}
     for provider, receipt in sorted(archives.items()):
         if receipt.get("bucket") != bucket:
@@ -705,9 +714,12 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
             output["status"] = "replayed_invalid"
     from .campaign_export import export_entry, verify_export
     campaign_id = parent.campaign_id
-    # Campaign ids are the stage entry ids. Publishing at the regular closed
-    # entry destination lets archive reconciliation reuse this verified export.
-    export_root = repository_root / "results" / "closed" / str(campaign_id) / "export"
+    if prune_verified_scratch:
+        # The CLI verifies this registered entry id against its private prepared
+        # stage and archive-pending journal before this API receives it.
+        export_root = repository_root / "results" / "closed" / str(closed_export_entry_id) / "export"
+    else:
+        export_root = repository_root / "results" / "analysis" / "archive-replays" / str(campaign_id)
     entry = {"entry_id": str(campaign_id),
         "run_ids": {provider: child.run_id for provider, child in children.items()},
         "parent_manifest_path": str(parent_path)}
@@ -730,6 +742,8 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     output["analysis"] = {"status": "completed", "selection_path": str(selection),
         "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest(),
         "report_path": str(report_path), "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
+    if prune_verified_scratch:
+        output["closed_export_entry_id"] = closed_export_entry_id
     if replay_storage_projection is not None:
         output["storage_projection"] = replay_storage_projection
     output["replayed_manifests"] = {

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -13,7 +15,7 @@ from .admission import load_cost_inputs
 from .config import resolve_campaign
 from .scheduling import load_schedule
 from .lifecycle_bundle import recommend_calibration_common_n
-from .lifecycle_runtime import load_runtime_config, load_initialized_campaign
+from .lifecycle_runtime import _constant, _object, load_runtime_config, load_initialized_campaign
 
 
 def _archive_status_projection(result: Any) -> dict[str, Any]:
@@ -27,6 +29,76 @@ def _archive_status_projection(result: Any) -> dict[str, Any]:
         "controller_archive_disk_bytes", "staging_peak_bytes", "staging_filesystem_free_bytes",
         "completion_generation", "reason", "error", "partial_objects"}
     return {key: status[key] for key in sorted(keys & status.keys())}
+
+
+def _verified_replay_entry_id(*, capsule_path: Path, capsule_sha256: str,
+                              observer: dict[str, Any], repository_root: Path) -> str:
+    """Bind replay export reuse to this runtime's registered archive-pending entry."""
+    capsule_path = Path(capsule_path)
+    if capsule_path.is_symlink() or not capsule_path.is_file():
+        raise ValueError("replay capsule must be a regular non-symlink file")
+    capsule_bytes = capsule_path.read_bytes()
+    if hashlib.sha256(capsule_bytes).hexdigest() != capsule_sha256:
+        raise ValueError("replay capsule bytes differ from their separately bound digest")
+    capsule = json.loads(capsule_bytes)
+    if capsule.get("schema_version") != 2 or capsule.get("status") != "archive_pending_replay":
+        raise ValueError("replay capsule is not a batch archive-pending capsule")
+    stage_path = Path(observer["prepared_stage_path"])
+    journal_path = Path(observer["journal_path"])
+    if any(path.is_symlink() or not path.is_file() for path in (stage_path, journal_path)):
+        raise ValueError("registered prepared stage or campaign journal is unavailable")
+    stage = json.loads(stage_path.read_text(encoding="utf-8"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if (stage.get("stage_id") != observer.get("stage_id")
+            or stage.get("stage_id") != journal.get("stage_id")
+            or Path(stage.get("repository_root", "")).resolve(strict=True) != repository_root.resolve(strict=True)):
+        raise ValueError("registered stage identity or repository root differs from replay runtime")
+    entry_id = observer.get("entry_id")
+    entries = [row for row in stage.get("entries", [])
+        if isinstance(row, dict) and row.get("entry_id") == entry_id]
+    if len(entries) != 1:
+        raise ValueError("runtime does not identify exactly one registered campaign entry")
+    entry = entries[0]
+    capsule_runs = {provider: str(child.get("run_id"))
+        for provider, child in capsule.get("child_manifests", {}).items() if isinstance(child, dict)}
+    if not capsule_runs or entry.get("run_ids") != capsule_runs:
+        raise ValueError("registered campaign run ids differ from the replay capsule")
+    parent_relative = Path(capsule.get("parent_path", ""))
+    if parent_relative.is_absolute() or ".." in parent_relative.parts:
+        raise ValueError("replay capsule parent path is unsafe")
+    capsule_parent = (repository_root / parent_relative).resolve(strict=True)
+    registered_parent = Path(entry.get("parent_manifest_path", "")).resolve(strict=True)
+    if capsule_parent != registered_parent:
+        raise ValueError("registered parent manifest differs from replay capsule")
+    record = journal.get("entries", {}).get(entry_id)
+    result = record.get("result") if isinstance(record, dict) else None
+    replay_ref = result.get("replay_capsule") if isinstance(result, dict) else None
+    if (not isinstance(record, dict) or record.get("state") != "archive_pending_validation"
+            or not isinstance(result, dict) or result.get("cleanup_open") is not False
+            or not isinstance(replay_ref, dict)
+            or replay_ref.get("sha256") != capsule_sha256
+            or Path(replay_ref.get("path", "")).resolve(strict=True) != capsule_path.resolve(strict=True)):
+        raise ValueError("campaign journal does not bind this capsule to a closed archive-pending entry")
+    return entry_id
+
+
+def _read_replay_quota_evidence(path: Path, expected_sha256: str) -> dict[str, Any]:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("fresh quota evidence must be a regular non-symlink file")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise ValueError("fresh quota evidence differs from its separately bound SHA-256")
+    document = json.loads(content, object_pairs_hook=_object, parse_constant=_constant)
+    fields = ("measured_free_bytes", "measured_at", "metadata_headroom_bytes",
+        "projected_other_growth_bytes", "reserve_bytes")
+    if (not isinstance(document, dict) or any(key not in document for key in fields)
+            or any(type(document[key]) is not int or document[key] <= 0
+                for key in ("measured_free_bytes", "metadata_headroom_bytes",
+                    "projected_other_growth_bytes", "reserve_bytes"))
+            or not isinstance(document["measured_at"], str)):
+        raise ValueError("quota evidence must bind measured bytes/time, metadata, other growth, and reserve")
+    return document
 
 
 def preview_lifecycle(*, config_path: Path, repository_root: Path,
@@ -105,6 +177,12 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--runtime-config", required=True, type=Path)
     replay.add_argument("--restore-path", required=True, type=Path,
         help="current roomy destination; free space is checked again at restore time")
+    replay.add_argument("--prune-verified-scratch", action="store_true",
+        help="after valid replay and verified export, remove only generation-verified downloaded archive/native scratch")
+    replay.add_argument("--quota-evidence", type=Path,
+        help="fresh user-quota JSON receipt for opt-in pruning (must be measured within 15 minutes)")
+    replay.add_argument("--quota-evidence-sha256",
+        help="separate SHA-256 binding for --quota-evidence")
     replay.add_argument("--format", choices=("human", "json"), default="json")
     return parser
 
@@ -291,15 +369,40 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             sink = runtime.get("archive_sink")
             if sink is None:
                 raise ValueError("runtime config has no archive sink")
+            replay_options = {}
+            if args.prune_verified_scratch:
+                if args.quota_evidence is None or not args.quota_evidence_sha256:
+                    raise ValueError("opt-in replay pruning requires --quota-evidence and --quota-evidence-sha256")
+                if not re.fullmatch(r"[a-f0-9]{64}", args.quota_evidence_sha256):
+                    raise ValueError("quota evidence SHA-256 must be a lowercase SHA-256 digest")
+                quota = _read_replay_quota_evidence(args.quota_evidence, args.quota_evidence_sha256)
+                observer = runtime.get("observer")
+                if not isinstance(observer, dict):
+                    raise ValueError("opt-in replay pruning requires the registered observer entry identity")
+                entry_id = _verified_replay_entry_id(capsule_path=args.capsule,
+                    capsule_sha256=args.capsule_sha256, observer=observer,
+                    repository_root=Path.cwd())
+                replay_options = {"prune_verified_scratch": True,
+                    "closed_export_entry_id": entry_id,
+                    "controller_quota_free_bytes": quota["measured_free_bytes"],
+                    "controller_quota_evidence_path": args.quota_evidence,
+                    "controller_quota_evidence_sha256": args.quota_evidence_sha256,
+                    "metadata_headroom_bytes": quota["metadata_headroom_bytes"],
+                    "projected_other_growth_bytes": quota["projected_other_growth_bytes"],
+                    "minimum_free_bytes": quota["reserve_bytes"]}
+            elif args.quota_evidence is not None or args.quota_evidence_sha256 is not None:
+                raise ValueError("quota evidence arguments require --prune-verified-scratch")
             from .gcs_archive import google_cloud_storage_backend
             from .archive_replay import restore_and_finalize_batch_capsule
             output = restore_and_finalize_batch_capsule(capsule_path=args.capsule,
                 expected_capsule_sha256=args.capsule_sha256,
-                backend=google_cloud_storage_backend(sink), bucket=sink["bucket"],
+                backend=None, backend_factory=lambda: google_cloud_storage_backend(sink), bucket=sink["bucket"],
                 archive_staging_root=sink["staging_directory"],
                 materialization_root=args.restore_path, repository_root=Path.cwd(),
                 maximum_part_bytes=sink["maximum_staging_bytes"],
-                minimum_free_bytes=sink["minimum_controller_free_bytes"])
+                minimum_free_bytes=replay_options.get("minimum_free_bytes",
+                    sink["minimum_controller_free_bytes"]), **{key: value for key, value in replay_options.items()
+                        if key != "minimum_free_bytes"})
             print(json.dumps(output, indent=2, sort_keys=True))
             return 0 if output["status"] == "replayed" else 1
         # Cleanup is rebuilt only from the private recovery journal, its saved

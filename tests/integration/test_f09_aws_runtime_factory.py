@@ -948,6 +948,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     integrity_faults = {"missing_part", "mutated_part", "wrong_generation"}
     quota_args = {}
     if fault in {"prune_and_reconcile", "quota_underflow"}:
+        registered_entry_id = "V-S1"
         free_bytes = 10**9
         metadata_bytes = 1_000_000
         growth_bytes = 900_000_000 if fault == "quota_underflow" else 1_000_000
@@ -958,7 +959,9 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             "projected_other_growth_bytes": growth_bytes,
             "reserve_bytes": reserve_bytes,
             "measured_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
-        quota_args = {"prune_verified_scratch": True, "controller_quota_free_bytes": free_bytes,
+        quota_args = {"prune_verified_scratch": True,
+            "closed_export_entry_id": registered_entry_id,
+            "controller_quota_free_bytes": free_bytes,
             "controller_quota_evidence_path": quota_path,
             "controller_quota_evidence_sha256": hashlib.sha256(quota_path.read_bytes()).hexdigest(),
             "metadata_headroom_bytes": metadata_bytes, "projected_other_growth_bytes": growth_bytes,
@@ -974,7 +977,6 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
         assert not list(materialized.iterdir())
         restored = {"status": "quota_rejected_before_materialization"}
     elif fault in integrity_faults:
-        import pytest
         object_ref = receipt["objects"][0]
         stored = backend.objects[object_ref["key"]]
         if fault == "missing_part":
@@ -1008,7 +1010,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             f"{provider}-{receipt['manifest']['experiment_id']}-{receipt['run_id']}.guest-archive")
         assert not archive_scratch.exists()
         assert backend.objects == remote_objects_before
-        export_root = repository_root / "results" / "closed" / str(parent.campaign_id) / "export"
+        export_root = repository_root / "results" / "closed" / "V-S1" / "export"
         assert export_root.is_dir()
         for item in closed.items:
             target = root / item.destination_path
@@ -1024,7 +1026,8 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             controller_session_id="fake-session")
         entry = stage["entries"][0]
         if fault == "prune_and_reconcile":
-            entry["entry_id"] = str(parent.campaign_id)
+            entry["entry_id"] = "V-S1"
+            assert entry["entry_id"] != str(parent.campaign_id)
         entry.update(run_ids={provider: child.run_id}, parent_manifest_path=str(parent_path),
             private_root=str(Path(recovery_path).parent),
             result_path=str(repository_root / child_ref.result_path))
@@ -1095,7 +1098,8 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.manifests import StaticGitProvenance
     archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
         and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
-            "mutated_part", "wrong_generation", "reconcile_campaign"})
+            "mutated_part", "wrong_generation", "reconcile_campaign", "prune_and_reconcile",
+            "quota_underflow"})
     if archive_roundtrip:
         import shutil
         results_root = repository_root / "results"
@@ -1277,9 +1281,13 @@ def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_
                 candidate.unlink(missing_ok=True)
         if isolated_results.is_dir() and not isolated_results.is_symlink():
             shutil.rmtree(isolated_results)
-        replay_root = repository_root / "results" / "closed" / replay_campaign_id / "export"
-        if replay_root.is_dir() and not replay_root.is_symlink():
-            shutil.rmtree(replay_root.parent)
+        closed_export = repository_root / "results" / "closed" / replay_campaign_id / "export"
+        if closed_export.is_dir() and not closed_export.is_symlink():
+            shutil.rmtree(closed_export)
+            closed_export.parent.rmdir()
+        analysis_export = repository_root / "results" / "analysis" / "archive-replays" / replay_campaign_id
+        if analysis_export.is_dir() and not analysis_export.is_symlink():
+            shutil.rmtree(analysis_export)
     request.addfinalizer(cleanup_archive_sink_workspace)
     child = children["aws"]
     if receive_fault == "readback":
