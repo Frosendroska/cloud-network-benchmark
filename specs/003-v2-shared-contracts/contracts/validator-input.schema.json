@@ -2643,9 +2643,6 @@
     "implementation_git_commit": {
       "$ref": "#/$defs/Evidence_str_"
     },
-    "iperf3_control_evidence": {
-      "$ref": "#/$defs/Evidence_Dict_str__Any__"
-    },
     "measurement_direction": {
       "$ref": "#/$defs/MeasurementDirection"
     },

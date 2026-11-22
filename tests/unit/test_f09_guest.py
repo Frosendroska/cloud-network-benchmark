@@ -578,7 +578,7 @@ def test_stage_guest_runtime_uses_trusted_scp_and_verifies_digest_revision_and_d
             assert request.action_type == "ssh"
             assert "sha256sum" in request.argv[-1] and "python3 -m venv" in request.argv[-1]
             assert "-m pip install" in request.argv[-1]
-            assert "pydantic>=2.0,<3" in request.argv[-1] and "PyYAML>=6.0,<7" in request.argv[-1]
+            assert "pydantic>=2.13.5,<3" in request.argv[-1] and "PyYAML>=6.0,<7" in request.argv[-1]
             return result(request.action_id, json.dumps({"python":"3.11.13", "pydantic":"2.14.0", "yaml":"6.0.2"}))
     runner = Runner()
     evidence = stage_guest_runtime(connected, source_root=repository_root, source_revision="a" * 40,
