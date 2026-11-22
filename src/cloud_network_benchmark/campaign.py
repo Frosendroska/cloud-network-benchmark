@@ -446,7 +446,7 @@ class CampaignDriver:
                             try:
                                 result = future.result()
                                 status = result.get("status") if isinstance(result, dict) else None
-                                if status not in {"complete", "failed"}:
+                                if status not in {"complete", "failed", "archive_pending_validation"}:
                                     status = "failed"
                                 result_payload = result if isinstance(result, dict) else {"returncode": result}
                                 if status == "failed" and "cleanup_open" not in result_payload:
@@ -465,6 +465,7 @@ class CampaignDriver:
                             _append_log(stage, f"{entry_id}: {journal['entries'][entry_id]['state']}")
                             if ((journal["entries"][entry_id].get("result") or {}).get("cleanup_open")
                                     or (journal["entries"][entry_id].get("result") or {}).get("launch_uncertain")
+                                    or journal["entries"][entry_id]["state"] == "archive_pending_validation"
                                     or (stage.get("stage") == "acceptance"
                                         and journal["entries"][entry_id]["state"] == "failed")
                                     or (stage.get("stage") == "week"
@@ -485,6 +486,48 @@ class CampaignDriver:
             _finalize_exports(stage, journal, result)
             _append_log(stage, f"stage {stage['stage_id']} status {result['status']}; counts {result['counts']}")
             return result
+
+    def reconcile_archive(self, state_root: Path, stage_id: str, entry_id: str, receipt_path: Path) -> dict[str, Any]:
+        """Close an archive-pending entry only from its capsule-bound replay receipt."""
+        root = Path(state_root); folder = root / stage_id
+        with _file_lock(root / ".campaign-driver.lock", blocking=False):
+            stage = json.loads((folder / "prepared-stage.json").read_text(encoding="utf-8"))
+            journal_path = folder / "campaign-journal.json"
+            journal = self._load_or_create_journal(stage, journal_path)
+            record = journal["entries"].get(entry_id)
+            if not record or record.get("state") != "archive_pending_validation":
+                raise ValueError("entry is not awaiting archive validation")
+            prior = record.get("result") or {}; capsule = prior.get("replay_capsule")
+            if not isinstance(capsule, dict) or capsule.get("status") != "archive_pending_replay":
+                raise ValueError("journal has no source-bound replay capsule")
+            receipt = Path(receipt_path)
+            if receipt.is_symlink() or not receipt.is_file():
+                raise ValueError("replay receipt must be a regular file")
+            capsule_file = Path(capsule.get("path", ""))
+            if capsule_file.is_symlink() or not capsule_file.is_file() or _digest(capsule_file) != capsule.get("sha256"):
+                raise ValueError("source replay capsule is missing or changed")
+            capsule_doc = json.loads(capsule_file.read_text(encoding="utf-8"))
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            validations = payload.get("validation", {})
+            expected_archives = {provider: {"manifest_sha256": item.get("manifest_sha256"),
+                "completion_generation": item.get("completion_generation")}
+                for provider, item in capsule_doc.get("archives", {}).items()}
+            observed_archives = {provider: {"manifest_sha256": item.get("manifest_sha256"),
+                "completion_generation": item.get("completion_generation")}
+                for provider, item in payload.get("archives", {}).items()}
+            if (payload.get("status") != "replayed" or payload.get("capsule_sha256") != capsule.get("sha256")
+                    or observed_archives != expected_archives
+                    or set(validations) != set(prior.get("run_ids", {}))
+                    or any(row.get("status", {}).get("data_validity") != "valid" for row in validations.values())
+                    or payload.get("analysis", {}).get("status") != "completed"):
+                raise ValueError("receipt does not prove valid native replay and analysis for this capsule")
+            record["result"] = {**prior, "archive_replay_receipt": str(receipt.resolve()),
+                "archive_replay_receipt_sha256": _digest(receipt), "archive_validation": "valid"}
+            record.update(state="complete", finished_at=_now(self.clock).isoformat(), error=None)
+            _write_json(journal_path, journal)
+            entry = next(row for row in stage["entries"] if row["entry_id"] == entry_id)
+            self._archive_closed_entry(stage, entry, record); _write_json(journal_path, journal)
+            return _status_payload(stage, journal)
 
     def _exclude_expired_slots(self, entries: list[dict[str, Any]], journal: dict[str, Any],
                                journal_path: Path, now: datetime) -> list[dict[str, Any]]:
@@ -611,7 +654,7 @@ class CampaignDriver:
                     try:
                         result = self.launch(entry, stage)
                         status = result.get("status") if isinstance(result, dict) else None
-                        status = status if status in {"complete", "failed"} else "failed"
+                        status = status if status in {"complete", "failed", "archive_pending_validation"} else "failed"
                         result_payload = result if isinstance(result, dict) else {"returncode": result}
                         if status == "failed" and "cleanup_open" not in result_payload:
                             result_payload["cleanup_open"] = True
@@ -649,13 +692,14 @@ class CampaignDriver:
                 prepared_path = path.parent / "prepared-stage.json"
                 prepared = json.loads(prepared_path.read_text(encoding="utf-8")) if prepared_path.is_file() else {}
                 counts = {state: sum(row.get("state") == state for row in value.get("entries", {}).values())
-                          for state in ("scheduled", "starting", "running", "complete", "failed", "missed")}
+                          for state in ("scheduled", "starting", "running", "archive_pending_validation", "complete", "failed", "missed")}
                 counts["expected"] = len(value.get("entries", {}))
                 pending_supervision = any(row.get("blocked_reason") in {"supervision_required", "cleanup_pending"}
                                           and row.get("state") == "scheduled"
                                           for row in value.get("entries", {}).values())
                 stage_status = ("active" if counts["starting"] + counts["running"] else
                                 "awaiting_operator" if pending_supervision else
+                                "archive_pending_validation" if counts["archive_pending_validation"] else
                                 "active" if counts["scheduled"] else
                                 "failed" if counts["failed"] else
                                 "missed" if counts["missed"] else "complete")
@@ -1150,7 +1194,7 @@ def _load_plan(path: Path) -> dict[str, Any]:
 
 def _status_payload(stage: dict[str, Any], journal: dict[str, Any]) -> dict[str, Any]:
     counts = {state: sum(item["state"] == state for item in journal["entries"].values())
-              for state in ("scheduled", "starting", "running", "complete", "failed", "missed")}
+              for state in ("scheduled", "starting", "running", "archive_pending_validation", "complete", "failed", "missed")}
     counts["expected"] = len(journal["entries"])
     next_entry = next((entry for entry in stage["entries"]
                        if journal["entries"][entry["entry_id"]]["state"] == "scheduled"), None)
@@ -1158,7 +1202,8 @@ def _status_payload(stage: dict[str, Any], journal: dict[str, Any]) -> dict[str,
                    and item["state"] == "scheduled"
                    for item in journal["entries"].values())
     settled = counts["scheduled"] == 0 or awaiting
-    outcome = "failed" if counts["failed"] else "missed" if counts["missed"] else "complete"
+    outcome = ("archive_pending_validation" if counts["archive_pending_validation"] else
+               "failed" if counts["failed"] else "missed" if counts["missed"] else "complete")
     return {"stage_id": stage["stage_id"], "status": "awaiting_operator" if awaiting else outcome if settled else "active",
             "current_or_next_entry": next_entry["entry_id"] if next_entry else None,
             "counts": counts, "entries": journal["entries"],
@@ -1222,7 +1267,7 @@ def _finalize_exports(stage: dict[str, Any], journal: dict[str, Any], result: di
     export_status = "not_ready"
     selection = None
     try:
-        pending = any(item["state"] in {"scheduled", "starting", "running"} for item in journal["entries"].values())
+        pending = any(item["state"] in {"scheduled", "starting", "running", "archive_pending_validation"} for item in journal["entries"].values())
         completed_entries = [] if pending else [entry for entry in stage["entries"]
                             if journal["entries"][entry["entry_id"]]["state"] in {"complete", "failed"}]
         if pending:

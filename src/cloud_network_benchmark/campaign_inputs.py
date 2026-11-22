@@ -352,6 +352,20 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         missing_tools = [name for name in ("terraform", "aws", "az", "gcloud", "ssh", "scp") if shutil.which(name) is None]
         if missing_tools:
             raise ValueError("install required controller tools on Linux: " + ", ".join(missing_tools))
+        prebuilt_bundle = settings.get("prebuilt_bundle")
+        if prebuilt_bundle is not None:
+            if not isinstance(prebuilt_bundle, dict) or set(prebuilt_bundle) != {"path", "sha256"}:
+                raise ValueError("prebuilt_bundle requires exactly the reviewed local path and SHA-256")
+            from .bootstrap import BootstrapConfig
+            try:
+                BootstrapConfig.model_validate({**_bootstrap(prebuilt_bundle),
+                    "install_prefix": "/var/lib/cnb/install"})
+            except (TypeError, ValueError) as exc:
+                raise ValueError("prebuilt_bundle path, digest or production source pins are invalid") from exc
+            timeouts = settings.get("timeouts", {})
+            if (timeouts.get("command_seconds", 90) != 90
+                    or timeouts.get("transfer_seconds", 45) != 45):
+                raise ValueError("prebuilt bundle profile must preserve the accepted 90s command and 45s transfer limits")
         minimum = settings.get("minimum_free_bytes")
         if type(minimum) is not int or minimum <= 0:
             raise ValueError("set positive minimum_free_bytes from measured stage storage needs")
@@ -481,7 +495,7 @@ def _support_payloads(settings):
     return {"aws": aws, "azure": azure, "gcp": gcp}
 
 
-def _bootstrap():
+def _bootstrap(prebuilt_bundle=None):
     # Existing source/patch identities verified by SourceBuild, not invented prices.
     return {"sources": [
         {"tool": "sockperf", "source_url": "https://codeload.github.com/Mellanox/sockperf/tar.gz/5ebd327da983225321818c0355db922515e026bd",
@@ -489,14 +503,16 @@ def _bootstrap():
          "source_sha256": "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e",
          "upstream_commit": "5ebd327da983225321818c0355db922515e026bd",
          "observation_patch_path": "tool_patches/sockperf-3.10-acquisition.patch",
-         "observation_patch_sha256": "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285"},
+         "observation_patch_sha256": "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc"},
         {"tool": "iperf3", "source_url": "https://codeload.github.com/esnet/iperf/tar.gz/2acfcfe94e928e74542c9f107e02aa6dd4748a79",
          "source_reference": "iperf-2acfcfe94e928e74542c9f107e02aa6dd4748a79", "archive_name": "iperf3.tar.gz",
          "source_sha256": "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
          "upstream_commit": "2acfcfe94e928e74542c9f107e02aa6dd4748a79",
          "observation_patch_path": "tool_patches/iperf-3.17.1-acquisition.patch",
          "observation_patch_sha256": "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661"}],
-        "remote_root": "/var/lib/cnb", "workspace": "/var/lib/cnb/work", "install_prefix": "/var/lib/cnb/install"}
+        "remote_root": "/var/lib/cnb", "workspace": "/var/lib/cnb/work",
+        "results_workspace": "/var/lib/cnb/results", "install_prefix": "/var/lib/cnb/install",
+        **({"prebuilt_bundle": copy.deepcopy(prebuilt_bundle)} if prebuilt_bundle is not None else {})}
 
 
 def provider_scope(providers):
@@ -792,7 +808,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "access": {"timeouts": settings.get("timeouts", {"ssh_seconds": 30, "command_seconds": 120,
                 "cloud_init_seconds": 300, "private_path_seconds": 60, "server_seconds": 60, "transfer_seconds": 300}),
                 "readiness": {"poll_interval_seconds": 2, "attempt_ceiling": 150},
-                "bootstrap": _bootstrap(), "guest_remote_root": "/var/lib/cnb/work",
+                "bootstrap": _bootstrap(settings.get("prebuilt_bundle")), "guest_remote_root": "/var/lib/cnb/work",
                 "diagnostic_interfaces": {p: settings["providers"][p]["diagnostic_interfaces"] for p in providers}},
             "providers": provider_runtime, "approval_refs": approvals}
         if settings.get("archive_sink") is not None:

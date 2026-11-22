@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import base64
+import json
 import math
 import re
 import shlex
 import time
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional, Sequence
 from urllib.parse import urlparse
 from pathlib import Path, PurePosixPath
 
@@ -72,7 +73,7 @@ class SourceBuild(StrictModel):
         pinned = {
             "5ebd327da983225321818c0355db922515e026bd": (
                 "tool_patches/sockperf-3.10-acquisition.patch",
-                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc",
                 "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e", "sockperf-"),
             "2acfcfe94e928e74542c9f107e02aa6dd4748a79": (
                 "tool_patches/iperf-3.17.1-acquisition.patch",
@@ -97,18 +98,35 @@ class SourceBuild(StrictModel):
         return self
 
 
+class PrebuiltBundle(StrictModel):
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("path")
+    @classmethod
+    def local_regular_path(cls, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute() or ".." in path.parts or any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError("prebuilt bundle path must be absolute and avoid symlinks and traversal")
+        if not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError("prebuilt bundle must be a regular file no larger than 64 MiB")
+        return str(path)
+
+
 class BootstrapConfig(StrictModel):
     sources: List[SourceBuild] = Field(min_length=2, max_length=2)
     remote_root: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
+    results_workspace: str = "/var/lib/cnb/results"
     install_prefix: str = Field(min_length=1)
+    prebuilt_bundle: PrebuiltBundle | None = None
     bootstrap_packages: List[str] = Field(default_factory=lambda: ["build-essential", "autoconf", "automake", "libtool", "pkg-config", "curl", "ca-certificates", "tar", "gzip", "iproute2", "iputils-ping", "netcat-openbsd", "nftables", "python3-venv"])
 
     @model_validator(mode="after")
     def validate_paths_and_tools(self):
         if {s.tool for s in self.sources} != {"sockperf", "iperf3"}:
             raise ValueError("exactly one Sockperf and one iperf3 source is required")
-        for name in ("remote_root", "workspace", "install_prefix"):
+        for name in ("remote_root", "workspace", "results_workspace", "install_prefix"):
             value = getattr(self, name)
             if not value.startswith("/") or PurePosixPath(value).as_posix() != value or ".." in value.split("/") or any(ord(c) < 32 for c in value):
                 raise ValueError(f"{name} must be a normalized absolute path")
@@ -116,8 +134,18 @@ class BootstrapConfig(StrictModel):
                 raise ValueError(f"{name} contains shell-unsafe path characters")
             if name != "remote_root" and not value.startswith(self.remote_root.rstrip("/") + "/"):
                 raise ValueError(f"{name} must be under remote_root")
+        paths = (self.workspace, self.results_workspace, self.install_prefix)
+        for index, first in enumerate(paths):
+            if any(first == second or first.startswith(second.rstrip("/") + "/")
+                    or second.startswith(first.rstrip("/") + "/") for second in paths[index + 1:]):
+                raise ValueError("bootstrap sources, native results and installed tools require separate roots")
         if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.-]{0,63}", p) for p in self.bootstrap_packages):
             raise ValueError("bootstrap package names must be simple package identifiers")
+        if self.prebuilt_bundle is not None:
+            if self.install_prefix != "/var/lib/cnb/install":
+                raise ValueError("prebuilt bundle requires the approved /var/lib/cnb/install prefix")
+            from .build_bundle import validate_bundle
+            validate_bundle(Path(self.prebuilt_bundle.path), self.prebuilt_bundle.sha256, self.sources)
         return self
 
 
@@ -139,6 +167,12 @@ class BuildObservation(StrictModel):
     observation_capability: str | None = None
     observation_semantics: str | None = None
     identity_bytes: str | None = None
+    build_origin: Literal["guest-source-build", "controller-prebuilt"] = "guest-source-build"
+    origin_artifact_id: str | None = None
+    origin_proof_bytes: str | None = None
+    prebuilt_bundle_path: str | None = None
+    prebuilt_bundle_sha256: str | None = None
+    bundle_artifact_id: str | None = None
 
     @model_validator(mode="after")
     def complete_observation(self):
@@ -160,11 +194,43 @@ class BuildObservation(StrictModel):
                 raise ValueError("observation build requires pinned upstream commit and patch digest")
             if not self.identity_bytes:
                 raise ValueError("observation build requires captured original build identity sidecar bytes")
+        if self.build_origin == "controller-prebuilt":
+            if (not self.origin_artifact_id or not self.origin_proof_bytes or not self.prebuilt_bundle_path
+                    or not self.bundle_artifact_id or not re.fullmatch(r"[a-f0-9]{64}", self.prebuilt_bundle_sha256 or "")):
+                raise ValueError("controller-prebuilt build requires origin proof and exact bundle artifact identity")
+            try:
+                proof = json.loads(self.origin_proof_bytes)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("controller-prebuilt origin proof must be valid JSON") from exc
+            controller = proof.get("controller_receipt", {})
+            guest = proof.get("guest_verification", {})
+            evidence_text = controller.get("operational_build_evidence_json")
+            if (proof.get("schema") != "CNB_PREBUILT_V1" or proof.get("tool") != self.tool
+                    or proof.get("role") != self.role or proof.get("binary_sha256") != self.binary_sha256
+                    or proof.get("origin") != "controller-prebuilt"
+                    or proof.get("bundle_sha256") != self.prebuilt_bundle_sha256
+                    or proof.get("bundle_artifact_id") != self.bundle_artifact_id
+                    or controller.get("tool") != self.tool or controller.get("source_reference") != self.source_reference
+                    or controller.get("source_sha256") != self.source_sha256
+                    or controller.get("binary_sha256") != self.binary_sha256
+                    or controller.get("upstream_commit") != self.upstream_commit
+                    or controller.get("patch_path") != self.patch_path
+                    or controller.get("patch_sha256") != self.patch_sha256
+                    or not isinstance(evidence_text, str)
+                    or hashlib.sha256(evidence_text.encode("utf-8")).hexdigest() != controller.get("build_evidence_sha256")
+                    or guest.get("binary_sha256") != self.binary_sha256
+                    or guest.get("binary_version") != self.binary_version
+                    or guest.get("binary_path") != self.binary_path):
+                raise ValueError("controller-prebuilt origin proof does not bind controller, guest and bundle evidence")
+        elif any(value is not None for value in (self.origin_artifact_id, self.origin_proof_bytes,
+                self.prebuilt_bundle_path, self.prebuilt_bundle_sha256, self.bundle_artifact_id)):
+            raise ValueError("guest source builds must not carry controller-prebuilt origin proof")
         return self
 
 
 def materialize_build_identity_artifacts(root: Path, deployment_id: str,
-        builds: List[BuildObservation] | tuple[BuildObservation, ...]) -> tuple[ArtifactRecord, ...]:
+        builds: List[BuildObservation] | tuple[BuildObservation, ...], *,
+        include_controller_bundle: bool = True) -> tuple[ArtifactRecord, ...]:
     """Persist exact remote sidecar bytes captured by the bootstrap command."""
     records: list[ArtifactRecord] = []
     for build in builds:
@@ -183,6 +249,41 @@ def materialize_build_identity_artifacts(root: Path, deployment_id: str,
             producer=role, unit_id=None, deployment_id=deployment_id, closed=True,
             size_bytes=Evidence[int](value=len(raw)), sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()),
             retrieval_state="verified")
+        record.verify_materialized_file(root)
+        records.append(record)
+        if build.origin_proof_bytes is not None and build.origin_artifact_id is not None:
+            proof_raw = build.origin_proof_bytes.encode("utf-8")
+            proof_path = f"metadata/build/{build.role}-{build.tool}.origin.json"
+            proof_target = root / proof_path
+            proof_target.parent.mkdir(parents=True, exist_ok=True)
+            if proof_target.exists() and proof_target.read_bytes() != proof_raw:
+                raise ValueError("build origin artifact conflicts with existing attempt evidence")
+            if not proof_target.exists():
+                proof_target.write_bytes(proof_raw)
+            proof_record = ArtifactRecord(artifact_id=build.origin_artifact_id, path=proof_path,
+                kind="build-origin", producer=role, unit_id=None, deployment_id=deployment_id,
+                closed=True, size_bytes=Evidence[int](value=len(proof_raw)),
+                sha256=StringEvidence(value=hashlib.sha256(proof_raw).hexdigest()), retrieval_state="verified")
+            proof_record.verify_materialized_file(root)
+            records.append(proof_record)
+    bundle = next((b for b in builds if b.build_origin == "controller-prebuilt"), None) if include_controller_bundle else None
+    if bundle is not None:
+        source = Path(bundle.prebuilt_bundle_path or "")
+        if (not source.is_absolute() or any(p.is_symlink() for p in (source, *source.parents)) or not source.is_file()
+                or hashlib.sha256(source.read_bytes()).hexdigest() != bundle.prebuilt_bundle_sha256):
+            raise ValueError("prebuilt bundle changed before raw artifact materialization")
+        bundle_path = "metadata/build/controller-prebuilt-tools.tar.gz"
+        target = root / bundle_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = source.read_bytes()
+        if target.exists() and target.read_bytes() != raw:
+            raise ValueError("prebuilt bundle conflicts with existing attempt evidence")
+        if not target.exists():
+            target.write_bytes(raw)
+        record = ArtifactRecord(artifact_id=bundle.bundle_artifact_id or "", path=bundle_path,
+            kind="controller-prebuilt-bundle", producer="controller", unit_id=None,
+            deployment_id=deployment_id, closed=True, size_bytes=Evidence[int](value=len(raw)),
+            sha256=StringEvidence(value=hashlib.sha256(raw).hexdigest()), retrieval_state="verified")
         record.verify_materialized_file(root)
         records.append(record)
     return tuple(records)
@@ -228,7 +329,7 @@ class BootstrapResult(StrictModel):
 def _required_capabilities(tool: str) -> List[str]:
     if tool == "sockperf":
         return ["server", "under-load", "-i", "-p", "-m", "--mps", "--reply-every", "--full-rtt", "--no-rdtsc", "--full-log", "-t"]
-    return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "cubic", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
+    return ["-s", "-c", "-B", "-p", "-P", "-t", "-O", "-i", "-l", "-C", "-Z", "-J", "--get-server-output", "--json-stream", "--forceflush"]
 
 
 def _build_config_prelude(config: BootstrapConfig) -> str:
@@ -511,13 +612,336 @@ def _failure_result(connection, actions, vm, request, result, category, message,
                            actions=actions, failure=_failure("bootstrap", vm, category, result, message, request), builds=builds, listeners=listeners)
 
 
+def _prepare_prebuilt_role(connection, vm, role, config, runner, deadline, clock, actions, builds, listeners):
+    """Transfer once and verify both controller-built binaries on this VM."""
+    bundle = config.prebuilt_bundle
+    if bundle is None:
+        return None
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle setup exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    aid = f"f02r-{role}-prebuilt-packages"
+    command_timeout = min(connection.timeouts.command_seconds, remaining)
+    package_script = _prebuilt_package_setup_script(config.bootstrap_packages, command_timeout)
+    encoded_script = f"exec(bytes.fromhex('{package_script.encode().hex()}'))"
+    argv = ["sudo", "python3", "-u", "-c", encoded_script]
+    req = _request(aid, vm, argv, command_timeout)
+    result = _execute(runner, req); actions.append(_action(aid, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_package_setup_failed",
+            "approved guest runtime prerequisites could not be prepared", builds, listeners)
+    bundle_path = f"{config.workspace}/prebuilt-{bundle.sha256}.tar.gz"
+    parents = set()
+    for target in (config.workspace, config.results_workspace, config.install_prefix):
+        p = PurePosixPath(target)
+        while p.as_posix() != "/":
+            parents.add(p.as_posix()); p = p.parent
+    symlink_guard = " && ".join(f"test ! -L {shlex.quote(path)}" for path in sorted(parents, key=len))
+    setup = (f"{symlink_guard} && sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 "
+        f"{shlex.quote(config.workspace)} {shlex.quote(config.results_workspace)} {shlex.quote(config.install_prefix)} && "
+        f"test ! -e {shlex.quote(bundle_path)} && test ! -L {shlex.quote(bundle_path)}")
+    remaining = deadline.remaining(clock, readiness=True)
+    req = _request(f"f02r-{role}-prebuilt-workspace", vm, ["sh", "-c", setup],
+        min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_workspace_conflict",
+            "bundle workspace or target paths contain conflicting state", builds, listeners)
+    for source in config.sources:
+        remaining = deadline.remaining(clock, readiness=True)
+        req = _request(f"f02r-{role}-{source.tool}-bundle-identity-preflight", vm,
+            ["sh", "-c", _identity_preflight_script(source, config)],
+            min(connection.timeouts.command_seconds, remaining))
+        result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+        if result.outcome != CommandOutcome.SUCCEEDED or result.stdout.strip() != "missing":
+            return _failure_result(connection, actions, vm, req, result, "prebuilt_cache_conflict",
+                "pre-existing source/build/origin cache state conflicts with explicit bundle selection", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle transfer exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    try:
+        # Re-hash and re-parse the actual local input immediately before each role upload.
+        from .build_bundle import validate_bundle
+        validate_bundle(Path(bundle.path), bundle.sha256, config.sources)
+    except Exception as exc:
+        req, failed = _request_failure(f"f02r-{role}-prebuilt-local-recheck", vm,
+            connection.timeouts.command_seconds, exc)
+        actions.append(_action(req.action_id, "ssh", vm, req, failed))
+        return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_local_changed",
+            "bundle failed its immediate pre-upload hash and provenance recheck", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle validation consumed the remaining upload allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    req = _request(f"f02r-{role}-prebuilt-transfer", vm,
+        [bundle.path, f"{vm.user}@{vm.host}:{bundle_path}"],
+        min(connection.timeouts.transfer_seconds, remaining), action_type="scp")
+    result = _execute(runner, req); actions.append(_action(req.action_id, "scp", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_bundle_transfer_failed",
+            "approved bundle transfer failed", builds, listeners)
+    remaining = deadline.remaining(clock, readiness=True)
+    if remaining <= 0:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                category="readiness_deadline_exhausted", message="bundle verification exceeded readiness allowance",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    from .build_bundle import linux_installer_script
+    caps = {source.tool: _required_capabilities(source.tool) for source in config.sources}
+    pins = {source.tool: {"source_reference": source.source_reference,
+        "source_sha256": source.source_sha256, "upstream_commit": source.upstream_commit,
+        "patch_path": source.observation_patch_path, "patch_sha256": source.observation_patch_sha256}
+        for source in config.sources}
+    script = linux_installer_script(bundle_path, bundle.sha256, config.install_prefix, role, caps, pins)
+    encoded_script = f"exec(bytes.fromhex('{script.encode().hex()}'))"
+    req = _request(f"f02r-{role}-prebuilt-verify-install", vm, ["python3", "-c", encoded_script],
+        min(connection.timeouts.command_seconds, remaining))
+    result = _execute(runner, req); actions.append(_action(req.action_id, "ssh", vm, req, result))
+    if result.outcome != CommandOutcome.SUCCEEDED:
+        return _failure_result(connection, actions, vm, req, result, "prebuilt_bundle_verification_failed",
+            "bundle bytes or guest tool compatibility failed independent verification", builds, listeners)
+    try:
+        output = json.loads(result.stdout)
+        if set(output) != {"sockperf", "iperf3"}:
+            raise ValueError("installer output did not include both tools")
+        for tool in ("sockperf", "iperf3"):
+            source, observed = next(s for s in config.sources if s.tool == tool), output[tool]
+            version = _canonical_version_text(observed["binary_version"])
+            help_outputs = observed.get("help_outputs", {})
+            capability_text = "\n".join([help_outputs.get("main", ""), *help_outputs.get("modes", {}).values()])
+            if not _capabilities_observed(capability_text, tool):
+                raise ValueError(f"{tool} installer capability receipt is incomplete")
+            identity = observed["identity_bytes"]
+            parsed = _parse_build_identity(identity, source)
+            if (parsed["binary_sha256"] != observed["binary_sha256"]
+                    or _canonical_version_text(parsed["binary_version_b64_decoded"]) != version):
+                raise ValueError(f"{tool} V1 identity does not match guest verification")
+            origin_bytes = observed["origin_proof_bytes"]
+            origin = json.loads(origin_bytes)
+            if (origin.get("schema") != "CNB_PREBUILT_V1" or origin.get("role") != role
+                    or origin.get("tool") != tool or origin.get("binary_sha256") != observed["binary_sha256"]
+                    or origin.get("bundle_sha256") != bundle.sha256):
+                raise ValueError(f"{tool} origin proof does not bind the role, bundle and installed bytes")
+            builds.append(BuildObservation(role=role, tool=tool, source_reference=source.source_reference,
+                source_sha256=source.source_sha256, compiler_version=parsed["compiler_version_b64_decoded"],
+                binary_path=observed["binary_path"], binary_version=version,
+                binary_sha256=observed["binary_sha256"], capabilities=_required_capabilities(tool),
+                artifact_id=f"f02r-{role}-{tool}-build", upstream_commit=source.upstream_commit,
+                patch_path=source.observation_patch_path, patch_sha256=source.observation_patch_sha256,
+                build_configuration=parsed["build_configuration_b64_decoded"],
+                observation_capability="CNB_ACQ_V1",
+                observation_semantics="sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1",
+                identity_bytes=identity, build_origin="controller-prebuilt",
+                origin_artifact_id=f"f02r-{role}-{tool}-origin", origin_proof_bytes=origin_bytes,
+                prebuilt_bundle_path=bundle.path, prebuilt_bundle_sha256=bundle.sha256,
+                bundle_artifact_id="f02r-controller-prebuilt-bundle"))
+    except Exception as exc:
+        req, failed = _request_failure(f"f02r-{role}-prebuilt-output", vm,
+            connection.timeouts.command_seconds, exc)
+        actions.append(_action(req.action_id, "ssh", vm, req, failed))
+        return _failure_result(connection, actions, vm, req, failed, "prebuilt_bundle_receipt_invalid",
+            "guest bundle receipt could not be tied to the approved origin and installed binary", builds, listeners)
+    return None
+
+
+def _prebuilt_package_setup_script(packages: Sequence[str], command_timeout: float) -> str:
+    """Bound apt acquisition and retain small, sanitized diagnostics on failure."""
+    package_json = json.dumps(list(packages))
+    timeout_literal = repr(float(command_timeout))
+    diagnostic_program = r'''import json, os, pathlib, re, socket
+rows = set()
+def accept(uri, suites):
+    try:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(uri)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+            return
+        if host != "ubuntu.com" and not host.endswith(".ubuntu.com"):
+            return
+        if not re.fullmatch(r"[a-z0-9.-]{1,253}", host):
+            return
+        for suite in suites.split():
+            if len(rows) >= 32:
+                return
+            if re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", suite):
+                rows.add((host, suite))
+    except Exception:
+        return
+for path in (pathlib.Path("/etc/apt/sources.list"), pathlib.Path("/etc/apt/sources.list.d/ubuntu.sources")):
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", errors="replace") as source_file:
+            text = source_file.read(65536)
+        if path.name == "ubuntu.sources":
+            for stanza in re.split(r"\n\s*\n", text):
+                fields = {}
+                for line in stanza.splitlines():
+                    match = re.match(r"^(URIs|Suites):\s*(.*)$", line)
+                    if match:
+                        fields[match.group(1)] = match.group(2).split()
+                for uri in fields.get("URIs", []):
+                    accept(uri, " ".join(fields.get("Suites", [])))
+        else:
+            for line in text.splitlines():
+                match = re.match(r"^\s*deb(?:-src)?\s+(?:\[[^]]*\]\s+)?(\S+)\s+(\S+)", line)
+                if match:
+                    accept(match.group(1), match.group(2))
+    except Exception:
+        continue
+safe_rows = [host + "=" + suite for host, suite in sorted(rows)[:32]]
+print("CNB_APT_SOURCES=" + ",".join(safe_rows))
+try:
+    addresses = socket.getaddrinfo("security.ubuntu.com", 80, type=socket.SOCK_STREAM)
+    print("CNB_SECURITY_ENDPOINT_DNS=ok address_count=" + str(len(addresses)))
+    first = addresses[0]
+    connection = socket.socket(first[0], first[1], first[2])
+    connection.settimeout(0.7)
+    connection.connect(first[4])
+    print("CNB_SECURITY_ENDPOINT_FIRST_ADDRESS_CONNECT=ok family=" + str(first[0]))
+    connection.close()
+except Exception as exc:
+    print("CNB_SECURITY_ENDPOINT_OBSERVATION_ERROR=" + type(exc).__name__)
+'''
+    return f'''import json, re, subprocess, sys, time
+PACKAGES = json.loads({package_json!r})
+OUTER_TIMEOUT = {timeout_literal}
+DIAGNOSTIC_PROGRAM = {diagnostic_program!r}
+APT_OPTIONS = ["-o", "Acquire::Retries=0", "-o", "Acquire::http::Timeout=8",
+               "-o", "Acquire::https::Timeout=8"]
+UPDATE_OPTIONS = APT_OPTIONS + ["-o", "APT::Update::Error-Mode=any"]
+def emit_output(value):
+    text = value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+    text = re.sub(r"(?i)(https?://)[^/@\\s]+@", r"\\1[redacted]@", text)
+    if len(text) > 12000:
+        text = "[output truncated]\\n" + text[-12000:]
+    if text:
+        print(text, end="" if text.endswith("\\n") else "\\n")
+def say(value):
+    try:
+        print(value, flush=True)
+    except Exception:
+        pass
+def diagnostics(command_deadline):
+    def emit_diagnostic(value):
+        text = value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+        safe = re.sub(r"[^A-Za-z0-9_= .,:+/-]", "?", text)[:1600]
+        if safe:
+            say(safe.replace("\\n", " | "))
+    try:
+        remaining = command_deadline - time.monotonic()
+        if remaining <= 0:
+            say("CNB_DIAGNOSTICS_SKIPPED=command_budget_exhausted")
+            return
+        result = subprocess.run([sys.executable, "-u", "-c", DIAGNOSTIC_PROGRAM],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=min(2.7, remaining), check=False)
+        say("CNB_SECURITY_ENDPOINT_OBSERVATION_SCOPE=first-address-only")
+        emit_diagnostic(result.stdout)
+        if result.returncode != 0:
+            say("CNB_DIAGNOSTIC_PROCESS_EXIT=" + str(result.returncode))
+    except subprocess.TimeoutExpired as exc:
+        say("CNB_SECURITY_ENDPOINT_OBSERVATION_SCOPE=first-address-only")
+        emit_diagnostic(exc.stdout)
+        say("CNB_DIAGNOSTICS_ERROR=TimeoutExpired")
+    except Exception as exc:
+        say("CNB_DIAGNOSTICS_ERROR=" + type(exc).__name__)
+def best_effort_diagnostics(command_deadline):
+    try:
+        diagnostics(command_deadline)
+    except Exception as exc:
+        say("CNB_DIAGNOSTICS_ERROR=" + type(exc).__name__)
+def run_stage(stage, args, deadline):
+    command = ["apt-get", *args]
+    say("CNB_APT_STAGE=" + stage + " COMMAND=" + json.dumps(command, separators=(",", ":")))
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return 124, "[stage budget exhausted]"
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=left, check=False)
+        return completed.returncode, completed.stdout
+    except KeyboardInterrupt:
+        return 130, "[apt stage interrupted]"
+    except subprocess.TimeoutExpired as exc:
+        return 124, (exc.stdout or b"") + (exc.stderr or b"") + b"\\n[apt stage timed out]\\n"
+    except Exception as exc:
+        return 127, "[apt invocation failed: " + type(exc).__name__ + "]"
+def main():
+    command_deadline = time.monotonic() + max(0.0, OUTER_TIMEOUT)
+    apt_deadline = command_deadline - 3.0
+    if apt_deadline <= time.monotonic():
+        say("CNB_APT_STAGE=update COMMAND_BUDGET_EXHAUSTED")
+        say("CNB_APT_RESULT=stage:update exit=124")
+        best_effort_diagnostics(command_deadline)
+        return 124
+    update_args = [*UPDATE_OPTIONS, "update"]
+    code, output = run_stage("update", update_args, apt_deadline)
+    try:
+        emit_output(output)
+    except Exception:
+        pass
+    if code != 0:
+        say("CNB_APT_RESULT=stage:update exit=" + str(code))
+        best_effort_diagnostics(command_deadline)
+        return code
+    install_args = [*APT_OPTIONS, "install", "-y", *PACKAGES]
+    code, output = run_stage("install", install_args, apt_deadline)
+    try:
+        emit_output(output)
+    except Exception:
+        pass
+    if code != 0:
+        say("CNB_APT_RESULT=stage:install exit=" + str(code))
+        best_effort_diagnostics(command_deadline)
+        return code
+    say("CNB_APT_RESULT=success")
+    return 0
+try:
+    sys.exit(main())
+except KeyboardInterrupt:
+    print("CNB_APT_RESULT=interrupted")
+    best_effort_diagnostics(time.monotonic())
+    sys.exit(130)
+'''
+
+
+class _CancellationRunner:
+    """Stop a peer before its next remote dispatch after another role fails."""
+    def __init__(self, delegate, cancellation):
+        self.delegate = delegate
+        self.cancellation = cancellation
+
+    def run(self, request):
+        if not self.cancellation.is_set():
+            return self.delegate.run(request)
+        from datetime import datetime, timezone
+        from .contracts.execution import CommandResult
+        now = datetime.now(timezone.utc)
+        return CommandResult(action_id=request.action_id, outcome=CommandOutcome.INTERRUPTED,
+            started_at=now, finished_at=now, duration_seconds=0, exit_code=None,
+            stdout="", stderr="peer preparation failed; command not dispatched",
+            redactions=request.redactions)
+
 def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner: CommandRunner, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic) -> BootstrapResult:
-    actions: List[RemoteActionEvidence] = []
-    builds: List[BuildObservation] = []
-    listeners: List[ListenerObservation] = []
+    """Prepare both roles, preserving each role's evidence on peer failure."""
     sources = {source.tool: source for source in config.sources}
-    tool_index = 0
-    for vm, role in ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b")):
+    roles = ((connection.vm_a, "vm_a"), (connection.vm_b, "vm_b"))
+
+    def prepare_role(vm, role, cancellation=None):
+        actions: List[RemoteActionEvidence] = []
+        builds: List[BuildObservation] = []
+        listeners: List[ListenerObservation] = []
+        tool_index = 0
+        command_runner = _CancellationRunner(runner, cancellation) if cancellation is not None else runner
         init = [(["cloud-init", "status", "--wait"], "cloud_init_seconds", "cloud_init")]
         if not _identity_references_available(vm):
             failed_request, failed_result = _request_failure(f"f02r-{role}-transport-preflight", vm, connection.timeouts.command_seconds, ValueError("credential reference unavailable between VMs"))
@@ -528,7 +952,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
         for argv, timeout_name, kind in init:
             timeout = min(getattr(connection.timeouts, timeout_name), deadline.remaining(clock, readiness=True))
             req = _request(f"f02r-{role}-cloud-init", vm, argv, timeout)
-            result = _execute(runner, req)
+            result = _execute(command_runner, req)
             actions.append(_action(req.action_id, "ssh", vm, req, result))
             if result.outcome != CommandOutcome.SUCCEEDED or "done" not in result.stdout.lower():
                 return _failure_result(connection, actions, vm, req, result, "cloud_init_failed", "cloud-init completion was not observed", builds, listeners)
@@ -543,7 +967,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before existing listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 inspect_id = f"f02r-vm_b-preflight-listener-inspect-{tool}"
                 inspect_request = _request(inspect_id, vm, ["systemctl", "show", f"cnb-{connection.deployment_id}-{tool}", "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
-                observed = _execute(runner, inspect_request)
+                observed = _execute(command_runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, observed))
                 if observed.outcome == CommandOutcome.SUCCEEDED:
                     load_state = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line).get("LoadState")
@@ -552,19 +976,24 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         if cat_remaining <= 0:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted inspecting service log destinations", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         cat_request = _request(f"f02r-vm_b-preflight-listener-config-{tool}", vm, ["systemctl", "cat", f"cnb-{connection.deployment_id}-{tool}"], min(connection.timeouts.server_seconds, cat_remaining))
-                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if (cat_result.outcome != CommandOutcome.SUCCEEDED or
                             not _unit_matches(observed.stdout, cat_result.stdout, tool, connection.private_ipv4_b, port, config.install_prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
                                 "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} listener conflicts before build preparation", action_id=inspect_id, occurred_at=observed.finished_at), builds=builds, listeners=listeners)
                 elif observed.outcome != CommandOutcome.FAILED or not any(text in (observed.stdout + observed.stderr).lower() for text in ("not found", "no such file", "could not be found")):
                     return _failure_result(connection, actions, vm, inspect_request, observed, "listener_inspection_failed", f"could not inspect existing {tool} listener", builds, listeners)
-        for source in config.sources:
+        if config.prebuilt_bundle is not None:
+            failed = _prepare_prebuilt_role(connection, vm, role, config, command_runner, deadline,
+                clock, actions, builds, listeners)
+            if failed is not None:
+                return failed
+        for source in (() if config.prebuilt_bundle is not None else config.sources):
             remaining = deadline.remaining(clock, readiness=True)
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before workspace setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
             identity_request = _request(f"f02r-{role}-{source.tool}-identity-preflight", vm, ["sh", "-c", _identity_preflight_script(source, config)], min(connection.timeouts.command_seconds, remaining))
-            identity_result = _execute(runner, identity_request)
+            identity_result = _execute(command_runner, identity_request)
             actions.append(_action(identity_request.action_id, "ssh", vm, identity_request, identity_result))
             if identity_result.outcome != CommandOutcome.SUCCEEDED:
                 return _failure_result(connection, actions, vm, identity_request, identity_result, "installed_identity_mismatch", f"existing {source.tool} source or binary identity conflicts with requested build", builds, listeners)
@@ -574,7 +1003,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             mkdir_script = f"sudo install -d -o \"$(id -un)\" -g \"$(id -gn)\" -m 0750 {shlex.quote(config.workspace)} {shlex.quote(config.install_prefix)}"
             workspace_request = _request(f"f02r-{role}-{source.tool}-workspace", vm, ["sh", "-c", mkdir_script], min(connection.timeouts.command_seconds, remaining))
             try:
-                workspace_result = _execute(runner, workspace_request)
+                workspace_result = _execute(command_runner, workspace_request)
             except Exception as exc:
                 failure = AccessFailureEvidence(stage="bootstrap", role=role, category="workspace_setup_failed", message=type(exc).__name__, action_id=workspace_request.action_id, occurred_at=datetime.now(timezone.utc))
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=failure, builds=builds, listeners=listeners)
@@ -596,7 +1025,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 timeout = min(connection.timeouts.command_seconds, remaining)
                 aid = f"f02r-{role}-{source.tool}-{index}"
                 req = _request(aid, vm, argv, timeout)
-                result = _execute(runner, req)
+                result = _execute(command_runner, req)
                 actions.append(_action(aid, "ssh", vm, req, result))
                 if result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, req, result, "source_build_failed", f"{source.tool} build action failed", builds, listeners)
@@ -679,7 +1108,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             if pre_remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before guest restriction", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
             pre_request = _request(pre_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, pre_remaining))
-            pre_result = _execute(runner, pre_request)
+            pre_result = _execute(command_runner, pre_request)
             actions.append(_action(pre_id, "ssh", vm, pre_request, pre_result))
             if pre_result.outcome == CommandOutcome.SUCCEEDED:
                 if not _acl_matches(pre_result.stdout, connection.private_ipv4_a, connection.private_ipv4_b, chain):
@@ -698,7 +1127,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if remaining <= 0:
                         return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while restricting guest ingress", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                     request = _request(f"f02r-vm_b-acl-pre-create-{index}", vm, argv, min(connection.timeouts.command_seconds, remaining))
-                    result = _execute(runner, request)
+                    result = _execute(command_runner, request)
                     actions.append(_action(request.action_id, "ssh", vm, request, result))
                     if result.outcome != CommandOutcome.SUCCEEDED:
                         return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
@@ -714,7 +1143,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 inspect_request = _request(inspect_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, remaining))
-                inspect_result = _execute(runner, inspect_request)
+                inspect_result = _execute(command_runner, inspect_request)
                 actions.append(_action(inspect_id, "ssh", vm, inspect_request, inspect_result))
                 if inspect_result.outcome == CommandOutcome.SUCCEEDED:
                     output = inspect_result.stdout
@@ -726,7 +1155,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         if cat_remaining <= 0:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service log destination observation", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
-                        cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                        cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                         if cat_result.outcome != CommandOutcome.SUCCEEDED or not _unit_matches(output, cat_result.stdout, tool, address, port, prefix, f"{config.workspace}/{stdout_path}", f"{config.workspace}/{stderr_path}",
                                 "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None):
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="listener_state_mismatch", message=f"existing {tool} unit does not match requested output mode/path", occurred_at=cat_result.finished_at), builds=builds, listeners=listeners)
@@ -735,7 +1164,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                         if proc_remaining <= 0:
                             return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                         proc_request = _request(proc_id, vm, _process_identity_command(f"cnb-{connection.deployment_id}-{tool}", f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
-                        proc_result = _execute(runner, proc_request)
+                        proc_result = _execute(command_runner, proc_request)
                         actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
                         build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
                         if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
@@ -753,7 +1182,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if mkdir_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before log setup", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 mkdir_request = _request(mkdir_id, vm, ["sudo", "install", "-d", "-m", "0755", str(PurePosixPath(stdout_abs).parent)], min(connection.timeouts.command_seconds, mkdir_remaining))
-                mkdir_result = _execute(runner, mkdir_request)
+                mkdir_result = _execute(command_runner, mkdir_request)
                 actions.append(_action(mkdir_id, "ssh", vm, mkdir_request, mkdir_result))
                 if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, mkdir_request, mkdir_result, "listener_log_setup_failed", f"could not prepare {tool} log destination", builds, listeners)
@@ -766,7 +1195,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listeners", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 req = _request(aid, vm, command, min(connection.timeouts.server_seconds, remaining))
-                result = _execute(runner, req)
+                result = _execute(command_runner, req)
                 actions.append(_action(aid, "ssh", vm, req, result))
                 if result.outcome != CommandOutcome.SUCCEEDED:
                     return _failure_result(connection, actions, vm, req, result, "listener_setup_failed", f"{tool} listener was not observed", builds, listeners)
@@ -775,13 +1204,13 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if verify_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before listener identity verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 verify_request = _request(verify_id, vm, ["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID,ExecStart,StandardOutput,StandardError,Restart,Environment"], min(connection.timeouts.server_seconds, verify_remaining))
-                verify_result = _execute(runner, verify_request)
+                verify_result = _execute(command_runner, verify_request)
                 actions.append(_action(verify_id, "ssh", vm, verify_request, verify_result))
                 cat_remaining = deadline.remaining(clock, readiness=True)
                 if cat_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service output path verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
-                cat_result = _execute(runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
                 if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
                         or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
                             "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
@@ -791,7 +1220,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                 if proc_remaining <= 0:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="listener verification consumed the preparation deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 proc_request = _request(proc_id, vm, _process_identity_command(unit, f"{prefix}/bin/{tool}"), min(connection.timeouts.server_seconds, proc_remaining))
-                proc_result = _execute(runner, proc_request)
+                proc_result = _execute(command_runner, proc_request)
                 actions.append(_action(proc_id, "ssh", vm, proc_request, proc_result))
                 build = next(b for b in builds if b.role == "vm_b" and b.tool == tool)
                 if proc_result.outcome != CommandOutcome.SUCCEEDED or not _process_identity_matches(proc_result.stdout, build.binary_path, build.binary_sha256):
@@ -805,7 +1234,7 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
             if remaining <= 0:
                 return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted before ACL inspection", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
             inspect = _request(inspect_id, vm, ["sudo", "nft", "-n", "-y", "list", "chain", "inet", "cnb_f02r", chain], min(connection.timeouts.command_seconds, remaining))
-            acl_result = _execute(runner, inspect)
+            acl_result = _execute(command_runner, inspect)
             actions.append(_action(inspect_id, "ssh", vm, inspect, acl_result))
             expected_acl = [f"{connection.private_ipv4_a}/32", connection.private_ipv4_b, "11111", "5201", "drop", "hook input"]
             if acl_result.outcome == CommandOutcome.SUCCEEDED:
@@ -826,16 +1255,66 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     if remaining <= 0:
                         return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role=role, category="readiness_deadline_exhausted", message="preparation deadline exhausted while applying ACL", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                     request = _request(aid, vm, argv, min(connection.timeouts.command_seconds, remaining))
-                    result = _execute(runner, request)
+                    result = _execute(command_runner, request)
                     actions.append(_action(aid, "ssh", vm, request, result))
                     if result.outcome != CommandOutcome.SUCCEEDED:
                         return _failure_result(connection, actions, vm, request, result, "listener_acl_failed", "guest benchmark ingress restriction failed", builds, listeners)
             else:
                 return _failure_result(connection, actions, vm, inspect, acl_result, "listener_acl_inspection_failed", "could not inspect guest benchmark ACL", builds, listeners)
-    if deadline.remaining(clock, readiness=True) <= 0:
-        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions,
-                               failure=AccessFailureEvidence(stage="bootstrap", category="readiness_deadline_exhausted", message="preparation completed after the original deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-    if deadline.remaining(clock, readiness=True) <= 0:
-        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions,
-                               failure=AccessFailureEvidence(stage="bootstrap", category="readiness_deadline_exhausted", message="preparation completed after the original deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
-    return BootstrapResult(succeeded=True, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, builds=builds, listeners=listeners)
+        if deadline.remaining(clock, readiness=True) <= 0:
+            return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions,
+                                   failure=AccessFailureEvidence(stage="bootstrap", category="readiness_deadline_exhausted", message="preparation completed after the original deadline", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+        # A role contributes only half of the campaign-wide build set, so it
+        # cannot satisfy BootstrapResult's complete-success invariant alone.
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, builds=builds, listeners=listeners)
+
+    outcomes = {}
+    primary_failure = None
+    if getattr(runner, "supports_concurrent_commands", False):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Event
+        cancellation = Event()
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="cnb-bootstrap") as pool:
+            futures = {pool.submit(prepare_role, vm, role, cancellation): role for vm, role in roles}
+            for future in as_completed(futures):
+                role = futures[future]
+                try:
+                    outcome = future.result()
+                except BaseException as exc:
+                    outcome = BootstrapResult(succeeded=False, identity=connection.identity,
+                        deployment_id=connection.deployment_id,
+                        failure=AccessFailureEvidence(stage="bootstrap", role=role,
+                            category="preparation_worker_failed", message=type(exc).__name__,
+                            occurred_at=datetime.now(timezone.utc)))
+                outcomes[role] = outcome
+                if outcome.failure is not None:
+                    if primary_failure is None:
+                        primary_failure = outcome
+                    cancellation.set()
+    else:
+        for vm, role in roles:
+            outcome = prepare_role(vm, role)
+            outcomes[role] = outcome
+            if outcome.failure is not None:
+                primary_failure = outcome
+                break
+
+    actions = [action for _, role in roles for action in outcomes.get(role, BootstrapResult(
+        succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id)).actions]
+    builds = [build for _, role in roles for build in outcomes.get(role, BootstrapResult(
+        succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id)).builds]
+    listeners = [listener for _, role in roles for listener in outcomes.get(role, BootstrapResult(
+        succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id)).listeners]
+    failures = [outcomes[role] for _, role in roles if role in outcomes and outcomes[role].failure is not None]
+    if failures:
+        failed = primary_failure or failures[0]
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=failed.failure, builds=builds, listeners=listeners)
+    if len(outcomes) != 2:
+        return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id,
+            actions=actions, failure=AccessFailureEvidence(stage="bootstrap", role="vm_b",
+                category="readiness_deadline_exhausted", message="preparation stopped after peer failure",
+                occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
+    return BootstrapResult(succeeded=True, identity=connection.identity, deployment_id=connection.deployment_id,
+        actions=actions, builds=builds, listeners=listeners)

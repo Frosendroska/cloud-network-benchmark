@@ -494,6 +494,13 @@ def _financial_runtime_binding(runtime, children):
     source = runtime.get("runtime_source")
     if source:
         sources[source["path"]] = source["sha256"]
+    bundle = getattr(runtime.get("access", {}).get("bootstrap"), "prebuilt_bundle", None)
+    if bundle is not None:
+        bundle_path = Path(bundle.path)
+        if (not bundle_path.is_file() or bundle_path.is_symlink()
+                or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.sha256):
+            raise ValueError("prebuilt tool bundle changed after runtime admission validation")
+        sources[str(bundle_path)] = bundle.sha256
     return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
         "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
                                          for c in children.values()}),

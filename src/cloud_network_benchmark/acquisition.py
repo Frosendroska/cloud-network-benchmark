@@ -503,7 +503,7 @@ def _expected_build_identity(tool: str) -> tuple[str, str, str, str]:
     if tool == "sockperf":
         return ("5ebd327da983225321818c0355db922515e026bd",
                 "tool_patches/sockperf-3.10-acquisition.patch",
-                "3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285",
+                "bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc",
                 "a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e")
     return ("2acfcfe94e928e74542c9f107e02aa6dd4748a79",
             "tool_patches/iperf-3.17.1-acquisition.patch",

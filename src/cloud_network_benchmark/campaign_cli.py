@@ -33,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     continuation.add_argument("--stage-id", required=True)
     continuation.add_argument("--entry-id", required=True)
     continuation.add_argument("--confirm-supervision", action="store_true")
+    archive = commands.add_parser("reconcile-archive", help="close an archive-pending entry from its native replay receipt")
+    archive.add_argument("--settings", type=Path)
+    archive.add_argument("--stage-id", required=True)
+    archive.add_argument("--entry-id", required=True)
+    archive.add_argument("--receipt", required=True, type=Path)
     # Private systemd entry point. It resumes the driver from its durable active pointer.
     runner = commands.add_parser("run", help=argparse.SUPPRESS)
     runner.add_argument("--state-root", required=True, type=Path)
@@ -61,6 +66,9 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
                 for line in campaign.logs(path, follow=args.follow):
                     sys.stdout.write(line)
                 return 0
+            elif args.action == "reconcile-archive":
+                result = campaign.reconcile_archive(Path(settings["state_root"]), args.stage_id,
+                    args.entry_id, args.receipt)
             else:
                 result = campaign.continue_supervised(Path(settings["state_root"]), args.stage_id,
                     args.entry_id, confirmed=args.confirm_supervision)

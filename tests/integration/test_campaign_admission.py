@@ -60,7 +60,7 @@ def operator_settings(tmp_path, root, monkeypatch):
             "azure": {**keys, "subscription_id": "11111111-1111-1111-1111-111111111111",
                 "tenant_id": "22222222-2222-2222-2222-222222222222", "selected_image": "Canonical:ubuntu-24_04-lts:server:24.04.202610010",
                 "ssh_public_key_path": str(key), "poll_seconds": 1, "command_timeout_seconds": 30},
-            "gcp": {**keys, "project_id": "offline-project", "images": {region: "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001" for region in ("europe-west3", "europe-west2")}, "public_key_path": str(key)}},
+            "gcp": {**keys, "project_id": "offline-project", "images": {region: "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001" for region in ("europe-west3", "europe-west2", "europe-north1")}, "public_key_path": str(key)}},
         "approvals": {name: {"confirmed": True, "source": str(source)} for name in
             ("f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n", "study_window", "calibration_authorized")},
         "pricing": {"reviewed": True, "id": "offline-generated-test-prices", "source": str(source),

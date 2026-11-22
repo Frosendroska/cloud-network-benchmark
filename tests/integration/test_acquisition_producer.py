@@ -212,7 +212,7 @@ def _build(tool: str, producer: VmRole, artifact_id: str):
     from cloud_network_benchmark.bootstrap import _required_capabilities
     semantics = "sockperf-3.10-enabled-v1" if tool == "sockperf" else "iperf-3.17.1-stats-v1"
     commit = "5ebd327da983225321818c0355db922515e026bd" if tool == "sockperf" else "2acfcfe94e928e74542c9f107e02aa6dd4748a79"
-    patch = ("3f0bb59a3c70b247e5ebde77254e1427c35dc6ec39e2a78a3c779cff7015a285" if tool == "sockperf"
+    patch = ("bfee91183037577a0861c24c27dd9c644134a644ac2edead0ab460f4875ac5fc" if tool == "sockperf"
              else "11b96daadb4a1f17dc24376bb3d0d7feec330efeedc550b1979b1566e9b81661")
     source_sha = ("a35a1daf310551b9f675af4fb7d95a6a10389fda4c7605d70a21554be0773f8e" if tool == "sockperf"
                   else "d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe")

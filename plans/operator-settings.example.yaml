@@ -6,6 +6,10 @@ schema_version: 1
 state_root: /srv/cnb/private
 results_root: /srv/cnb/results
 minimum_free_bytes: null
+# Optional accepted, controller-built Ubuntu24.04 x86-64 tools archive.
+# Supplying it binds both VM installs to this exact local path and digest; the
+# selected bootstrap has no source-build fallback on any bundle failure.
+prebuilt_bundle: null # {path: /absolute/path/controller-tools.tar.gz, sha256: <64 lowercase hex>}
 ledger:
   path: /srv/cnb/private/budget-ledger.json
   scope_id: thesis-primary

@@ -20,7 +20,7 @@
 +static int64_t cnb_monotonic_ns() {
 +    TicksTime value;
 +    value.setNowNonInline();
-+    return value.toNsec();
++    return value.debugToNsec();
 +}
 +
 +static void cnb_observe_entry(std::atomic<int64_t> &slot) {
@@ -54,7 +54,7 @@
 +    int64_t start = cnb_filter_start_ns.load(std::memory_order_acquire);
 +    int64_t end = cnb_filter_end_ns.load(std::memory_order_acquire);
 +    if (!cnb_invocation_id[0] || !cnb_boot_id[0] || cnb_stop_signal != SIGALRM || sender <= 0 || receiver <= 0 || start <= 0 || end <= 0 || end < start) return;
-+    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"sockperf\",\"semantics_id\":\"sockperf-3.10-enabled-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"probe_window\",\"sender_enabled_ns\":%lld,\"receiver_enabled_ns\":%lld,\"termination_ns\":%lld,\"native_filter_start_ns\":%lld,\"native_filter_end_ns\":%lld,\"termination_reason\":\"timer\"}\n", cnb_invocation_id, (long)getpid(), cnb_boot_id, (long long)sender, (long long)receiver, (long long)s_endTime.toNsec(), (long long)start, (long long)end);
++    fprintf(stderr, "CNB_ACQ_V1 {\"format\":1,\"tool\":\"sockperf\",\"semantics_id\":\"sockperf-3.10-enabled-v1\",\"invocation_id\":\"%s\",\"pid\":%ld,\"boot_id\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\",\"record_kind\":\"probe_window\",\"sender_enabled_ns\":%lld,\"receiver_enabled_ns\":%lld,\"termination_ns\":%lld,\"native_filter_start_ns\":%lld,\"native_filter_end_ns\":%lld,\"termination_reason\":\"timer\"}\n", cnb_invocation_id, (long)getpid(), cnb_boot_id, (long long)sender, (long long)receiver, (long long)s_endTime.debugToNsec(), (long long)start, (long long)end);
 +    fflush(stderr);
 +}
 +
@@ -66,8 +66,8 @@
          return;
      }
 +    if (g_pApp->m_const_params.measurement == TIME_BASED && !g_pApp->m_const_params.pPlaybackVector && !g_pApp->m_const_params.b_client_ping_pong && !g_pApp->m_const_params.b_stream) {
-+        cnb_filter_start_ns.store(testStart.toNsec(), std::memory_order_release);
-+        cnb_filter_end_ns.store(testEnd.toNsec(), std::memory_order_release);
++        cnb_filter_start_ns.store(testStart.debugToNsec(), std::memory_order_release);
++        cnb_filter_end_ns.store(testEnd.debugToNsec(), std::memory_order_release);
 +    }
  
      TicksDuration *pLat = new TicksDuration[SIZE];
