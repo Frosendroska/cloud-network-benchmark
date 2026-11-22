@@ -124,7 +124,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         stop_vm_b_listeners)
     from .lifecycle_bundle import (build_remote_closed_inventory, lifecycle_declarations,
         retrieve_closed_bundle_with_ledger)
-    from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
+    from .orchestration import ProviderStageOutcome, _remaining_f11_allowance, update_archive_recovery
     from .lifecycle_guest import GuestRequest
     from .post_measurement_barrier import PostMeasurementBarrier
 
@@ -535,6 +535,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 {"failure": f"{type(exc).__name__}: producer closure failed"})
 
     def retrieve(deployment: Any, provision: Any):
+        actions = []
         try:
             item = attempt(deployment, provision)
             if barrier is not None:
@@ -658,7 +659,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         maximum_part_bytes=max_part, maximum_archive_bytes=max_archive,
                         minimum_free_bytes=int(archive_sink.get("minimum_guest_free_bytes", min_free)),
                         runner=runner, deadline=item.deadline, clock=clock.monotonic))
-                actions = [action for archive in guest_archives for action in archive["actions"]]
+                actions.extend(action for archive in guest_archives for action in archive["actions"])
                 part_counter = 0
                 def fetch_part(role: str, part: dict) -> Path:
                     nonlocal part_counter
@@ -692,7 +693,9 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     maximum_archive_bytes=max_archive, minimum_controller_free_bytes=min_free,
                     controller_quota_free_bytes=archive_sink["controller_quota_free_bytes"],
                     closed_inventory=manifest.model_dump(mode="json"), deadline=item.deadline,
-                    clock=clock.monotonic)
+                    clock=clock.monotonic,
+                    object_progress=lambda status: update_archive_recovery(
+                        recovery_path, provider, status))
                 archive_status["actions"] = actions
                 item.retrieval = RetrievalResult(complete=True, cleanup_required=True,
                     actions=actions, records=[], failures=[],
@@ -700,6 +703,16 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             return ProviderStageOutcome("retrieve", item.retrieval.complete
                 and not item.retrieval.failures, item.retrieval)
         except Exception as exc:
+            partial_objects = getattr(exc, "partial_objects", None)
+            if isinstance(partial_objects, list):
+                from .retrieval import RetrievalResult
+                archive_status = {"status": "failed", "verified": False,
+                    "partial_objects": partial_objects,
+                    "error": f"{type(exc).__name__}: {exc}"}
+                failed_retrieval = RetrievalResult(complete=False, cleanup_required=True,
+                    actions=actions, records=[], failures=[{"category": "archive_publish_failed",
+                        "message": f"{type(exc).__name__}: {exc}"}], archive_status=archive_status)
+                return ProviderStageOutcome("retrieve", False, failed_retrieval)
             return ProviderStageOutcome("retrieve", False,
                 {"failure": f"{type(exc).__name__}: closed bundle retrieval failed",
                  "details": [(error.get("loc"), error.get("msg")) for error in exc.errors()]
