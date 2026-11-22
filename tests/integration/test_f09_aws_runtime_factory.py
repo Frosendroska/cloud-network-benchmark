@@ -946,7 +946,34 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     restore_staging, materialized = tmp_path / "capsule-restore-staging", tmp_path / "capsule-native"
     restore_staging.mkdir(); materialized.mkdir()
     integrity_faults = {"missing_part", "mutated_part", "wrong_generation"}
-    if fault in integrity_faults:
+    quota_args = {}
+    if fault in {"prune_and_reconcile", "quota_underflow"}:
+        free_bytes = 10**9
+        metadata_bytes = 1_000_000
+        growth_bytes = 900_000_000 if fault == "quota_underflow" else 1_000_000
+        reserve_bytes = 512 * 1024 * 1024
+        quota_path = tmp_path / "fresh-user-quota.json"
+        quota_path.write_text(json.dumps({"measured_free_bytes": free_bytes,
+            "metadata_headroom_bytes": metadata_bytes,
+            "projected_other_growth_bytes": growth_bytes,
+            "reserve_bytes": reserve_bytes,
+            "measured_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        quota_args = {"prune_verified_scratch": True, "controller_quota_free_bytes": free_bytes,
+            "controller_quota_evidence_path": quota_path,
+            "controller_quota_evidence_sha256": hashlib.sha256(quota_path.read_bytes()).hexdigest(),
+            "metadata_headroom_bytes": metadata_bytes, "projected_other_growth_bytes": growth_bytes,
+            "minimum_free_bytes": reserve_bytes}
+    remote_objects_before = dict(backend.objects)
+    if fault == "quota_underflow":
+        with pytest.raises(OSError, match="user quota cannot cover"):
+            restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+                expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+                archive_staging_root=restore_staging, materialization_root=materialized,
+                repository_root=repository_root, maximum_part_bytes=2_000_000, **quota_args)
+        assert not list(restore_staging.iterdir())
+        assert not list(materialized.iterdir())
+        restored = {"status": "quota_rejected_before_materialization"}
+    elif fault in integrity_faults:
         import pytest
         object_ref = receipt["objects"][0]
         stored = backend.objects[object_ref["key"]]
@@ -961,20 +988,33 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
                 expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
                 archive_staging_root=restore_staging, materialization_root=materialized,
                 repository_root=repository_root, maximum_part_bytes=2_000_000,
-                evaluated_at=clock.utc_now() + timedelta(minutes=1))
+                evaluated_at=clock.utc_now() + timedelta(minutes=1), **quota_args)
         restored = {"status": "archive_integrity_rejected"}
     else:
         restored = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
             expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
             archive_staging_root=restore_staging, materialization_root=materialized,
             repository_root=repository_root, maximum_part_bytes=2_000_000,
-            evaluated_at=clock.utc_now() + timedelta(minutes=1))
+            evaluated_at=clock.utc_now() + timedelta(minutes=1), **quota_args)
     if fault is None:
         assert restored["status"] == "replayed", restored.get("validation")
         assert restored["validation"][provider]["status"]["data_validity"] == "valid"
         assert Path(restored["analysis"]["report_path"]).is_file()
         assert Path(restored["replay_receipt"]["path"]).is_file()
-    if fault == "reconcile_campaign":
+    if fault == "prune_and_reconcile":
+        assert restored["scratch_prune"]["status"] == "complete"
+        assert not Path(restored["native_roots"][provider]).exists()
+        archive_scratch = restore_staging / provider / (
+            f"{provider}-{receipt['manifest']['experiment_id']}-{receipt['run_id']}.guest-archive")
+        assert not archive_scratch.exists()
+        assert backend.objects == remote_objects_before
+        export_root = repository_root / "results" / "closed" / str(parent.campaign_id) / "export"
+        assert export_root.is_dir()
+        for item in closed.items:
+            target = root / item.destination_path
+            assert hashlib.sha256(target.read_bytes()).hexdigest() == item.expected_sha256
+            assert (export_root / "runs" / child.run_id / item.destination_path).read_bytes() == target.read_bytes()
+    if fault in {"reconcile_campaign", "prune_and_reconcile"}:
         from cloud_network_benchmark.campaign import CampaignDriver
         from tests.integration.test_campaign_driver import FakeClock as CampaignClock, stage_fixture
         campaign_clock = CampaignClock()
@@ -983,6 +1023,8 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             repository_root=str(repository_root), results_root=str(repository_root / "results"),
             controller_session_id="fake-session")
         entry = stage["entries"][0]
+        if fault == "prune_and_reconcile":
+            entry["entry_id"] = str(parent.campaign_id)
         entry.update(run_ids={provider: child.run_id}, parent_manifest_path=str(parent_path),
             private_root=str(Path(recovery_path).parent),
             result_path=str(repository_root / child_ref.result_path))
@@ -1032,6 +1074,8 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     ("failure_check", True, True, "valid", "eu-north-1", "mutated_part"),
     ("failure_check", True, True, "valid", "eu-north-1", "wrong_generation"),
     ("failure_check", True, True, "valid", "eu-north-1", "reconcile_campaign"),
+    ("failure_check", True, True, "valid", "eu-north-1", "prune_and_reconcile"),
+    ("failure_check", True, True, "valid", "eu-north-1", "quota_underflow"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
         tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail,
@@ -1219,6 +1263,7 @@ def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_
     owned_result_paths = [parent_path]
     owned_result_paths.extend(Path(row.manifest_path) for row in parent.child_runs)
     owned_result_paths.extend(Path(row.result_path) for row in parent.child_runs)
+    replay_campaign_id = str(parent.campaign_id)
     def cleanup_archive_sink_workspace():
         for path in owned_result_paths:
             candidate = path if path.is_absolute() else repository_root / path
@@ -1232,11 +1277,9 @@ def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_
                 candidate.unlink(missing_ok=True)
         if isolated_results.is_dir() and not isolated_results.is_symlink():
             shutil.rmtree(isolated_results)
-        replay_root = repository_root / "results" / "analysis" / "archive-replays"
-        if replay_root.is_dir():
-            for replay_path in replay_root.glob(f"*{campaign_token.replace('-', '')}*"):
-                if replay_path.is_dir() and not replay_path.is_symlink():
-                    shutil.rmtree(replay_path)
+        replay_root = repository_root / "results" / "closed" / replay_campaign_id / "export"
+        if replay_root.is_dir() and not replay_root.is_symlink():
+            shutil.rmtree(replay_root.parent)
     request.addfinalizer(cleanup_archive_sink_workspace)
     child = children["aws"]
     if receive_fault == "readback":
@@ -1402,6 +1445,9 @@ def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_
         maximum_part_bytes=runtime["archive_sink"]["maximum_staging_bytes"],
         evaluated_at=clock.utc_now() + timedelta(minutes=1))
     assert replay["status"] == "replayed", replay
+    assert replay["scratch_prune"] == {"status": "not_requested", "items": []}
+    assert Path(replay["native_roots"]["aws"]).is_dir()
+    assert (staging_root / "aws" / f"aws-{child.experiment_id}-{child.run_id}.guest-archive").is_dir()
 
 
 def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, repository_root, monkeypatch):

@@ -7,7 +7,7 @@ cannot set validation state; the production projection and F08 validator do.
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import base64
 import hashlib
 import json
@@ -94,6 +94,124 @@ def _inventory(root: Path) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError("native result tree is empty")
     return rows
+
+
+def _tree_inventory_for_prune(root: Path) -> list[dict[str, Any]]:
+    """Inventory a generated scratch tree without following links."""
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("replay scratch target is not a real directory")
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("replay scratch tree contains a symlink")
+        if path.is_file():
+            if path.stat().st_nlink != 1:
+                raise ValueError("replay scratch tree contains a hard link outside its owned file")
+            rows.append({"path": path.relative_to(root).as_posix(),
+                "size_bytes": path.stat().st_size, "sha256": _digest_file(path)})
+        elif not path.is_dir():
+            raise ValueError("replay scratch tree contains a non-regular entry")
+    return rows
+
+
+def _digest_file(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def _remove_verified_scratch(root: Path, expected: list[dict[str, Any]]) -> int:
+    """Remove one exact generated tree after its full inventory is rechecked."""
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root.absolute():
+        raise ValueError("replay scratch target changed or has symlink components")
+    if _tree_inventory_for_prune(root) != sorted(expected, key=lambda row: row["path"]):
+        raise ValueError("replay scratch inventory changed; refusing deletion")
+    # Revalidate the complete tree before the first unlink. Only regular files
+    # from this exact generated target are removed; directory cleanup is rmdir-only.
+    files = [root / row["path"] for row in sorted(expected, key=lambda row: row["path"])]
+    dirs = []
+    for current, names, filenames in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in names:
+            candidate = current_path / name
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise ValueError("replay scratch tree changed during deletion preflight")
+            dirs.append(candidate)
+        for name in filenames:
+            candidate = current_path / name
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError("replay scratch tree changed during deletion preflight")
+    if set(files) != {path for path in root.rglob("*") if path.is_file()}:
+        raise ValueError("replay scratch tree contains an undeclared file")
+    removed = sum(row["size_bytes"] for row in expected)
+    for path in files:
+        path.unlink()
+    for path in dirs:
+        path.rmdir()
+    root.rmdir()
+    return removed
+
+
+def _preflight_scratch(root: Path, expected: list[dict[str, Any]]) -> None:
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root.absolute():
+        raise ValueError("replay scratch target changed or has symlink components")
+    if _tree_inventory_for_prune(root) != sorted(expected, key=lambda row: row["path"]):
+        raise ValueError("replay scratch inventory changed; refusing deletion")
+
+
+def _archive_scratch_inventory(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Rebuild the exact downloaded role-archive file inventory from its receipt."""
+    rows: list[dict[str, Any]] = []
+    manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    rows.append({"path": "manifest.json", "size_bytes": len(manifest_bytes),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+    for role in manifest.get("roles", []):
+        name = role.get("role")
+        if name not in {"vm_a", "vm_b"}:
+            raise ValueError("archive role is not valid for bounded scratch cleanup")
+        files, parts = role.get("files"), role.get("parts")
+        if not isinstance(files, list) or not isinstance(parts, list):
+            raise ValueError("archive role inventory is incomplete")
+        role_manifest = {"schema_version": 1, "format": "deterministic-tar-gzip",
+            "raw_bytes": sum(row["size_bytes"] for row in files),
+            "archive_bytes": role.get("archive_bytes"), "archive_sha256": role.get("archive_sha256"),
+            "files": files, "parts": parts}
+        data = (json.dumps(role_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        rows.append({"path": f"{name}/manifest.json", "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()})
+        for part in parts:
+            rows.append({"path": f"{name}/{part['path']}", "size_bytes": part["size_bytes"],
+                "sha256": part["sha256"]})
+    return sorted(rows, key=lambda row: row["path"])
+
+
+def _check_fresh_replay_quota(*, free_bytes: int, evidence_path: Path,
+        evidence_sha256: str, metadata_headroom_bytes: int,
+        projected_other_growth_bytes: int, reserve_bytes: int, now: datetime) -> None:
+    from .storage_admission import validate_controller_quota_evidence
+    validate_controller_quota_evidence(free_bytes, evidence_path, evidence_sha256)
+    evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+    measured_at = evidence.get("measured_at")
+    if not isinstance(measured_at, str):
+        raise ValueError("opt-in replay pruning requires fresh measured_at quota evidence")
+    try:
+        timestamp = datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("replay quota evidence measured_at is invalid") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError("replay quota evidence measured_at must include a UTC offset")
+    age = (now.astimezone(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+    if age < -60 or age > 900:
+        raise ValueError("replay quota evidence must be no more than 15 minutes old")
+    for field, expected in (("metadata_headroom_bytes", metadata_headroom_bytes),
+            ("projected_other_growth_bytes", projected_other_growth_bytes),
+            ("reserve_bytes", reserve_bytes)):
+        if type(evidence.get(field)) is not int or evidence[field] != expected:
+            raise ValueError(f"replay quota evidence does not bind the planned {field}")
 
 
 def write_batch_replay_capsule(path: Path, *, archives: Mapping[str, Mapping[str, Any]],
@@ -390,8 +508,18 @@ def finalize_restored_capsule(*, capsule_path: Path, native_root: Path,
 def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_sha256: str,
         backend: Any, bucket: str, archive_staging_root: Path, materialization_root: Path,
         repository_root: Path, maximum_part_bytes: int, minimum_free_bytes: int = 0,
-        evaluated_at: datetime | None = None) -> dict[str, Any]:
-    """Restore every provider archive, attach verified records, run F08, then F12."""
+        evaluated_at: datetime | None = None, prune_verified_scratch: bool = False,
+        controller_quota_free_bytes: int | None = None,
+        controller_quota_evidence_path: Path | None = None,
+        controller_quota_evidence_sha256: str | None = None,
+        metadata_headroom_bytes: int | None = None,
+        projected_other_growth_bytes: int | None = None) -> dict[str, Any]:
+    """Restore every provider archive, attach verified records, run F08, then F12.
+
+    Scratch pruning is opt-in and requires fresh, hash-bound quota evidence plus
+    source-bound growth, metadata and reserve bounds. The default retains all
+    downloaded and restored scratch trees.
+    """
     from .contracts.admission import ReservationEvidence
     from .contracts.artifacts import ArtifactRecord
     from .contracts.common import Evidence, StringEvidence
@@ -413,6 +541,45 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     archives = capsule.get("archives")
     if not isinstance(archives, dict) or not archives:
         raise ValueError("capsule has no provider archive receipts")
+    replay_storage_projection = None
+    if type(prune_verified_scratch) is not bool:
+        raise ValueError("prune_verified_scratch must be an explicit boolean")
+    if prune_verified_scratch:
+        if (type(controller_quota_free_bytes) is not int or controller_quota_free_bytes < 0
+                or controller_quota_evidence_path is None or controller_quota_evidence_sha256 is None
+                or type(metadata_headroom_bytes) is not int or metadata_headroom_bytes <= 0
+                or type(projected_other_growth_bytes) is not int or projected_other_growth_bytes <= 0
+                or type(minimum_free_bytes) is not int or minimum_free_bytes <= 0):
+            raise ValueError("opt-in replay pruning requires fresh quota evidence, positive metadata, workspace-growth, and reserve bounds")
+        _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
+            evidence_path=Path(controller_quota_evidence_path),
+            evidence_sha256=controller_quota_evidence_sha256,
+            metadata_headroom_bytes=metadata_headroom_bytes,
+            projected_other_growth_bytes=projected_other_growth_bytes,
+            reserve_bytes=minimum_free_bytes, now=datetime.now(timezone.utc))
+        raw_bytes = compressed_bytes = 0
+        for receipt in archives.values():
+            manifest = receipt.get("manifest")
+            if not isinstance(manifest, dict):
+                raise ValueError("replay archive receipt lacks its immutable manifest")
+            from .retrieval import RetrievalManifest
+            closed = RetrievalManifest.model_validate(manifest.get("closed_inventory"))
+            raw_bytes += sum(item.expected_size_bytes for item in closed.items)
+            roles = manifest.get("roles")
+            if not isinstance(roles, list) or {row.get("role") for row in roles if isinstance(row, dict)} != {"vm_a", "vm_b"}:
+                raise ValueError("replay archive does not contain both complete role inventories")
+            compressed_bytes += sum(row.get("archive_bytes", 0) for row in roles)
+        # Peak new payload is downloaded role archives plus three raw copies:
+        # restored scratch, canonical results and the closed F12 export.
+        peak = compressed_bytes + 3 * raw_bytes + metadata_headroom_bytes + projected_other_growth_bytes
+        required = peak + minimum_free_bytes
+        if controller_quota_free_bytes < required:
+            raise OSError(f"user quota cannot cover bounded replay peak: need {required} bytes, have {controller_quota_free_bytes}")
+        replay_storage_projection = {"raw_bytes": raw_bytes, "compressed_archive_bytes": compressed_bytes,
+            "raw_copy_count_at_peak": 3, "metadata_headroom_bytes": metadata_headroom_bytes,
+            "projected_other_growth_bytes": projected_other_growth_bytes,
+            "reserve_bytes": minimum_free_bytes, "required_free_bytes": required,
+            "observed_user_quota_free_bytes": controller_quota_free_bytes}
     repository_root = Path(repository_root).resolve(strict=True)
     archive_staging_root, materialization_root = Path(archive_staging_root), Path(materialization_root)
     for path, label in ((archive_staging_root, "archive staging root"),
@@ -536,9 +703,11 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
             "summary": summary, "status": validation.validation_status.model_dump(mode="json")}
         if validation.validation_status.data_validity != "valid":
             output["status"] = "replayed_invalid"
-    from .campaign_export import export_entry
+    from .campaign_export import export_entry, verify_export
     campaign_id = parent.campaign_id
-    export_root = repository_root / "results" / "analysis" / "archive-replays" / str(campaign_id)
+    # Campaign ids are the stage entry ids. Publishing at the regular closed
+    # entry destination lets archive reconciliation reuse this verified export.
+    export_root = repository_root / "results" / "closed" / str(campaign_id) / "export"
     entry = {"entry_id": str(campaign_id),
         "run_ids": {provider: child.run_id for provider, child in children.items()},
         "parent_manifest_path": str(parent_path)}
@@ -547,6 +716,8 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
         entry, export_root)
     if selection is None:
         raise ValueError("validated restored batch did not produce a deterministic export selection")
+    if not verify_export(export_root):
+        raise ValueError("verified restored batch did not produce an intact F12 export")
     from .analysis import analyze_selection
     first_child = next(iter(children.values()))
     report = analyze_selection(selection,
@@ -559,12 +730,57 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     output["analysis"] = {"status": "completed", "selection_path": str(selection),
         "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest(),
         "report_path": str(report_path), "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
+    if replay_storage_projection is not None:
+        output["storage_projection"] = replay_storage_projection
     output["replayed_manifests"] = {
         "parent": {"path": capsule["parent_path"],
             "sha256": hashlib.sha256(parent_path.read_bytes()).hexdigest()},
         "children": {provider: {"path": capsule["child_paths"][provider],
             "sha256": hashlib.sha256(child_paths[provider].read_bytes()).hexdigest()}
             for provider in sorted(child_paths)}}
+    if prune_verified_scratch and output["status"] == "replayed":
+        prune_targets = []
+        for provider, receipt in sorted(archives.items()):
+            closed = RetrievalManifest.model_validate(receipt["manifest"]["closed_inventory"])
+            native_expected = sorted(({"path": item.destination_path,
+                "size_bytes": item.expected_size_bytes, "sha256": item.expected_sha256}
+                for item in closed.items), key=lambda row: row["path"])
+            manifest = receipt["manifest"]
+            archive_root = archive_staging_root / provider / (
+                f"{provider}-{manifest['experiment_id']}-{receipt['run_id']}.guest-archive")
+            prune_targets.extend(((provider, "archive", archive_root,
+                _archive_scratch_inventory(manifest)), (provider, "native", native_roots[provider], native_expected)))
+        preflight_error = None
+        try:
+            for _provider, _kind, target, expected in prune_targets:
+                _preflight_scratch(target, expected)
+        except (OSError, ValueError) as exc:
+            preflight_error = f"{type(exc).__name__}: {exc}"
+        prune_rows = []
+        if preflight_error is not None:
+            output["scratch_prune"] = {"status": "withheld_unverified_scratch",
+                "error": preflight_error, "items": []}
+        else:
+            removed: dict[str, dict[str, Any]] = {}
+            for provider, kind, target, expected in prune_targets:
+                try:
+                    amount = _remove_verified_scratch(target, expected)
+                    removed.setdefault(provider, {})[kind] = amount
+                except (OSError, ValueError) as exc:
+                    prune_rows.append({"provider": provider, "status": "partial_or_retained",
+                        "error": f"{type(exc).__name__}: {exc}"})
+                    break
+            for provider in sorted(archives):
+                amounts = removed.get(provider, {})
+                if len(amounts) == 2:
+                    prune_rows.append({"provider": provider, "status": "pruned",
+                        "archive_bytes_removed": amounts["archive"], "native_bytes_removed": amounts["native"]})
+            output["scratch_prune"] = {"status": "complete" if len(removed) == len(archives)
+                and all(len(rows) == 2 for rows in removed.values()) else "partial", "items": prune_rows}
+    elif prune_verified_scratch:
+        output["scratch_prune"] = {"status": "withheld_invalid_replay", "items": []}
+    else:
+        output["scratch_prune"] = {"status": "not_requested", "items": []}
     receipt_root = archive_staging_root / "replay-receipts"
     if receipt_root.exists() and (receipt_root.is_symlink() or not receipt_root.is_dir()):
         raise ValueError("replay receipt destination is not a real directory")
