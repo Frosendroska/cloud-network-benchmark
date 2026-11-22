@@ -219,10 +219,24 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
         Scenario.INTER_REGION: ("germanywestcentral", "uksouth", "1", "1", "none"),
     }[Scenario(d.scenario)]
     got = (d.vm_a.region, d.vm_b.region, d.vm_a.zone, d.vm_b.zone, d.placement.kind)
-    sweden_component = (d.experiment_id == "EXP-901" and d.mode == ExperimentMode.ACCEPTANCE
-        and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE
-        and got == ("swedencentral", "swedencentral", "1", "1", "none"))
-    if got != expected and not sweden_component:
+    sweden_locality = ("swedencentral", "swedencentral", "1", "1", "none")
+    sweden_placement = ("swedencentral", "swedencentral", "1", "1", "proximity_placement_group")
+    sweden_research = (d.experiment_id in {"EXP-001", "EXP-003"}
+        and d.mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+        and d.context == "standard"
+        and got == (sweden_placement if d.scenario == Scenario.PLACEMENT_OPTIMIZATION else sweden_locality))
+    sweden_acceptance = (d.mode == ExperimentMode.ACCEPTANCE
+        and ((d.experiment_id == "EXP-901" and d.context == "failure_check" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
+             or (d.experiment_id == "EXP-903" and d.context == "standard" and d.scenario == Scenario.SAME_ZONE and got == sweden_locality)
+             or (d.experiment_id == "EXP-003" and d.context == "standard" and d.scenario == Scenario.PLACEMENT_OPTIMIZATION and got == sweden_placement)))
+    required_north = ((d.experiment_id in {"EXP-001", "EXP-003"}
+                       and d.mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY})
+                      or (d.mode == ExperimentMode.ACCEPTANCE and
+                          ((d.experiment_id == "EXP-903" and d.scenario == Scenario.SAME_ZONE)
+                           or (d.experiment_id == "EXP-003" and d.scenario == Scenario.PLACEMENT_OPTIMIZATION))))
+    if required_north and not (sweden_research or sweden_acceptance):
+        raise ValueError("primary S1/S3 cannot fall back from Sweden Central without a reviewed region-specific exception")
+    if got != expected and not (sweden_research or sweden_acceptance):
         raise ValueError(f"scenario locality/placement mismatch: expected {expected}, got {got}")
     if d.scenario == Scenario.PLACEMENT_OPTIMIZATION and not d.placement.name:
         raise ValueError("placement optimization requires a named PPG")

@@ -42,7 +42,7 @@ def options(tmp_path: Path, priority: str = "P0"):
 @pytest.mark.parametrize("filename,scenario,region_b,zone_b,ppg,peering", [
     ("exp-901-azure-single-provider.yaml", "same_zone", "germanywestcentral", "1", False, False),
     ("exp-002-cross-zone.yaml", "cross_zone", "germanywestcentral", "2", False, False),
-    ("exp-003-placement-optimization.yaml", "placement_optimization", "germanywestcentral", "1", True, False),
+    ("exp-003-placement-optimization.yaml", "placement_optimization", "swedencentral", "1", True, False),
     ("exp-004-inter-region.yaml", "inter_region", "uksouth", "1", False, True),
 ])
 def test_scenario_mapping_is_explicit(repository_root: Path, tmp_path: Path, filename, scenario, region_b, zone_b, ppg, peering):

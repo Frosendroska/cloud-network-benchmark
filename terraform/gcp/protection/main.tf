@@ -14,9 +14,10 @@ resource "terraform_data" "scope_guard" {
         "cross_zone|europe-west3-a|europe-west3-b",
         "placement_optimization|europe-west3-a|europe-west3-a",
         "inter_region|europe-west3-a|europe-west2-a",
-        "same_zone|europe-north1-a|europe-north1-a",
+        "same_zone|europe-north1-c|europe-north1-c",
+        "placement_optimization|europe-north1-c|europe-north1-c",
       ], "${var.scenario}|${var.zone_a}|${var.zone_b}")
-      error_message = "GCP protection accepts only the selected baseline topology or Finland same-zone pair."
+      error_message = "GCP protection accepts only the selected baseline topology or Finland zone c S1/S3 pair."
     }
     precondition {
       condition = (can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_a)) &&

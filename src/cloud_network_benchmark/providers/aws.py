@@ -68,7 +68,7 @@ ALLOWED_SCENARIO_LOCALITIES = {
         (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
     },
     "cross_zone": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1b"))},
-    "placement_optimization": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a"))},
+    "placement_optimization": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a")), (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a"))},
     "inter_region": {(("eu-central-1", "eu-west-2"), ("eu-central-1a", "eu-west-2a"))},
 }
 TERMINAL_AUTOMATION_STATES = {"Success", "Cancelled", "TimedOut", "Failed"}
@@ -1380,11 +1380,26 @@ class AwsProviderDriver:
         actual = ((deployment.vm_a.region, deployment.vm_b.region), (deployment.vm_a.zone, deployment.vm_b.zone))
         if actual not in ALLOWED_SCENARIO_LOCALITIES.get(scenario, set()) or any(REGION_FOR_ZONE.get(zone) != region for region, zone in zip(*actual)):
             raise AwsProviderError(f"AWS scenario region/zone combination is unsupported: {actual}", category="scenario_mismatch")
-        if "eu-north-1" in actual[0] and not (
-            scenario == "same_zone" and deployment.mode == "acceptance"
-            and deployment.context == "failure_check" and deployment.experiment_id == "EXP-900"
-        ):
-            raise AwsProviderError("Stockholm is limited to the reviewed EXP-900 acceptance check", category="scenario_mismatch")
+        research_identity = ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                             or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+        acceptance_identity = ((scenario == "same_zone" and deployment.experiment_id == "EXP-903")
+                               or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+        if ((research_identity and deployment.mode in {"short_study", "calibration", "diagnostic_day"})
+                or (acceptance_identity and deployment.mode == "acceptance" and deployment.context == "standard")):
+            expected = (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a"))
+            if actual != expected:
+                raise AwsProviderError("primary S1/S3 cannot fall back from Stockholm without a reviewed region-specific exception", category="scenario_mismatch")
+        if "eu-north-1" in actual[0]:
+            research = (deployment.mode in {"short_study", "calibration", "diagnostic_day"}
+                        and deployment.context == "standard"
+                        and ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                             or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003")))
+            acceptance = (deployment.mode == "acceptance"
+                          and ((scenario == "same_zone" and deployment.experiment_id == "EXP-900" and deployment.context == "failure_check")
+                               or (scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
+                               or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
+            if not (research or acceptance):
+                raise AwsProviderError("Stockholm locality is outside the registered S1/S3 research or acceptance scope", category="scenario_mismatch")
         return list(dict.fromkeys(actual[0]))
 
     def _deployment_scope(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:

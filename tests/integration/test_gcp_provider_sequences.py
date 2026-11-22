@@ -70,18 +70,32 @@ def test_provider_rejects_noncanonical_scenario_zones(tmp_path):
             GcpProviderDriver._validate_deployment(case)
 
 
-def test_finland_provider_scope_rejects_non_acceptance_identity_before_commands(tmp_path):
+def test_finland_provider_scope_supports_research_identity_and_rejects_other_scenarios(tmp_path):
     from cloud_network_benchmark.providers.gcp import GcpProviderError
     deployment, _ = _cleanup_fixture(tmp_path)
     deployment = deployment.model_copy(update={
-        "vm_a": deployment.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a"}),
-        "vm_b": deployment.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a"}),
+        "vm_a": deployment.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c"}),
+        "vm_b": deployment.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c"}),
     })
     GcpProviderDriver._validate_deployment(deployment)
+    study = deployment.model_copy(update={"experiment_id": "EXP-001", "mode": "short_study", "context": "standard"})
+    GcpProviderDriver._validate_deployment(study)
+    s3_acceptance = deployment.model_copy(update={
+        "experiment_id": "EXP-003", "mode": "acceptance", "context": "standard",
+        "scenario": "placement_optimization",
+        "placement": deployment.placement.model_copy(update={"kind": "compact_placement_policy", "name": "reviewed-s3", "collocated": True}),
+    })
+    GcpProviderDriver._validate_deployment(s3_acceptance)
+    frankfurt_fallback = study.model_copy(update={
+        "vm_a": study.vm_a.model_copy(update={"region": "europe-west3", "zone": "europe-west3-a"}),
+        "vm_b": study.vm_b.model_copy(update={"region": "europe-west3", "zone": "europe-west3-a"}),
+    })
+    with pytest.raises(GcpProviderError, match="cannot fall back"):
+        GcpProviderDriver._validate_deployment(frankfurt_fallback)
     for changed in (deployment.model_copy(update={"experiment_id": "EXP-999"}),
                     deployment.model_copy(update={"context": "standard"}),
-                    deployment.model_copy(update={"mode": "short_study"})):
-        with pytest.raises(GcpProviderError, match="Finland is limited"):
+                    deployment.model_copy(update={"scenario": "cross_zone"})):
+        with pytest.raises(GcpProviderError):
             GcpProviderDriver._validate_deployment(changed)
 
 
@@ -264,8 +278,8 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
             "subnets": {"europe-north1": ["10.80.1.0/24"]},
         })
         base = base.model_copy(update={
-            "vm_a": base.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
-            "vm_b": base.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-a", "network": north_network}),
+            "vm_a": base.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c", "network": north_network}),
+            "vm_b": base.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c", "network": north_network}),
         })
     vm_b = base.vm_b
     placement = base.placement
@@ -360,9 +374,9 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     output=driver.provision(deployment)
     if north:
         assert (output.vm_a.region, output.vm_b.region) == ("europe-north1", "europe-north1")
-        assert (output.vm_a.zone, output.vm_b.zone) == ("europe-north1-a", "europe-north1-a")
+        assert (output.vm_a.zone, output.vm_b.zone) == ("europe-north1-c", "europe-north1-c")
         protection_vars = json.loads((driver._attempt_dir(deployment)/"protection"/"vars.json").read_text())
-        assert (protection_vars["zone_a"], protection_vars["zone_b"]) == ("europe-north1-a", "europe-north1-a")
+        assert (protection_vars["zone_a"], protection_vars["zone_b"]) == ("europe-north1-c", "europe-north1-c")
         assert protection_vars["image_a"] == protection_vars["image_b"] == settings.images["europe-north1"]
     assert (output.vm_a.private_ipv4,output.vm_b.private_ipv4)==(("10.80.1.10","10.80.1.11") if scenario!="inter_region" else ("10.80.1.10","10.81.1.11"))
     assert output.vm_a.connection.host == "8.8.8.8" and output.vm_b.connection.host == "1.1.1.1"

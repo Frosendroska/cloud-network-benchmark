@@ -20,7 +20,7 @@ providers:
   aws:
     account_id: null
     controller_cidr: null
-    ami_ids: {eu-central-1: null}
+    ami_ids: {eu-north-1: ami-084df9e6ad4622caf}
     public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     diagnostic_interfaces: {vm_a: null, vm_b: null}
@@ -28,7 +28,7 @@ providers:
     subscription_id: null
     tenant_id: null
     controller_cidr: null
-    selected_image: null # concrete Ubuntu24.04 publisher:offer:sku:version, never latest
+    selected_image: Canonical:ubuntu-24_04-lts:server:24.04.202610250 # exercised Sweden image, concrete version
     ssh_public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     poll_seconds: 2
@@ -37,7 +37,7 @@ providers:
   gcp:
     project_id: null
     controller_cidr: null
-    images: {europe-west3: null, europe-west2: null} # provider contract requires both; same pinned global Ubuntu image may be used
+    images: {europe-north1: projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105} # exercised Finland image
     public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     diagnostic_interfaces: {vm_a: null, vm_b: null}

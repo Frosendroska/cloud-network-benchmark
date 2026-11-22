@@ -96,7 +96,7 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
     values = {
         "account_id": "123456789012",
         "controller_cidr": "203.0.113.4/32",
-        "ami_ids": {"eu-central-1": "ami-0123456789abcdef0", "eu-west-2": "ami-0abcdef0123456789"},
+        "ami_ids": {"eu-central-1": "ami-0123456789abcdef0", "eu-west-2": "ami-0abcdef0123456789", "eu-north-1": "ami-0123456789abcdef0"},
         "public_key": KEY,
         "authentication_reference": "private-ssh-key:attempt-only",
         "private_state_root": tmp_path / "private-state",
@@ -128,15 +128,26 @@ def make_settings(tmp_path: Path, deployment=None, **overrides):
     return AwsRuntimeSettings(**values)
 
 
-def test_stockholm_provider_scope_rejects_non_acceptance_identity_before_commands(tmp_path):
+def test_stockholm_provider_scope_supports_research_locality_and_rejects_other_scenarios(tmp_path):
     deployment = make_deployment(config_path="configs/tests/exp-900-single-provider-north.yaml")
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment=deployment,
         ami_ids={"eu-north-1": "ami-0123456789abcdef0"}), clock=lambda: NOW)
     assert driver._regions(deployment) == ["eu-north-1"]
+    study = deployment.model_copy(update={"experiment_id": "EXP-001", "mode": "short_study", "context": "standard"})
+    assert driver._regions(study) == ["eu-north-1"]
+    s3_acceptance = deployment.model_copy(update={"experiment_id": "EXP-003", "mode": "acceptance",
+                                                   "context": "standard", "scenario": "placement_optimization"})
+    assert driver._regions(s3_acceptance) == ["eu-north-1"]
+    frankfurt_fallback = study.model_copy(update={
+        "vm_a": study.vm_a.model_copy(update={"region": "eu-central-1", "zone": "eu-central-1a"}),
+        "vm_b": study.vm_b.model_copy(update={"region": "eu-central-1", "zone": "eu-central-1a"}),
+    })
+    with pytest.raises(AwsProviderError, match="cannot fall back"):
+        driver._regions(frankfurt_fallback)
     for changed in (deployment.model_copy(update={"experiment_id": "EXP-999"}),
                     deployment.model_copy(update={"context": "standard"}),
-                    deployment.model_copy(update={"mode": "short_study"})):
-        with pytest.raises(AwsProviderError, match="Stockholm is limited"):
+                    deployment.model_copy(update={"scenario": "cross_zone"})):
+        with pytest.raises(AwsProviderError, match="unsupported|outside"):
             driver._regions(changed)
 
 
@@ -841,8 +852,9 @@ def test_frozen_scenarios_match_aws_regions_and_pair_root(scenario, file, tmp_pa
     variables = driver._pair_variables(deployment)
     assert variables["scenario"] == scenario
     assert variables["controller_cidr"].endswith("/32")
-    assert variables["primary_region"] == "eu-central-1"
-    assert variables["primary_zone"] == "eu-central-1a"
+    northern = scenario in {"same_zone", "placement_optimization"}
+    assert variables["primary_region"] == ("eu-north-1" if northern else "eu-central-1")
+    assert variables["primary_zone"] == ("eu-north-1a" if northern else "eu-central-1a")
     assert variables["image_id_primary"] == "ami-0123456789abcdef0"
 
 

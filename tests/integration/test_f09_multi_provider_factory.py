@@ -238,7 +238,7 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert "gcp-pair-destroy" in [request.action_id for request in runner.requests]
     if north:
         assert runner.deployment.vm_a.region == runner.deployment.vm_b.region == "europe-north1"
-        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-a"
+        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-c"
         assert runner.driver.settings.images == runtime["providers"]["gcp"]["options"]["images"]
         assert all("europe-west3" not in request.argv and "europe-west2" not in request.argv
             for request in runner.requests if request.action_id.startswith("gcp-"))
