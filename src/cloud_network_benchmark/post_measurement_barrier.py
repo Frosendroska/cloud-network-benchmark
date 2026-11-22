@@ -28,8 +28,8 @@ class PostMeasurementBarrier:
         if not isinstance(spec, Mapping) or spec.get("schema_version") != 1:
             raise ValueError("post-measurement barrier requires schema version 1")
         barrier_id = spec.get("barrier_id")
-        root_value = spec.get("barrier_root")
-        participants = spec.get("participants")
+        root_value = spec.get("barrier_root", spec.get("absolute_barrier_root"))
+        participants = spec.get("participants", spec.get("expected_participants"))
         if not isinstance(barrier_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", barrier_id):
             raise ValueError("barrier identity is malformed")
         if not isinstance(root_value, str) or not Path(root_value).is_absolute():
@@ -55,18 +55,39 @@ class PostMeasurementBarrier:
             raise ValueError("barrier root cannot traverse symlink components")
         self.spec = {"schema_version": 1, "barrier_id": barrier_id,
             "barrier_root": str(root), "participants": normalized}
+        if spec.get("start_utc") is not None:
+            from datetime import datetime
+            start = datetime.fromisoformat(spec["start_utc"].replace("Z", "+00:00"))
+            if start.tzinfo is None or start.utcoffset() is None:
+                raise ValueError("barrier frozen start UTC must include timezone")
+            self.spec["start_utc"] = start.astimezone(__import__("datetime").timezone.utc).isoformat()
         self.digest = hashlib.sha256(_canonical(self.spec)).hexdigest()
         self.path = root / f"{barrier_id}.state.json"
         self.lock_path = root / f"{barrier_id}.lock"
         self._initialize()
 
-    def _locked(self, callback: Callable[[dict[str, Any]], Any]) -> Any:
+    def _locked(self, callback: Callable[[dict[str, Any]], Any], *, deadline: Any = None,
+            clock: Callable[[], float] = time.monotonic, cancelled: Callable[[], bool] = lambda: False,
+            maximum_wait: float = 1.0) -> Any:
         if self.lock_path.is_symlink() or self.path.is_symlink():
             raise ValueError("barrier state and lock must not be symlinks")
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.lock_path, flags, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            end = clock() + maximum_wait
+            while True:
+                if cancelled():
+                    raise InterruptedError("barrier lock acquisition was cancelled")
+                remaining = min(maximum_wait, end - clock())
+                if deadline is not None:
+                    remaining = min(remaining, deadline.remaining(clock, cleanup=True))
+                if remaining <= 0:
+                    raise TimeoutError("barrier lock acquisition reached its bounded deadline")
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.025, remaining))
             state = json.loads(self.path.read_text(encoding="utf-8"))
             if state.get("spec_sha256") != self.digest or state.get("spec") != self.spec:
                 raise ValueError("barrier state belongs to a different or replaced participant set")
@@ -99,7 +120,10 @@ class PostMeasurementBarrier:
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.lock_path, flags, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise TimeoutError("barrier initialization lock is already held") from exc
             if self.path.exists():
                 state = json.loads(self.path.read_text(encoding="utf-8"))
                 if state.get("spec_sha256") != self.digest or state.get("spec") != self.spec:
@@ -112,7 +136,8 @@ class PostMeasurementBarrier:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def signal_terminal(self, participant: Mapping[str, str], *, succeeded: bool) -> dict:
+    def signal_terminal(self, participant: Mapping[str, str], *, succeeded: bool,
+            deadline: Any = None, clock: Callable[[], float] = time.monotonic) -> dict:
         if type(succeeded) is not bool:
             raise ValueError("measurement terminal outcome must be explicit")
         key = _canonical(dict(participant)).decode()
@@ -133,9 +158,10 @@ class PostMeasurementBarrier:
                 state["state"] = "released"
             self._write(state)
             return dict(state)
-        return self._locked(apply)
+        return self._locked(apply, deadline=deadline, clock=clock)
 
-    def abort(self, reason: str) -> dict:
+    def abort(self, reason: str, *, deadline: Any = None,
+            clock: Callable[[], float] = time.monotonic, nonblocking: bool = False) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("barrier abort requires a reason")
         def apply(state: dict[str, Any]) -> dict:
@@ -144,20 +170,29 @@ class PostMeasurementBarrier:
                 state["abort_reason"] = reason[:200]
                 self._write(state)
             return dict(state)
-        return self._locked(apply)
+        return self._locked(apply, deadline=deadline, clock=clock,
+            maximum_wait=0.0 if nonblocking else 1.0)
 
     def wait_released(self, *, deadline: Any, clock: Callable[[], float] = time.monotonic,
             cancelled: Callable[[], bool] = lambda: False,
             sleep: Callable[[float], None] = time.sleep) -> dict:
         while True:
             if cancelled():
-                self.abort("participant_cancelled")
+                try:
+                    self.abort("participant_cancelled", deadline=deadline, clock=clock, nonblocking=True)
+                except (TimeoutError, InterruptedError):
+                    pass
                 raise InterruptedError("post-measurement barrier was cancelled")
             remaining = deadline.remaining(clock, cleanup=True)
             if remaining <= 0:
-                self.abort("original_deadline_expired_before_barrier_release")
+                try:
+                    self.abort("original_deadline_expired_before_barrier_release",
+                        deadline=deadline, clock=clock, nonblocking=True)
+                except (TimeoutError, InterruptedError):
+                    pass
                 raise TimeoutError("post-measurement barrier reached the original deadline")
-            snapshot = self._locked(lambda state: dict(state))
+            snapshot = self._locked(lambda state: dict(state), deadline=deadline, clock=clock,
+                cancelled=cancelled, maximum_wait=remaining)
             if snapshot["state"] == "released":
                 return snapshot
             if snapshot["state"] == "aborted":

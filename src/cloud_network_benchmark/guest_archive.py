@@ -10,6 +10,7 @@ import argparse
 import json
 from pathlib import Path
 import shlex
+import shutil
 import sys
 from typing import Any, Mapping, Sequence
 
@@ -31,7 +32,10 @@ def create_guest_archive(source: Path, destination: Path, *, maximum_part_bytes:
     if projected_archive_upper_bound(sum(row[2] for row in rows), len(rows)) > maximum_archive_bytes:
         raise ValueError("guest archive upper bound exceeds its configured maximum byte bound")
     manifest = create_closed_archive(source, destination,
-        max_part_bytes=maximum_part_bytes, minimum_headroom_bytes=minimum_free_bytes)
+        max_part_bytes=maximum_part_bytes,
+        free_bytes=lambda path: shutil.disk_usage(path).free,
+        minimum_headroom_bytes=minimum_free_bytes,
+        minimum_source_headroom_bytes=minimum_free_bytes)
     return manifest
 
 
@@ -74,7 +78,34 @@ def create_remote_guest_archive(connection: Any, *, role: str, source_directory:
     if remaining <= 0:
         raise TimeoutError("archive creation reached original deadline or cleanup reserve")
     vm = connection.vm_a if role == "vm_a" else connection.vm_b
-    argv = ["python3", "-m", "cloud_network_benchmark.guest_archive",
+    # Measurement guests do not have the application installed. Deliver only
+    # the two stdlib-only source modules needed for compression, bound to this
+    # executing checkout; never install a package or resolve dependencies.
+    import tempfile
+    from pathlib import Path
+    package_root = Path(__file__).resolve().parent
+    helper_root = f"/tmp/cnb-guest-archive-{connection.deployment_id}-{role}"
+    helper_package = helper_root + "/cloud_network_benchmark"
+    archive_parent = str(PurePosixPath(archive_directory).parent)
+    mkdir = _request(f"f09-guest-archive-mkdir-{connection.deployment_id}-{role}", vm,
+        ["sh", "-c", "test ! -e " + shlex.quote(helper_root) + " && test ! -e "
+         + shlex.quote(archive_directory) + " && mkdir -p " + shlex.quote(helper_package)
+         + " " + shlex.quote(archive_parent)],
+        min(connection.timeouts.command_seconds, remaining))
+    mkdir_result = _execute(runner, mkdir)
+    if mkdir_result.outcome != CommandOutcome.SUCCEEDED:
+        raise RuntimeError(f"guest archive helper directory unavailable for {role}")
+    actions = [_action(mkdir.action_id, mkdir.action_type, vm, mkdir, mkdir_result)]
+    for name in ("closed_archive.py", "guest_archive.py"):
+        source = package_root / name
+        request = _request(f"f09-guest-archive-helper-{connection.deployment_id}-{role}-{name}", vm,
+            [str(source), f"{vm.user}@{vm.host}:{helper_package}/{name}"],
+            min(connection.timeouts.transfer_seconds, deadline.remaining(clock, cleanup=True)), "scp")
+        result = _execute(runner, request)
+        actions.append(_action(request.action_id, request.action_type, vm, request, result))
+        if result.outcome != CommandOutcome.SUCCEEDED:
+            raise RuntimeError(f"guest archive helper delivery failed for {role}")
+    argv = ["env", "PYTHONPATH=" + helper_root, "python3", "-m", "cloud_network_benchmark.guest_archive",
         "--source", source_directory, "--destination", archive_directory,
         "--maximum-part-bytes", str(maximum_part_bytes),
         "--maximum-archive-bytes", str(maximum_archive_bytes),
@@ -97,7 +128,7 @@ def create_remote_guest_archive(connection: Any, *, role: str, source_directory:
             raise ValueError("guest archive contains a part above the transfer bound")
         return {"role": role, "source_directory": source_directory,
             "archive_directory": archive_directory, "manifest": manifest,
-            "action": action.model_dump(mode="json")}
+            "actions": [*([item.model_dump(mode="json") for item in actions]), action.model_dump(mode="json")]}
     except (IndexError, KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"guest archive result is invalid for {role}: {type(exc).__name__}") from exc
 

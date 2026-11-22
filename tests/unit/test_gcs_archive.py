@@ -606,15 +606,13 @@ def test_materialize_verified_archive_stays_pending_until_explicit_replay(tmp_pa
     second_archive.mkdir()
     second_native = tmp_path / "analysis-native-2"
     second_native.mkdir()
-    replayed = materialize_verified_archive(backend=backend, bucket="valid-bucket",
-        provider="aws", experiment_id="exp-001", run_id="replay-001",
-        expected_manifest_sha256=uploaded["manifest_sha256"],
-        archive_directory=second_archive, materialization_root=second_native,
-        maximum_part_bytes=4096,
-        replay=lambda _root: {"validation_status": "valid", "result_id": "offline-replay-1"})
-    assert replayed["status"] == "replayed"
-    assert replayed["validation_status"] == "valid"
-    assert replayed["replay_result"]["result_id"] == "offline-replay-1"
+    with pytest.raises(TypeError, match="replay"):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=second_archive, materialization_root=second_native,
+            maximum_part_bytes=4096,
+            replay=lambda _root: {"validation_status": "valid", "result_id": "fabricated"})
 
 
 def test_guest_archive_is_deterministic_bounded_and_preserves_native_sources(tmp_path):
@@ -697,7 +695,7 @@ def test_materialization_rejects_unsafe_or_occupied_destinations_and_fabricated_
             expected_manifest_sha256=uploaded["manifest_sha256"],
             archive_directory=archive_destination, materialization_root=unsafe_root,
             maximum_part_bytes=4096)
-    with pytest.raises(ValueError, match="explicit validation_status"):
+    with pytest.raises(TypeError, match="replay"):
         materialize_verified_archive(backend=backend, bucket="valid-bucket",
             provider="aws", experiment_id="exp-001", run_id="replay-001",
             expected_manifest_sha256=uploaded["manifest_sha256"],

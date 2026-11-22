@@ -614,11 +614,129 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             archive_dir.cleanup()
 
 
+def publish_guest_archive_parts(*, guest_archives: list[dict], fetch_part: Callable[[str, dict], Path],
+        staging_directory: Path,
+        backend: GCSObjectBackend, bucket: str, provider: str, experiment_id: str, run_id: str,
+        closed_inventory: dict,
+        maximum_part_bytes: int, deadline: Any, clock: Callable[[], float] = time.monotonic,
+        chunk_bytes: int = 8 * 1024 * 1024) -> dict:
+    """Publish already guest-compressed role parts and immutable receipts.
+
+    `staged_parts` contains only one-at-a-time controller files. The logical
+    manifest is preflighted before the first create, then parts, manifest and
+    completion are uploaded create-only and read back by generation.
+    """
+    if not valid_bucket_name(bucket) or provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive destination identity is invalid")
+    if not all(_ID.fullmatch(value) for value in (experiment_id, run_id)):
+        raise ValueError("experiment and run identities must be stable safe identifiers")
+    if not guest_archives or len({row.get("role") for row in guest_archives}) != len(guest_archives):
+        raise ValueError("guest archive roles must be nonempty and unique")
+    def remaining():
+        value = deadline.remaining(clock, cleanup=True)
+        if value <= 0:
+            raise TimeoutError("archive transfer reached the original deadline or cleanup reserve")
+        return value
+    roles = []
+    expected_parts = []
+    for archive in sorted(guest_archives, key=lambda value: value["role"]):
+        role, manifest = archive["role"], archive["manifest"]
+        if role not in {"vm_a", "vm_b"} or not isinstance(manifest, dict):
+            raise ValueError("guest archive role manifest is invalid")
+        files, parts = manifest.get("files"), manifest.get("parts")
+        if not isinstance(files, list) or not files or not isinstance(parts, list) or not parts:
+            raise ValueError("guest archive inventory or parts are incomplete")
+        roles.append({"role": role, "files": files, "archive_bytes": manifest.get("archive_bytes"), "parts": parts})
+        for index, part in enumerate(parts, 1):
+            if (part.get("path") != f"archive.tar.gz.part-{index:05d}"
+                    or type(part.get("size_bytes")) is not int
+                    or not 0 < part["size_bytes"] <= min(maximum_part_bytes, FAT32_FILE_LIMIT)
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))):
+                raise ValueError("guest part sequence or byte bound is invalid")
+            expected_parts.append((role, part["size_bytes"], part))
+    staging_directory = Path(staging_directory)
+    if staging_directory.is_symlink() or not staging_directory.is_dir():
+        raise ValueError("one-part staging directory must be an existing real directory")
+    prefix = f"cnb/v1/{provider}/{experiment_id}/{run_id}/"
+    manifest = {"schema_version": 1, "provider": provider, "experiment_id": experiment_id,
+        "run_id": run_id, "closed_inventory": closed_inventory, "roles": roles}
+    manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_key, completion_key = prefix + "manifest.json", prefix + "complete.json"
+    # A preoccupied prefix is closed; do not mutate it, even if incomplete.
+    if backend.stat(manifest_key, timeout_seconds=remaining()) is not None or backend.stat(
+            completion_key, timeout_seconds=remaining()) is not None:
+        raise ValueError("logical run prefix is already occupied")
+    objects = []
+    for role, size, part in expected_parts:
+        path = Path(fetch_part(role, part))
+        if path.parent.resolve() != staging_directory.resolve() or path.is_symlink() or not path.is_file():
+            raise ValueError("guest part fetch did not return a file in the bounded staging directory")
+        try:
+            if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
+                raise ValueError("guest part failed controller size/hash verification")
+            key = f"{prefix}parts/{role}/{part['path']}-{part['sha256']}"
+            if backend.stat(key, timeout_seconds=remaining()) is not None:
+                raise ValueError("guest part key is already occupied")
+            created = backend.upload(key, path, size_bytes=size, sha256=part["sha256"],
+                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+            generation = str(created.get("generation", ""))
+            if not generation or created.get("size_bytes") != size:
+                raise ValueError("GCS create response omitted the exact immutable object identity")
+            backend.download(key, path, maximum_bytes=maximum_part_bytes,
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
+                raise ValueError("GCS generation-bound part readback failed")
+            objects.append({"key": key, "size_bytes": size, "sha256": part["sha256"], "generation": generation})
+        finally:
+            path.unlink(missing_ok=True)
+    for key, content, digest in ((manifest_key, manifest_bytes, manifest_sha),):
+        with tempfile.TemporaryDirectory(prefix="cnb-guest-meta-", dir=staging_directory) as temp:
+            source = Path(temp) / "metadata.json"
+            source.write_bytes(content)
+            created = backend.upload(key, source, size_bytes=len(content), sha256=digest,
+                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+            generation = str(created.get("generation", ""))
+            if not generation or created.get("size_bytes") != len(content):
+                raise ValueError("GCS metadata create response omitted its immutable identity")
+            readback = Path(temp) / "readback.json"
+            backend.download(key, readback, maximum_bytes=max(maximum_part_bytes, len(content)),
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(readback, max(maximum_part_bytes, len(content)), lambda: remaining()) != (len(content), digest):
+                raise ValueError("GCS manifest generation-bound readback failed")
+        objects.append({"key": key, "size_bytes": len(content), "sha256": digest, "generation": generation})
+    completion = {"schema_version": 2, "manifest_sha256": manifest_sha,
+        "objects": objects}
+    complete_bytes = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    complete_sha = hashlib.sha256(complete_bytes).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="cnb-guest-complete-", dir=staging_directory) as temp:
+        source = Path(temp) / "complete.json"
+        source.write_bytes(complete_bytes)
+        created = backend.upload(completion_key, source, size_bytes=len(complete_bytes), sha256=complete_sha,
+            if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+        completion_generation = str(created.get("generation", ""))
+        if not completion_generation or created.get("size_bytes") != len(complete_bytes):
+            raise ValueError("GCS completion create response omitted immutable identity")
+        readback = Path(temp) / "readback.json"
+        backend.download(completion_key, readback, maximum_bytes=max(maximum_part_bytes, len(complete_bytes)),
+            timeout_seconds=remaining(), generation=completion_generation)
+        if _hash(readback, max(maximum_part_bytes, len(complete_bytes)), lambda: remaining()) != (len(complete_bytes), complete_sha):
+            raise ValueError("GCS completion generation-bound readback failed")
+    for row in [*objects, {"key": completion_key, "generation": completion_generation,
+                           "size_bytes": len(complete_bytes)}]:
+        current = backend.stat(row["key"], timeout_seconds=remaining())
+        if current is None or str(current.get("generation")) != row["generation"] or current.get("size_bytes") != row["size_bytes"]:
+            raise ValueError("a verified archive generation changed before acceptance")
+    return {"status": "verified", "verified": True, "validation_state": "archive_pending_validation",
+        "bucket": bucket, "prefix": prefix, "manifest_sha256": manifest_sha,
+        "manifest": manifest, "objects": objects, "completion_generation": completion_generation,
+        "archive_bytes": sum(item["size_bytes"] for _, item in expected_parts)}
+
+
 def materialize_verified_archive(*, backend: GCSObjectBackend, bucket: str, provider: str,
         experiment_id: str, run_id: str, expected_manifest_sha256: str,
         archive_directory: Path, materialization_root: Path,
-        maximum_part_bytes: int, minimum_free_bytes: int = 0,
-        replay: Callable[[Path], Any] | None = None) -> dict:
+        maximum_part_bytes: int, minimum_free_bytes: int = 0) -> dict:
     """Download a completed archive by generation, verify, then extract safely.
 
     Without a replay callback the returned receipt explicitly remains pending;
@@ -660,6 +778,8 @@ def materialize_verified_archive(*, backend: GCSObjectBackend, bucket: str, prov
         backend.download(complete_key, complete_path, maximum_bytes=maximum_part_bytes,
             timeout_seconds=30, generation=str(complete_ref["generation"]))
         complete = json.loads(complete_path.read_bytes())
+        if complete.get("schema_version") == 1:
+            raise ValueError("legacy archive completion schema v1 is unsupported for generation-bound restoration")
         if (complete.get("schema_version") != 2
                 or complete.get("manifest_sha256") != expected_manifest_sha256
                 or not isinstance(complete.get("objects"), list)):
@@ -730,14 +850,6 @@ def materialize_verified_archive(*, backend: GCSObjectBackend, bucket: str, prov
             "archive_path": str(local_archive), "native_root": str(destination),
             "raw_bytes": native_manifest["raw_bytes"], "archive_bytes": native_manifest["archive_bytes"],
             "completion_generation": str(complete_ref["generation"])}
-        if replay is not None:
-            replay_result = replay(destination)
-            status = (replay_result.get("validation_status") if isinstance(replay_result, dict)
-                else getattr(replay_result, "validation_status", None))
-            if status not in {"valid", "invalid", "incomplete", "not_validated"}:
-                raise ValueError("replay callback must return an explicit validation_status")
-            receipt.update(status="replayed", validation_status=status,
-                replay_status="completed", replay_result=replay_result)
         return receipt
     except BaseException:
         shutil.rmtree(local_archive, ignore_errors=True)

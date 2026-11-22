@@ -66,3 +66,31 @@ def test_unverified_or_malformed_archive_manifest_fails_closed(tmp_path):
     with pytest.raises(ValueError, match="lowercase SHA"):
         validate_storage_review("week", review(archive_manifest_sha256="not-a-hash"), minimum_free_bytes=500_000_000,
             results_path=tmp_path, disk_free=lambda _: 900_000_000)
+
+
+def test_remote_archive_mode_uses_aggregate_controller_peak_and_separate_restore_peak(tmp_path):
+    remote = review(expected_raw_bytes=200_000, expected_archive_bytes=100_000,
+        expected_archive_part_count=4, expected_concurrent_archive_part_count=3,
+        maximum_archive_part_bytes=64_000, capsule_state_manifest_bytes=20_000,
+        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000)
+    result = validate_storage_review("day", remote, minimum_free_bytes=222_000,
+        results_path=tmp_path / "halle", restore_path=tmp_path / "mac-restore",
+        storage_mode="remote_archive", disk_free=lambda path: 222_000 if "halle" in str(path) else 400_000)
+    assert result["controller_peak_required_bytes"] == 222_000
+    assert result["restore_destination_required_bytes"] == 350_000
+    assert result["observed_restore_free_bytes"] == 400_000
+
+
+def test_remote_archive_requires_measured_roomy_restore_space_and_aggregate_parts(tmp_path):
+    remote = review(expected_raw_bytes=200_000, expected_archive_bytes=100_000,
+        expected_archive_part_count=4, expected_concurrent_archive_part_count=3,
+        maximum_archive_part_bytes=64_000, capsule_state_manifest_bytes=20_000,
+        controller_reserve_bytes=10_000, restore_destination_headroom_bytes=50_000)
+    with pytest.raises(OSError, match="roomy restore destination"):
+        validate_storage_review("day", remote, minimum_free_bytes=222_000,
+            results_path=tmp_path, restore_path=tmp_path / "mac",
+            storage_mode="remote_archive", disk_free=lambda _: 222_000)
+    with pytest.raises(ValueError, match="aggregate archive part inventory"):
+        validate_storage_review("day", {**remote, "expected_archive_part_count": 1}, minimum_free_bytes=222_000,
+            results_path=tmp_path, restore_path=tmp_path / "mac",
+            storage_mode="remote_archive", disk_free=lambda _: 1_000_000)
