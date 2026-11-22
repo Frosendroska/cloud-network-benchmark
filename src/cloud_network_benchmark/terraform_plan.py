@@ -96,7 +96,15 @@ def validate_scope(plan: dict, provider: str, root: Path, v: dict) -> list[dict]
     """Require fresh exact scope; unknown critical inputs fail via missing values."""
     if not str(plan.get("format_version", "")).startswith("1.") or plan.get("errored") or plan.get("deferred_changes") or plan.get("resource_drift"):
         raise PlanReviewError("unsupported, incomplete or drifted Terraform plan")
-    _same({k: item["value"] for k, item in plan.get("variables", {}).items()}, v, "input variables")
+    actual_variables = {k: item["value"] for k, item in plan.get("variables", {}).items()}
+    expected_variables = dict(v)
+    if provider == "aws" and root.name == "safety" and "expiry_role_permissions_boundary_arn" not in expected_variables:
+        # Terraform includes a newly declared nullable default in plan JSON even
+        # when a legacy reviewed tfvars file omitted it. Accept only that exact
+        # null default; all other missing or additional inputs remain exact.
+        if actual_variables.get("expiry_role_permissions_boundary_arn") is None:
+            actual_variables.pop("expiry_role_permissions_boundary_arn", None)
+    _same(actual_variables, expected_variables, "input variables")
     for check in plan.get("checks", []):
         if check.get("status") in {"fail", "error"}: raise PlanReviewError("Terraform plan checks failed")
     resources = {}
@@ -130,6 +138,17 @@ def _aws_scope(r: dict, root: Path, v: dict) -> None:
         name = f"cnb-expiry-{v['resource_namespace'].replace('.', '-')[:24]}-{digest}"
         role = r["aws_iam_role.expiry"]
         _same(role.get("name"), name, "expiry role name")
+        boundary = v.get("expiry_role_permissions_boundary_arn")
+        if boundary is not None and (
+            not isinstance(boundary, str)
+            or not boundary.startswith(f"arn:aws:iam::{v['account_id']}:policy/")
+            or not boundary.removeprefix(f"arn:aws:iam::{v['account_id']}:policy/")
+        ):
+            raise PlanReviewError("expiry role permissions boundary must be a customer-managed policy in the approved AWS account")
+        _same(role.get("permissions_boundary"), boundary, "expiry role permissions boundary")
+        _same(role.get("tags", {}), {} if boundary is None else {
+            "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]
+        }, "expiry role ownership tags")
         _same(json.loads(role["assume_role_policy"]), {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ssm.amazonaws.com"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"aws:SourceAccount": v["account_id"]}, "ArnLike": {"aws:SourceArn": f"arn:aws:ssm:{v['region']}:{v['account_id']}:automation-execution/*"}}}]}, "expiry trust")
         policy = r["aws_iam_role_policy.expiry"]
         _same(policy.get("name"), "cnb-expiry-stop-owned-instances", "expiry policy name")

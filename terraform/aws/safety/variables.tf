@@ -30,3 +30,17 @@ variable "run_id" {
 variable "deployment_id" {
   type = string
 }
+
+variable "expiry_role_permissions_boundary_arn" {
+  type        = string
+  description = "Optional existing customer-managed IAM policy ARN used as the expiry role permissions boundary."
+  default     = null
+  nullable    = true
+  validation {
+    condition = var.expiry_role_permissions_boundary_arn == null || can(regex(
+      "^arn:aws:iam::[0-9]{12}:policy/(?:[A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+$",
+      var.expiry_role_permissions_boundary_arn
+    ))
+    error_message = "expiry_role_permissions_boundary_arn must be an IAM customer-managed policy ARN with a valid path."
+  }
+}

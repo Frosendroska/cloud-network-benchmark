@@ -47,7 +47,7 @@ def scope(provider, root, scenario="same_zone"):
         trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ssm.amazonaws.com"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"aws:SourceAccount": v["account_id"]}, "ArnLike": {"aws:SourceArn": "arn:aws:ssm:eu-north-1:238360820461:automation-execution/*"}}}]}
         policy = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["ec2:DescribeInstances"], "Resource": "*"}, {"Effect": "Allow", "Action": ["ec2:StopInstances"], "Resource": "arn:aws:ec2:eu-north-1:238360820461:instance/*", "Condition": {"StringEquals": {"ec2:ResourceTag/cnb_run_id": v["run_id"], "ec2:ResourceTag/cnb_deployment_id": v["deployment_id"]}}}]}
         body = {"assumeRole": "{{ AutomationAssumeRole }}", "parameters": {k: {"type": "String"} for k in ("AutomationAssumeRole", "ExpiryTriggerUtc", "RunId", "DeploymentId", "Region")}, "mainSteps": [{"name": "waitUntilExpiry", "action": "aws:sleep", "inputs": {"Timestamp": "{{ ExpiryTriggerUtc }}"}}, {"name": "discoverAndStopOwnedInstances", "action": "aws:executeScript", "inputs": {"Runtime": "python3.11", "Handler": "handler", "Script": (ROOT/"terraform/aws/safety/expiry.py").read_text(), "InputPayload": {"run_id": "{{ RunId }}", "deployment_id": "{{ DeploymentId }}", "region": "{{ Region }}"}}, "timeoutSeconds": 330}]}
-        return v, {"aws_iam_role.expiry": {"name": name, "assume_role_policy": json.dumps(trust)}, "aws_iam_role_policy.expiry": {"name": "cnb-expiry-stop-owned-instances", "policy": json.dumps(policy)}, "aws_ssm_document.expiry": {"name": name, "document_type": "Automation", "document_format": "JSON", "content": json.dumps(body)}}
+        return v, {"aws_iam_role.expiry": {"name": name, "permissions_boundary": None, "tags": {}, "assume_role_policy": json.dumps(trust)}, "aws_iam_role_policy.expiry": {"name": "cnb-expiry-stop-owned-instances", "policy": json.dumps(policy)}, "aws_ssm_document.expiry": {"name": name, "document_type": "Automation", "document_format": "JSON", "content": json.dumps(body)}}
     v.update(scenario=scenario, primary_region="eu-north-1", primary_zone="eu-north-1a", image_id_primary="ami-084df9e6ad4622caf", image_id_london="ami-fixture-london", controller_cidr="203.0.113.4/32", placement_group_name="scope-cluster")
     # Independently enumerated same-zone layout (no EIP, placement or London resources).
     names = ["terraform_data.account_guard", "aws_vpc.frankfurt", "aws_internet_gateway.frankfurt", "aws_route_table.frankfurt", "aws_subnet.a", "aws_route_table_association.a", "aws_security_group.vm_a", "aws_security_group.vm_b_frankfurt[0]", "aws_instance.vm_a", "aws_instance.vm_b_frankfurt[0]", "aws_ec2_tag.eni_a", "aws_ec2_tag.eni_a_deployment", "aws_ec2_tag.eni_b_frankfurt[0]", "aws_ec2_tag.eni_b_frankfurt_deployment[0]"]
@@ -73,6 +73,52 @@ def test_all_four_roots_have_exact_fresh_scope(provider, root):
     v, resources = scope(provider,root)
     checked = tp.validate_scope(plan_document(v,resources,provider), provider, ROOT/"terraform"/provider/root, v)
     assert len(checked) == len(resources)
+
+
+def test_legacy_aws_safety_plan_accepts_only_declared_null_default():
+    v, resources = scope("aws", "safety")
+    plan = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
+    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == len(resources)
+
+
+def test_configured_aws_safety_boundary_is_bound_to_arn_and_ownership_tags():
+    v, resources = scope("aws", "safety")
+    arn = f"arn:aws:iam::{v['account_id']}:policy/team/ExpiryBoundary"
+    v["expiry_role_permissions_boundary_arn"] = arn
+    resources["aws_iam_role.expiry"].update(permissions_boundary=arn, tags={
+        "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]
+    })
+    plan = plan_document(v, resources, "aws")
+    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == len(resources)
+    for mutation in ("wrong_account", "wrong_boundary", "missing_tag", "wrong_tag_value"):
+        changed = deepcopy(plan)
+        role = next(x for x in changed["resource_changes"] if x["address"] == "aws_iam_role.expiry")["change"]["after"]
+        if mutation == "wrong_account": role["permissions_boundary"] = "arn:aws:iam::999999999999:policy/team/ExpiryBoundary"
+        elif mutation == "wrong_boundary": role["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/team/Other"
+        elif mutation == "missing_tag": role["tags"].pop("cnb_deployment_id")
+        else: role["tags"]["cnb_run_id"] = "another-run"
+        with pytest.raises(tp.PlanReviewError): tp.validate_scope(changed, "aws", ROOT/"terraform/aws/safety", v)
+
+
+def test_configured_aws_safety_boundary_must_be_customer_policy_in_approved_account():
+    v, resources = scope("aws", "safety")
+    v["expiry_role_permissions_boundary_arn"] = "arn:aws:iam::999999999999:policy/team/Foreign"
+    resources["aws_iam_role.expiry"].update(
+        permissions_boundary=v["expiry_role_permissions_boundary_arn"],
+        tags={"cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]},
+    )
+    with pytest.raises(tp.PlanReviewError, match="approved AWS account"):
+        tp.validate_scope(plan_document(v, resources, "aws"), "aws", ROOT/"terraform/aws/safety", v)
+
+
+@pytest.mark.parametrize("extra", [
+    {"expiry_role_permissions_boundary_arn": "arn:aws:iam::999999999999:policy/foreign"},
+    {"unapproved_null_input": None},
+])
+def test_aws_safety_plan_rejects_unexpected_variables(extra):
+    v, resources = scope("aws", "safety")
+    plan = plan_document({**v, **extra}, resources, "aws")
+    with pytest.raises(tp.PlanReviewError): tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)
 
 
 @pytest.mark.parametrize("scenario,count", [("same_zone",8),("cross_zone",8),("placement_optimization",9),("inter_region",9)])
@@ -165,6 +211,14 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert all(p.stat().st_mode & 0o077 == 0 for p in directory.iterdir())
     assert directory.stat().st_mode & 0o077 == 0
     assert runner.requests[-1].timeout_seconds <= runner.requests[0].timeout_seconds
+
+
+def test_reviewed_apply_accepts_legacy_aws_safety_tfvars_with_null_default(tmp_path,operator):
+    req, runner = request(tmp_path, "aws", "safety")
+    v, resources = scope("aws", "safety")
+    runner.document = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
+    assert tp.reviewed_apply(req, runner.run).outcome == "succeeded"
+    assert [r.argv[2] for r in runner.requests] == ["plan", "show", "apply"]
 
 
 def test_missing_operator_receipt_never_applies_and_preserves_files(tmp_path):
