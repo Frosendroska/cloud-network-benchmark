@@ -6,6 +6,7 @@ and stream downloads to the supplied bounded staging file.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import stat
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
@@ -25,6 +27,57 @@ _ARCHIVE_PROJECT_ID = "project-a70f8497-3463-4ef2-9cd"
 _ARCHIVE_SERVICE_ACCOUNT = "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"
 _ARCHIVE_SOURCE_PRINCIPAL = "katyabraun0@gmail.com"
 _ARCHIVE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_write"
+
+
+class _GoogleRequestBudget:
+    """Share one monotonic deadline across auth and storage HTTP dispatches."""
+
+    def __init__(self, transport_error: type[Exception], clock: Callable[[], float] = time.monotonic):
+        self._transport_error = transport_error
+        self._clock = clock
+        self._deadline = contextvars.ContextVar("gcs_archive_request_deadline", default=None)
+
+    @contextmanager
+    def operation(self, timeout_seconds: float):
+        if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+            raise TimeoutError("GCS archive operation has no remaining request budget")
+        token = self._deadline.set(self._clock() + float(timeout_seconds))
+        try:
+            yield
+        finally:
+            self._deadline.reset(token)
+
+    def remaining(self) -> float:
+        deadline = self._deadline.get()
+        if deadline is None:
+            raise RuntimeError("GCS HTTP request is outside its bounded archive operation")
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise TimeoutError("GCS archive operation exhausted its shared timeout/request budget")
+        return remaining
+
+    def auth_request(self, request: Callable[..., Any], *args, **kwargs):
+        # OAuth's refresh helper may retry unsuccessful responses internally. Turn
+        # every such response into a transport failure before it can enter that loop.
+        response = self.dispatch(request, *args, **kwargs)
+        status = getattr(response, "status_code", 200)
+        if not 200 <= status < 300:
+            close = getattr(response, "close", None)
+            if close:
+                close()
+            raise self._transport_error(f"Google credential request returned HTTP {status}")
+        return response
+
+    def dispatch(self, request: Callable[..., Any], *args, **kwargs):
+        """Set a fresh timeout immediately before any auth or storage HTTP dispatch."""
+        kwargs["timeout"] = self.remaining()
+        return request(*args, **kwargs)
+
+
+def _disable_http_retries(session: Any, adapter_type: type) -> None:
+    adapter = adapter_type(max_retries=0)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
 
 def _safe_source_adc(path: str | Path, expected_principal: str) -> dict:
@@ -113,6 +166,9 @@ class GoogleCloudStorageBackend:
             from google.cloud import storage
             from google.auth import load_credentials_from_file
             from google.auth import impersonated_credentials
+            from google.auth import exceptions as auth_exceptions
+            from google.auth.transport.requests import AuthorizedSession, Request
+            from requests.adapters import HTTPAdapter
         except ImportError as exc:  # pragma: no cover - optional production extra
             raise RuntimeError("install the gcs optional dependency on the controller") from exc
         try:
@@ -122,39 +178,51 @@ class GoogleCloudStorageBackend:
                 target_principal=expected_service_account_email,
                 target_scopes=[_ARCHIVE_SCOPE],
                 lifetime=lifetime)
-            archive_client = storage.Client(project=expected_project_id, credentials=credentials)
+            self._request_budget = _GoogleRequestBudget(auth_exceptions.TransportError)
+            auth_session = Request().session
+            _disable_http_retries(auth_session, HTTPAdapter)
+            auth_request = Request(session=auth_session)
+            bounded_auth_request = lambda *args, **kwargs: self._request_budget.auth_request(
+                auth_request, *args, **kwargs)
+            authorized_session = AuthorizedSession(credentials,
+                auth_request=bounded_auth_request, max_refresh_attempts=0)
+            _disable_http_retries(authorized_session, HTTPAdapter)
+            storage_request = authorized_session.request
+            def bounded_storage_request(*args, **kwargs):
+                return self._request_budget.dispatch(storage_request, *args, **kwargs)
+            authorized_session.request = bounded_storage_request
+            archive_client = storage.Client(project=expected_project_id,
+                credentials=credentials, _http=authorized_session)
         except Exception:
             raise ValueError("archive impersonated credentials could not be constructed") from None
         self._bucket = archive_client.bucket(bucket)
 
 
     def stat(self, key: str, *, timeout_seconds: float) -> dict | None:
-        blob = self._bucket.get_blob(key, timeout=timeout_seconds, retry=None)
+        with self._request_budget.operation(timeout_seconds):
+            blob = self._bucket.get_blob(key, timeout=self._request_budget.remaining(), retry=None)
         if blob is None:
             return None
         return {"generation": str(blob.generation), "size_bytes": int(blob.size or 0)}
 
     def upload(self, key: str, source: Path, *, size_bytes: int, sha256: str,
                if_generation_match: int, chunk_bytes: int, timeout_seconds: float) -> dict:
-        started = time.monotonic()
-        def remaining_timeout() -> float:
-            remaining = timeout_seconds - (time.monotonic() - started)
-            if remaining <= 0:
-                raise TimeoutError("generation-bound object upload exhausted its shared timeout")
-            return remaining
-        blob = self._bucket.blob(key, chunk_size=chunk_bytes)
-        blob.metadata = {"cnb-sha256": sha256}
-        # Drive the SDK's resumable state machine directly. Blob.upload_from_file
-        # reuses one timeout for every chunk and deletes the object implicitly on
-        # DataCorruption; both behaviors violate this archive's source-bound budget.
-        with Path(source).open("rb") as stream:
-            upload, transport = blob._initiate_resumable_upload(
-                blob.bucket.client, stream, "application/octet-stream", size_bytes,
-                if_generation_match=if_generation_match, chunk_size=chunk_bytes,
-                timeout=remaining_timeout(), checksum="crc32c", retry=None)
-            response = None
-            while not upload.finished:
-                response = upload.transmit_next_chunk(transport, timeout=remaining_timeout())
+        with self._request_budget.operation(timeout_seconds):
+            def remaining_timeout() -> float:
+                return self._request_budget.remaining()
+            blob = self._bucket.blob(key, chunk_size=chunk_bytes)
+            blob.metadata = {"cnb-sha256": sha256}
+            # Drive the SDK's resumable state machine directly. Blob.upload_from_file
+            # reuses one timeout for every chunk and deletes the object implicitly on
+            # DataCorruption; both behaviors violate this archive's source-bound budget.
+            with Path(source).open("rb") as stream:
+                upload, transport = blob._initiate_resumable_upload(
+                    blob.bucket.client, stream, "application/octet-stream", size_bytes,
+                    if_generation_match=if_generation_match, chunk_size=chunk_bytes,
+                    timeout=remaining_timeout(), checksum="crc32c", retry=None)
+                response = None
+                while not upload.finished:
+                    response = upload.transmit_next_chunk(transport, timeout=remaining_timeout())
         if response is None:
             raise RuntimeError("GCS resumable create returned no final response")
         properties = response.json()
@@ -167,35 +235,34 @@ class GoogleCloudStorageBackend:
 
     def download(self, key: str, destination: Path, *, maximum_bytes: int,
                  timeout_seconds: float, generation: str) -> None:
-        started = time.monotonic()
-        def remaining_timeout() -> float:
-            remaining = timeout_seconds - (time.monotonic() - started)
-            if remaining <= 0:
-                raise TimeoutError("generation-bound object download exhausted its shared timeout")
-            return remaining
-        blob = self._bucket.blob(key, generation=int(generation))
-        blob.reload(if_generation_match=int(generation), timeout=remaining_timeout(), retry=None)
-        if blob is None or blob.size is None or blob.size > maximum_bytes:
-            raise ValueError("remote part is missing or exceeds staging bound")
-        from google.cloud.storage._media.requests import ChunkedDownload
-        client = blob.bucket.client
-        download_url = blob._get_download_url(client, if_generation_match=int(generation))
-        try:
-            with Path(destination).open("wb") as stream:
-                download = ChunkedDownload(download_url, 8 * 1024 * 1024, stream,
-                    headers={"accept-encoding": "identity"}, start=0, end=int(blob.size) - 1,
-                    retry=None)
-                while not download.finished:
-                    download.consume_next_chunk(client._http, timeout=remaining_timeout())
-            if Path(destination).stat().st_size != int(blob.size):
-                raise ValueError("generation-bound download returned an incomplete object")
-        except Exception:
-            Path(destination).unlink(missing_ok=True)
-            raise
+        with self._request_budget.operation(timeout_seconds):
+            def remaining_timeout() -> float:
+                return self._request_budget.remaining()
+            blob = self._bucket.blob(key, generation=int(generation))
+            blob.reload(if_generation_match=int(generation), timeout=remaining_timeout(), retry=None)
+            if blob is None or blob.size is None or blob.size > maximum_bytes:
+                raise ValueError("remote part is missing or exceeds staging bound")
+            from google.cloud.storage._media.requests import ChunkedDownload
+            client = blob.bucket.client
+            download_url = blob._get_download_url(client, if_generation_match=int(generation))
+            try:
+                with Path(destination).open("wb") as stream:
+                    download = ChunkedDownload(download_url, 8 * 1024 * 1024, stream,
+                        headers={"accept-encoding": "identity"}, start=0, end=int(blob.size) - 1,
+                        retry=None)
+                    while not download.finished:
+                        download.consume_next_chunk(client._http, timeout=remaining_timeout())
+                if Path(destination).stat().st_size != int(blob.size):
+                    raise ValueError("generation-bound download returned an incomplete object")
+            except Exception:
+                Path(destination).unlink(missing_ok=True)
+                raise
 
     def delete(self, key: str, *, generation: str, timeout_seconds: float) -> None:
-        self._bucket.blob(key, generation=int(generation)).delete(
-            if_generation_match=int(generation), timeout=timeout_seconds, retry=None)
+        with self._request_budget.operation(timeout_seconds):
+            self._bucket.blob(key, generation=int(generation)).delete(
+                if_generation_match=int(generation),
+                timeout=self._request_budget.remaining(), retry=None)
 
 
 def google_cloud_storage_backend(settings: dict[str, Any]) -> GoogleCloudStorageBackend:

@@ -511,12 +511,40 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     google = types.ModuleType("google")
     cloud = types.ModuleType("google.cloud")
     auth = types.ModuleType("google.auth")
+    auth.__path__ = []
     impersonated = types.ModuleType("google.auth.impersonated_credentials")
+    exceptions = types.ModuleType("google.auth.exceptions")
+    exceptions.TransportError = type("TransportError", (Exception,), {})
+    auth.exceptions = exceptions
     impersonated.Credentials = Credentials
     auth.load_credentials_from_file = load_credentials
     auth.impersonated_credentials = impersonated
     storage = types.ModuleType("google.cloud.storage")
     storage.Client = Client
+    transport = types.ModuleType("google.auth.transport")
+    transport.__path__ = []
+    transport_requests = types.ModuleType("google.auth.transport.requests")
+    class Session:
+        def __init__(self): self.adapters = {}
+        def mount(self, prefix, adapter): self.adapters[prefix] = adapter
+        def request(self, *args, **kwargs): return type("Response", (), {"status_code": 200})()
+    class Adapter:
+        def __init__(self, *, max_retries): self.max_retries = max_retries
+    class Request:
+        def __init__(self, session=None): self.session = session or Session()
+        def __call__(self, *args, **kwargs): return self.session.request(*args, **kwargs)
+    class AuthorizedSession(Session):
+        def __init__(self, credentials, *, auth_request, max_refresh_attempts):
+            super().__init__()
+            self.credentials, self.auth_request = credentials, auth_request
+            self.max_refresh_attempts = max_refresh_attempts
+    transport_requests.Request = Request
+    transport_requests.AuthorizedSession = AuthorizedSession
+    google_transport = transport
+    requests_package = types.ModuleType("requests")
+    requests_package.__path__ = []
+    requests_adapters = types.ModuleType("requests.adapters")
+    requests_adapters.HTTPAdapter = Adapter
     media = types.ModuleType("google.cloud.storage._media")
     requests_media = types.ModuleType("google.cloud.storage._media.requests")
     class ChunkedDownload:
@@ -540,6 +568,11 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     monkeypatch.setitem(sys.modules, "google.cloud.storage._media.requests", requests_media)
     monkeypatch.setitem(sys.modules, "google.auth", auth)
     monkeypatch.setitem(sys.modules, "google.auth.impersonated_credentials", impersonated)
+    monkeypatch.setitem(sys.modules, "google.auth.exceptions", exceptions)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_transport)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", transport_requests)
+    monkeypatch.setitem(sys.modules, "requests", requests_package)
+    monkeypatch.setitem(sys.modules, "requests.adapters", requests_adapters)
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "human-adc.json")
     original_environment = dict(os.environ)
     from cloud_network_benchmark.gcs_archive import google_cloud_storage_backend
@@ -550,6 +583,8 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
         "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"})
     assert client_options[0]["project"] == "project-a70f8497-3463-4ef2-9cd"
     assert client_options[0]["credentials"] is not None
+    assert client_options[0]["_http"].max_refresh_attempts == 0
+    assert all(adapter.max_retries == 0 for adapter in client_options[0]["_http"].adapters.values())
     assert credential_calls[0] == ("load", str(source_file))
     assert credential_calls[1][0] == "impersonated"
     assert credential_calls[1][1] == {"source_credentials": source_credentials,
@@ -573,13 +608,105 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     assert backend.upload("key", source, size_bytes=4, sha256="a" * 64,
         if_generation_match=0, chunk_bytes=262144, timeout_seconds=9) == {
             "generation": "8", "size_bytes": 4}
-    assert calls[0] == ("stat", "key", {"timeout": 9, "retry": None})
+    assert calls[0][0:2] == ("stat", "key")
+    assert calls[0][2]["timeout"] <= 9 and calls[0][2]["timeout"] > 0
+    assert calls[0][2]["retry"] is None
     assert calls[1] == ("blob", "key", {"generation": 7})
     assert next(row for row in calls if row[0] == "reload")[1]["if_generation_match"] == 7
     initiate = next(row for row in calls if row[0] == "initiate")
     assert initiate[3]["if_generation_match"] == 0 and initiate[3]["retry"] is None
     assert initiate[3]["checksum"] == "crc32c"
     assert not any(row[0] == "delete" for row in calls)
+
+
+def test_google_auth_and_storage_subrequests_share_one_operation_budget():
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    now, auth_timeouts, storage_timeouts = [100.0], [], []
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: now[0])
+    class Response:
+        status_code = 200
+
+    def auth_request(*, timeout):
+        auth_timeouts.append(timeout)
+        now[0] += 1.0
+        return Response()
+    def storage_request(*, timeout):
+        storage_timeouts.append(timeout)
+        now[0] += 1.0
+        return Response()
+
+    with budget.operation(10):
+        budget.auth_request(auth_request)
+        budget.auth_request(auth_request)
+        budget.dispatch(storage_request)
+    assert auth_timeouts == [10, 9]
+    assert storage_timeouts == [8]
+
+
+def test_google_request_budget_fails_before_storage_dispatch_after_auth_exhaustion():
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    now, storage_calls = [0.0], []
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: now[0])
+    class Response:
+        status_code = 200
+    def slow_auth(*, timeout):
+        assert timeout == 10
+        now[0] += 9.5
+        return Response()
+
+    with budget.operation(10):
+        budget.auth_request(slow_auth)
+        assert budget.remaining() == pytest.approx(0.5)
+        next_timeout = budget.dispatch(lambda *, timeout: timeout)
+        assert next_timeout == pytest.approx(0.5)
+        now[0] += 0.5
+        with pytest.raises(TimeoutError, match="exhausted"):
+            storage_calls.append(budget.remaining())
+    assert storage_calls == []
+
+
+def test_google_auth_failure_and_connection_error_are_not_retried():
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: 5.0)
+    calls = []
+    class Response:
+        status_code = 503
+        def close(self): calls.append("closed")
+    def retryable_auth_response(*, timeout):
+        calls.append(timeout)
+        return Response()
+    with budget.operation(10):
+        with pytest.raises(RuntimeError, match="HTTP 503"):
+            budget.auth_request(retryable_auth_response)
+    assert calls == [10, "closed"]
+
+    connection_calls = []
+    def failed_connection(*, timeout):
+        connection_calls.append(timeout)
+        raise OSError("offline fake connection failure")
+    with budget.operation(10):
+        with pytest.raises(OSError, match="offline fake"):
+            budget.auth_request(failed_connection)
+    assert connection_calls == [10]
+
+
+def test_google_storage_401_is_returned_after_one_dispatch():
+    import cloud_network_benchmark.gcs_archive as archive_sink
+
+    budget = archive_sink._GoogleRequestBudget(RuntimeError, lambda: 1.0)
+    calls = []
+    class Response:
+        status_code = 401
+    def storage_401(*, timeout):
+        calls.append(timeout)
+        return Response()
+    with budget.operation(10):
+        response = budget.dispatch(storage_401)
+    assert response.status_code == 401
+    assert calls == [10]
 
 
 def test_production_archive_backend_requires_complete_explicit_adc_identity():
@@ -710,6 +837,7 @@ def test_google_backend_download_shares_one_monotonic_timeout(
     monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
     from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
     backend = object.__new__(GoogleCloudStorageBackend)
+    backend._request_budget = archive_sink._GoogleRequestBudget(TimeoutError, lambda: now[0])
     backend._bucket = Bucket()
     target = tmp_path / "remote-part"
     if expect_download:
@@ -770,6 +898,7 @@ def test_google_backend_upload_refreshes_timeout_and_never_deletes_on_crc(
     monkeypatch.setitem(sys.modules, "google.cloud", cloud)
     monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
     backend = object.__new__(archive_sink.GoogleCloudStorageBackend)
+    backend._request_budget = archive_sink._GoogleRequestBudget(TimeoutError, lambda: now[0])
     backend._bucket = Bucket(Client())
     source = tmp_path / "upload-source"
     source.write_bytes(b"data")
@@ -830,6 +959,7 @@ def test_google_backend_download_refreshes_timeout_for_each_chunk(monkeypatch, t
     monkeypatch.setitem(sys.modules, "google.cloud.storage._media.requests", requests_media)
     monkeypatch.setattr(archive_sink.time, "monotonic", lambda: now[0])
     backend = object.__new__(archive_sink.GoogleCloudStorageBackend)
+    backend._request_budget = archive_sink._GoogleRequestBudget(TimeoutError, lambda: now[0])
     backend._bucket = Bucket()
     destination = tmp_path / "download"
     with pytest.raises(TimeoutError, match="shared timeout"):
