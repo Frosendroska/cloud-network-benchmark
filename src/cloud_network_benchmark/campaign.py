@@ -274,7 +274,7 @@ class CampaignDriver:
         state_root, results_root = Path(settings["state_root"]), Path(settings["results_root"])
         with _file_lock(state_root / ".campaign-driver.lock", blocking=False):
             for previous in self.status(state_root):
-                if previous["entries"] and any(row["state"] in {"scheduled", "starting", "running"}
+                if previous["entries"] and any(row["state"] in {"scheduled", "starting", "running", "archive_pending_validation"}
                                                  for row in previous["entries"].values()):
                     raise RuntimeError("another campaign stage is still active or awaiting operator action")
             stage = self.prepare(plan, settings, root, state_root, results_root, self.clock)
@@ -312,6 +312,7 @@ class CampaignDriver:
             self._reconcile_ambiguous(stage, journal, journal_path)
             blocked = any((item.get("result") or {}).get("cleanup_open")
                           or (item.get("result") or {}).get("launch_uncertain")
+                          or item.get("state") == "archive_pending_validation"
                           for item in journal["entries"].values())
             if stage.get("stage") == "acceptance":
                 blocked |= any(item["state"] == "failed" for item in journal["entries"].values())
@@ -488,7 +489,7 @@ class CampaignDriver:
             return result
 
     def reconcile_archive(self, state_root: Path, stage_id: str, entry_id: str, receipt_path: Path) -> dict[str, Any]:
-        """Close an archive-pending entry only from its capsule-bound replay receipt."""
+        """Close an archive-pending entry only after replay artifacts and cleanup revalidate."""
         root = Path(state_root); folder = root / stage_id
         with _file_lock(root / ".campaign-driver.lock", blocking=False):
             stage = json.loads((folder / "prepared-stage.json").read_text(encoding="utf-8"))
@@ -497,35 +498,156 @@ class CampaignDriver:
             record = journal["entries"].get(entry_id)
             if not record or record.get("state") != "archive_pending_validation":
                 raise ValueError("entry is not awaiting archive validation")
-            prior = record.get("result") or {}; capsule = prior.get("replay_capsule")
-            if not isinstance(capsule, dict) or capsule.get("status") != "archive_pending_replay":
-                raise ValueError("journal has no source-bound replay capsule")
+            prior = record.get("result") or {}; capsule_ref = prior.get("replay_capsule")
+            if prior.get("cleanup_open") is not False or not isinstance(capsule_ref, dict):
+                raise ValueError("archive-pending entry lacks closed cleanup or a source-bound capsule")
+            capsule_file = Path(capsule_ref.get("path", ""))
             receipt = Path(receipt_path)
-            if receipt.is_symlink() or not receipt.is_file():
-                raise ValueError("replay receipt must be a regular file")
-            capsule_file = Path(capsule.get("path", ""))
-            if capsule_file.is_symlink() or not capsule_file.is_file() or _digest(capsule_file) != capsule.get("sha256"):
-                raise ValueError("source replay capsule is missing or changed")
+            if (capsule_file.is_symlink() or not capsule_file.is_file()
+                    or _digest(capsule_file) != capsule_ref.get("sha256")
+                    or receipt.is_symlink() or not receipt.is_file()):
+                raise ValueError("capsule or replay receipt is missing, unsafe, or changed")
             capsule_doc = json.loads(capsule_file.read_text(encoding="utf-8"))
             payload = json.loads(receipt.read_text(encoding="utf-8"))
+            entry = next((item for item in stage["entries"] if item["entry_id"] == entry_id), None)
+            if entry is None:
+                raise ValueError("prepared stage no longer contains the pending entry")
+            run_ids = entry.get("run_ids", {})
+            repository = Path(stage["repository_root"]).resolve(strict=True)
+            from .manifests import CampaignManifest, ChildRunManifest
+            from .orchestration import SavedLifecycleRecovery
+            from .contracts.admission import ReservationEvidence
+            reservation = ReservationEvidence.model_validate(capsule_doc.get("reservation", {}))
+            if (capsule_doc.get("schema_version") != 2
+                    or capsule_doc.get("status") != "archive_pending_replay"
+                    or capsule_ref.get("status") != "archive_pending_replay"
+                    or reservation.state != "reserved"):
+                raise ValueError("capsule is not a typed batch replay capsule from a reserved lifecycle")
+            parent_rel = Path(capsule_doc.get("parent_path", ""))
+            if parent_rel.is_absolute() or ".." in parent_rel.parts:
+                raise ValueError("capsule parent path is unsafe")
+            parent_path = repository / parent_rel
+            if (parent_path.is_symlink() or not parent_path.is_file()
+                    or _digest(parent_path) != _digest(entry.get("parent_manifest_path"))):
+                raise ValueError("source parent manifest is missing or differs from the prepared entry")
+            parent_doc = json.loads(parent_path.read_text(encoding="utf-8"))
+            if parent_doc != capsule_doc.get("parent_manifest"):
+                raise ValueError("capsule parent manifest differs from its source")
+            parent = CampaignManifest.model_validate(parent_doc)
+            if (set(run_ids) != set(capsule_doc.get("archives", {}))
+                    or set(run_ids) != set(capsule_doc.get("child_manifests", {}))
+                    or set(run_ids) != set(capsule_doc.get("provider_results", {}))):
+                raise ValueError("capsule provider set differs from the prepared campaign")
+            if parent.campaign_id != reservation.campaign_id:
+                raise ValueError("capsule reservation campaign identity differs from its parent")
+            children = {}
+            for provider, run_id in run_ids.items():
+                rel = Path(capsule_doc["child_paths"][provider])
+                if rel.is_absolute() or ".." in rel.parts:
+                    raise ValueError("capsule child path is unsafe")
+                child_path = repository / rel
+                if child_path.is_symlink() or not child_path.is_file():
+                    raise ValueError("source child manifest is missing")
+                child_doc = json.loads(child_path.read_text(encoding="utf-8"))
+                if child_doc != capsule_doc["child_manifests"][provider]:
+                    raise ValueError("capsule child manifest differs from its source")
+                child = ChildRunManifest.model_validate(child_doc)
+                archive = capsule_doc["archives"][provider]
+                if child.run_id != run_id or archive.get("run_id") != run_id or str(child.provider) != provider:
+                    raise ValueError("capsule run/provider identity differs from the prepared campaign")
+                children[provider] = child
+            recovery_path = Path(entry["private_root"]) / "lifecycle-recovery.json"
+            if recovery_path.is_symlink() or not recovery_path.is_file():
+                raise ValueError("independent lifecycle cleanup record is unavailable")
+            recovery = SavedLifecycleRecovery.model_validate_json(recovery_path.read_text(encoding="utf-8"))
+            recovery_rows = {str(item.provider): item for item in recovery.providers}
+            reservation_id = reservation.reservation_id.value
+            if (recovery.controller_session_id != stage.get("controller_session_id")
+                    or recovery.attempt_id != parent.campaign_id
+                    or recovery.reservation_id != reservation_id
+                    or set(recovery_rows) != set(run_ids)
+                    or any(item.cleanup_open or item.deployment_id != f"{run_ids[provider]}-deployment"
+                           for provider, item in recovery_rows.items())):
+                raise ValueError("saved lifecycle recovery does not independently prove cleanup for this exact run set")
             validations = payload.get("validation", {})
             expected_archives = {provider: {"manifest_sha256": item.get("manifest_sha256"),
                 "completion_generation": item.get("completion_generation")}
-                for provider, item in capsule_doc.get("archives", {}).items()}
+                for provider, item in capsule_doc["archives"].items()}
             observed_archives = {provider: {"manifest_sha256": item.get("manifest_sha256"),
                 "completion_generation": item.get("completion_generation")}
                 for provider, item in payload.get("archives", {}).items()}
-            if (payload.get("status") != "replayed" or payload.get("capsule_sha256") != capsule.get("sha256")
-                    or observed_archives != expected_archives
-                    or set(validations) != set(prior.get("run_ids", {}))
-                    or any(row.get("status", {}).get("data_validity") != "valid" for row in validations.values())
+            if (payload.get("status") != "replayed" or payload.get("capsule_sha256") != capsule_ref.get("sha256")
+                    or observed_archives != expected_archives or set(validations) != set(run_ids)
                     or payload.get("analysis", {}).get("status") != "completed"):
-                raise ValueError("receipt does not prove valid native replay and analysis for this capsule")
+                raise ValueError("receipt does not bind successful replay and analysis to this capsule")
+            # Re-run the canonical validator over its saved typed inputs and compare the
+            # exact persisted/receipt result. Status strings alone never close a journal entry.
+            from .contracts.validation import ValidatorInput, ValidationResult
+            from .retrieval import RetrievalManifest
+            from .validation import evaluate_comparison, validate_bundle
+            result_root = Path(stage["results_root"]) / "raw"
+            inputs, saved_results = {}, {}
+            for provider, run_id in run_ids.items():
+                bundle = result_root / str(run_id)
+                input_path, result_path = bundle / "validation" / "input.json", bundle / "validation" / "result.json"
+                if (bundle.is_symlink() or not bundle.is_dir() or input_path.is_symlink()
+                        or result_path.is_symlink() or not input_path.is_file() or not result_path.is_file()):
+                    raise ValueError("saved canonical validation inputs/results are missing")
+                validator_input = ValidatorInput.model_validate_json(input_path.read_text(encoding="utf-8"))
+                saved = ValidationResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+                child = children[provider]
+                if (validator_input.identity.run_id != run_id or validator_input.provider != provider
+                        or validator_input.identity.experiment_id != child.experiment_id
+                        or validator_input.identity.config_id != child.config_id
+                        or validator_input.identity.campaign_id != child.campaign_id
+                        or validator_input.identity.deployment_id != child.deployment_id
+                        or validator_input.config_sha256 != child.config_provenance.sha256
+                        or validator_input.execution_state != "succeeded"
+                        or validator_input.cleanup_state != "succeeded"
+                        or saved.run_id != run_id or saved.validation_status.data_validity != "valid"):
+                    raise ValueError("saved validator input/result identity or validity differs from the source child")
+                closed_inventory = RetrievalManifest.model_validate(
+                    capsule_doc["archives"][provider]["manifest"]["closed_inventory"])
+                expected_inventory = {item.destination_path: item for item in closed_inventory.items}
+                observed_records = {item.path: item for item in validator_input.artifact_records}
+                if set(observed_records) != set(expected_inventory):
+                    raise ValueError("typed validator artifact set differs from the frozen remote inventory")
+                for relative, expected in expected_inventory.items():
+                    artifact = observed_records[relative]
+                    if (artifact.artifact_id != expected.artifact_id
+                            or artifact.size_bytes.value != expected.expected_size_bytes
+                            or artifact.sha256.value != expected.expected_sha256):
+                        raise ValueError("typed validator artifact identity differs from the frozen remote inventory")
+                    artifact.verify_materialized_file(bundle)
+                config_snapshot = Path(validator_input.config_snapshot_path)
+                if config_snapshot.is_symlink() or not config_snapshot.is_file() or _digest(config_snapshot) != validator_input.config_sha256:
+                    raise ValueError("saved config snapshot is missing or does not match the validated config hash")
+                inputs[provider] = validator_input; saved_results[provider] = saved
+            base = {provider: validate_bundle(value, evaluated_at=saved_results[provider].evaluated_at)
+                    for provider, value in inputs.items()}
+            replayed = evaluate_comparison(list(inputs.values()), list(base.values())) if len(inputs) > 1 else {
+                next(iter(inputs.values())).identity.run_id: next(iter(base.values()))}
+            for provider, value in inputs.items():
+                run_id = value.identity.run_id
+                stated = ValidationResult.model_validate(validations[provider].get("result", {}))
+                if (replayed[run_id] != saved_results[provider] or stated != saved_results[provider]
+                        or validations[provider].get("status") != saved_results[provider].validation_status.model_dump(mode="json")):
+                    raise ValueError("receipt validation differs from canonical replay of saved native evidence")
+            analysis = payload["analysis"]
+            for path_key, hash_key in (("selection_path", "selection_sha256"), ("report_path", "report_sha256")):
+                artifact = Path(analysis.get(path_key, ""))
+                if artifact.is_symlink() or not artifact.is_file() or _digest(artifact) != analysis.get(hash_key):
+                    raise ValueError("replay analysis artifact is missing or differs from its bound digest")
+            from .analysis import analyze_selection
+            analysis_result = analyze_selection(Path(analysis["selection_path"]),
+                analysis_git=next(iter(children.values())).config_provenance.implementation_git_commit.value)
+            report_payload = json.loads(Path(analysis["report_path"]).read_text(encoding="utf-8"))
+            if report_payload != analysis_result.payload:
+                raise ValueError("analysis report differs from deterministic analysis of the bound selection")
             record["result"] = {**prior, "archive_replay_receipt": str(receipt.resolve()),
                 "archive_replay_receipt_sha256": _digest(receipt), "archive_validation": "valid"}
             record.update(state="complete", finished_at=_now(self.clock).isoformat(), error=None)
             _write_json(journal_path, journal)
-            entry = next(row for row in stage["entries"] if row["entry_id"] == entry_id)
             self._archive_closed_entry(stage, entry, record); _write_json(journal_path, journal)
             return _status_payload(stage, journal)
 
@@ -559,7 +681,7 @@ class CampaignDriver:
             state = journal["entries"][pointer["supervised_entry_id"]]["state"]
             if state in {"starting", "running"}:
                 return self.run(stage)
-            if state in {"complete", "failed", "missed"}:
+            if state in {"complete", "failed", "missed", "archive_pending_validation"}:
                 return _status_payload(stage, journal)
             return self._run_supervised(stage, pointer["supervised_entry_id"])
         return self.run(stage)
@@ -676,7 +798,7 @@ class CampaignDriver:
                     self._archive_closed_entry(stage, entry, journal["entries"][entry_id])
                     _write_json(journal_path, journal)
                 status = _status_payload(stage, journal)
-                if not any(item["state"] in {"scheduled", "starting", "running"}
+                if not any(item["state"] in {"scheduled", "starting", "running", "archive_pending_validation"}
                            for item in journal["entries"].values()):
                     _finalize_exports(stage, journal, status)
                 _append_log(stage, f"supervised attempt {entry_id} ended {journal['entries'][entry_id]['state']}; review pending")

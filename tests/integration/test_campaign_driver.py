@@ -904,3 +904,87 @@ def test_status_projects_next_slot_and_recorded_export_backup_notification_resul
         assert status["stage_summary"] == summary and status["exports"]["stage"] == "verified"
     else:
         assert not status["stage_summary"] and "stage" not in status["exports"]
+
+
+def test_restart_blocks_all_later_slots_while_archive_validation_is_pending(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    launched = []
+    engine = driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"})
+    path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    first = stage["entries"][0]["entry_id"]
+    saved["entries"][first].update(state="archive_pending_validation",
+        finished_at=clock.utc_now().isoformat(), result={"cleanup_open": False,
+            "replay_capsule": {"status": "archive_pending_replay"}})
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    result = engine.run(stage)
+
+    assert launched == []
+    assert result["counts"]["archive_pending_validation"] == 1
+    assert result["counts"]["missed"] == 1
+
+
+def test_archive_reconciliation_rejects_open_cleanup_and_handwritten_receipt(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["repository_root"] = str(ROOT)
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    engine = driver(clock, lambda *_: pytest.fail("reconciliation must not launch"))
+    journal_path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, journal_path)
+    entry = stage["entries"][0]
+    capsule_path = tmp_path / "capsule.json"
+    capsule_doc = {"schema_version": 2, "status": "archive_pending_replay"}
+    capsule_path.write_text(json.dumps(capsule_doc), encoding="utf-8")
+    capsule_sha = hashlib.sha256(capsule_path.read_bytes()).hexdigest()
+    receipt_path = tmp_path / "handwritten-receipt.json"
+    receipt_path.write_text(json.dumps({"status": "replayed", "capsule_sha256": capsule_sha,
+        "archives": {}, "validation": {}, "analysis": {"status": "completed"}}), encoding="utf-8")
+    record = saved["entries"][entry["entry_id"]]
+    record.update(state="archive_pending_validation", result={"cleanup_open": True,
+        "run_ids": entry["run_ids"], "replay_capsule": {"status": "archive_pending_replay",
+            "path": str(capsule_path), "sha256": capsule_sha}})
+    journal_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="closed cleanup"):
+        engine.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], receipt_path)
+    assert journal(stage)["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+
+    record["result"]["cleanup_open"] = False
+    journal_path.write_text(json.dumps(saved), encoding="utf-8")
+    with pytest.raises((ValueError, OSError)):
+        engine.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], receipt_path)
+    assert journal(stage)["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+
+
+def test_active_supervised_pointer_does_not_dispatch_archive_pending_entry(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["stage"] = "acceptance"
+    stage["entries"][0]["requires_supervision"] = True
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    dispatched = []
+    engine = driver(clock, lambda *_: pytest.fail("pending archive must not launch"),
+        dispatch=lambda *_: dispatched.append(True) or {"started": True})
+    path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    entry_id = stage["entries"][0]["entry_id"]
+    saved["entries"][entry_id].update(state="archive_pending_validation",
+        result={"cleanup_open": False})
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    pointer = Path(stage["state_root"]) / "active-stage.json"
+    pointer.write_text(json.dumps({"stage_id": stage["stage_id"],
+        "stage_path": str(stage_dir / "prepared-stage.json"), "supervised_entry_id": entry_id}), encoding="utf-8")
+
+    result = engine.run_active(Path(stage["state_root"]))
+
+    assert result["counts"]["archive_pending_validation"] == 1
+    assert dispatched == []
