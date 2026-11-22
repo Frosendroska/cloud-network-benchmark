@@ -21,7 +21,7 @@ _REMOTE = r'''import json, os, pathlib, sys, time
 p=json.loads(sys.argv[1]); root=pathlib.Path(p["workspace"]); root.is_dir() or sys.exit(20)
 proc=pathlib.Path(p.get("proc_root", "/proc"))
 boot=(proc/"sys/kernel/random/boot_id").read_text().strip(); out={"boot_id":boot,"processes":{},"files":{}}
-valid={"R","S","D","T","t","W","X","x","K","P","I"}
+valid={"R","S","D","W","X","x","K","P","I"}
 for x in p["processes"]:
  s=(proc/str(x["pid"])/"stat").read_text(); f=s[s.rfind(")")+2:].split(); state=f[0]; ticks=int(f[19])
  out["processes"][x["kind"]]={"pid":x["pid"],"boot_id":boot,"start_ticks":ticks,"state":state,"alive":state in valid and state not in {"Z","X","x"}}
@@ -30,7 +30,7 @@ for x in p["files"]:
  st=q.stat(); out["files"][x["path"]]={"size":st.st_size,"mtime":st.st_mtime,"kind":x["kind"]}
 print(json.dumps(out,sort_keys=True))'''
 
-_LIVE_PROC_STATES = {"R", "S", "D", "T", "t", "W", "K", "P", "I"}
+_LIVE_PROC_STATES = {"R", "S", "D", "W", "K", "P", "I"}
 
 
 def _safe_rel(value: Any) -> bool:
