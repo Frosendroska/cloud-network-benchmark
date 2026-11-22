@@ -56,9 +56,11 @@ def _safe_files(source: Path, guard: Callable[[], None] | None = None) -> list[t
 
 
 class _PartSink:
-    def __init__(self, root: Path, max_part_bytes: int, guard: Callable[[], None] | None = None):
+    def __init__(self, root: Path, max_part_bytes: int, guard: Callable[[], None] | None = None,
+                 on_part: Callable[[Path, dict], None] | None = None):
         self.root, self.limit = root, max_part_bytes
         self.guard = guard
+        self.on_part = on_part
         self.parts: list[dict] = []
         self.archive_hash = hashlib.sha256()
         self.archive_bytes = 0
@@ -102,6 +104,9 @@ class _PartSink:
         os.replace(partial, final)
         self.parts.append({"path": final.name, "size_bytes": self.part_bytes,
                            "sha256": self.part_hash.hexdigest()})
+        if self.on_part is not None:
+            self.on_part(final, self.parts[-1])
+            final.unlink()
         self.stream = None
 
     def finish(self):
@@ -181,7 +186,8 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
                           minimum_headroom_bytes: int = 0,
                           minimum_source_headroom_bytes: int = 0,
                           before_write: Callable[[int], None] | None = None,
-                          guard: Callable[[], None] | None = None) -> dict:
+                          guard: Callable[[], None] | None = None,
+                          on_part: Callable[[Path, dict], None] | None = None) -> dict:
     """Create and publish a deterministic archive directory, preserving source.
 
     Parts use a conservative 4 GiB-minus-one bound by default, so each part is
@@ -204,11 +210,13 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
     if free_bytes is not None and free_bytes(source) < minimum_source_headroom_bytes:
         raise OSError("source free space is below required headroom")
     parent = destination.parent.resolve(strict=True)
-    if free_bytes is not None and free_bytes(parent) < upper + minimum_headroom_bytes:
-        raise OSError("destination free space does not cover archive upper bound and required headroom")
+    if free_bytes is not None:
+        required = upper + minimum_headroom_bytes if on_part is None else max_part_bytes + minimum_headroom_bytes
+        if free_bytes(parent) < required:
+            raise OSError("destination free space does not cover bounded archive part and required headroom")
     temp = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".partial", dir=parent))
     try:
-        sink = _PartSink(temp, max_part_bytes, guard)
+        sink = _PartSink(temp, max_part_bytes, guard, on_part)
         with gzip.GzipFile(filename="", mode="wb", fileobj=sink, mtime=0, compresslevel=9) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
                 for name, path, size, _digest in rows:
@@ -217,7 +225,14 @@ def create_closed_archive(source: Path, destination: Path, *, max_part_bytes: in
                     info.uname = info.gname = ""
                     info.mode = 0o644
                     with path.open("rb") as payload:
-                        archive.addfile(info, payload)
+                        try:
+                            archive.addfile(info, payload)
+                        except Exception as exc:
+                            if _sha(path, guard) != (size, _digest):
+                                raise ValueError(f"archive source changed while streaming: {name}") from exc
+                            raise
+                    if _sha(path, guard) != (size, _digest):
+                        raise ValueError(f"archive source changed while streaming: {name}")
                     if before_write is not None:
                         before_write(size)
         sink.finish()

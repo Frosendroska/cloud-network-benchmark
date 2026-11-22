@@ -97,6 +97,24 @@ def test_interrupted_archive_build_has_no_manifest_or_publishable_destination(tm
     assert not list(tmp_path.glob(".archive.*.partial/manifest.json"))
 
 
+def test_source_changed_while_streaming_is_rejected_without_publish(tmp_path):
+    source = tmp_path / "closed"
+    source.mkdir()
+    (source / "a.bin").write_bytes(bytes(range(256)) * 4096)
+    later = source / "z.json"
+    later.write_bytes(b"native-before")
+    changed = False
+    def mutate_after_first_file(_size):
+        nonlocal changed
+        if not changed:
+            later.write_bytes(b"native-after")
+            changed = True
+    with pytest.raises(ValueError, match="source changed while streaming"):
+        create_closed_archive(source, tmp_path / "archive", max_part_bytes=1024,
+                              before_write=mutate_after_first_file)
+    assert changed and not (tmp_path / "archive").exists()
+
+
 def test_archive_projection_is_conservative_and_rejects_invalid_inputs():
     assert projected_archive_upper_bound(1000, 1) > 1000
     with pytest.raises(ValueError):

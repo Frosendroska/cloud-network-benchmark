@@ -335,3 +335,200 @@ def upload_sealed_archive(archive_dir: Path, *, backend: GCSObjectBackend,
         raise GCSArchiveFailure(f"archive upload or verification failed ({type(exc).__name__})",
             partial_objects=[{"key": key, "generation": value}
                 for key, value in sorted(unresolved.items())]) from exc
+
+
+def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBackend,
+                             bucket: str, provider: str, experiment_id: str, run_id: str,
+                             maximum_staging_bytes: int, closure_verified: bool,
+                             maximum_archive_bytes: int, minimum_controller_free_bytes: int,
+                             staging_directory: Path, deadline: Any,
+                             clock: Callable[[], float] = time.monotonic,
+                             chunk_bytes: int = 8 * 1024 * 1024,
+                             status_callback: Callable[[dict], None] | None = None) -> dict:
+    """Compress and relay one bounded part at a time, retaining only its verified manifest."""
+    from .closed_archive import FAT32_FILE_LIMIT, create_closed_archive, projected_archive_upper_bound, _safe_files
+    if closure_verified is not True:
+        raise ValueError("native producers must be closed before archive upload")
+    if not valid_bucket_name(bucket) or provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive destination identity is invalid")
+    if not all(_ID.fullmatch(value) for value in (experiment_id, run_id)):
+        raise ValueError("experiment and run identities must be stable safe identifiers")
+    if type(maximum_staging_bytes) is not int or maximum_staging_bytes <= 0:
+        raise ValueError("maximum controller staging bytes must be positive")
+    if type(minimum_controller_free_bytes) is not int or minimum_controller_free_bytes < 0:
+        raise ValueError("minimum controller free bytes must be nonnegative")
+    root, source = Path(staging_directory), Path(source_directory)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("controller staging directory must be an existing real directory")
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError("native source must be a real directory")
+    max_part = min(FAT32_FILE_LIMIT, maximum_staging_bytes)
+
+    def remaining():
+        value = deadline.remaining(clock, cleanup=True)
+        if value <= 0:
+            raise TimeoutError("archive transfer reached the original deadline or cleanup reserve")
+        return value
+
+    def guard():
+        remaining()
+
+    guard()
+    rows = _safe_files(source, guard)
+    projection = projected_archive_upper_bound(sum(row[2] for row in rows), len(rows))
+    if projection > maximum_archive_bytes:
+        raise ValueError("measured archive upper bound exceeds configured archive limit")
+    projected_parts = (projection + max_part - 1) // max_part
+    manifest_state_bytes = (2048 + sum(len(row[0].encode("utf-8")) * 12 + 192 for row in rows)
+        + projected_parts * 192 + 2048 + projected_parts * 256 + 2048)
+    required = max_part + manifest_state_bytes + minimum_controller_free_bytes
+    if shutil.disk_usage(root).free < required:
+        raise OSError("controller quota lacks one bounded part, manifest/state overhead and required headroom")
+    prefix = f"cnb/v1/{provider}/{experiment_id}/{run_id}/"
+    manifest_key, completion_key = prefix + "manifest.json", prefix + "complete.json"
+    partial: dict[str, str] = {}
+    uploaded: list[dict] = []
+    archive_dir = None
+    verified_bytes = 0
+    def report(state: str, **extra):
+        if status_callback is not None:
+            try:
+                status_callback({"status": state, "verified": state == "verified",
+                    "verified_parts": len(uploaded), "verified_bytes": verified_bytes, **extra})
+            except Exception:
+                pass
+    try:
+        report("progress")
+        prior_manifest = backend.stat(manifest_key, timeout_seconds=remaining())
+        prior_completion = backend.stat(completion_key, timeout_seconds=remaining())
+        if prior_manifest is not None:
+            partial[manifest_key] = str(prior_manifest.get("generation", "unknown"))
+        if prior_completion is not None:
+            partial[completion_key] = str(prior_completion.get("generation", "unknown"))
+        if prior_completion is not None and prior_manifest is None:
+            raise ValueError("completion marker exists without its immutable manifest")
+        part_number = 0
+
+        def relay(part_path: Path, part: dict):
+            nonlocal part_number, verified_bytes
+            guard()
+            part_number += 1
+            if part["size_bytes"] > max_part:
+                raise ValueError("compressed part exceeds configured one-part bound")
+            key = f"{prefix}parts/{part_number:08d}-{part['sha256']}"
+            current = backend.stat(key, timeout_seconds=remaining())
+            if current is None:
+                if prior_completion is not None:
+                    raise ValueError("completed archive is missing a remote part")
+                partial[key] = "unknown"
+                try:
+                    current = backend.upload(key, part_path, size_bytes=part["size_bytes"],
+                        sha256=part["sha256"], if_generation_match=0, chunk_bytes=chunk_bytes,
+                        timeout_seconds=remaining())
+                except Exception:
+                    try:
+                        observed = backend.stat(key, timeout_seconds=remaining())
+                    except Exception:
+                        raise
+                    if observed is None:
+                        partial.pop(key, None)
+                        raise
+                    current = observed
+            generation = str(current.get("generation", ""))
+            partial[key] = generation or "unknown"
+            if current.get("size_bytes") != part["size_bytes"] or not generation:
+                raise ValueError("remote part collision or incomplete upload")
+            if shutil.disk_usage(root).free + part_path.stat().st_size < required:
+                raise OSError("controller quota lacks part verification headroom")
+            backend.download(key, part_path, maximum_bytes=max_part,
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(part_path, max_part, guard) != (part["size_bytes"], part["sha256"]):
+                raise ValueError("remote part byte count or SHA-256 verification failed")
+            uploaded.append({"key": key, "size_bytes": part["size_bytes"],
+                "sha256": part["sha256"], "generation": generation})
+            verified_bytes += part["size_bytes"]
+            partial.pop(key, None)
+            report("progress")
+
+        archive_dir = tempfile.TemporaryDirectory(prefix="cnb-gcs-relay-", dir=root)
+        archive_path = Path(archive_dir.name) / "sealed"
+        manifest = create_closed_archive(source, archive_path, max_part_bytes=max_part,
+            free_bytes=lambda _path: shutil.disk_usage(root).free,
+            minimum_headroom_bytes=minimum_controller_free_bytes, guard=guard, on_part=relay)
+        manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        if len(manifest_bytes) > max_part:
+            raise ValueError("archive manifest exceeds configured one-part bound")
+        if prior_manifest is not None:
+            temp_path = Path(archive_dir.name) / "manifest.readback"
+            backend.download(manifest_key, temp_path, maximum_bytes=max_part,
+                timeout_seconds=remaining(), generation=str(prior_manifest["generation"]))
+            if _hash(temp_path, max_part, guard) != (len(manifest_bytes), manifest_sha):
+                raise ValueError("logical run prefix is already bound to a different archive manifest")
+            manifest_generation = str(prior_manifest["generation"])
+        else:
+            manifest_path = Path(archive_dir.name) / "manifest.json"
+            manifest_path.write_bytes(manifest_bytes)
+            partial[manifest_key] = "unknown"
+            result = backend.upload(manifest_key, manifest_path, size_bytes=len(manifest_bytes),
+                sha256=manifest_sha, if_generation_match=0, chunk_bytes=chunk_bytes,
+                timeout_seconds=remaining())
+            manifest_generation = str(result["generation"])
+            partial[manifest_key] = manifest_generation
+            backend.download(manifest_key, manifest_path, maximum_bytes=max_part,
+                timeout_seconds=remaining(), generation=manifest_generation)
+            if _hash(manifest_path, max_part, guard) != (len(manifest_bytes), manifest_sha):
+                raise ValueError("remote manifest failed byte-count or SHA-256 verification")
+            partial.pop(manifest_key, None)
+        objects = [*uploaded, {"key": manifest_key, "size_bytes": len(manifest_bytes),
+            "sha256": manifest_sha, "generation": manifest_generation}]
+        completion = {"schema_version": 1, "manifest_sha256": manifest_sha,
+            "objects": [{"key": item["key"], "size_bytes": item["size_bytes"],
+                         "sha256": item["sha256"]} for item in objects]}
+        completion_bytes = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        completion_sha = hashlib.sha256(completion_bytes).hexdigest()
+        if prior_completion is not None:
+            marker = Path(archive_dir.name) / "complete.readback"
+            backend.download(completion_key, marker, maximum_bytes=max_part,
+                timeout_seconds=remaining(), generation=str(prior_completion["generation"]))
+            if _hash(marker, max_part, guard) != (len(completion_bytes), completion_sha):
+                raise ValueError("completion marker differs from this verified archive")
+            completion_generation = str(prior_completion["generation"])
+        else:
+            marker = Path(archive_dir.name) / "complete.json"
+            marker.write_bytes(completion_bytes)
+            partial[completion_key] = "unknown"
+            result = backend.upload(completion_key, marker, size_bytes=len(completion_bytes),
+                sha256=completion_sha, if_generation_match=0, chunk_bytes=chunk_bytes,
+                timeout_seconds=remaining())
+            completion_generation = str(result["generation"])
+            partial[completion_key] = completion_generation
+            backend.download(completion_key, marker, maximum_bytes=max_part,
+                timeout_seconds=remaining(), generation=completion_generation)
+            if _hash(marker, max_part, guard) != (len(completion_bytes), completion_sha):
+                raise ValueError("remote completion marker failed byte-count or SHA-256 verification")
+            partial.pop(completion_key, None)
+        result = {"status": "verified", "verified": True, "bucket": bucket, "prefix": prefix,
+            "manifest_sha256": manifest_sha, "archive_bytes": manifest["archive_bytes"],
+            "objects": objects, "completion_generation": completion_generation,
+            "staging_peak_bytes": max([item["size_bytes"] for item in uploaded] + [len(manifest_bytes), len(completion_bytes)])}
+        report("verified", manifest_sha256=manifest_sha,
+               completion_generation=completion_generation, archive_bytes=manifest["archive_bytes"])
+        return result
+    except BaseException as exc:
+        # Keep remote generations as recovery evidence; never remove guest originals.
+        for key, generation in list(partial.items()):
+            try:
+                observed = backend.stat(key, timeout_seconds=remaining())
+                if observed is not None:
+                    partial[key] = str(observed.get("generation", generation))
+            except Exception:
+                partial[key] = generation or "unknown"
+        report("failed", error=type(exc).__name__, partial_object_count=len(uploaded) + len(partial))
+        raise GCSArchiveFailure(f"bounded archive relay failed ({type(exc).__name__}: {exc})",
+            partial_objects=([{"key": row["key"], "generation": row["generation"]}
+                              for row in uploaded] + [{"key": key, "generation": generation}
+                             for key, generation in sorted(partial.items())]) ) from exc
+    finally:
+        if archive_dir is not None:
+            archive_dir.cleanup()

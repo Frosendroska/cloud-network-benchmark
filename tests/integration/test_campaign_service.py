@@ -185,6 +185,42 @@ def test_observer_exposes_failed_remote_archive_and_keeps_health_faulted(tmp_pat
     assert snapshot["cleanup_liabilities"][0]["entry_id"] == "entry-1"
 
 
+def test_observer_exposes_secret_free_archive_progress_during_running_entry(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.campaign_supervisor as supervisor
+    state = tmp_path / "state"
+    stage_dir = state / "stage-1"
+    status_root = tmp_path / "archive-status"
+    stage_dir.mkdir(parents=True)
+    status_root.mkdir()
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"archive_sink": {"archive_root": str(status_root)}}))
+    (status_root / "aws-run-1.status.json").write_text(json.dumps({
+        "status": "progress", "verified": False, "verified_parts": 3,
+        "verified_bytes": 12288, "credential": "must-not-appear"}))
+    stage = {"stage_id": "stage-1", "stage": "acceptance", "results_root": str(tmp_path / "results"),
+        "minimum_free_bytes": 0, "entries": [{"entry_id": "entry-1",
+            "runtime_config_path": str(runtime), "run_ids": {"aws": "run-1"}}]}
+    journal = {"entries": {"entry-1": {"state": "running", "result": {}}}}
+    (stage_dir / "prepared-stage.json").write_text(json.dumps(stage))
+    (stage_dir / "campaign-journal.json").write_text(json.dumps(journal))
+    (state / "active-stage.json").write_text(json.dumps({"stage_id": "stage-1",
+        "stage_path": str(stage_dir / "prepared-stage.json")}))
+    monkeypatch.setattr(supervisor, "_read_only_preflight", lambda _: {"status": "qualified"})
+
+    class StopAfterOne:
+        calls = 0
+        def is_set(self): return self.calls > 0
+        def wait(self, _): self.calls += 1
+
+    supervisor.observe(state, StopAfterOne(), interval=0)
+    snapshot_text = (state / "observer-status.json").read_text()
+    snapshot = json.loads(snapshot_text)
+    assert snapshot["remote_archive_status"]["entry-1"]["aws"]["status"] == "progress"
+    assert snapshot["remote_archive_status"]["entry-1"]["aws"]["verified_parts"] == 3
+    assert "must-not-appear" not in snapshot_text
+
+
 def test_periodic_preflight_reports_identity_terraform_and_expiry_without_leaking_output(monkeypatch):
     import cloud_network_benchmark.campaign_identity as identity
     import cloud_network_benchmark.campaign_supervisor as supervisor

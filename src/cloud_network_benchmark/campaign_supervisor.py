@@ -62,17 +62,40 @@ def observe(state_root: Path, stop: threading.Event, interval: float = 30.0) -> 
             stale_outputs = []
             for entry_id, row in entries.items():
                 result = row.get("result") or {}
+                prepared_entry = next((item for item in stage.get("entries", [])
+                                       if item.get("entry_id") == entry_id), {})
+                progress_archives = {}
+                try:
+                    runtime_path = Path(prepared_entry.get("runtime_config_path", ""))
+                    if runtime_path.is_file() and not runtime_path.is_symlink():
+                        archive_sink = json.loads(runtime_path.read_text(encoding="utf-8")).get("archive_sink")
+                        if isinstance(archive_sink, dict):
+                            status_root = Path(archive_sink["archive_root"])
+                            for provider, run_id in prepared_entry.get("run_ids", {}).items():
+                                status_path = status_root / f"{provider}-{run_id}.status.json"
+                                if status_path.is_file() and not status_path.is_symlink():
+                                    saved = json.loads(status_path.read_text(encoding="utf-8"))
+                                    progress_archives[provider] = {key: saved[key] for key in (
+                                        "status", "verified", "verified_parts", "verified_bytes",
+                                        "manifest_sha256", "completion_generation", "archive_bytes",
+                                        "error", "partial_object_count") if key in saved}
+                except (OSError, ValueError, KeyError, TypeError):
+                    progress_archives = {}
                 provider_results = result.get("provider_results", {})
                 if isinstance(provider_results, dict):
                     archives = {provider: value.get("archive_status")
                         for provider, value in provider_results.items()
                         if isinstance(value, dict) and value.get("archive_status") is not None}
+                    progress_archives.update(archives)
                     if archives:
-                        archive_status[entry_id] = archives
-                        for provider, archive in archives.items():
+                        archive_status[entry_id] = progress_archives
+                    elif progress_archives:
+                        archive_status[entry_id] = progress_archives
+                    for provider, archive in progress_archives.items():
+                        if isinstance(archive, dict):
                             state = archive.get("status")
                             if state in {"failed", "withheld"} or (
-                                    state != "not_configured" and archive.get("verified") is not True):
+                                    state == "verified" and archive.get("verified") is not True):
                                 archive_faults.append({"entry_id": entry_id, "provider": provider,
                                     "status": state, "verified": archive.get("verified")})
                 if result.get("cleanup_open") is True or result.get("launch_uncertain") is True:

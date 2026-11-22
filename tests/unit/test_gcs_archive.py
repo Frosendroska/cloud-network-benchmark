@@ -121,7 +121,7 @@ def test_requires_sealed_archive_and_rejects_changed_part_after_seal(tmp_path):
         _upload(archive, backend, source)
     (archive / part).write_bytes(part_bytes)
     (source / "sockperf.csv").write_bytes(b"changed after seal")
-    with pytest.raises(ValueError, match="source changed"):
+    with pytest.raises(ValueError, match="native source changed after archive sealing"):
         _upload(archive, backend, source)
 
 
@@ -145,8 +145,14 @@ def test_collision_and_remote_missing_or_changed_parts_fail_closed(tmp_path):
 
 def test_interrupted_upload_reconciles_exact_object_and_resumes_idempotently(tmp_path):
     source, archive = _archive(tmp_path)
-    backend = FakeGCS()
-    backend.interrupt_after = 1
+    class InterruptReadback(FakeGCS):
+        interrupted = False
+        def download(self, key, destination, **kwargs):
+            if "/parts/" in key and not self.interrupted:
+                self.interrupted = True
+                raise TimeoutError("synthetic interrupted readback")
+            return super().download(key, destination, **kwargs)
+    backend = InterruptReadback()
     from cloud_network_benchmark.gcs_archive import GCSArchiveFailure
     with pytest.raises(GCSArchiveFailure):
         _upload(archive, backend, source)
@@ -343,4 +349,127 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     assert calls[1] == ("blob", "key", {"generation": 7})
     assert calls[2][1]["if_generation_match"] == 7 and calls[2][1]["retry"] is None
     assert calls[3][1]["if_generation_match"] == 7 and calls[3][1]["retry"] is None
+
+
+def test_bounded_relay_reconstructs_archive_and_never_stages_full_bundle(tmp_path):
+    import gzip
+    import tarfile
+    import io
+    from cloud_network_benchmark.gcs_archive import relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    backend = FakeGCS()
+    statuses = []
+    result = relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+        experiment_id="exp-001", run_id="relay-001", maximum_staging_bytes=4096,
+        closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+        staging_directory=tmp_path, deadline=Deadline(), status_callback=statuses.append)
+    assert result["verified"] and result["staging_peak_bytes"] <= 4096
+    manifest_object = backend.objects[result["prefix"] + "manifest.json"]
+    assert list(backend.objects)[-2:] == [result["prefix"] + "manifest.json",
+                                         result["prefix"] + "complete.json"]
+    manifest = json.loads(manifest_object[0])
+    compressed = b"".join(backend.objects[row["key"]][0] for row in result["objects"]
+        if "/parts/" in row["key"])
+    assert hashlib.sha256(compressed).hexdigest() == manifest["archive_sha256"]
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress(compressed)), mode="r:") as archive:
+        assert {member.name: archive.extractfile(member).read() for member in archive.getmembers()} == {
+            path.name: path.read_bytes() for path in source.iterdir()}
+    assert all(path.is_file() for path in source.iterdir())
+    assert not list(tmp_path.glob("cnb-gcs-relay-*"))
+    assert statuses[0]["status"] == "progress" and statuses[-1]["status"] == "verified"
+    assert statuses[-1]["verified_parts"] == len(manifest["parts"])
+    backend.objects.pop(result["objects"][0]["key"])
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure
+    with pytest.raises(GCSArchiveFailure, match="completed archive is missing a remote part"):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="relay-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert all(path.is_file() for path in source.iterdir())
+
+
+def test_bounded_relay_resume_preserves_partial_generations_and_rejects_source_change(tmp_path):
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    class InterruptReadback(FakeGCS):
+        interrupted = False
+        def download(self, key, destination, **kwargs):
+            if "/parts/" in key and not self.interrupted:
+                self.interrupted = True
+                raise TimeoutError("synthetic interrupted readback")
+            return super().download(key, destination, **kwargs)
+    backend = InterruptReadback()
+    with pytest.raises(GCSArchiveFailure) as failed:
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="resume-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert failed.value.partial_objects and all(row["generation"] != "unknown" for row in failed.value.partial_objects)
+    resumed = relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+        experiment_id="exp-001", run_id="resume-001", maximum_staging_bytes=4096,
+        closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+        staging_directory=tmp_path, deadline=Deadline())
+    assert resumed["verified"]
+    (source / "sockperf.csv").write_bytes(b"changed")
+    with pytest.raises(GCSArchiveFailure, match="completed archive is missing a remote part"):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="resume-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+
+
+def test_bounded_relay_rejects_one_part_headroom_and_keeps_originals(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import cloud_network_benchmark.gcs_archive as archive_sink
+    from cloud_network_benchmark.gcs_archive import relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    monkeypatch.setattr(archive_sink.shutil, "disk_usage", lambda _path: SimpleNamespace(free=4095))
+    with pytest.raises(OSError, match="one bounded part, manifest/state overhead"):
+        relay_closed_native_tree(source, backend=FakeGCS(), bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="space-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert all(path.is_file() for path in source.iterdir())
+
+
+def test_bounded_relay_requires_closed_sources_and_uses_one_deadline(tmp_path):
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    with pytest.raises(ValueError, match="closed"):
+        relay_closed_native_tree(source, backend=FakeGCS(), bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="open-001", maximum_staging_bytes=4096,
+            closure_verified=False, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+
+    class ExpiringDeadline:
+        calls = 0
+        def remaining(self, _clock, *, cleanup=False):
+            self.calls += 1
+            return 1 if self.calls < 4 else 0
+    backend = FakeGCS()
+    with pytest.raises(TimeoutError):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="deadline-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=ExpiringDeadline())
+    assert all(path.is_file() for path in source.iterdir())
+
+
+def test_bounded_relay_part_collision_is_generation_bound_and_preserves_originals(tmp_path):
+    from cloud_network_benchmark.closed_archive import create_closed_archive
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    sealed = tmp_path / "sealed-for-collision"
+    manifest = create_closed_archive(source, sealed, max_part_bytes=4096)
+    first = manifest["parts"][0]
+    backend = FakeGCS()
+    key = f"cnb/v1/aws/exp-001/collision-001/parts/00000001-{first['sha256']}"
+    backend.objects[key] = (b"x" * first["size_bytes"], "foreign-generation")
+    with pytest.raises(GCSArchiveFailure):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="collision-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert backend.objects[key][1] == "foreign-generation"
+    assert all(path.is_file() for path in source.iterdir())
 

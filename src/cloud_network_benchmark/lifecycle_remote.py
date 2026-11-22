@@ -425,8 +425,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if archive_sink is not None:
                 # Explicitly configured controller-only post-close sink. This
                 # runs after measured traffic and complete native retrieval.
-                from .closed_archive import create_closed_archive
-                from .gcs_archive import GoogleCloudStorageBackend, upload_sealed_archive
+                from .gcs_archive import GoogleCloudStorageBackend, relay_closed_native_tree
                 bucket = archive_sink.get("bucket")
                 maximum_staging_bytes = archive_sink.get("maximum_staging_bytes")
                 maximum_archive_bytes = archive_sink.get("maximum_archive_bytes")
@@ -439,51 +438,39 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         "archive_status": {"status": "withheld", "verified": False,
                             "reason": "closed native retrieval incomplete"}})
                 else:
-                    archive_root = Path(archive_sink["archive_root"])
-                    archive_path = archive_root / f"{provider}-{deployment.deployment_id}"
+                    status_path = None
                     try:
-                        import shutil
-                        from .closed_archive import FAT32_FILE_LIMIT, _safe_files, projected_archive_upper_bound
-                        def guard():
-                            if item.deadline.remaining(clock.monotonic, cleanup=True) <= 0:
-                                raise TimeoutError("archive reached the original deadline or cleanup reserve")
-                        guard()
-                        if archive_root.is_symlink():
-                            raise ValueError("archive root cannot be a symlink")
-                        archive_root.mkdir(parents=True, exist_ok=True)
                         staging_root = Path(archive_sink["staging_directory"])
                         if staging_root.is_symlink() or not staging_root.is_dir():
                             raise ValueError("configured controller staging directory is unavailable")
-                        if archive_path.is_symlink():
-                            raise ValueError("existing archive cannot be a symlink")
-                        rows = _safe_files(item.result_root, guard)
-                        projection = projected_archive_upper_bound(sum(row[2] for row in rows), len(rows))
-                        if projection > maximum_archive_bytes:
-                            raise OSError("measured archive upper bound exceeds configured local archive limit")
-                        if not archive_path.exists():
-                            create_closed_archive(item.result_root, archive_path,
-                                max_part_bytes=min(FAT32_FILE_LIMIT, maximum_staging_bytes),
-                                free_bytes=lambda target: shutil.disk_usage(target).free,
-                                minimum_headroom_bytes=minimum_free, guard=guard)
-                        local_archive_bytes = sum(path.stat().st_size for path in archive_path.iterdir()
-                                                  if path.is_file() and not path.is_symlink())
-                        if local_archive_bytes > maximum_archive_bytes:
-                            raise OSError("sealed archive exceeds configured local archive byte limit")
-                        if shutil.disk_usage(archive_root).free < minimum_free:
-                            raise OSError("controller archive filesystem lacks required headroom")
+                        archive_root = Path(archive_sink["archive_root"])
+                        if archive_root.is_symlink():
+                            raise ValueError("archive status root cannot be a symlink")
+                        archive_root.mkdir(parents=True, exist_ok=True)
+                        status_path = archive_root / f"{provider}-{pair_of(provision).identity.run_id}.status.json"
+                        def report_archive_progress(status):
+                            safe = {key: status[key] for key in ("status", "verified", "verified_parts",
+                                "verified_bytes", "manifest_sha256", "completion_generation",
+                                "archive_bytes", "error", "partial_object_count") if key in status}
+                            temporary = status_path.with_suffix(".partial")
+                            temporary.write_text(json.dumps(safe, sort_keys=True) + "\n", encoding="utf-8")
+                            temporary.replace(status_path)
                         backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket)
-                        archive_status = upload_sealed_archive(archive_path,
+                        archive_status = relay_closed_native_tree(item.result_root,
                             backend=backend, bucket=bucket, provider=provider,
                             experiment_id=child.experiment_id, run_id=pair_of(provision).identity.run_id,
                             maximum_staging_bytes=maximum_staging_bytes,
                             closure_verified=item.retrieval.complete,
-                            source_directory=item.result_root,
                             maximum_archive_bytes=maximum_archive_bytes,
                             minimum_controller_free_bytes=minimum_free,
                             staging_directory=staging_root, deadline=item.deadline,
-                            clock=clock.monotonic)
+                            clock=clock.monotonic, status_callback=report_archive_progress)
                         item.retrieval = item.retrieval.model_copy(update={"archive_status": archive_status})
                     except Exception as exc:
+                        if status_path is not None:
+                            report_archive_progress({"status": "failed", "verified": False,
+                                "error": type(exc).__name__, "partial_object_count": len(
+                                    getattr(exc, "partial_objects", []))})
                         item.retrieval = item.retrieval.model_copy(update={"complete": False,
                             "cleanup_required": True,
                             "failures": [*item.retrieval.failures,
