@@ -432,7 +432,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
                             ledger_state: dict[str, Any] | None = None,
                             controller_session_id: str | None = None):
     """Build F11 inputs from the initialized identities and exact sourced cost rows."""
-    from decimal import Decimal
+    from decimal import Decimal, ROUND_CEILING
     from .admission import AdmissionPlan, WorkflowAllowance, validate_timing_profile_allowance
     from .contracts.admission import ReservationRequest
     from .contracts.common import Evidence, Provider
@@ -473,8 +473,13 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
             except Exception as exc:
                 raise ValueError("cost envelope amount is invalid") from exc
             funding[bucket] = funding.get(bucket, Decimal("0")) + amount
-    estimated = sum((Decimal(str(component["amount_usd"]))
-        for row in rows.values() for component in row["components"].values()), Decimal("0"))
+    # Admission reserves each complete provider liability independently. Keep
+    # request construction on the same four-decimal USD ceiling basis so a
+    # multi-provider request cannot understate the sum of those reservations.
+    estimated = sum((sum((Decimal(str(component["amount_usd"]))
+        for component in row["components"].values()), Decimal("0")).quantize(
+            Decimal("0.0001"), rounding=ROUND_CEILING)
+        for row in rows.values()), Decimal("0"))
     allowance = runtime["allowance"]
     validate_timing_profile_allowance(campaign.admission.timing_profile, allowance, set(child_ids))
     from .admission import validate_workflow_profile_allowance

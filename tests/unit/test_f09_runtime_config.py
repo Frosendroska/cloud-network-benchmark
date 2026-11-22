@@ -99,6 +99,22 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
     assert blocked.outstanding_cleanup is True
 
 
+def test_f11_request_rounds_complete_provider_liabilities_before_aggregation():
+    from decimal import ROUND_CEILING
+
+    raw = {
+        "aws": "1.9002126961554286",
+        "azure": "3.7598114621877015",
+        "gcp": "1.8983905148983125",
+    }
+    rounded = [Decimal(value).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+        for value in raw.values()]
+    assert rounded == [Decimal("1.9003"), Decimal("3.7599"), Decimal("1.8984")]
+    assert sum(rounded, Decimal("0")) == Decimal("7.5586")
+    raw_sum = sum((Decimal(value) for value in raw.values()), Decimal("0"))
+    assert raw_sum.quantize(Decimal("0.0001"), rounding=ROUND_CEILING) == Decimal("7.5585")
+
+
 def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repository_root, tmp_path, monkeypatch):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
