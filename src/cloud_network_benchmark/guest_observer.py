@@ -144,10 +144,15 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
         if expected.get("kind") in {"producer", "tcp_client"} and "timeout_seconds" in expected:
             age = actual.get("age_seconds") if isinstance(actual, Mapping) else None
             resolution = actual.get("age_resolution_seconds") if isinstance(actual, Mapping) else None
+            requested = expected.get("requested_seconds")
+            grace = expected.get("finalization_grace_seconds")
+            maximum_age = min(expected["timeout_seconds"], requested + grace
+                if type(requested) is int and isinstance(grace, (int, float)) and not isinstance(grace, bool)
+                and math.isfinite(grace) and grace > 0 else -1)
             if (isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age)
                     or isinstance(resolution, bool) or not isinstance(resolution, (int, float))
                     or not math.isfinite(resolution) or resolution < 0 or resolution > 0.1
-                    or age < 0 or age > expected["timeout_seconds"] + resolution):
+                    or age < 0 or maximum_age <= 0 or age > maximum_age + resolution):
                 problems.append("measurement_process_exceeded_original_timeout:" + expected["kind"])
     observed_files = result.get("files", {})
     for item in role["files"]:

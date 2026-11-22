@@ -50,7 +50,7 @@ def _probe(_role, payload):
                   for item in payload["files"]}}
 
 
-def _actual_sockperf_progress(tmp_path, monkeypatch):
+def _actual_sockperf_progress(tmp_path, monkeypatch, *, request_timeout=600):
     from cloud_network_benchmark.contracts.execution import CommandRequest
     from cloud_network_benchmark.measurement_process import LocalMeasurementProcesses, SystemMeasurementClock
     from cloud_network_benchmark.observer_publisher import GuestObserverProgress
@@ -94,11 +94,12 @@ def _actual_sockperf_progress(tmp_path, monkeypatch):
         phase="multi_flow", streams=4, trial_index=None, parent_unit_id=None)])
     progress = GuestObserverProgress(workspace / ".observer-progress.json", deployment_id="run-aws-deployment",
         observation=observation)
-    runner = LocalMeasurementProcesses(SystemMeasurementClock(), observer_callback=progress, proc_root=proc_root)
+    runner = LocalMeasurementProcesses(SystemMeasurementClock(), observer_callback=progress, proc_root=proc_root,
+        finalization_grace_seconds=15)
     csv = workspace / "measurements" / "probe.csv"
     csv.parent.mkdir()
     request = CommandRequest(action_id="sockperf-probe-chunk-000001", action_type="measurement",
-        argv=[str(executable), "--full-log", str(csv), "-t", "300"], cwd=str(workspace), timeout_seconds=600)
+        argv=[str(executable), "--full-log", str(csv), "-t", "300"], cwd=str(workspace), timeout_seconds=request_timeout)
     handle = runner.start(request, stdout_path=workspace / "out", stderr_path=workspace / "err")
     deadline = time.monotonic() + 2
     while not progress.path.exists() and time.monotonic() < deadline:
@@ -263,8 +264,9 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     while runner.poll(handle) is None:
         time.sleep(0.01)
     closed_progress = json.loads(progress_writer.path.read_text())
-    for callback, deployment, pair, connection, bootstrap, diagnostics in callbacks.values():
-        assert callback(deployment, pair, connection, bootstrap, diagnostics, closed_progress)["status"] == "incomplete"
+    callback, deployment, pair, connection, bootstrap, diagnostics = callbacks["aws"]
+    assert callback(deployment, pair, connection, bootstrap, diagnostics, closed_progress)["status"] == "incomplete"
+    assert len(json.loads((root / "observer-state.json").read_text())["participants"]) == 2
     (proc_root / "3501/stat").write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
     rotated_command = CommandRequest(action_id="sockperf-probe-chunk-000002", action_type="measurement",
         argv=[str(executable), "--full-log", str(workspace_path / "measurements/probe-002.csv"), "-t", "300"],
@@ -272,9 +274,17 @@ def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_pa
     rotated_handle = runner.start(rotated_command, stdout_path=workspace_path / "out-rotate",
         stderr_path=workspace_path / "err-rotate")
     rotated_progress = json.loads(progress_writer.path.read_text())
-    callback, deployment, pair, connection, bootstrap, diagnostics = callbacks["aws"]
-    second_reports = [callback(*callbacks[provider][1:], rotated_progress) for provider in run_ids]
-    assert [row["status"] for row in second_reports] == ["incomplete", "incomplete", "published"]
+    for provider in run_ids:
+        callback, deployment, pair, connection, bootstrap, diagnostics = callbacks[provider]
+        if provider != "aws":
+            completed = callback(deployment, pair, connection, bootstrap, diagnostics, closed_progress)
+            assert completed["status"] == "incomplete"
+            state = json.loads((root / "observer-state.json").read_text())
+            assert len(state["participants"]) == 2
+        restarted = callback(deployment, pair, connection, bootstrap, diagnostics, rotated_progress)
+        assert restarted["status"] == "published"
+        stage_now = json.loads(prepared_path.read_text())
+        assert observe_bindings(stage_now, bindings_path, now=time.time(), probe=probe)["health"] == "healthy"
     refreshed_stage = json.loads(prepared_path.read_text())
     refreshed = observe_bindings(refreshed_stage, bindings_path, now=time.time(), probe=probe)
     assert refreshed["health"] == "healthy"
@@ -342,6 +352,7 @@ def test_fixed_acceptance_and_calibration_progress_maps_phase_outputs(
         observation=SimpleNamespace(measurement_units=[unit]))
     base = {"pid": 801, "boot_id": BOOT, "start_ticks": 80801,
         "unit_id": unit_id, "timeout_seconds": 90, "requested_seconds": 20,
+        "finalization_grace_seconds": 15,
         "phase": phase, "streams": streams, "trial_index": trial_index,
         "parent_unit_id": None}
     writer({"event": "started", "kind": "producer", **base, "path": f"measurements/{unit_id}.csv",
@@ -356,6 +367,97 @@ def test_fixed_acceptance_and_calibration_progress_maps_phase_outputs(
     assert progress["producer"]["trial_index"] == trial_index
     assert progress["tcp_client"]["pid"] == 802
     assert progress["iperf3_outputs"][0]["path"] == f"measurements/{unit_id}.iperf3.json"
+
+
+def test_actual_acceptance_progress_survives_publisher_and_guest_probe(tmp_path):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.observer_publisher import GuestObserverProgress, validate_guest_progress
+
+    unit_id = "V-S1-multi"
+    unit = SimpleNamespace(unit_id=unit_id, kind="phase", phase="multi_flow", streams=4,
+        trial_index=None, parent_unit_id=None)
+    writer = GuestObserverProgress(tmp_path / "progress.json", deployment_id="run-aws-deployment",
+        observation=SimpleNamespace(measurement_units=[unit]))
+    process = {"pid": 810, "boot_id": BOOT, "start_ticks": 8100, "unit_id": unit_id,
+        "timeout_seconds": 90, "requested_seconds": 60, "finalization_grace_seconds": 15,
+        "phase": "multi_flow", "streams": 4,
+        "trial_index": None, "parent_unit_id": None}
+    writer({"event": "started", "kind": "producer", **process,
+        "path": f"measurements/{unit_id}.csv", "action_id": f"sockperf-{unit_id}",
+        "streaming_output": False})
+    writer({"event": "started", "kind": "tcp_client", **{**process, "pid": 811, "start_ticks": 8110},
+        "path": f"measurements/{unit_id}.iperf3.json", "action_id": f"iperf3-{unit_id}",
+        "streaming_output": False})
+    progress = validate_guest_progress(json.loads(writer.path.read_text()), deployment_id="run-aws-deployment")
+
+    participant = _participant("entry", "aws", "run-aws")
+    participant["roles"]["vm_a"]["processes"] = [progress["producer"],
+        participant["roles"]["vm_a"]["processes"][1], progress["tcp_client"]]
+    participant["roles"]["vm_a"]["files"].append({"kind": "iperf3_client", **progress["iperf3_outputs"][0]})
+    identity = ("entry", "aws", "run-aws")
+    owned = {identity: {role: {"vm_id": participant["roles"][role]["vm_id"],
+        "connection": participant["roles"][role]["connection"]} for role in ("vm_a", "vm_b")}}
+    receipt_path = tmp_path / "launch.json"
+    receipt_sha = write_launch_receipt(receipt_path, stage_id="stage", participants=owned)
+    binding = build_bindings(stage_id="stage", campaign_id="campaign", participants=[participant],
+        launch_receipt=json.loads(receipt_path.read_text()))
+    vm_a = binding["entries"][0]["roles"]["vm_a"]
+    assert {item["kind"] for item in vm_a["processes"]} == {"producer", "diagnostics", "tcp_client"}
+    assert any(item["kind"] == "iperf3_client" for item in vm_a["files"])
+
+    binding_path = tmp_path / "bindings.json"
+    binding_sha = publish_bindings(binding_path, binding)
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text(json.dumps({"access": {"bootstrap": {"workspace": WORKSPACE}}}))
+    stage = {"stage_id": "stage", "campaign_id": "campaign", "entries": [{"entry_id": "entry",
+        "run_ids": {"aws": "run-aws"}, "runtime_config_path": str(runtime_path)}],
+        "observer_bindings_sha256": binding_sha, "observer_launch_receipt_path": str(receipt_path),
+        "observer_launch_receipt_sha256": receipt_sha}
+    result = observe_bindings(stage, binding_path, now=time.time(), probe=_probe,
+        run=lambda *_args, **_kwargs: pytest.fail("unexpected SSH"))
+    key = __import__("json").dumps(["entry", "aws", "run-aws"], separators=(",", ":"))
+    assert result["entries"][key]["roles"]["vm_a"]["health"] == "healthy"
+
+
+def test_pending_sockperf_age_uses_duration_grace_and_original_stage_deadline(tmp_path, monkeypatch):
+    from cloud_network_benchmark.observer_publisher import validate_guest_progress
+
+    process_runner, process_handle, raw_progress, _writer, _proc_root, _exe, _workspace = \
+        _actual_sockperf_progress(tmp_path, monkeypatch, request_timeout=86400)
+    progress = validate_guest_progress(raw_progress, deployment_id="run-aws-deployment")
+    participant = _participant("entry", "aws", "run-aws")
+    participant["roles"]["vm_a"]["processes"] = [progress["producer"],
+        participant["roles"]["vm_a"]["processes"][1]]
+    participant["roles"]["vm_a"]["files"][0] = {"kind": "sockperf_chunk", **progress["sockperf_chunks"][0]}
+    identity = ("entry", "aws", "run-aws")
+    owned = {identity: {role: {"vm_id": participant["roles"][role]["vm_id"],
+        "connection": participant["roles"][role]["connection"]} for role in ("vm_a", "vm_b")}}
+    receipt_path = tmp_path / "launch.json"
+    receipt_sha = write_launch_receipt(receipt_path, stage_id="stage", participants=owned)
+    binding = build_bindings(stage_id="stage", campaign_id="campaign", participants=[participant],
+        launch_receipt=json.loads(receipt_path.read_text()))
+    binding_path = tmp_path / "bindings.json"
+    binding_sha = publish_bindings(binding_path, binding)
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text(json.dumps({"access": {"bootstrap": {"workspace": WORKSPACE}}}))
+    stage = {"stage_id": "stage", "campaign_id": "campaign", "entries": [{"entry_id": "entry",
+        "run_ids": {"aws": "run-aws"}, "runtime_config_path": str(runtime_path)}],
+        "observer_bindings_sha256": binding_sha, "observer_launch_receipt_path": str(receipt_path),
+        "observer_launch_receipt_sha256": receipt_sha}
+    def probe_at(age):
+        def probe(role, payload):
+            result = _probe(role, payload)
+            if "producer" in result["processes"]:
+                result["processes"]["producer"]["age_seconds"] = age
+            return result
+        return probe
+    healthy = observe_bindings(stage, binding_path, now=time.time(), probe=probe_at(315))
+    key = json.dumps(["entry", "aws", "run-aws"], separators=(",", ":"))
+    assert healthy["entries"][key]["roles"]["vm_a"]["health"] == "healthy"
+    stale = observe_bindings(stage, binding_path, now=time.time(), probe=probe_at(1800))
+    assert "measurement_process_exceeded_original_timeout:producer" in \
+        stale["entries"][key]["roles"]["vm_a"]["errors"], stale
+    process_runner.stop(process_handle, time.monotonic() + 2)
 
 
 def test_f02_listener_process_receipt_parses_real_identity_and_rejects_reuse():

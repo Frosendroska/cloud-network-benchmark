@@ -98,6 +98,7 @@ def test_live_sockperf_full_log_may_remain_empty_until_process_finalizes():
     path = "measurements/probe-0001.csv"
     role["processes"][0].update({"path": path, "action_id": "sockperf-probe-0001",
         "unit_id": "probe-0001", "timeout_seconds": 90, "requested_seconds": 70,
+        "finalization_grace_seconds": 15,
         "phase": "single_flow", "streams": 1, "trial_index": None, "parent_unit_id": None,
         "streaming_output": False})
     role["files"][0].update({"output_state": "finalization_pending", "unit_id": "probe-0001",

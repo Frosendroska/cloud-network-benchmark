@@ -37,7 +37,9 @@ def _observer_progress_callback(observer_config: dict[str, Any] | None):
             # Observer publication is read-only side evidence. An incomplete
             # receipt invalidates the snapshot and leaves health unknown.
             try:
-                invalidate_runtime_observer_snapshot(observer_config)
+                invalidate_runtime_observer_snapshot(observer_config, participant=(
+                    observer_config.get("entry_id"),
+                    getattr(deployment.provider, "value", deployment.provider), deployment.run_id))
             except Exception:
                 pass
             return {"status": "incomplete", "error_type": type(exc).__name__}

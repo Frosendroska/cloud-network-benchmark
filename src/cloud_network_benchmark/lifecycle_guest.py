@@ -104,7 +104,8 @@ def execute_request(request: GuestRequest, *, processes=None, clock=None) -> Gue
                 request.output_root / ".observer-progress.json",
                 deployment_id=request.identity.deployment_id,
                 observation=request.observation)
-        processes = LocalMeasurementProcesses(clock, observer_callback=observer_callback)
+        processes = LocalMeasurementProcesses(clock, observer_callback=observer_callback,
+            finalization_grace_seconds=request.shutdown_grace_seconds)
     if request.observation.provider != request.identity.provider:
         raise ValueError("provider identity mismatch")
     if package_tree_sha256(request.package_root) != request.package_sha256:

@@ -207,7 +207,7 @@ def build_bindings(*, stage_id: str, campaign_id: str,
             if len({f["path"] for f in files}) != len(files):
                 raise ValueError("duplicate output file receipt")
             roles[role] = {"vm_id": owned_role["vm_id"], "connection": owned_role["connection"],
-                "workspace": workspace, "processes": [by_kind[k] for k in sorted(expected_kinds)],
+                "workspace": workspace, "processes": [by_kind[k] for k in sorted(by_kind)],
                 "files": files}
         workload = participant.get("active_workload")
         if workload is not None:
@@ -303,7 +303,8 @@ def validate_guest_progress(value: Mapping[str, Any], *, deployment_id: str) -> 
 def _progress_process(value: Mapping[str, Any], kind: str) -> dict[str, Any]:
     process = _process({"kind": kind, **value}, kind)
     required = {"kind", "pid", "boot_id", "start_ticks", "path", "action_id", "unit_id", "timeout_seconds",
-                "requested_seconds", "phase", "streams", "trial_index", "parent_unit_id", "streaming_output"}
+                "requested_seconds", "finalization_grace_seconds", "phase", "streams", "trial_index",
+                "parent_unit_id", "streaming_output"}
     if set(value) != required:
         raise ValueError("observer process workload identity is incomplete")
     path = _file({"kind": "sockperf_chunk" if kind == "producer" else "iperf3_client",
@@ -315,6 +316,10 @@ def _progress_process(value: Mapping[str, Any], kind: str) -> dict[str, Any]:
             or type(value["requested_seconds"]) is not int or value["requested_seconds"] <= 0
             or isinstance(value["timeout_seconds"], bool) or not isinstance(value["timeout_seconds"], (int, float))
             or not math.isfinite(value["timeout_seconds"]) or value["timeout_seconds"] <= 0
+            or isinstance(value["finalization_grace_seconds"], bool)
+            or not isinstance(value["finalization_grace_seconds"], (int, float))
+            or not math.isfinite(value["finalization_grace_seconds"])
+            or value["finalization_grace_seconds"] <= 0
             or value["streams"] is not None and (type(value["streams"]) is not int or value["streams"] <= 0)
             or value["trial_index"] is not None and (type(value["trial_index"]) is not int or value["trial_index"] <= 0)
             or value["parent_unit_id"] is not None and not isinstance(value["parent_unit_id"], str)
@@ -596,8 +601,9 @@ def publish_runtime_observer_snapshot(config: Mapping[str, Any], *, deployment: 
             "active_participants": len(expected), "observed_participants": len(actual)}
 
 
-def invalidate_runtime_observer_snapshot(config: Mapping[str, Any]) -> None:
-    """Force a hash-consistent unknown snapshot after any incomplete live receipt."""
+def invalidate_runtime_observer_snapshot(config: Mapping[str, Any], *,
+        participant: tuple[str, str, str] | None = None) -> None:
+    """Invalidate one participant receipt, or the whole stage when none is named."""
     bindings_path = Path(config["bindings_path"])
     prepared_path = Path(config["prepared_stage_path"])
     state_path = Path(config["state_path"])
@@ -605,10 +611,20 @@ def invalidate_runtime_observer_snapshot(config: Mapping[str, Any]) -> None:
         prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
         if prepared.get("stage_id") != config.get("stage_id"):
             raise ValueError("observer invalidation stage identity mismatch")
+        if participant is None:
+            state = {"schema_version": 1, "owned": {}, "participants": {}}
+        else:
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {
+                "schema_version": 1, "owned": {}, "participants": {}}
+            if (state.get("schema_version") != 1 or not isinstance(state.get("owned"), dict)
+                    or not isinstance(state.get("participants"), dict)):
+                raise ValueError("observer aggregate state is malformed")
+            key = _participant_key(*participant)
+            state["owned"].pop(key, None)
+            state["participants"].pop(key, None)
         digest = publish_bindings(bindings_path, {"stage_id": config["stage_id"],
             "campaign_id": config["campaign_id"], "entries": []})
-        _atomic_bytes(state_path, _json_bytes({"schema_version": 1, "owned": {}, "participants": {}}),
-            replace=True)
+        _atomic_bytes(state_path, _json_bytes(state), replace=True)
         prepared["observer_bindings_sha256"] = digest
         _atomic_bytes(prepared_path,
             (json.dumps(prepared, sort_keys=True, indent=2) + "\n").encode(), replace=True)

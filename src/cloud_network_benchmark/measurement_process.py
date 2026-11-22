@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import math
 import subprocess
 import threading
 import time
@@ -75,11 +76,12 @@ class LocalMeasurementProcesses:
 
     def __init__(self, clock: MeasurementClock, *, preview_bytes: int = 8192,
                  observer_callback: Callable[[Mapping[str, object]], None] | None = None,
-                 proc_root: Path = Path("/proc")) -> None:
+                 proc_root: Path = Path("/proc"), finalization_grace_seconds: float | None = None) -> None:
         self.clock = clock
         self.preview_bytes = preview_bytes
         self.observer_callback = observer_callback
         self.proc_root = Path(proc_root)
+        self.finalization_grace_seconds = finalization_grace_seconds
         self._events: "queue.Queue[ProcessEvent]" = queue.Queue(maxsize=32)
 
     def start(self, request: CommandRequest, *, stdout_path: Path, stderr_path: Path) -> LocalProcess:
@@ -111,7 +113,7 @@ class LocalMeasurementProcesses:
             thread.start()
         try:
             observer_record = self._observer_record(request, proc.pid, stdout_path=stdout_path,
-                proc_root=self.proc_root) if self.observer_callback else None
+                proc_root=self.proc_root, finalization_grace_seconds=self.finalization_grace_seconds) if self.observer_callback else None
         except BaseException as start_error:
             try:
                 self.stop(handle, started_mono + request.timeout_seconds)
@@ -158,7 +160,8 @@ class LocalMeasurementProcesses:
 
     @staticmethod
     def _observer_record(request: CommandRequest, pid: int, *, stdout_path: Path,
-                         proc_root: Path = Path("/proc")) -> Mapping[str, object] | None:
+                         proc_root: Path = Path("/proc"),
+                         finalization_grace_seconds: float | None = None) -> Mapping[str, object] | None:
         """Capture actual client processes and the paths already owned by F03."""
         if not request.argv:
             return None
@@ -195,9 +198,14 @@ class LocalMeasurementProcesses:
             duration = int(request.argv[request.argv.index("-t") + 1])
         except (ValueError, IndexError, TypeError):
             raise RuntimeError("actual measurement observer duration is unavailable") from None
+        if (isinstance(finalization_grace_seconds, bool)
+                or not isinstance(finalization_grace_seconds, (int, float))
+                or not math.isfinite(finalization_grace_seconds) or finalization_grace_seconds <= 0):
+            raise RuntimeError("actual measurement observer finalization grace is unavailable")
         return {"kind": kind, "pid": pid, "boot_id": boot_id, "start_ticks": ticks,
                 "path": relative, "action_id": action_id, "unit_id": action_id[len(prefix):],
                 "timeout_seconds": request.timeout_seconds, "requested_seconds": duration,
+                "finalization_grace_seconds": float(finalization_grace_seconds),
                 "streaming_output": kind == "tcp_client" and "--json-stream" in request.argv
                     and "--forceflush" in request.argv}
 
