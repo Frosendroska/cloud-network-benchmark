@@ -38,13 +38,13 @@ run "stockholm_same_zone_pair" {
       aws_instance.vm_a.ami == var.image_id_primary &&
       aws_instance.vm_b_frankfurt[0].ami == var.image_id_primary &&
       aws_instance.vm_a.instance_type == "m7i.xlarge" &&
-      aws_instance.vm_b_frankfurt[0].instance_type == "m7i.xlarge")
+    aws_instance.vm_b_frankfurt[0].instance_type == "m7i.xlarge")
     error_message = "Stockholm pair must use the pinned regional AMI, selected zone and exact shape"
   }
   assert {
     condition = (length(aws_instance.vm_b_frankfurt) == 1 &&
       length(aws_instance.vm_b_london) == 0 &&
-      length(aws_subnet.b_frankfurt) == 0)
+    length(aws_subnet.b_frankfurt) == 0)
     error_message = "Stockholm acceptance creates exactly the local same-zone pair"
   }
 }
@@ -61,7 +61,7 @@ run "stockholm_s3_cluster_pair" {
   assert {
     condition = (length(aws_placement_group.cluster) == 1 &&
       aws_instance.vm_a.placement_group == var.placement_group_name &&
-      aws_instance.vm_b_frankfurt[0].placement_group == var.placement_group_name)
+    aws_instance.vm_b_frankfurt[0].placement_group == var.placement_group_name)
     error_message = "Stockholm S3 must use the selected cluster placement group on both roles"
   }
 }
