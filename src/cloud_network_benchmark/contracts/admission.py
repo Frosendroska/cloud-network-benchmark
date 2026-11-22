@@ -131,7 +131,8 @@ class AdmissionRequirements(StrictModel):
             if spec is None or spec["mode"] != mode.value or timing_profile is not None:
                 raise ValueError("workflow profile is unsupported for this mode or timing profile")
             cap = spec["cap_seconds"]
-        scheduled = mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+        scheduled = (mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+            and workflow_profile is None)
         return {
             "priority": priority,
             "lifetime_cap_seconds": cap,

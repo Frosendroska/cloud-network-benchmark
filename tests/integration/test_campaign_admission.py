@@ -152,6 +152,45 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     assert len(namespaces) == len(set(namespaces)) == 6
 
 
+def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
+        repository_root, tmp_path, monkeypatch, request):
+    """Exercise real stage generation and driver validation for the frozen all-ready pair."""
+    from cloud_network_benchmark.campaign import _acceptance_pair
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, FAILURE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
+    window = {"not_before_utc": lower, "not_after_utc": upper}
+    acceptance = settings["stage_inputs"]["acceptance"]
+    acceptance.update(workflow_profile=ACCEPTANCE_PROFILE,
+        failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window)
+    acceptance.pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, FAILURE_PROFILE]
+    settings["approvals"]["paired_acceptance"]["fields"] = {
+        "mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
+        "execution_window_utc": window}
+
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+
+    pair = stage["entries"][:2]
+    assert [row["entry_id"] for row in pair] == ["V-S1", "V-S3"]
+    assert all(row["scheduled_start"] is None for row in pair)
+    assert {row["launch_at"] for row in pair} == {lower}
+    assert stage["dispatch_policy"]["execution_window"] == window
+    assert stage["dispatch_policy"]["ready_window_seconds"] == 600
+    assert stage["measurement_start_barrier"]["execution_window"] == window
+    assert stage["measurement_start_barrier"]["ready_window_seconds"] == 600
+    expected = {(entry["entry_id"], provider, run_id)
+        for entry in pair for provider, run_id in entry["run_ids"].items()}
+    observed = {(row["entry_id"], row["provider"], row["run_id"])
+        for row in stage["measurement_start_barrier"]["expected_participants"]}
+    assert len(expected) == 6 and observed == expected
+    assert _acceptance_pair(stage) == pair
+
+
 def test_generated_calibration_binds_runtime_observer_without_changing_workload(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     clock = Clock()
@@ -194,6 +233,33 @@ def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repo
         activate_prepared_stage(stage, settings, repository_root, preflight=preflight)
     assert observed["candidate"]["status"] == "READY_FOR_ADMISSION"
     assert set(observed["runtimes"]) == {entry["entry_id"] for entry in stage["entries"]}
+    assert all(not Path(path).exists() for path in stage["approval_refs"].values())
+
+
+def test_real_calibration_activation_without_acceptance_receipt_writes_no_approval_files(
+        repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.campaign_inputs import activate_prepared_stage
+    from cloud_network_benchmark.validation_profiles import CALIBRATION_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    calibration = settings["stage_inputs"]["calibration"]
+    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window)
+    calibration.pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
+    stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+    # Remove the fixture's generic review source: a calibration activation must
+    # not mistake that placeholder for a completed acceptance receipt.
+    Path(settings["approvals"]["paid_acceptance"]["source"]).unlink()
+
+    with pytest.raises(ValueError):
+        activate_prepared_stage(stage, settings, repository_root,
+            preflight=lambda *_a, **_k: pytest.fail("missing acceptance receipt reached financial preflight"))
+    assert stage["status"] == "DRAFT_UNAPPROVED"
     assert all(not Path(path).exists() for path in stage["approval_refs"].values())
 
 

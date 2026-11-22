@@ -931,15 +931,21 @@ def _validate_resolved_protocol(
         raise ValueError("unsupported timing profile")
     if workflow_profile is not None:
         failure_scope = {"EXP-900": {Provider.AWS}, "EXP-901": {Provider.AZURE}, "EXP-902": {Provider.GCP}}
+        def provider_scope_matches(expected):
+            selected = set(map(Provider, provider_set))
+            if observation_provider is None:
+                return selected == expected
+            return selected == {Provider(observation_provider)} and Provider(observation_provider) in expected
+
         valid = ((workflow_profile == "all_cloud_acceptance_v1" and normalized_mode == ExperimentMode.ACCEPTANCE
                   and experiment_id in {"EXP-903", "EXP-003"} and normalized_context == "standard"
-                  and set(map(Provider, provider_set)) == {Provider.AWS, Provider.AZURE, Provider.GCP})
+                  and provider_scope_matches({Provider.AWS, Provider.AZURE, Provider.GCP}))
                  or (workflow_profile == "all_cloud_calibration_v1" and normalized_mode == ExperimentMode.CALIBRATION
                      and experiment_id == "EXP-001" and normalized_context == "standard"
-                     and set(map(Provider, provider_set)) == {Provider.AWS, Provider.AZURE, Provider.GCP})
+                     and provider_scope_matches({Provider.AWS, Provider.AZURE, Provider.GCP}))
                  or (workflow_profile == "all_cloud_failure_acceptance_v1" and normalized_mode == ExperimentMode.ACCEPTANCE
                      and experiment_id in failure_scope and normalized_context == "failure_check"
-                     and set(map(Provider, provider_set)) == failure_scope[experiment_id]))
+                     and provider_scope_matches(failure_scope[experiment_id])))
         if not valid:
             raise ValueError("resolved workflow profile identity/scope mismatch")
     benchmark.validate_mode(normalized_mode)

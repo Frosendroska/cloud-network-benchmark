@@ -233,7 +233,7 @@ def _acceptance_dispatch_policy(settings, approval_refs):
         return {"policy_id": "acceptance-paired-s1-s3-ready-v1", "group_by": "acceptance_slot",
             "scenarios": ["S1", "S3"], "max_parallel_entries": 2,
             "start_policy": "all_ready", "execution_window": window,
-            "ready_window_seconds": 60, "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
+            "ready_window_seconds": 600, "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
     start_utc = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat()
     return {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
         "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_utc": start_utc,
@@ -790,6 +790,17 @@ def _write_evidence(directory, declarations, scope, settings):
 
 def _frozen_config(data, alias, settings, entry_id):
     data = copy.deepcopy(data)
+    stage_inputs = settings.get("stage_inputs", {})
+    workflow_profile = None
+    if alias in {"s1_acceptance", "s3_acceptance"}:
+        workflow_profile = stage_inputs.get("acceptance", {}).get("workflow_profile")
+    elif alias in {"aws_failure", "azure_failure", "gcp_failure"}:
+        workflow_profile = stage_inputs.get("acceptance", {}).get("failure_workflow_profile")
+    elif alias == "calibration":
+        workflow_profile = stage_inputs.get("calibration", {}).get("workflow_profile")
+    if workflow_profile is not None:
+        data["admission"]["workflow_profile"] = workflow_profile
+        data["admission"]["lifetime_cap_seconds"] = profile_spec(workflow_profile)["cap_seconds"]
     if alias == "s3_acceptance":
         data["config_id"] = "exp-003-acceptance"
         data["mode"] = "acceptance"
@@ -908,6 +919,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         elif stage == "acceptance" and entry_id in {"V-S1", "V-S3"} and profile != ACCEPTANCE_PROFILE:
             scheduled = _utc(inputs["start_utc"], "acceptance.start_utc")
             window = None
+        elif stage == "acceptance" and entry_id in {"V-S1", "V-S3"} and profile == ACCEPTANCE_PROFILE:
+            scheduled = None
+            window = None
         elif stage == "calibration" and profile == CALIBRATION_PROFILE:
             scheduled = None
             window = None
@@ -918,6 +932,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             scheduled = None
             window = None
         launch_at = scheduled - timedelta(seconds=prep) if scheduled else now
+        if profile == ACCEPTANCE_PROFILE and entry_id in {"V-S1", "V-S3"}:
+            launch_at = _utc(_profile_execution_window(inputs, "acceptance")["not_before_utc"],
+                             "acceptance.execution_window_utc.not_before_utc")
         if scheduled and launch_at <= now:
             raise ValueError(f"{entry_id}: setup lead time is already missed; explicitly review new timing, no backfill")
         end = (scheduled or now) + timedelta(seconds=allowance["measurement_seconds"] + allowance["measurement_shutdown_seconds"] + allowance["retrieval_seconds"] + allowance["cleanup_seconds"])
@@ -1047,7 +1064,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         start_barrier = {"schema_version": 1, "barrier_id": f"{stage_id}-normal-measurement-start",
             "expected_participants": participants,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start")}
-        if runtime.get("workflow_profile") == ACCEPTANCE_PROFILE:
+        if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
             start_barrier.update(start_policy="all_ready",
                 execution_window=_profile_execution_window(inputs, "acceptance"), ready_window_seconds=600)
         else:
