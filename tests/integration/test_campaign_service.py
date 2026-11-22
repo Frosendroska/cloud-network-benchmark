@@ -111,7 +111,7 @@ def test_observer_binds_ids_paths_and_records_cleanup_disk_and_stale_fault(tmp_p
 
 @pytest.mark.parametrize("row_state,minimum,free,expected_health", [
     ("failed", 100, 500, "fault"),
-    ("missed", 100, 500, "healthy"),
+    ("missed", 100, 500, "fault"),
     ("complete", 100, 50, "fault"),
     ("complete", 100, 500, "healthy"),
 ])
@@ -238,3 +238,83 @@ def test_periodic_preflight_reports_identity_terraform_and_expiry_without_leakin
     assert result["terraform_version"] == "1.10.2"
     stage["credential_valid_through_utc"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     assert supervisor._read_only_preflight(stage)["status"] == "blocked"
+
+
+def test_observer_does_not_call_provider_preflight(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.campaign_supervisor as supervisor
+
+    state = tmp_path / "state"
+    stage_dir = state / "stage"
+    stage_dir.mkdir(parents=True)
+    (stage_dir / "prepared-stage.json").write_text(json.dumps({"entries": [], "minimum_free_bytes": 0}))
+    (stage_dir / "campaign-journal.json").write_text(json.dumps({"entries": {}}))
+    (state / "active-stage.json").write_text(json.dumps({"stage_id": "s", "stage_path": str(stage_dir / "prepared-stage.json")}))
+    monkeypatch.setattr(supervisor, "_read_only_preflight", lambda _: (_ for _ in ()).throw(AssertionError("must not run")))
+
+    class StopAfterOne:
+        calls = 0
+        def is_set(self): return self.calls > 0
+        def wait(self, _): self.calls += 1
+
+    supervisor.observe(state, StopAfterOne(), interval=0)
+    saved = json.loads((state / "observer-status.json").read_text())
+    assert saved["credential_preflight"]["status"] == "not_run_by_observer"
+    assert "guest_health_unqualified" in saved["observer_mode"]
+
+
+def test_live_entry_without_persisted_guest_binding_is_unknown_not_healthy(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.campaign_supervisor as supervisor
+
+    state = tmp_path / "state"
+    stage_dir = state / "stage"
+    stage_dir.mkdir(parents=True)
+    (stage_dir / "prepared-stage.json").write_text(json.dumps({"entries": [], "minimum_free_bytes": 0}))
+    (stage_dir / "campaign-journal.json").write_text(json.dumps({"entries": {"e": {"state": "running", "result": {}}}}))
+    (state / "active-stage.json").write_text(json.dumps({"stage_id": "s", "stage_path": str(stage_dir / "prepared-stage.json")}))
+
+    class StopAfterOne:
+        calls = 0
+        def is_set(self): return self.calls > 0
+        def wait(self, _): self.calls += 1
+
+    supervisor.observe(state, StopAfterOne(), interval=0)
+    saved = json.loads((state / "observer-status.json").read_text())
+    assert saved["health"] == "unknown"
+    assert saved["output_freshness"]["e"]["evidence"] == "controller_local_files_only"
+
+
+def test_independent_watcher_detects_stale_snapshot_deduplicates_and_retries_failed_hook(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.observer_watch import poll_once
+
+    root = tmp_path / "state"
+    root.mkdir()
+    path = root / "observer-status.json"
+    path.write_text(json.dumps({"observed_at": datetime.fromtimestamp(100, timezone.utc).isoformat(), "health": "healthy"}))
+    calls = []
+    broken = lambda event: (_ for _ in ()).throw(RuntimeError("delivery failed"))
+    event, fingerprint = poll_once(root, stale_after=30, now=200, notify=broken)
+    assert event["event"] == "stale_observer" and event["notification"] == "failed"
+    assert fingerprint is None
+    event, fingerprint = poll_once(root, stale_after=30, now=201, notify=lambda value: calls.append(value))
+    assert event["event"] == "stale_observer" and event["notification"] == "delivered"
+    assert len(calls) == 1
+    event, fingerprint = poll_once(root, stale_after=30, now=202, notify=lambda value: calls.append(value),
+                                   previous_fingerprint=fingerprint)
+    assert "notification" not in event and len(calls) == 1
+
+
+def test_independent_watcher_is_quiet_for_unchanged_health(tmp_path):
+    import json
+    from datetime import datetime, timezone
+    from cloud_network_benchmark.observer_watch import poll_once
+
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "observer-status.json").write_text(json.dumps({"observed_at": datetime.fromtimestamp(100, timezone.utc).isoformat(), "health": "healthy"}))
+    called = []
+    event, fingerprint = poll_once(root, stale_after=30, now=110, notify=lambda value: called.append(value))
+    assert event["event"] == "healthy" and fingerprint is None and called == []
