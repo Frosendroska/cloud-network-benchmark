@@ -167,13 +167,23 @@ def test_generated_week_freezes_the_bounded_source_hashed_pair_policy(repository
 
 
 def test_archive_sink_runtime_config_loads_through_real_stage_generation(repository_root, tmp_path, monkeypatch, request):
+    import json
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     archive_root, staging_root = tmp_path / "archive", tmp_path / "archive-staging"
     archive_root.mkdir()
     staging_root.mkdir()
-    settings["archive_sink"] = {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
+    source_adc = tmp_path / "human-adc.json"
+    source_adc.write_text(json.dumps({"type": "authorized_user", "client_id": "client",
+        "client_secret": "secret", "refresh_token": "refresh",
+        "quota_project_id": "project-a70f8497-3463-4ef2-9cd", "universe_domain": "googleapis.com"}))
+    source_adc.chmod(0o600)
+    settings["archive_sink"] = {"mode": "impersonated_adc", "bucket": "valid-bucket", "maximum_staging_bytes": 8192,
         "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
-        "archive_root": str(archive_root), "staging_directory": str(staging_root)}
+        "archive_root": str(archive_root), "staging_directory": str(staging_root),
+        "source_credentials_file": str(source_adc),
+        "expected_source_principal": "katyabraun0@gmail.com",
+        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"}
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
     register_generated_cleanup(stage, request)
@@ -183,6 +193,10 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     assert runtime["archive_sink"]["maximum_archive_bytes"] == 1_000_000
     assert runtime["archive_sink"]["archive_root"] == archive_root
     assert runtime["archive_sink"]["staging_directory"] == staging_root
+    assert runtime["archive_sink"]["mode"] == "impersonated_adc"
+    assert runtime["archive_sink"]["source_credentials_file"] == source_adc
+    assert runtime["archive_sink"]["expected_source_principal"] == "katyabraun0@gmail.com"
+    assert runtime["archive_sink"]["expected_project_id"] == "project-a70f8497-3463-4ef2-9cd"
 
 
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):

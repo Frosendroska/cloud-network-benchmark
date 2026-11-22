@@ -8,15 +8,52 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
-import time
+import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ARCHIVE_PROJECT_ID = "project-a70f8497-3463-4ef2-9cd"
+_ARCHIVE_SERVICE_ACCOUNT = "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"
+_ARCHIVE_SOURCE_PRINCIPAL = "katyabraun0@gmail.com"
+_ARCHIVE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_write"
+
+
+def _safe_source_adc(path: str | Path, expected_principal: str) -> dict:
+    """Read a private human ADC file without refreshing it or exposing errors."""
+    candidate = Path(path)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("archive source ADC path must be absolute and normalized")
+    if any(parent.is_symlink() for parent in (candidate, *candidate.parents)):
+        raise ValueError("archive source ADC file is unsafe")
+    try:
+        info = candidate.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ValueError
+        if os.name == "posix" and (info.st_mode & 0o077 or not info.st_mode & 0o400
+                or info.st_uid != os.geteuid()):
+            raise ValueError
+        document = json.loads(candidate.read_text(encoding="utf-8"))
+        if (not isinstance(document, dict) or document.get("type") != "authorized_user"
+                or not isinstance(document.get("client_id"), str)
+                or not isinstance(document.get("client_secret"), str)
+                or not document["client_secret"]
+                or not isinstance(document.get("refresh_token"), str)
+                or not document["refresh_token"]
+                or document.get("quota_project_id") != _ARCHIVE_PROJECT_ID
+                or document.get("universe_domain", "googleapis.com") != "googleapis.com"):
+            raise ValueError
+        if not valid_archive_source(expected_principal):
+            raise ValueError
+        return document
+    except Exception:
+        raise ValueError("archive source ADC is missing, unsafe, or not the configured human ADC type") from None
 
 
 class GCSObjectBackend(Protocol):
@@ -41,15 +78,52 @@ def valid_bucket_name(value: Any) -> bool:
         and re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value) is None)
 
 
-class GoogleCloudStorageBackend:
-    """Production backend. Construct only on the configured controller identity."""
+def valid_archive_identity(project_id: Any, service_account_email: Any) -> bool:
+    return project_id == _ARCHIVE_PROJECT_ID and service_account_email == _ARCHIVE_SERVICE_ACCOUNT
 
-    def __init__(self, bucket: str):
+
+def valid_archive_source(principal: Any) -> bool:
+    return principal == _ARCHIVE_SOURCE_PRINCIPAL
+
+
+class GoogleCloudStorageBackend:
+    """Production backend impersonating the fixed archive SA from explicit human ADC."""
+
+    def __init__(self, bucket: str, *, source_credentials_file: str | Path,
+                 expected_source_principal: str, expected_project_id: str,
+                 expected_service_account_email: str, lifetime: int = 900):
+        if not isinstance(source_credentials_file, (str, Path)) or not str(source_credentials_file).strip():
+            raise ValueError("archive source ADC path is required")
+        if (not isinstance(expected_project_id, str) or not expected_project_id.strip()
+                or not isinstance(expected_service_account_email, str)
+                or not expected_service_account_email.strip()):
+            raise ValueError("expected archive project and service-account identity are required")
+        if not valid_archive_identity(expected_project_id, expected_service_account_email):
+            raise ValueError("configured archive identity does not match the approved archive account")
+        if not isinstance(expected_source_principal, str) or not expected_source_principal.strip():
+            raise ValueError("expected archive source principal is required")
+        if not valid_archive_source(expected_source_principal):
+            raise ValueError("configured archive source principal is not the approved human identity")
+        if type(lifetime) is not int or not 600 <= lifetime <= 3600:
+            raise ValueError("archive impersonation lifetime must be between 600 and 3600 seconds")
+        _safe_source_adc(source_credentials_file, expected_source_principal)
         try:
             from google.cloud import storage
+            from google.auth import load_credentials_from_file
+            from google.auth import impersonated_credentials
         except ImportError as exc:  # pragma: no cover - optional production extra
             raise RuntimeError("install the gcs optional dependency on the controller") from exc
-        self._bucket = storage.Client().bucket(bucket)
+        try:
+            source_credentials, _ = load_credentials_from_file(str(source_credentials_file))
+            credentials = impersonated_credentials.Credentials(
+                source_credentials=source_credentials,
+                target_principal=expected_service_account_email,
+                target_scopes=[_ARCHIVE_SCOPE],
+                lifetime=lifetime)
+            archive_client = storage.Client(project=expected_project_id, credentials=credentials)
+        except Exception:
+            raise ValueError("archive impersonated credentials could not be constructed") from None
+        self._bucket = archive_client.bucket(bucket)
 
     def stat(self, key: str, *, timeout_seconds: float) -> dict | None:
         blob = self._bucket.get_blob(key, timeout=timeout_seconds, retry=None)

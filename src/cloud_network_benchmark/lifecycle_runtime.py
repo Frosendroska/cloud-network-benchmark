@@ -94,17 +94,27 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
     if "archive_sink" in root:
-        sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-            "minimum_controller_free_bytes", "archive_root", "staging_directory"},
-            "archive_sink")
-        from .gcs_archive import valid_bucket_name
-        if (not valid_bucket_name(sink["bucket"])
+        required_sink_fields = {"mode", "bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+            "minimum_controller_free_bytes", "archive_root", "staging_directory", "source_credentials_file",
+            "expected_source_principal", "expected_project_id", "expected_service_account_email"}
+        sink = root["archive_sink"]
+        if (not isinstance(sink, dict) or not required_sink_fields <= set(sink)
+                or set(sink) - required_sink_fields):
+            raise ValueError("archive_sink has missing or unsupported fields")
+        from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
+        if (sink["mode"] != "impersonated_adc"
+                or not valid_bucket_name(sink["bucket"])
+                or not isinstance(sink["source_credentials_file"], str) or not sink["source_credentials_file"].strip()
+                or not valid_archive_source(sink["expected_source_principal"])
+                or any(not isinstance(sink[field], str) or not sink[field].strip()
+                    for field in ("expected_project_id", "expected_service_account_email"))
+                or not valid_archive_identity(sink["expected_project_id"], sink["expected_service_account_email"])
                 or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
                 or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
                 or type(sink["minimum_controller_free_bytes"]) is not int
                 or sink["minimum_controller_free_bytes"] < 0):
             raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
-        for field in ("archive_root", "staging_directory"):
+        for field in ("archive_root", "staging_directory", "source_credentials_file"):
             sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
     allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
         "readiness_seconds", "stabilization_seconds", "measurement_seconds",
