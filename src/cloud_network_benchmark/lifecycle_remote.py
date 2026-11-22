@@ -59,6 +59,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         retrieve_closed_bundle_with_ledger)
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
+    from .post_measurement_barrier import PostMeasurementBarrier
 
     if set(children) != {provider}:
         raise ValueError("production remote stages require exactly one provider child")
@@ -68,6 +69,20 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             or observation.mode != campaign.mode or observation.config_id != child.config_id
             or observation.experiment_id != child.experiment_id):
         raise ValueError("initialized provider observation identity does not match the child")
+    barrier = None
+    barrier_participant = None
+    barrier_spec = runtime.get("post_measurement_barrier")
+    if barrier_spec is not None:
+        barrier = PostMeasurementBarrier(barrier_spec)
+        schedule_entry = getattr(observation, "schedule_entry", None)
+        schedule_entry = getattr(schedule_entry, "value", None)
+        entry_id = getattr(schedule_entry, "entry_id", None) or child.run_id
+        matches = [row for row in barrier.spec["participants"]
+            if row["entry_id"] == entry_id and row["provider"] == provider
+            and row["run_id"] == child.run_id]
+        if len(matches) != 1:
+            raise ValueError("prepared post-measurement barrier does not contain this exact child")
+        barrier_participant = matches[0]
     revision = child.config_provenance.implementation_git_commit.value
     if not revision:
         raise ValueError("initialized implementation revision is unavailable")
@@ -92,6 +107,11 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         # owns the SSH stop operation and records whether process absence was
         # actually verified. Setting an Event alone is never reported as stop.
         cancel_event.set()
+        if barrier is not None:
+            try:
+                barrier.abort("participant_cancelled")
+            except Exception:
+                pass
         with control_lock:
             return {"requested": True, "verified_stopped": False,
                     "invocation_id": (control["process_record"] or {}).get("invocation_id")}
@@ -323,6 +343,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             and not item.closures[role].failures for role in ("vm_a", "vm_b"))
                     and item.listener_closure.closed and item.listener_closure.closed_at is not None
                     and not item.listener_closure.failures):
+                if barrier is not None:
+                    barrier.signal_terminal(barrier_participant, succeeded=True)
                 return ProviderStageOutcome("close", True,
                     {"diagnostics": item.closures, "listeners": item.listener_closure,
                      "measurement_ended_at": item.measurement_ended_at})
@@ -350,16 +372,29 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 and not item.listener_closure.failures
                 and item.guest is not None and measurement_closed_at is not None)
             item.closures["vm_a_measurement_closed_at"] = measurement_closed_at
+            if barrier is not None:
+                barrier.signal_terminal(barrier_participant, succeeded=valid)
             return ProviderStageOutcome("close", valid,
                 {"diagnostics": closures, "listeners": item.listener_closure,
                  "measurement_ended_at": item.measurement_ended_at})
         except Exception as exc:
+            if barrier is not None:
+                try:
+                    barrier.signal_terminal(barrier_participant, succeeded=False)
+                except Exception:
+                    pass
             return ProviderStageOutcome("close", False,
                 {"failure": f"{type(exc).__name__}: producer closure failed"})
 
     def retrieve(deployment: Any, provision: Any):
         try:
             item = attempt(deployment, provision)
+            if barrier is not None:
+                # Close callbacks write only genuine observed terminal results.
+                # Archive, retrieval, and upload cannot start until every
+                # source-bound participant has reached successful closure.
+                barrier.wait_released(deadline=item.deadline, clock=clock.monotonic,
+                    cancelled=cancel_event.is_set, sleep=sleep)
             closures = item.closures or {}
             close_a, close_b = closures.get("vm_a"), closures.get("vm_b")
             if (close_a is None or close_b is None or close_a.closed_at is None or close_b.closed_at is None
