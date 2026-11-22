@@ -124,9 +124,12 @@ def test_pair_apply_review_rechecks_full_budget_and_preserves_total_stage_deadli
 
     clock=[2.0]
     calls=[]
-    def reviewed(request,execute,*,review_seconds,apply_timeout_seconds,before_apply):
+    budget_checks=[]
+    def reviewed(request,execute,*,review_seconds,apply_timeout_seconds,before_apply,review_admission_path):
+        assert review_admission_path is None
         calls.append((request.timeout_seconds,review_seconds,apply_timeout_seconds))
         clock[0]+=review_elapsed
+        budget_checks.append("invoked")
         calls.append((before_apply(),))
         return execute(request.model_copy(update={"timeout_seconds":calls[-1][0]}))
     monkeypatch.setattr("cloud_network_benchmark.terraform_plan.reviewed_apply",reviewed)
@@ -134,9 +137,11 @@ def test_pair_apply_review_rechecks_full_budget_and_preserves_total_stage_deadli
     runner=SwedenRunner(d,o,base)
     result=az.provision(d,o,runner,clock=lambda:clock[0],
         utc_now=lambda:base+timedelta(seconds=clock[0]-1))
+    expected_review_request=20.0 if anchor=="cap" else 79.0
+    assert calls[0]==pytest.approx((expected_review_request,60,180))
+    assert budget_checks==["invoked"]
     if anchor is None:
         assert result.deployment is not None,(result.failures,calls,[q.action_type for q in runner.requests])
-        assert calls[0]==pytest.approx((79.0,60,180))
         assert calls[1]==pytest.approx((134.0,))
         assert any(q.action_type=="pair_apply" for q in runner.requests)
     else:
