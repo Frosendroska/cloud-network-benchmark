@@ -30,7 +30,7 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {
     "europe-west3": ("europe-west3-a", "europe-west3-b"),
     "europe-west2": ("europe-west2-a",),
-    "europe-north1": ("europe-north1-a",),
+    "europe-north1": ("europe-north1-c",),
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
@@ -432,13 +432,19 @@ class GcpProviderDriver:
     def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
-        northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
-                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
-        if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
-                            and deployment.experiment_id == "EXP-902"):
-            raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
+        northern = (deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
+                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-c"
+                    and deployment.scenario in {"same_zone", "placement_optimization"})
+        northern_research = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
+                    and deployment.mode in {"short_study", "calibration", "diagnostic_day"} and deployment.context == "standard")
+        northern_acceptance = (northern and deployment.mode == "acceptance"
+                    and ((deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-902" and deployment.context == "failure_check")
+                         or (deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
+                         or (deployment.scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
+        if northern and not (northern_research or northern_acceptance):
+            raise GcpProviderError("Finland locality is outside the registered S1/S3 research or acceptance scope", category="scenario_unsupported")
         if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
-            raise GcpProviderError("only the selected Frankfurt/London topology or Finland same-zone pair is supported", category="scenario_unsupported")
+            raise GcpProviderError("only the selected baseline topology or Finland same-zone S1/S3 pair is supported", category="scenario_unsupported")
         if deployment.vm_a.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"} or deployment.vm_b.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"}:
             raise GcpProviderError("GCP roles must use selected n2-standard-4 shape", category="shape_unsupported")
         if deployment.vm_a.role != "vm_a" or deployment.vm_b.role != "vm_b" or deployment.vm_a.function != "client_traffic_generator" or deployment.vm_b.function != "server_receiver":
@@ -900,7 +906,7 @@ class GcpProviderDriver:
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
         if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
-        if args and args[0] == "compute" and len(args) > 1 and args[1] == "instances" and args[2:3] == ["list"] or args and args[0] == "compute" and len(args) > 2 and args[2] == "list":
+        if args[:1] == ["compute"] and "list" in args and "--format=json" in args:
             if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
         try:
@@ -1034,12 +1040,15 @@ class GcpProviderDriver:
         # --regions on addresses is not a supported complete-list query and can
         # produce warnings even for empty output. Never suppress such warnings.
         collections = (
-            ("addresses", "addresses", addresses), ("subnetworks", "subnet", support),
-            ("instance-templates", "instance_templates", support), ("networks", "networks", support),
-            ("firewall-rules", "firewalls", support), ("routes", "routes", support),
-            ("resource-policies", "policy", support))
-        for command, action, target in collections:
-            result = self._gcloud_json(["compute", command, "list", "--project", self.settings.project_id, "--format=json"],
+            ("addresses", "addresses", ["compute", "addresses", "list"], addresses),
+            ("subnetworks", "subnet", ["compute", "networks", "subnets", "list"], support),
+            ("instance-templates", "instance_templates", ["compute", "instance-templates", "list"], support),
+            ("networks", "networks", ["compute", "networks", "list"], support),
+            ("firewall-rules", "firewalls", ["compute", "firewall-rules", "list"], support),
+            ("routes", "routes", ["compute", "routes", "list"], support),
+            ("resource-policies", "policy", ["compute", "resource-policies", "list"], support))
+        for command, action, argv, target in collections:
+            result = self._gcloud_json([*argv, "--project", self.settings.project_id, "--format=json"],
                 f"gcp-{action}-inventory-all-scopes")
             if not isinstance(result, list):
                 raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")

@@ -86,7 +86,7 @@ def _northern_acceptance(repository_root: Path, provider: str, region: str, zone
 
 @pytest.mark.parametrize(
     ("provider", "region", "zone"),
-    [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a"), ("azure", "swedencentral", "1")],
+    [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-c"), ("azure", "swedencentral", "1")],
 )
 def test_northern_locality_is_accepted_for_named_same_zone_checks(
     repository_root: Path, provider: str, region: str, zone: str,
@@ -104,7 +104,7 @@ def test_northern_locality_is_accepted_for_named_same_zone_checks(
     ("provider", "region", "zone", "wrong_zone", "wrong_experiment"),
     [
         ("aws", "eu-north-1", "eu-north-1a", "eu-north-1b", "EXP-999"),
-        ("gcp", "europe-north1", "europe-north1-a", "europe-north1-b", "EXP-999"),
+        ("gcp", "europe-north1", "europe-north1-c", "europe-north1-b", "EXP-999"),
         ("azure", "swedencentral", "1", "2", "EXP-999"),
     ],
 )
@@ -132,7 +132,7 @@ def test_northern_locality_rejects_wrong_zone_identity_and_network(
     ("provider", "region", "zone", "unknown_region", "unknown_zone"),
     [
         ("aws", "eu-north-1", "eu-north-1a", "eu-future-1", "eu-future-1a"),
-        ("gcp", "europe-north1", "europe-north1-a", "europe-future1", "europe-future1-a"),
+        ("gcp", "europe-north1", "europe-north1-c", "europe-future1", "europe-future1-a"),
         ("azure", "swedencentral", "1", "futurecentral", "1"),
     ],
 )
@@ -158,16 +158,30 @@ def test_unknown_region_is_a_structured_validation_error(
     assert any(f"unsupported {provider} region: {unknown_region}" in issue["message"] for issue in error["details"]["issues"])
 
 
-@pytest.mark.parametrize(("provider", "region", "zone"), [("aws", "eu-north-1", "eu-north-1a"), ("gcp", "europe-north1", "europe-north1-a"), ("azure", "swedencentral", "1")])
-def test_northern_locality_does_not_extend_research_study(
-    repository_root: Path, provider: str, region: str, zone: str,
-) -> None:
-    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text(encoding="utf-8"))
-    item = data["provider_configs"][provider]
-    old_region = item["regions"]["vm_a"]
-    item["regions"] = {"vm_a": region, "vm_b": region}
-    item["zones"] = {"vm_a": zone, "vm_b": zone}
-    item["network"]["address_spaces"] = {region: item["network"]["address_spaces"][old_region]}
-    item["network"]["subnets"] = {region: item["network"]["subnets"][old_region]}
-    with pytest.raises(ValueError, match="regions/zones do not match"):
+@pytest.mark.parametrize("filename", [
+    "exp-001-multi-provider.yaml", "exp-001-calibration.yaml",
+    "exp-001-diagnostic-day.yaml", "exp-003-placement-optimization.yaml",
+])
+def test_northern_research_configs_resolve_through_normal_entrypoint(repository_root: Path, filename: str) -> None:
+    config, _source, _provenance, _role = load_campaign(repository_root / "configs/experiments" / filename, repository_root)
+    assert {config.provider_configs[p].regions.vm_a for p in config.selected_providers} == {
+        "eu-north-1", "swedencentral", "europe-north1"
+    }
+    assert {config.provider_configs[p].regions.vm_b for p in config.selected_providers} == {
+        "eu-north-1", "swedencentral", "europe-north1"
+    }
+    if config.scenario == "placement_optimization":
+        assert config.provider_configs["gcp"].placement.collocated is True
+        assert config.provider_configs["gcp"].placement.max_distance is None
+
+
+def test_northern_research_rejects_unregistered_scenario_and_zone(repository_root: Path) -> None:
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["scenario"] = "cross_zone"
+    data["provider_configs"]["aws"]["zones"] = {"vm_a": "eu-north-1a", "vm_b": "eu-north-1b"}
+    with pytest.raises(ValueError):
+        CampaignConfiguration.model_validate(data)
+    data = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
+    data["provider_configs"]["gcp"]["zones"] = {"vm_a": "europe-north1-a", "vm_b": "europe-north1-a"}
+    with pytest.raises(ValueError):
         CampaignConfiguration.model_validate(data)

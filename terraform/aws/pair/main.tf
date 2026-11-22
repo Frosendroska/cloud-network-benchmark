@@ -33,8 +33,8 @@ resource "terraform_data" "account_guard" {
     }
     precondition {
       condition = (var.primary_region == "eu-central-1" && var.primary_zone == "eu-central-1a" ||
-      var.scenario == "same_zone" && var.primary_region == "eu-north-1" && var.primary_zone == "eu-north-1a")
-      error_message = "Stockholm is admitted only for the reviewed same-zone eu-north-1a pair."
+      var.scenario in ["same_zone", "placement_optimization"] && var.primary_region == "eu-north-1" && var.primary_zone == "eu-north-1a")
+      error_message = "Stockholm supports only the selected eu-north-1a S1/S3 pair."
     }
   }
 }

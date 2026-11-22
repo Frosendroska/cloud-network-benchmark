@@ -585,6 +585,7 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
     completed = {
         "registration": (),
         "preparation": ("registration",),
+        "post_provision": ("registration", "provision"),
         "measurement": ("registration", "preparation"),
         "retrieval": ("registration", "preparation", "measurement"),
     }
@@ -593,6 +594,7 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
     fields = {
         "registration": (),
         "preparation": ("registration_seconds",),
+        "post_provision": ("registration_seconds", "provision_seconds"),
         "measurement": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"),
         "retrieval": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
                       "measurement_seconds", "measurement_shutdown_seconds"),

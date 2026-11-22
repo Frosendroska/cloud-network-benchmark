@@ -93,8 +93,7 @@ class CleanupClock:
 def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     deployment = saved.deployment
     if saved.provider == Provider.AWS:
-        from .providers import aws
-        settings = __import__("cloud_network_benchmark.providers.aws", fromlist=["AwsRuntimeSettings"]).AwsRuntimeSettings.model_validate(saved.settings)
+        settings = _aws_cleanup_settings(saved.settings)
         return settings.private_state_root / saved.expiry_request.resource_namespace / deployment.run_id / deployment.deployment_id / "attempt.json"
     if saved.provider == Provider.GCP:
         settings = __import__("cloud_network_benchmark.providers.gcp", fromlist=["GcpRuntimeSettings"]).GcpRuntimeSettings.model_validate(saved.settings)
@@ -105,14 +104,33 @@ def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     return options.attempt_root / "recovery.json"
 
 
+def _aws_cleanup_settings(value: dict[str, Any]):
+    """Validate saved AWS settings, adapting only the retired cleanup snapshot shape."""
+    from .providers.aws import AwsRuntimeSettings
+
+    settings = dict(value)
+    phase_fields = {"post_registration_workflow_seconds", "post_provision_workflow_seconds"}
+    missing = phase_fields - settings.keys()
+    if missing:
+        if missing != phase_fields:
+            raise ValueError("historical AWS cleanup settings omit only part of the phase allowance snapshot")
+        remaining = settings.get("complete_workflow_remaining_seconds")
+        if isinstance(remaining, bool) or not isinstance(remaining, int) or remaining <= 0:
+            raise ValueError("historical AWS cleanup settings lack their original complete-workflow remainder")
+        # These launch-only values are deliberately equal: the strict registration
+        # invariant rejects the adapted model if anyone accidentally reuses it to launch.
+        settings.update({key: remaining for key in phase_fields})
+    return AwsRuntimeSettings.model_validate(settings)
+
+
 def _validate_request(saved: SavedProviderCleanupSettings) -> None:
     d, r, reservation = saved.deployment, saved.expiry_request, saved.reservation
     from datetime import timedelta
     if r.expires_at.value != reservation.expires_at.value - timedelta(seconds=saved.provider_lead_seconds):
         raise ValueError("saved provider expiry request no longer matches its original F11 lead")
     if saved.provider == Provider.AWS:
-        from .providers.aws import AwsProviderDriver, AwsRuntimeSettings, SAFETY_LEAD_SECONDS
-        settings = AwsRuntimeSettings.model_validate(saved.settings)
+        from .providers.aws import AwsProviderDriver, SAFETY_LEAD_SECONDS
+        settings = _aws_cleanup_settings(saved.settings)
         driver = AwsProviderDriver.__new__(AwsProviderDriver); driver.settings = settings
         from .providers.aws import _namespace, _legacy_namespace
         expected_namespaces = {_namespace(d), _legacy_namespace(d)}
@@ -157,7 +175,7 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
         if not Path(record.journal_reference).is_file() or Path(record.journal_reference).is_symlink():
             raise ValueError("original AWS recovery journal is unavailable")
         from .providers.aws import AwsProviderDriver, AwsRuntimeSettings
-        result = AwsProviderDriver(runner, AwsRuntimeSettings.model_validate(saved.settings),
+        result = AwsProviderDriver(runner, _aws_cleanup_settings(saved.settings),
             clock=utc_now).cleanup(d)
         journal = Path(record.journal_reference)
         absent_ids = _known_resource_ids(journal)
