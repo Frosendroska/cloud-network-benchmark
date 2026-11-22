@@ -31,8 +31,8 @@ def _archive_status_projection(result: Any) -> dict[str, Any]:
     return {key: status[key] for key in sorted(keys & status.keys())}
 
 
-def _verified_replay_entry_id(*, capsule_path: Path, capsule_sha256: str,
-                              observer: dict[str, Any], repository_root: Path) -> str:
+def _verified_replay_entry(*, capsule_path: Path, capsule_sha256: str,
+                           observer: dict[str, Any], repository_root: Path) -> tuple[str, Path]:
     """Bind replay export reuse to this runtime's registered archive-pending entry."""
     capsule_path = Path(capsule_path)
     if capsule_path.is_symlink() or not capsule_path.is_file():
@@ -53,6 +53,11 @@ def _verified_replay_entry_id(*, capsule_path: Path, capsule_sha256: str,
             or stage.get("stage_id") != journal.get("stage_id")
             or Path(stage.get("repository_root", "")).resolve(strict=True) != repository_root.resolve(strict=True)):
         raise ValueError("registered stage identity or repository root differs from replay runtime")
+    results_root = Path(stage.get("results_root", ""))
+    if (not results_root.is_absolute() or results_root.is_symlink() or not results_root.is_dir()
+            or results_root.resolve(strict=True) != results_root.absolute()):
+        raise ValueError("registered stage results root must be an existing real directory")
+    results_root = results_root.resolve(strict=True)
     entry_id = observer.get("entry_id")
     entries = [row for row in stage.get("entries", [])
         if isinstance(row, dict) and row.get("entry_id") == entry_id]
@@ -79,7 +84,18 @@ def _verified_replay_entry_id(*, capsule_path: Path, capsule_sha256: str,
             or replay_ref.get("sha256") != capsule_sha256
             or Path(replay_ref.get("path", "")).resolve(strict=True) != capsule_path.resolve(strict=True)):
         raise ValueError("campaign journal does not bind this capsule to a closed archive-pending entry")
-    return entry_id
+    result_paths = capsule.get("result_paths")
+    if not isinstance(result_paths, dict) or set(result_paths) != set(capsule_runs):
+        raise ValueError("replay capsule result roots do not match its registered provider set")
+    for relative in result_paths.values():
+        if not isinstance(relative, str):
+            raise ValueError("replay capsule has an invalid result path")
+        result_path = (repository_root / relative).resolve(strict=True)
+        try:
+            result_path.relative_to(results_root)
+        except ValueError as exc:
+            raise ValueError("replay capsule result path is outside the registered stage results root") from exc
+    return entry_id, results_root
 
 
 def _read_replay_quota_evidence(path: Path, expected_sha256: str) -> dict[str, Any]:
@@ -379,11 +395,14 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 observer = runtime.get("observer")
                 if not isinstance(observer, dict):
                     raise ValueError("opt-in replay pruning requires the registered observer entry identity")
-                entry_id = _verified_replay_entry_id(capsule_path=args.capsule,
+                entry_id, results_root = _verified_replay_entry(capsule_path=args.capsule,
                     capsule_sha256=args.capsule_sha256, observer=observer,
                     repository_root=Path.cwd())
+                if quota["reserve_bytes"] < int(sink["minimum_controller_free_bytes"]):
+                    raise ValueError("fresh quota reserve is below the frozen runtime controller minimum")
                 replay_options = {"prune_verified_scratch": True,
                     "closed_export_entry_id": entry_id,
+                    "closed_export_results_root": results_root,
                     "controller_quota_free_bytes": quota["measured_free_bytes"],
                     "controller_quota_evidence_path": args.quota_evidence,
                     "controller_quota_evidence_sha256": args.quota_evidence_sha256,

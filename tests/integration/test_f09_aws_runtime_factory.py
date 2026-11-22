@@ -961,6 +961,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             "measured_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
         quota_args = {"prune_verified_scratch": True,
             "closed_export_entry_id": registered_entry_id,
+            "closed_export_results_root": repository_root / "results",
             "controller_quota_free_bytes": free_bytes,
             "controller_quota_evidence_path": quota_path,
             "controller_quota_evidence_sha256": hashlib.sha256(quota_path.read_bytes()).hexdigest(),

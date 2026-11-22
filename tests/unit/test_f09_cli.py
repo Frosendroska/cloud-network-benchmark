@@ -124,10 +124,13 @@ def _replay_cli_context(tmp_path, *, archives=None):
     manifests.mkdir(parents=True)
     parent_path = manifests / "parent.json"
     parent_path.write_text(json.dumps({"campaign_id": "generated-campaign-91"}), encoding="utf-8")
+    results_root = repository / "private-results" / "P0"
+    (results_root / "raw" / "run-aws-91").mkdir(parents=True)
     capsule_path = tmp_path / "capsule.json"
     capsule = {"schema_version": 2, "status": "archive_pending_replay",
         "parent_path": "results/manifests/parent.json",
         "parent_manifest": {"campaign_id": "generated-campaign-91"},
+        "result_paths": {"aws": "private-results/P0/raw/run-aws-91"},
         "child_manifests": {"aws": {"run_id": "run-aws-91"}},
         "archives": archives or {"aws": {"manifest": {}}}}
     capsule_path.write_text(json.dumps(capsule, sort_keys=True), encoding="utf-8")
@@ -135,7 +138,8 @@ def _replay_cli_context(tmp_path, *, archives=None):
     private = tmp_path / "private"
     private.mkdir()
     stage_path, journal_path = private / "prepared-stage.json", private / "journal.json"
-    stage = {"stage_id": "P0", "repository_root": str(repository), "entries": [{
+    stage = {"stage_id": "P0", "repository_root": str(repository),
+        "results_root": str(results_root), "entries": [{
         "entry_id": "V-S1", "parent_manifest_path": str(parent_path),
         "run_ids": {"aws": "run-aws-91"}}]}
     stage_path.write_text(json.dumps(stage), encoding="utf-8")
@@ -154,7 +158,7 @@ def _replay_cli_context(tmp_path, *, archives=None):
             "journal_path": journal_path}}
     return {"repository": repository, "runtime_path": runtime_path, "runtime": runtime,
         "capsule_path": capsule_path, "capsule_sha256": capsule_sha256,
-        "restore_path": restore, "staging": staging}
+        "restore_path": restore, "staging": staging, "results_root": results_root}
 
 
 def _replay_cli_args(context, *extra):
@@ -207,11 +211,31 @@ def test_replay_cli_opt_in_binds_registered_entry_and_explicit_quota_receipt(
     assert code == 0
     assert called["prune_verified_scratch"] is True
     assert called["closed_export_entry_id"] == "V-S1"
+    assert called["closed_export_results_root"] == context["results_root"]
     assert called["closed_export_entry_id"] != "generated-campaign-91"
     assert called["controller_quota_free_bytes"] == quota["measured_free_bytes"]
     assert called["metadata_headroom_bytes"] == quota["metadata_headroom_bytes"]
     assert called["projected_other_growth_bytes"] == quota["projected_other_growth_bytes"]
     assert called["minimum_free_bytes"] == quota["reserve_bytes"]
+
+
+def test_replay_cli_rejects_reserve_below_frozen_runtime_minimum_before_backend(
+        tmp_path, monkeypatch, capsys):
+    from cloud_network_benchmark import gcs_archive, lifecycle_cli
+    context = _replay_cli_context(tmp_path)
+    quota_path = tmp_path / "low-reserve.json"
+    quota = {"measured_free_bytes": 50_000, "measured_at": datetime.now(timezone.utc).isoformat(),
+        "metadata_headroom_bytes": 4096, "projected_other_growth_bytes": 8192, "reserve_bytes": 1}
+    quota_path.write_text(json.dumps(quota), encoding="utf-8")
+    quota_sha256 = hashlib.sha256(quota_path.read_bytes()).hexdigest()
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail("under-floor reserve must be rejected before backend creation"))
+    code = main(_replay_cli_args(context, "--prune-verified-scratch", "--quota-evidence",
+        str(quota_path), "--quota-evidence-sha256", quota_sha256))
+    error = json.loads(capsys.readouterr().err)
+    assert code == 2 and "below the frozen runtime controller minimum" in error["error"]
 
 
 def test_replay_cli_rejects_missing_fresh_quota_before_backend(tmp_path, monkeypatch, capsys):
@@ -252,7 +276,7 @@ def test_replay_cli_rejects_stale_or_underquota_evidence_before_backend(
     quota = {"measured_free_bytes": 1000, "measured_at": "2020-01-01T00:00:00+00:00"
             if freshness == "stale" else datetime.now(timezone.utc).isoformat(),
         "metadata_headroom_bytes": 100, "projected_other_growth_bytes": 100,
-        "reserve_bytes": 100}
+            "reserve_bytes": 512}
     quota_path.write_text(json.dumps(quota), encoding="utf-8")
     quota_sha256 = hashlib.sha256(quota_path.read_bytes()).hexdigest()
     monkeypatch.chdir(context["repository"])

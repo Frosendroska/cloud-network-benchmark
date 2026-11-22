@@ -511,6 +511,7 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
         repository_root: Path, maximum_part_bytes: int, minimum_free_bytes: int = 0,
         evaluated_at: datetime | None = None, prune_verified_scratch: bool = False,
         backend_factory: Any | None = None, closed_export_entry_id: str | None = None,
+        closed_export_results_root: Path | None = None,
         controller_quota_free_bytes: int | None = None,
         controller_quota_evidence_path: Path | None = None,
         controller_quota_evidence_sha256: str | None = None,
@@ -556,6 +557,12 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
         if (not isinstance(closed_export_entry_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", closed_export_entry_id)):
             raise ValueError("opt-in replay pruning requires the registered closed-export entry id")
+        if closed_export_results_root is None:
+            raise ValueError("opt-in replay pruning requires the verified stage results root")
+        closed_export_results_root = Path(closed_export_results_root)
+        if (closed_export_results_root.is_symlink() or not closed_export_results_root.is_dir()
+                or closed_export_results_root.resolve(strict=True) != closed_export_results_root.absolute()):
+            raise ValueError("verified stage results root must be an existing real directory")
         _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
             evidence_path=Path(controller_quota_evidence_path),
             evidence_sha256=controller_quota_evidence_sha256,
@@ -717,13 +724,14 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     if prune_verified_scratch:
         # The CLI verifies this registered entry id against its private prepared
         # stage and archive-pending journal before this API receives it.
-        export_root = repository_root / "results" / "closed" / str(closed_export_entry_id) / "export"
+        export_root = closed_export_results_root / "closed" / str(closed_export_entry_id) / "export"
     else:
         export_root = repository_root / "results" / "analysis" / "archive-replays" / str(campaign_id)
     entry = {"entry_id": str(campaign_id),
         "run_ids": {provider: child.run_id for provider, child in children.items()},
         "parent_manifest_path": str(parent_path)}
-    selection = export_entry({"results_root": str(repository_root / "results"),
+    selection_results_root = closed_export_results_root if prune_verified_scratch else repository_root / "results"
+    selection = export_entry({"results_root": str(selection_results_root),
         "repository_root": str(repository_root), "stage_id": "archive-replay", "entries": []},
         entry, export_root)
     if selection is None:

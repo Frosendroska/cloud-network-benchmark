@@ -42,10 +42,12 @@ links. A failed preflight removes nothing. Canonical native results, exports,
 manifests, replay receipts, runtime context, and verified remote archive objects
 remain in place.
 
-The replay export is written to `results/closed/<registered-entry-id>/export`
-only for this opt-in path. The CLI derives the entry id from the private runtime
+The replay export is written to
+`<stage-results-root>/closed/<registered-entry-id>/export` only for this opt-in
+path. The CLI derives the entry id and results root from the private runtime
 and confirms it against the prepared stage, campaign journal, parent manifest,
-run ids, and exact replay capsule. Reconciliation then verifies and reuses that
-export directory instead of making another raw copy. The default path is the
+run ids, and exact replay capsule. The fresh quota reserve must meet the frozen
+runtime controller minimum. Reconciliation then verifies and reuses that export
+directory instead of making another raw copy. The default path is the
 existing `results/analysis/archive-replays/<campaign-id>` location and keeps all
 scratch data.
