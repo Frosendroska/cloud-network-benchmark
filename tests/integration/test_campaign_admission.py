@@ -81,6 +81,9 @@ def operator_settings(tmp_path, root, monkeypatch):
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
     settings["approvals"]["weekly_concurrency"] = {"confirmed": True, "source": str(source),
         "fields": {"mode": "paired_s1_s3", "max_parallel_entries": 2}}
+    settings["approvals"]["paired_acceptance"] = {"confirmed": True, "source": str(source),
+        "fields": {"mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
+            "start_utc": f"{tomorrow}T06:00:00+00:00"}}
     for stage, measurement in (("acceptance", 76), ("week", 226), ("calibration", 1180)):
         settings["stage_inputs"][stage] = {"first_day_utc": tomorrow,
             "start_utc": f"{tomorrow}T06:00:00+00:00",
@@ -317,10 +320,16 @@ def test_operator_confirmations_generate_bound_acceptance_review_without_asserti
             continue
         attempt = json.loads(Path(entry["parent_manifest_path"]).read_text())["campaign_id"]
         row = {}
-        for action in ("server_failure", "controller_loss", "expiry", "cleanup"):
+        for action in ("server_failure", "expiry", "cleanup"):
             evidence = tmp_path / f"{entry['entry_id']}-{action}-observed.txt"
             evidence.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: {action}")
             row[action] = {"confirmed": True, "source": str(evidence)}
+        recovery = tmp_path / f"{entry['entry_id']}-ordinary-recovery-observed.txt"
+        recovery.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: ordinary recovery")
+        waiver = tmp_path / f"{entry['entry_id']}-physical-loss-waiver.txt"
+        waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: physical Halle loss is waived by the current decision")
+        row["ordinary_recovery"] = {"confirmed": True, "source": str(recovery)}
+        row["controller_loss"] = {"waived": True, "reason": "Physical Halle loss is explicitly waived.", "source": str(waiver)}
         declarations[entry["entry_id"]] = row
     settings["stage_inputs"]["acceptance"]["failure_checks"] = declarations
     prepared = Path(stage["state_root"]) / stage["stage_id"] / "prepared.json"
@@ -341,3 +350,62 @@ def test_operator_confirmations_generate_bound_acceptance_review_without_asserti
     # completed native acceptance, even with operator failure confirmations.
     with pytest.raises(ValueError, match="completed|success"):
         _validate_paid_acceptance_evidence(evidence, plan.resolved_campaign)
+
+
+def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_attempt(repository_root, tmp_path,
+        monkeypatch, request):
+    import cloud_network_benchmark.campaign_inputs as inputs
+    from cloud_network_benchmark.acceptance_review import _runtime_scope_sha256
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+    declarations = {}
+    for entry in stage["entries"]:
+        if not entry["entry_id"].endswith("FAIL"):
+            continue
+        attempt = json.loads(Path(entry["parent_manifest_path"]).read_text())["campaign_id"]
+        row = {}
+        for action in ("server_failure", "expiry", "cleanup"):
+            source = tmp_path / f"{entry['entry_id']}-{action}.txt"
+            source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: {action}")
+            row[action] = {"confirmed": True, "source": str(source)}
+        recovery = tmp_path / f"{entry['entry_id']}-recovery.txt"
+        recovery.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: ordinary recovery")
+        waiver = tmp_path / f"{entry['entry_id']}-waiver.txt"
+        waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: explicit physical loss waiver")
+        row["ordinary_recovery"] = {"confirmed": True, "source": str(recovery)}
+        row["controller_loss"] = {"waived": True, "reason": "Physical loss is waived.", "source": str(waiver)}
+        declarations[entry["entry_id"]] = row
+
+    reused_entry = next(entry for entry in stage["entries"] if entry["entry_id"] == "V-A-FAIL")
+    parent = json.loads(Path(reused_entry["parent_manifest_path"]).read_text())
+    config_path = Path(reused_entry["config_path"])
+    runtime_path = Path(reused_entry["runtime_config_path"])
+    identity = {"config_path": str(config_path), "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "source_config_sha256": reused_entry["source_config_sha256"], "runtime_config_path": str(runtime_path),
+        "runtime_config_sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+        "runtime_scope_sha256": _runtime_scope_sha256(runtime_path),
+        "implementation_git_commit": parent.get("implementation_git_commit")}
+    check = {"provider": "aws", "attempt_id": parent["campaign_id"], "config_identity": identity}
+    for action in ("server_failure", "expiry", "cleanup", "ordinary_recovery"):
+        source = tmp_path / f"reuse-{action}.txt"
+        source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {parent['campaign_id']}: {action}")
+        check[action] = {"status": "passed", "source_path": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    waiver = tmp_path / "reuse-waiver.txt"
+    waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: physical loss is waived")
+    check["controller_loss"] = {"status": "waived", "reason": "Physical loss is waived.",
+        "source_path": str(waiver), "source_sha256": hashlib.sha256(waiver.read_bytes()).hexdigest()}
+    old = tmp_path / "completed-registered-check.yaml"
+    old.write_text(yaml.safe_dump({"schema_version": 1, "checks": {"V-A-FAIL": check}}))
+    declarations["V-A-FAIL"] = {"reuse": {"source": str(old), "sha256": hashlib.sha256(old.read_bytes()).hexdigest()}}
+    settings["stage_inputs"]["acceptance"]["failure_checks"] = declarations
+    _, review = inputs._review_from_prepared(settings, stage)
+    assert review["checks"]["V-A-FAIL"]["attempt_id"] == parent["campaign_id"]
+    assert review["checks"]["V-A-FAIL"]["config_identity"] == identity
+    check["config_identity"]["runtime_config_sha256"] = "0" * 64
+    old.write_text(yaml.safe_dump({"schema_version": 1, "checks": {"V-A-FAIL": check}}))
+    settings["stage_inputs"]["acceptance"]["failure_checks"]["V-A-FAIL"]["reuse"]["sha256"] = hashlib.sha256(old.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="identity changed|exact prepared config/runtime"):
+        inputs._review_from_prepared(settings, stage)

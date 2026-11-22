@@ -149,7 +149,7 @@ def _gate_rows(settings, stage):
     required = {"f10_offline", "paid_authorization", "quota_review"}
     if stage != "acceptance":
         required.add("paid_acceptance")
-    required |= {"acceptance": set(), "calibration": {"calibration_authorized"},
+    required |= {"acceptance": {"paired_acceptance"}, "calibration": {"calibration_authorized"},
                  "day": {"common_n", "diagnostic_day_authorized", "size_export_review"},
                  "week": {"common_n", "study_window", "weekly_concurrency", "size_export_review"}}[stage]
     for key in sorted(required):
@@ -160,6 +160,21 @@ def _gate_rows(settings, stage):
         if not isinstance(row.get("fields", {}), dict):
             raise ValueError(f"approvals.{key}.fields must be a map")
     return {key: declarations[key] for key in required}
+
+
+def _acceptance_dispatch_policy(settings, approval_refs):
+    declaration = {**settings.get("approvals", {}),
+                   **settings.get("stage_inputs", {}).get("acceptance", {}).get("approvals", {})}["paired_acceptance"]
+    fields = declaration.get("fields", {})
+    start_utc = _utc(settings.get("stage_inputs", {}).get("acceptance", {}).get("start_utc"),
+        "stage_inputs.acceptance.start_utc").isoformat()
+    if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+            or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc").isoformat() != start_utc):
+        raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
+    evidence_path = _path(approval_refs["paired_acceptance"], "paired_acceptance evidence", file=True)
+    return {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
+        "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_utc": start_utc,
+        "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
 
 
 def _weekly_dispatch_policy(settings, approval_refs):
@@ -258,6 +273,14 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         gates = _gate_rows(settings, stage)
         if stage == "week":
             _validate_weekly_concurrency(gates["weekly_concurrency"])
+        elif stage == "acceptance":
+            declaration = gates.get("paired_acceptance")
+            if declaration is not None and "acceptance" in settings.get("stage_inputs", {}):
+                fields = declaration.get("fields", {})
+                start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
+                if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+                        or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
+                    raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
         _cost_payload(settings, root)
         if stage in {"day", "week"}:
             _common_n(settings)
@@ -270,6 +293,8 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 _utc(f"{start}T{time}+00:00", f"windows_utc.{window}")
         elif stage != "acceptance":
             _utc(settings["stage_inputs"][stage].get("start_utc"), f"stage_inputs.{stage}.start_utc")
+        elif entries:
+            _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
         for _, alias in entries:
             path = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
             data = yaml.safe_load(path.read_text())
@@ -494,13 +519,64 @@ def _review_from_prepared(settings, prepared):
     for registered, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
         entry = entries[registered]
         parent = json.loads(_path(entry["parent_manifest_path"], "acceptance manifest", file=True).read_text())
-        checks[registered] = {"provider": provider, "attempt_id": parent["campaign_id"]}
-        for action in ("server_failure", "controller_loss", "expiry", "cleanup"):
-            observation = declarations.get(registered, {}).get(action, {})
+        declaration = declarations.get(registered, {})
+        reuse = declaration.get("reuse") if isinstance(declaration, dict) else None
+        if reuse is not None:
+            from .acceptance_review import _failure_review, _runtime_scope_sha256
+            if not isinstance(reuse, dict):
+                raise ValueError(f"failure_checks.{registered}.reuse must identify a source-bound completed check")
+            reuse_path = _path(reuse.get("source"), f"failure_checks.{registered}.reuse.source", file=True)
+            reuse_hash = reuse.get("sha256")
+            if not isinstance(reuse_hash, str) or _sha(reuse_path) != reuse_hash:
+                raise ValueError(f"failure_checks.{registered}.reuse source hash differs")
+            _failure_review({"path": str(reuse_path), "sha256": reuse_hash}, required_entries={registered})
+            reused_review = yaml.safe_load(reuse_path.read_text(encoding="utf-8"))
+            reused = reused_review["checks"][registered]
+            config_path = _path(entry["config_path"], f"{registered} config", file=True)
+            runtime_path = _path(entry["runtime_config_path"], f"{registered} runtime config", file=True)
+            identity = reused.get("config_identity", {})
+            if (identity.get("config_sha256") != _sha(config_path)
+                    or identity.get("source_config_sha256") != entry["source_config_sha256"]
+                    or identity.get("runtime_scope_sha256") != _runtime_scope_sha256(runtime_path)
+                    or identity.get("implementation_git_commit") != parent.get("implementation_git_commit")):
+                raise ValueError(f"reused {registered} failure evidence does not match the exact prepared config/runtime sources")
+            checks[registered] = reused
+            continue
+        config_path = _path(entry["config_path"], f"{registered} config", file=True)
+        runtime_path = _path(entry["runtime_config_path"], f"{registered} runtime config", file=True)
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        if Path(runtime.get("initialized_campaign_manifest", "")) != Path(entry["parent_manifest_path"]):
+            raise ValueError(f"{registered} runtime config does not belong to its prepared attempt")
+        from .acceptance_review import _runtime_scope_sha256
+        checks[registered] = {"provider": provider, "attempt_id": parent["campaign_id"],
+            "config_identity": {"config_path": str(config_path), "config_sha256": _sha(config_path),
+                "source_config_sha256": entry["source_config_sha256"],
+                "runtime_config_path": str(runtime_path), "runtime_config_sha256": _sha(runtime_path),
+                "runtime_scope_sha256": _runtime_scope_sha256(runtime_path),
+                "implementation_git_commit": parent.get("implementation_git_commit")}}
+        row = declaration
+        for action in ("server_failure", "expiry", "cleanup"):
+            observation = row.get(action, {})
             if observation.get("confirmed") is not True:
                 raise ValueError(f"record supervised acceptance.failure_checks.{registered}.{action} confirmation and actual source before research")
             source = _path(observation.get("source"), f"failure_checks.{registered}.{action}.source", file=True)
             checks[registered][action] = {"status": "passed", "source_path": str(source), "source_sha256": _sha(source)}
+        controller = row.get("controller_loss", {})
+        if controller.get("confirmed") is True:
+            source = _path(controller.get("source"), f"failure_checks.{registered}.controller_loss.source", file=True)
+            checks[registered]["controller_loss"] = {"status": "passed", "source_path": str(source), "source_sha256": _sha(source)}
+        elif controller.get("waived") is True and isinstance(controller.get("reason"), str) and controller["reason"].strip():
+            source = _path(controller.get("source"), f"failure_checks.{registered}.controller_loss.waiver_source", file=True)
+            recovery = row.get("ordinary_recovery", {})
+            if recovery.get("confirmed") is not True:
+                raise ValueError(f"physical controller-loss waiver for {registered} requires actual ordinary_recovery evidence")
+            recovery_source = _path(recovery.get("source"), f"failure_checks.{registered}.ordinary_recovery.source", file=True)
+            checks[registered]["controller_loss"] = {"status": "waived", "source_path": str(source),
+                "source_sha256": _sha(source), "reason": controller["reason"].strip()}
+            checks[registered]["ordinary_recovery"] = {"status": "passed", "source_path": str(recovery_source),
+                "source_sha256": _sha(recovery_source)}
+        else:
+            raise ValueError(f"record supervised acceptance.failure_checks.{registered}.controller_loss as passed or explicitly waived with a source")
     accepted = [entries[key] for key in ("V-S1", "V-S3")]
     review = {"schema_version": 1, "repository_root": prepared["repository_root"],
         "accepted_campaigns": [row["parent_manifest_path"] for row in accepted],
@@ -623,13 +699,15 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             prices_checked_on=cost_payload["prices_checked_on"],
             cost_input_sha256={"value": cost_payload["source_sha256"]},
             estimated_cost_usd={"value": float(estimated)})
-        data["scheduled_start"] = None
         config_path = generated / f"{entry_id.lower()}.yaml"
-        config_path.write_text(yaml.safe_dump(data, sort_keys=False))
-        source_configs[entry_id] = (config_path, data)
-        config_paths[data["config_id"]] = config_path
         providers = data["selected_providers"]
         allowance = _allowance(settings, stage, providers)
+        allowance_seconds = sum(allowance[key] for key in ("registration_seconds", "provision_seconds",
+            "readiness_seconds", "stabilization_seconds", "measurement_seconds",
+            "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"))
+        for provider in providers:
+            if allowance_seconds + allowance["provider_leads_seconds"][provider] > data["admission"]["lifetime_cap_seconds"]:
+                raise ValueError(f"{entry_id}: full setup, fixed-start wait, native phases, retrieval and cleanup do not fit {provider}'s original cap")
         prep = sum(allowance[k] for k in ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"))
         if stage == "week":
             parts = entry_id.split("-")
@@ -640,16 +718,23 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         elif stage != "acceptance":
             scheduled = _utc(inputs["start_utc"], f"{stage}.start_utc")
             window = "night"
+        elif entry_id in {"V-S1", "V-S3"}:
+            scheduled = _utc(inputs["start_utc"], "acceptance.start_utc")
+            window = "acceptance"
         else:
             scheduled = None
             window = None
+        data["scheduled_start"] = scheduled.isoformat() if scheduled else None
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        source_configs[entry_id] = (config_path, data)
+        config_paths[data["config_id"]] = config_path
         launch_at = scheduled - timedelta(seconds=prep) if scheduled else now
         if scheduled and launch_at <= now:
             raise ValueError(f"{entry_id}: setup lead time is already missed; explicitly review new timing, no backfill")
         end = (scheduled or now) + timedelta(seconds=allowance["measurement_seconds"] + allowance["measurement_shutdown_seconds"] + allowance["retrieval_seconds"] + allowance["cleanup_seconds"])
         if _utc(settings["credential_refresh"]["valid_through_utc"], "credential_refresh.valid_through_utc") < end:
             raise ValueError(f"credential_refresh evidence does not cover {entry_id} through cleanup")
-        if scheduled:
+        if scheduled and stage != "acceptance":
             schedule_rows.append([entry_id, data["config_id"], data["experiment_id"], scheduled.isoformat(), window, data["admission"]["priority"]])
         scenario = "S1" if alias in {"s1", "s1_acceptance"} else "S3" if alias in {"s3", "s3_acceptance"} else None
         entries.append({"entry_id": entry_id, "scenario": scenario,
@@ -664,7 +749,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         scheduled = entry["scheduled_start"]
         schedule_path = None
         selected_entry = None
-        if scheduled:
+        if scheduled and stage != "acceptance":
             row = next(row for row in schedule_rows if row[0] == entry["entry_id"])
             buffer = io.StringIO(newline="")
             writer = csv.writer(buffer)
@@ -718,7 +803,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         entry.update(schedule_path=str(schedule_path) if schedule_path else None,
             row_id=entry["entry_id"] if scheduled else None, runtime_config_path=str(runtime_path),
             cost_inputs_path=str(cost_path), parent_manifest_path=str(parent_path),
-            run_ids={str(child.provider): child.run_id for child in initialized.children})
+            run_ids={str(child.provider): child.run_id for child in initialized.children},
+            runtime_config_sha256=_sha(runtime_path))
     stage_data = {"stage_id": stage_id, "stage": stage, "controller_session_id": session,
         "ledger_path": str(ledger_path), "scope_id": ledger["scope_id"], "state_root": str(state_root),
         "results_root": str(result), "repository_root": str(root), "entries": entries,
@@ -731,5 +817,53 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
     if stage == "week":
         stage_data["dispatch_policy"] = _weekly_dispatch_policy(settings, approvals)
+    elif stage == "acceptance":
+        stage_data["dispatch_policy"] = _acceptance_dispatch_policy(settings, approvals)
+        normal = [entry for entry in entries if entry["entry_id"] in {"V-S1", "V-S3"}]
+        participants = [{"entry_id": entry["entry_id"], "provider": provider, "run_id": run_id}
+            for entry in normal for provider, run_id in sorted(entry["run_ids"].items())]
+        if len(participants) != 6:
+            raise ValueError("paired acceptance measurement barrier requires exactly six initialized normal children")
+        barrier = {"schema_version": 1, "barrier_id": f"{stage_id}-normal-measurement-terminal",
+            "expected_participants": participants,
+            "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-terminal")}
+        start_barrier = {"schema_version": 1, "barrier_id": f"{stage_id}-normal-measurement-start",
+            "expected_participants": participants,
+            "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start"),
+            "start_utc": _utc(inputs["start_utc"], "acceptance.start_utc").isoformat()}
+        stage_data["post_measurement_barrier"] = barrier
+        stage_data["measurement_start_barrier"] = start_barrier
+        for entry in normal:
+            runtime_path = Path(entry["runtime_config_path"])
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            runtime["post_measurement_barrier"] = barrier
+            runtime["measurement_start_barrier"] = start_barrier
+            atomic_write_json(runtime_path, runtime)
+            entry["runtime_config_sha256"] = _sha(runtime_path)
+        for entry in entries:
+            if not entry.get("requires_supervision"):
+                continue
+            declaration = settings.get("stage_inputs", {}).get("acceptance", {}).get("failure_checks", {}).get(entry["entry_id"], {})
+            reuse = declaration.get("reuse") if isinstance(declaration, dict) else None
+            if reuse is None:
+                continue
+            if not isinstance(reuse, dict):
+                raise ValueError(f"failure_checks.{entry['entry_id']}.reuse must identify a source-bound completed check")
+            from .acceptance_review import _failure_review, _runtime_scope_sha256
+            source = _path(reuse.get("source"), f"failure_checks.{entry['entry_id']}.reuse.source", file=True)
+            source_hash = reuse.get("sha256")
+            if not isinstance(source_hash, str) or _sha(source) != source_hash:
+                raise ValueError(f"failure_checks.{entry['entry_id']}.reuse source hash differs")
+            _failure_review({"path": str(source), "sha256": source_hash}, required_entries={entry["entry_id"]})
+            old = yaml.safe_load(source.read_text(encoding="utf-8"))["checks"][entry["entry_id"]]
+            identity = old.get("config_identity", {})
+            parent = json.loads(Path(entry["parent_manifest_path"]).read_text(encoding="utf-8"))
+            if (identity.get("config_sha256") != entry["config_sha256"]
+                    or identity.get("source_config_sha256") != entry["source_config_sha256"]
+                    or identity.get("runtime_scope_sha256") != _runtime_scope_sha256(entry["runtime_config_path"])
+                    or identity.get("implementation_git_commit") != parent.get("implementation_git_commit")):
+                raise ValueError(f"reused {entry['entry_id']} failure evidence does not match the exact prepared config/runtime sources")
+            entry["reused_failure_check"] = {"source_path": str(source), "source_sha256": source_hash,
+                "attempt_id": old["attempt_id"]}
     atomic_write_json(private / "prepared.json", stage_data)
     return stage_data

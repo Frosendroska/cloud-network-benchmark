@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +80,10 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("runtime configuration is not valid UTF-8 JSON") from exc
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
-    root = _keys(raw, root_keys | ({"archive_sink"} if isinstance(raw, dict) and "archive_sink" in raw else set()),
+    optional = ({"archive_sink"} if isinstance(raw, dict) and "archive_sink" in raw else set())
+    optional |= ({"post_measurement_barrier"} if isinstance(raw, dict) and "post_measurement_barrier" in raw else set())
+    optional |= ({"measurement_start_barrier"} if isinstance(raw, dict) and "measurement_start_barrier" in raw else set())
+    root = _keys(raw, root_keys | optional,
         "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
@@ -116,6 +120,58 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
             raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
         for field in ("archive_root", "staging_directory", "source_credentials_file"):
             sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
+    if "post_measurement_barrier" in root:
+        barrier = _keys(root["post_measurement_barrier"],
+            {"schema_version", "barrier_id", "barrier_root", "expected_participants"},
+            "post-measurement barrier")
+        participants = barrier["expected_participants"]
+        if (type(barrier["schema_version"]) is not int or barrier["schema_version"] != 1
+                or not isinstance(barrier["barrier_id"], str) or not barrier["barrier_id"]
+                or not isinstance(barrier["barrier_root"], str) or not Path(barrier["barrier_root"]).is_absolute()
+                or not isinstance(participants, list) or len(participants) != 6):
+            raise ValueError("post-measurement barrier must identify exactly six initialized acceptance children")
+        normalized = set()
+        for participant in participants:
+            row = _keys(participant, {"entry_id", "provider", "run_id"}, "barrier participant")
+            if (row["entry_id"] not in {"V-S1", "V-S3"} or row["provider"] not in {"aws", "azure", "gcp"}
+                    or not isinstance(row["run_id"], str) or not row["run_id"]):
+                raise ValueError("post-measurement barrier participant is outside the registered normal acceptance pair")
+            identity = (row["entry_id"], row["provider"], row["run_id"])
+            if identity in normalized:
+                raise ValueError("post-measurement barrier participants must be unique")
+            normalized.add(identity)
+        if ({(entry, provider) for entry, provider, _ in normalized}
+                != {(entry, provider) for entry in ("V-S1", "V-S3") for provider in ("aws", "azure", "gcp")}):
+            raise ValueError("post-measurement barrier must cover every provider child of both registered entries")
+    if "measurement_start_barrier" in root:
+        barrier = _keys(root["measurement_start_barrier"],
+            {"schema_version", "barrier_id", "barrier_root", "expected_participants", "start_utc"},
+            "measurement start barrier")
+        participants = barrier["expected_participants"]
+        try:
+            start = datetime.fromisoformat(str(barrier["start_utc"]).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("measurement start barrier needs its fixed reviewed UTC start") from exc
+        if (type(barrier["schema_version"]) is not int or barrier["schema_version"] != 1
+                or not isinstance(barrier["barrier_id"], str) or not barrier["barrier_id"]
+                or not isinstance(barrier["barrier_root"], str) or not Path(barrier["barrier_root"]).is_absolute()
+                or start.tzinfo is None or start.utcoffset() is None or start.utcoffset().total_seconds() != 0
+                or not isinstance(participants, list) or len(participants) != 6):
+            raise ValueError("measurement start barrier must bind six children to one fixed UTC start")
+        identities = set()
+        pairs = set()
+        for participant in participants:
+            row = _keys(participant, {"entry_id", "provider", "run_id"}, "measurement start participant")
+            if (row["entry_id"] not in {"V-S1", "V-S3"} or row["provider"] not in {"aws", "azure", "gcp"}
+                    or not isinstance(row["run_id"], str) or not row["run_id"]):
+                raise ValueError("measurement start participant is outside the registered normal acceptance pair")
+            identity = (row["entry_id"], row["provider"], row["run_id"])
+            if identity in identities:
+                raise ValueError("measurement start barrier participants must be unique")
+            identities.add(identity)
+            pairs.add(identity[:2])
+        if pairs != {(entry, provider) for entry in ("V-S1", "V-S3") for provider in ("aws", "azure", "gcp")}:
+            raise ValueError("measurement start barrier must cover both registered entries in all three providers")
     allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
         "readiness_seconds", "stabilization_seconds", "measurement_seconds",
         "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds",
@@ -196,7 +252,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs must be a map of existing F11 gate names to evidence files")
     allowed_gates = {"f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n",
         "study_window", "calibration_authorized", "diagnostic_day_authorized", "size_export_review",
-        "optional_review", "original_failure", "weekly_concurrency"}
+            "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance"}
     if set(root["approval_refs"]) - allowed_gates:
         raise ValueError("approval_refs names an unknown F11 gate")
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")

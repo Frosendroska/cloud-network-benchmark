@@ -146,10 +146,44 @@ def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budge
     driver(clock, lambda *_: pytest.fail("completed observation relaunched")).run(stage)
 
 
-def test_acceptance_s1_s3_entries_remain_serial(tmp_path):
+def acceptance_stage_fixture(tmp_path):
     stage = stage_fixture(tmp_path, slots=1)
     stage["stage"] = "acceptance"
-    stage.pop("dispatch_policy")
+    pair = stage["entries"]
+    pair[0].update(entry_id="V-S1", scenario="S1", requires_supervision=False)
+    pair[1].update(entry_id="V-S3", scenario="S3", requires_supervision=False)
+    pair[0]["priority"], pair[1]["priority"] = "P0", "P1"
+    for entry_id in ("V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"):
+        pair.append({**pair[0], "entry_id": entry_id, "scenario": None,
+                     "requires_supervision": True, "private_root": str(tmp_path / entry_id),
+                     "run_ids": {p: f"{entry_id}-{p}" for p in ("aws", "azure", "gcp")}})
+    approval_source = tmp_path / "acceptance-concurrency-source.json"
+    approval_source.write_text('{"fixture":"SYNTHETIC OFFLINE TEST ONLY"}\n')
+    evidence = tmp_path / "acceptance-concurrency-evidence.json"
+    fixed_start = pair[0]["scheduled_start"]
+    evidence.write_text(json.dumps({"mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
+        "start_utc": fixed_start,
+        "source_path": str(approval_source),
+        "source_sha256": hashlib.sha256(approval_source.read_bytes()).hexdigest()}) + "\n")
+    stage["dispatch_policy"] = {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
+        "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_utc": fixed_start,
+        "evidence_path": str(evidence), "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}
+    stage["post_measurement_barrier"] = {"schema_version": 1,
+        "barrier_id": f"{stage['stage_id']}-normal-measurement-terminal",
+        "barrier_root": str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-terminal"),
+        "expected_participants": [
+            {"entry_id": entry["entry_id"], "provider": provider, "run_id": run_id}
+            for entry in pair[:2] for provider, run_id in entry["run_ids"].items()]}
+    stage["measurement_start_barrier"] = {"schema_version": 1,
+        "barrier_id": f"{stage['stage_id']}-normal-measurement-start",
+        "barrier_root": str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-start"),
+        "start_utc": pair[0]["scheduled_start"],
+        "expected_participants": stage["post_measurement_barrier"]["expected_participants"]}
+    return stage
+
+
+def test_acceptance_s1_s3_entries_run_as_one_bounded_parallel_slot(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
     active = 0
     peak = 0
     lock = threading.Lock()
@@ -165,7 +199,197 @@ def test_acceptance_s1_s3_entries_remain_serial(tmp_path):
         return {"status": "complete", "cleanup_open": False}
 
     driver(FakeClock(), launch).run(stage)
-    assert peak == 1
+    assert peak == 2
+    saved = journal(stage)
+    assert saved["entries"]["V-A-FAIL"]["state"] == "scheduled"
+    assert saved["entries"]["V-Z-FAIL"]["state"] == "scheduled"
+    assert saved["entries"]["V-G-FAIL"]["state"] == "scheduled"
+
+
+def test_acceptance_rejects_incomplete_pair_before_launch(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    stage["entries"].pop(1)
+    launched = []
+    with pytest.raises(ValueError, match="five registered"):
+        driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert launched == []
+
+
+def test_acceptance_rejects_changed_pair_admission_before_launch(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    Path(stage["dispatch_policy"]["evidence_path"]).write_text("{}\n")
+    launched = []
+    with pytest.raises(ValueError, match="evidence is missing or changed"):
+        driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert launched == []
+
+
+def test_acceptance_does_not_shift_fixed_start_after_aggregate_admission(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    launched = []
+    clock = FakeClock()
+
+    def pre_admit(_entries, _stage):
+        clock.current = datetime.fromisoformat(stage["measurement_start_barrier"]["start_utc"].replace("Z", "+00:00"))
+
+    result = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+        launch=lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"},
+        pre_admit=pre_admit, clock=clock, sleep=clock.sleep).run(stage)
+    assert launched == []
+    assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+
+
+def test_supervised_continue_reuses_exact_completed_failure_without_launch(tmp_path):
+    import yaml
+    from cloud_network_benchmark.acceptance_review import _runtime_scope_sha256
+
+    stage = acceptance_stage_fixture(tmp_path)
+    entry = next(row for row in stage["entries"] if row["entry_id"] == "V-A-FAIL")
+    entry["config_path"] = str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml")
+    entry["config_sha256"] = hashlib.sha256(Path(entry["config_path"]).read_bytes()).hexdigest()
+    entry["source_config_sha256"] = entry["config_sha256"]
+    runtime = tmp_path / "V-A-FAIL-runtime.json"
+    runtime.write_text('{"schema_version": 1, "ledger": {"scope_id": "reuse"}}\n')
+    entry["runtime_config_path"] = str(runtime)
+    entry["runtime_config_sha256"] = hashlib.sha256(runtime.read_bytes()).hexdigest()
+    parent = tmp_path / "V-A-FAIL-parent.json"
+    attempt = "synthetic-reused-aws-attempt"
+    commit = {"value": "a" * 40, "unavailable_reason": None}
+    parent.write_text(json.dumps({"campaign_id": attempt, "implementation_git_commit": commit}))
+    entry["parent_manifest_path"] = str(parent)
+    evidence = {}
+    for action in ("server_failure", "expiry", "cleanup", "ordinary_recovery"):
+        source = tmp_path / f"reused-{action}.txt"
+        source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: {action}\n")
+        evidence[action] = {"status": "passed", "source_path": str(source),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    waiver = tmp_path / "reused-waiver.txt"
+    waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: physical loss waived\n")
+    evidence["controller_loss"] = {"status": "waived", "reason": "Explicitly waived.",
+        "source_path": str(waiver), "source_sha256": hashlib.sha256(waiver.read_bytes()).hexdigest()}
+    evidence["config_identity"] = {"config_path": entry["config_path"], "config_sha256": entry["config_sha256"],
+        "source_config_sha256": entry["source_config_sha256"], "runtime_config_path": str(runtime),
+        "runtime_config_sha256": entry["runtime_config_sha256"],
+        "runtime_scope_sha256": _runtime_scope_sha256(runtime), "implementation_git_commit": commit}
+    review = tmp_path / "reused-failure-review.yaml"
+    review.write_text(yaml.safe_dump({"schema_version": 1,
+        "checks": {"V-A-FAIL": {"provider": "aws", "attempt_id": attempt, **evidence}}}))
+    entry["reused_failure_check"] = {"source_path": str(review),
+        "source_sha256": hashlib.sha256(review.read_bytes()).hexdigest(), "attempt_id": attempt}
+    folder = Path(stage["state_root"]) / stage["stage_id"]
+    folder.mkdir(parents=True, exist_ok=True)
+    prepared = folder / "prepared-stage.json"
+    prepared.write_text(json.dumps(stage))
+    engine = driver(FakeClock(), lambda *_: pytest.fail("reused failure attempted provider lifecycle"),
+        dispatch=lambda *_: pytest.fail("reused failure dispatched supervisor"))
+    journal_path = folder / "campaign-journal.json"
+    journal = engine._load_or_create_journal(stage, journal_path)
+    for entry_id in ("V-S1", "V-S3"):
+        journal["entries"][entry_id].update(state="complete", result={"cleanup_open": False})
+    journal_path.write_text(json.dumps(journal))
+    result = engine.continue_supervised(Path(stage["state_root"]), stage["stage_id"], "V-A-FAIL", confirmed=True)
+    assert result["status"] == "reused"
+    saved = json.loads(journal_path.read_text())["entries"]["V-A-FAIL"]
+    assert saved["state"] == "failed" and saved["result"]["measurement_reused"] is True
+    assert saved["export_status"] == "verified"
+
+
+def test_completed_acceptance_pair_restarts_without_remeasurement(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    launched = []
+    first = driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or
+        {"status": "complete", "cleanup_open": False})
+    first.run(stage)
+    assert set(launched) == {"V-S1", "V-S3"}
+    restarted = driver(FakeClock(), lambda *_: pytest.fail("completed acceptance pair was measured twice"))
+    restarted.run(stage)
+
+
+@pytest.mark.parametrize("one_cent_under", [False, True])
+def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_root, tmp_path, monkeypatch, one_cent_under):
+    import copy
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from cloud_network_benchmark.admission import BudgetLedger, load_cost_inputs
+    from cloud_network_benchmark.config import resolve_campaign
+    from cloud_network_benchmark.contracts.common import Evidence, Provider
+    from tests.integration.test_f11_ledger import scheduled_request_and_plan
+
+    stage = acceptance_stage_fixture(tmp_path)
+    stage["repository_root"] = str(repository_root)
+    stage["scope_id"] = "offline-acceptance-pair"
+    stage["controller_session_id"] = "offline-acceptance-controller"
+    costs_path = ROOT / "tests/fixtures/f11/cost-inputs.json"
+    clock = FakeClock()
+    providers = [Provider.AWS, Provider.AZURE, Provider.GCP]
+    for entry in stage["entries"][:2]:
+        entry["runtime_config_path"] = str(tmp_path / f"{entry['entry_id']}-runtime.json")
+        entry["parent_manifest_path"] = str(tmp_path / f"{entry['entry_id']}-parent.json")
+        entry["cost_inputs_path"] = str(costs_path)
+
+    costs = load_cost_inputs(costs_path)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    runtime = {"ledger": {"path": stage["ledger_path"], "scope_id": stage["scope_id"],
+                          "initialize_if_missing": True}}
+
+    def runtime_loader(_path, *, selected_providers=None):
+        assert selected_providers == {"aws", "azure", "gcp"}
+        return copy.deepcopy(runtime)
+
+    initialized_ids = iter(("V-S1", "V-S3"))
+    def initialized(_path, *, repository_root, config_path, schedule_path):
+        assert schedule_path is None
+        entry_id = next(initialized_ids)
+        parent = SimpleNamespace(campaign_id=entry_id)
+        return parent, {provider.value: SimpleNamespace(run_id=f"{entry_id}-{provider.value}") for provider in providers}
+
+    def admission_inputs(*, campaign, parent, children, costs, runtime, ledger_state, controller_session_id):
+        request, plan = scheduled_request_and_plan(campaign, costs, campaign_id=parent.campaign_id,
+            providers=providers, child_prefix=parent.campaign_id, namespace_prefix=parent.campaign_id,
+            funding={"primary": "50.20"}, measurement_seconds=76)
+        request = request.model_copy(update={
+            "incurred_cost_usd": Evidence[float](unavailable_reason="ledger derives pair spend"),
+            "active_reserved_usd": Evidence[float](unavailable_reason="ledger derives pair holds")})
+        return request, plan
+
+    import cloud_network_benchmark.lifecycle_runtime as lifecycle_runtime
+    import cloud_network_benchmark.config as config_module
+    monkeypatch.setattr(lifecycle_runtime, "load_runtime_config", runtime_loader)
+    monkeypatch.setattr(lifecycle_runtime, "load_initialized_campaign", initialized)
+    monkeypatch.setattr(lifecycle_runtime, "build_admission_request", admission_inputs)
+    monkeypatch.setattr(config_module, "resolve_campaign", lambda *_: (campaign, None))
+
+    book = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
+        utc_now=clock.utc_now, monotonic_now=clock.monotonic, controller_session_id=stage["controller_session_id"])
+    book.initialize(costs)
+    if one_cent_under:
+        request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="prior-one-cent",
+            providers=providers, child_prefix="prior-one-cent", namespace_prefix="prior-one-cent",
+            funding={"primary": "0.01"}, measurement_seconds=76)
+        request = request.model_copy(update={
+            "incurred_cost_usd": Evidence[float](unavailable_reason="ledger derives pair spend"),
+            "active_reserved_usd": Evidence[float](unavailable_reason="ledger derives pair holds")})
+        assert book.reserve(request, plan=plan).status == "reserved"
+
+    launched = []
+    engine = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+        launch=lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}, clock=clock,
+        sleep=clock.sleep)
+    engine.pre_admit = engine._pre_admit_acceptance_pair
+    if one_cent_under:
+        result = engine.run(stage)
+        assert launched == []
+        assert len(book.inspect()["reservations"]) == 2  # prior + first paired liability; no VM call occurred
+        assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+    else:
+        result = engine.run(stage)
+        reservations = book.inspect()["reservations"]
+        assert len(reservations) == 2
+        assert all(set(row["plan"]["providers"]) == {"aws", "azure", "gcp"} for row in reservations.values())
+        assert len({tuple(sorted(row["child_identities"].items())) for row in reservations.values()}) == 2
+        assert len({tuple(sorted(row["plan"]["namespaces"].items())) for row in reservations.values()}) == 2
+        assert set(launched) == {"V-S1", "V-S3"}
+        assert all(result["entries"][entry_id]["aggregate_reservation_ids"] for entry_id in ("V-S1", "V-S3"))
 
 
 def test_missed_slots_are_recorded_and_never_backfilled(tmp_path):
