@@ -460,6 +460,47 @@ def test_bounded_relay_rejects_changed_source_before_mutating_occupied_prefix(tm
     assert set(backend.objects) == existing_keys
 
 
+def test_bounded_relay_manifest_metadata_collision_with_missing_part_creates_nothing(tmp_path):
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+
+    class InterruptAfterManifest(FakeGCS):
+        uploads = 0
+        def upload(self, key, source, **kwargs):
+            result = super().upload(key, source, **kwargs)
+            self.uploads += 1
+            if key.endswith("manifest.json"):
+                raise InterruptedError("synthetic interruption after manifest creation")
+            return result
+
+    backend = InterruptAfterManifest()
+    options = dict(bucket="valid-bucket", provider="aws", experiment_id="exp-001",
+        run_id="manifest-metadata-collision-001", maximum_staging_bytes=4096,
+        closure_verified=True, maximum_archive_bytes=2_000_000,
+        minimum_controller_free_bytes=0, staging_directory=tmp_path, deadline=Deadline())
+    with pytest.raises(GCSArchiveFailure):
+        relay_closed_native_tree(source, backend=backend, **options)
+
+    prefix = "cnb/v1/aws/exp-001/manifest-metadata-collision-001/"
+    manifest_key = prefix + "manifest.json"
+    completion_key = prefix + "complete.json"
+    prior_manifest = json.loads(backend.objects[manifest_key][0])
+    backend.objects.pop(completion_key, None)
+    missing_part = prefix + "parts/00000001-" + prior_manifest["parts"][0]["sha256"]
+    backend.objects.pop(missing_part)
+    prior_manifest["archive_sha256"] = "0" * 64
+    altered_bytes = (json.dumps(prior_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    backend.objects[manifest_key] = (altered_bytes, backend.objects[manifest_key][1])
+    before = dict(backend.objects)
+    upload_count = backend.uploads
+
+    with pytest.raises(GCSArchiveFailure, match="missing a declared remote part"):
+        relay_closed_native_tree(source, backend=backend, **options)
+
+    assert backend.objects == before
+    assert backend.uploads == upload_count
+
+
 def test_bounded_relay_resume_preserves_partial_generations_and_rejects_source_change(tmp_path):
     from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
     source, _unused = _archive(tmp_path)

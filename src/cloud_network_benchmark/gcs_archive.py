@@ -429,6 +429,28 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
                         or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))
                         for part in prior_parts)):
                 raise ValueError("existing manifest has no valid ordered part sequence")
+            # A published manifest closes the remote archive. Bind the entire
+            # ordered part set before rebuilding locally, and never resume by
+            # creating a missing part under an occupied manifest prefix.
+            with tempfile.TemporaryDirectory(prefix="cnb-gcs-prior-part-", dir=root) as temp:
+                readback = Path(temp) / "part"
+                for number, part in enumerate(prior_parts, start=1):
+                    expected_name = f"archive.tar.gz.part-{number:05d}"
+                    if part["path"] != expected_name:
+                        raise ValueError("existing manifest has an invalid ordered part path")
+                    key = f"{prefix}parts/{number:08d}-{part['sha256']}"
+                    current = backend.stat(key, timeout_seconds=remaining())
+                    if current is None:
+                        if prior_completion is not None:
+                            raise ValueError("completed archive is missing a remote part")
+                        raise ValueError("existing manifest is missing a declared remote part")
+                    generation = str(current.get("generation", ""))
+                    if (not generation or current.get("size_bytes") != part["size_bytes"]):
+                        raise ValueError("existing manifest part has an invalid generation or size")
+                    backend.download(key, readback, maximum_bytes=max_part,
+                        timeout_seconds=remaining(), generation=generation)
+                    if _hash(readback, max_part, guard) != (part["size_bytes"], part["sha256"]):
+                        raise ValueError("existing manifest part failed generation-bound content verification")
         part_number = 0
 
         def relay(part_path: Path, part: dict):
@@ -446,6 +468,8 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             key = f"{prefix}parts/{part_number:08d}-{part['sha256']}"
             current = backend.stat(key, timeout_seconds=remaining())
             if current is None:
+                if prior_manifest_payload is not None:
+                    raise ValueError("existing manifest is missing a declared remote part")
                 if prior_completion is not None:
                     raise ValueError("completed archive is missing a remote part")
                 partial[key] = "unknown"
@@ -490,6 +514,8 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             raise ValueError("native source changed while the archive was being relayed")
         if prior_manifest_payload is not None and part_number != len(prior_manifest_payload["parts"]):
             raise ValueError("generated part sequence is incomplete for the occupied run manifest")
+        if prior_manifest_payload is not None and prior_manifest_payload != manifest:
+            raise ValueError("logical run prefix is already bound to a different archive manifest")
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
         if len(manifest_bytes) > max_part:
