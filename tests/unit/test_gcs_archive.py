@@ -388,6 +388,78 @@ def test_bounded_relay_reconstructs_archive_and_never_stages_full_bundle(tmp_pat
     assert all(path.is_file() for path in source.iterdir())
 
 
+def test_bounded_relay_rechecks_parts_after_completion_upload(tmp_path):
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+
+    class DeletePartAtCompletion(FakeGCS):
+        def upload(self, key, source, **kwargs):
+            result = super().upload(key, source, **kwargs)
+            if key.endswith("complete.json"):
+                part_key = next(key for key in self.objects if "/parts/" in key)
+                del self.objects[part_key]
+            return result
+
+    backend = DeletePartAtCompletion()
+    with pytest.raises(GCSArchiveFailure, match="before completion acceptance"):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="completion-race-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert all(path.is_file() for path in source.iterdir())
+
+
+def test_bounded_relay_rescans_sources_after_sink_finishes(tmp_path, monkeypatch):
+    import cloud_network_benchmark.closed_archive as closed_archive
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    original = closed_archive.create_closed_archive
+
+    def finish_then_mutate(*args, **kwargs):
+        result = original(*args, **kwargs)
+        (source / "sockperf.csv").write_bytes(b"mutated after sink finish")
+        return result
+
+    monkeypatch.setattr(closed_archive, "create_closed_archive", finish_then_mutate)
+    backend = FakeGCS()
+    with pytest.raises(GCSArchiveFailure, match="source changed while"):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="source-race-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert not any(key.endswith(("manifest.json", "complete.json")) for key in backend.objects)
+    assert (source / "sockperf.csv").read_bytes() == b"mutated after sink finish"
+
+
+def test_bounded_relay_rejects_changed_source_before_mutating_occupied_prefix(tmp_path):
+    from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+
+    class InterruptAfterManifest(FakeGCS):
+        def upload(self, key, source, **kwargs):
+            result = super().upload(key, source, **kwargs)
+            if key.endswith("manifest.json"):
+                raise InterruptedError("synthetic interruption after manifest creation")
+            return result
+
+    backend = InterruptAfterManifest()
+    with pytest.raises(GCSArchiveFailure):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="occupied-prefix-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert f"cnb/v1/aws/exp-001/occupied-prefix-001/manifest.json" in backend.objects
+    assert f"cnb/v1/aws/exp-001/occupied-prefix-001/complete.json" not in backend.objects
+    existing_keys = set(backend.objects)
+    (source / "sockperf.csv").write_bytes(b"different source reuses this run identity")
+    with pytest.raises(GCSArchiveFailure, match="different native source inventory"):
+        relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
+            experiment_id="exp-001", run_id="occupied-prefix-001", maximum_staging_bytes=4096,
+            closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
+            staging_directory=tmp_path, deadline=Deadline())
+    assert set(backend.objects) == existing_keys
+
+
 def test_bounded_relay_resume_preserves_partial_generations_and_rejects_source_change(tmp_path):
     from cloud_network_benchmark.gcs_archive import GCSArchiveFailure, relay_closed_native_tree
     source, _unused = _archive(tmp_path)
@@ -411,7 +483,7 @@ def test_bounded_relay_resume_preserves_partial_generations_and_rejects_source_c
         staging_directory=tmp_path, deadline=Deadline())
     assert resumed["verified"]
     (source / "sockperf.csv").write_bytes(b"changed")
-    with pytest.raises(GCSArchiveFailure, match="completed archive is missing a remote part"):
+    with pytest.raises(GCSArchiveFailure, match="different native source inventory"):
         relay_closed_native_tree(source, backend=backend, bucket="valid-bucket", provider="aws",
             experiment_id="exp-001", run_id="resume-001", maximum_staging_bytes=4096,
             closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,

@@ -407,6 +407,28 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             partial[completion_key] = str(prior_completion.get("generation", "unknown"))
         if prior_completion is not None and prior_manifest is None:
             raise ValueError("completion marker exists without its immutable manifest")
+        prior_manifest_payload = None
+        if prior_manifest is not None:
+            if prior_manifest.get("size_bytes", max_part + 1) > max_part:
+                raise ValueError("existing manifest exceeds configured one-part bound")
+            with tempfile.TemporaryDirectory(prefix="cnb-gcs-prior-manifest-", dir=root) as temp:
+                manifest_readback = Path(temp) / "manifest.json"
+                backend.download(manifest_key, manifest_readback, maximum_bytes=max_part,
+                    timeout_seconds=remaining(), generation=str(prior_manifest["generation"]))
+                prior_manifest_payload = json.loads(manifest_readback.read_bytes())
+            current_files = [{"path": name, "size_bytes": size, "sha256": digest}
+                for name, _path, size, digest in rows]
+            if not isinstance(prior_manifest_payload, dict) or prior_manifest_payload.get("files") != current_files:
+                raise ValueError("logical run prefix is bound to a different native source inventory")
+            prior_parts = prior_manifest_payload.get("parts")
+            if (not isinstance(prior_parts, list) or not prior_parts
+                    or any(not isinstance(part, dict)
+                        or not isinstance(part.get("path"), str)
+                        or type(part.get("size_bytes")) is not int
+                        or not 0 < part["size_bytes"] <= max_part
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))
+                        for part in prior_parts)):
+                raise ValueError("existing manifest has no valid ordered part sequence")
         part_number = 0
 
         def relay(part_path: Path, part: dict):
@@ -415,6 +437,12 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             part_number += 1
             if part["size_bytes"] > max_part:
                 raise ValueError("compressed part exceeds configured one-part bound")
+            if prior_manifest_payload is not None:
+                prior_parts = prior_manifest_payload["parts"]
+                if part_number > len(prior_parts) or any(
+                        prior_parts[part_number - 1].get(field) != part.get(field)
+                        for field in ("path", "size_bytes", "sha256")):
+                    raise ValueError("generated part sequence differs from the occupied run manifest")
             key = f"{prefix}parts/{part_number:08d}-{part['sha256']}"
             current = backend.stat(key, timeout_seconds=remaining())
             if current is None:
@@ -455,6 +483,13 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
         manifest = create_closed_archive(source, archive_path, max_part_bytes=max_part,
             free_bytes=lambda _path: shutil.disk_usage(root).free,
             minimum_headroom_bytes=minimum_controller_free_bytes, guard=guard, on_part=relay)
+        current_rows = _safe_files(source, guard)
+        current_files = [(name, size, digest) for name, _path, size, digest in current_rows]
+        original_files = [(name, size, digest) for name, _path, size, digest in rows]
+        if current_files != original_files:
+            raise ValueError("native source changed while the archive was being relayed")
+        if prior_manifest_payload is not None and part_number != len(prior_manifest_payload["parts"]):
+            raise ValueError("generated part sequence is incomplete for the occupied run manifest")
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
         if len(manifest_bytes) > max_part:
@@ -508,6 +543,22 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             if _hash(marker, max_part, guard) != (len(completion_bytes), completion_sha):
                 raise ValueError("remote completion marker failed byte-count or SHA-256 verification")
             partial.pop(completion_key, None)
+        # Retain exact late-stage identities if the completion acceptance readback
+        # discovers that a manifest-bound object changed after marker upload.
+        partial[manifest_key] = manifest_generation
+        partial[completion_key] = completion_generation
+        for row in objects:
+            latest = backend.stat(row["key"], timeout_seconds=remaining())
+            if (latest is None or str(latest.get("generation")) != row["generation"]
+                    or latest.get("size_bytes") != row["size_bytes"]):
+                raise ValueError("manifest-recorded remote object disappeared or changed before completion acceptance")
+        latest_completion = backend.stat(completion_key, timeout_seconds=remaining())
+        if (latest_completion is None
+                or str(latest_completion.get("generation")) != completion_generation
+                or latest_completion.get("size_bytes") != len(completion_bytes)):
+            raise ValueError("completion marker disappeared or changed before acceptance")
+        partial.pop(manifest_key, None)
+        partial.pop(completion_key, None)
         result = {"status": "verified", "verified": True, "bucket": bucket, "prefix": prefix,
             "manifest_sha256": manifest_sha, "archive_bytes": manifest["archive_bytes"],
             "objects": objects, "completion_generation": completion_generation,
