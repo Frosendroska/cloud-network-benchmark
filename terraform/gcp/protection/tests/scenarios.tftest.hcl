@@ -70,7 +70,7 @@ run "finland_s3_collocated_without_distance" {
   }
   assert {
     condition = (length(google_compute_resource_policy.compact) == 1 &&
-      google_compute_resource_policy.compact[0].group_placement_policy[0].collocation == "COLLOCATED")
+    google_compute_resource_policy.compact[0].group_placement_policy[0].collocation == "COLLOCATED")
     error_message = "Finland S3 uses the provider-native COLLOCATED placement policy"
   }
 }
