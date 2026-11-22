@@ -202,7 +202,7 @@ class ReservationRequest(StrictModel):
             raise ValueError("unsupported timing profile")
         if self.workflow_profile is not None:
             spec = PROFILE_SPECS.get(self.workflow_profile)
-            if spec is None or spec["mode"] != self.mode.value or self.timing_profile is not None:
+            if spec is None or spec["mode"] != ExperimentMode(self.mode).value or self.timing_profile is not None:
                 raise ValueError("workflow profile is unsupported for this mode or timing profile")
             expected_cap = spec["cap_seconds"]
         if self.lifetime_cap_seconds != expected_cap:

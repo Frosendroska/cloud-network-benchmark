@@ -537,6 +537,8 @@ def _begin_profile_cleanup(deployment: ProviderDeploymentInput, options: AzureRu
         return now_mono + max(1.0, invocation_seconds), None, None
     if deployment.admission.timing_profile:
         fallback = now_mono + min(300.0, max(1.0, invocation_seconds))
+    elif deployment.admission.workflow_profile:
+        fallback = now_mono + min(660.0, max(1.0, invocation_seconds))
     else:
         fallback_end = min(options.cap_deadline_monotonic, now_mono + min(660.0, max(1.0, invocation_seconds)))
         if deployment.expiry.value is not None and deployment.expiry.value.expires_at.value is not None:

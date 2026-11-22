@@ -552,6 +552,51 @@ def test_unchanged_unfiltered_builtin_catalog_reproduces_size_limit(repository_r
             "profile_absence_role_definitions",lambda:1100.0,("id",))
 
 
+def test_workflow_cleanup_after_original_stop_uses_bounded_emergency_window(
+        repository_root: Path, tmp_path: Path):
+    from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark import azure_provider
+    from cloud_network_benchmark.validation_profiles import FAILURE_PROFILE
+    start = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    d, o, _ = profile_attempt(repository_root, tmp_path, start + timedelta(seconds=100))
+    cap_end = start + timedelta(seconds=3900)
+    reservation = d.reservation.value.model_copy(update={"timing_profile": None,
+        "expires_at": Evidence(value=cap_end)})
+    admission = d.admission.model_copy(update={"timing_profile": None,
+        "workflow_profile": FAILURE_PROFILE, "lifetime_cap_seconds": 3900})
+    d = d.model_copy(update={"admission": admission, "reservation": Evidence(value=reservation)})
+    stop = cap_end - timedelta(seconds=720)
+    o = o.model_copy(update={"timing_profile": None, "workflow_profile": FAILURE_PROFILE,
+        "cap_deadline_monotonic": 4900.0, "retry_end_at": cap_end})
+    azure_provider._initialize_profile_timing(d, o, clock=lambda: 1000.0, utc_now=lambda: start)
+    azure_provider._bind_profile_stop(d, o, stop)
+    late_now = start + timedelta(seconds=3181)
+    deadline, state, note = azure_provider._begin_profile_cleanup(d, o,
+        clock=lambda: 4181.0, utc_now=lambda: late_now, invocation_seconds=660)
+    assert note and state["timing_status"] == "late"
+    assert deadline == 4841.0
+    assert deadline < o.cap_deadline_monotonic + 1
+    assert state["cap_expires_at"] == cap_end.isoformat()
+    assert state["provider_stop_at"] == stop.isoformat()
+
+    class EmergencyRunner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            from cloud_network_benchmark.contracts.execution import CommandResult
+            self.requests.append(request)
+            return CommandResult(action_id=request.action_id, outcome="succeeded",
+                started_at=late_now, finished_at=late_now, duration_seconds=0,
+                exit_code=0, stdout="ok", stderr="")
+
+    runner = EmergencyRunner()
+    emergency_options = o.model_copy(update={"cap_deadline_monotonic": deadline,
+        "cleanup_timing_active": True, "cleanup_timing_phase": "emergency"})
+    azure_provider._command(runner, emergency_options, tmp_path, ["az", "group", "exists"],
+        "cleanup-recovery-probe", lambda: 4181.0)
+    assert len(runner.requests) == 1
+    assert runner.requests[0].timeout_seconds <= 660
+
+
 def test_profile_absence_recovery_uses_separate_window_without_replaying_destroy(
         repository_root: Path,tmp_path: Path):
     now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)

@@ -488,6 +488,87 @@ def test_cleanup_destroy_is_attempted_without_state_and_primary_failure_is_prese
     assert result.cleanup_failure.category == "inventory_incomplete"
 
 
+@pytest.mark.parametrize("late_position", ["after_stop_before_cap", "after_cap"])
+def test_aws_cleanup_runs_bounded_recovery_after_original_stop_deadline(tmp_path, late_position):
+    class Runner:
+        def __init__(self): self.actions = []
+        def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None:
+                self.actions.append(request.action_id)
+                return identity
+            self.actions.append(request.action_id)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    base = make_deployment()
+    if late_position == "after_stop_before_cap":
+        # Failure profile STOP is cap minus 720s; begin cleanup one second late,
+        # while 719 seconds remain before the immutable cap.
+        cap_end = NOW + timedelta(seconds=719)
+        cap_start = NOW - timedelta(seconds=3181)
+        admission = base.admission.model_copy(update={
+            "workflow_profile": "all_cloud_failure_acceptance_v1", "lifetime_cap_seconds": 3900})
+    else:
+        cap_end = NOW - timedelta(seconds=301)
+        cap_start = base.reservation.value.cap_started_at.value
+        admission = base.admission
+    expired = base.reservation.value.model_copy(update={
+        "cap_started_at": Evidence[datetime](value=cap_start),
+        "expires_at": Evidence[datetime](value=cap_end)})
+    deployment = base.model_copy(update={"admission": admission, "reservation": Evidence(value=expired)})
+    runner = Runner()
+    settings = make_settings(tmp_path, deployment, cleanup_routine_seconds=600, cleanup_absence_seconds=60)
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": ["eu-central-1"], "executions": {},
+        "cleanup_started_at": (NOW-timedelta(seconds=700)).isoformat()})
+    # Reconstruct the driver after its original 600-second routine window elapsed.
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
+    driver._inventory_region = lambda *_args: {"complete": True, "remaining": {}, "resources": {}}
+    result = driver.cleanup(deployment)
+    journal = driver._load_journal(attempt, deployment)
+    assert "aws-pair-destroy" in runner.actions
+    assert result.cleanup_state == "succeeded"
+    assert result.inventory.value["cleanup_timing"]["status"] == "late"
+    assert journal["cleanup_acceptance_timing"]["status"] == "late"
+    assert expired.expires_at.value == cap_end
+
+
+@pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
+def test_aws_cleanup_checks_routine_and_absence_at_their_own_boundaries(
+        tmp_path, routine_finish, expected_status):
+    class Runner:
+        def run(self, request):
+            identity = legacy_cleanup_read_reply(request)
+            if identity is not None: return identity
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
+                finished_at=NOW, duration_seconds=0, exit_code=0, stdout="{}", stderr="")
+
+    deployment = make_deployment()
+    current = [NOW]
+    settings = make_settings(tmp_path, deployment, cleanup_routine_seconds=600,
+        cleanup_absence_seconds=60)
+    driver = AwsProviderDriver(Runner(), settings, clock=lambda: current[0])
+    attempt = driver._attempt_dir(deployment)
+    (attempt / "pair.tfvars.json").write_text("{}")
+    driver._save_journal(attempt, {"schema_version": 1, "run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "pair_state_path": str(attempt / "pair.tfstate"), "regions": ["eu-central-1"], "executions": {}})
+    calls = [0]
+    def inventory(*_args):
+        calls[0] += 1
+        current[0] = NOW + timedelta(seconds=routine_finish if calls[0] == 1 else routine_finish+2)
+        return {"complete": True, "remaining": {}, "resources": {}}
+    driver._inventory_region = inventory
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.inventory.value["cleanup_timing"]["status"] == expected_status
+
+
 def test_cleanup_keeps_launch_blocker_when_destroy_runner_raises(tmp_path):
     class Runner:
         def __init__(self):

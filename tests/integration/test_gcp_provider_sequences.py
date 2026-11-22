@@ -45,7 +45,7 @@ def _instance_response(driver, deployment, role):
     subnet_role = "b" if role == "vm_b" and deployment.scenario == "inter_region" else "a"
     base = f"https://www.googleapis.com/compute/v1/projects/{driver.settings.project_id}"
     return {"id": "73101" if role == "vm_a" else "73102", "name": name, "selfLink": f"{base}/zones/{intent.zone}/instances/{name}", "zone": f"{base}/zones/{intent.zone}", "machineType": "n2-standard-4", "reservationAffinity": {"consumeReservationType": "NO_RESERVATION"}, "scheduling": {"automaticRestart": False}, "networkInterfaces": [{"network": f"{base}/global/networks/{driver._namespace(deployment)}-net", "networkIP": ip, "subnetwork": f"{base}/regions/{intent.region}/subnetworks/{driver._namespace(deployment)}-{subnet_role}", "nicType": "GVNIC", "accessConfigs": [{"natIP": "8.8.8.8"}]}], "disks": [{"boot": True, "source": f"{base}/zones/{intent.zone}/disks/{driver._namespace(deployment)}-{suffix}-boot"}]}
-def test_original_reservation_lead_is_immutable_across_retry_and_controller_delay():
+def test_original_reservation_lead_is_immutable_across_retry_and_controller_delay(tmp_path):
     started = datetime.now(timezone.utc) - timedelta(seconds=5)
     original_end = datetime.now(timezone.utc) + timedelta(seconds=1800)
     reservation = ReservationEvidence(schema_version=2, campaign_id="c", reservation_id=Evidence[str](value="r-1"), state="reserved", reserved_cost_usd=Evidence[float](value=10), cap_started_at=Evidence[datetime](value=started), expires_at=Evidence[datetime](value=original_end), cap_start_policy_id=StringEvidence(value="reserved-before-provider"), source_path="register.csv", source_sha256="a" * 64)
@@ -54,9 +54,35 @@ def test_original_reservation_lead_is_immutable_across_retry_and_controller_dela
     assert first == original_end - timedelta(seconds=30)
     assert delayed < first
     assert reservation.expires_at.value == original_end
-    driver = object.__new__(GcpProviderDriver)
+    deployment, driver = _cleanup_fixture(tmp_path)
+    deployment_reservation = reservation.model_copy(update={"expires_at": Evidence[datetime](value=original_end)})
+    deployment = deployment.model_copy(update={"reservation": Evidence(value=deployment_reservation)})
     driver.clock = lambda: started + timedelta(seconds=1)
-    assert driver._fit(reservation, first, 60) is None
+    assert driver._fit(deployment, deployment_reservation, first, 60) is None
+
+
+def test_gcp_provider_fit_uses_aggregate_workflow_remainder(tmp_path, monkeypatch):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    deployment, base = _cleanup_fixture(tmp_path)
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    deployment = deployment.model_copy(update={"admission": admission})
+    settings = base.settings.model_copy(update={
+        "complete_workflow_remaining_seconds": 3535,
+        "workflow_cap_started_monotonic": 100.0,
+        "registration_allowance_seconds": 900, "provision_allowance_seconds": 900})
+    driver = gcp_provider.GcpProviderDriver(object(), settings, monotonic_clock=lambda: 480.0)
+    # AWS 200s plus Azure 180s consume the shared registration budget. GCP's
+    # complete-workflow fit is debited by the same elapsed 380 seconds.
+    assert driver._remaining_workflow_seconds(deployment, "registration") == 3155
+    assert driver._remaining_workflow_seconds(deployment, "preparation") == 2635
+    assert driver._remaining_after_provision_seconds(deployment) == 1735
+    after_full_registration = gcp_provider.GcpProviderDriver(object(), settings,
+        monotonic_clock=lambda: 1000.0)
+    assert after_full_registration._remaining_workflow_seconds(deployment, "preparation") == 2635
+    trigger_seconds_left = 4170-(1000.0-100.0)
+    pair_apply_slack = trigger_seconds_left-after_full_registration._remaining_after_provision_seconds(deployment)
+    assert pair_apply_slack == 1535
 
 
 def test_provider_rejects_noncanonical_scenario_zones(tmp_path):
@@ -525,6 +551,70 @@ def test_same_attempt_prior_controller_session_blocks_reuse_and_provision_but_al
     assert after_cleanup["controller_session_id"] == "prior-session"
     assert {key: after_cleanup[key] for key in original_cap} == original_cap
     assert after_cleanup["cleanup_state"] == "succeeded"
+
+
+@pytest.mark.parametrize("late_position", ["after_stop_before_cap", "after_cap"])
+def test_workflow_cleanup_uses_bounded_recovery_after_original_stop_deadline(tmp_path, monkeypatch, late_position):
+    from cloud_network_benchmark.contracts.common import Evidence
+    deployment, driver = _cleanup_fixture(tmp_path)
+    cap_end = deployment.reservation.value.expires_at.value
+    late_now = (cap_end - timedelta(seconds=719)
+        if late_position == "after_stop_before_cap" else cap_end + timedelta(seconds=1))
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_failure_acceptance_v1", "lifetime_cap_seconds": 3900})
+    reservation = deployment.reservation.value.model_copy(update={
+        "cap_started_at": Evidence(value=cap_end-timedelta(seconds=3900))})
+    deployment = deployment.model_copy(update={"admission": admission,
+        "reservation": Evidence(value=reservation)})
+    driver.clock = lambda: late_now
+    monkeypatch.setattr("cloud_network_benchmark.providers.gcp.time.monotonic", lambda: 100.0)
+    expiry = deployment.expiry.value
+    attempt = driver._attempt_dir(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": True, "registered": True,
+        "expiry": expiry.model_dump(mode="json") if expiry else None,
+        "cleanup_started_at": (late_now-timedelta(seconds=700)).isoformat()})
+    # Reconstruct from the persisted attempt after its original routine window elapsed.
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    driver = GcpProviderDriver(object(), driver.settings)
+    driver.clock = lambda: late_now
+    actions = []
+    monkeypatch.setattr(driver, "_terraform", lambda _attempt, root, action, _deployment, _extra:
+        actions.append((root, action)) or {})
+    monkeypatch.setattr(driver, "_inventory", lambda _deployment: {
+        "pages_complete": True, "instances": [], "resources": [], "known": []})
+    result = driver.cleanup(deployment)
+    journal = driver._load(attempt, deployment)
+    assert result.cleanup_state == "succeeded"
+    assert ("pair", "destroy") in actions
+    assert result.inventory.value["cleanup_timing"]["status"] == "late"
+    assert journal["cleanup_acceptance_timing"]["status"] == "late"
+    assert deployment.reservation.value.expires_at.value == cap_end
+
+
+@pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
+def test_gcp_cleanup_checks_routine_and_absence_at_their_own_boundaries(
+        tmp_path, monkeypatch, routine_finish, expected_status):
+    deployment, driver = _cleanup_fixture(tmp_path)
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    deployment = deployment.model_copy(update={"admission": admission})
+    current = [deployment.reservation.value.cap_started_at.value + timedelta(seconds=1)]
+    driver.clock = lambda: current[0]
+    attempt = driver._attempt_dir(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": True, "registered": True})
+    monkeypatch.setattr(driver, "_terraform", lambda *_args: {})
+    calls = [0]
+    def inventory(_deployment):
+        calls[0] += 1
+        current[0] = deployment.reservation.value.cap_started_at.value + timedelta(
+            seconds=1 + (routine_finish if calls[0] == 1 else routine_finish+2))
+        return {"pages_complete": True, "instances": [], "resources": [], "known": []}
+    monkeypatch.setattr(driver, "_inventory", inventory)
+    result = driver.cleanup(deployment)
+    assert result.cleanup_state == "succeeded"
+    assert result.inventory.value["cleanup_timing"]["status"] == expected_status
 
 
 def test_cleanup_does_not_claim_cancellation_or_trigger_after_native_deadline(tmp_path, monkeypatch):

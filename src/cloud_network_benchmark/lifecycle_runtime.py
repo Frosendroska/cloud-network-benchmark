@@ -982,7 +982,10 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "cost_source_path": reservation.source_path,
                 "complete_workflow_cost_handoff": StructuredEvidence(value=handoff),
                 "support_cost_evidence": StructuredEvidence(value=support_evidence),
-                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds)}
+                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds),
+                "workflow_cap_started_monotonic": float(record["cap_start_monotonic"]),
+                "registration_allowance_seconds": float(runtime["allowance"].registration_seconds),
+                "provision_allowance_seconds": float(runtime["allowance"].provision_seconds)}
             if observation.admission.requires_primary_review:
                 review = sources.get("primary_review_path")
                 if review is None: raise ValueError("GCP scenario requires source-bound primary review")
@@ -991,7 +994,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 registration_timeout_seconds=runtime.get("provider_registration_timeout_seconds", 180),
                 plan_review_timeout_seconds=50 if runtime.get("workflow_profile") else config.get("plan_review_timeout_seconds", 0),
                 plan_review_admission_path=runtime.get("plan_review_admission_path"))
-            driver = GcpProviderDriver(runner, settings, clock=clock.utc_now)
+            driver = GcpProviderDriver(runner, settings, clock=clock.utc_now,
+                monotonic_clock=clock.monotonic)
             trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
                 campaign.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,

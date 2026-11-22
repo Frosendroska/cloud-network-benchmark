@@ -197,6 +197,7 @@ class AwsProviderDriver:
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
         self._cleanup_deadline: float | None = None
+        self._cleanup_acceptance_deadlines: list[datetime] = []
         self._precreate_deadline: float | None = None
         self._active_primary_failure: FailureEvidence | None = None
         self._initialized_terraform: set[str] = set()
@@ -515,6 +516,7 @@ class AwsProviderDriver:
             failure = _failure(AwsProviderError("cleanup account or regions differ from registered AWS scope", category="scope_mismatch"), self.clock())
             return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
         self._registration_deadline = None
+        self._cleanup_acceptance_deadlines = []
         routine_seconds = self.settings.cleanup_routine_seconds or self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
         cleanup_now = self.clock().astimezone(timezone.utc)
         started_at = journal.get("cleanup_started_at")
@@ -530,9 +532,23 @@ class AwsProviderDriver:
         cap_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)
         from ..validation_profiles import provider_lead_seconds
         lead = provider_lead_seconds(deployment.admission.workflow_profile, "aws", SAFETY_LEAD_SECONDS)
-        cleanup_end = min(cap_end - timedelta(seconds=lead), started_utc + timedelta(seconds=routine_seconds))
-        routine_end = min(cleanup_end, cap_end - timedelta(seconds=self.settings.cleanup_absence_seconds or 0))
-        self._cleanup_deadline = time.monotonic() + max(0.0, (routine_end-cleanup_now).total_seconds())
+        # Cleanup is a bounded recovery action even when the acceptance clock is late.
+        # The immutable reservation and provider trigger remain evidence bounds; this
+        # execution window does not move either deadline or make cleanup timely.
+        acceptance_routine_end = min(cap_end - timedelta(seconds=lead),
+            started_utc + timedelta(seconds=routine_seconds))
+        self._cleanup_acceptance_deadlines = [acceptance_routine_end]
+        previous_timing = journal.get("cleanup_acceptance_timing", {})
+        timing_status = previous_timing.get("status")
+        if timing_status not in {"late", "unknown"}:
+            timing_status = "late" if cleanup_now >= acceptance_routine_end else "within_deadline"
+        journal["cleanup_acceptance_timing"] = {
+            "routine_deadline_utc": acceptance_routine_end.isoformat(),
+            "status": timing_status,
+        }
+        # Execution gets a separate per-invocation recovery window. It never changes
+        # the original reservation/STOP deadline or the recorded acceptance status.
+        self._cleanup_deadline = time.monotonic() + max(1.0, float(routine_seconds))
 
         try:
             identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
@@ -615,6 +631,9 @@ class AwsProviderDriver:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
         if self.settings.cleanup_absence_seconds is not None:
+            routine_finished_at = self.clock().astimezone(timezone.utc)
+            if routine_finished_at >= acceptance_routine_end:
+                journal["cleanup_acceptance_timing"]["status"] = "late"
             absence_started = journal.get("cleanup_absence_started_at")
             if absence_started is None:
                 absence_started = self.clock().astimezone(timezone.utc).isoformat()
@@ -623,8 +642,12 @@ class AwsProviderDriver:
             absence_started_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
             absence_end = min(cap_end-timedelta(seconds=lead),
                 absence_started_utc+timedelta(seconds=self.settings.cleanup_absence_seconds))
+            self._cleanup_acceptance_deadlines.append(absence_end)
             absence_now = self.clock().astimezone(timezone.utc)
-            self._cleanup_deadline = time.monotonic() + max(0.0, (absence_end-absence_now).total_seconds())
+            journal["cleanup_acceptance_timing"]["absence_deadline_utc"] = absence_end.isoformat()
+            if absence_now >= absence_end:
+                journal["cleanup_acceptance_timing"]["status"] = "late"
+            self._cleanup_deadline = time.monotonic() + max(1.0, float(self.settings.cleanup_absence_seconds))
         safety_absent: dict[str, bool] = {}
         safety_targets: dict[str, Any] = {}
         for region in regions:
@@ -671,9 +694,18 @@ class AwsProviderDriver:
             failure = _failure(AwsProviderError("one or more regional expiry executions failed or timed out", category="expiry_execution_failed"), self.clock()) if state == "failed" else None
             expiry = expiry.model_copy(update={"state": state, "failure": failure, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
+        timing = dict(journal.get("cleanup_acceptance_timing", {}))
+        timing["routine_deadline_utc"] = acceptance_routine_end.isoformat()
+        if timing.get("status") not in {"late", "unknown"} and self.clock().astimezone(timezone.utc) >= acceptance_routine_end:
+            timing["status"] = "late"
+        if len(self._cleanup_acceptance_deadlines) > 1:
+            timing["absence_deadline_utc"] = self._cleanup_acceptance_deadlines[-1].isoformat()
+            if self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[-1]:
+                timing["status"] = "late"
+        journal["cleanup_acceptance_timing"] = timing
         result = AwsCleanupResult(
             cleanup_state=CleanupState.SUCCEEDED,
-            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "safety_targets": safety_targets, "complete": True}),
+            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "safety_targets": safety_targets, "cleanup_timing": timing, "complete": True}),
             expiry=Evidence[ExpiryEvidence](value=expiry) if expiry else Evidence[ExpiryEvidence](unavailable_reason="expiry not registered"),
             primary_failure=primary,
         )
@@ -1414,6 +1446,13 @@ class AwsProviderDriver:
     def _failed_cleanup(self, inventory: dict[str, Any], secondary: list[FailureEvidence], primary: FailureEvidence | None, failure: FailureEvidence, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
         journal = self._load_journal(self._attempt_dir(deployment), deployment)
         expiry = self._expiry_from_journal(deployment, journal)
+        timing = {"status": "late" if any(self.clock().astimezone(timezone.utc) >= bound
+            for bound in self._cleanup_acceptance_deadlines) else "within_deadline"}
+        if self._cleanup_acceptance_deadlines:
+            timing["routine_deadline_utc"] = self._cleanup_acceptance_deadlines[0].isoformat()
+            if len(self._cleanup_acceptance_deadlines) > 1:
+                timing["absence_deadline_utc"] = self._cleanup_acceptance_deadlines[-1].isoformat()
+        journal["cleanup_acceptance_timing"] = timing
         journal["cleanup_state"] = "failed"
         journal["last_cleanup_inventory"] = inventory
         journal["cleanup_attempted_at"] = self.clock().astimezone(timezone.utc).isoformat()
@@ -1427,7 +1466,7 @@ class AwsProviderDriver:
         return AwsCleanupResult(
             cleanup_state=CleanupState.FAILED,
             cleanup_failure=failure,
-            inventory=StructuredEvidence(value={"regions": inventory, "complete": False}),
+            inventory=StructuredEvidence(value={"regions": inventory, "cleanup_timing": timing, "complete": False}),
             expiry=Evidence[ExpiryEvidence](value=expiry) if expiry else Evidence[ExpiryEvidence](unavailable_reason="expiry registration not available"),
             primary_failure=primary,
             secondary_failures=secondary,

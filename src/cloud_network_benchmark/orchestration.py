@@ -200,7 +200,9 @@ def consume_retry_attempt(recovery_path: Path, artifact_id: str) -> bool:
     return _mutate_recovery_journal(recovery_path, update)
 
 
-def update_provider_recovery(recovery_path: Path, provider: str, stage: str, status: str) -> None:
+def update_provider_recovery(recovery_path: Path, provider: str, stage: str, status: str, *,
+                             cleanup_timing_status: str | None = None,
+                             cleanup_timing_failure: str | None = None) -> None:
     """Fsync current provider liabilities around resource-creating stages."""
     if provider not in {"aws", "azure", "gcp"} or status not in {"started", "succeeded", "failed"}:
         raise ValueError("provider recovery update identity/status is invalid")
@@ -222,6 +224,9 @@ def update_provider_recovery(recovery_path: Path, provider: str, stage: str, sta
                     payload["expiry_registered"] = True
                 if stage == "cleanup" and status == "succeeded":
                     payload.update(expiry_registered=False, creation_may_have_started=False, cleanup_open=False)
+                    if cleanup_timing_status in {"within_deadline", "late", "unknown"}:
+                        payload["cleanup_timing_status"] = cleanup_timing_status
+                        payload["cleanup_timing_failure"] = cleanup_timing_failure
             rows.append(payload)
         return SavedLifecycleRecovery.model_validate({**recovery.model_dump(), "providers": rows}), None
     _mutate_recovery_journal(recovery_path, update)
@@ -610,7 +615,7 @@ def _stage_budget_name(stage: str) -> str:
         "close":"retrieval", "retrieve":"retrieval", "cleanup":"cleanup"}[stage]
 
 
-def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
+def _remaining_f11_allowance(allowance: Any, stage: str, *, registration_elapsed: float = 0.0) -> Any:
     """Represent the reserved allowance after completed lifecycle phases."""
     from dataclasses import replace
     completed = {
@@ -628,7 +633,10 @@ def _remaining_f11_allowance(allowance: Any, stage: str) -> Any:
         "retrieval": ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
                       "measurement_seconds", "measurement_shutdown_seconds"),
     }[stage]
-    return replace(allowance, **{name: 0.0 for name in fields}, completed_stages=completed[stage])
+    updates = {name: 0.0 for name in fields}
+    if stage == "registration":
+        updates["registration_seconds"] = max(0.0, allowance.registration_seconds - registration_elapsed)
+    return replace(allowance, **updates, completed_stages=completed[stage])
 
 
 def _before_stage(context: LifecycleContext, clock: Any, provider: str, stage: str,
@@ -722,8 +730,22 @@ def execute_provider_workflows(
                         stage_before()
                     update_provider_recovery(recovery_path, provider, stage, "started")
                 def after(_value, success):
+                    timing_status = None
+                    if stage == "cleanup":
+                        inventory = getattr(getattr(_value, "inventory", None), "value", None)
+                        timing = inventory.get("cleanup_timing") if isinstance(inventory, Mapping) else None
+                        timing_status = (timing.get("status") if isinstance(timing, Mapping)
+                            else getattr(_value, "timing_status", None))
                     update_provider_recovery(recovery_path, provider, stage,
-                                             "succeeded" if success else "failed")
+                        "succeeded" if success else "failed",
+                        cleanup_timing_status=timing_status,
+                        cleanup_timing_failure=getattr(_value, "timing_failure", None) if stage == "cleanup" else None)
+                    if stage == "cleanup":
+                        if timing_status in {"late", "unknown"}:
+                            result = results[provider]
+                            result.execution_state = "failed"
+                            result.primary_failure = result.primary_failure or (
+                                f"{provider} cleanup completed with {timing_status} acceptance timing")
                     if stage == "retrieve":
                         evidence = getattr(_value, "evidence", None)
                         archive_status = getattr(evidence, "archive_status", None)
@@ -977,11 +999,24 @@ def run_lifecycle(*, ledger: Any, reservation_request: Any, admission_plan: Any,
     except BaseException as exc:
         return initialization_failed("workflow_factory_failed",
             f"workflow_factory_failed ({type(exc).__name__}: {exc})")
+    registration_started_monotonic: float | None = None
     def f11_stage_fit(stage: str):
+        nonlocal registration_started_monotonic
         if stage == "cleanup":
             return None
+        observed = getattr(clock, "monotonic", None)
+        monotonic_now = observed() if callable(observed) else observed
+        if isinstance(monotonic_now, bool) or not isinstance(monotonic_now, (int, float)):
+            import time
+            monotonic_now = time.monotonic()
+        if stage == "registration":
+            if registration_started_monotonic is None:
+                registration_started_monotonic = monotonic_now
+            elapsed = max(0.0, monotonic_now-registration_started_monotonic)
+        else:
+            elapsed = 0.0
         return ledger.check_stage_fit(reservation_id, stage=stage,
-            remaining=_remaining_f11_allowance(allowance, stage))
+            remaining=_remaining_f11_allowance(allowance, stage, registration_elapsed=elapsed))
     workflows = {provider: replace(hooks, stage_admission=f11_stage_fit)
                  for provider, hooks in workflows.items()}
     result = execute_provider_workflows(workflows, context=context, clock=clock, max_workers=max_workers,
