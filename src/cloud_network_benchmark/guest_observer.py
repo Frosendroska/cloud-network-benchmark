@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import shlex
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
@@ -33,17 +36,32 @@ def _safe_rel(value: Any) -> bool:
     return not path.is_absolute() and path.as_posix() == value and all(part not in {"", ".", ".."} for part in path.parts)
 
 
-def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str) -> list[str]:
+def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str,
+                   owned_role: Mapping[str, Any] | None) -> list[str]:
     errors = []
     if role.get("workspace") != workspace:
         errors.append("workspace_mismatch")
-    if not isinstance(role.get("ssh_target"), str) or not role["ssh_target"] or any(c.isspace() for c in role["ssh_target"]):
-        errors.append("ssh_target_missing")
-    if not isinstance(role.get("vm_id"), str) or not role["vm_id"]:
-        errors.append("vm_identity_missing")
+    connection = role.get("connection")
+    if not isinstance(role.get("vm_id"), str) or not role["vm_id"] or owned_role is None or role.get("vm_id") != owned_role.get("vm_id"):
+        errors.append("vm_identity_unowned")
+    if not isinstance(connection, dict) or owned_role is None or connection != owned_role.get("connection"):
+        errors.append("connection_receipt_mismatch")
+    else:
+        host, user = connection.get("host"), connection.get("user")
+        port = connection.get("port")
+        known_hosts, identity_file = connection.get("known_hosts"), connection.get("identity_file")
+        if (not isinstance(host, str) or not host or host.startswith("-")
+                or not re.fullmatch(r"[A-Za-z0-9.-]+", host)
+                or not isinstance(user, str) or user.startswith("-") or not re.fullmatch(r"[A-Za-z0-9._-]+", user)
+                or type(port) is not int or not 1 <= port <= 65535
+                or not isinstance(known_hosts, str) or not Path(known_hosts).is_absolute()
+                or not isinstance(identity_file, str) or not Path(identity_file).is_absolute()
+                or any(c.isspace() for c in (known_hosts or "") + (identity_file or ""))):
+            errors.append("connection_binding_invalid")
     procs = role.get("processes")
     expected = {"producer", "diagnostics"} if role_name == "vm_a" else {"receiver", "diagnostics"}
-    if not isinstance(procs, list) or {x.get("kind") for x in procs if isinstance(x, dict)} != expected:
+    if (not isinstance(procs, list) or len(procs) != len(expected)
+            or {x.get("kind") for x in procs if isinstance(x, dict)} != expected):
         errors.append("process_bindings_incomplete")
     else:
         for item in procs:
@@ -58,7 +76,8 @@ def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str) -> l
             x.get("kind") for x in files if isinstance(x, dict)}:
         errors.append("output_bindings_incomplete")
     else:
-        if any(not _safe_rel(x.get("path")) for x in files):
+        if (any(not isinstance(x, dict) or not _safe_rel(x.get("path")) for x in files)
+                or len({x.get("path") for x in files}) != len(files)):
             errors.append("output_path_invalid")
         if role_name == "vm_a":
             chunks = [x for x in files if x.get("kind") == "sockperf_chunk"]
@@ -69,10 +88,15 @@ def _validate_role(role: Mapping[str, Any], workspace: str, role_name: str) -> l
     return errors
 
 
-def _ssh_probe(role: Mapping[str, Any], payload: dict, *, run: Callable[..., Any] = subprocess.run) -> dict:
+def _ssh_probe(role: Mapping[str, Any], payload: dict, *, timeout: float,
+               run: Callable[..., Any] = subprocess.run) -> dict:
+    connection = role["connection"]
     remote = " ".join(("python3", "-c", shlex.quote(_REMOTE), shlex.quote(json.dumps(payload, separators=(",", ":")))))
-    result = run(["ssh", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=5",
-                  role["ssh_target"], remote], check=False, capture_output=True, text=True, timeout=12)
+    target = f"{connection['user']}@{connection['host']}"
+    result = run(["ssh", "-i", connection["identity_file"], "-p", str(connection["port"]),
+                  "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oIdentitiesOnly=yes",
+                  "-oUserKnownHostsFile=" + connection["known_hosts"], "-oConnectTimeout=5",
+                  target, remote], check=False, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         raise RuntimeError("guest_probe_unreachable")
     value = json.loads(result.stdout)
@@ -83,19 +107,24 @@ def _ssh_probe(role: Mapping[str, Any], payload: dict, *, run: Callable[..., Any
 
 def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: float,
                run: Callable[..., Any] = subprocess.run, probe: Callable[..., dict] | None = None,
-               freshness_seconds: float = 120) -> dict:
-    errors = _validate_role(role, workspace, role_name)
+               freshness_seconds: float = 120, owned_role: Mapping[str, Any] | None = None,
+               timeout: float = 12) -> dict:
+    if not all(math.isfinite(value) for value in (now, freshness_seconds, timeout)) or freshness_seconds <= 0 or timeout <= 0:
+        return {"health": "unknown", "errors": ["observer_clock_or_probe_budget_invalid"]}
+    errors = _validate_role(role, workspace, role_name, owned_role)
     if errors:
         return {"health": "unknown", "errors": sorted(set(errors))}
     payload = {"workspace": workspace, "processes": role["processes"], "files": role["files"]}
     try:
-        result = (probe or (lambda r, p: _ssh_probe(r, p, run=run)))(role, payload)
+        result = (probe or (lambda r, p: _ssh_probe(r, p, timeout=timeout, run=run)))(role, payload)
     except Exception as exc:
         return {"health": "fault", "errors": ["guest_probe_unreachable" if isinstance(exc, (OSError, subprocess.SubprocessError, RuntimeError)) else "guest_probe_invalid"]}
+    if not isinstance(result, Mapping):
+        return {"health": "fault", "errors": ["guest_probe_malformed"]}
     problems = []
     for expected in role["processes"]:
         actual = result.get("processes", {}).get(expected["kind"], {})
-        if (actual.get("alive") is not True or actual.get("pid") != expected["pid"]
+        if (not isinstance(actual, Mapping) or actual.get("alive") is not True or actual.get("pid") != expected["pid"]
                 or actual.get("boot_id") != expected["boot_id"]
                 or actual.get("start_ticks") != expected["start_ticks"]):
             problems.append("process_identity_mismatch:" + expected["kind"])
@@ -105,14 +134,29 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
         if not isinstance(value, dict) or type(value.get("size")) is not int or value["size"] <= 0:
             problems.append("output_missing_or_empty:" + item["kind"])
             continue
-        if not (item["kind"] == "sockperf_chunk" and item.get("state") == "completed") and now - float(value.get("mtime", 0)) > freshness_seconds:
-            problems.append("output_stale:" + item["kind"])
+        try:
+            mtime = float(value["mtime"])
+            if not math.isfinite(mtime):
+                raise ValueError
+            if mtime > now + 5:
+                problems.append("output_time_in_future:" + item["kind"])
+            elif not (item["kind"] == "sockperf_chunk" and item.get("state") == "completed") and now - mtime > freshness_seconds:
+                problems.append("output_stale:" + item["kind"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            problems.append("output_timestamp_invalid:" + item["kind"])
     if role_name == "vm_a":
         current_chunks = [x for x in role["files"] if x["kind"] == "sockperf_chunk" and x["state"] == "current"]
-        if not any(isinstance(observed_files.get(x["path"]), dict)
-                   and observed_files[x["path"]].get("size", 0) > 0
-                   and now - float(observed_files[x["path"]].get("mtime", 0)) <= freshness_seconds
-                   for x in current_chunks):
+        fresh_current = False
+        for item in current_chunks:
+            value = observed_files.get(item["path"])
+            try:
+                mtime = float(value["mtime"])
+                fresh_current |= (isinstance(value, Mapping) and type(value.get("size")) is int
+                                  and value["size"] > 0 and math.isfinite(mtime)
+                                  and now - freshness_seconds <= mtime <= now + 5)
+            except (TypeError, ValueError, KeyError, OverflowError):
+                continue
+        if not fresh_current:
             problems.append("current_sockperf_chunk_not_fresh")
     return {"health": "fault" if problems else "healthy", "errors": sorted(set(problems))}
 
@@ -120,7 +164,9 @@ def probe_role(role: Mapping[str, Any], workspace: str, role_name: str, *, now: 
 def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,
                      run: Callable[..., Any] = subprocess.run, now: float | None = None,
                      probe: Callable[..., dict] | None = None,
-                     active_entry_ids: set[str] | None = None) -> dict:
+                     active_entry_ids: set[str] | None = None,
+                     probe_budget_seconds: float = 20,
+                     monotonic: Callable[[], float] = time.monotonic) -> dict:
     """Verify the hash-pinned binding against prepared stage IDs, then probe all roles."""
     try:
         raw = Path(bindings_path).read_bytes()
@@ -132,29 +178,65 @@ def observe_bindings(stage: Mapping[str, Any], bindings_path: Path, *,
                 or bindings.get("campaign_id") != stage.get("campaign_id")):
             return {"health": "fault", "errors": ["stage_binding_mismatch"]}
         at = __import__("time").time() if now is None else now
-        prepared = {item["entry_id"]: item for item in stage.get("entries", [])}
+        if not math.isfinite(at) or not math.isfinite(probe_budget_seconds) or probe_budget_seconds <= 0:
+            return {"health": "unknown", "errors": ["observer_clock_or_budget_invalid"]}
+        prepared_rows = stage.get("entries", [])
+        prepared = {item["entry_id"]: item for item in prepared_rows}
+        if len(prepared) != len(prepared_rows):
+            return {"health": "unknown", "errors": ["duplicate_prepared_entry"]}
         results = {}
         binding_entries = bindings.get("entries", [])
         if not isinstance(binding_entries, list):
             return {"health": "fault", "errors": ["guest_bindings_invalid"]}
-        if active_entry_ids is not None and {item.get("entry_id") for item in binding_entries} != active_entry_ids:
+        expected = set()
+        active_sources = [source for entry_id, source in prepared.items()
+                          if active_entry_ids is None or entry_id in active_entry_ids]
+        for source in active_sources:
+            for provider, run_id in source.get("run_ids", {}).items():
+                expected.add((source["entry_id"], provider, run_id))
+        actual = []
+        for item in binding_entries:
+            if not isinstance(item, dict):
+                return {"health": "fault", "errors": ["guest_bindings_invalid"]}
+            actual.append((item.get("entry_id"), item.get("provider"), item.get("run_id")))
+        if len(actual) != len(set(actual)):
+            return {"health": "fault", "errors": ["duplicate_guest_participant"]}
+        if set(actual) != expected:
             return {"health": "unknown", "errors": ["active_guest_binding_set_mismatch"]}
+        launch_path = Path(stage["observer_launch_receipt_path"])
+        launch_raw = launch_path.read_bytes()
+        if hashlib.sha256(launch_raw).hexdigest() != stage["observer_launch_receipt_sha256"]:
+            return {"health": "unknown", "errors": ["launch_receipt_hash_mismatch"]}
+        launch_receipt = json.loads(launch_raw)
+        if launch_receipt.get("stage_id") != stage.get("stage_id"):
+            return {"health": "unknown", "errors": ["launch_receipt_stage_mismatch"]}
+        owned = launch_receipt.get("participants", {})
+        expected_owned = {json.dumps(item, separators=(",", ":")) for item in expected}
+        if not isinstance(owned, dict) or set(owned) != expected_owned:
+            return {"health": "unknown", "errors": ["owned_launch_participant_set_mismatch"]}
+        deadline = monotonic() + probe_budget_seconds
         for entry in binding_entries:
             entry_id = entry.get("entry_id")
             source = prepared.get(entry_id)
-            if source is None or entry.get("provider") not in source.get("run_ids", {}):
-                results[str(entry_id)] = {"health": "fault", "errors": ["admitted_run_mismatch"]}
-                continue
             provider, run_id = entry["provider"], source["run_ids"][entry["provider"]]
+            result_key = json.dumps([entry_id, provider, run_id], separators=(",", ":"))
             runtime = json.loads(Path(source["runtime_config_path"]).read_text(encoding="utf-8"))
             workspace = runtime["access"]["bootstrap"]["workspace"]
             if (entry.get("run_id") != run_id or entry.get("deployment_id") != run_id + "-deployment"
                     or set(entry.get("roles", {})) != {"vm_a", "vm_b"}):
-                results[str(entry_id)] = {"health": "fault", "errors": ["admitted_run_mismatch"]}
+                results[result_key] = {"health": "fault", "errors": ["admitted_run_mismatch"]}
                 continue
-            role_results = {role: probe_role(binding, workspace, role, now=at, run=run, probe=probe)
-                            for role, binding in entry["roles"].items()}
-            results[str(entry_id)] = {"provider": provider, "run_id": run_id, "deployment_id": entry["deployment_id"],
+            participant_key = json.dumps([entry_id, provider, run_id], separators=(",", ":"))
+            owned_participant = owned.get(participant_key, {})
+            role_results = {}
+            for role, binding in entry["roles"].items():
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    role_results[role] = {"health": "fault", "errors": ["guest_probe_budget_exhausted"]}
+                else:
+                    role_results[role] = probe_role(binding, workspace, role, now=at, run=run, probe=probe,
+                        owned_role=owned_participant.get(role), timeout=min(12.0, remaining))
+            results[result_key] = {"provider": provider, "run_id": run_id, "deployment_id": entry["deployment_id"],
                                       "roles": role_results,
                                       "health": "healthy" if all(x["health"] == "healthy" for x in role_results.values()) else "fault"}
         return {"health": "healthy" if results and all(x["health"] == "healthy" for x in results.values()) else "fault",

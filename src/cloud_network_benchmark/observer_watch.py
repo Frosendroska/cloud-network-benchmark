@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import time
@@ -17,11 +18,16 @@ from typing import Callable, Sequence
 
 def _snapshot(path: Path, now: float, stale_after: float) -> tuple[str, dict]:
     try:
+        if not math.isfinite(now) or not math.isfinite(stale_after) or stale_after <= 0:
+            raise ValueError("watcher clock or staleness limit is invalid")
         value = json.loads(path.read_text(encoding="utf-8"))
         observed = datetime.fromisoformat(str(value["observed_at"]).replace("Z", "+00:00"))
         if observed.tzinfo is None:
             raise ValueError("observer timestamp must include a timezone")
-        age = max(0.0, now - observed.timestamp())
+        stamp = observed.timestamp()
+        if not math.isfinite(now) or not math.isfinite(stamp) or stamp > now + 5:
+            raise ValueError("observer timestamp is invalid or in the future")
+        age = max(0.0, now - stamp)
         if age > stale_after:
             return "stale_observer", {"age_seconds": int(age), "health": value.get("health")}
         if value.get("health") != "healthy":
@@ -36,7 +42,11 @@ def poll_once(state_root: Path, *, stale_after: float, now: float | None = None,
               notify: Callable[[dict], None] | None = None,
               previous_fingerprint: str | None = None) -> tuple[dict, str | None]:
     now = time.time() if now is None else now
-    status, details = _snapshot(Path(state_root) / "observer-status.json", now, stale_after)
+    if not math.isfinite(now) or not math.isfinite(stale_after) or stale_after <= 0:
+        now = time.time()
+        status, details = "observer_unavailable", {"age_seconds": None, "health": "unknown"}
+    else:
+        status, details = _snapshot(Path(state_root) / "observer-status.json", now, stale_after)
     event = {"event": status, "observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
              "state_root": str(state_root), **details}
     fingerprint = json.dumps({k: event.get(k) for k in ("event", "health", "missed_entries")}, sort_keys=True)
