@@ -220,46 +220,50 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         stage = plan["stage"]
         archive_sink = settings.get("archive_sink")
         if archive_sink is not None:
-            from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
-            required_archive_fields = {"mode", "bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-                "minimum_controller_free_bytes", "archive_root", "staging_directory", "source_credentials_file",
-                "expected_source_principal", "expected_project_id", "expected_service_account_email"}
+            from .gcs_archive import valid_bucket_name
             if (not isinstance(archive_sink, dict)
-                    or not required_archive_fields <= set(archive_sink)
-                    or set(archive_sink) - required_archive_fields
-                    or archive_sink.get("mode") != "impersonated_adc"
+                    or not {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                        "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+                        "controller_quota_free_bytes", "controller_quota_evidence_path",
+                        "controller_quota_evidence_sha256", "archive_root", "staging_directory"}.issubset(archive_sink)
+                    or set(archive_sink) - {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                        "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+                        "controller_quota_free_bytes", "controller_quota_evidence_path",
+                        "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"}
                     or not valid_bucket_name(archive_sink.get("bucket"))
-                    or not isinstance(archive_sink.get("source_credentials_file"), str)
-                    or not archive_sink["source_credentials_file"].strip()
-                    or not valid_archive_source(archive_sink.get("expected_source_principal"))
-                    or any(not isinstance(archive_sink[field], str) or not archive_sink[field].strip()
-                        for field in ("expected_project_id", "expected_service_account_email"))
-                    or not valid_archive_identity(archive_sink.get("expected_project_id"),
-                        archive_sink.get("expected_service_account_email"))
                     or type(archive_sink.get("maximum_staging_bytes")) is not int
                     or archive_sink["maximum_staging_bytes"] <= 0
                     or type(archive_sink.get("maximum_archive_bytes")) is not int
                     or archive_sink["maximum_archive_bytes"] <= 0
                     or type(archive_sink.get("minimum_controller_free_bytes")) is not int
-                    or archive_sink["minimum_controller_free_bytes"] < 0):
-                raise ValueError("archive_sink requires a bucket and measured archive, staging and free-space bounds")
+                    or archive_sink["minimum_controller_free_bytes"] < 0
+                    or type(archive_sink.get("minimum_guest_free_bytes")) is not int
+                    or archive_sink["minimum_guest_free_bytes"] < 0
+                    or type(archive_sink.get("maximum_capsule_bytes")) is not int
+                    or archive_sink["maximum_capsule_bytes"] <= 0
+                    or type(archive_sink.get("controller_quota_free_bytes")) is not int
+                    or archive_sink["controller_quota_free_bytes"] < 0):
+                raise ValueError("archive_sink requires measured guest/controller bounds and capsule state maximum")
+            _path(archive_sink["controller_quota_evidence_path"], "archive_sink.controller_quota_evidence_path", file=True)
+            from .storage_admission import validate_controller_quota_evidence
+            validate_controller_quota_evidence(archive_sink["controller_quota_free_bytes"],
+                archive_sink["controller_quota_evidence_path"], archive_sink["controller_quota_evidence_sha256"])
+            if "restore_path" in archive_sink:
+                _path(archive_sink["restore_path"], "archive_sink.restore_path")
+            for field in ("archive_root", "staging_directory"):
+                candidate = Path(archive_sink[field])
+                for base_name in ("results_root", "state_root"):
+                    base = Path(settings[base_name])
+                    if candidate == base or candidate in base.parents or base in candidate.parents:
+                        raise ValueError(f"archive_sink.{field} must not overlap {base_name}")
             _path(archive_sink["archive_root"], "archive_sink.archive_root")
             _path(archive_sink["staging_directory"], "archive_sink.staging_directory")
-            _path(archive_sink["source_credentials_file"], "archive_sink.source_credentials_file")
-            from .gcs_archive import _safe_source_adc
-            _safe_source_adc(archive_sink["source_credentials_file"], archive_sink["expected_source_principal"])
-            for label in ("archive_root", "staging_directory", "source_credentials_file"):
+            for label in ("archive_root", "staging_directory"):
                 candidate = Path(archive_sink[label])
                 for base_name in ("results_root", "state_root"):
                     base = Path(settings[base_name])
                     if candidate == base or candidate in base.parents or base in candidate.parents:
                         raise ValueError(f"archive_sink.{label} must not overlap {base_name}")
-                for other_label in ("archive_root", "staging_directory", "source_credentials_file"):
-                    if other_label == label:
-                        continue
-                    other = Path(archive_sink[other_label])
-                    if candidate == other or candidate in other.parents or other in candidate.parents:
-                        raise ValueError(f"archive_sink.{label} must not overlap archive_sink.{other_label}")
         _path(settings.get("state_root"), "state_root")
         _path(settings.get("results_root"), "results_root")
         if Path(settings["state_root"]) == Path(settings["results_root"]):
@@ -274,13 +278,12 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         if stage == "week":
             _validate_weekly_concurrency(gates["weekly_concurrency"])
         elif stage == "acceptance":
-            declaration = gates.get("paired_acceptance")
-            if declaration is not None and "acceptance" in settings.get("stage_inputs", {}):
-                fields = declaration.get("fields", {})
-                start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
-                if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-                        or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
-                    raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
+            declaration = gates["paired_acceptance"]
+            fields = declaration.get("fields", {})
+            start = _utc(settings["stage_inputs"][stage].get("start_utc"), "stage_inputs.acceptance.start_utc")
+            if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
+                    or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
+                raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
         _cost_payload(settings, root)
         if stage in {"day", "week"}:
             _common_n(settings)
@@ -371,13 +374,28 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             raise ValueError("set positive minimum_free_bytes from measured stage storage needs")
         if stage in {"day", "week"}:
             review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
+            remote_archive = archive_sink is not None
+            if remote_archive and review.get("capsule_state_manifest_bytes", 0) < archive_sink["maximum_capsule_bytes"]:
+                raise ValueError("storage review capsule state bound is below archive_sink.maximum_capsule_bytes")
+            if remote_archive and (review.get("controller_quota_free_bytes") != archive_sink["controller_quota_free_bytes"]
+                    or review.get("controller_quota_evidence_sha256") != archive_sink["controller_quota_evidence_sha256"]
+                    or review.get("controller_quota_evidence_path") != archive_sink["controller_quota_evidence_path"]):
+                raise ValueError("storage review controller quota does not match the archive sink evidence")
             validate_storage_review(stage, review, minimum_free_bytes=minimum,
-                                    results_path=Path(settings["results_root"]))
+                                    results_path=Path(settings["results_root"]),
+                                    storage_mode="remote_archive" if remote_archive else "local")
         disk_path = Path(settings["results_root"])
         while not disk_path.exists():
             disk_path = disk_path.parent
-        if shutil.disk_usage(disk_path).free < minimum:
-            raise ValueError("insufficient local free disk for the declared stage requirement")
+        storage_floor = (review.get("expected_concurrent_archive_part_count", 1)
+            * review.get("maximum_archive_part_bytes", 0)
+            + review.get("capsule_state_manifest_bytes", 0)
+            + review.get("controller_reserve_bytes", 0)) if stage in {"day", "week"} and archive_sink is not None else minimum
+        observed_storage_free = (archive_sink["controller_quota_free_bytes"]
+            if stage in {"day", "week"} and archive_sink is not None
+            else shutil.disk_usage(disk_path).free)
+        if observed_storage_free < storage_floor:
+            raise ValueError("measured destination quota or free space is below the declared stage requirement")
         # Check the installed bounded transport before read-only identity APIs.
         # Source-bound amounts and approval still fail closed at admission.
         if not local_preparation:
@@ -715,15 +733,13 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             prices_checked_on=cost_payload["prices_checked_on"],
             cost_input_sha256={"value": cost_payload["source_sha256"]},
             estimated_cost_usd={"value": float(estimated)})
+        data["scheduled_start"] = None
         config_path = generated / f"{entry_id.lower()}.yaml"
+        config_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        source_configs[entry_id] = (config_path, data)
+        config_paths[data["config_id"]] = config_path
         providers = data["selected_providers"]
         allowance = _allowance(settings, stage, providers)
-        allowance_seconds = sum(allowance[key] for key in ("registration_seconds", "provision_seconds",
-            "readiness_seconds", "stabilization_seconds", "measurement_seconds",
-            "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds"))
-        for provider in providers:
-            if allowance_seconds + allowance["provider_leads_seconds"][provider] > data["admission"]["lifetime_cap_seconds"]:
-                raise ValueError(f"{entry_id}: full setup, fixed-start wait, native phases, retrieval and cleanup do not fit {provider}'s original cap")
         prep = sum(allowance[k] for k in ("registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds"))
         if stage == "week":
             parts = entry_id.split("-")
@@ -734,23 +750,16 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         elif stage != "acceptance":
             scheduled = _utc(inputs["start_utc"], f"{stage}.start_utc")
             window = "night"
-        elif entry_id in {"V-S1", "V-S3"}:
-            scheduled = _utc(inputs["start_utc"], "acceptance.start_utc")
-            window = "acceptance"
         else:
             scheduled = None
             window = None
-        data["scheduled_start"] = scheduled.isoformat() if scheduled else None
-        config_path.write_text(yaml.safe_dump(data, sort_keys=False))
-        source_configs[entry_id] = (config_path, data)
-        config_paths[data["config_id"]] = config_path
         launch_at = scheduled - timedelta(seconds=prep) if scheduled else now
         if scheduled and launch_at <= now:
             raise ValueError(f"{entry_id}: setup lead time is already missed; explicitly review new timing, no backfill")
         end = (scheduled or now) + timedelta(seconds=allowance["measurement_seconds"] + allowance["measurement_shutdown_seconds"] + allowance["retrieval_seconds"] + allowance["cleanup_seconds"])
         if _utc(settings["credential_refresh"]["valid_through_utc"], "credential_refresh.valid_through_utc") < end:
             raise ValueError(f"credential_refresh evidence does not cover {entry_id} through cleanup")
-        if scheduled and stage != "acceptance":
+        if scheduled:
             schedule_rows.append([entry_id, data["config_id"], data["experiment_id"], scheduled.isoformat(), window, data["admission"]["priority"]])
         scenario = "S1" if alias in {"s1", "s1_acceptance"} else "S3" if alias in {"s3", "s3_acceptance"} else None
         entries.append({"entry_id": entry_id, "scenario": scenario,
@@ -765,7 +774,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         scheduled = entry["scheduled_start"]
         schedule_path = None
         selected_entry = None
-        if scheduled and stage != "acceptance":
+        if scheduled:
             row = next(row for row in schedule_rows if row[0] == entry["entry_id"])
             buffer = io.StringIO(newline="")
             writer = csv.writer(buffer)
@@ -813,14 +822,17 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "providers": provider_runtime, "approval_refs": approvals}
         if settings.get("archive_sink") is not None:
             runtime["archive_sink"] = copy.deepcopy(settings["archive_sink"])
+            if stage in {"day", "week"}:
+                review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
+                runtime["archive_sink"]["controller_quota_free_bytes"] = review["controller_quota_free_bytes"]
+                runtime["archive_sink"]["controller_quota_evidence_sha256"] = review["controller_quota_evidence_sha256"]
         runtime_path = private / entry["entry_id"] / "runtime.json"
         runtime_path.parent.mkdir(exist_ok=True, mode=0o700)
         atomic_write_json(runtime_path, runtime)
         entry.update(schedule_path=str(schedule_path) if schedule_path else None,
             row_id=entry["entry_id"] if scheduled else None, runtime_config_path=str(runtime_path),
             cost_inputs_path=str(cost_path), parent_manifest_path=str(parent_path),
-            run_ids={str(child.provider): child.run_id for child in initialized.children},
-            runtime_config_sha256=_sha(runtime_path))
+            run_ids={str(child.provider): child.run_id for child in initialized.children})
     stage_data = {"stage_id": stage_id, "stage": stage, "controller_session_id": session,
         "ledger_path": str(ledger_path), "scope_id": ledger["scope_id"], "state_root": str(state_root),
         "results_root": str(result), "repository_root": str(root), "entries": entries,

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import shlex
+import hashlib
+import json
 import time
 import threading
 from dataclasses import dataclass
@@ -59,15 +61,60 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         retrieve_closed_bundle_with_ledger)
     from .orchestration import ProviderStageOutcome, _remaining_f11_allowance
     from .lifecycle_guest import GuestRequest
+    from .post_measurement_barrier import PostMeasurementBarrier
 
-    if set(children) != {provider}:
-        raise ValueError("production remote stages require exactly one provider child")
+    selected = {str(getattr(value, "value", value)) for value in campaign.selected_providers}
+    if provider not in children or set(children) != selected:
+        raise ValueError("production remote stages require the complete selected provider child set")
     child = children[provider]
     observation = child.resolved_observation
     if (str(getattr(observation.provider, "value", observation.provider)) != provider
             or observation.mode != campaign.mode or observation.config_id != child.config_id
             or observation.experiment_id != child.experiment_id):
         raise ValueError("initialized provider observation identity does not match the child")
+    barrier = None
+    barrier_participant = None
+    barrier_spec = runtime.get("post_measurement_barrier")
+    if barrier_spec is None and archive_sink is not None:
+        participants = []
+        for selected_provider, selected_child in sorted(children.items()):
+            entry = getattr(getattr(selected_child.resolved_observation, "schedule_entry", None), "value", None)
+            participants.append({"entry_id": getattr(entry, "entry_id", None) or selected_child.run_id,
+                "provider": selected_provider, "run_id": selected_child.run_id})
+        barrier_id = "archive-post-close-" + hashlib.sha256(json.dumps(
+            participants, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
+        barrier_spec = {"schema_version": 1, "barrier_id": barrier_id,
+            "barrier_root": str(Path(archive_sink["archive_root"]) / ".post-measurement-barriers"),
+            "participants": participants}
+    if barrier_spec is not None:
+        barrier = PostMeasurementBarrier(barrier_spec)
+        schedule_entry = getattr(observation, "schedule_entry", None)
+        schedule_entry = getattr(schedule_entry, "value", None)
+        entry_id = getattr(schedule_entry, "entry_id", None) or child.run_id
+        matches = [row for row in barrier.spec["participants"]
+            if row["entry_id"] == entry_id and row["provider"] == provider
+            and row["run_id"] == child.run_id]
+        if len(matches) != 1:
+            raise ValueError("prepared post-measurement barrier does not contain this exact child")
+        barrier_participant = matches[0]
+    measurement_start_barrier = None
+    measurement_start_participant = None
+    start_spec = runtime.get("measurement_start_barrier")
+    if start_spec is not None:
+        measurement_start_barrier = PostMeasurementBarrier(start_spec)
+        if len(measurement_start_barrier.spec["participants"]) != 6:
+            raise ValueError("measurement-start barrier must bind the exact six paired participants")
+        schedule_entry = getattr(observation, "schedule_entry", None)
+        schedule_entry = getattr(schedule_entry, "value", None)
+        entry_id = getattr(schedule_entry, "entry_id", None) or child.run_id
+        matches = [row for row in measurement_start_barrier.spec["participants"]
+            if row["entry_id"] == entry_id and row["provider"] == provider
+            and row["run_id"] == child.run_id]
+        if len(matches) != 1:
+            raise ValueError("prepared measurement-start barrier does not contain this exact child")
+        if not measurement_start_barrier.spec.get("start_utc"):
+            raise ValueError("measurement-start barrier requires one frozen UTC start")
+        measurement_start_participant = matches[0]
     revision = child.config_provenance.implementation_git_commit.value
     if not revision:
         raise ValueError("initialized implementation revision is unavailable")
@@ -92,6 +139,13 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
         # owns the SSH stop operation and records whether process absence was
         # actually verified. Setting an Event alone is never reported as stop.
         cancel_event.set()
+        if barrier is not None:
+            try:
+                barrier.abort("participant_cancelled", nonblocking=True)
+            except (TimeoutError, InterruptedError):
+                pass
+            except Exception:
+                pass
         with control_lock:
             return {"requested": True, "verified_stopped": False,
                     "invocation_id": (control["process_record"] or {}).get("invocation_id")}
@@ -165,8 +219,19 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     {"failure": "F11 measurement remainder is insufficient", "reasons": fit.reason_codes})
             start_mono, start_utc = clock.monotonic(), clock.utc_now()
             slot = item.observation.scheduled_start
-            wait_until = max(start_mono + 60.0,
-                start_mono + max(0.0, (slot - start_utc).total_seconds()) if slot else start_mono)
+            if measurement_start_barrier is not None:
+                frozen_start = datetime.fromisoformat(
+                    measurement_start_barrier.spec["start_utc"].replace("Z", "+00:00"))
+                if slot is None or abs((slot - frozen_start).total_seconds()) > 1e-6:
+                    raise ValueError("paired scheduled_start must equal its source-bound frozen UTC start")
+                until_slot = (frozen_start - start_utc).total_seconds()
+                if until_slot <= 60.0:
+                    raise TimeoutError("paired preparation did not finish at least 60 seconds before frozen start")
+                wait_until = start_mono + max(60.0, until_slot - 60.0)
+            else:
+                # Ordinary single-run scheduling retains its existing wait behavior.
+                wait_until = max(start_mono + 60.0,
+                    start_mono + max(0.0, (slot - start_utc).total_seconds()) if slot else start_mono)
             if wait_until + allowance.measurement_seconds + allowance.retrieval_seconds + allowance.cleanup_seconds > item.deadline.overall_deadline_monotonic:
                 return ProviderStageOutcome("stabilize", False,
                     {"failure": "stabilization and remaining stages do not fit the original cap"})
@@ -193,6 +258,41 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if item.stable is None or item.prepared is None or not item.prepared.succeeded:
                 return ProviderStageOutcome("measure", False,
                     {"failure": "successful preparation and stabilization are required"})
+            if measurement_start_barrier is not None:
+                measurement_start_barrier.signal_terminal(measurement_start_participant,
+                    succeeded=True, deadline=item.deadline, clock=clock.monotonic)
+                measurement_start_barrier.wait_released(deadline=item.deadline,
+                    clock=clock.monotonic, cancelled=cancel_event.is_set, sleep=sleep)
+                frozen_start = datetime.fromisoformat(
+                    measurement_start_barrier.spec["start_utc"].replace("Z", "+00:00"))
+                now_utc = clock.utc_now()
+                if now_utc >= frozen_start:
+                    measurement_start_barrier.abort("participants_not_ready_before_frozen_start",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("paired participants missed the frozen measurement start")
+                delay = (frozen_start - now_utc).total_seconds()
+                if delay > item.deadline.remaining(clock.monotonic, cleanup=True):
+                    measurement_start_barrier.abort("frozen_start_outside_original_deadline",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("frozen measurement start exceeds the original deadline")
+                required_after_start = (sum(float(unit.measured_seconds) for unit in item.observation.measurement_units)
+                    + float(runtime["allowance"].measurement_shutdown_seconds)
+                    + float(runtime["allowance"].retrieval_seconds))
+                if delay + required_after_start > item.deadline.remaining(clock.monotonic, cleanup=True):
+                    measurement_start_barrier.abort("measurement_and_retrieval_do_not_fit_original_deadline",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("frozen start leaves insufficient measured and retrieval time before cleanup reserve")
+                target_mono = clock.monotonic() + max(0.0, delay)
+                while clock.monotonic() < target_mono:
+                    if cancel_event.is_set() or item.deadline.remaining(clock.monotonic, cleanup=True) <= required_after_start:
+                        measurement_start_barrier.abort("cancelled_or_cap_too_short_before_frozen_start",
+                            deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                        raise InterruptedError("frozen measurement start wait lost its original cap fit")
+                    sleep(min(0.25, target_mono - clock.monotonic()))
+                if clock.utc_now() < frozen_start:
+                    measurement_start_barrier.abort("utc_monotonic_start_mapping_was_early",
+                        deadline=item.deadline, clock=clock.monotonic, nonblocking=True)
+                    raise TimeoutError("monotonic start mapping preceded the frozen UTC boundary")
             pair, connection = pair_of(provision), item.connection
             bootstrap = item.prepared.evidence["bootstrap"]
             guest_runtime = item.prepared.evidence["guest_runtime"]
@@ -323,6 +423,9 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                             and not item.closures[role].failures for role in ("vm_a", "vm_b"))
                     and item.listener_closure.closed and item.listener_closure.closed_at is not None
                     and not item.listener_closure.failures):
+                if barrier is not None:
+                    barrier.signal_terminal(barrier_participant, succeeded=True,
+                        deadline=item.deadline, clock=clock.monotonic)
                 return ProviderStageOutcome("close", True,
                     {"diagnostics": item.closures, "listeners": item.listener_closure,
                      "measurement_ended_at": item.measurement_ended_at})
@@ -350,16 +453,31 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 and not item.listener_closure.failures
                 and item.guest is not None and measurement_closed_at is not None)
             item.closures["vm_a_measurement_closed_at"] = measurement_closed_at
+            if barrier is not None:
+                barrier.signal_terminal(barrier_participant, succeeded=valid,
+                    deadline=item.deadline, clock=clock.monotonic)
             return ProviderStageOutcome("close", valid,
                 {"diagnostics": closures, "listeners": item.listener_closure,
                  "measurement_ended_at": item.measurement_ended_at})
         except Exception as exc:
+            if barrier is not None:
+                try:
+                    barrier.signal_terminal(barrier_participant, succeeded=False,
+                        deadline=item.deadline, clock=clock.monotonic)
+                except Exception:
+                    pass
             return ProviderStageOutcome("close", False,
                 {"failure": f"{type(exc).__name__}: producer closure failed"})
 
     def retrieve(deployment: Any, provision: Any):
         try:
             item = attempt(deployment, provision)
+            if barrier is not None:
+                # Close callbacks write only genuine observed terminal results.
+                # Archive, retrieval, and upload cannot start until every
+                # source-bound participant has reached successful closure.
+                barrier.wait_released(deadline=item.deadline, clock=clock.monotonic,
+                    cancelled=cancel_event.is_set, sleep=sleep)
             closures = item.closures or {}
             close_a, close_b = closures.get("vm_a"), closures.get("vm_b")
             if (close_a is None or close_b is None or close_a.closed_at is None or close_b.closed_at is None
@@ -414,83 +532,113 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                 timeout_seconds=item.connection.timeouts.transfer_seconds,
                 controller_materialized_ids=[record.artifact_id for record in materialized])
             item.manifest = manifest
-            item.retrieval = retrieve_closed_bundle_with_ledger(ledger=ledger,
-                reservation_id=reservation.reservation_id.value, recovery_path=recovery_path,
-                allowance=_remaining_f11_allowance(runtime["allowance"], "retrieval"),
-                connection=item.connection, manifest=manifest, runner=runner,
-                filesystem=item.result_root, deadline=item.deadline,
-                provider_trigger=deployment.expiry.value.expires_at.value,
-                retry_seconds=float(runtime["copy_retry_seconds"]), now_utc=clock.utc_now,
-                clock=clock.monotonic, compressed_transfer=True)
-            if archive_sink is not None:
-                # Explicitly configured controller-only post-close sink. This
-                # runs after measured traffic and complete native retrieval.
-                from .gcs_archive import GoogleCloudStorageBackend, relay_closed_native_tree
-                bucket = archive_sink.get("bucket")
-                maximum_staging_bytes = archive_sink.get("maximum_staging_bytes")
-                maximum_archive_bytes = archive_sink.get("maximum_archive_bytes")
-                minimum_free = archive_sink.get("minimum_controller_free_bytes")
-                if not item.retrieval.complete:
-                    item.retrieval = item.retrieval.model_copy(update={
-                        "complete": False,
-                        "failures": [*item.retrieval.failures,
-                            {"reason": "GCS archive withheld: closed native retrieval incomplete"}],
-                        "archive_status": {"status": "withheld", "verified": False,
-                            "reason": "closed native retrieval incomplete"}})
-                else:
-                    status_path = None
-                    try:
-                        staging_root = Path(archive_sink["staging_directory"])
-                        if staging_root.is_symlink() or not staging_root.is_dir():
-                            raise ValueError("configured controller staging directory is unavailable")
-                        archive_root = Path(archive_sink["archive_root"])
-                        if archive_root.is_symlink():
-                            raise ValueError("archive status root cannot be a symlink")
-                        archive_root.mkdir(parents=True, exist_ok=True)
-                        status_path = archive_root / f"{provider}-{pair_of(provision).identity.run_id}.status.json"
-                        credential_evidence = {"credential_mode": "impersonated_adc",
-                            "credential_status": "configured_not_live_qualified",
-                            "source_principal": archive_sink["expected_source_principal"],
-                            "target_project_id": archive_sink["expected_project_id"],
-                            "target_service_account": archive_sink["expected_service_account_email"],
-                            "target_scope": "https://www.googleapis.com/auth/devstorage.read_write",
-                            "token_lifetime_seconds": 900}
-                        def report_archive_progress(status):
-                            safe = {key: status[key] for key in ("status", "verified", "verified_parts",
-                                "verified_bytes", "manifest_sha256", "completion_generation",
-                                "archive_bytes", "error", "partial_object_count") if key in status}
-                            safe.update(credential_evidence)
-                            temporary = status_path.with_suffix(".partial")
-                            temporary.write_text(json.dumps(safe, sort_keys=True) + "\n", encoding="utf-8")
-                            temporary.replace(status_path)
-                        backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket,
-                            source_credentials_file=archive_sink["source_credentials_file"],
-                            expected_source_principal=archive_sink["expected_source_principal"],
-                            expected_project_id=archive_sink.get("expected_project_id"),
-                            expected_service_account_email=archive_sink.get("expected_service_account_email"))
-                        archive_status = relay_closed_native_tree(item.result_root,
-                            backend=backend, bucket=bucket, provider=provider,
-                            experiment_id=child.experiment_id, run_id=pair_of(provision).identity.run_id,
-                            maximum_staging_bytes=maximum_staging_bytes,
-                            closure_verified=item.retrieval.complete,
-                            maximum_archive_bytes=maximum_archive_bytes,
-                            minimum_controller_free_bytes=minimum_free,
-                            staging_directory=staging_root, deadline=item.deadline,
-                            clock=clock.monotonic, status_callback=report_archive_progress)
-                        archive_status.update(credential_evidence)
-                        item.retrieval = item.retrieval.model_copy(update={"archive_status": archive_status})
-                    except Exception as exc:
-                        if status_path is not None:
-                            report_archive_progress({"status": "failed", "verified": False,
-                                "error": type(exc).__name__, "partial_object_count": len(
-                                    getattr(exc, "partial_objects", []))})
-                        item.retrieval = item.retrieval.model_copy(update={"complete": False,
-                            "cleanup_required": True,
-                            "failures": [*item.retrieval.failures,
-                                {"reason": "GCS archive failed; originals retained and provider cleanup continues"}],
-                            "archive_status": {"status": "failed", "verified": False,
-                                "error": f"{type(exc).__name__}: archive sink failed",
-                                "partial_objects": getattr(exc, "partial_objects", [])}})
+            if archive_sink is None:
+                item.retrieval = retrieve_closed_bundle_with_ledger(ledger=ledger,
+                    reservation_id=reservation.reservation_id.value, recovery_path=recovery_path,
+                    allowance=_remaining_f11_allowance(runtime["allowance"], "retrieval"),
+                    connection=item.connection, manifest=manifest, runner=runner,
+                    filesystem=item.result_root, deadline=item.deadline,
+                    provider_trigger=deployment.expiry.value.expires_at.value,
+                    retry_seconds=float(runtime["copy_retry_seconds"]), now_utc=clock.utc_now,
+                    clock=clock.monotonic, compressed_transfer=True)
+            else:
+                from .gcs_archive import GoogleCloudStorageBackend, publish_guest_archive_parts
+                from .guest_archive import create_remote_guest_archive
+                from .retrieval import RetrievalResult
+                import hashlib
+                bucket = archive_sink["bucket"]
+                max_staging = int(archive_sink["maximum_staging_bytes"])
+                max_archive = int(archive_sink["maximum_archive_bytes"])
+                min_free = int(archive_sink["minimum_controller_free_bytes"])
+                staging_root = Path(archive_sink["staging_directory"])
+                if staging_root.is_symlink() or not staging_root.is_dir():
+                    raise ValueError("configured controller one-part staging directory is unavailable")
+                fit = ledger.check_stage_fit(reservation.reservation_id.value, stage="retrieval",
+                    remaining=_remaining_f11_allowance(runtime["allowance"], "retrieval"))
+                if getattr(fit, "eligible", None) is not True:
+                    raise ValueError("result-transfer retrieval stage is not admitted by the current ledger")
+                max_part = min(max_staging, 0xFFFFFFFF)
+                guest_archives = []
+                total_projection = 0
+                inventory_by_role = {}
+                for role in ("vm_a", "vm_b"):
+                    rows_by_path = {row["path"]: dict(row) for row in item.inventories[role].files}
+                    workspace = Path(manifest.remote_workspace)
+                    selected = []
+                    for native in manifest.items:
+                        if native.source_role != role:
+                            continue
+                        try:
+                            relative = Path(native.source_path).relative_to(workspace).as_posix()
+                        except ValueError as exc:
+                            raise ValueError("closed native source path escaped the measured workspace") from exc
+                        row = rows_by_path.get(relative)
+                        if (row is None or row["size_bytes"] != native.expected_size_bytes
+                                or row["sha256"] != native.expected_sha256):
+                            raise ValueError("closed role inventory differs from its declared native artifacts")
+                        selected.append(row)
+                    if not selected:
+                        raise ValueError(f"closed native inventory has no declared artifacts for {role}")
+                    inventory_by_role[role] = selected
+                    rows = selected
+                    from .closed_archive import projected_archive_upper_bound
+                    total_projection += projected_archive_upper_bound(sum(row["size_bytes"] for row in rows), len(rows))
+                if total_projection > max_archive:
+                    raise ValueError("closed guest archives exceed the configured aggregate archive byte bound")
+                for role in ("vm_a", "vm_b"):
+                    guest_dir = f"/tmp/cnb-closed-{deployment.deployment_id}-{role}"
+                    guest_archives.append(create_remote_guest_archive(item.connection, role=role,
+                        source_directory=manifest.remote_workspace, archive_directory=guest_dir,
+                        expected_inventory=inventory_by_role[role],
+                        maximum_part_bytes=max_part, maximum_archive_bytes=max_archive,
+                        minimum_free_bytes=int(archive_sink.get("minimum_guest_free_bytes", min_free)),
+                        runner=runner, deadline=item.deadline, clock=clock.monotonic))
+                actions = [action for archive in guest_archives for action in archive["actions"]]
+                part_counter = 0
+                def fetch_part(role: str, part: dict) -> Path:
+                    nonlocal part_counter
+                    part_counter += 1
+                    remaining = item.deadline.remaining(clock.monotonic, cleanup=True)
+                    size = part["size_bytes"]
+                    if (remaining <= 0 or size > max_staging
+                            or archive_sink["controller_quota_free_bytes"] < size + min_free):
+                        raise OSError("one bounded guest part does not fit the original retrieval window or staging quota")
+                    rec = ledger.inspect()["reservations"].get(reservation.reservation_id.value, {})
+                    if rec.get("execution_scope") == "paid_request":
+                        attempt_id = f"{deployment.deployment_id}:guest-archive:{role}:{part['path']}"
+                        if not ledger.debit_result_transfer(reservation.reservation_id.value,
+                                provider=provider, attempt_id=attempt_id, maximum_payload_bytes=size):
+                            raise ValueError("result-transfer ledger denied this exact guest part")
+                    vm = item.connection.vm_a if role == "vm_a" else item.connection.vm_b
+                    destination = staging_root / f".{deployment.deployment_id}-{role}-{part_counter:06d}.part"
+                    if destination.exists() or destination.is_symlink():
+                        raise FileExistsError("one-part staging destination already exists")
+                    archive_dir = next(row["archive_directory"] for row in guest_archives if row["role"] == role)
+                    remote = f"{vm.user}@{vm.host}:{archive_dir}/{part['path']}"
+                    request = _request(f"f09-guest-part-{deployment.deployment_id}-{role}-{part_counter}",
+                        vm, [remote, str(destination)], min(item.connection.timeouts.transfer_seconds, remaining), "scp")
+                    result = _execute(runner, request)
+                    actions.append(_action(request.action_id, request.action_type, vm, request, result))
+                    if result.outcome != CommandOutcome.SUCCEEDED:
+                        destination.unlink(missing_ok=True)
+                        raise RuntimeError(f"one bounded archive part retrieval failed for {role}")
+                    if destination.is_symlink() or not destination.is_file() or destination.stat().st_size != size:
+                        destination.unlink(missing_ok=True)
+                        raise ValueError("retrieved guest part differs from its frozen byte bound")
+                    return destination
+                backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket)
+                archive_status = publish_guest_archive_parts(guest_archives=guest_archives,
+                    fetch_part=fetch_part, staging_directory=staging_root, backend=backend,
+                    bucket=bucket, provider=provider, experiment_id=child.experiment_id,
+                    run_id=pair_of(provision).identity.run_id, maximum_part_bytes=max_part,
+                    maximum_archive_bytes=max_archive, minimum_controller_free_bytes=min_free,
+                    controller_quota_free_bytes=archive_sink["controller_quota_free_bytes"],
+                    closed_inventory=manifest.model_dump(mode="json"), deadline=item.deadline,
+                    clock=clock.monotonic)
+                archive_status["actions"] = actions
+                item.retrieval = RetrievalResult(complete=True, cleanup_required=True,
+                    actions=actions, records=[], failures=[],
+                    archive_status={**archive_status, "validation_state": "archive_pending_validation"})
             return ProviderStageOutcome("retrieve", item.retrieval.complete
                 and not item.retrieval.failures, item.retrieval)
         except Exception as exc:

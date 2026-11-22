@@ -14,8 +14,10 @@ import shutil
 import stat
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
+
+from .closed_archive import FAT32_FILE_LIMIT
 
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -617,9 +619,12 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
             partial.pop(manifest_key, None)
         objects = [*uploaded, {"key": manifest_key, "size_bytes": len(manifest_bytes),
             "sha256": manifest_sha, "generation": manifest_generation}]
-        completion = {"schema_version": 1, "manifest_sha256": manifest_sha,
+        # Completion v2 binds every object generation as well as bytes. This
+        # lets a later roomy-destination retrieval reject same-key replacement.
+        completion = {"schema_version": 2, "manifest_sha256": manifest_sha,
             "objects": [{"key": item["key"], "size_bytes": item["size_bytes"],
-                         "sha256": item["sha256"]} for item in objects]}
+                         "sha256": item["sha256"], "generation": item["generation"]}
+                        for item in objects]}
         completion_bytes = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode()
         completion_sha = hashlib.sha256(completion_bytes).hexdigest()
         if prior_completion is not None:
@@ -683,3 +688,475 @@ def relay_closed_native_tree(source_directory: Path, *, backend: GCSObjectBacken
     finally:
         if archive_dir is not None:
             archive_dir.cleanup()
+
+
+def publish_guest_archive_parts(*, guest_archives: list[dict], fetch_part: Callable[[str, dict], Path],
+        staging_directory: Path,
+        backend: GCSObjectBackend, bucket: str, provider: str, experiment_id: str, run_id: str,
+        closed_inventory: dict,
+        maximum_part_bytes: int, maximum_archive_bytes: int, minimum_controller_free_bytes: int,
+        controller_quota_free_bytes: int,
+        deadline: Any, clock: Callable[[], float] = time.monotonic,
+        chunk_bytes: int = 8 * 1024 * 1024) -> dict:
+    """Publish already guest-compressed role parts and immutable receipts.
+
+    Only one controller part exists at a time. The logical manifest is
+    preflighted before the first create, then parts, manifest and completion
+    are uploaded create-only and read back by generation.
+    """
+    if not valid_bucket_name(bucket) or provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive destination identity is invalid")
+    if not all(_ID.fullmatch(value) for value in (experiment_id, run_id)):
+        raise ValueError("experiment and run identities must be stable safe identifiers")
+    if (type(maximum_part_bytes) is not int or maximum_part_bytes <= 0
+            or type(maximum_archive_bytes) is not int or maximum_archive_bytes <= 0
+            or type(minimum_controller_free_bytes) is not int or minimum_controller_free_bytes < 0
+            or type(controller_quota_free_bytes) is not int or controller_quota_free_bytes < 0):
+        raise ValueError("guest archive size and reserve limits must be nonnegative bounded integers")
+    if {row.get("role") for row in guest_archives} != {"vm_a", "vm_b"} or len(guest_archives) != 2:
+        raise ValueError("guest archive role inventory must contain VM A and VM B exactly once")
+    def remaining():
+        value = deadline.remaining(clock, cleanup=True)
+        if value <= 0:
+            raise TimeoutError("archive transfer reached the original deadline or cleanup reserve")
+        return value
+    roles = []
+    expected_parts = []
+    for archive in sorted(guest_archives, key=lambda value: value["role"]):
+        role, manifest = archive["role"], archive["manifest"]
+        if role not in {"vm_a", "vm_b"} or not isinstance(manifest, dict):
+            raise ValueError("guest archive role manifest is invalid")
+        files, parts = manifest.get("files"), manifest.get("parts")
+        if not isinstance(files, list) or not files or not isinstance(parts, list) or not parts:
+            raise ValueError("guest archive inventory or parts are incomplete")
+        roles.append({"role": role, "files": files, "raw_bytes": manifest.get("raw_bytes"),
+            "archive_bytes": manifest.get("archive_bytes"), "archive_sha256": manifest.get("archive_sha256"),
+            "parts": parts})
+        for index, part in enumerate(parts, 1):
+            if (part.get("path") != f"archive.tar.gz.part-{index:05d}"
+                    or type(part.get("size_bytes")) is not int
+                    or not 0 < part["size_bytes"] <= min(maximum_part_bytes, FAT32_FILE_LIMIT)
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))):
+                raise ValueError("guest part sequence or byte bound is invalid")
+            expected_parts.append((role, part["size_bytes"], part))
+    staging_directory = Path(staging_directory)
+    if staging_directory.is_symlink() or not staging_directory.is_dir():
+        raise ValueError("one-part staging directory must be an existing real directory")
+    prefix = f"cnb/v1/{provider}/{experiment_id}/{run_id}/"
+    manifest = {"schema_version": 1, "provider": provider, "experiment_id": experiment_id,
+        "run_id": run_id, "closed_inventory": closed_inventory, "roles": roles}
+    manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    expected_archive_total = sum(size for _role, size, _part in expected_parts)
+    if expected_archive_total > maximum_archive_bytes or len(manifest_bytes) > maximum_part_bytes:
+        raise ValueError("guest archive aggregate or immutable manifest exceeds configured bounds")
+    peak_staged = max(max(size for _role, size, _part in expected_parts), len(manifest_bytes))
+    if peak_staged + minimum_controller_free_bytes > controller_quota_free_bytes:
+        raise OSError("measured controller user quota cannot hold one bounded archive object plus reserve")
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest_key, completion_key = prefix + "manifest.json", prefix + "complete.json"
+    # A preoccupied prefix is closed; do not mutate it, even if incomplete.
+    if backend.stat(manifest_key, timeout_seconds=remaining()) is not None or backend.stat(
+            completion_key, timeout_seconds=remaining()) is not None:
+        raise ValueError("logical run prefix is already occupied")
+    part_keys = [f"{prefix}parts/{role}/{part['path']}-{part['sha256']}"
+        for role, _size, part in expected_parts]
+    for key in part_keys:
+        if backend.stat(key, timeout_seconds=remaining()) is not None:
+            raise ValueError("logical run prefix contains an occupied part before upload")
+    objects = []
+    for role, size, part in expected_parts:
+        path = Path(fetch_part(role, part))
+        if path.parent.resolve() != staging_directory.resolve() or path.is_symlink() or not path.is_file():
+            raise ValueError("guest part fetch did not return a file in the bounded staging directory")
+        try:
+            if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
+                raise ValueError("guest part failed controller size/hash verification")
+            key = f"{prefix}parts/{role}/{part['path']}-{part['sha256']}"
+            created = backend.upload(key, path, size_bytes=size, sha256=part["sha256"],
+                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+            generation = str(created.get("generation", ""))
+            if not generation or created.get("size_bytes") != size:
+                raise ValueError("GCS create response omitted the exact immutable object identity")
+            backend.download(key, path, maximum_bytes=maximum_part_bytes,
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(path, maximum_part_bytes, lambda: remaining()) != (size, part["sha256"]):
+                raise ValueError("GCS generation-bound part readback failed")
+            objects.append({"key": key, "size_bytes": size, "sha256": part["sha256"], "generation": generation})
+        finally:
+            path.unlink(missing_ok=True)
+    for key, content, digest in ((manifest_key, manifest_bytes, manifest_sha),):
+        if len(content) + minimum_controller_free_bytes > controller_quota_free_bytes:
+            raise OSError("measured controller user quota cannot hold the immutable archive manifest")
+        with tempfile.TemporaryDirectory(prefix="cnb-guest-meta-", dir=staging_directory) as temp:
+            source = Path(temp) / "metadata.json"
+            source.write_bytes(content)
+            created = backend.upload(key, source, size_bytes=len(content), sha256=digest,
+                if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+            generation = str(created.get("generation", ""))
+            if not generation or created.get("size_bytes") != len(content):
+                raise ValueError("GCS metadata create response omitted its immutable identity")
+            readback = Path(temp) / "readback.json"
+            backend.download(key, readback, maximum_bytes=max(maximum_part_bytes, len(content)),
+                timeout_seconds=remaining(), generation=generation)
+            if _hash(readback, max(maximum_part_bytes, len(content)), lambda: remaining()) != (len(content), digest):
+                raise ValueError("GCS manifest generation-bound readback failed")
+        objects.append({"key": key, "size_bytes": len(content), "sha256": digest, "generation": generation})
+    completion = {"schema_version": 2, "manifest_sha256": manifest_sha,
+        "objects": objects}
+    complete_bytes = (json.dumps(completion, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if (len(complete_bytes) > maximum_part_bytes
+            or len(complete_bytes) + minimum_controller_free_bytes > controller_quota_free_bytes):
+        raise OSError("measured controller user quota cannot hold the immutable completion receipt")
+    complete_sha = hashlib.sha256(complete_bytes).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="cnb-guest-complete-", dir=staging_directory) as temp:
+        source = Path(temp) / "complete.json"
+        source.write_bytes(complete_bytes)
+        created = backend.upload(completion_key, source, size_bytes=len(complete_bytes), sha256=complete_sha,
+            if_generation_match=0, chunk_bytes=chunk_bytes, timeout_seconds=remaining())
+        completion_generation = str(created.get("generation", ""))
+        if not completion_generation or created.get("size_bytes") != len(complete_bytes):
+            raise ValueError("GCS completion create response omitted immutable identity")
+        readback = Path(temp) / "readback.json"
+        backend.download(completion_key, readback, maximum_bytes=max(maximum_part_bytes, len(complete_bytes)),
+            timeout_seconds=remaining(), generation=completion_generation)
+        if _hash(readback, max(maximum_part_bytes, len(complete_bytes)), lambda: remaining()) != (len(complete_bytes), complete_sha):
+            raise ValueError("GCS completion generation-bound readback failed")
+    for row in [*objects, {"key": completion_key, "generation": completion_generation,
+                           "size_bytes": len(complete_bytes)}]:
+        current = backend.stat(row["key"], timeout_seconds=remaining())
+        if current is None or str(current.get("generation")) != row["generation"] or current.get("size_bytes") != row["size_bytes"]:
+            raise ValueError("a verified archive generation changed before acceptance")
+    return {"status": "verified", "verified": True, "validation_state": "archive_pending_validation",
+        "bucket": bucket, "prefix": prefix, "manifest_sha256": manifest_sha,
+        "manifest": manifest, "objects": objects, "completion_generation": completion_generation,
+        "archive_bytes": expected_archive_total, "run_id": run_id}
+
+
+def materialize_verified_archive(*, backend: GCSObjectBackend, bucket: str, provider: str,
+        experiment_id: str, run_id: str, expected_manifest_sha256: str,
+        archive_directory: Path, materialization_root: Path,
+        maximum_part_bytes: int, minimum_free_bytes: int = 0) -> dict:
+    """Download a completed archive by generation, verify, then extract safely.
+
+    Without a replay callback the returned receipt explicitly remains pending;
+    archive integrity alone never upgrades data validation.
+    """
+    from .closed_archive import verify_and_extract_archive
+
+    if not valid_bucket_name(bucket) or provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive destination identity is invalid")
+    if not all(_ID.fullmatch(value) for value in (experiment_id, run_id)):
+        raise ValueError("experiment and run identities must be stable safe identifiers")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256):
+        raise ValueError("expected manifest digest must be a SHA-256 identity")
+    if type(maximum_part_bytes) is not int or maximum_part_bytes <= 0:
+        raise ValueError("maximum materialized part bytes must be positive")
+    if type(minimum_free_bytes) is not int or minimum_free_bytes < 0:
+        raise ValueError("minimum materialization headroom must be nonnegative")
+    archive_directory, materialization_root = Path(archive_directory), Path(materialization_root)
+    for path, label in ((archive_directory, "archive directory"),
+                        (materialization_root, "materialization root")):
+        if path.is_symlink() or not path.is_dir() or path.resolve(strict=True) != path.absolute():
+            raise ValueError(f"{label} must be an existing real directory without symlink components")
+    destination = materialization_root / f"{provider}-{experiment_id}-{run_id}-native"
+    local_archive = archive_directory / f"{provider}-{experiment_id}-{run_id}.archive"
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("native materialization destination must be new")
+    if local_archive.exists() or local_archive.is_symlink():
+        raise FileExistsError("archive staging destination must be new")
+
+    prefix = f"cnb/v1/{provider}/{experiment_id}/{run_id}/"
+    complete_key, manifest_key = prefix + "complete.json", prefix + "manifest.json"
+    complete_ref = backend.stat(complete_key, timeout_seconds=30)
+    if not complete_ref or not complete_ref.get("generation"):
+        raise ValueError("archive completion marker is absent")
+    complete_path = archive_directory / f".{provider}-{experiment_id}-{run_id}.complete.partial"
+    if complete_path.exists() or complete_path.is_symlink():
+        raise FileExistsError("completion staging path is occupied")
+    try:
+        backend.download(complete_key, complete_path, maximum_bytes=maximum_part_bytes,
+            timeout_seconds=30, generation=str(complete_ref["generation"]))
+        complete = json.loads(complete_path.read_bytes())
+        if complete.get("schema_version") == 1:
+            raise ValueError("legacy archive completion schema v1 is unsupported for generation-bound restoration")
+        if (complete.get("schema_version") != 2
+                or complete.get("manifest_sha256") != expected_manifest_sha256
+                or not isinstance(complete.get("objects"), list)):
+            raise ValueError("completion marker does not bind the requested archive")
+        objects = complete["objects"]
+        keys = [row.get("key") for row in objects if isinstance(row, dict)]
+        if len(keys) != len(objects) or len(set(keys)) != len(keys) or manifest_key not in keys:
+            raise ValueError("completion object inventory is malformed")
+        rows_by_key = {row["key"]: row for row in objects}
+        manifest_ref = backend.stat(manifest_key, timeout_seconds=30)
+        manifest_row = rows_by_key[manifest_key]
+        if (manifest_ref is None or not manifest_ref.get("generation")
+                or manifest_ref.get("size_bytes") != manifest_row.get("size_bytes")
+                or type(manifest_row.get("size_bytes")) is not int
+                or not 0 < manifest_row["size_bytes"] <= maximum_part_bytes):
+            raise ValueError("manifest generation or size differs from completion")
+        local_archive.mkdir(mode=0o700)
+        manifest_path = local_archive / "manifest.json"
+        backend.download(manifest_key, manifest_path, maximum_bytes=maximum_part_bytes,
+            timeout_seconds=30, generation=str(manifest_ref["generation"]))
+        manifest_bytes = manifest_path.read_bytes()
+        if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha256:
+            raise ValueError("manifest bytes do not match the bound digest")
+        manifest = json.loads(manifest_bytes)
+        parts = manifest.get("parts")
+        if not isinstance(parts, list) or not parts:
+            raise ValueError("archive manifest has no part inventory")
+        expected = {manifest_key: (len(manifest_bytes), expected_manifest_sha256)}
+        part_key_by_name = {}
+        for number, part in enumerate(parts, 1):
+            if (not isinstance(part, dict) or part.get("path") != f"archive.tar.gz.part-{number:05d}"
+                    or type(part.get("size_bytes")) is not int
+                    or not 0 < part["size_bytes"] <= maximum_part_bytes
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))):
+                raise ValueError("archive manifest part identity is invalid")
+            key = f"{prefix}parts/{number:08d}-{part['sha256']}"
+            expected[key] = (part["size_bytes"], part["sha256"])
+            part_key_by_name[key] = part["path"]
+        if set(keys) != set(expected):
+            raise ValueError("completion and manifest inventories differ")
+        required = sum(size for size, _digest in expected.values()) + minimum_free_bytes
+        if shutil.disk_usage(archive_directory).free < required:
+            raise OSError("analysis destination lacks archive bytes plus required headroom")
+        for key, (size, digest) in expected.items():
+            row = rows_by_key[key]
+            current = backend.stat(key, timeout_seconds=30)
+            if (current is None or not current.get("generation")
+                    or current.get("generation") != row.get("generation")
+                    or current.get("size_bytes") != size or row.get("size_bytes") != size):
+                raise ValueError("archive object generation or size differs from completion")
+            if key == manifest_key:
+                continue
+            target = local_archive / part_key_by_name[key]
+            backend.download(key, target, maximum_bytes=maximum_part_bytes,
+                timeout_seconds=30, generation=str(current["generation"]))
+            if _hash(target, maximum_part_bytes, lambda: None) != (size, digest):
+                raise ValueError("downloaded archive part failed byte-count or SHA-256 verification")
+        final_ref = backend.stat(complete_key, timeout_seconds=30)
+        if final_ref is None or final_ref.get("generation") != complete_ref["generation"]:
+            raise ValueError("completion marker changed during materialization")
+        native_manifest = verify_and_extract_archive(local_archive, destination,
+            expected_manifest_sha256=expected_manifest_sha256,
+            free_bytes=lambda path: shutil.disk_usage(path).free,
+            minimum_headroom_bytes=minimum_free_bytes)
+        receipt = {"status": "materialized_pending_replay", "verified": True,
+            "validation_status": "not_validated", "replay_status": "not_run",
+            "bucket": bucket, "prefix": prefix, "manifest_sha256": expected_manifest_sha256,
+            "archive_path": str(local_archive), "native_root": str(destination),
+            "raw_bytes": native_manifest["raw_bytes"], "archive_bytes": native_manifest["archive_bytes"],
+            "completion_generation": str(complete_ref["generation"])}
+        return receipt
+    except BaseException:
+        shutil.rmtree(local_archive, ignore_errors=True)
+        if destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        complete_path.unlink(missing_ok=True)
+
+
+def materialize_verified_guest_archives(*, backend: GCSObjectBackend, bucket: str,
+        provider: str, experiment_id: str, run_id: str, expected_manifest_sha256: str,
+        archive_directory: Path, materialization_root: Path, maximum_part_bytes: int,
+        minimum_free_bytes: int = 0) -> dict:
+    """Restore a role-separated guest archive into one replay-native tree.
+
+    Every part is generation-bound through the immutable completion receipt,
+    verified against the guest manifest, and safely extracted before any file
+    is published into the native result root.
+    """
+    from .closed_archive import verify_and_extract_archive
+    from .retrieval import RetrievalManifest
+    if not valid_bucket_name(bucket) or provider not in {"aws", "azure", "gcp"}:
+        raise ValueError("archive destination identity is invalid")
+    if not all(_ID.fullmatch(value) for value in (experiment_id, run_id)):
+        raise ValueError("experiment and run identities must be stable safe identifiers")
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_manifest_sha256):
+        raise ValueError("expected manifest digest must be a SHA-256 identity")
+    if type(maximum_part_bytes) is not int or maximum_part_bytes <= 0 or type(minimum_free_bytes) is not int or minimum_free_bytes < 0:
+        raise ValueError("restore part bound and free-space reserve must be valid integers")
+    archive_directory, materialization_root = Path(archive_directory), Path(materialization_root)
+    for path, label in ((archive_directory, "archive staging directory"), (materialization_root, "native restore directory")):
+        if path.is_symlink() or not path.is_dir() or path.resolve(strict=True) != path.absolute():
+            raise ValueError(f"{label} must be an existing real directory without symlink components")
+    if archive_directory.stat().st_dev != materialization_root.stat().st_dev:
+        raise ValueError("archive and restore staging must share a filesystem to keep the measured peak bounded")
+    destination = materialization_root / f"{provider}-{experiment_id}-{run_id}-native"
+    local_archive = archive_directory / f"{provider}-{experiment_id}-{run_id}.guest-archive"
+    if destination.exists() or destination.is_symlink() or local_archive.exists() or local_archive.is_symlink():
+        raise FileExistsError("guest archive restore destinations must be new")
+    prefix = f"cnb/v1/{provider}/{experiment_id}/{run_id}/"
+    complete_key, manifest_key = prefix + "complete.json", prefix + "manifest.json"
+    complete_ref = backend.stat(complete_key, timeout_seconds=30)
+    if not complete_ref or not complete_ref.get("generation"):
+        raise ValueError("archive completion marker is absent")
+    complete_path = archive_directory / f".{run_id}.guest-complete.partial"
+    if complete_path.exists() or complete_path.is_symlink():
+        raise FileExistsError("completion staging path is occupied")
+    created_native_dirs = []
+    try:
+        backend.download(complete_key, complete_path, maximum_bytes=maximum_part_bytes,
+            timeout_seconds=30, generation=str(complete_ref["generation"]))
+        completion = json.loads(complete_path.read_bytes())
+        if (completion.get("schema_version") != 2 or completion.get("manifest_sha256") != expected_manifest_sha256
+                or not isinstance(completion.get("objects"), list)):
+            raise ValueError("completion receipt does not bind the requested role archive")
+        refs = {row.get("key"): row for row in completion["objects"] if isinstance(row, dict)}
+        if len(refs) != len(completion["objects"]) or len(refs) != len(completion["objects"]):
+            raise ValueError("completion object generation inventory is malformed")
+        manifest_ref = refs.get(manifest_key)
+        if manifest_ref is None or type(manifest_ref.get("size_bytes")) is not int or not 0 < manifest_ref["size_bytes"] <= maximum_part_bytes:
+            raise ValueError("completion receipt has no bounded immutable manifest entry")
+        current_manifest = backend.stat(manifest_key, timeout_seconds=30)
+        if (current_manifest is None or str(current_manifest.get("generation")) != str(manifest_ref.get("generation"))
+                or current_manifest.get("size_bytes") != manifest_ref["size_bytes"]
+                or manifest_ref.get("sha256") != expected_manifest_sha256):
+            raise ValueError("archive manifest object generation differs from completion")
+        local_archive.mkdir(mode=0o700)
+        manifest_path = local_archive / "manifest.json"
+        backend.download(manifest_key, manifest_path, maximum_bytes=maximum_part_bytes,
+            timeout_seconds=30, generation=str(current_manifest["generation"]))
+        manifest_bytes = manifest_path.read_bytes()
+        if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha256:
+            raise ValueError("archive manifest bytes differ from its pinned digest")
+        manifest = json.loads(manifest_bytes)
+        if any(manifest.get(field) != value for field, value in (("provider", provider),
+                ("experiment_id", experiment_id), ("run_id", run_id))):
+            raise ValueError("archive manifest identity differs from the requested run")
+        closed = RetrievalManifest.model_validate(manifest.get("closed_inventory"))
+        if closed.identity.get("run_id") != run_id or closed.identity.get("provider") != provider:
+            raise ValueError("closed retrieval inventory identity differs from the archive path")
+        role_rows = manifest.get("roles")
+        if not isinstance(role_rows, list) or {row.get("role") for row in role_rows if isinstance(row, dict)} != {"vm_a", "vm_b"}:
+            raise ValueError("archive must contain exactly both VM role manifests")
+        expected_by_role = {}
+        for role in ("vm_a", "vm_b"):
+            expected_by_role[role] = []
+            for item in closed.items:
+                if item.source_role == role:
+                    relative = str(PurePosixPath(item.source_path).relative_to(PurePosixPath(closed.remote_workspace)))
+                    expected_by_role[role].append({"path": relative,
+                        "size_bytes": item.expected_size_bytes, "sha256": item.expected_sha256})
+        expected_keys = {manifest_key}
+        total_archive_bytes = 0
+        total_raw_bytes = sum(item.expected_size_bytes for item in closed.items)
+        if total_raw_bytes + minimum_free_bytes > shutil.disk_usage(materialization_root).free:
+            raise OSError("native restore destination lacks raw payload plus measured headroom")
+        projected_archive_bytes = 0
+        for role_row in role_rows:
+            parts = role_row.get("parts")
+            if not isinstance(parts, list) or not parts:
+                raise ValueError("role archive part list is empty")
+            size_sum = 0
+            for number, part in enumerate(parts, 1):
+                if (part.get("path") != f"archive.tar.gz.part-{number:05d}"
+                        or type(part.get("size_bytes")) is not int
+                        or not 0 < part["size_bytes"] <= maximum_part_bytes
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))):
+                    raise ValueError("role archive part declaration is malformed")
+                size_sum += part["size_bytes"]
+            if size_sum != role_row.get("archive_bytes"):
+                raise ValueError("role archive total differs from its ordered part sizes")
+            projected_archive_bytes += size_sum
+        required_peak = total_raw_bytes + projected_archive_bytes + minimum_free_bytes
+        if shutil.disk_usage(archive_directory).free < required_peak:
+            raise OSError("restore filesystem lacks compressed archive, native output and reserve peak")
+        role_native = []
+        for role_row in role_rows:
+            role = role_row["role"]
+            expected_files = sorted(expected_by_role[role], key=lambda row: row["path"])
+            files = role_row.get("files")
+            if not expected_files or files != expected_files:
+                raise ValueError("role archive files differ from the frozen retrieval inventory")
+            parts = role_row.get("parts")
+            if not isinstance(parts, list) or not parts:
+                raise ValueError("role archive part list is empty")
+            standard = {"schema_version": 1, "format": "deterministic-tar-gzip",
+                "raw_bytes": sum(row["size_bytes"] for row in files),
+                "archive_bytes": role_row.get("archive_bytes"),
+                "archive_sha256": role_row.get("archive_sha256"), "files": files, "parts": parts}
+            # Guest role receipts bind the exact deterministic ClosedArchive manifest.
+            if (type(standard["archive_bytes"]) is not int or standard["archive_bytes"] <= 0
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(standard["archive_sha256"]))):
+                raise ValueError("role archive total identity is malformed")
+            role_dir = local_archive / role
+            role_dir.mkdir(mode=0o700)
+            (role_dir / "manifest.json").write_text(json.dumps(standard, sort_keys=True,
+                separators=(",", ":")) + "\n", encoding="utf-8")
+            for number, part in enumerate(parts, 1):
+                if (part.get("path") != f"archive.tar.gz.part-{number:05d}"
+                        or type(part.get("size_bytes")) is not int
+                        or not 0 < part["size_bytes"] <= maximum_part_bytes
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(part.get("sha256", "")))):
+                    raise ValueError("role archive part declaration is malformed")
+                key = f"{prefix}parts/{role}/{part['path']}-{part['sha256']}"
+                expected_keys.add(key)
+                ref = refs.get(key)
+                current = backend.stat(key, timeout_seconds=30)
+                if (ref is None or current is None or str(ref.get("generation")) != str(current.get("generation"))
+                        or current.get("size_bytes") != part["size_bytes"] or ref.get("size_bytes") != part["size_bytes"]
+                        or ref.get("sha256") != part["sha256"]):
+                    raise ValueError("role part generation or size differs from completion receipt")
+                target = role_dir / part["path"]
+                backend.download(key, target, maximum_bytes=maximum_part_bytes,
+                    timeout_seconds=30, generation=str(current["generation"]))
+                if _hash(target, maximum_part_bytes, lambda: None) != (part["size_bytes"], part["sha256"]):
+                    raise ValueError("restored role part failed size or SHA-256 verification")
+                total_archive_bytes += part["size_bytes"]
+            native = local_archive / f"{role}-native"
+            verify_and_extract_archive(role_dir, native,
+                expected_manifest_sha256=hashlib.sha256((role_dir / "manifest.json").read_bytes()).hexdigest())
+            role_native.append((role, native))
+        if set(refs) != expected_keys:
+            raise ValueError("completion object inventory differs from the role manifests")
+        current_complete = backend.stat(complete_key, timeout_seconds=30)
+        if current_complete is None or str(current_complete.get("generation")) != str(complete_ref["generation"]):
+            raise ValueError("completion marker changed during restore")
+        for key, row in refs.items():
+            current = backend.stat(key, timeout_seconds=30)
+            if (current is None or str(current.get("generation")) != str(row.get("generation"))
+                    or current.get("size_bytes") != row.get("size_bytes")):
+                raise ValueError("a manifest-recorded object changed before restored native publication")
+        destination.mkdir(mode=0o700)
+        for role, root in role_native:
+            by_source = {item.source_path: item for item in closed.items if item.source_role == role}
+            for item in by_source.values():
+                relative = str(PurePosixPath(item.source_path).relative_to(PurePosixPath(closed.remote_workspace)))
+                source = root / relative
+                size, digest = _hash(source, total_raw_bytes, lambda: None)
+                if (size, digest) != (item.expected_size_bytes, item.expected_sha256):
+                    raise ValueError("restored native file differs from its lifecycle artifact record")
+                target = destination / item.destination_path
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError("native restore artifact path is occupied")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+        expected_inventory = sorted(({"path": item.destination_path,
+            "size_bytes": item.expected_size_bytes, "sha256": item.expected_sha256} for item in closed.items),
+            key=lambda row: row["path"])
+        actual_inventory = []
+        for path in sorted(destination.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("restored native tree contains a symlink")
+            if path.is_file():
+                size, digest = _hash(path, total_raw_bytes, lambda: None)
+                actual_inventory.append({"path": path.relative_to(destination).as_posix(),
+                    "size_bytes": size, "sha256": digest})
+        if actual_inventory != expected_inventory:
+            raise ValueError("published native inventory differs from the immutable closed inventory")
+        return {"status": "materialized_pending_replay", "verified": True,
+            "validation_status": "not_validated", "replay_status": "not_run", "bucket": bucket,
+            "prefix": prefix, "manifest_sha256": expected_manifest_sha256, "manifest": manifest,
+            "archive_path": str(local_archive), "native_root": str(destination),
+            "raw_bytes": total_raw_bytes, "archive_bytes": total_archive_bytes,
+            "completion_generation": str(complete_ref["generation"])}
+    except BaseException:
+        shutil.rmtree(local_archive, ignore_errors=True)
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        complete_path.unlink(missing_ok=True)

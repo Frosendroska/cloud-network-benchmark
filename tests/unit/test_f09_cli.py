@@ -52,7 +52,7 @@ def test_cli_requires_explicit_paid_scope_for_run():
 
 def test_root_cli_keeps_existing_commands_and_delegates_lifecycle_help(capsys):
     for args, expected in ((["--help"], ("validate", "resolve", "dry-run", "init", "analyze", "lifecycle")),
-                           (["lifecycle", "--help"], ("preview", "run", "cleanup", "recommend-common-n"))):
+                           (["lifecycle", "--help"], ("preview", "run", "cleanup", "recommend-common-n", "replay-archives"))):
         try:
             root_main(args)
         except SystemExit as exc:

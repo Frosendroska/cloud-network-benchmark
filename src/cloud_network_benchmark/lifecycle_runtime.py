@@ -80,11 +80,9 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("runtime configuration is not valid UTF-8 JSON") from exc
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
-    optional = ({"archive_sink"} if isinstance(raw, dict) and "archive_sink" in raw else set())
-    optional |= ({"post_measurement_barrier"} if isinstance(raw, dict) and "post_measurement_barrier" in raw else set())
-    optional |= ({"measurement_start_barrier"} if isinstance(raw, dict) and "measurement_start_barrier" in raw else set())
-    root = _keys(raw, root_keys | optional,
-        "runtime config")
+    optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
+        "measurement_start_barrier") if isinstance(raw, dict) and key in raw}
+    root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
     root["initialized_campaign_manifest"] = _source_path(path.parent,
@@ -98,28 +96,28 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
     if "archive_sink" in root:
-        required_sink_fields = {"mode", "bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-            "minimum_controller_free_bytes", "archive_root", "staging_directory", "source_credentials_file",
-            "expected_source_principal", "expected_project_id", "expected_service_account_email"}
-        sink = root["archive_sink"]
-        if (not isinstance(sink, dict) or not required_sink_fields <= set(sink)
-                or set(sink) - required_sink_fields):
-            raise ValueError("archive_sink has missing or unsupported fields")
-        from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
-        if (sink["mode"] != "impersonated_adc"
-                or not valid_bucket_name(sink["bucket"])
-                or not isinstance(sink["source_credentials_file"], str) or not sink["source_credentials_file"].strip()
-                or not valid_archive_source(sink["expected_source_principal"])
-                or any(not isinstance(sink[field], str) or not sink[field].strip()
-                    for field in ("expected_project_id", "expected_service_account_email"))
-                or not valid_archive_identity(sink["expected_project_id"], sink["expected_service_account_email"])
+        sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+            "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+            "controller_quota_free_bytes", "controller_quota_evidence_path",
+            "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"},
+            "archive_sink")
+        from .gcs_archive import valid_bucket_name
+        if (not valid_bucket_name(sink["bucket"])
                 or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
                 or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
                 or type(sink["minimum_controller_free_bytes"]) is not int
-                or sink["minimum_controller_free_bytes"] < 0):
+                or sink["minimum_controller_free_bytes"] < 0
+                or type(sink["minimum_guest_free_bytes"]) is not int or sink["minimum_guest_free_bytes"] < 0
+                or type(sink["maximum_capsule_bytes"]) is not int or sink["maximum_capsule_bytes"] <= 0
+                or type(sink["controller_quota_free_bytes"]) is not int or sink["controller_quota_free_bytes"] < 0):
             raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
-        for field in ("archive_root", "staging_directory", "source_credentials_file"):
+        for field in ("controller_quota_evidence_path", "archive_root", "staging_directory"):
             sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
+        if "restore_path" in sink:
+            sink["restore_path"] = _source_path(path.parent, sink["restore_path"], "archive_sink.restore_path", must_exist=False)
+        from .storage_admission import validate_controller_quota_evidence
+        validate_controller_quota_evidence(sink["controller_quota_free_bytes"],
+            sink["controller_quota_evidence_path"], sink["controller_quota_evidence_sha256"])
     if "post_measurement_barrier" in root:
         barrier = _keys(root["post_measurement_barrier"],
             {"schema_version", "barrier_id", "barrier_root", "expected_participants"},
@@ -252,7 +250,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs must be a map of existing F11 gate names to evidence files")
     allowed_gates = {"f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n",
         "study_window", "calibration_authorized", "diagnostic_day_authorized", "size_export_review",
-            "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance"}
+        "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance"}
     if set(root["approval_refs"]) - allowed_gates:
         raise ValueError("approval_refs names an unknown F11 gate")
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")
@@ -666,7 +664,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
             actual_stages = {}
             for provider, child in children.items():
                 actual_stages[provider] = build_provider_remote_stages(provider=provider,
-                    campaign=campaign, parent=parent, children={provider: child}, runtime=runtime,
+                    campaign=campaign, parent=parent, children=children, runtime=runtime,
                     ledger=ledger, reservation=reservation, runner=runner, clock=clock,
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",

@@ -175,18 +175,18 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     archive_root, staging_root = tmp_path / "archive", tmp_path / "archive-staging"
     archive_root.mkdir()
     staging_root.mkdir()
-    source_adc = tmp_path / "human-adc.json"
-    source_adc.write_text(json.dumps({"type": "authorized_user", "client_id": "client",
-        "client_secret": "secret", "refresh_token": "refresh",
-        "quota_project_id": "project-a70f8497-3463-4ef2-9cd", "universe_domain": "googleapis.com"}))
-    source_adc.chmod(0o600)
-    settings["archive_sink"] = {"mode": "impersonated_adc", "bucket": "valid-bucket", "maximum_staging_bytes": 8192,
+    quota_evidence = tmp_path / "quota-evidence.json"
+    quota_payload = json.dumps({"measured_free_bytes": 1_000_000}, sort_keys=True).encode()
+    quota_evidence.write_bytes(quota_payload)
+    settings["archive_sink"] = {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
         "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
-        "archive_root": str(archive_root), "staging_directory": str(staging_root),
-        "source_credentials_file": str(source_adc),
-        "expected_source_principal": "katyabraun0@gmail.com",
-        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
-        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"}
+        "minimum_guest_free_bytes": 2048, "maximum_capsule_bytes": 65536,
+        "controller_quota_free_bytes": 1_000_000,
+        "controller_quota_evidence_path": str(quota_evidence),
+        "controller_quota_evidence_sha256": hashlib.sha256(quota_payload).hexdigest(),
+        "restore_path": str(tmp_path / "restore"),
+        "archive_root": str(archive_root), "staging_directory": str(staging_root)}
+
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
     register_generated_cleanup(stage, request)
@@ -194,12 +194,9 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     runtime = load_runtime_config(Path(entry["runtime_config_path"]))
     assert runtime["archive_sink"]["bucket"] == "valid-bucket"
     assert runtime["archive_sink"]["maximum_archive_bytes"] == 1_000_000
+    assert runtime["archive_sink"]["maximum_capsule_bytes"] == 65536
     assert runtime["archive_sink"]["archive_root"] == archive_root
     assert runtime["archive_sink"]["staging_directory"] == staging_root
-    assert runtime["archive_sink"]["mode"] == "impersonated_adc"
-    assert runtime["archive_sink"]["source_credentials_file"] == source_adc
-    assert runtime["archive_sink"]["expected_source_principal"] == "katyabraun0@gmail.com"
-    assert runtime["archive_sink"]["expected_project_id"] == "project-a70f8497-3463-4ef2-9cd"
 
 
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):

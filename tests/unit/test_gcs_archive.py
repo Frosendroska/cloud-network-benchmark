@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from cloud_network_benchmark.closed_archive import create_closed_archive
-from cloud_network_benchmark.gcs_archive import upload_sealed_archive
+from cloud_network_benchmark.gcs_archive import upload_sealed_archive, publish_guest_archive_parts
 
 
 class Deadline:
@@ -98,6 +98,52 @@ def test_upload_is_immutable_verified_idempotent_and_keeps_native_sources(tmp_pa
         key: value for key, value in second.items() if key != "staging_filesystem_free_bytes"}
     assert first["staging_peak_bytes"] <= 8192
     assert {p.name: p.read_bytes() for p in source.iterdir()} == original
+
+
+def test_guest_parts_publish_generation_bound_manifest_and_completion(tmp_path):
+    backend = FakeGCS()
+    staging = tmp_path / "staging"; staging.mkdir()
+    content = b"closed-native-part"
+    digest = hashlib.sha256(content).hexdigest()
+    part = {"path": "archive.tar.gz.part-00001", "size_bytes": len(content), "sha256": digest}
+    guest_archives = [{"role": role, "manifest": {"files": [{"path": f"{role}/run.csv",
+        "size_bytes": 17, "sha256": "b" * 64}], "parts": [part], "raw_bytes": 17,
+        "archive_bytes": len(content), "archive_sha256": digest}} for role in ("vm_a", "vm_b")]
+    def fetch(role, selected):
+        assert role in {"vm_a", "vm_b"} and selected == part
+        path = staging / "one.part"; path.write_bytes(content); return path
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="approved-later", provider="aws",
+        experiment_id="exp-001", run_id="run-001", closed_inventory={"items": []},
+        maximum_part_bytes=4096, maximum_archive_bytes=4096, minimum_controller_free_bytes=0,
+        controller_quota_free_bytes=100_000, deadline=Deadline(), clock=lambda: 0.0)
+    assert receipt["status"] == "verified"
+    assert receipt["validation_state"] == "archive_pending_validation"
+    assert [row["role"] for row in receipt["manifest"]["roles"]] == ["vm_a", "vm_b"]
+    assert receipt["completion_generation"]
+    assert not list(staging.iterdir())
+
+
+def test_guest_part_publish_preflights_occupied_prefix_without_mutation(tmp_path):
+    backend = FakeGCS()
+    prefix = "cnb/v1/aws/exp-001/run-001/"
+    backend.objects[prefix + "manifest.json"] = (b"occupied", "prior")
+    staging = tmp_path / "staging"; staging.mkdir()
+    called = []
+    content = b"part"; digest = hashlib.sha256(content).hexdigest()
+    part = {"path": "archive.tar.gz.part-00001", "size_bytes": len(content), "sha256": digest}
+    with pytest.raises(ValueError, match="already occupied"):
+        publish_guest_archive_parts(guest_archives=[{"role": role, "manifest": {
+            "files": [{"path": f"{role}/run.csv", "size_bytes": 1, "sha256": "c" * 64}],
+            "parts": [part], "raw_bytes": 1, "archive_bytes": len(content), "archive_sha256": digest}}
+            for role in ("vm_a", "vm_b")],
+            fetch_part=lambda *_: called.append(True),
+            staging_directory=staging, backend=backend, bucket="approved-later", provider="aws",
+            experiment_id="exp-001", run_id="run-001", closed_inventory={}, maximum_part_bytes=4096,
+            maximum_archive_bytes=4096, minimum_controller_free_bytes=0, controller_quota_free_bytes=4096,
+            deadline=Deadline(), clock=lambda: 0.0)
+    assert called == []
+    assert list(backend.objects) == [prefix + "manifest.json"]
 
 
 def test_requires_sealed_archive_and_rejects_changed_part_after_seal(tmp_path):
@@ -694,6 +740,141 @@ def test_bounded_relay_requires_closed_sources_and_uses_one_deadline(tmp_path):
             closure_verified=True, maximum_archive_bytes=2_000_000, minimum_controller_free_bytes=0,
             staging_directory=tmp_path, deadline=ExpiringDeadline())
     assert all(path.is_file() for path in source.iterdir())
+
+
+def _published_archive(tmp_path, *, run_id="replay-001"):
+    from cloud_network_benchmark.gcs_archive import relay_closed_native_tree
+    source, _unused = _archive(tmp_path)
+    backend = FakeGCS()
+    status = relay_closed_native_tree(source, backend=backend, bucket="valid-bucket",
+        provider="aws", experiment_id="exp-001", run_id=run_id,
+        maximum_staging_bytes=4096, closure_verified=True, maximum_archive_bytes=2_000_000,
+        minimum_controller_free_bytes=0, staging_directory=tmp_path, deadline=Deadline())
+    raw_bytes = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+    assert raw_bytes > status["staging_peak_bytes"]
+    assert status["staging_peak_bytes"] <= 4096
+    completion = json.loads(backend.objects[f"{status['prefix']}complete.json"][0])
+    assert completion["schema_version"] == 2
+    assert all(row.get("generation") for row in completion["objects"])
+    return source, backend, status
+
+
+def test_materialize_verified_archive_stays_pending_until_explicit_replay(tmp_path):
+    from cloud_network_benchmark.gcs_archive import materialize_verified_archive
+    source, backend, uploaded = _published_archive(tmp_path)
+    archive_destination = tmp_path / "analysis-archive"
+    archive_destination.mkdir()
+    native_destination = tmp_path / "analysis-native"
+    native_destination.mkdir()
+    receipt = materialize_verified_archive(backend=backend, bucket="valid-bucket",
+        provider="aws", experiment_id="exp-001", run_id="replay-001",
+        expected_manifest_sha256=uploaded["manifest_sha256"],
+        archive_directory=archive_destination, materialization_root=native_destination,
+        maximum_part_bytes=4096)
+    assert receipt["status"] == "materialized_pending_replay"
+    assert receipt["validation_status"] == "not_validated"
+    assert receipt["replay_status"] == "not_run"
+    assert (Path(receipt["native_root"]) / "sockperf.csv").read_bytes() == (source / "sockperf.csv").read_bytes()
+
+    second_archive = tmp_path / "analysis-archive-2"
+    second_archive.mkdir()
+    second_native = tmp_path / "analysis-native-2"
+    second_native.mkdir()
+    with pytest.raises(TypeError, match="replay"):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=second_archive, materialization_root=second_native,
+            maximum_part_bytes=4096,
+            replay=lambda _root: {"validation_status": "valid", "result_id": "fabricated"})
+
+
+def test_guest_archive_is_deterministic_bounded_and_preserves_native_sources(tmp_path):
+    from cloud_network_benchmark.guest_archive import create_guest_archive
+    source, _unused = _archive(tmp_path)
+    original = {path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*") if path.is_file()}
+    from cloud_network_benchmark.closed_archive import projected_archive_upper_bound
+    upper_bound = projected_archive_upper_bound(sum(map(len, original.values())), len(original))
+    first = create_guest_archive(source, tmp_path / "guest-archive-a",
+        maximum_part_bytes=4096, maximum_archive_bytes=upper_bound, minimum_free_bytes=0)
+    second = create_guest_archive(source, tmp_path / "guest-archive-b",
+        maximum_part_bytes=4096, maximum_archive_bytes=upper_bound, minimum_free_bytes=0)
+    assert first == second
+    assert all(row["size_bytes"] <= 4096 for row in first["parts"])
+    assert {path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*") if path.is_file()} == original
+
+
+def test_guest_archive_rejects_output_inside_source_and_projection_over_limit(tmp_path):
+    from cloud_network_benchmark.guest_archive import create_guest_archive
+    source, _unused = _archive(tmp_path)
+    with pytest.raises(ValueError, match="inside"):
+        create_guest_archive(source, source / ".archive", maximum_part_bytes=4096,
+            maximum_archive_bytes=2_000_000, minimum_free_bytes=0)
+    with pytest.raises(ValueError, match="upper bound"):
+        create_guest_archive(source, tmp_path / "too-large", maximum_part_bytes=4096,
+            maximum_archive_bytes=1, minimum_free_bytes=0)
+
+
+@pytest.mark.parametrize("corruption", ["missing_part", "generation", "content"])
+def test_materialization_rejects_missing_or_changed_remote_part(tmp_path, corruption):
+    from cloud_network_benchmark.gcs_archive import materialize_verified_archive
+    _source, backend, uploaded = _published_archive(tmp_path)
+    prefix = "cnb/v1/aws/exp-001/replay-001/"
+    manifest = json.loads(backend.objects[prefix + "manifest.json"][0])
+    key = prefix + "parts/00000001-" + manifest["parts"][0]["sha256"]
+    if corruption == "missing_part":
+        backend.objects.pop(key)
+    elif corruption == "generation":
+        content, _generation = backend.objects[key]
+        backend.objects[key] = (content, "altered-generation")
+    else:
+        content, generation = backend.objects[key]
+        backend.objects[key] = (content + b"corrupt", generation)
+    archive_destination = tmp_path / "analysis-archive"
+    archive_destination.mkdir()
+    native_destination = tmp_path / "analysis-native"
+    native_destination.mkdir()
+    with pytest.raises((ValueError, FileNotFoundError, RuntimeError)):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=archive_destination, materialization_root=native_destination,
+            maximum_part_bytes=4096)
+    assert not list(native_destination.iterdir())
+
+
+def test_materialization_rejects_unsafe_or_occupied_destinations_and_fabricated_replay(tmp_path):
+    from cloud_network_benchmark.gcs_archive import materialize_verified_archive
+    _source, backend, uploaded = _published_archive(tmp_path)
+    archive_destination = tmp_path / "analysis-archive"
+    archive_destination.mkdir()
+    native_destination = tmp_path / "analysis-native"
+    native_destination.mkdir()
+    occupied = native_destination / "aws-exp-001-replay-001-native"
+    occupied.mkdir()
+    with pytest.raises(FileExistsError):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=archive_destination, materialization_root=native_destination,
+            maximum_part_bytes=4096)
+    occupied.rmdir()
+    unsafe_root = tmp_path / "unsafe-link"
+    unsafe_root.symlink_to(native_destination, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=archive_destination, materialization_root=unsafe_root,
+            maximum_part_bytes=4096)
+    with pytest.raises(TypeError, match="replay"):
+        materialize_verified_archive(backend=backend, bucket="valid-bucket",
+            provider="aws", experiment_id="exp-001", run_id="replay-001",
+            expected_manifest_sha256=uploaded["manifest_sha256"],
+            archive_directory=archive_destination, materialization_root=native_destination,
+            maximum_part_bytes=4096, replay=lambda _root: {"valid": True})
 
 
 def test_bounded_relay_part_collision_is_generation_bound_and_preserves_originals(tmp_path):
