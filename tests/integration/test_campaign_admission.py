@@ -184,6 +184,10 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
         "controller_quota_free_bytes": 1_000_000,
         "controller_quota_evidence_path": str(quota_evidence),
         "controller_quota_evidence_sha256": hashlib.sha256(quota_payload).hexdigest(),
+        "source_credentials_file": str(tmp_path / "synthetic-adc.json"),
+        "expected_source_principal": "katyabraun0@gmail.com",
+        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
         "restore_path": str(tmp_path / "restore"),
         "archive_root": str(archive_root), "staging_directory": str(staging_root)}
 
@@ -197,6 +201,101 @@ def test_archive_sink_runtime_config_loads_through_real_stage_generation(reposit
     assert runtime["archive_sink"]["maximum_capsule_bytes"] == 65536
     assert runtime["archive_sink"]["archive_root"] == archive_root
     assert runtime["archive_sink"]["staging_directory"] == staging_root
+    assert runtime["archive_sink"]["source_credentials_file"] == tmp_path / "synthetic-adc.json"
+    assert runtime["archive_sink"]["expected_source_principal"] == "katyabraun0@gmail.com"
+
+
+def test_supported_preparer_pair_reserves_then_launches_both_normal_lifecycles(
+        repository_root, tmp_path, monkeypatch, request):
+    import copy
+    import subprocess
+    from types import SimpleNamespace
+    from cloud_network_benchmark.admission import load_cost_inputs
+    from cloud_network_benchmark.campaign import CampaignDriver
+    from cloud_network_benchmark.contracts.common import Evidence, Provider
+    from tests.integration.test_f11_ledger import scheduled_request_and_plan
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    class AdvancingClock(Clock):
+        def __init__(self):
+            self.now = datetime.now(timezone.utc).replace(microsecond=0)
+            self.tick = 100.0
+        def monotonic(self):
+            return self.tick
+        def sleep(self, seconds):
+            self.tick += seconds
+            self.now += timedelta(seconds=seconds)
+    clock = AdvancingClock()
+    fixed_start = (clock.utc_now() + timedelta(seconds=600)).isoformat()
+    settings["stage_inputs"]["acceptance"]["start_utc"] = fixed_start
+    settings["approvals"]["paired_acceptance"]["fields"]["start_utc"] = fixed_start
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), clock)
+    register_generated_cleanup(stage, request)
+    providers = [Provider.AWS, Provider.AZURE, Provider.GCP]
+    costs_path = repository_root / "tests/fixtures/f11/cost-inputs.json"
+    for entry in stage["entries"][:2]:
+        entry["runtime_config_path"] = str(tmp_path / f"{entry['entry_id']}-runtime.json")
+        entry["parent_manifest_path"] = str(tmp_path / f"{entry['entry_id']}-parent.json")
+        entry["cost_inputs_path"] = str(costs_path)
+    costs = load_cost_inputs(costs_path)
+    from cloud_network_benchmark.config import resolve_campaign
+    campaign, _ = resolve_campaign(repository_root / "configs/tests/exp-903-three-provider-smoke.yaml", repository_root)
+    runtime = {"ledger": {"path": stage["ledger_path"], "scope_id": stage["scope_id"],
+                          "initialize_if_missing": True}}
+    initialized_ids = iter(("V-S1", "V-S3"))
+
+    def runtime_loader(_path, *, selected_providers=None):
+        assert selected_providers == {"aws", "azure", "gcp"}
+        return copy.deepcopy(runtime)
+
+    def initialized(_path, *, repository_root, config_path, schedule_path):
+        assert schedule_path is None
+        entry_id = next(initialized_ids)
+        return SimpleNamespace(campaign_id=entry_id), {
+            provider.value: SimpleNamespace(run_id=f"{entry_id}-{provider.value}") for provider in providers}
+
+    def admission_inputs(*, campaign, parent, children, costs, runtime, ledger_state, controller_session_id):
+        admission, plan = scheduled_request_and_plan(campaign, costs, campaign_id=parent.campaign_id,
+            providers=providers, child_prefix=parent.campaign_id, namespace_prefix=parent.campaign_id,
+            funding={"primary": "50.20"}, measurement_seconds=76)
+        admission = admission.model_copy(update={
+            "incurred_cost_usd": Evidence[float](unavailable_reason="offline test ledger derives spend"),
+            "active_reserved_usd": Evidence[float](unavailable_reason="offline test ledger derives holds")})
+        return admission, plan
+
+    import cloud_network_benchmark.lifecycle_runtime as lifecycle_runtime
+    import cloud_network_benchmark.config as config_module
+    monkeypatch.setattr(lifecycle_runtime, "load_runtime_config", runtime_loader)
+    monkeypatch.setattr(lifecycle_runtime, "load_initialized_campaign", initialized)
+    monkeypatch.setattr(lifecycle_runtime, "build_admission_request", admission_inputs)
+    monkeypatch.setattr(config_module, "resolve_campaign", lambda *_a, **_k: (campaign, None))
+    launched = []
+
+    class OfflineLifecycle:
+        returncode = 1
+        pid = 999999
+        def __init__(self, command, **kwargs):
+            launched.append(command)
+            kwargs["stdout"].write(b'{"status":"failed","providers":{}}\n')
+            kwargs["stdout"].flush()
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(subprocess, "Popen", OfflineLifecycle)
+    result = CampaignDriver(clock=clock, sleep=clock.sleep).run(stage)
+    normal = {command[command.index("--config") + 1] for command in launched
+        if command[command.index("--config") + 1].endswith(("v-s1.yaml", "v-s3.yaml"))}
+    assert len(normal) == 2, {"launched": launched, "result": result,
+        "states": {key: value["state"] for key, value in result["entries"].items()},
+        "errors": {key: value.get("error") for key, value in result["entries"].items()},
+        "schedule": [(row["entry_id"], row["scheduled_start"], row["launch_at"]) for row in stage["entries"]]}
+    assert {Path(path).stem for path in normal} == {"v-s1", "v-s3"}
+    ledger = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
+        utc_now=clock.utc_now, monotonic_now=clock.monotonic,
+        controller_session_id=stage["controller_session_id"])
+    assert len(ledger.inspect()["reservations"]) == 2
+    assert set(result["entries"]) >= {"V-S1", "V-S3"}
 
 
 def test_actual_week_generation_preserves_all56_schedule_hashes_and_runtime_isolation(repository_root, tmp_path, monkeypatch, request):

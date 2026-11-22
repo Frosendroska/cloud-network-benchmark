@@ -419,11 +419,12 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     monkeypatch.setitem(sys.modules, "google.auth.impersonated_credentials", impersonated)
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "human-adc.json")
     original_environment = dict(os.environ)
-    from cloud_network_benchmark.gcs_archive import GoogleCloudStorageBackend
-    backend = GoogleCloudStorageBackend("valid-bucket", source_credentials_file=source_file,
-        expected_source_principal="katyabraun0@gmail.com",
-        expected_project_id="project-a70f8497-3463-4ef2-9cd",
-        expected_service_account_email="cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com")
+    from cloud_network_benchmark.gcs_archive import google_cloud_storage_backend
+    backend = google_cloud_storage_backend({"bucket": "valid-bucket",
+        "source_credentials_file": source_file,
+        "expected_source_principal": "katyabraun0@gmail.com",
+        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com"})
     assert client_options[0]["project"] == "project-a70f8497-3463-4ef2-9cd"
     assert client_options[0]["credentials"] is not None
     assert credential_calls[0] == ("load", str(source_file))
@@ -448,6 +449,12 @@ def test_google_backend_pins_generation_and_disables_sdk_retries(monkeypatch, tm
     assert calls[1] == ("blob", "key", {"generation": 7})
     assert calls[2][1]["if_generation_match"] == 7 and calls[2][1]["retry"] is None
     assert calls[3][1]["if_generation_match"] == 7 and calls[3][1]["retry"] is None
+
+
+def test_production_archive_backend_requires_complete_explicit_adc_identity():
+    from cloud_network_benchmark.gcs_archive import google_cloud_storage_backend
+    with pytest.raises(ValueError, match="explicit source ADC"):
+        google_cloud_storage_backend({"bucket": "valid-bucket"})
 
 
 def test_archive_impersonation_rejects_missing_wrong_source_and_wrong_target_before_client(tmp_path, monkeypatch):

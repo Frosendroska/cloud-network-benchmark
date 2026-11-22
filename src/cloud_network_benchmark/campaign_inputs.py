@@ -225,11 +225,15 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                     or not {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
                         "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
                         "controller_quota_free_bytes", "controller_quota_evidence_path",
-                        "controller_quota_evidence_sha256", "archive_root", "staging_directory"}.issubset(archive_sink)
+                        "controller_quota_evidence_sha256", "archive_root", "staging_directory",
+                        "source_credentials_file", "expected_source_principal", "expected_project_id",
+                        "expected_service_account_email"}.issubset(archive_sink)
                     or set(archive_sink) - {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
                         "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
                         "controller_quota_free_bytes", "controller_quota_evidence_path",
-                        "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"}
+                        "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
+                        "source_credentials_file", "expected_source_principal", "expected_project_id",
+                        "expected_service_account_email"}
                     or not valid_bucket_name(archive_sink.get("bucket"))
                     or type(archive_sink.get("maximum_staging_bytes")) is not int
                     or archive_sink["maximum_staging_bytes"] <= 0
@@ -244,6 +248,12 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                     or type(archive_sink.get("controller_quota_free_bytes")) is not int
                     or archive_sink["controller_quota_free_bytes"] < 0):
                 raise ValueError("archive_sink requires measured guest/controller bounds and capsule state maximum")
+            from .gcs_archive import valid_archive_identity, valid_archive_source
+            if (not valid_archive_source(archive_sink.get("expected_source_principal"))
+                    or not valid_archive_identity(archive_sink.get("expected_project_id"),
+                        archive_sink.get("expected_service_account_email"))):
+                raise ValueError("archive_sink source ADC and approved archive account identity must be explicit")
+            _path(archive_sink["source_credentials_file"], "archive_sink.source_credentials_file")
             _path(archive_sink["controller_quota_evidence_path"], "archive_sink.controller_quota_evidence_path", file=True)
             from .storage_admission import validate_controller_quota_evidence
             validate_controller_quota_evidence(archive_sink["controller_quota_free_bytes"],
@@ -748,6 +758,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             window = parts[3].lower()
             date_utc = date.fromisoformat(str(inputs["first_day_utc"])) + timedelta(days=day - 1)
             scheduled = _utc(f"{date_utc}T{inputs['windows_utc'][window]}+00:00", "WEEK window")
+        elif stage == "acceptance" and entry_id in {"V-S1", "V-S3"}:
+            scheduled = _utc(inputs["start_utc"], "acceptance.start_utc")
+            window = None
         elif stage != "acceptance":
             scheduled = _utc(inputs["start_utc"], f"{stage}.start_utc")
             window = "night"
@@ -821,6 +834,16 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 "bootstrap": _bootstrap(settings.get("prebuilt_bundle")), "guest_remote_root": "/var/lib/cnb/work",
                 "diagnostic_interfaces": {p: settings["providers"][p]["diagnostic_interfaces"] for p in providers}},
             "providers": provider_runtime, "approval_refs": approvals}
+        if stage == "day":
+            stage_private = Path(state_root) / stage_id
+            runtime["observer"] = {"stage_id": stage_id, "campaign_id": stage_id,
+                "entry_id": entry_id,
+                "workspace": runtime["access"]["bootstrap"].workspace,
+                "state_path": str(stage_private / "observer-aggregate.json"),
+                "journal_path": str(stage_private / "campaign-journal.json"),
+                "prepared_stage_path": str(stage_private / "prepared-stage.json"),
+                "bindings_path": str(stage_private / "observer-bindings.json"),
+                "launch_receipt_root": str(stage_private / "observer-launch-receipts")}
         if settings.get("archive_sink") is not None:
             runtime["archive_sink"] = copy.deepcopy(settings["archive_sink"])
             if stage in {"day", "week"}:
@@ -844,6 +867,10 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
              "gcp": ("project_id",)}[provider])} for provider in sorted(settings["providers"])},
         "credential_valid_through_utc": settings["credential_refresh"]["valid_through_utc"],
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
+    if stage == "day":
+        stage_data.update(campaign_id=stage_id,
+            observer_bindings_path=str(private / "observer-bindings.json"),
+            observer_launch_receipt_root=str(private / "observer-launch-receipts"))
     if stage == "week":
         stage_data["dispatch_policy"] = _weekly_dispatch_policy(settings, approvals)
     elif stage == "acceptance":

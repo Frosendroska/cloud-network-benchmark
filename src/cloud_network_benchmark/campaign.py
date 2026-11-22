@@ -1397,7 +1397,9 @@ def _entry_digests(entry: dict[str, Any]) -> dict[str, str | None]:
 
 
 def _stage_digest(stage: dict[str, Any]) -> str:
-    raw = json.dumps(stage, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    frozen = {key: value for key, value in stage.items() if key not in {
+        "observer_bindings_sha256", "observer_launch_receipt_path", "observer_launch_receipt_sha256"}}
+    raw = json.dumps(frozen, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 

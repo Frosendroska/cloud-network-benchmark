@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -81,7 +82,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
     optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
-        "measurement_start_barrier") if isinstance(raw, dict) and key in raw}
+        "measurement_start_barrier", "observer") if isinstance(raw, dict) and key in raw}
     root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
@@ -99,10 +100,17 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
             "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
             "controller_quota_free_bytes", "controller_quota_evidence_path",
-            "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory"},
+            "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
+            "source_credentials_file", "expected_source_principal", "expected_project_id",
+            "expected_service_account_email"},
             "archive_sink")
-        from .gcs_archive import valid_bucket_name
+        from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
         if (not valid_bucket_name(sink["bucket"])
+                or not isinstance(sink["expected_source_principal"], str)
+                or not valid_archive_source(sink["expected_source_principal"])
+                or not isinstance(sink["expected_project_id"], str)
+                or not isinstance(sink["expected_service_account_email"], str)
+                or not valid_archive_identity(sink["expected_project_id"], sink["expected_service_account_email"])
                 or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
                 or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
                 or type(sink["minimum_controller_free_bytes"]) is not int
@@ -113,11 +121,24 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
             raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
         for field in ("controller_quota_evidence_path", "archive_root", "staging_directory"):
             sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
+        sink["source_credentials_file"] = _source_path(path.parent, sink["source_credentials_file"],
+            "archive_sink.source_credentials_file", must_exist=False)
         if "restore_path" in sink:
             sink["restore_path"] = _source_path(path.parent, sink["restore_path"], "archive_sink.restore_path", must_exist=False)
         from .storage_admission import validate_controller_quota_evidence
         validate_controller_quota_evidence(sink["controller_quota_free_bytes"],
             sink["controller_quota_evidence_path"], sink["controller_quota_evidence_sha256"])
+    if "observer" in root:
+        observer = _keys(root["observer"], {"stage_id", "campaign_id", "entry_id", "workspace",
+            "state_path", "journal_path", "prepared_stage_path", "bindings_path", "launch_receipt_root"},
+            "observer runtime")
+        if any(not isinstance(observer[key], str) or not observer[key].strip()
+               for key in ("stage_id", "campaign_id", "entry_id", "workspace")):
+            raise ValueError("observer stage identity and workspace must be explicit")
+        for field in ("state_path", "journal_path", "prepared_stage_path", "bindings_path", "launch_receipt_root"):
+            observer[field] = _source_path(path.parent, observer[field], f"observer.{field}", must_exist=False)
+        if observer["workspace"] != root["access"]["bootstrap"]["workspace"]:
+            raise ValueError("observer workspace must match the source-bound guest workspace")
     if "post_measurement_barrier" in root:
         barrier = _keys(root["post_measurement_barrier"],
             {"schema_version", "barrier_id", "barrier_root", "expected_participants"},
@@ -661,6 +682,28 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         actual_stages = stages
         if actual_stages is None:
             from .lifecycle_remote import build_provider_remote_stages
+            observer_callback = None
+            if "observer" in runtime:
+                from .observer_publisher import (invalidate_runtime_observer_snapshot,
+                    publish_runtime_observer_snapshot)
+                observer_config = runtime["observer"]
+                def observer_callback(deployment, pair, connection, bootstrap, diagnostics, progress):
+                    try:
+                        publish_runtime_observer_snapshot(observer_config, deployment=deployment,
+                            pair=pair, connection=connection, bootstrap=bootstrap,
+                            diagnostics=diagnostics, progress=progress)
+                    except Exception as exc:
+                        # Observer publication is read-only side evidence. A
+                        # missing receipt leaves guest health unknown and does
+                        # not alter measurement or cleanup execution.
+                        invalidate_runtime_observer_snapshot(observer_config)
+                        error_path = Path(observer_config["state_path"]).with_suffix(".error.json")
+                        payload = json.dumps({"stage_id": observer_config["stage_id"],
+                            "entry_id": observer_config["entry_id"],
+                            "error_type": type(exc).__name__}, sort_keys=True) + "\n"
+                        temp = error_path.with_suffix(error_path.suffix + ".tmp")
+                        temp.write_text(payload, encoding="utf-8")
+                        os.replace(temp, error_path)
             actual_stages = {}
             for provider, child in children.items():
                 actual_stages[provider] = build_provider_remote_stages(provider=provider,
@@ -669,6 +712,7 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",
                     archive_sink=runtime.get("archive_sink"),
+                    observer_progress_callback=observer_callback,
                     sleep=runtime.get("sleep", __import__("time").sleep))
         workflows = build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,

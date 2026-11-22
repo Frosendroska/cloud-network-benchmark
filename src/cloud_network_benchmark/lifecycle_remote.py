@@ -611,7 +611,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                     retry_seconds=float(runtime["copy_retry_seconds"]), now_utc=clock.utc_now,
                     clock=clock.monotonic, compressed_transfer=True)
             else:
-                from .gcs_archive import GoogleCloudStorageBackend, publish_guest_archive_parts
+                from .gcs_archive import google_cloud_storage_backend, publish_guest_archive_parts
                 from .guest_archive import create_remote_guest_archive
                 from .retrieval import RetrievalResult
                 import hashlib
@@ -688,7 +688,7 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
                         deadline=item.deadline, clock=clock.monotonic,
                         action_id=f"f09-guest-part-{deployment.deployment_id}-{role}-{part_counter}",
                         actions=actions)
-                backend = archive_sink.get("backend") or GoogleCloudStorageBackend(bucket)
+                backend = archive_sink.get("backend") or google_cloud_storage_backend(archive_sink)
                 archive_status = publish_guest_archive_parts(guest_archives=guest_archives,
                     fetch_part=fetch_part, staging_directory=staging_root, backend=backend,
                     bucket=bucket, provider=provider, experiment_id=child.experiment_id,

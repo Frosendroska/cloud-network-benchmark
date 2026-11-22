@@ -291,11 +291,11 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             sink = runtime.get("archive_sink")
             if sink is None:
                 raise ValueError("runtime config has no archive sink")
-            from .gcs_archive import GoogleCloudStorageBackend
+            from .gcs_archive import google_cloud_storage_backend
             from .archive_replay import restore_and_finalize_batch_capsule
             output = restore_and_finalize_batch_capsule(capsule_path=args.capsule,
                 expected_capsule_sha256=args.capsule_sha256,
-                backend=GoogleCloudStorageBackend(sink["bucket"]), bucket=sink["bucket"],
+                backend=google_cloud_storage_backend(sink), bucket=sink["bucket"],
                 archive_staging_root=sink["staging_directory"],
                 materialization_root=args.restore_path, repository_root=Path.cwd(),
                 maximum_part_bytes=sink["maximum_staging_bytes"],

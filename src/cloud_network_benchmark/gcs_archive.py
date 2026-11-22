@@ -127,6 +127,7 @@ class GoogleCloudStorageBackend:
             raise ValueError("archive impersonated credentials could not be constructed") from None
         self._bucket = archive_client.bucket(bucket)
 
+
     def stat(self, key: str, *, timeout_seconds: float) -> dict | None:
         blob = self._bucket.get_blob(key, timeout=timeout_seconds, retry=None)
         if blob is None:
@@ -163,6 +164,19 @@ class GoogleCloudStorageBackend:
     def delete(self, key: str, *, generation: str, timeout_seconds: float) -> None:
         self._bucket.blob(key, generation=int(generation)).delete(
             if_generation_match=int(generation), timeout=timeout_seconds, retry=None)
+
+
+def google_cloud_storage_backend(settings: dict[str, Any]) -> GoogleCloudStorageBackend:
+    """Build the production archive backend from explicit, reviewed ADC identity."""
+    required = {"bucket", "source_credentials_file", "expected_source_principal",
+        "expected_project_id", "expected_service_account_email"}
+    if not isinstance(settings, dict) or not required <= settings.keys():
+        raise ValueError("archive backend requires explicit source ADC and approved archive identity")
+    return GoogleCloudStorageBackend(settings["bucket"],
+        source_credentials_file=settings["source_credentials_file"],
+        expected_source_principal=settings["expected_source_principal"],
+        expected_project_id=settings["expected_project_id"],
+        expected_service_account_email=settings["expected_service_account_email"])
 
 
 def _hash(path: Path, limit: int, guard: Callable[[], None]) -> tuple[int, str]:

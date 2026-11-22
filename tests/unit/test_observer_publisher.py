@@ -148,7 +148,6 @@ def test_production_process_hook_publishes_atomic_observed_rotation(tmp_path, mo
     closed = json.loads(progress.path.read_text())
     assert closed["producer"] is None
     assert closed["sockperf_chunks"] == [{"path": "measurements/probe.csv", "state": "completed"}]
-
     stat_path = proc_root / "3501/stat"
     stat_path.write_text("3501 (sockperf fake) S " + "1 " * 18 + "7654322\n")
     second_csv = workspace / "measurements" / "probe-002.csv"
@@ -162,6 +161,81 @@ def test_production_process_hook_publishes_atomic_observed_rotation(tmp_path, mo
         {"path": "measurements/probe-002.csv", "state": "current"}]
     runner.stop(next_handle, time.monotonic() + 2)
 
+
+def test_runtime_callback_aggregates_only_complete_owned_day_participants(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.observer_publisher import publish_runtime_observer_snapshot
+
+    runner, handle, progress, _writer, _proc_root, _exe, _workspace = _actual_sockperf_progress(tmp_path, monkeypatch)
+    stage_id, entry_id = "day-stage", "DAY"
+    root = tmp_path / "stage"
+    root.mkdir()
+    bindings_path = root / "observer-bindings.json"
+    launch_root = root / "launch-receipts"
+    runtime_paths = {}
+    run_ids = {provider: f"day-{provider}" for provider in ("aws", "azure", "gcp")}
+    for provider in run_ids:
+        runtime_path = root / f"{provider}.runtime.json"
+        runtime_path.write_text(json.dumps({"access": {"bootstrap": {"workspace": WORKSPACE}}}))
+        runtime_paths[provider] = runtime_path
+    prepared_path = root / "prepared-stage.json"
+    prepared_document = {"stage_id": stage_id, "campaign_id": stage_id,
+        "stage": "day", "state_root": str(tmp_path), "entries": [{"entry_id": entry_id,
+            "run_ids": run_ids, "runtime_config_path": str(runtime_paths["aws"])}],
+        "observer_bindings_path": str(bindings_path),
+        "observer_launch_receipt_root": str(launch_root)}
+    from cloud_network_benchmark.campaign import _stage_digest
+    frozen_stage_digest = _stage_digest(prepared_document)
+    prepared_path.write_text(json.dumps(prepared_document))
+    journal_path = root / "campaign-journal.json"
+    journal_path.write_text(json.dumps({"stage_id": stage_id, "entries": {entry_id: {"state": "running"}}}))
+    workspace = WORKSPACE
+    reports = []
+    for index, provider in enumerate(run_ids):
+        run_id = run_ids[provider]
+        deployment_id = run_id + "-deployment"
+        def remote(role, suffix):
+            return SimpleNamespace(host=f"192.0.2.{10 + index * 2 + suffix}", user="bench", port=22,
+                authentication_reference=str(tmp_path / f"{provider}-identity"),
+                host_key_reference=str(tmp_path / f"{provider}-known-hosts"))
+        connection = SimpleNamespace(deployment_id=deployment_id, vm_a=remote("vm_a", 0),
+            vm_b=remote("vm_b", 1))
+        pair = SimpleNamespace(deployment_id=deployment_id,
+            vm_a=SimpleNamespace(resource_id=f"{provider}-vm-a"),
+            vm_b=SimpleNamespace(resource_id=f"{provider}-vm-b"))
+        deployment = SimpleNamespace(provider=provider, run_id=run_id, deployment_id=deployment_id)
+        listener = SimpleNamespace(tool="iperf3", role="vm_b", state="active", pid=4100 + index,
+            boot_id=BOOT, start_ticks=5100 + index,
+            stdout_path=f"{WORKSPACE}/iperf3/server.jsonl")
+        bootstrap = SimpleNamespace(listeners=[listener])
+        diagnostics = {role: SimpleNamespace(deployment_id=deployment_id, role=role,
+            pid=4200 + index * 2 + (role == "vm_b"), boot_id=BOOT,
+            start_ticks=5200 + index * 2 + (role == "vm_b")) for role in ("vm_a", "vm_b")}
+        config = {"stage_id": stage_id, "campaign_id": stage_id, "entry_id": entry_id,
+            "workspace": workspace, "state_path": str(root / "observer-state.json"),
+            "journal_path": str(journal_path), "prepared_stage_path": str(prepared_path),
+            "bindings_path": str(bindings_path), "launch_receipt_root": str(launch_root)}
+        reports.append(publish_runtime_observer_snapshot(config, deployment=deployment,
+            pair=pair, connection=connection, bootstrap=bootstrap, diagnostics=diagnostics,
+            progress=progress))
+    assert [item["status"] for item in reports] == ["incomplete", "incomplete", "published"]
+    stage = json.loads(prepared_path.read_text())
+    assert _stage_digest(stage) == frozen_stage_digest
+    def probe(_role, payload):
+        return {"processes": {item["kind"]: {"pid": item["pid"], "boot_id": item["boot_id"],
+            "start_ticks": item["start_ticks"], "alive": True, "state": "S"}
+            for item in payload["processes"]},
+            "files": {item["path"]: {"size": 16, "mtime": time.time() - 1}
+                for item in payload["files"]}}
+    observed = observe_bindings(stage, bindings_path, now=time.time(), probe=probe)
+    assert observed["health"] == "healthy"
+    assert len(observed["entries"]) == 3
+    from cloud_network_benchmark.observer_publisher import invalidate_runtime_observer_snapshot
+    invalidate_runtime_observer_snapshot(config)
+    invalidated_stage = json.loads(prepared_path.read_text())
+    invalidated = observe_bindings(invalidated_stage, bindings_path, now=time.time(), probe=probe)
+    assert invalidated == {"health": "unknown", "errors": ["active_guest_binding_set_mismatch"]}
+    runner.stop(handle, time.monotonic() + 2)
 
 def test_guest_progress_rejects_partial_or_inconsistent_rotation():
     from cloud_network_benchmark.observer_publisher import validate_guest_progress

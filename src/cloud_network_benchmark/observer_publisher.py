@@ -6,6 +6,7 @@ infers a process, guest path, VM, or connection from a name or timestamp.
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -268,3 +269,166 @@ class GuestObserverProgress:
                 "sockperf_chunks": ([{"path": item, "state": "completed"} for item in self._completed]
                     + ([{"path": self._current_path, "state": "current"}] if self._current_path else []))}
             _atomic_bytes(self.path, _json_bytes(snapshot), replace=True)
+
+
+@contextlib.contextmanager
+def _exclusive_file_lock(path: Path):
+    import fcntl
+    path = Path(path)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("observer lock path must be absolute and cannot be a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _remote_role_binding(remote: Any, *, vm_id: str, workspace: str) -> dict[str, Any]:
+    connection = {"host": remote.host, "user": remote.user, "port": remote.port,
+        "known_hosts": str(Path(remote.host_key_reference)),
+        "identity_file": str(Path(remote.authentication_reference))}
+    return {"vm_id": vm_id, "connection": connection, "workspace": workspace}
+
+
+def _observer_participant(config: Mapping[str, Any], deployment: Any, pair: Any,
+                          connection: Any, bootstrap: Any, diagnostics: Mapping[str, Any],
+                          progress: Mapping[str, Any]) -> tuple[tuple[str, str, str], dict[str, Any], dict[str, Any]]:
+    """Project only identities and paths already captured by production lifecycle callbacks."""
+    entry_id = _required_text(config.get("entry_id"), "observer entry_id")
+    provider = _required_text(getattr(deployment.provider, "value", deployment.provider), "observer provider")
+    run_id = _required_text(deployment.run_id, "observer run_id")
+    deployment_id = _required_text(deployment.deployment_id, "observer deployment_id")
+    if pair.deployment_id != deployment_id or connection.deployment_id != deployment_id:
+        raise ValueError("observer callback deployment identity mismatch")
+    workspace = _required_text(config.get("workspace"), "observer workspace")
+    listener_rows = [item for item in bootstrap.listeners
+        if item.tool == "iperf3" and item.role == "vm_b" and item.state == "active"]
+    if len(listener_rows) != 1:
+        raise ValueError("one actual active VM-B iperf3 listener identity is required")
+    listener = listener_rows[0]
+    if any(getattr(listener, key, None) is None for key in ("pid", "boot_id", "start_ticks")):
+        raise ValueError("VM-B iperf3 listener has no captured process identity")
+    producer = progress.get("producer")
+    if producer is None:
+        raise ValueError("actual VM-A Sockperf producer is no longer active")
+    chunks = progress.get("sockperf_chunks")
+    if not isinstance(chunks, list) or not any(item.get("state") == "current" for item in chunks):
+        raise ValueError("actual current VM-A Sockperf output chunk is unavailable")
+    if set(diagnostics) != {"vm_a", "vm_b"}:
+        raise ValueError("both actual diagnostics process receipts are required")
+    roles = {}
+    owned = {}
+    remote_by_role = {"vm_a": connection.vm_a, "vm_b": connection.vm_b}
+    deployed_by_role = {"vm_a": pair.vm_a, "vm_b": pair.vm_b}
+    for role in ("vm_a", "vm_b"):
+        diagnostic = diagnostics[role]
+        if (diagnostic.deployment_id != deployment_id or diagnostic.role != role
+                or any(getattr(diagnostic, field, None) is None for field in ("pid", "boot_id", "start_ticks"))):
+            raise ValueError(f"{role} diagnostics process receipt is incomplete or mismatched")
+        owned[role] = _remote_role_binding(remote_by_role[role],
+            vm_id=deployed_by_role[role].resource_id, workspace=workspace)
+        processes = ([{"kind": "producer", **dict(producer)},
+                      {"kind": "diagnostics", "pid": diagnostic.pid,
+                       "boot_id": diagnostic.boot_id, "start_ticks": diagnostic.start_ticks}]
+                     if role == "vm_a" else
+                     [{"kind": "receiver", "pid": listener.pid,
+                       "boot_id": listener.boot_id, "start_ticks": listener.start_ticks},
+                      {"kind": "diagnostics", "pid": diagnostic.pid,
+                       "boot_id": diagnostic.boot_id, "start_ticks": diagnostic.start_ticks}])
+        files = ([{"kind": "sockperf_chunk", **dict(chunk)} for chunk in chunks]
+                 if role == "vm_a" else [])
+        if role == "vm_b":
+            remote_output = PurePosixPath(listener.stdout_path)
+            root = PurePosixPath(workspace)
+            try:
+                receiver_path = remote_output.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise ValueError("VM-B receiver output escapes its declared workspace") from exc
+            files.append({"kind": "iperf3_receiver", "path": receiver_path})
+        files.append({"kind": "diagnostics", "path": f"diagnostics/{role}.jsonl"})
+        roles[role] = {**owned[role], "processes": processes, "files": files}
+    participant = {"entry_id": entry_id, "provider": provider, "run_id": run_id,
+        "deployment_id": deployment_id, "roles": roles}
+    return (entry_id, provider, run_id), owned, participant
+
+
+def publish_runtime_observer_snapshot(config: Mapping[str, Any], *, deployment: Any,
+        pair: Any, connection: Any, bootstrap: Any, diagnostics: Mapping[str, Any],
+        progress: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate a complete active set from callbacks carrying native lifecycle receipts."""
+    required = {"stage_id", "campaign_id", "entry_id", "workspace", "state_path", "journal_path",
+        "prepared_stage_path", "bindings_path", "launch_receipt_root"}
+    if not isinstance(config, Mapping) or not required <= config.keys():
+        raise ValueError("observer runtime configuration is incomplete")
+    key, owned, participant = _observer_participant(config, deployment, pair, connection,
+        bootstrap, diagnostics, progress)
+    state_path, journal_path = Path(config["state_path"]), Path(config["journal_path"])
+    prepared_path, bindings_path = Path(config["prepared_stage_path"]), Path(config["bindings_path"])
+    receipt_root = Path(config["launch_receipt_root"])
+    lock_path = state_path.with_suffix(".lock")
+    for path in (state_path, journal_path, prepared_path, bindings_path, receipt_root):
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError("observer runtime paths must be absolute and cannot be symlinks")
+    with _exclusive_file_lock(lock_path):
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {
+            "schema_version": 1, "owned": {}, "participants": {}}
+        if state.get("schema_version") != 1 or not isinstance(state.get("owned"), dict) or not isinstance(state.get("participants"), dict):
+            raise ValueError("observer aggregate state is malformed")
+        key_text = _participant_key(*key)
+        state["owned"][key_text] = owned
+        state["participants"][key_text] = participant
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+        if journal.get("stage_id") != config["stage_id"] or prepared.get("stage_id") != config["stage_id"]:
+            raise ValueError("observer aggregate stage identity mismatch")
+        active_ids = {entry_id for entry_id, row in journal.get("entries", {}).items()
+                      if row.get("state") in {"starting", "running"}}
+        expected = {_participant_key(entry["entry_id"], provider, run_id)
+            for entry in prepared.get("entries", []) if entry["entry_id"] in active_ids
+            for provider, run_id in entry.get("run_ids", {}).items()}
+        actual = set(state["participants"]) & expected
+        bindings_path.parent.mkdir(parents=True, exist_ok=True)
+        if actual == expected and expected:
+            receipt_participants = {tuple(json.loads(row)): state["owned"][row] for row in sorted(expected)}
+            receipt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            receipt_value = {"stage_id": config["stage_id"], "participants": {
+                _participant_key(*identity): roles for identity, roles in receipt_participants.items()}}
+            receipt_raw = _json_bytes(receipt_value)
+            receipt_path = receipt_root / f"launch-{hashlib.sha256(receipt_raw).hexdigest()}.json"
+            receipt_sha256 = write_launch_receipt(receipt_path, stage_id=config["stage_id"],
+                participants=receipt_participants)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            participants = [state["participants"][row] for row in sorted(expected)]
+            bindings = build_bindings(stage_id=config["stage_id"], campaign_id=config["campaign_id"],
+                participants=participants, launch_receipt=receipt)
+            bindings_sha256 = publish_bindings(bindings_path, bindings)
+            prepared["observer_launch_receipt_path"] = str(receipt_path)
+            prepared["observer_launch_receipt_sha256"] = receipt_sha256
+            prepared["observer_bindings_sha256"] = bindings_sha256
+        else:
+            prepared["observer_bindings_sha256"] = publish_bindings(bindings_path,
+                {"stage_id": config["stage_id"], "campaign_id": config["campaign_id"], "entries": []})
+        _atomic_bytes(state_path, _json_bytes(state), replace=True)
+        _atomic_bytes(prepared_path, (json.dumps(prepared, sort_keys=True, indent=2) + "\n").encode(), replace=True)
+        return {"status": "published" if actual == expected and expected else "incomplete",
+            "active_participants": len(expected), "observed_participants": len(actual)}
+
+
+def invalidate_runtime_observer_snapshot(config: Mapping[str, Any]) -> None:
+    """Force a hash-consistent unknown snapshot after any incomplete live receipt."""
+    bindings_path = Path(config["bindings_path"])
+    prepared_path = Path(config["prepared_stage_path"])
+    state_path = Path(config["state_path"])
+    with _exclusive_file_lock(state_path.with_suffix(".lock")):
+        prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+        if prepared.get("stage_id") != config.get("stage_id"):
+            raise ValueError("observer invalidation stage identity mismatch")
+        digest = publish_bindings(bindings_path, {"stage_id": config["stage_id"],
+            "campaign_id": config["campaign_id"], "entries": []})
+        prepared["observer_bindings_sha256"] = digest
+        _atomic_bytes(prepared_path,
+            (json.dumps(prepared, sort_keys=True, indent=2) + "\n").encode(), replace=True)
