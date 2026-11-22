@@ -49,21 +49,42 @@ def _source_bound_test_common_n(tmp_path, request, frozen_clock, deterministic_t
 
 class Clock:
     def __init__(self):
-        self._owner = threading.get_ident()
+        self._owner = threading.current_thread()
         self._offsets = {self._owner: 0.0}
         self._lock = threading.Lock()
-    def _offset(self):
-        ident = threading.get_ident()
+    def _offset_for(self, worker):
         with self._lock:
-            if ident == self._owner:
+            if worker is self._owner:
                 return max(self._offsets.values())
-            return self._offsets.setdefault(ident, self._offsets[self._owner])
+            return self._offsets.setdefault(worker, max(self._offsets.values()))
+    def _offset(self):
+        return self._offset_for(threading.current_thread())
+    def _sleep_for(self, worker, seconds):
+        with self._lock:
+            current = max(self._offsets.values()) if worker is self._owner else self._offsets.setdefault(
+                worker, max(self._offsets.values()))
+            self._offsets[worker] = current + seconds
     def utc_now(self): return NOW + timedelta(seconds=self._offset())
     def monotonic(self): return 100.0 + self._offset()
     def sleep(self, seconds):
-        ident = threading.get_ident()
-        with self._lock:
-            self._offsets[ident] = self._offsets.get(ident, max(self._offsets.values())) + seconds
+        self._sleep_for(threading.current_thread(), seconds)
+
+
+def test_clock_phase_workers_inherit_highwater_without_serializing_parallel_workers():
+    clock = Clock()
+    day_seconds = 86_400
+    phase_one = [threading.Thread() for _ in range(3)]
+    assert [clock._offset_for(worker) for worker in phase_one] == [0, 0, 0]
+    for worker, elapsed in zip(phase_one, (day_seconds, day_seconds - 10, day_seconds - 20)):
+        clock._sleep_for(worker, elapsed)
+    assert clock._offset() == day_seconds
+
+    phase_two = [threading.Thread() for _ in range(3)]
+    assert [clock._offset_for(worker) for worker in phase_two] == [day_seconds] * 3
+    for worker, elapsed in zip(phase_two, (12, 10, 8)):
+        clock._sleep_for(worker, elapsed)
+    assert clock._offset() == day_seconds + 12
+    assert clock._offset_for(phase_one[1]) == day_seconds - 10
 
 
 class FailedExternalCommands:
