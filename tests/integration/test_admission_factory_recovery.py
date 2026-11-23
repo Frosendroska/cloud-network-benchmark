@@ -209,6 +209,16 @@ def test_real_sequential_clock_anchor_never_extends_utc_cap(tmp_path,clock_type)
     settings=json.loads(next((fixture.private / "f09-cleanup/azure").glob("*.json")).read_text())
     assert settings["settings"]["cap_deadline_monotonic"] <= row["cap_start_monotonic"]+1200
     assert fixture.clock.utc_now()+timedelta(seconds=settings["settings"]["cap_deadline_monotonic"]-fixture.clock.monotonic()) <= expires
+    timing_path=settings["settings"].get("cleanup_timing_path")
+    if timing_path:
+        timing=json.loads(Path(timing_path).read_text())
+        source_cap=row["cap_start_monotonic"]+(expires-decision.evidence.cap_started_at.value).total_seconds()
+        mapped_cap=timing["origin_monotonic"]+(expires-datetime.fromisoformat(timing["origin_utc"])).total_seconds()
+        assert settings["settings"]["cap_started_monotonic"] == row["cap_start_monotonic"]
+        assert timing["cap_started_monotonic"] == row["cap_start_monotonic"]
+        assert timing["source_cap_deadline_monotonic"] == source_cap
+        assert timing["cap_deadline_monotonic"] <= mapped_cap+1e-6
+        assert timing["cap_deadline_monotonic"] <= source_cap+1e-6
 
 
 @pytest.mark.parametrize("issue", ["after_settings","before_settings"])

@@ -242,6 +242,68 @@ def register_profile_expiry(d,o,start,now,runner,*,clock=1000.0):
         clock=lambda:clock,utc_now=lambda:now)
 
 
+def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository_root,tmp_path,monkeypatch):
+    """Offline replay of the preserved S3 timing values with a fake runner."""
+    from cloud_network_benchmark.contracts.common import Evidence
+
+    origin_utc=datetime.fromisoformat("2026-11-23T15:53:48.107353+00:00")
+    origin_mono=1059650.89673908
+    cap_started_at=datetime.fromisoformat("2026-11-23T15:53:46.267707+00:00")
+    cap_expires_at=datetime.fromisoformat("2026-11-23T17:03:46.267707+00:00")
+    cap_deadline=1063849.057103963
+    second_sample_cap=origin_mono+(cap_expires_at-origin_utc).total_seconds()
+    factory_cap=min(cap_deadline,second_sample_cap)
+    now=origin_utc+timedelta(seconds=1)
+    d=deployment(repository_root,"exp-903-three-provider-smoke.yaml")
+    reservation=d.reservation.value.model_copy(update={
+        "workflow_profile":"all_cloud_acceptance_v1",
+        "cap_started_at":Evidence(value=cap_started_at),"expires_at":Evidence(value=cap_expires_at)})
+    admission=d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "lifetime_cap_seconds":4200})
+    d=d.model_copy(update={"admission":admission,"reservation":Evidence(value=reservation)})
+    value=options(tmp_path,d.admission.priority).model_dump(mode="python")
+    value.update(complete_workflow_seconds=3535,post_registration_workflow_seconds=2635,
+        cap_deadline_monotonic=factory_cap,cap_started_monotonic=cap_deadline-4200.0,
+        retry_end_at=cap_expires_at,workflow_profile="all_cloud_acceptance_v1",
+        cleanup_timing_path=tmp_path/"private"/"azure-clock-map.json")
+    o=AzureRuntimeOptions.model_validate(value)
+
+    # The old second-sample comparison rejects these original numbers by 10.88us.
+    assert cap_deadline > second_sample_cap+1e-6
+    assert o.cap_deadline_monotonic == second_sample_cap
+    assert o.cap_deadline_monotonic < cap_deadline
+    assert o.cap_deadline_monotonic <= azure_provider._source_cap_deadline(o,reservation)+1e-6
+
+    monkeypatch.setattr(azure_provider,"_clock_identity",lambda:
+        "9b1cc84e4aaa6905066a2c10c49aaf2d277d8eb394364da05ec60206638994fd")
+    azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:origin_utc,
+        origin_monotonic=origin_mono,origin_utc=origin_utc)
+    runner=AutomationRunner(d,o,now)
+    result=register_expiry(d,expiry_request(d,o,cap_expires_at-timedelta(seconds=120)),o,runner,
+        clock=lambda:origin_mono+1.0,utc_now=lambda:now)
+    assert result.state=="registered",result.failure
+    assert runner.requests
+
+
+def test_original_cap_monotonic_sample_rejects_overlong_runtime_cap(repository_root,tmp_path):
+    from cloud_network_benchmark.contracts.common import Evidence
+
+    now=datetime(2026,11,23,15,53,49,tzinfo=timezone.utc)
+    d,o,_=profile_attempt(repository_root,tmp_path,now)
+    cap_started_at=datetime.fromisoformat("2026-11-23T15:53:46.267707+00:00")
+    cap_expires_at=datetime.fromisoformat("2026-11-23T17:03:46.267707+00:00")
+    reservation=d.reservation.value.model_copy(update={
+        "cap_started_at":Evidence(value=cap_started_at),"expires_at":Evidence(value=cap_expires_at)})
+    d=d.model_copy(update={"reservation":Evidence(value=reservation)})
+    original_start_mono=1059649.057103963
+    o=o.model_copy(update={"cap_started_monotonic":original_start_mono,
+        "cap_deadline_monotonic":original_start_mono+4200.000002})
+    with pytest.raises(ValueError,match="exceeds the original admission monotonic cap"):
+        azure_provider._initialize_profile_timing(d,o,clock=lambda:1059650.0,
+            utc_now=lambda:datetime.fromisoformat("2026-11-23T15:53:47.0+00:00"))
+    assert not o.cleanup_timing_path.exists()
+
+
 @pytest.mark.parametrize("anchor_state", ["missing","corrupt","foreign"])
 def test_profile_registration_requires_original_timer_before_any_provider_call(
         repository_root: Path,tmp_path: Path,anchor_state):

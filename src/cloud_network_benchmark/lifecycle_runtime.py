@@ -1044,7 +1044,9 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 complete_workflow_seconds=float(runtime["allowance"].total_seconds),
                 post_registration_workflow_seconds=float(_remaining_f11_allowance(
                     runtime["allowance"], "preparation").total_seconds),
-                cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
+                cap_deadline_monotonic=cap_end,
+                cap_started_monotonic=float(record["cap_start_monotonic"]),
+                admission_evidence=admission_evidence,
                 timing_profile=deployment.admission.timing_profile,
                 workflow_profile=deployment.admission.workflow_profile,
                 cleanup_timing_path=(Path(private_root) / "azure-cleanup-timing" / child.run_id
@@ -1076,7 +1078,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             if not cleanup_only:
                 # Local recovery and original Terraform inputs must exist before
                 # the advancing-clock preflight can fail. No provider calls here.
-                azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic, utc_now=clock.utc_now)
+                azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic,
+                    utc_now=clock.utc_now, timing_origin=(anchor_mono, anchor_utc))
                 azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             options_by_provider[provider] = (options, None)
 
