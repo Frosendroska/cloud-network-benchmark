@@ -1025,6 +1025,7 @@ def _validate_provider_registrations(runner: CommandRunner, options: AzureRuntim
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
              clock: Callable[[], float], *, allow_not_found: bool = False,
              allow_missing_resource_group: str | None = None,
+             expected_missing_job_schedule_url: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
     if options.cleanup_timing_active:
@@ -1106,7 +1107,19 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
             review_admission_path=options.plan_review_admission_path)
     else:
         result = execute(req)
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or (
+    method_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--method"]
+    url_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--url"]
+    subscription_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--subscription"]
+    expected_job_url_pattern=(r"/subscriptions/"+re.escape(options.subscription_id)
+        +r"/resourceGroups/[^/?]+/providers/Microsoft\.Automation/automationAccounts/[^/?]+"
+        +r"/jobSchedules/[^/?]+\?api-version="+re.escape(AUTOMATION_API))
+    exact_job_schedule_absence = (expected_missing_job_schedule_url is not None
+        and action in {"expiry_jobSchedules_before_delete", "expiry_jobSchedules_absence"}
+        and method_values == ["GET"] and url_values == [expected_missing_job_schedule_url]
+        and subscription_values == [options.subscription_id]
+        and re.fullmatch(expected_job_url_pattern, expected_missing_job_schedule_url) is not None
+        and _is_exact_missing_job_schedule(result))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_job_schedule_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1270,7 +1283,9 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
                             account: str, collection: str, child: str,
                             clock: Callable[[],float], actions: list[dict[str,Any]]) -> None:
     base=f"{account}/{collection}/{child}?api-version={AUTOMATION_API}"
-    read=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_before_delete",clock,allow_not_found=True)
+    expected_missing_job_schedule_url=base if collection=="jobSchedules" else None
+    read=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_before_delete",clock,
+        allow_not_found=True,expected_missing_job_schedule_url=expected_missing_job_schedule_url)
     actions.append(_safe_cleanup_action(options,read))
     if read.outcome=="failed" and (_is_exact_not_found(read)
             or (collection == "jobSchedules" and _is_exact_missing_job_schedule(read))): return
@@ -1281,7 +1296,8 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
         raise RuntimeError(f"Azure {collection} readback identity mismatch")
     deleted=_command(runner,options,root,_azure_rest("DELETE",base),f"expiry_{collection}_delete",clock,allow_not_found=True)
     actions.append(_safe_cleanup_action(options,deleted))
-    verify=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_absence",clock,allow_not_found=True)
+    verify=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_absence",clock,
+        allow_not_found=True,expected_missing_job_schedule_url=expected_missing_job_schedule_url)
     actions.append(_safe_cleanup_action(options,verify))
     if verify.outcome!="failed" or not (_is_exact_not_found(verify)
             or (collection == "jobSchedules" and _is_exact_missing_job_schedule(verify))):
@@ -2198,7 +2214,9 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
     if (prereq.get("automation_account_id") not in (None, expected_account)
             or prereq.get("resource_group_id") not in (None, expected_group)
             or (role_assignment_id and not valid_assignment)
-            or (role_definition_id and not valid_definition)):
+            or (role_definition_id and not valid_definition)
+            or (prereq.get("job_schedule_id") is not None
+                and not _is_uuid_segment(str(prereq.get("job_schedule_id"))))):
         raise ValueError("recovery journal contains foreign expiry identities; refusing cleanup")
     try:
         # Pair destroy precedes inventory. Expiry remains until direct inventory proves both VMs absent.
