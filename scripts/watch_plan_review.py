@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import Callable
 
 from cloud_network_benchmark import plan_disclosure
 from cloud_network_benchmark.terraform_plan import PlanReviewError
@@ -86,7 +87,8 @@ def _complete_binding(path: Path, roots: list[Path], baseline: dict[Path, str],
 
 def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
           *, poll_seconds: float = 0.025,
-          display_limit: int = 32768) -> Path:
+          display_limit: int = 32768,
+          on_ready: Callable[[], None] | None = None) -> Path:
     if (isinstance(watch_end_epoch, bool) or not isinstance(watch_end_epoch, (int, float))
             or not math.isfinite(watch_end_epoch) or watch_end_epoch < 1_000_000_000
             or watch_end_epoch <= time.time()
@@ -107,6 +109,8 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
         if not any((request.parent / marker).exists() or (request.parent / marker).is_symlink()
                    for marker in ("accepted-review.json", "review-cancelled.json", "failure.json")):
             raise PlanReviewError("a pre-existing request is still pending or unresolved")
+    if on_ready is not None:
+        on_ready()
     seen = dict(baseline)
     while time.time() < watch_end_epoch:
         current = _requests(owned)
@@ -152,17 +156,18 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owned-root", action="append", required=True, type=Path,
-                        help="one of exactly six original child roots to monitor and search")
+                        help="one exact original child root (supply one to six non-overlapping roots)")
     parser.add_argument("--checkpoint", required=True, type=Path,
                         help="new protected disclosure checkpoint directory")
     parser.add_argument("--watch-end-epoch", required=True, type=float,
-                        help="one finite overall end no later than the original producer deadline")
+                        help="finite absolute initial-watch horizon from the approved stage packet")
     parser.add_argument("--poll-seconds", type=float, default=0.025)
     parser.add_argument("--display-limit", type=int, default=32768)
     args = parser.parse_args(argv)
     watch(args.owned_root, args.checkpoint, args.watch_end_epoch,
           poll_seconds=args.poll_seconds,
-          display_limit=args.display_limit)
+          display_limit=args.display_limit,
+          on_ready=lambda: print("watch_ready=true", flush=True))
     return 0
 
 

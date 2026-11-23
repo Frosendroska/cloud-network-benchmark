@@ -14,7 +14,7 @@ symlinks in its path or discovered tree. It recursively detects one new original
 ```
 
 The watcher selects that exact original request path, finds its unique variables
-file by the request hash under the six roots, then delegates scope validation,
+file by the request hash under the supplied roots, then delegates scope validation,
 complete disclosure, source/state comparison and immutable checkpointing to
 `cloud_network_benchmark.plan_disclosure`.
 
@@ -43,6 +43,11 @@ PYTHONPATH=/absolute/reviewed/checkout/src /absolute/venv/bin/python \
   --checkpoint /absolute/private/checkpoints/new-disclosure-unique-name \
   --watch-end-epoch ORIGINAL_FINITE_WATCH_END_EPOCH
 ```
+
+Wait for `watch_ready=true` in that terminal before dispatching the provider
+stage. This signal is printed only after the exact roots, pre-existing requests,
+and initial baseline have passed validation. It contains no request or plan
+content.
 
 Keep terminal output private because it contains the complete saved-plan
 payload. The watcher fails closed if the original evidence is stale, changed,

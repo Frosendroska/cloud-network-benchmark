@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from threading import Event
 import time
 
 import pytest
@@ -222,8 +223,10 @@ def test_prepositioned_watcher_handles_original_open_write_publication(tmp_path,
     roots = _six_roots(tmp_path, attempt)
     checkpoint = tmp_path / "checkpoint"
     watch_end = time.time() + 5
+    baseline_ready = Event()
 
     def publish_in_place():
+        assert baseline_ready.wait(timeout=2), "watcher did not validate its baseline"
         path = _request(attempt, "gcp-protection-apply-review-delayed", publish=False)
         payload = (json.dumps({
             "action_id": "gcp-protection-apply", "root": str(ROOT / "terraform/gcp/protection"),
@@ -248,7 +251,10 @@ def test_prepositioned_watcher_handles_original_open_write_publication(tmp_path,
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         producer = pool.submit(publish_in_place)
-        published = watch_plan_review.watch(roots, checkpoint, watch_end, poll_seconds=0.005)
+        assert not attempt.exists()
+        published = watch_plan_review.watch(
+            roots, checkpoint, watch_end, poll_seconds=0.005,
+            on_ready=baseline_ready.set)
         producer.result()
     assert published == checkpoint / "gcp-protection-apply"
     output = capsys.readouterr().out
@@ -379,3 +385,25 @@ def test_watcher_rejects_unbounded_allowlist_sizes(tmp_path, count):
     roots = [tmp_path / f"root-{index}" for index in range(count)]
     with pytest.raises(PlanReviewError, match="between one and six"):
         watch_plan_review.watch(roots, tmp_path / "checkpoint", time.time() + 1)
+
+
+def test_cli_emits_watch_ready_only_after_watch_baseline_validation(tmp_path, monkeypatch, capsys):
+    from scripts import watch_plan_review
+
+    seen = []
+
+    def validated_watch(roots, checkpoint, watch_end, **kwargs):
+        kwargs["on_ready"]()
+        seen.append((roots, checkpoint, watch_end))
+        return checkpoint
+
+    monkeypatch.setattr(watch_plan_review, "watch", validated_watch)
+    roots = [tmp_path / f"provider-root-{index}" for index in range(1, 4)]
+    args = []
+    for root in roots:
+        args.extend(["--owned-root", str(root)])
+    args.extend(["--checkpoint", str(tmp_path / "checkpoint"),
+                 "--watch-end-epoch", str(time.time() + 10)])
+    assert watch_plan_review.main(args) == 0
+    assert len(seen) == 1
+    assert capsys.readouterr().out == "watch_ready=true\n"
