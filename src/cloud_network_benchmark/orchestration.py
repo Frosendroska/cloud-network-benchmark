@@ -398,6 +398,7 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                     update_provider_recovery(recovery_path, record.provider, "cleanup", "succeeded")
                     outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
                         "absence_proved": True, "billable_resources_present": False,
+                        "cleanup_open": False,
                         "reason": "saved source receipt acknowledged by the original F11 ledger",
                         "launch_blocked": False, **cleanup_timing}
                     continue

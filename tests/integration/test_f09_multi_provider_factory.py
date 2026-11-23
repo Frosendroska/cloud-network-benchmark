@@ -445,7 +445,7 @@ def _costs(path: Path, campaign, children):
     "all-provider-calibration",
     "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
-        tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
+        tmp_path, monkeypatch, request, capsys, frozen_clock, deterministic_token, fake_git_commits,
         successful_protection, config_name, interrupt_f11_cleanup, interrupt_controller,
         interrupt_stop_verified):
     config = ROOT / config_name
@@ -1022,6 +1022,29 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             cleanup_runner=NoUnexpectedCleanupCommand(), cleanup_utc_now=clock.utc_now,
             cleanup_monotonic_now=clock.monotonic)
         assert cleanup_status == 0
+        cleanup_report = json.loads(capsys.readouterr().out)
+        assert all(cleanup_report["providers"][provider]["cleanup_open"] is False for provider in children)
+        from tests.integration.test_campaign_driver import stage_fixture
+        from cloud_network_benchmark.campaign import CampaignDriver
+        import subprocess
+        consumer_root = tmp_path / "campaign-consumer"
+        consumer_root.mkdir()
+        consumer_stage = stage_fixture(consumer_root, slots=1)
+        consumer_entry = consumer_stage["entries"][0]
+        consumer_private = Path(consumer_entry["private_root"])
+        consumer_private.mkdir(parents=True)
+        (consumer_private / "lifecycle-recovery.json").write_text("{}")
+        consumer_state = Path(consumer_stage["state_root"]) / consumer_stage["stage_id"]
+        consumer_state.mkdir(parents=True)
+        consumer_stage["repository_root"] = str(ROOT)
+        def feed_actual_cleanup_report(command, **kwargs):
+            kwargs["stdout"].write(json.dumps(cleanup_report).encode())
+            return type("Completed", (), {"returncode": cleanup_status})()
+        with monkeypatch.context() as consumer_patch:
+            consumer_patch.setattr(subprocess, "run", feed_actual_cleanup_report)
+            reconciled = CampaignDriver._reconcile_lifecycle(consumer_entry, consumer_stage)
+        assert reconciled["status"] == "failed" and reconciled["cleanup_open"] is False
+        assert reconciled["cleanup_report"] == cleanup_report
         recovered = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
         assert all(not row["cleanup_open"] and not row["expiry_registered"]
             and not row["creation_may_have_started"] for row in recovered["providers"])
