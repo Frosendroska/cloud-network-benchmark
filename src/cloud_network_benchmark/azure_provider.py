@@ -66,6 +66,9 @@ class AzureRuntimeOptions(StrictModel):
     # Original admission sample. Keeping this basis avoids remapping a fixed
     # cap through a later UTC/monotonic pair during Azure expiry registration.
     cap_started_monotonic: Optional[float] = Field(default=None, gt=0, exclude_if=lambda value: value is None)
+    # Per-operation stage ceiling, derived from the immutable cap start. It is
+    # transient and never replaces the original cap binding above.
+    workflow_stage_deadline_monotonic: Optional[float] = Field(default=None, exclude=True)
     admission_evidence: dict[str, Any]
     retry_end_at: datetime
     poll_seconds: int = Field(ge=1, le=300)
@@ -137,8 +140,10 @@ class AzureRuntimeOptions(StrictModel):
             raise ValueError("profile cleanup requires an absolute external timing-state path")
         if (self.timing_profile or self.workflow_profile) and self.cleanup_timing_path.is_relative_to(self.attempt_root):
             raise ValueError("profile cleanup timing state must survive provider attempt-root deletion")
-        if (self.timing_profile or self.workflow_profile) and self.command_timeout_seconds > 180:
-            raise ValueError("profile Azure commands are capped at 180 seconds")
+        if self.workflow_profile and self.command_timeout_seconds > 120:
+            raise ValueError("profile Azure commands are capped at 120 seconds")
+        if self.timing_profile and self.command_timeout_seconds > 180:
+            raise ValueError("EXP-901 Azure commands are capped at 180 seconds")
         if not self.admission_evidence.get("priority_review_reference") and self.admission_evidence.get("priority") in {"P2", "P3"}:
             raise ValueError("P2/P3 requires explicit priority review evidence")
         if self.admission_evidence.get("outstanding_cleanup") is not False:
@@ -158,6 +163,11 @@ class AzureRuntimeOptions(StrictModel):
                 self.cap_deadline_monotonic, self.poll_seconds, self.command_timeout_seconds,
                 float(price["automation_rate_per_job_minute"]), float(price["job_minutes_bound"]))):
             raise ValueError("time and price bounds must be finite")
+        if (self.workflow_stage_deadline_monotonic is not None
+                and (not isfinite(self.workflow_stage_deadline_monotonic)
+                    or self.workflow_stage_deadline_monotonic <= 0
+                    or self.workflow_stage_deadline_monotonic > self.cap_deadline_monotonic)):
+            raise ValueError("Azure workflow stage deadline must be finite and within the original cap")
         return self
 
 
@@ -984,7 +994,10 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     if options.cleanup_timing_active:
         _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
             phase=options.cleanup_timing_phase or "routine")
-    remaining = options.cap_deadline_monotonic-clock()
+    operation_deadline = min(options.cap_deadline_monotonic,
+        options.workflow_stage_deadline_monotonic
+        if options.workflow_stage_deadline_monotonic is not None else options.cap_deadline_monotonic)
+    remaining = operation_deadline-clock()
     if options.cleanup_timing_active and options.cleanup_timing_phase == "routine":
         try:
             timing = json.loads(options.cleanup_timing_path.read_text(encoding="utf-8"))
@@ -1022,9 +1035,11 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     environment = dict(os.environ)
     tf_root = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("-chdir=")), "terraform")
     environment["TF_DATA_DIR"] = str(root / ("terraform-data-" + Path(tf_root).name))
+    reviewed_apply = ("apply" in argv and any(arg.startswith("-chdir=") for arg in argv)
+        and options.plan_review_timeout_seconds > 0)
     req = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type=action, argv=argv,
-        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=min(
-            options.command_timeout_seconds, 180.0 if options.timing_profile else options.command_timeout_seconds, remaining),
+        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=(remaining if reviewed_apply else min(
+            options.command_timeout_seconds, 180.0 if options.timing_profile else options.command_timeout_seconds, remaining)),
         environment=environment, environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
     def execute(req: CommandRequest) -> CommandResult:
         try:
@@ -1050,6 +1065,7 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         from .terraform_plan import reviewed_apply
         req = req.model_copy(update={"cwd": str(root)})
         result = reviewed_apply(req, execute, review_seconds=options.plan_review_timeout_seconds,
+            command_timeout_seconds=int(options.command_timeout_seconds),
             apply_timeout_seconds=apply_timeout_seconds, before_apply=before_apply,
             review_admission_path=options.plan_review_admission_path)
     else:
@@ -1660,7 +1676,19 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
     if request.target_selector != ";".join(ids):
         raise ValueError("expiry target selector must name exactly A and B")
     try:
-        evidence = _register_expiry_impl(deployment, request, options, runner, clock=clock, utc_now=utc_now, sleep=sleep)
+        registration_options = options
+        if deployment.admission.workflow_profile:
+            allowance = options.profile_allowance or {}
+            cap_start = options.cap_started_monotonic
+            if cap_start is None:
+                raise ValueError("profile Azure registration requires the original monotonic cap start")
+            deadline = cap_start + float(allowance.get("registration_seconds", 0.0))
+            deadline = min(deadline, options.cap_deadline_monotonic)
+            if trigger is not None:
+                stop_deadline = cap_start + (trigger - reservation.cap_started_at.value).total_seconds()
+                deadline = min(deadline, stop_deadline)
+            registration_options = options.model_copy(update={"workflow_stage_deadline_monotonic": deadline})
+        evidence = _register_expiry_impl(deployment, request, registration_options, runner, clock=clock, utc_now=utc_now, sleep=sleep)
         if evidence.state == "registered" and evidence.expires_at.value is not None:
             _bind_profile_stop(deployment, options, evidence.expires_at.value)
         return evidence
@@ -1790,6 +1818,18 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
     provision_stage_seconds = float(deployment.provisioning_timeout_seconds or options.command_timeout_seconds)
     mono=clock()
     provision_deadline_monotonic = mono + provision_stage_seconds
+    if deployment.admission.workflow_profile:
+        allowance = options.profile_allowance or {}
+        cap_start = options.cap_started_monotonic
+        if cap_start is None:
+            raise ValueError("profile Azure provisioning requires the original monotonic cap start")
+        stage_start = cap_start + float(allowance.get("registration_seconds", 0.0))
+        provision_deadline_monotonic = min(provision_deadline_monotonic,
+            stage_start + float(allowance.get("provision_seconds", 0.0)), options.cap_deadline_monotonic)
+        stop = deployment.expiry.value.expires_at.value
+        reservation_start = deployment.reservation.value.cap_started_at.value
+        provision_deadline_monotonic = min(provision_deadline_monotonic,
+            cap_start + (stop - reservation_start).total_seconds())
     now=utc_now().astimezone(UTC)
     _require_profile_timing_anchor(deployment, options, require_stop=True)
     name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
@@ -1825,7 +1865,7 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         review_deadline = min(preapply_mono+review_slack, provision_deadline_monotonic)
         if review_deadline <= preapply_mono:
             raise TimeoutError("pair plan review no longer fits within the original provision-stage allowance")
-        review_options = options.model_copy(update={"cap_deadline_monotonic":review_deadline})
+        review_options = options.model_copy(update={"workflow_stage_deadline_monotonic":review_deadline})
         if provision_stage_seconds > options.post_registration_workflow_seconds:
             raise TimeoutError("pair provision stage exceeds the post-registration workflow allowance")
         # The F11 allowance reserves the provision component inside the full
@@ -1852,7 +1892,7 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         apply=_tf(root,review_options,runner,clock,"terraform/azure/pair",*args,action="pair_apply",
             apply_timeout_seconds=min(options.command_timeout_seconds, provision_deadline_monotonic-preapply_mono),
             before_apply=apply_budget_after_review); results.append(apply.durable_view())
-        post_apply_options=options.model_copy(update={"cap_deadline_monotonic":min(options.cap_deadline_monotonic,provision_deadline_monotonic)})
+        post_apply_options=options.model_copy(update={"workflow_stage_deadline_monotonic":provision_deadline_monotonic})
         if clock() >= provision_deadline_monotonic:
             raise TimeoutError("original Azure provision-stage deadline elapsed before pair output and host trust")
         out=_tf(root,post_apply_options,runner,clock,"terraform/azure/pair","output","-json",action="pair_output")

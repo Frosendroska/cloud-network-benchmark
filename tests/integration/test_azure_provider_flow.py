@@ -12,6 +12,7 @@ from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, r
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
 from cloud_network_benchmark.contracts.execution import CommandResult
+from cloud_network_benchmark.terraform_plan import reviewed_apply as _real_reviewed_apply
 pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
 from tests.fixtures.f06 import RESPONSE_FIXTURES
@@ -43,6 +44,65 @@ def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: P
     with pytest.raises(ValueError, match="confirmed Azure deallocation"):
         provision(d,o,Runner(),clock=lambda:1.0,utc_now=lambda:datetime.now(timezone.utc))
     assert not o.attempt_root.exists()
+
+
+@pytest.mark.parametrize("started,should_apply", [(800.0, True), (840.0, False)])
+def test_azure_saved_review_uses_stage_budget_and_clamps_each_command(
+        repository_root: Path, tmp_path: Path, monkeypatch, started: float, should_apply: bool):
+    """Queue and manual review share the stage budget; Terraform calls stay <=120s."""
+    import cloud_network_benchmark.terraform_plan as plan_review
+    monkeypatch.setattr(plan_review, "reviewed_apply", _real_reviewed_apply)
+
+    d = deployment(repository_root)
+    o = options(tmp_path / "attempt", d.admission.priority)
+    o = o.model_copy(update={"command_timeout_seconds": 120,
+        "plan_review_timeout_seconds": 120,
+        "plan_review_admission_path": tmp_path / "review-queue",
+        "workflow_stage_deadline_monotonic": 1000.0})
+    root = repository_root / "terraform" / "azure" / "pair"
+    vars_file = tmp_path / "vars.json"
+    vars_file.write_text("{}")
+    state = tmp_path / "state.tfstate"
+    elapsed = [started]
+    monkeypatch.setattr(plan_review.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(plan_review.time, "time", lambda: 1_800_000_000 + elapsed[0])
+    monkeypatch.setattr(plan_review, "validate_scope", lambda *args: {"resource_changes": []})
+    monkeypatch.setattr(plan_review, "original_review_cutoff", lambda *args: 9_999_999_999.0)
+    monkeypatch.setattr(plan_review, "_review_admission_lock",
+        lambda *args: elapsed.__setitem__(0, elapsed[0] + 110) or None)
+
+    def wait_for_review(directory, binding, deadline):
+        elapsed[0] += 55
+        if elapsed[0] >= deadline:
+            raise TimeoutError("review exceeded original stage budget")
+        return {"decision": "approved", "binding": binding}
+
+    monkeypatch.setattr(plan_review, "await_review", wait_for_review)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            argv = request.argv
+            if "plan" in argv:
+                Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("-out="))).write_bytes(b"plan")
+            elapsed[0] += 5
+            out = "{}" if "show" in argv else "{}"
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
+                started_at=now, finished_at=now, duration_seconds=0, exit_code=0, stdout=out, stderr="")
+    runner = Runner()
+    command = ["terraform", f"-chdir={root}", "apply", "-input=false",
+        f"-state={state}", f"-var-file={vars_file}"]
+    if should_apply:
+        result = azure_provider._command(runner, o, tmp_path, command, "pair_apply", lambda: elapsed[0])
+        assert result.outcome == CommandOutcome.SUCCEEDED
+        assert ["apply" in request.argv for request in runner.requests].count(True) == 1
+    else:
+        with pytest.raises((TimeoutError, ValueError)):
+            azure_provider._command(runner, o, tmp_path, command, "pair_apply", lambda: elapsed[0])
+        assert not any("apply" in request.argv for request in runner.requests)
+    assert runner.requests
+    assert all(request.timeout_seconds <= 120 for request in runner.requests)
 
 
 class AutomationRunner:
@@ -265,7 +325,8 @@ def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository
     value.update(complete_workflow_seconds=3535,post_registration_workflow_seconds=2635,
         cap_deadline_monotonic=factory_cap,cap_started_monotonic=cap_deadline-4200.0,
         retry_end_at=cap_expires_at,workflow_profile="all_cloud_acceptance_v1",
-        cleanup_timing_path=tmp_path/"private"/"azure-clock-map.json")
+        cleanup_timing_path=tmp_path/"private"/"azure-clock-map.json",
+        profile_allowance={"registration_seconds":900,"provision_seconds":1800})
     o=AzureRuntimeOptions.model_validate(value)
 
     # The old second-sample comparison rejects these original numbers by 10.88us.
