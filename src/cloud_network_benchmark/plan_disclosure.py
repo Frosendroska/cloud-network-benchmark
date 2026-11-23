@@ -19,8 +19,8 @@ import time
 from . import terraform_plan as tp
 
 
-# SHA-256 of terraform_plan.py at integrated core baseline def3a5cd922ccf034166070ed9eb76817f2703e6.
-PINNED_VALIDATOR_SHA256 = "1665d4e3e414a0c81c6f480b5acd0b8b955584e5601afc57a7a48806cab7a205"
+# SHA-256 of terraform_plan.py after the registered GCP placement-name contract.
+PINNED_VALIDATOR_SHA256 = "0ab7b971dab60c8d4256553be21136d8305eea5f8c4941d1849b2c6ae43ccef1"
 
 
 def digest(data: bytes) -> str:

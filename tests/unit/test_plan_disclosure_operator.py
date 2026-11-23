@@ -59,6 +59,18 @@ def _variables():
     return scope("gcp", "protection")[0]
 
 
+def test_disclosure_pins_exact_current_validator_bytes_and_rejects_changed_hash(monkeypatch):
+    validator_path = Path(plan_disclosure.tp.__file__).resolve()
+    current_hash = hashlib.sha256(validator_path.read_bytes()).hexdigest()
+    assert current_hash == plan_disclosure.PINNED_VALIDATOR_SHA256
+    identity = plan_disclosure._validator_identity()
+    assert identity == {"path": str(validator_path), "sha256": current_hash}
+
+    monkeypatch.setattr(plan_disclosure, "PINNED_VALIDATOR_SHA256", "0" * 64)
+    with pytest.raises(PlanReviewError, match="does not match frozen release SHA-256"):
+        plan_disclosure._validator_identity()
+
+
 def _six_roots(base: Path, provider_root: Path) -> list[Path]:
     return [provider_root, *(base / f"allowlisted-provider-root-{index}" for index in range(1, 6))]
 

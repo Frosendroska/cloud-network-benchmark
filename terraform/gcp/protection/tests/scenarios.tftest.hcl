@@ -120,7 +120,8 @@ run "cross_zone" {
 run "placement_optimization" {
   command = plan
   variables {
-    scenario = "placement_optimization"
+    scenario              = "placement_optimization"
+    placement_policy_name = "cnb-v-s3-0645901bca"
   }
   assert {
     condition     = length(google_compute_resource_policy.compact) == 1 && local.ips == ["10.80.1.10", "10.80.1.11"]
