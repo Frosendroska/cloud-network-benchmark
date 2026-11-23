@@ -1124,7 +1124,7 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         +r"/resourceGroups/[^/?]+/providers/Microsoft\.Automation/automationAccounts/[^/?]+"
         +r"/jobSchedules/[^/?]+\?api-version="+re.escape(AUTOMATION_API))
     exact_job_schedule_absence = (expected_missing_job_schedule_url is not None
-        and action in {"expiry_jobSchedules_before_delete", "expiry_jobSchedules_absence"}
+        and action in {"expiry_jobSchedules_before_delete", "expiry_jobSchedules_absence", "profile_absence_automation"}
         and method_values == ["GET"] and url_values == [expected_missing_job_schedule_url]
         and subscription_values == [options.subscription_id]
         and re.fullmatch(expected_job_url_pattern, expected_missing_job_schedule_url) is not None
@@ -1392,18 +1392,29 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
         raise RuntimeError("independent Azure role-definition inventory found the attempt custom role")
     account = expiry.get("automation_account_id")
     if account:
-        targets = [(account, "automation account", AUTOMATION_API)]
+        expected_account=(f"/subscriptions/{options.subscription_id}/resourceGroups/{name}"
+            f"/providers/Microsoft.Automation/automationAccounts/{name}-auto")
+        if account != expected_account:
+            raise RuntimeError("independent Azure Automation absence target is outside the owned account")
+        targets = [(account, "automation account", AUTOMATION_API, None, None)]
         for collection, key in (("jobSchedules", "job_schedule_id"), ("schedules", "schedule"), ("runbooks", "runbook")):
             child = expiry.get(key) or expiry.get("metadata", {}).get(key)
             if child:
-                targets.append((f"{account}/{collection}/{child}", f"Automation {collection} child", AUTOMATION_API))
-        for target, label, api in targets:
-            result = _command(runner, options, root, _azure_rest("GET", f"{target}?api-version={api}"),
+                targets.append((f"{account}/{collection}/{child}", f"Automation {collection} child",
+                    AUTOMATION_API, collection, child))
+        for target, label, api, collection, child in targets:
+            url=f"{target}?api-version={api}"
+            expected_missing_job_schedule_url=(url if collection=="jobSchedules" else None)
+            if collection=="jobSchedules" and not _is_uuid_segment(str(child)):
+                raise RuntimeError("independent Azure job schedule absence target is not the registered owned identity")
+            result = _command(runner, options, root, _azure_rest("GET", url),
                 "profile_absence_automation", clock, allow_not_found=True,
-                allow_missing_resource_group=state["resource_group"])
+                allow_missing_resource_group=state["resource_group"],
+                expected_missing_job_schedule_url=expected_missing_job_schedule_url)
             actions.append(_safe_cleanup_action(options, result))
             if result.outcome != "failed" or not (_is_exact_not_found(result)
-                    or _is_exact_missing_attempt_resource_group(result, state["resource_group"])):
+                    or _is_exact_missing_attempt_resource_group(result, state["resource_group"])
+                    or (expected_missing_job_schedule_url is not None and _is_exact_missing_job_schedule(result))):
                 raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
 
 

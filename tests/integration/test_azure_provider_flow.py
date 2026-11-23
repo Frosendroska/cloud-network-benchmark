@@ -140,6 +140,57 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
             expected_missing_job_schedule_url=expected_url)
 
 
+@pytest.mark.parametrize("case", ["actual", "authorization", "mixed", "duplicate", "wrong_target"])
+def test_final_profile_absence_accepts_only_exact_owned_job_schedule_not_found(repository_root,tmp_path,case):
+    from cloud_network_benchmark.azure_provider import _verify_profile_absence
+    import hashlib
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    job_id="00000000-0000-0000-0000-000000000123"
+    child_url=f"{account}/jobSchedules/{job_id}?api-version={azure_provider.AUTOMATION_API}"
+    baseline={"groups":[],"watchers":[]}
+    baseline["sha256"]=hashlib.sha256(json.dumps(baseline,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,"job_schedule_id":job_id},
+        "profile_external_baseline":baseline}
+    actual='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
+    if case=="authorization": error='ERROR: Not Found({"code":"AuthorizationFailed","message":"Job Schedule not found."})'
+    elif case=="mixed": error=actual
+    elif case=="duplicate": error='ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'
+    else: error=actual
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            now_result=now
+            if request.action_type=="profile_absence_group":
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                    started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=0,stdout="false",stderr="")
+            if request.action_type in {"profile_absence_resources","profile_absence_groups",
+                    "profile_absence_role_assignments","profile_absence_role_definitions"}:
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                    started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=0,stdout='{"value":[]}',stderr="")
+            url=request.argv[request.argv.index("--url")+1]
+            if case=="wrong_target" and url==account+"?api-version="+azure_provider.AUTOMATION_API:
+                stderr=actual; stdout=""
+            elif url==child_url:
+                stderr=error; stdout="noise" if case=="mixed" else ""
+            else:
+                stderr='{"error":{"code":"ResourceNotFound"}}'; stdout=""
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
+    runner=Runner(); actions=[]
+    if case=="actual":
+        _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+        request=next(r for r in runner.requests if "--url" in r.argv
+            and "/jobSchedules/" in r.argv[r.argv.index("--url")+1])
+        assert request.action_type=="profile_absence_automation"
+        assert request.argv[request.argv.index("--url")+1]==child_url
+    else:
+        with pytest.raises(RuntimeError):
+            _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+
+
 
 def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); o=options(tmp_path, d.admission.priority)
