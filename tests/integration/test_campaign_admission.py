@@ -279,6 +279,18 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     assert len(expected) == 6 and observed == expected
     assert _acceptance_pair(stage) == pair
 
+    from cloud_network_benchmark.lifecycle_remote import build_provider_remote_stages
+    for entry in pair:
+        runtime, parent, children, _request, _plan = load_entry(stage, entry, repository_root)
+        campaign, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
+        assert runtime["measurement_start_barrier"]["start_policy"] == "all_ready"
+        for provider in children:
+            stages = build_provider_remote_stages(provider=provider, campaign=campaign,
+                parent=parent, children=children, runtime=runtime, ledger=None,
+                reservation=None, runner=None, clock=Clock(), repository_root=repository_root,
+                recovery_path=tmp_path / f"{entry['entry_id']}-{provider}-recovery.json")
+            assert callable(stages.measure)
+
 
 def test_operator_recovery_uses_entry_parent_campaign_not_stage_aggregation_id(
         repository_root, tmp_path, monkeypatch, request):
@@ -500,6 +512,38 @@ def test_generated_calibration_binds_runtime_observer_without_changing_workload(
     decision = ledger.reserve(reservation_request, plan=admission_plan)
     assert decision.status == "rejected"
     assert decision.reasons == ("financial_authorization_invalid",)
+
+
+def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.lifecycle_remote import build_provider_remote_stages
+    from cloud_network_benchmark.validation_profiles import CALIBRATION_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE,
+        execution_window_utc=window)
+    settings["stage_inputs"]["calibration"].pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
+    stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+    entry = stage["entries"][0]
+    runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+        allow_missing_approval_evidence=True)
+    parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+        repository_root=repository_root, config_path=Path(entry["config_path"]))
+    campaign, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
+    assert runtime["measurement_start_barrier"]["start_policy"] == "all_ready"
+    assert runtime["observer"]["entry_id"] == "CAL-S1"
+    for provider in children:
+        stages = build_provider_remote_stages(provider=provider, campaign=campaign,
+            parent=parent, children=children, runtime=runtime, ledger=None,
+            reservation=None, runner=None, clock=Clock(), repository_root=repository_root,
+            recovery_path=tmp_path / f"calibration-{provider}-recovery.json",
+            archive_sink={"archive_root": str(tmp_path / "calibration-archive")})
+        assert callable(stages.measure)
 
 
 def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repository_root, tmp_path, monkeypatch, request):

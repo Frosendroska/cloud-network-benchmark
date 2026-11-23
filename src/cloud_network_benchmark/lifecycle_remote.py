@@ -50,6 +50,37 @@ def _latest_common_measurement_start(cap_expires_at: datetime, allowance: Any, p
     return (cap_expires_at.astimezone(timezone.utc) - timedelta(seconds=required))
 
 
+def _prepared_barrier_entry_id(observation: Any, runtime: Mapping[str, Any]) -> str:
+    """Resolve the exact prepared entry identity for a frozen barrier participant."""
+    schedule_entry = getattr(observation, "schedule_entry", None)
+    schedule_entry = getattr(schedule_entry, "value", None)
+    schedule_id = getattr(schedule_entry, "entry_id", None)
+    observer = runtime.get("observer")
+    observer_id = observer.get("entry_id") if isinstance(observer, Mapping) else None
+    if schedule_id is not None and observer_id is not None and schedule_id != observer_id:
+        raise ValueError("prepared schedule and observer entry identities differ")
+    entry_id = schedule_id or observer_id
+    if not isinstance(entry_id, str) or not entry_id.strip():
+        raise ValueError("prepared barrier requires exact schedule or runtime observer entry identity")
+    return entry_id
+
+
+def _exact_barrier_participant(participants: list[Mapping[str, Any]], *,
+        entry_id: str, provider: str, run_id: str) -> Mapping[str, Any]:
+    matches = [row for row in participants if row.get("entry_id") == entry_id
+        and row.get("provider") == provider and row.get("run_id") == run_id]
+    if len(matches) != 1:
+        raise ValueError("prepared barrier does not contain exactly one matching child")
+    return matches[0]
+
+
+def _generated_archive_entry_id(observation: Any, run_id: str) -> str:
+    """Match generated archive barriers, which retain the legacy schedule/run key."""
+    schedule_entry = getattr(observation, "schedule_entry", None)
+    schedule_entry = getattr(schedule_entry, "value", None)
+    return getattr(schedule_entry, "entry_id", None) or run_id
+
+
 def _fetch_bounded_guest_archive_part(*, runner: Any, connection: Any, role: str,
         source_path: str, destination: Path, staging_directory: Path, size_bytes: int,
         maximum_staging_bytes: int, minimum_free_bytes: int,
@@ -155,11 +186,13 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
     barrier = None
     barrier_participant = None
     barrier_spec = runtime.get("post_measurement_barrier")
-    if barrier_spec is None and archive_sink is not None:
+    generated_archive_barrier = barrier_spec is None and archive_sink is not None
+    if generated_archive_barrier:
         participants = []
         for selected_provider, selected_child in sorted(children.items()):
-            entry = getattr(getattr(selected_child.resolved_observation, "schedule_entry", None), "value", None)
-            participants.append({"entry_id": getattr(entry, "entry_id", None) or selected_child.run_id,
+            entry_id = _generated_archive_entry_id(selected_child.resolved_observation,
+                selected_child.run_id)
+            participants.append({"entry_id": entry_id,
                 "provider": selected_provider, "run_id": selected_child.run_id})
         barrier_id = "archive-post-close-" + hashlib.sha256(json.dumps(
             participants, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
@@ -168,15 +201,10 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             "participants": participants}
     if barrier_spec is not None:
         barrier = PostMeasurementBarrier(barrier_spec)
-        schedule_entry = getattr(observation, "schedule_entry", None)
-        schedule_entry = getattr(schedule_entry, "value", None)
-        entry_id = getattr(schedule_entry, "entry_id", None) or child.run_id
-        matches = [row for row in barrier.spec["participants"]
-            if row["entry_id"] == entry_id and row["provider"] == provider
-            and row["run_id"] == child.run_id]
-        if len(matches) != 1:
-            raise ValueError("prepared post-measurement barrier does not contain this exact child")
-        barrier_participant = matches[0]
+        entry_id = (_generated_archive_entry_id(observation, child.run_id) if generated_archive_barrier else
+            _prepared_barrier_entry_id(observation, runtime))
+        barrier_participant = _exact_barrier_participant(barrier.spec["participants"],
+            entry_id=entry_id, provider=provider, run_id=child.run_id)
     measurement_start_barrier = None
     measurement_start_participant = None
     ready_triggered_start = False
@@ -196,14 +224,11 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             if entry_id not in expected_entries:
                 raise ValueError("ready-triggered barrier requires exact prepared runtime entry identity")
         entry_id = entry_id or child.run_id
-        matches = [row for row in measurement_start_barrier.spec["participants"]
-            if row["entry_id"] == entry_id and row["provider"] == provider
-            and row["run_id"] == child.run_id]
-        if len(matches) != 1:
-            raise ValueError("prepared measurement-start barrier does not contain this exact child")
+        measurement_start_participant = _exact_barrier_participant(
+            measurement_start_barrier.spec["participants"], entry_id=entry_id,
+            provider=provider, run_id=child.run_id)
         if not ready_triggered_start and not measurement_start_barrier.spec.get("start_utc"):
             raise ValueError("measurement-start barrier requires one frozen UTC start")
-        measurement_start_participant = matches[0]
     revision = child.config_provenance.implementation_git_commit.value
     if not revision:
         raise ValueError("initialized implementation revision is unavailable")
