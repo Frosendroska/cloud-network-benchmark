@@ -940,12 +940,16 @@ def _is_exact_not_found(result: CommandResult) -> bool:
 
 
 def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_group: str) -> bool:
-    """Accept only Azure CLI's structured wrapper for this exact absent parent."""
+    """Accept only Azure CLI's exact structured or canonical CLI absence for this parent."""
     if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
         return False
+    expected_message = f"Resource group '{resource_group}' could not be found."
     wrapped = re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*", result.stderr, re.DOTALL)
     if wrapped is None:
-        return False
+        cli_message=(r"\s*ERROR:\s*\(ResourceGroupNotFound\)\s+"+re.escape(expected_message)
+            +r"\r?\nCode:\s*ResourceGroupNotFound\r?\nMessage:\s*"
+            +re.escape(expected_message)+r"\s*")
+        return re.fullmatch(cli_message,result.stderr,re.DOTALL) is not None
     def unique_object(pairs):
         output = {}
         for key, value in pairs:
@@ -960,9 +964,46 @@ def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_gro
     if not isinstance(payload, dict) or set(payload) != {"error"}:
         return False
     error = payload["error"]
-    expected_message = f"Resource group '{resource_group}' could not be found."
     return (isinstance(error, dict) and set(error) == {"code", "message"}
         and error.get("code") == "ResourceGroupNotFound" and error.get("message") == expected_message)
+
+
+def _automation_account_parts(account_id: str) -> dict[str,str] | None:
+    match=re.fullmatch(r"/subscriptions/(?P<subscription>[^/]+)/resourceGroups/(?P<group>[^/]+)"
+        r"/providers/Microsoft\.Automation/automationAccounts/(?P<account>[^/]+)",account_id)
+    if match is None:
+        return None
+    parts=match.groupdict()
+    return parts if parts["account"]==parts["group"]+"-auto" else None
+
+
+def _is_exact_missing_automation_account(result: CommandResult, expected_account_id: str) -> bool:
+    """Match only the canonical nested ResourceNotFound for the exact owned account."""
+    parts=_automation_account_parts(expected_account_id)
+    if parts is None or result.outcome!="failed" or result.stdout.strip() or not result.stderr.strip():
+        return False
+    wrapped=re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*",result.stderr,re.DOTALL)
+    if wrapped is None:
+        return False
+    def unique_object(pairs):
+        output={}
+        for key,value in pairs:
+            if key in output:
+                raise ValueError("duplicate JSON key")
+            output[key]=value
+        return output
+    try:
+        payload=json.loads(wrapped.group(1),object_pairs_hook=unique_object)
+    except (json.JSONDecodeError,ValueError):
+        return False
+    if not isinstance(payload,dict) or set(payload)!={"error"}:
+        return False
+    expected_message=(f"The Resource 'Microsoft.Automation/automationAccounts/{parts['account']}' "
+        f"under resource group '{parts['group']}' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    error=payload["error"]
+    return (isinstance(error,dict) and set(error)=={"code","message"}
+        and error.get("code")=="ResourceNotFound" and error.get("message")==expected_message)
 
 
 def _is_exact_missing_automation_child(result: CommandResult, expected_url: str) -> bool:
@@ -1056,6 +1097,7 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
              clock: Callable[[], float], *, allow_not_found: bool = False,
              allow_missing_resource_group: str | None = None,
              expected_missing_automation_child_url: str | None = None,
+             expected_missing_automation_account_id: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
     if options.cleanup_timing_active:
@@ -1165,7 +1207,25 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         and subscription_values == [options.subscription_id]
         and child_identity_valid
         and _is_exact_missing_automation_child(result,expected_missing_automation_child_url))
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or (
+    account_parts=(_automation_account_parts(expected_missing_automation_account_id)
+        if expected_missing_automation_account_id is not None else None)
+    account_identity_valid=(account_parts is not None and account_parts["subscription"]==options.subscription_id)
+    account_url=(expected_missing_automation_account_id+"?api-version="+AUTOMATION_API
+        if expected_missing_automation_account_id is not None else None)
+    account_profile_request=(action=="profile_absence_automation" and argv[:2]==["az","rest"]
+        and method_values==["GET"] and url_values==[account_url] and output_values==["json"]
+        and subscription_values==[options.subscription_id]
+        and not any(flag in argv for flag in ("--body","--headers","--query","--resource")))
+    account_cli_request=(action=="automation_account_absence" and argv[:3]==["az","resource","show"]
+        and [argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--ids"]==[expected_missing_automation_account_id]
+        and output_values==["json"] and subscription_values==[options.subscription_id]
+        and not any(flag in argv for flag in ("--method","--url","--body","--headers","--query")))
+    exact_automation_account_absence=(account_identity_valid
+        and (account_profile_request or account_cli_request)
+        and (_is_exact_missing_automation_account(result,expected_missing_automation_account_id)
+            or (account_cli_request and account_parts is not None
+                and _is_exact_missing_attempt_resource_group(result,account_parts["group"]))))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or exact_automation_account_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1447,15 +1507,19 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
         for target, label, api, collection, child in targets:
             url=f"{target}?api-version={api}"
             expected_missing_automation_child_url=(url if collection in {"jobSchedules","schedules","runbooks"} else None)
+            expected_missing_automation_account_id=(account if label=="automation account" else None)
             if collection=="jobSchedules" and not _is_uuid_segment(str(child)):
                 raise RuntimeError("independent Azure job schedule absence target is not the registered owned identity")
             result = _command(runner, options, root, _azure_rest("GET", url),
                 "profile_absence_automation", clock, allow_not_found=True,
                 allow_missing_resource_group=state["resource_group"],
-                expected_missing_automation_child_url=expected_missing_automation_child_url)
+                expected_missing_automation_child_url=expected_missing_automation_child_url,
+                expected_missing_automation_account_id=expected_missing_automation_account_id)
             actions.append(_safe_cleanup_action(options, result))
             if result.outcome != "failed" or not (_is_exact_not_found(result)
                     or _is_exact_missing_attempt_resource_group(result, state["resource_group"])
+                    or (expected_missing_automation_account_id is not None
+                        and _is_exact_missing_automation_account(result,expected_missing_automation_account_id))
                     or (expected_missing_automation_child_url is not None
                         and _is_exact_missing_automation_child(result,expected_missing_automation_child_url))):
                 raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
@@ -2365,9 +2429,13 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
         exp=_tf(root,options,runner,clock,"terraform/azure/expiry","destroy","-auto-approve","-input=false",f"-var-file={expiry_vars}",action="expiry_destroy")
         actions.append(_safe_cleanup_action(options,exp))
         if account and parent_exists:
-            account_absence=_command(runner,options,root,["az","resource","show","--ids",account,"--output","json"],"automation_account_absence",clock,allow_not_found=True)
+            account_absence=_command(runner,options,root,["az","resource","show","--ids",account,"--output","json"],
+                "automation_account_absence",clock,allow_not_found=True,
+                expected_missing_automation_account_id=account)
             actions.append(_safe_cleanup_action(options,account_absence))
-            if account_absence.outcome!="failed" or not _is_exact_not_found(account_absence):
+            if account_absence.outcome!="failed" or not (_is_exact_not_found(account_absence)
+                    or _is_exact_missing_automation_account(account_absence,account)
+                    or _is_exact_missing_attempt_resource_group(account_absence,state["resource_group"])):
                 raise RuntimeError("Automation account absence is not proven by exact resource identity")
         verify=_command(runner,options,root,["az","group","exists","--name",state["resource_group"],"--output","tsv"],"expiry_inventory",clock)
         actions.append(_safe_cleanup_action(options,verify))
