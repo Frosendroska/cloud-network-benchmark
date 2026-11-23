@@ -1154,7 +1154,8 @@ def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_bloc
     assert (o.attempt_root/"recovery.json").exists()
 
 
-@pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]}"])
+@pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]} ",
+    "[{\"id\":\"/subscriptions/foreign/providers/Microsoft.Authorization/roleAssignments/x\",\"scope\":\"/subscriptions/foreign\",\"principalId\":\"p\",\"roleDefinitionId\":\"r\"}]"])
 def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root:Path,tmp_path:Path,inventory):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
@@ -1164,6 +1165,9 @@ def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
     assert "role assignment inventory" in result.failures[0].message
+    request=next(q for q in runner.requests if q.action_type=="role_cleanup_inventory")
+    assert request.argv == ["az","role","assignment","list","--scope",
+        runner.group_id,"--output","json"]
     assert (o.attempt_root/"recovery.json").exists()
 
 

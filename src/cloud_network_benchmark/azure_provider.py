@@ -1037,6 +1037,35 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     return result
 
 
+def _role_assignments_at_scope(runner: CommandRunner, options: AzureRuntimeOptions,
+                               root: Path, scope: str, action: str,
+                               clock: Callable[[], float]) -> tuple[Any, list[dict[str, Any]]]:
+    """Read direct role assignments at one exact scope, rejecting ambiguous output."""
+    result = _command(runner, options, root,
+        ["az", "role", "assignment", "list", "--scope", scope, "--output", "json"],
+        action, clock)
+    if result.stderr.strip() or not result.stdout.strip():
+        raise RuntimeError("role assignment inventory is blank or incomplete")
+    try:
+        assignments = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("role assignment inventory is malformed") from exc
+    if not isinstance(assignments, list):
+        raise RuntimeError("role assignment inventory is malformed")
+    seen: set[str] = set()
+    for item in assignments:
+        if not isinstance(item, dict) or any(not isinstance(item.get(key), str) or not item[key].strip()
+                for key in ("id", "scope", "principalId", "roleDefinitionId")):
+            raise RuntimeError("role assignment inventory contains an unknown or malformed entry")
+        identity = item["id"].lower()
+        if identity in seen:
+            raise RuntimeError("role assignment inventory contains a duplicate identity")
+        seen.add(identity)
+        if item["scope"].rstrip("/").lower() != scope.rstrip("/").lower():
+            raise RuntimeError("role assignment inventory contains an inherited or foreign scope")
+    return result, assignments
+
+
 def _prove_vm_absent(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
                      resource_id: str, clock: Callable[[], float], *, absent_parent_group: str | None = None) -> CommandResult:
     """Accept exact VM absence, or typed parent absence already independently proved."""
@@ -1431,7 +1460,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise RuntimeError("job binding identity readback mismatch")
     if not isinstance(actual,dict) or {k.lower():v for k,v in actual.items()} != binding["properties"]["parameters"]:
         raise RuntimeError("job binding readback mismatch")
-    assignments = json.loads(_command(runner, options, root, ["az", "role", "assignment", "list", "--scope", expiry_ids["resource_group_id"], "--all", "--output", "json"], "role_assignment_readback", clock).stdout or "[]")
+    _, assignments = _role_assignments_at_scope(runner, options, root,
+        expiry_ids["resource_group_id"], "role_assignment_readback", clock)
     assignment = next((x for x in assignments if x.get("id", "").lower() == expiry_ids["role_assignment_id"].lower()), None)
     if assignment is None or assignment.get("principalId", "").lower() != expiry_ids["principal_id"].lower() or assignment.get("scope", "").lower() != expiry_ids["resource_group_id"].lower() or assignment.get("roleDefinitionId", "").lower()!=expiry_ids["role_definition_id"].lower():
         raise RuntimeError("Automation managed identity role assignment readback mismatch")
@@ -1523,7 +1553,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
             or job.get("properties", {}).get("runbook", {}).get("name") != m.get("runbook")
             or job.get("properties", {}).get("schedule", {}).get("name") != m.get("schedule")):
         raise RuntimeError("registered expiry job binding changed")
-    assignments = json.loads(_command(runner, options, root, ["az", "role", "assignment", "list", "--scope", m["resource_group_id"], "--all", "--output", "json"], "expiry_role_recheck", clock).stdout or "[]")
+    _, assignments = _role_assignments_at_scope(runner, options, root,
+        m["resource_group_id"], "expiry_role_recheck", clock)
     assignment = next((x for x in assignments if x.get("id", "").lower() == m.get("role_assignment_id", "").lower()), None)
     if (assignment is None or assignment.get("principalId", "").lower() != m.get("managed_identity_principal_id", "").lower()
             or assignment.get("scope","").lower()!=m.get("resource_group_id","").lower()
@@ -2135,10 +2166,9 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
         verify=_command(runner,options,root,["az","group","exists","--name",state["resource_group"],"--output","tsv"],"expiry_inventory",clock)
         actions.append(_safe_cleanup_action(options,verify))
         if verify.stderr.strip() or verify.stdout.strip().lower()!="false": raise RuntimeError("attempt resource group removal is not verified")
-        residual_roles=_command(runner,options,root,["az","role","assignment","list","--scope",f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}","--all","--output","json"],"role_cleanup_inventory",clock)
-        if residual_roles.stderr.strip() or not residual_roles.stdout.strip(): raise RuntimeError("role assignment inventory is blank or incomplete")
-        assignments=json.loads(residual_roles.stdout)
-        if not isinstance(assignments,list): raise RuntimeError("role assignment inventory is malformed")
+        residual_roles,assignments=_role_assignments_at_scope(runner,options,root,
+            f"/subscriptions/{options.subscription_id}/resourceGroups/{state['resource_group']}",
+            "role_cleanup_inventory",clock)
         if assignments:
             raise RuntimeError("role assignment inventory still contains resources after expiry destroy")
         actions.append(_safe_cleanup_action(options,residual_roles))
