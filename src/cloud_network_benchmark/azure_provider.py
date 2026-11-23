@@ -290,6 +290,19 @@ def _validate_request(d: ProviderDeploymentInput, o: AzureRuntimeOptions, now: d
                 or o.command_timeout_seconds > 180
                 or (d.cleanup_timeout_seconds or 300) > 300):
             raise ValueError("Azure EXP-901 profile workflow or command allowance differs from the reviewed envelope")
+    elif workflow_profile is not None:
+        from .validation_profiles import PROFILE_SPECS
+        source_allowance = PROFILE_SPECS[workflow_profile]["allowance"]
+        expected_allowance = {key: float(source_allowance[key]) for key in (
+            "registration_seconds", "provision_seconds", "readiness_seconds",
+            "stabilization_seconds", "measurement_seconds", "measurement_shutdown_seconds",
+            "retrieval_seconds", "cleanup_seconds")}
+        expected_allowance["azure_provider_lead_seconds"] = float(
+            source_allowance["provider_leads_seconds"]["azure"])
+        if o.profile_allowance != expected_allowance:
+            raise ValueError("Azure workflow profile requires the exact registered allowance vector")
+        if o.command_timeout_seconds > 120:
+            raise ValueError("profile Azure commands are capped at 120 seconds")
     mode_measurement_seconds={"acceptance":30,"short_study":180,"calibration":720,"diagnostic_day":86400}[ExperimentMode(d.mode).value]
     if (o.complete_workflow_seconds < mode_measurement_seconds or o.post_registration_workflow_seconds < mode_measurement_seconds
             or o.complete_workflow_seconds > mode_cap or o.post_registration_workflow_seconds > mode_cap):
@@ -1678,7 +1691,9 @@ def register_expiry(deployment: ProviderDeploymentInput, request: ExpiryRequest,
     try:
         registration_options = options
         if deployment.admission.workflow_profile:
-            allowance = options.profile_allowance or {}
+            allowance = options.profile_allowance
+            if allowance is None:
+                raise ValueError("profile Azure registration requires the source-bound allowance vector")
             cap_start = options.cap_started_monotonic
             if cap_start is None:
                 raise ValueError("profile Azure registration requires the original monotonic cap start")
@@ -1819,7 +1834,9 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
     mono=clock()
     provision_deadline_monotonic = mono + provision_stage_seconds
     if deployment.admission.workflow_profile:
-        allowance = options.profile_allowance or {}
+        allowance = options.profile_allowance
+        if allowance is None:
+            raise ValueError("profile Azure provisioning requires the source-bound allowance vector")
         cap_start = options.cap_started_monotonic
         if cap_start is None:
             raise ValueError("profile Azure provisioning requires the original monotonic cap start")
@@ -1830,6 +1847,10 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         reservation_start = deployment.reservation.value.cap_started_at.value
         provision_deadline_monotonic = min(provision_deadline_monotonic,
             cap_start + (stop - reservation_start).total_seconds())
+        # All Azure operations in provisioning inherit the original cumulative
+        # stage cutoff. Keep the source overall cap untouched for its bindings.
+        options = options.model_copy(update={
+            "workflow_stage_deadline_monotonic": provision_deadline_monotonic})
     now=utc_now().astimezone(UTC)
     _require_profile_timing_anchor(deployment, options, require_stop=True)
     name,ids=_validate_request(deployment,options,now,mono,require_registered=True)

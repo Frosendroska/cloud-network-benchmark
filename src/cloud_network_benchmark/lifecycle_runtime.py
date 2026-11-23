@@ -1078,7 +1078,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     "retrieval_seconds": float(runtime["allowance"].retrieval_seconds),
                     "cleanup_seconds": float(runtime["allowance"].cleanup_seconds),
                     "azure_provider_lead_seconds": float(runtime["allowance"].provider_leads_seconds["azure"])}
-                    if deployment.admission.timing_profile else None),
+                    if (deployment.admission.timing_profile or deployment.admission.workflow_profile) else None),
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
                 plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),

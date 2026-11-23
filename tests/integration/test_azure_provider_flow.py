@@ -326,7 +326,10 @@ def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository
         cap_deadline_monotonic=factory_cap,cap_started_monotonic=cap_deadline-4200.0,
         retry_end_at=cap_expires_at,workflow_profile="all_cloud_acceptance_v1",
         cleanup_timing_path=tmp_path/"private"/"azure-clock-map.json",
-        profile_allowance={"registration_seconds":900,"provision_seconds":1800})
+        profile_allowance={"registration_seconds":900,"provision_seconds":900,
+            "readiness_seconds":600,"stabilization_seconds":60,"measurement_seconds":100,
+            "measurement_shutdown_seconds":15,"retrieval_seconds":300,"cleanup_seconds":660,
+            "azure_provider_lead_seconds":120})
     o=AzureRuntimeOptions.model_validate(value)
 
     # The old second-sample comparison rejects these original numbers by 10.88us.

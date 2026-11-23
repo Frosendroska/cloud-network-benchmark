@@ -486,6 +486,168 @@ def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
     assert total_provider_liability > 0
 
 
+
+@pytest.mark.parametrize("case", ["V-S1", "V-S3", "V-AWS-FAIL", "V-AZURE-FAIL", "V-GCP-FAIL", "CAL-S1"])
+def test_source_profile_allowance_reaches_materialized_azure_factory(
+        repository_root, tmp_path, monkeypatch, request, case):
+    """Materialize actual Azure hooks from generated normal, failure, and CAL runtimes."""
+    import json
+    from cloud_network_benchmark.admission import load_cost_inputs
+    from cloud_network_benchmark.campaign_inputs import prepare_stage
+    from cloud_network_benchmark.contracts.admission import ReservationEvidence
+    from cloud_network_benchmark.contracts.common import Evidence, Provider, StringEvidence, StructuredEvidence
+    from cloud_network_benchmark.lifecycle_adapters import RemoteStages
+    from cloud_network_benchmark.lifecycle_runtime import build_provider_workflows
+    from cloud_network_benchmark.validation_profiles import PROFILE_SPECS
+    import cloud_network_benchmark.lifecycle_adapters as adapters
+    import cloud_network_benchmark.azure_provider as azure_provider
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    settings["stage_inputs"]["acceptance"].update(workflow_profile="all_cloud_acceptance_v1",
+        failure_workflow_profile="all_cloud_failure_acceptance_v1", execution_window_utc=window)
+    settings["stage_inputs"]["acceptance"].pop("allowance", None)
+    settings["stage_inputs"]["calibration"].update(workflow_profile="all_cloud_calibration_v1",
+        execution_window_utc=window)
+    settings["stage_inputs"]["calibration"].pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = ["all_cloud_acceptance_v1",
+        "all_cloud_failure_acceptance_v1", "all_cloud_calibration_v1"]
+    plan = {"stage": "acceptance", "configs": {
+        "aws_failure": "configs/tests/exp-900-single-provider-north.yaml",
+        "azure_failure": "configs/tests/azure-901-single-provider-north.yaml",
+        "gcp_failure": "configs/tests/exp-902-gcp-single-provider-north.yaml"}}
+    acceptance = prepare_stage(plan, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    calibration = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(acceptance, request)
+    register_generated_cleanup(calibration, request)
+    entries = {row["entry_id"]: (row, acceptance) for row in acceptance["entries"]}
+    entries.update({row["entry_id"]: (row, calibration) for row in calibration["entries"]})
+    for alias, provider in (("aws_failure", "AWS"), ("azure_failure", "AZURE"), ("gcp_failure", "GCP")):
+        failure_entry = next(row for row in acceptance["entries"] if row["config_alias"] == alias)
+        entries[f"V-{provider}-FAIL"] = (failure_entry, acceptance)
+    entry, stage = entries[case]
+    runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+        allow_missing_approval_evidence=True)
+    parent, all_children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+        repository_root=repository_root, config_path=Path(entry["config_path"]))
+    campaign, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
+    costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
+    profile = runtime["workflow_profile"]
+    spec = PROFILE_SPECS[profile]
+    if "azure" in runtime["providers"]:
+        public_key = tmp_path / f"{case}-azure.pub"
+        public_key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9F4huSqss0wx3n6f5+WJiEpePM3oXTbuOzBLRR5NCc test\n")
+        runtime["providers"]["azure"]["options"]["ssh_public_key_path"] = public_key
+        expiry_cost = json.loads(runtime["providers"]["azure"]["sources"]["expiry_cost_path"].read_text())
+        expiry_cost["job_minutes_bound"] = 20
+        expiry_cost_path = tmp_path / f"{case}-azure-expiry-cost.json"
+        expiry_cost_path.write_text(json.dumps(expiry_cost))
+        runtime["providers"]["azure"]["sources"]["expiry_cost_path"] = expiry_cost_path
+
+    # Materialize the actual selected provider set from each generated source
+    # entry. This yields 12 hooksets across paired S1/S3, three single-provider
+    # failure checks and CAL, without invoking any provider command.
+    children = all_children
+    start = datetime.now(timezone.utc).replace(microsecond=0)
+    cap = spec["cap_seconds"]
+    reservation_id = f"factory-{case.lower()}-reservation"
+    reservation = ReservationEvidence(schema_version=2, campaign_id=parent.campaign_id,
+        workflow_profile=profile, reservation_id=Evidence(value=reservation_id), state="reserved",
+        reserved_cost_usd=Evidence(value=100.0), cap_started_at=Evidence(value=start),
+        expires_at=Evidence(value=start + timedelta(seconds=cap)),
+        cap_start_policy_id=StringEvidence(value="synthetic-fixed-profile-cap"),
+        source_path=costs.source_path, source_sha256=costs.payload_sha256)
+    class FakeLedger:
+        scope_id = stage["scope_id"]
+        controller_session_id = stage["controller_session_id"]
+        def inspect(self):
+            return {"reservations": {reservation_id: {"session": self.controller_session_id,
+                "cap_start_monotonic": 1000.0, "cap_seconds": cap}}}
+    class FakeClock:
+        def utc_now(self): return start
+        def monotonic(self): return 1000.0
+    clock = FakeClock()
+    captured = {}
+    original_azure_hooks = adapters.azure_hooks
+    def capture_hooks(deployment, expiry_request, **kwargs):
+        captured.update(deployment=deployment, request=expiry_request, options=kwargs["options"])
+        return original_azure_hooks(deployment, expiry_request, **kwargs)
+    monkeypatch.setattr(adapters, "azure_hooks", capture_hooks)
+    stage_hooks = {provider: RemoteStages(prepare=lambda *_: None, stabilize=lambda *_: None,
+        measure=lambda *_: None, close=lambda *_: None, retrieve=lambda *_: None,
+        claim=lambda *_: None) for provider in children}
+    cleanup_references = {}
+    private_root = tmp_path / case / "private"
+    private_root.mkdir(parents=True)
+    workflows = build_provider_workflows(campaign=campaign, parent=parent, children=children,
+        costs=costs, runtime=runtime, reservation=reservation, ledger=FakeLedger(), runner=object(),
+        clock=clock, stages=stage_hooks, private_root=private_root,
+        cleanup_references=cleanup_references)
+    assert set(workflows) == set(children)
+    assert all(callable(hooks.protect) and callable(hooks.create) for hooks in workflows.values())
+    source = spec["allowance"]
+    expected = {key: float(source[key]) for key in (
+        "registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
+        "measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds")}
+    expected["azure_provider_lead_seconds"] = float(source["provider_leads_seconds"]["azure"])
+    assert set(cleanup_references) == set(children)
+    assert all(Path(path).is_file() for path in cleanup_references.values())
+    if "azure" in children:
+        assert captured["options"].profile_allowance == expected
+        saved_settings = Path(cleanup_references["azure"])
+        saved_value = json.loads(saved_settings.read_text())
+        assert saved_value["settings"]["profile_allowance"] == expected
+        missing_allowance = captured["options"].model_copy(update={"profile_allowance": None})
+        with pytest.raises(ValueError, match="exact registered allowance vector"):
+            azure_provider._validate_request(captured["deployment"], missing_allowance,
+                start, None, check_live_clock=False)
+
+    deadlines = {}
+    def capture_registration(_deployment, _expiry_request, options, *_args, **_kwargs):
+        deadlines["registration"] = options.workflow_stage_deadline_monotonic
+        raise RuntimeError("offline cutoff capture")
+    monkeypatch.setattr(azure_provider, "_register_expiry_impl", capture_registration)
+    if "azure" in children:
+        with pytest.raises(ValueError, match="reservation/deadline has expired"):
+            azure_provider.register_expiry(captured["deployment"], captured["request"],
+                captured["options"], object(), clock=lambda: 1000.0 + cap,
+                utc_now=lambda: start + timedelta(seconds=cap))
+        assert deadlines == {}
+        assert workflows["azure"].protect().state == "failed"
+        assert deadlines["registration"] == 1000.0 + source["registration_seconds"]
+
+    if "azure" not in children:
+        return
+    stop_at = captured["request"].expires_at.value
+    azure_provider._bind_profile_stop(captured["deployment"], captured["options"], stop_at)
+    expiry = azure_provider.ExpiryEvidence(schema_version=2,
+        run_id=captured["deployment"].run_id, deployment_id=captured["deployment"].deployment_id,
+        provider=Provider.AZURE, action="deallocate", state="registered",
+        registration_id=Evidence(value=f"schedule-{case}"), registered_at=Evidence(value=start),
+        expires_at=Evidence(value=stop_at), target_selector=captured["request"].target_selector,
+        provider_metadata=StructuredEvidence(value={"reservation_id": reservation_id,
+            "source_sha256": reservation.source_sha256}))
+    provision_deployment = captured["deployment"].model_copy(update={"expiry": Evidence(value=expiry)})
+    provision_deadlines = []
+    def capture_first_provider_command(_root, options, *_args, **_kwargs):
+        provision_deadlines.append(options.workflow_stage_deadline_monotonic)
+        raise RuntimeError("offline provision cutoff capture")
+    monkeypatch.setattr(azure_provider, "_tf", capture_first_provider_command)
+    azure_provider.provision(provision_deployment, captured["options"], object(),
+        clock=clock.monotonic, utc_now=clock.utc_now)
+    stop_cap = 1000.0 + (stop_at - start).total_seconds()
+    expected_provision = min(1000.0 + source["registration_seconds"] + source["provision_seconds"],
+        1000.0 + float(provision_deployment.provisioning_timeout_seconds),
+        1000.0 + cap, stop_cap)
+    assert provision_deadlines == [expected_provision]
+    assert expected_provision > 1000.0
+
+
+
 def test_generated_calibration_binds_runtime_observer_without_changing_workload(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     clock = Clock()
