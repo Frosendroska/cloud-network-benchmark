@@ -368,16 +368,19 @@ def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal
         raise FinancialError('financial_legacy_liability_unconverted')
     for record in records:
         validate_stored_commitment(record, scope_id=state['scope_id'])
-    prior = [r['financial'] for r in records]
+    all_prior = [r['financial'] for r in records]
+    prior_records = [r for r in records if r.get('financial_terminal_state') != 'cancelled_unused']
+    prior = [r['financial'] for r in prior_records]
+    records = [r for r in records if r.get('financial_terminal_state') != 'cancelled_unused']
     caps = Caps.model_validate(snapshot['caps'])
     # Never release original maxima or allow later FX changes to discount old exposure.
-    rate = max([amount(snapshot['rate'])] + [amount(f['rate']) for f in prior])
+    rate = max([amount(snapshot['rate'])] + [amount(f['rate']) for f in all_prior])
     gross = [max(amount(f['gross_eur']),
         liability(max(amount(r['reserved_cost_usd']), amount(r.get('incurred_usd', 0))) * rate)
         + max(amount(f['gross_eur']) - liability(amount(r['reserved_cost_usd']) * amount(f['rate'])), Decimal(0)))
              for r, f in zip(records, prior)]
-    external = max([amount(snapshot['external_gross_eur'])] + [amount(f['external_gross_eur']) for f in prior])
-    cash_external = max([amount(snapshot['external_cash_eur'])] + [amount(f['external_cash_eur']) for f in prior])
+    external = max([amount(snapshot['external_gross_eur'])] + [amount(f['external_gross_eur']) for f in all_prior])
+    cash_external = max([amount(snapshot['external_cash_eur'])] + [amount(f['external_cash_eur']) for f in all_prior])
     future = liability(remaining_usd * rate)
     total = external + sum(gross) + amount(snapshot['gross_eur']) + future
     cash = cash_external + sum(gross) + amount(snapshot['cash_eur']) + future
@@ -419,6 +422,71 @@ def validate_stored_commitment(record: dict, *, scope_id: str) -> None:
             or sum((amount(v) for v in f['providers_eur'].values()), Decimal(0)) != amount(f['gross_eur'])
             or amount(f['gross_eur']) < liability(amount(record['reserved_cost_usd']) * amount(f['rate']))
             or amount(f['external_cash_eur']) != amount(f['external_gross_eur'])):
+        raise FinancialError('financial_ledger_invalid')
+    terminal = record.get('financial_terminal_state')
+    cancellation = record.get('financial_cancellation')
+    if terminal is None:
+        if cancellation is not None:
+            raise FinancialError('financial_ledger_invalid')
+    elif terminal in {'cancelled_unused', 'contradicted'}:
+        if (not isinstance(cancellation, dict)
+                or cancellation.get('status') != terminal
+                or cancellation.get('event_id') != f"cancel-unused:{record.get('reservation_id')}"
+                or not isinstance(cancellation.get('proof'), dict)
+                or not isinstance(cancellation.get('restored_funding_by_bucket'), dict)
+                or not cancellation.get('reservation_snapshot_sha256')):
+            raise FinancialError('financial_ledger_invalid')
+        try:
+            for digest in (cancellation.get('proof_sha256', ''), cancellation.get('reservation_snapshot_sha256', '')):
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(ch not in '0123456789abcdef' for ch in digest)):
+                    raise ValueError('cancellation hash invalid')
+            restored = {k: amount(v) for k, v in cancellation['restored_funding_by_bucket'].items()}
+            if (set(restored) != set(record.get('funding_moves', {}))
+                    or restored != {k: amount(v) for k, v in record['funding_moves'].items()}
+                    or sum(restored.values(), Decimal(0)) != amount(cancellation.get('restored_funding_usd', -1))):
+                raise ValueError('restored funding mismatch')
+            proof_digest = hashlib.sha256(json.dumps(cancellation['proof'], sort_keys=True).encode()).hexdigest()
+            if proof_digest != cancellation['proof_sha256']:
+                raise ValueError('cancellation proof digest mismatch')
+            artifacts = cancellation['proof'].get('verified_evidence', {}).get('artifacts')
+            if (not isinstance(artifacts, list) or len(artifacts) < 3
+                    or any(not isinstance(a, dict) or not a.get('path') for a in artifacts)):
+                raise ValueError('cancellation artifacts missing')
+            for artifact in artifacts:
+                digest = artifact.get('sha256')
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(ch not in '0123456789abcdef' for ch in digest)):
+                    raise ValueError('cancellation artifact hash invalid')
+            if terminal == 'cancelled_unused':
+                original = cancellation.get('reservation_snapshot')
+                if not isinstance(original, dict):
+                    raise ValueError('cancellation original reservation snapshot missing')
+                snapshot = hashlib.sha256(json.dumps(original, sort_keys=True,
+                    separators=(',', ':')).encode()).hexdigest()
+                if snapshot != cancellation['reservation_snapshot_sha256']:
+                    raise ValueError('cancellation original reservation snapshot hash mismatch')
+                current = dict(record)
+                current.pop('financial_terminal_state', None)
+                current.pop('financial_cancellation', None)
+                current.pop('released_usd', None)
+                current.pop('released_by_bucket', None)
+                comparable = dict(original)
+                comparable.pop('released_usd', None)
+                comparable.pop('released_by_bucket', None)
+                if current != comparable:
+                    raise ValueError('cancelled reservation source fields changed')
+                prior_released = amount(original.get('released_usd', '0'))
+                prior_buckets = original.get('released_by_bucket', {})
+                expected_buckets = {key: amount(value) for key, value in prior_buckets.items()}
+                for key, value in restored.items():
+                    expected_buckets[key] = expected_buckets.get(key, Decimal(0)) + value
+                if (amount(record.get('released_usd', '0')) != prior_released + amount(record['reserved_cost_usd'])
+                        or {key: amount(value) for key, value in record.get('released_by_bucket', {}).items()} != expected_buckets):
+                    raise ValueError('cancelled reservation release counters changed')
+        except (ValueError, TypeError, KeyError) as exc:
+            raise FinancialError('financial_ledger_invalid') from exc
+    else:
         raise FinancialError('financial_ledger_invalid')
 
 

@@ -52,6 +52,48 @@ def _hash(value: str, name: str) -> str:
     return value
 
 
+# The offline exception is intentionally bound to this one reviewed source and
+# the four reservations produced by the two failed acceptance attempts.
+_UNLAUNCHED_SOURCE_COMMIT = "70267ec9dd58b0149f281fb66a8d2520b19cfd92"
+_UNLAUNCHED_SOURCE_TREE = "cfdd9dda76ee4dbb3f42c08d5dcf364d962545ac"
+_USER_ACCOUNTING_EXCEPTION_SHA256 = "ae1b1dc8f283ce9926de07e70d72caa85883f78d1b6632a8391e3c4e52a56ac8"
+_UNLAUNCHED_RESERVATIONS = {
+    "609687d8ec5928cde1915b7d2fc2cc49": ("acceptance-20261123T151109Z-52ef4ee7", "V-S1", "20261123T151109Z-exp-903-c7346234", "exp-903-acceptance"),
+    "a331c6b0be290a7723782d478a4c4b33": ("acceptance-20261123T151109Z-52ef4ee7", "V-S3", "20261123T151110Z-exp-003-1e21615c", "exp-003-acceptance"),
+    "f26710f8218ba3061a480b21337feebd": ("acceptance-20261123T155244Z-9b22b6f1", "V-S1", "20261123T155244Z-exp-903-4b8ee429", "exp-903-acceptance"),
+    "306102d70d8e0cd0533e07e8d1ff4f06": ("acceptance-20261123T155244Z-9b22b6f1", "V-S3", "20261123T155244Z-exp-003-a151b36b", "exp-003-acceptance"),
+}
+_UNLAUNCHED_SOURCE_ARTIFACT_HASHES = {
+    "609687d8ec5928cde1915b7d2fc2cc49": ("41f016f3a5b8570478cf96d2d86aff0097d1b56ef2a1170843ef2b31794076f9", "caa0d57bf858ab5be1cae74b1e67da1e78c4a2b2da16159d8cf38d66a6a7ca88"),
+    "a331c6b0be290a7723782d478a4c4b33": ("41f016f3a5b8570478cf96d2d86aff0097d1b56ef2a1170843ef2b31794076f9", "c03360bf6f1966b46685dbb6b8e84e5c89138faa53abe51aa7a3adb9e00fad3e"),
+    "f26710f8218ba3061a480b21337feebd": ("b1464ed9ae2909e334bc41cd0af32ec3a4d6e4e68e0b843feb3ad1b24772c8d0", "4e09c0d384650978c96fdd0dd0cbd09720529922b6127610efb15989a8323cb5"),
+    "306102d70d8e0cd0533e07e8d1ff4f06": ("b1464ed9ae2909e334bc41cd0af32ec3a4d6e4e68e0b843feb3ad1b24772c8d0", "ac19c357425e6ad85a0894d4baae953534438e5daf643a2d0f604b3578e34ceb"),
+}
+
+
+@dataclass(frozen=True)
+class UnlaunchedCancellationEvidence:
+    """Hash-bound terminal and recovery artifacts for one proven-unused hold."""
+    reservation_id: str
+    expected_ledger_sha256: str
+    source_commit: str
+    source_tree: str
+    terminal_journal_path: str
+    terminal_journal_sha256: str
+    recovery_path: str
+    recovery_sha256: str
+    controller_quiescence_path: str
+    controller_quiescence_sha256: str
+    campaign_lock_path: str
+    campaign_driver_lock_path: str
+    authority_receipt_path: str
+    authority_receipt_sha256: str
+    azure_anchor_path: str | None = None
+    azure_anchor_sha256: str | None = None
+    azure_settings_path: str | None = None
+    azure_settings_sha256: str | None = None
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
@@ -518,6 +560,286 @@ class Reconciliation:
     cleanup_status_reported: bool = False
 
 
+def _cancellation_json(path_text: str, expected_sha256: str, label: str) -> Mapping[str, Any]:
+    path = Path(path_text)
+    if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents)
+            or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024):
+        raise ValueError(f"{label} artifact is unavailable or unsafe")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != _hash(expected_sha256, f"{label} sha256"):
+        raise ValueError(f"{label} artifact hash mismatch")
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} artifact must contain an object")
+    return value
+
+
+def _cancellation_lock_paths(recovery: Mapping[str, Any], stage_id: str,
+                            expected_entry: str) -> tuple[Path, Path]:
+    """Derive the two locks held by campaign.py from the immutable provider journals."""
+    rows = recovery.get("providers")
+    if not isinstance(rows, list) or len(rows) != 3:
+        raise ValueError("recovery artifact lacks lock-binding provider rows")
+    if not any(spec[0] == stage_id and spec[1] == expected_entry
+            for spec in _UNLAUNCHED_RESERVATIONS.values()):
+        raise ValueError("stage is outside the pinned cancellation scope")
+    roots: set[Path] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or not isinstance(row.get("journal_reference"), str):
+            raise ValueError("recovery artifact lacks original provider journal references")
+        journal = Path(row["journal_reference"])
+        if not journal.is_absolute() or journal.is_symlink() or any(p.is_symlink() for p in journal.parents):
+            raise ValueError("original provider journal reference is unsafe")
+        stage_roots = [parent for parent in journal.parents if parent.name == stage_id]
+        if len(stage_roots) != 1:
+            raise ValueError("provider journal is outside the original stage namespace")
+        stage_root = stage_roots[0]
+        try:
+            relative = journal.relative_to(stage_root)
+        except ValueError as exc:
+            raise ValueError("provider journal is outside the original stage namespace") from exc
+        if (len(relative.parts) < 3 or relative.parts[0] != expected_entry
+                or relative.parts[1] != row.get("provider")):
+            raise ValueError("provider journal path does not match its provider record")
+        roots.add(stage_root)
+    if len(roots) != 1:
+        raise ValueError("provider journals do not share one original stage root")
+    stage_root = roots.pop()
+    state_root = stage_root.parent
+    return state_root / ".campaign-driver.lock", stage_root / "campaign-journal.lock"
+
+
+def _live_proc_quiescence(stage_id: str, attempt_id: str) -> Mapping[str, Any]:
+    """Fail-closed Linux /proc inventory used while both original campaign locks are held."""
+    proc = Path("/proc")
+    if not proc.is_dir() or not Path("/proc/sys/kernel/random/boot_id").is_file():
+        raise ValueError("live Linux /proc quiescence proof is unavailable")
+    uid = os.getuid()
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    rows: list[dict[str, Any]] = []
+    pids: dict[int, tuple[int, int, str, str]] = {}
+    complete = True
+    # Read every same-UID process and its ancestry inputs. An unreadable row
+    # invalidates the inventory instead of being silently omitted.
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text()
+            close = stat_text.rfind(")")
+            fields = stat_text[close + 2:].split()
+            ppid, start_ticks = int(fields[1]), int(fields[19])
+            status = (entry / "status").read_text()
+            uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+            proc_uid = int(uid_line.split()[1])
+            if proc_uid != uid:
+                continue
+            cwd = os.readlink(entry / "cwd")
+            cmdline = (entry / "cmdline").read_bytes()
+            cmd_sha = hashlib.sha256(cmdline).hexdigest()
+            pids[pid] = (ppid, start_ticks, cwd, cmd_sha)
+        except (OSError, ValueError, StopIteration, IndexError):
+            # Processes can disappear during a walk; repeatability is part of
+            # the proof, so even a race makes this pass inconclusive.
+            complete = False
+    for pid, (ppid, start_ticks, cwd, cmd_sha) in sorted(pids.items()):
+        ancestry: list[int] = []
+        parent = ppid
+        seen: set[int] = set()
+        while parent > 0 and parent not in seen and len(ancestry) < 256:
+            seen.add(parent)
+            ancestry.append(parent)
+            parent = pids[parent][0] if parent in pids else 0
+        cmd = (proc / str(pid) / "cmdline").read_bytes().decode("utf-8", "replace")
+        scope = attempt_id in cmd or stage_id in cmd or stage_id in cwd
+        rows.append({"pid": pid, "uid": uid, "start_ticks": start_ticks, "cwd": cwd,
+            "cmdline_sha256": cmd_sha, "ancestry_pids": ancestry,
+            "attempt_scope_match": scope})
+    if not complete or any(row["attempt_scope_match"] for row in rows):
+        raise ValueError("live /proc scan is incomplete or finds an active campaign process")
+    return {"proc_root": "/proc", "complete": True, "uid": uid, "boot_id": boot_id,
+        "attempt_id": attempt_id,
+        "process_count": len(rows), "processes": rows,
+        "scan_sha256": hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()}
+
+
+def _verify_unlaunched_cancellation_proof(proof: UnlaunchedCancellationEvidence,
+                                          record: Mapping[str, Any]) -> dict[str, Any]:
+    reservation_id = proof.reservation_id
+    spec = _UNLAUNCHED_RESERVATIONS.get(reservation_id)
+    if spec is None:
+        raise ValueError("reservation is outside the reviewed unlaunched cancellation scope")
+    if (proof.source_commit != _UNLAUNCHED_SOURCE_COMMIT
+            or proof.source_tree != _UNLAUNCHED_SOURCE_TREE):
+        raise ValueError("pinned production source identity mismatch")
+    _hash(proof.expected_ledger_sha256, "expected ledger sha256")
+    stage_id, entry_id, attempt_id, config_id = spec
+    terminal = _cancellation_json(proof.terminal_journal_path,
+        proof.terminal_journal_sha256, "terminal journal")
+    recovery = _cancellation_json(proof.recovery_path,
+        proof.recovery_sha256, "lifecycle recovery")
+    pinned_terminal_sha, pinned_recovery_sha = _UNLAUNCHED_SOURCE_ARTIFACT_HASHES[reservation_id]
+    if (proof.terminal_journal_sha256 != pinned_terminal_sha
+            or proof.recovery_sha256 != pinned_recovery_sha):
+        raise ValueError("terminal/recovery artifact is not the pinned original source")
+    owner = _cancellation_json(proof.controller_quiescence_path,
+        proof.controller_quiescence_sha256, "controller quiescence")
+    authority = _cancellation_json(proof.authority_receipt_path,
+        proof.authority_receipt_sha256, "user accounting authorization")
+    if terminal.get("stage_id") != stage_id:
+        raise ValueError("terminal journal stage identity mismatch")
+    campaign_id = record.get("request", {}).get("campaign_id")
+    request = record.get("request", {})
+    reservation_evidence = record.get("evidence", {})
+    financial = record.get("financial", {})
+    binding = financial.get("binding", {}) if isinstance(financial, Mapping) else {}
+    runtime = binding.get("runtime", {}) if isinstance(binding, Mapping) else {}
+    runtime_source = runtime.get("runtime_source", {}) if isinstance(runtime, Mapping) else {}
+    input_digests = terminal.get("input_digests", {}).get(entry_id, {})
+    if (campaign_id != attempt_id or request.get("config_id") != config_id
+            or request.get("selected_providers") != ["aws", "azure", "gcp"]
+            or request.get("source_path") != reservation_evidence.get("source_path")
+            or request.get("source_sha256") != reservation_evidence.get("source_sha256")
+            or reservation_evidence.get("reservation_id", {}).get("value") != reservation_id
+            or reservation_evidence.get("campaign_id") != attempt_id
+            or reservation_evidence.get("state") != "reserved"):
+        raise ValueError("original reservation source, config, or campaign identity mismatch")
+    if (binding.get("campaign_id") != attempt_id or binding.get("config_id") != config_id
+            or binding.get("config_sha256") != input_digests.get("config_path")
+            or binding.get("cost_sha256") != request.get("source_sha256")
+            or binding.get("run_ids") != record.get("child_identities")
+            or binding.get("namespaces") != record.get("plan", {}).get("namespaces")
+            or runtime.get("implementation_revision") != proof.source_commit
+            or runtime.get("initialized_revisions") != [proof.source_commit]
+            or runtime_source.get("sha256") != input_digests.get("runtime_config_path")):
+        raise ValueError("original financial binding does not match the pinned runtime/config/source")
+    if (Path(proof.authority_receipt_path).name != "user-accounting-exception-20261123.json"
+            or proof.authority_receipt_sha256 != _USER_ACCOUNTING_EXCEPTION_SHA256
+            or not isinstance(authority.get("approved"), str)
+            or "independently proven-unused estimates" not in authority["approved"]
+            or "EUR154.23" not in authority["approved"]
+            or not isinstance(authority.get("not_approved"), list)
+            or "Fabricated final zero invoices" not in authority["not_approved"]):
+        raise ValueError("user accounting exception receipt identity mismatch")
+    if recovery.get("attempt_id") != attempt_id or recovery.get("reservation_id") != reservation_id:
+        raise ValueError("recovery reservation or attempt identity mismatch")
+    driver_path, journal_path = _cancellation_lock_paths(recovery, stage_id, entry_id)
+    if (str(driver_path) != proof.campaign_driver_lock_path
+            or str(journal_path) != proof.campaign_lock_path):
+        raise ValueError("campaign locks do not derive from the original provider journals")
+    scan = owner.get("proc_scan", {})
+    process_rows = scan.get("processes") if isinstance(scan, Mapping) else None
+    locks = owner.get("locks", {})
+    try:
+        observed = datetime.fromisoformat(owner["observed_at"].replace("Z", "+00:00"))
+        fresh_scan = abs((datetime.now(timezone.utc) - _utc(observed)).total_seconds()) <= 90
+    except (ValueError, TypeError, KeyError):
+        fresh_scan = False
+    rows_valid = (isinstance(process_rows, list) and all(
+        isinstance(row, Mapping) and isinstance(row.get("pid"), int) and row["pid"] > 0
+        and isinstance(row.get("uid"), int) and row["uid"] >= 0
+        and isinstance(row.get("start_ticks"), int) and row["start_ticks"] > 0
+        and isinstance(row.get("cwd"), str) and row["cwd"]
+        and isinstance(row.get("cmdline_sha256"), str) and len(row["cmdline_sha256"]) == 64
+        and isinstance(row.get("ancestry_pids"), list)
+        and all(isinstance(pid, int) and pid > 0 for pid in row["ancestry_pids"])
+        and isinstance(row.get("attempt_scope_match"), bool) for row in process_rows))
+    pids = [row["pid"] for row in process_rows] if rows_valid else []
+    if (owner.get("attempt_id") != attempt_id
+            or owner.get("controller_session_id") != recovery.get("controller_session_id")
+            or owner.get("state") != "terminal" or not fresh_scan or not rows_valid
+            or scan.get("proc_root") != "/proc" or scan.get("complete") is not True
+            or scan.get("attempt_id") != attempt_id or not scan.get("boot_id")
+            or not isinstance(scan.get("uid"), int) or scan.get("process_count") != len(process_rows)
+            or len(set(pids)) != len(pids) or any(row["attempt_scope_match"] for row in process_rows)
+            or owner.get("active_processes") != []
+            or not isinstance(locks, Mapping)
+            or not isinstance(locks.get("driver"), Mapping)
+            or locks["driver"].get("path") != proof.campaign_driver_lock_path
+            or locks["driver"].get("held_exclusive") is not True
+            or not isinstance(locks["driver"].get("device"), int)
+            or not isinstance(locks["driver"].get("inode"), int)
+            or not isinstance(locks.get("journal"), Mapping)
+            or locks["journal"].get("path") != proof.campaign_lock_path
+            or locks["journal"].get("held_exclusive") is not True
+            or not isinstance(locks["journal"].get("device"), int)
+            or not isinstance(locks["journal"].get("inode"), int)):
+        raise ValueError("controller owner is active or its terminal state is unproved")
+    entry = terminal.get("entries", {}).get(entry_id)
+    result = entry.get("result") if isinstance(entry, Mapping) else None
+    failures = result.get("provider_results") if isinstance(result, Mapping) else None
+    if (not isinstance(entry, Mapping) or entry.get("state") != "failed"
+            or not isinstance(result, Mapping) or result.get("cleanup_open") is not False
+            or not isinstance(failures, Mapping) or set(failures) != {"aws", "azure", "gcp"}):
+        raise ValueError("terminal journal does not prove complete failed protection")
+    for provider, item in failures.items():
+        failure = item.get("primary_failure") if isinstance(item, Mapping) else None
+        if not isinstance(failure, str) or f"{provider} protect failed" not in failure:
+            raise ValueError("terminal provider result is not a protection rejection")
+        if any(marker in failure.lower() for marker in ("accepted-review", "approved review",
+                "apply succeeded", "creation_may_have_started")):
+            raise ValueError("terminal provider outcome includes an accepted gate or creation claim")
+        if provider == "azure" and attempt_id.endswith("a151b36b"):
+            if "original Azure profile timing anchor is foreign, expired, or already bound" not in failure:
+                raise ValueError("Azure rejection does not match the pinned pre-provider anchor guard")
+        elif "operator inspection required before saved-plan apply; deadline expired" not in failure:
+            raise ValueError("provider rejection is not the pinned pre-apply review timeout")
+    providers = recovery.get("providers")
+    if (not isinstance(providers, list) or {p.get("provider") for p in providers if isinstance(p, Mapping)}
+            != {"aws", "azure", "gcp"} or len(providers) != 3):
+        raise ValueError("recovery artifact lacks complete provider coverage")
+    children = record.get("child_identities", {})
+    for item in providers:
+        provider = item["provider"]
+        if (item.get("deployment_id") != f"{children.get(provider)}-deployment"
+                or item.get("expiry_registered") is not False
+                or item.get("creation_may_have_started") is not False
+                or item.get("cleanup_open") is not False):
+            raise ValueError("recovery artifact reports expiry, creation, or cleanup liability")
+    artifacts = [{"kind": "terminal_journal", "path": proof.terminal_journal_path,
+                  "sha256": proof.terminal_journal_sha256},
+                 {"kind": "lifecycle_recovery", "path": proof.recovery_path,
+                  "sha256": proof.recovery_sha256},
+                 {"kind": "controller_quiescence", "path": proof.controller_quiescence_path,
+                  "sha256": proof.controller_quiescence_sha256},
+                 {"kind": "user_accounting_authorization", "path": proof.authority_receipt_path,
+                  "sha256": proof.authority_receipt_sha256}]
+    if attempt_id.endswith("a151b36b"):
+        if not all((proof.azure_anchor_path, proof.azure_anchor_sha256,
+                    proof.azure_settings_path, proof.azure_settings_sha256)):
+            raise ValueError("Azure anchor rejection requires both saved anchor artifacts")
+        anchor = _cancellation_json(proof.azure_anchor_path, proof.azure_anchor_sha256, "Azure anchor")
+        settings = _cancellation_json(proof.azure_settings_path, proof.azure_settings_sha256, "Azure settings")
+        deployment = settings.get("deployment", {})
+        reservation = deployment.get("reservation", {}).get("value", {})
+        anchor_origin = datetime.fromisoformat(anchor["origin_utc"])
+        cap_start = datetime.fromisoformat(reservation["cap_started_at"]["value"])
+        cap_end = datetime.fromisoformat(reservation["expires_at"]["value"])
+        mapped_cap = float(anchor["origin_monotonic"]) + (cap_end - anchor_origin).total_seconds()
+        configured_cap = float(settings["settings"]["cap_deadline_monotonic"])
+        if (anchor.get("reservation_id") != reservation_id or anchor.get("provider_stop_at") is not None
+                or reservation.get("reservation_id", {}).get("value") != reservation_id
+                or datetime.fromisoformat(anchor["cap_started_at"]) != cap_start
+                or datetime.fromisoformat(anchor["cap_expires_at"]) != cap_end
+                or configured_cap - mapped_cap <= 1e-6):
+            raise ValueError("Azure timing artifacts do not prove the reported pre-provider rejection")
+        artifacts.extend([
+            {"kind": "azure_anchor", "path": proof.azure_anchor_path, "sha256": proof.azure_anchor_sha256},
+            {"kind": "azure_settings", "path": proof.azure_settings_path, "sha256": proof.azure_settings_sha256},
+        ])
+    return {"proof_type": "pinned_unlaunched_protection_rejection_v1",
+            "reservation_id": reservation_id, "campaign_id": campaign_id,
+            "source_commit": proof.source_commit, "source_tree": proof.source_tree,
+            "terminal_stage_id": stage_id, "terminal_entry_id": entry_id,
+            "attempt_id": attempt_id, "providers": ["aws", "azure", "gcp"],
+            "controller_owner_binding": {"attempt_id": attempt_id,
+                "controller_session_id": recovery.get("controller_session_id"),
+                "state": "terminal", "driver_lock": dict(locks["driver"]),
+                "journal_lock": dict(locks["journal"])},
+            "artifacts": artifacts}
+
+
 class BudgetLedger:
     """Serialized JSON ledger shared by cooperating processes on one local disk."""
     def __init__(self, path: Path, *, scope_id: str, utc_now: Callable[[], datetime],
@@ -639,6 +961,15 @@ class BudgetLedger:
                 _decimal(item.get("released_usd", "0"), "released funding")
                 if "financial" in item:
                     validate_stored_commitment(item, scope_id=self.scope_id)
+                cancellation = item.get("financial_cancellation")
+                if cancellation is not None:
+                    event = state["events"].get(cancellation.get("event_id"))
+                    payload = event.get("payload", {}) if isinstance(event, Mapping) else {}
+                    if (payload.get("event_type") != "cancelled_unused"
+                            or payload.get("proof_sha256") != cancellation.get("proof_sha256")
+                            or payload.get("reservation_snapshot_sha256") != cancellation.get("reservation_snapshot_sha256")
+                            or payload.get("restored_funding_by_bucket") != cancellation.get("restored_funding_by_bucket")):
+                        raise ValueError("ledger_unavailable")
                 if item.get("execution_scope") == "paid_request":
                     transfers = item.get("result_transfer")
                     if not isinstance(transfers, dict) or set(transfers) != set(item.get("plan", {}).get("providers", [])):
@@ -738,6 +1069,185 @@ class BudgetLedger:
         fd = self._lock()
         try: return self._read()
         finally: fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
+    def _acquire_campaign_locks(self, proof: UnlaunchedCancellationEvidence,
+                                recovery: Mapping[str, Any], owner: Mapping[str, Any]) -> list[int]:
+        stage_id = _UNLAUNCHED_RESERVATIONS[proof.reservation_id][0]
+        entry_id = _UNLAUNCHED_RESERVATIONS[proof.reservation_id][1]
+        driver, journal = _cancellation_lock_paths(recovery, stage_id, entry_id)
+        if str(driver) != proof.campaign_driver_lock_path or str(journal) != proof.campaign_lock_path:
+            raise ValueError("campaign lock paths do not match original recovery journal locations")
+        rows = owner.get("locks", {})
+        if not isinstance(rows, Mapping):
+            raise ValueError("controller owner artifact lacks both campaign lock identities")
+        descriptors: list[int] = []
+        deadline = time.monotonic() + self.lock_timeout_seconds
+        try:
+            # Match campaign.py lock order: state-root driver, then stage journal.
+            for key, path in (("driver", driver), ("journal", journal)):
+                lock = rows.get(key)
+                if (not isinstance(lock, Mapping) or lock.get("path") != str(path)
+                        or lock.get("held_exclusive") is not True or path.is_symlink()
+                        or any(parent.is_symlink() for parent in path.parents) or not path.is_file()):
+                    raise ValueError("original campaign lock is unavailable or owner proof mismatches")
+                fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_dev != lock.get("device")
+                        or info.st_ino != lock.get("inode")):
+                    os.close(fd)
+                    raise ValueError("original campaign lock identity changed")
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        descriptors.append(fd)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            os.close(fd)
+                            raise TimeoutError("original campaign lock is owned by another process")
+                        time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            return descriptors
+        except BaseException:
+            for fd in reversed(descriptors):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            raise
+
+    def preview_proven_unlaunched(self, proof: UnlaunchedCancellationEvidence) -> Mapping[str, Any]:
+        """Read-only eligibility report; never changes the ledger."""
+        return self._cancel_proven_unlaunched(proof, preview=True)
+
+    def cancel_proven_unlaunched(self, proof: UnlaunchedCancellationEvidence) -> Mapping[str, Any]:
+        """Apply one reviewed source-bound terminal cancellation transaction."""
+        return self._cancel_proven_unlaunched(proof, preview=False)
+
+    def _cancel_proven_unlaunched(self, proof: UnlaunchedCancellationEvidence, *, preview: bool,
+                                  _prevalidated_evidence: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        """Restore one exact reviewed allocation after verifying terminal no-launch evidence.
+
+        This is a separate terminal accounting event. It neither writes billing
+        facts nor changes the original reservation evidence or financial inputs.
+        """
+        if not isinstance(proof, UnlaunchedCancellationEvidence):
+            raise ValueError("typed unlaunched cancellation evidence is required")
+        proof_base = {"reservation_id": proof.reservation_id,
+            "expected_ledger_sha256": _hash(proof.expected_ledger_sha256, "expected ledger sha256"),
+            "source_commit": proof.source_commit, "source_tree": proof.source_tree,
+            "terminal_journal_path": proof.terminal_journal_path,
+            "terminal_journal_sha256": _hash(proof.terminal_journal_sha256, "terminal journal sha256"),
+            "recovery_path": proof.recovery_path,
+            "recovery_sha256": _hash(proof.recovery_sha256, "recovery sha256"),
+            "azure_anchor_path": proof.azure_anchor_path,
+            "azure_anchor_sha256": proof.azure_anchor_sha256,
+            "azure_settings_path": proof.azure_settings_path,
+            "azure_settings_sha256": proof.azure_settings_sha256}
+        owner = _cancellation_json(proof.controller_quiescence_path,
+            proof.controller_quiescence_sha256, "controller quiescence")
+        recovery = _cancellation_json(proof.recovery_path, proof.recovery_sha256, "lifecycle recovery")
+        campaign_fds = self._acquire_campaign_locks(proof, recovery, owner)
+        fd = None
+        try:
+            fd = self._lock()
+            state = self._read()
+            rec = state["reservations"].get(proof.reservation_id)
+            if rec is None:
+                raise ValueError("reservation identity mismatch")
+            verified = (_verify_unlaunched_cancellation_proof(proof, rec)
+                if _prevalidated_evidence is None else dict(_prevalidated_evidence))
+            # Controller inventory files and their fresh live scans can differ
+            # between an idempotent retry. Bind stable terminal/recovery/source/
+            # authority facts and the exact lock owner identity separately.
+            stable_base = {key: value for key, value in proof_base.items()
+                if key not in {"expected_ledger_sha256", "controller_quiescence_path",
+                    "controller_quiescence_sha256"}}
+            stable_verified = {key: value for key, value in verified.items() if key != "artifacts"}
+            stable_verified["artifacts"] = [artifact for artifact in verified["artifacts"]
+                if artifact.get("kind") != "controller_quiescence"]
+            stable_payload = {**stable_base, "verified_evidence": stable_verified}
+            stable_digest = hashlib.sha256(json.dumps(stable_payload, sort_keys=True).encode()).hexdigest()
+            event_id = f"cancel-unused:{proof.reservation_id}"
+            prior_event = state["events"].get(event_id)
+            if prior_event is not None:
+                if prior_event.get("payload", {}).get("stable_identity_sha256") != stable_digest:
+                    raise ValueError("cancellation evidence conflicts with the existing terminal event")
+                return rec["financial_cancellation"]
+            verified["live_proc_quiescence"] = _live_proc_quiescence(
+                _UNLAUNCHED_RESERVATIONS[proof.reservation_id][0],
+                _UNLAUNCHED_RESERVATIONS[proof.reservation_id][2])
+            proof_payload = {**proof_base, "verified_evidence": verified}
+            proof_digest = hashlib.sha256(json.dumps(proof_payload, sort_keys=True).encode()).hexdigest()
+            actual_ledger_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
+            if actual_ledger_sha256 != proof.expected_ledger_sha256:
+                raise ValueError("ledger snapshot changed; refresh evidence against the current ledger")
+            if (rec.get("financial_terminal_state") or rec.get("terminal_released")
+                    or rec.get("creation_claims") or rec.get("expiry_fingerprint")
+                    or rec.get("expiry_registered")
+                    or rec.get("lifecycle_terminal") is not True or rec.get("cleanup_open") is not False
+                    or proof.reservation_id in state.get("cleanup_open", ())
+                    or proof.reservation_id in state.get("cleanup_blocked", ())
+                    or proof.reservation_id in state.get("budget_blocked", ())):
+                raise ValueError("reservation has lifecycle, creation, cleanup, or prior terminal liability")
+            providers = set(rec["plan"].get("providers", ()))
+            if (providers != {"aws", "azure", "gcp"}
+                    or rec.get("provider_cleanup") != {name: True for name in providers}):
+                raise ValueError("cancellation requires complete all-provider cleanup")
+            billing = rec.get("provider_billing", {})
+            if set(billing) != providers or any(
+                    row.get("final") or _decimal(row.get("actual_usd") or "0") > 0
+                    or _decimal(row.get("estimate_usd") or "0") > 0
+                    for row in billing.values()):
+                raise ValueError("provider billing evidence is nonzero or already finalized")
+            if _decimal(rec.get("incurred_usd", "0")) != 0 or _decimal(rec.get("released_usd", "0")) != 0:
+                raise ValueError("reservation has incurred charges or prior releases")
+            transfers = rec.get("result_transfer", {})
+            if any(item.get("debited_bytes", 0) != 0 or item.get("attempts")
+                    for item in transfers.values()):
+                raise ValueError("reservation has result-transfer activity")
+            original = rec.get("funding_moves", {})
+            if not original or any(_decimal(value) > 0 and bucket not in state["funding_remaining"]
+                                   for bucket, value in original.items()):
+                raise ValueError("original funding allocation cannot be restored safely")
+            restored = {bucket: _decimal(value) for bucket, value in original.items()}
+            restored_total = sum(restored.values(), Decimal("0"))
+            if restored_total <= 0 or restored_total > _decimal(rec["reserved_cost_usd"]):
+                raise ValueError("original unused funding allocation is outside its reservation ceiling")
+            snapshot_sha256 = hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if preview:
+                return {"status": "eligible_proven_unused", "reservation_id": proof.reservation_id,
+                    "proof_sha256": proof_digest,
+                    "restored_funding_by_bucket": {key: str(value) for key, value in sorted(restored.items())},
+                    "restored_funding_usd": str(restored_total),
+                    "reservation_snapshot_sha256": snapshot_sha256}
+            for bucket, amount in restored.items():
+                state["funding_remaining"][bucket] = str(_decimal(state["funding_remaining"].get(bucket, "0")) + amount)
+            cancellation = {"status": "cancelled_unused", "event_id": event_id,
+                "proof_sha256": proof_digest, "proof": proof_payload,
+                "reservation_snapshot_sha256": snapshot_sha256,
+                "reservation_snapshot": dict(rec),
+                "prior_released_usd": str(_decimal(rec.get("released_usd", "0"))),
+                "prior_released_by_bucket": dict(rec.get("released_by_bucket", {})),
+                "prior_released_by_bucket_present": "released_by_bucket" in rec,
+                "restored_funding_by_bucket": {key: str(value) for key, value in sorted(restored.items())},
+                "restored_funding_usd": str(restored_total)}
+            rec["released_by_bucket"] = {bucket: str(_decimal(rec.get("released_by_bucket", {}).get(bucket, "0")) + amount)
+                for bucket, amount in restored.items()}
+            rec["released_usd"] = str(_decimal(rec.get("released_usd", "0"))
+                + _decimal(rec["reserved_cost_usd"]))
+            rec["financial_terminal_state"] = "cancelled_unused"
+            rec["financial_cancellation"] = cancellation
+            event_payload = {"event_type": "cancelled_unused", "reservation_id": proof.reservation_id,
+                "proof_sha256": proof_digest, "reservation_snapshot_sha256": snapshot_sha256,
+                "stable_identity_sha256": stable_digest,
+                "restored_funding_by_bucket": cancellation["restored_funding_by_bucket"]}
+            event_digest = hashlib.sha256(json.dumps(event_payload, sort_keys=True).encode()).hexdigest()
+            state["events"][event_id] = {"digest": event_digest, "payload": event_payload}
+            self._write(state)
+            return cancellation
+        finally:
+            if fd is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+            for campaign_fd in reversed(campaign_fds):
+                fcntl.flock(campaign_fd, fcntl.LOCK_UN); os.close(campaign_fd)
 
     def reconcile_cost_source(self, inputs: CostInputs, review_evidence: Mapping[str, Any]) -> Mapping[str, Any]:
         """Switch dated cost inputs only with a durable, source-linked human review record."""
@@ -938,9 +1448,14 @@ class BudgetLedger:
             fingerprint = hashlib.sha256(json.dumps({"request": request.model_dump(mode="json"), "source": plan.costs.payload_sha256, "plan":plan_payload}, sort_keys=True, default=str).encode()).hexdigest()
             prior = state["claims"].get(key) or state.get("campaign_claims",{}).get(request.campaign_id)
             if prior:
+                prior_evidence = ReservationEvidence.model_validate(prior["evidence"])
+                prior_record = state["reservations"].get(prior_evidence.reservation_id.value, {})
+                if prior_record.get("financial_terminal_state"):
+                    return AdmissionDecision("rejected", False, None,
+                        ("reservation_terminal",), state["revision"])
                 if prior["fingerprint"] != fingerprint:
                     return AdmissionDecision("rejected", False, None, ("duplicate_conflict",), state["revision"])
-                ev = ReservationEvidence.model_validate(prior["evidence"])
+                ev = prior_evidence
                 return AdmissionDecision("reserved", False, ev, (), state["revision"])
             active_source = state.get("active_cost_source")
             if active_source and (active_source.get("path") != plan.costs.source_path or active_source.get("sha256") != plan.costs.payload_sha256):
@@ -1099,6 +1614,8 @@ class BudgetLedger:
         state = self.inspect()
         rec = state["reservations"].get(reservation_id)
         if not rec: return StageDecision(False, ("ledger_unavailable",), None)
+        if rec.get("financial_terminal_state") in {"cancelled_unused", "contradicted"} and stage != "cleanup":
+            return StageDecision(False, ("reservation_terminal",), None)
         if stage != "cleanup":
             try:
                 revalidate_financial_record(rec, state=state, now=self.utc_now(),
@@ -1177,7 +1694,8 @@ class BudgetLedger:
             if not rec or rec.get("execution_scope") != "paid_request" or name not in rec.get("result_transfer", {}):
                 return False
             if (rec.get("session") != self.controller_session_id or rec.get("lifecycle_terminal")
-                    or rec.get("terminal_released") or rec.get("provider_cleanup", {}).get(name)
+                    or rec.get("terminal_released") or rec.get("financial_terminal_state")
+                    or rec.get("provider_cleanup", {}).get(name)
                     or state.get("budget_blocked")):
                 return False
             try:
@@ -1209,6 +1727,8 @@ class BudgetLedger:
         try:
             state = self._read(); rec = state["reservations"].get(reservation_id)
             if not rec: return StageDecision(False,("ledger_unavailable",),None)
+            if rec.get("financial_terminal_state"):
+                return StageDecision(False,("reservation_terminal",),None)
             provider_name = Provider(provider).value
             claim_now = _utc(self.utc_now())
             new_paid_claim = (rec.get("execution_scope") == "paid_request"
@@ -1390,6 +1910,30 @@ class BudgetLedger:
                 return ReservationEvidence.model_validate(state["reservations"][event.reservation_id]["evidence"])
             rec=state["reservations"].get(event.reservation_id)
             if rec is None: raise ValueError("identity_mismatch")
+            if rec.get("financial_terminal_state") == "cancelled_unused":
+                contradiction = ((event.incurred_usd is not None and _decimal(event.incurred_usd) > 0)
+                    or event.billable_resources_present is True
+                    or (event.actual and event.incurred_usd is None)
+                    or (event.billing_final and event.incurred_usd is None)
+                    or (event.cleanup_status_reported and not event.cleanup_verified_absent
+                        and event.billable_resources_present is None))
+                if not contradiction:
+                    raise ValueError("cancelled reservation cannot resume reconciliation")
+                rec["financial_terminal_state"] = "contradicted"
+                rec["financial_cancellation"]["status"] = "contradicted"
+                rec["released_usd"] = rec["financial_cancellation"]["prior_released_usd"]
+                rec["released_by_bucket"] = rec["financial_cancellation"]["prior_released_by_bucket"]
+                blocked = state.setdefault("budget_blocked", [])
+                if event.reservation_id not in blocked:
+                    blocked.append(event.reservation_id)
+                if release_total:
+                    self._write(state)
+                    raise ValueError("cancelled reservation contradiction cannot release funding")
+                if event.billing_final and event.incurred_usd is None:
+                    self._write(state)
+                    raise ValueError("unknown final billing reinstated the conservative hold")
+            elif rec.get("financial_cancellation") and release_total:
+                raise ValueError("cancelled reservation allocation cannot receive a second refund")
             provider = Provider(event.provider).value
             if provider not in rec["plan"]["providers"]: raise ValueError("identity_mismatch")
             bill = rec.setdefault("provider_billing", {name:{"actual_usd":None,"estimate_usd":None,"final":False,"event_id":None,"history":[]} for name in rec["plan"]["providers"]})[provider]
@@ -1530,8 +2074,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub=parser.add_subparsers(dest="command",required=True)
     p=sub.add_parser("preview",help="read-only local schedule preview")
     p.add_argument("--schedule",required=True,type=Path);p.add_argument("--config-map",required=True,type=Path);p.add_argument("--cost-inputs",required=True,type=Path);p.add_argument("--now",required=True)
+    c=sub.add_parser("cancel-unused",help="review or apply one source-bound proven-unlaunched cancellation")
+    c.add_argument("--ledger",required=True,type=Path)
+    c.add_argument("--scope-id",required=True)
+    c.add_argument("--controller-session-id",required=True)
+    c.add_argument("--proof",required=True,type=Path,help="private JSON UnlaunchedCancellationEvidence object")
+    c.add_argument("--apply",action="store_true",help="apply the terminal accounting event; default is read-only preview")
     args=parser.parse_args(argv)
     try:
+        if args.command == "cancel-unused":
+            if args.proof.is_symlink() or not args.proof.is_file():
+                raise ValueError("cancellation proof file must be a regular non-symlink file")
+            proof = UnlaunchedCancellationEvidence(**json.loads(args.proof.read_text(encoding="utf-8")))
+            ledger = BudgetLedger(args.ledger, scope_id=args.scope_id,
+                utc_now=lambda: datetime.now(timezone.utc), monotonic_now=time.monotonic,
+                controller_session_id=args.controller_session_id)
+            report = (ledger.cancel_proven_unlaunched(proof) if args.apply
+                else ledger.preview_proven_unlaunched(proof))
+            print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+            return 0
         now=datetime.fromisoformat(args.now.replace("Z","+00:00")); _utc(now)
         report=preview(args.schedule,args.config_map,args.cost_inputs,now,root=Path.cwd())
         print(json.dumps(report,sort_keys=True,separators=(",",":")))
