@@ -27,6 +27,8 @@ def _request(attempt: Path, name: str, variables: dict | None = None,
     vars_path.write_text(json.dumps(variables, sort_keys=True))
     plan_root = ROOT / "terraform" / provider / root
     state = attempt / "original.tfstate"
+    state_bytes = b'{"lineage":"offline-original-state"}\n'
+    state.write_bytes(state_bytes)
     _, resources = scope(provider, root)
     plan = plan_document(variables, resources, provider)
     plan_bytes = (json.dumps(plan, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
@@ -40,7 +42,7 @@ def _request(attempt: Path, name: str, variables: dict | None = None,
     (directory / "saved-plan.json").write_bytes(plan_bytes)
     binding = {
         "action_id": f"{provider}-{root}-apply", "root": str(plan_root), "state": str(state),
-        "state_sha256": None, "plan_sha256": hashlib.sha256(binary).hexdigest(),
+        "state_sha256": hashlib.sha256(state_bytes).hexdigest(), "plan_sha256": hashlib.sha256(binary).hexdigest(),
         "json_sha256": hashlib.sha256(plan_bytes).hexdigest(),
         "variables_sha256": hashlib.sha256(vars_path.read_bytes()).hexdigest(),
         "source_sha256": plan_disclosure.tp.source_hash(plan_root),
@@ -205,9 +207,9 @@ def test_watcher_rejects_request_with_stale_file_timestamp(tmp_path, monkeypatch
     real_requests = watch_plan_review._requests
     calls = [0]
 
-    def appear_after_start(roots):
+    def appear_after_start(roots, *args, **kwargs):
         calls[0] += 1
-        return {} if calls[0] == 1 else real_requests(roots)
+        return {} if calls[0] == 1 else real_requests(roots, *args, **kwargs)
 
     monkeypatch.setattr(watch_plan_review, "_requests", appear_after_start)
     with pytest.raises(PlanReviewError, match="predates this watcher"):
@@ -230,7 +232,8 @@ def test_prepositioned_watcher_handles_original_open_write_publication(tmp_path,
         path = _request(attempt, "gcp-protection-apply-review-delayed", publish=False)
         payload = (json.dumps({
             "action_id": "gcp-protection-apply", "root": str(ROOT / "terraform/gcp/protection"),
-            "state": str(attempt / "original.tfstate"), "state_sha256": None,
+            "state": str(attempt / "original.tfstate"),
+            "state_sha256": hashlib.sha256((attempt / "original.tfstate").read_bytes()).hexdigest(),
             "plan_sha256": hashlib.sha256(b"offline-original-plan:gcp-protection-apply-review-delayed").hexdigest(),
             "json_sha256": hashlib.sha256((path.parent / "saved-plan.json").read_bytes()).hexdigest(),
             "variables_sha256": hashlib.sha256((attempt / "inputs/safety-eu-north-1.tfvars.json").read_bytes()).hexdigest(),
@@ -286,6 +289,205 @@ def test_watcher_discovers_nested_aws_safety_request_under_late_provider_root(tm
     assert str(request.parent) in output
     assert "human_review_required=true" in output
     assert not (request.parent / "operator-review.json").exists()
+
+
+@pytest.mark.parametrize(("provider", "root_name"), [("aws", "safety"), ("gcp", "protection")])
+def test_mirror_provider_link_does_not_block_complete_original_disclosure(
+        tmp_path, capsys, monkeypatch, provider, root_name):
+    from scripts import watch_plan_review
+
+    attempt = tmp_path / "acceptance" / "V-S3" / provider
+    if provider == "aws":
+        data_path = (attempt / "cnb-20261123T130643Z-exp-003-e83f53cd-aws-fixture"
+                     / "20261123T130643Z-exp-003-e83f53cd-aws"
+                     / "20261123T130643Z-exp-003-e83f53cd-aws-deployment"
+                     / "terraform-data-safety-365dda5a")
+        version = "6.70.0"
+    else:
+        data_path = (attempt / "08eed51c16ef"
+                     / "20261123T130643Z-exp-003-e83f53cd-gcp"
+                     / "20261123T130643Z-exp-003-e83f53cd-gcp-deployment"
+                     / "protection" / "terraform-data-protection-e37f184c")
+        version = "7.46.1"
+    cache_link = (data_path / "providers" / "registry.terraform.io" / "hashicorp" /
+                  ("google" if provider == "gcp" else provider) / version / "linux_amd64")
+    mirror = tmp_path / "mirror"
+    namespace_provider = "google" if provider == "gcp" else provider
+    package = (mirror / "registry.terraform.io" / "hashicorp" / namespace_provider /
+               version / "linux_amd64")
+    package.mkdir(parents=True)
+    (package / f"terraform-provider-{namespace_provider}_v{version}").write_text("offline fixture")
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    (package / "review-request.json").write_text('{"action_id":"hidden"}')
+    cache_link.parent.mkdir(parents=True)
+    cache_link.symlink_to(package, target_is_directory=True)
+    roots = _six_roots(tmp_path, attempt)
+    checkpoint = tmp_path / f"{provider}-checkpoint"
+    ready = Event()
+    watch_end = time.time() + 6
+
+    def publish_after_ready():
+        assert ready.wait(2)
+        return _request(attempt, f"{provider}-{root_name}-apply-review-mirror",
+                        provider=provider, root=root_name)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        producer = pool.submit(publish_after_ready)
+        published = watch_plan_review.watch(roots, checkpoint, watch_end,
+                                            poll_seconds=0.005, on_ready=ready.set)
+        request = producer.result()
+
+    assert published == checkpoint / f"{provider}-{root_name}-apply"
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    entry = manifest["entries"][0]
+    assert entry["review_directory"] == str(request.parent)
+    assert entry["lossless"] is True
+    assert (published / "review-request.json").read_bytes() == request.read_bytes()
+    assert (published / "saved-plan.json").is_file()
+    assert (published / "saved.tfplan").is_file()
+    assert list(published.glob("variables*"))
+    output = capsys.readouterr().out
+    request_mtime = request.stat().st_mtime
+    original_cutoff = min(request_mtime + 40.0, watch_end)
+    assert time.time() < original_cutoff
+    assert f"deadline_utc_epoch={original_cutoff}" in output
+    assert "python -m cloud_network_benchmark.terraform_plan" in output
+    assert entry["state_sha256"] == hashlib.sha256((attempt / "original.tfstate").read_bytes()).hexdigest()
+    assert "human_review_required=true" in output
+    assert not (request.parent / "operator-review.json").exists()
+
+
+def test_nested_provider_cache_link_to_wrong_target_is_rejected(tmp_path, monkeypatch):
+    from scripts import watch_plan_review
+
+    attempt = tmp_path / "acceptance" / "V-S3" / "aws"
+    link = (attempt / "cnb-fixture" / "fixture-aws" / "fixture-aws-deployment" /
+            "terraform-data-safety-deadbeef" /
+            "providers" / "registry.terraform.io" / "hashicorp" / "aws" / "6.70.0" / "linux_amd64")
+    link.parent.mkdir(parents=True)
+    wrong = tmp_path / "unapproved-provider-target"
+    wrong.mkdir()
+    link.symlink_to(wrong, target_is_directory=True)
+    mirror = tmp_path / "approved-mirror"
+    expected = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+    expected.mkdir(parents=True)
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    with pytest.raises(PlanReviewError, match="symlink"):
+        watch_plan_review.watch([attempt], tmp_path / "checkpoint", time.time() + 2)
+
+
+@pytest.mark.parametrize(("provider_root", "relative", "namespace", "provider", "version"), [
+    ("aws", "cnb-20261123T130643Z-exp-903-b45cdaa1-aws-20261123T1306-a356363d50c461a781edbf16/20261123T130643Z-exp-903-b45cdaa1-aws/20261123T130643Z-exp-903-b45cdaa1-aws-deployment/terraform-data-safety-365dda5a", "hashicorp", "aws", "6.70.0"),
+    ("aws", "cnb-20261123T130643Z-exp-003-e83f53cd-aws-20261123T1306-721bfafb573b50f9cf8ea865/20261123T130643Z-exp-003-e83f53cd-aws/20261123T130643Z-exp-003-e83f53cd-aws-deployment/terraform-data-safety-365dda5a", "hashicorp", "aws", "6.70.0"),
+    ("azure", "20261123T130643Z-exp-903-b45cdaa1-azure/20261123T130643Z-exp-903-b45cdaa1-azure-deployment/terraform-data-expiry", "hashicorp", "azurerm", "4.81.0"),
+    ("azure", "20261123T130643Z-exp-903-b45cdaa1-azure/20261123T130643Z-exp-903-b45cdaa1-azure-deployment/terraform-data-pair", "hashicorp", "azurerm", "4.81.0"),
+    ("gcp", "4da92a874f43/20261123T130643Z-exp-903-b45cdaa1-gcp/20261123T130643Z-exp-903-b45cdaa1-gcp-deployment/protection/terraform-data-protection-e37f184c", "hashicorp", "google", "7.46.1"),
+    ("gcp", "08eed51c16ef/20261123T130643Z-exp-003-e83f53cd-gcp/20261123T130643Z-exp-003-e83f53cd-gcp-deployment/protection/terraform-data-protection-e37f184c", "hashicorp", "google", "7.46.1"),
+])
+def test_all_recorded_v4_provider_cache_layouts_are_bound_to_configured_mirror(
+        tmp_path, monkeypatch, provider_root, relative, namespace, provider, version):
+    from scripts import watch_plan_review
+
+    root = tmp_path / "acceptance" / "V-S1" / provider_root
+    mirror = tmp_path / "mirror"
+    target = mirror / "registry.terraform.io" / namespace / provider / version / "linux_amd64"
+    target.mkdir(parents=True)
+    (target / f"terraform-provider-{provider}_v{version}").write_text("fixture package")
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    link = root / relative / "providers" / "registry.terraform.io" / namespace / provider / version / "linux_amd64"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target, target_is_directory=True)
+
+    assert watch_plan_review._requests([root]) == {}
+
+
+def test_cache_link_retarget_during_disclosure_withholds_manual_command(tmp_path, monkeypatch, capsys):
+    attempt = tmp_path / "acceptance" / "V-S3" / "aws"
+    link = (attempt / "cnb-fixture" / "fixture-aws" / "fixture-aws-deployment" /
+            "terraform-data-safety-deadbeef" /
+            "providers" / "registry.terraform.io" / "hashicorp" / "aws" / "6.70.0" / "linux_amd64")
+    mirror = tmp_path / "mirror"
+    target = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+    target.mkdir(parents=True)
+    (target / "provider-binary").write_text("fixture")
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target, target_is_directory=True)
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    request = _request(attempt, "aws-safety-eu-north-1-review-retarget", provider="aws", root="safety")
+    original_pages = plan_disclosure._bounded_pages
+    changed = [False]
+
+    def retarget_after_page(*args, **kwargs):
+        pages = original_pages(*args, **kwargs)
+        if not changed[0]:
+            link.unlink()
+            alternative_mirror = tmp_path / "retargeted-mirror"
+            alternative = alternative_mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+            alternative.mkdir(parents=True)
+            config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{alternative_mirror}"\n }}\n}}\n')
+            link.symlink_to(alternative, target_is_directory=True)
+            changed[0] = True
+        return pages
+
+    monkeypatch.setattr(plan_disclosure, "_bounded_pages", retarget_after_page)
+    with pytest.raises(PlanReviewError, match="symlink"):
+        plan_disclosure.disclose([attempt], tmp_path / "checkpoint", time.time() + 5,
+                                 request_path=request)
+    output = capsys.readouterr().out
+    assert "human_review_required=true" not in output
+    assert "python -m cloud_network_benchmark.terraform_plan" not in output
+    assert not (request.parent / "operator-review.json").exists()
+
+
+@pytest.mark.parametrize("link_name", ["alias", "linux_amd64"])
+def test_unrecognized_or_malformed_mirror_symlink_still_fails_closed(tmp_path, link_name):
+    from scripts import watch_plan_review
+
+    attempt = tmp_path / "attempt"
+    target = tmp_path / "outside"
+    target.mkdir()
+    if link_name == "alias":
+        link = attempt / "alias"
+    else:
+        link = (attempt / "terraform-data-safety-test" / "providers" /
+                "registry.terraform.io" / "hashicorp" / "aws" / "not-a-version" / link_name)
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(PlanReviewError, match="symlink"):
+        watch_plan_review.watch([attempt], tmp_path / "checkpoint", time.time() + 2)
+    assert not (tmp_path / "checkpoint").exists()
+
+
+def test_provider_cache_link_replacement_with_file_fails_closed(tmp_path, monkeypatch):
+    from scripts import watch_plan_review
+
+    attempt = tmp_path / "acceptance" / "V-S3" / "aws"
+    link = (attempt / "cnb-fixture" / "fixture-aws" / "fixture-aws-deployment" /
+            "terraform-data-safety-deadbeef" /
+            "providers" / "registry.terraform.io" / "hashicorp" / "aws" / "6.70.0" / "linux_amd64")
+    mirror = tmp_path / "mirror"
+    package = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+    package.mkdir(parents=True)
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    link.parent.mkdir(parents=True)
+    link.symlink_to(package, target_is_directory=True)
+    assert watch_plan_review._requests([attempt]) == {}
+    link.unlink()
+    file_target = tmp_path / "provider-file"
+    file_target.write_text("changed cache target")
+    link.symlink_to(file_target)
+    with pytest.raises(PlanReviewError, match="symlink"):
+        watch_plan_review._requests([attempt])
 
 
 def test_incomplete_open_request_fails_at_fixed_watch_end(tmp_path):

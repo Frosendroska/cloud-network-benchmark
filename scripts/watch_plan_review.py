@@ -32,14 +32,13 @@ def _root(path: Path) -> Path:
     return absolute
 
 
-def _requests(roots: list[Path]) -> dict[Path, str]:
+def _requests(roots: list[Path], mirror_snapshot=None,
+              cache_links: dict | None = None) -> dict[Path, str]:
     found = {}
     for root in roots:
         if not root.exists():
             continue
-        for child in root.rglob("*"):
-            if child.is_symlink():
-                raise PlanReviewError("allowlisted provider tree contains a symlink")
+        for child in plan_disclosure._walk_owned(root, mirror_snapshot, cache_links):
             if child.name != "review-request.json" or "-review-" not in child.parent.name:
                 continue
             if not child.is_file():
@@ -50,7 +49,8 @@ def _requests(roots: list[Path]) -> dict[Path, str]:
 
 def _complete_binding(path: Path, roots: list[Path], baseline: dict[Path, str],
                       cutoff: float, watch_end_epoch: float,
-                      poll_seconds: float) -> tuple[dict, bytes, int, str]:
+                      poll_seconds: float, mirror_snapshot,
+                      expected_cache_links: dict) -> tuple[dict, bytes, int, str]:
     required = {"action_id", "root", "state", "state_sha256", "plan_sha256", "json_sha256",
                 "variables_sha256", "source_sha256", "scope"}
     last: tuple[int, str] | None = None
@@ -60,7 +60,10 @@ def _complete_binding(path: Path, roots: list[Path], baseline: dict[Path, str],
                        "review-cancelled.json", "failure.json"):
             if (path.parent / marker).exists() or (path.parent / marker).is_symlink():
                 raise PlanReviewError("original producer closed or cancelled the review while publishing")
-        current = _requests(roots)
+        cache_links = {}
+        current = _requests(roots, mirror_snapshot, cache_links)
+        if cache_links != expected_cache_links:
+            raise PlanReviewError("Terraform provider cache links changed during request publication")
         if any(current.get(old_path) != old_hash for old_path, old_hash in baseline.items()):
             raise PlanReviewError("previous original request changed or disappeared during publication")
         new = [candidate for candidate in current if candidate not in baseline]
@@ -104,7 +107,8 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
            for index, left in enumerate(owned) for right in owned[index + 1:]):
         raise PlanReviewError("allowlisted provider roots must not overlap")
     watch_started = time.time()
-    baseline = _requests(owned)
+    mirror_snapshot = plan_disclosure._provider_mirror_snapshot()
+    baseline = _requests(owned, mirror_snapshot)
     for request in baseline:
         if not any((request.parent / marker).exists() or (request.parent / marker).is_symlink()
                    for marker in ("accepted-review.json", "review-cancelled.json", "failure.json")):
@@ -113,7 +117,8 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
         on_ready()
     seen = dict(baseline)
     while time.time() < watch_end_epoch:
-        current = _requests(owned)
+        current_cache_links = {}
+        current = _requests(owned, mirror_snapshot, current_cache_links)
         for path, old_hash in seen.items():
             if current.get(path) != old_hash:
                 raise PlanReviewError("observed original request changed or disappeared while watching")
@@ -134,19 +139,23 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
                 if (directory / marker).exists() or (directory / marker).is_symlink():
                     raise PlanReviewError("new request is accepted, cancelled, or no longer pending")
             binding, request_bytes, request_mtime_ns, request_hash = _complete_binding(
-                request, owned, baseline, cutoff, watch_end_epoch, poll_seconds)
+                request, owned, baseline, cutoff, watch_end_epoch, poll_seconds,
+                mirror_snapshot, current_cache_links)
             if not isinstance(binding, dict) or not isinstance(binding.get("action_id"), str):
                 raise PlanReviewError("new original request has no valid action identity")
             current_publication = request.stat()
-            latest = _requests(owned)
+            latest_cache_links = {}
+            latest = _requests(owned, mirror_snapshot, latest_cache_links)
             if (current_publication.st_mtime_ns != request_mtime_ns
                     or hashlib.sha256(request.read_bytes()).hexdigest() != request_hash):
                 raise PlanReviewError("original request hash or publication time changed while watching")
-            if latest.get(request) != request_hash or len(latest) != len(baseline) + 1:
+            if (latest.get(request) != request_hash or len(latest) != len(baseline) + 1
+                    or latest_cache_links != current_cache_links):
                 raise PlanReviewError("review request set changed before disclosure began")
             result = plan_disclosure.disclose(
                 owned, checkpoint, cutoff, display_limit,
-                request_path=request)
+                request_path=request, mirror_snapshot=mirror_snapshot,
+                cache_links=current_cache_links)
             return result[0]
         seen.update(current)
         time.sleep(min(poll_seconds, max(0.0, watch_end_epoch - time.time())))

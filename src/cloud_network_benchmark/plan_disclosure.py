@@ -41,6 +41,139 @@ def _regular(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _configured_provider_mirrors() -> list[Path]:
+    """Read only filesystem-mirror paths from Terraform's explicit CLI config."""
+    config = os.environ.get("TF_CLI_CONFIG_FILE")
+    if not config:
+        return []
+    path = Path(config)
+    if path.is_symlink() or not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    mirrors = []
+    block = re.compile(r'(?ms)filesystem_mirror\s*\{([^{}]*)\}')
+    path_value = re.compile(r'(?m)^\s*path\s*=\s*("(?:[^"\\]|\\.)*")\s*$')
+    for match in block.finditer(text):
+        value = path_value.search(match.group(1))
+        if value is None:
+            continue
+        try:
+            candidate = Path(json.loads(value.group(1)))
+            if (candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink()
+                    and candidate.resolve(strict=True) == candidate):
+                mirrors.append(candidate)
+        except (OSError, ValueError, TypeError):
+            continue
+    mirrors = sorted(set(mirrors))
+    return mirrors if len(mirrors) == 1 else []
+
+
+def _provider_mirror_snapshot() -> tuple[str, str, str] | None:
+    config = os.environ.get("TF_CLI_CONFIG_FILE")
+    if not config:
+        return None
+    path = Path(config)
+    try:
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    mirrors = _configured_provider_mirrors()
+    if len(mirrors) != 1:
+        return None
+    return str(path.absolute()), digest(payload), str(mirrors[0])
+
+
+def _terraform_provider_cache_link(path: Path, root: Path,
+                                   mirror_snapshot: tuple[str, str, str] | None) -> bool:
+    """Recognize only the source-owned review-workspace link to its configured mirror."""
+    if not path.is_symlink():
+        return False
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if (len(parts) < 7 or parts[-6] != "providers"
+            or parts[-5] != "registry.terraform.io"):
+        return False
+    namespace, provider, version, platform = parts[-4:]
+    if (not re.fullmatch(r"[A-Za-z0-9_-]+", namespace)
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", provider)
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}(?:[-+][A-Za-z0-9.-]+)?", version)
+            or not re.fullmatch(r"[A-Za-z0-9_]+", platform)):
+        return False
+    if not path.is_dir():
+        return False
+    data_index = len(parts) - 7
+    data_name = parts[data_index]
+    if provider == "aws":
+        layout = (len(parts) == 10 and parts[0].startswith("cnb-")
+                  and parts[2].endswith("-deployment")
+                  and re.fullmatch(r"terraform-data-safety-[0-9a-f]{8}", data_name) is not None)
+    elif provider == "azurerm":
+        layout = (len(parts) == 9 and parts[0].startswith("20")
+                  and parts[1].endswith("-deployment")
+                  and re.fullmatch(r"terraform-data-(?:expiry|pair)", data_name) is not None)
+    elif provider == "google":
+        layout = (len(parts) == 11 and re.fullmatch(r"[0-9a-f]{12}", parts[0]) is not None
+                  and parts[2].endswith("-deployment") and parts[3] in {"protection", "pair"}
+                  and re.fullmatch(r"terraform-data-(?:protection|pair)-[0-9a-f]{8}", data_name) is not None)
+    else:
+        layout = False
+    if namespace != "hashicorp" or not layout:
+        return False
+    if mirror_snapshot is None:
+        return False
+    config_path, expected_config_hash, mirror_text = mirror_snapshot
+    try:
+        if (os.environ.get("TF_CLI_CONFIG_FILE") != config_path
+                or digest(Path(config_path).read_bytes()) != expected_config_hash):
+            return False
+        expected = Path(mirror_text) / "registry.terraform.io" / namespace / provider / version / platform
+        return (expected.is_dir() and os.readlink(path) == str(expected)
+                and expected.resolve(strict=True) == path.resolve(strict=True))
+    except OSError:
+        return False
+
+
+def _provider_cache_signature(path: Path) -> tuple:
+    target = path.resolve(strict=True)
+    stat = target.stat()
+    return (os.readlink(path), str(target), stat.st_dev, stat.st_ino,
+            stat.st_mode, stat.st_size, stat.st_mtime_ns)
+
+
+def _walk_owned(root: Path, mirror_snapshot=None, cache_links: dict | None = None):
+    """Walk an owned attempt root without following links, pruning only mirror aliases."""
+    if mirror_snapshot is None:
+        mirror_snapshot = _provider_mirror_snapshot()
+    for current, dirs, files in os.walk(root, followlinks=False):
+        directory = Path(current)
+        kept = []
+        for name in dirs:
+            child = directory / name
+            if child.is_symlink():
+                if _terraform_provider_cache_link(child, root, mirror_snapshot):
+                    if cache_links is not None:
+                        cache_links[child] = _provider_cache_signature(child)
+                    continue
+                raise tp.PlanReviewError("owned roots contain an unrecognized symlink")
+            kept.append(name)
+        dirs[:] = kept
+        for name in files:
+            child = directory / name
+            if child.is_symlink():
+                if _terraform_provider_cache_link(child, root, mirror_snapshot):
+                    if cache_links is not None:
+                        cache_links[child] = _provider_cache_signature(child)
+                    continue
+                raise tp.PlanReviewError("owned roots contain an unrecognized symlink")
+            yield child
+
+
 def _assert_pending_original(path: Path, request_bytes: bytes) -> None:
     if _regular(path) != request_bytes:
         raise tp.PlanReviewError("original review request changed during disclosure")
@@ -50,21 +183,23 @@ def _assert_pending_original(path: Path, request_bytes: bytes) -> None:
         raise tp.PlanReviewError("original review request is no longer pending")
 
 
-def _request_inventory(roots: list[Path]) -> dict[Path, str]:
+def _request_inventory(roots: list[Path], mirror_snapshot=None,
+                       cache_links: dict | None = None) -> dict[Path, str]:
     inventory = {}
     for root in roots:
         if not root.exists():
             continue
-        for path in root.rglob("*"):
-            if path.is_symlink():
-                raise tp.PlanReviewError("owned request roots contain a symlink")
+        for path in _walk_owned(root, mirror_snapshot, cache_links):
             if path.name == "review-request.json":
                 inventory[path] = digest(_regular(path))
     return inventory
 
 
-def _assert_request_inventory(roots: list[Path], expected: dict[Path, str]) -> None:
-    if _request_inventory(roots) != expected:
+def _assert_request_inventory(roots: list[Path], expected: dict[Path, str],
+                              mirror_snapshot=None, expected_cache_links=None) -> None:
+    cache_links = {}
+    if (_request_inventory(roots, mirror_snapshot, cache_links) != expected
+            or (expected_cache_links is not None and cache_links != expected_cache_links)):
         raise tp.PlanReviewError("original request set changed during disclosure")
 
 
@@ -95,8 +230,8 @@ def _private_destination(path: Path) -> Path:
     return path
 
 
-def _source_inventory(root: Path) -> dict:
-    files = sorted(p for p in root.rglob("*") if p.is_file()
+def _source_inventory(root: Path, mirror_snapshot=None) -> dict:
+    files = sorted(p for p in _walk_owned(root, mirror_snapshot) if p.is_file()
                    and (p.suffix in {".tf", ".py", ".ps1"} or p.name == ".terraform.lock.hcl")
                    and ".terraform" not in p.parts)
     return {str(p.relative_to(root)): digest(_regular(p)) for p in files}
@@ -551,12 +686,21 @@ def _sensitive(value, key="", path=(), provider=None, variables=None,
 
 
 def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
-             display_limit: int = 32768, *, request_path: Path | None = None) -> list[Path]:
+             display_limit: int = 32768, *, request_path: Path | None = None,
+             mirror_snapshot=None, cache_links: dict | None = None) -> list[Path]:
     _validator_identity()
     if isinstance(deadline_epoch, bool) or not isinstance(deadline_epoch, (int, float)) or not math.isfinite(deadline_epoch):
         raise tp.PlanReviewError("original plan-review deadline must be a finite epoch timestamp")
     owned = [_safe_root(p) for p in roots]
-    request_inventory = _request_inventory(owned) if request_path is not None else None
+    if mirror_snapshot is None:
+        mirror_snapshot = _provider_mirror_snapshot()
+    observed_cache_links = {}
+    request_inventory = (_request_inventory(owned, mirror_snapshot, observed_cache_links)
+                         if request_path is not None else None)
+    expected_cache_links = (dict(cache_links) if cache_links is not None
+                            else dict(observed_cache_links))
+    if cache_links is not None and observed_cache_links != cache_links:
+        raise tp.PlanReviewError("Terraform provider cache links changed before disclosure")
     checkpoint_root = checkpoint_root.absolute()
     if checkpoint_root.exists() or checkpoint_root.is_symlink():
         raise tp.PlanReviewError("checkpoint destination must not already exist")
@@ -584,9 +728,9 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
                 raise tp.PlanReviewError("another original request is still pending or unresolved")
     else:
         for root in owned:
-            for path in root.rglob("review-request.json"):
-                if any(p.is_symlink() for p in (path, *path.parents)):
-                    raise tp.PlanReviewError("review discovery encountered a symlink")
+            for path in _walk_owned(root, mirror_snapshot, observed_cache_links):
+                if path.name != "review-request.json":
+                    continue
                 requests.append(path)
         requests = sorted(set(requests))
     if not requests:
@@ -607,11 +751,9 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
             raise tp.PlanReviewError("saved plan bytes do not match request binding")
         # The current request schema binds the variable hash, but not its path. Resolve within
         # explicitly owned roots and fail closed unless that hash identifies exactly one file.
-        if any(p.is_symlink() for root in owned if root.exists() for p in root.rglob("*")):
-            raise tp.PlanReviewError("owned variable lookup roots contain a symlink")
         vars_candidates = [p for root in owned if root.exists()
-                           for pattern in ("*.tfvars.json", "*.tfvars", "vars.json")
-                           for p in root.rglob(pattern)]
+                           for p in _walk_owned(root, mirror_snapshot, observed_cache_links)
+                           if p.name.endswith((".tfvars.json", ".tfvars")) or p.name == "vars.json"]
         vars_candidates = [p for p in vars_candidates if digest(_regular(p)) == binding.get("variables_sha256")]
         if len(vars_candidates) != 1:
             raise tp.PlanReviewError("could not uniquely bind original variable file within owned roots")
@@ -620,7 +762,7 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
         if root_path.is_symlink() or root_path.absolute() != root_path.resolve(strict=True):
             raise tp.PlanReviewError("Terraform root traverses a symlink")
         state_path = Path(binding["state"])
-        source_inventory = _source_inventory(root_path)
+        source_inventory = _source_inventory(root_path, mirror_snapshot)
         if digest(tp._json(source_inventory)) != binding.get("source_sha256"):
             raise tp.PlanReviewError("Terraform source changed since plan review request")
         state_bytes = _regular(state_path) if state_path.exists() or state_path.is_symlink() else None
@@ -685,10 +827,11 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
                 raise tp.PlanReviewError("original plan-review deadline elapsed before checkpoint publication")
             _assert_pending_original(req_path, req_bytes)
             if request_inventory is not None:
-                _assert_request_inventory(owned, request_inventory)
+                _assert_request_inventory(owned, request_inventory, mirror_snapshot, expected_cache_links)
             if digest(_regular(req_path.parent / "saved-plan.json")) != binding["json_sha256"] or digest(_regular(req_path.parent / "saved.tfplan")) != binding["plan_sha256"]:
                 raise tp.PlanReviewError("saved plan changed before checkpoint publication")
-            if digest(_regular(var_path)) != binding["variables_sha256"] or _source_inventory(root_path) != source_inventory:
+            if (digest(_regular(var_path)) != binding["variables_sha256"]
+                    or _source_inventory(root_path, mirror_snapshot) != source_inventory):
                 raise tp.PlanReviewError("variables or source changed before checkpoint publication")
             current_state = _regular(state_path) if state_path.exists() or state_path.is_symlink() else None
             if current_state != state_bytes: raise tp.PlanReviewError("state changed before checkpoint publication")
@@ -713,7 +856,7 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
             source = next(item for item in prepared if item[0].parent == Path(row["review_directory"]))
             _assert_pending_original(source[0], source[1])
             if request_inventory is not None:
-                _assert_request_inventory(owned, request_inventory)
+                _assert_request_inventory(owned, request_inventory, mirror_snapshot, expected_cache_links)
             if time.time() >= deadline_epoch:
                 raise tp.PlanReviewError("original plan-review deadline elapsed before receipt command publication")
             print("human_review_required=true deadline_utc_epoch=" + str(deadline_epoch))
