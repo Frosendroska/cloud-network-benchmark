@@ -304,7 +304,87 @@ def _private_receipt(path: Path, value: dict[str, Any]) -> tuple[Path, bytes]:
     return path, raw
 
 
-def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) -> bool:
+def _gcp_precreation_selector(record: Any, saved: SavedProviderCleanupSettings,
+                              recovery: Any, result: Any, state: dict[str, Any]) -> str | None:
+    """Bind an empty GCP inventory to one original, uncreated saved attempt."""
+    from .contracts.common import CleanupState
+    from .providers.gcp import GcpCleanupResult, GcpRuntimeSettings
+
+    if (saved.provider != Provider.GCP or record.provider != "gcp"
+            or record.expiry_registered is not False
+            or record.creation_may_have_started is not False
+            or recovery.attempt_id != saved.deployment.campaign_id
+            or recovery.reservation_id != saved.reservation.reservation_id.value
+            or record.deployment_id != saved.deployment.deployment_id):
+        return None
+    journal = Path(record.journal_reference)
+    expected_journal = _expected_journal(saved)
+    if (not isinstance(state, dict) or journal.is_symlink() or not journal.is_file()
+            or any(parent.is_symlink() for parent in journal.parents)
+            or journal.resolve() != expected_journal.resolve()):
+        return None
+    try:
+        _validate_request(saved)
+    except (TypeError, ValueError):
+        return None
+    settings = GcpRuntimeSettings.model_validate(saved.settings)
+    from .providers.gcp import GcpProviderDriver
+    binding_driver = GcpProviderDriver.__new__(GcpProviderDriver)
+    binding_driver.settings = settings
+    expected_binding = binding_driver._binding_fingerprint(saved.deployment)
+    expected_selector = (f"project={settings.project_id};run_id={saved.deployment.run_id};"
+        f"deployment_id={saved.deployment.deployment_id};roles=vm_a,vm_b")
+    if (saved.expiry_request.resource_namespace != saved.deployment.run_id
+            or saved.expiry_request.target_selector != expected_selector
+            or state.get("binding_sha256") != expected_binding
+            or state.get("run_id") != saved.deployment.run_id
+            or state.get("deployment_id") != saved.deployment.deployment_id
+            or state.get("reservation_id") != recovery.reservation_id
+            or ("creation_may_have_started" in state and state.get("creation_may_have_started") is not False)
+            or state.get("deployment_output") is not None
+            or ("registered" in state and state.get("registered") is not False)
+            or state.get("expiry") is not None
+            or state.get("cleanup_state") != "succeeded"
+            or state.get("launch_blocked") is not False):
+        return None
+    registration_started = state.get("registration_may_have_started")
+    if registration_started is not None and registration_started is not False and registration_started is not True:
+        return None
+    if registration_started is True and (
+            state.get("unused_protection_destroy_attempted") is not True
+            or state.get("protection_cleanup_state") != "succeeded"):
+        return None
+    for key in ("templates", "observed_resources", "observed_disks"):
+        value = state.get(key, {} if key != "observed_disks" else [])
+        if value not in ({}, []):
+            return None
+    if not isinstance(result, GcpCleanupResult) or (
+            result.cleanup_state != CleanupState.SUCCEEDED or result.cleanup_failure is not None
+            or result.primary_failure is not None
+            or result.expiry.value is not None
+            or result.expiry.unavailable_reason != "no native expiry was registered"):
+        return None
+    inventory = result.inventory.value if result.inventory else None
+    if not isinstance(inventory, dict):
+        return None
+    region = saved.deployment.vm_a.region
+    required_scopes = {"all_project_zones", region, "global"}
+    completed_scopes = inventory.get("completed_scopes")
+    if (not isinstance(completed_scopes, list)
+            or any(not isinstance(scope, str) or not scope.strip() for scope in completed_scopes)
+            or inventory.get("pages_complete") is not True
+            or set(completed_scopes) != required_scopes
+            or inventory.get("zone_scope") != "all_project_zones"
+            or inventory.get("regions_scanned") != [region]
+            or inventory.get("resources") != []
+            or any(inventory.get(name) != [] for name in
+                ("instances", "disks", "addresses", "support_resources"))):
+        return None
+    return expected_selector
+
+
+def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str], *,
+                      gcp_precreation_selector: str | None = None) -> bool:
     from .contracts.common import CleanupState
     state = getattr(result, "cleanup_state", None)
     if state not in {CleanupState.SUCCEEDED, CleanupState.NOT_REQUIRED}:
@@ -320,7 +400,7 @@ def _result_is_absent(provider: Provider, result: Any, absent_ids: list[str]) ->
             and all(row.get("complete") is True and not row.get("remaining") for row in regions.values())
             and isinstance(safety, dict) and bool(safety) and all(value is True for value in safety.values()))
     if provider == Provider.GCP:
-        if not absent_ids:
+        if not absent_ids and not gcp_precreation_selector:
             return False
         inventory = result.inventory.value if result.inventory else None
         return (isinstance(inventory, dict) and inventory.get("pages_complete") is True
@@ -373,6 +453,7 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
         state = json.loads(journal.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         state = {}
+    gcp_precreation_selector = None
     if provider_resource_ids is not None:
         if (not isinstance(provider_resource_ids, list)
                 or any(not isinstance(item, str) or not item.strip() for item in provider_resource_ids)):
@@ -401,18 +482,33 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
                 or identity.deployment_id != saved.deployment.deployment_id
                 or getattr(identity.provider, "value", identity.provider) != str(saved.provider)):
             raise ValueError("Azure cleanup result identity differs from the saved deployment")
+    gcp_identity_mismatch = False
+    if saved.provider == Provider.GCP:
+        journal_ids = (_journal_ids(journal, "observed_resources") + _journal_ids(journal, "observed_disks")
+            + _nested_resource_ids(state.get("templates", {}))
+            + _nested_resource_ids(state.get("observed_resources", {}))
+            + _nested_resource_ids(state.get("observed_disks", [])))
+        journal_ids = list(dict.fromkeys(item for item in journal_ids if isinstance(item, str) and item.strip()))
+        if absent_ids:
+            gcp_identity_mismatch = set(absent_ids) != set(journal_ids)
+        elif result is not None:
+            gcp_precreation_selector = _gcp_precreation_selector(record, saved, recovery, result, state)
+            if gcp_precreation_selector:
+                absent_ids = [gcp_precreation_selector]
     if saved.provider == Provider.AWS and result is not None:
         inventory = getattr(getattr(result,"inventory",None),"value",None)
         if isinstance(inventory,dict):
             absent_ids.extend(_nested_resource_ids(inventory.get("safety_targets",{})))
     absent_ids = list(dict.fromkeys(item for item in absent_ids if isinstance(item, str) and item.strip()))
-    verified_absent = result is not None and _result_is_absent(saved.provider, result, absent_ids)
+    verified_absent = result is not None and not gcp_identity_mismatch and _result_is_absent(saved.provider, result, absent_ids,
+        gcp_precreation_selector=(gcp_precreation_selector if saved.provider == Provider.GCP else None))
     at = utc_now()
     typed = result.model_dump(mode="json") if result is not None and hasattr(result, "model_dump") else None
     receipt = {"schema_version": 1, "provider": str(saved.provider),
         "reservation_id": recovery.reservation_id, "deployment_id": saved.deployment.deployment_id,
         "occurred_at": at.isoformat(), "cleanup_result": typed,
         "absence_proved": verified_absent,
+        "absence_identity_kind": ("source_bound_selector" if gcp_precreation_selector else "provider_resource_ids"),
         "absent_resource_ids": sorted(set(absent_ids)) if verified_absent else []}
     raw = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
@@ -498,6 +594,14 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any,
                     + _nested_resource_ids(state.get("templates", {}))
                     + _nested_resource_ids(state.get("observed_resources", {}))
                     + _nested_resource_ids(state.get("observed_disks", [])))
+                precreation_selector = (_gcp_precreation_selector(record, saved, recovery, result, state)
+                    if not expected_ids else None)
+                if precreation_selector:
+                    expected_ids = [precreation_selector]
+                    if receipt.get("absence_identity_kind") != "source_bound_selector":
+                        continue
+                elif receipt.get("absence_identity_kind") == "source_bound_selector":
+                    continue
                 if set(expected_ids) != set(receipt["absent_resource_ids"]):
                     continue
             else:
@@ -509,7 +613,8 @@ def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any,
                     continue
                 if not set(saved.expiry_request.target_selector.split(";")) <= set(receipt["absent_resource_ids"]):
                     continue
-            if not _result_is_absent(saved.provider, result, receipt["absent_resource_ids"]):
+            if not _result_is_absent(saved.provider, result, receipt["absent_resource_ids"],
+                    gcp_precreation_selector=(precreation_selector if saved.provider == Provider.GCP else None)):
                 continue
             if (receipt_path.parent.resolve() != directory.resolve()
                     or stat.S_IMODE(receipt_path.stat().st_mode) & 0o077):

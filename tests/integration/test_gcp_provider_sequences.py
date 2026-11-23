@@ -497,6 +497,176 @@ def _cleanup_fixture(tmp_path):
     return deployment, GcpProviderDriver(object(), settings)
 
 
+def _gcp_precreation_absence_case(tmp_path):
+    import json
+    from types import SimpleNamespace
+    from cloud_network_benchmark.contracts.admission import ExpiryRequest
+    from cloud_network_benchmark.contracts.common import CleanupState, Evidence, Provider, StructuredEvidence
+    from cloud_network_benchmark.lifecycle_cleanup import _gcp_precreation_selector
+    from cloud_network_benchmark.providers.gcp import GcpCleanupResult
+
+    deployment, driver = _cleanup_fixture(tmp_path)
+    selector = (f"project={driver.settings.project_id};run_id={deployment.run_id};"
+        f"deployment_id={deployment.deployment_id};roles=vm_a,vm_b")
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="gcp", action="stop",
+        expires_at=Evidence(value=deployment.reservation.value.expires_at.value-timedelta(seconds=30)),
+        reservation_id=deployment.reservation.value.reservation_id,
+        resource_namespace=deployment.run_id, target_selector=selector)
+    saved = SimpleNamespace(provider=Provider.GCP, deployment=deployment,
+        reservation=deployment.reservation.value, settings=driver.settings.model_dump(mode="json"),
+        expiry_request=request, provider_lead_seconds=30.0)
+    record = SimpleNamespace(provider="gcp", expiry_registered=False,
+        creation_may_have_started=False, deployment_id=deployment.deployment_id)
+    recovery = SimpleNamespace(attempt_id=deployment.campaign_id,
+        reservation_id=deployment.reservation.value.reservation_id.value)
+    state = {"binding_sha256": driver._binding_fingerprint(deployment),
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "reservation_id": recovery.reservation_id, "cleanup_state": "succeeded",
+        "launch_blocked": False, "registration_may_have_started": False}
+    journal = driver._attempt_dir(deployment) / "attempt.json"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps(state))
+    record.journal_reference = str(journal)
+    inventory = {"pages_complete": True,
+        "completed_scopes": ["all_project_zones", deployment.vm_a.region, "global"],
+        "regions_scanned": [deployment.vm_a.region], "zone_scope": "all_project_zones",
+        "resources": [], "instances": [], "disks": [], "addresses": [], "support_resources": []}
+    result = GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED,
+        inventory=StructuredEvidence(value=inventory), expiry=Evidence(unavailable_reason="no native expiry was registered"))
+    return _gcp_precreation_selector, record, saved, recovery, state, result, selector, journal
+
+
+def test_gcp_empty_inventory_needs_exact_unstarted_attempt_and_all_scopes(tmp_path):
+    from cloud_network_benchmark.lifecycle_cleanup import _result_is_absent
+
+    check, record, saved, recovery, state, result, selector, _journal = _gcp_precreation_absence_case(tmp_path)
+    assert check(record, saved, recovery, result, state) == selector
+    assert _result_is_absent(saved.provider, result, [selector], gcp_precreation_selector=selector)
+    assert not _result_is_absent(saved.provider, result, [])
+
+
+@pytest.mark.parametrize("mutation", ["missing-scope", "foreign-scope", "incomplete-pages",
+    "residual-resource", "foreign-template-id", "creation-started", "registered-expiry",
+    "foreign-binding", "foreign-project", "foreign-region", "malformed-scopes", "recovery-flag"])
+def test_gcp_empty_inventory_precreation_exception_fails_closed(tmp_path, mutation):
+    import json
+    check, record, saved, recovery, state, result, _selector, journal = _gcp_precreation_absence_case(tmp_path)
+    inventory = result.inventory.value
+    if mutation == "missing-scope": inventory["completed_scopes"].remove("global")
+    elif mutation == "foreign-scope": inventory["completed_scopes"].append("foreign-project")
+    elif mutation == "incomplete-pages": inventory["pages_complete"] = False
+    elif mutation == "residual-resource": inventory["resources"] = [{"id": "foreign-resource"}]
+    elif mutation == "foreign-template-id": state["templates"] = {"vm_a": {"id": "foreign-template"}}
+    elif mutation == "creation-started":
+        state["creation_may_have_started"] = True
+        record.creation_may_have_started = True
+    elif mutation == "registered-expiry":
+        state["expiry"] = {"state": "registered"}
+        record.expiry_registered = True
+    elif mutation == "foreign-binding": state["binding_sha256"] = "f" * 64
+    elif mutation == "foreign-project": saved.settings["project_id"] = "foreign-project"
+    elif mutation == "foreign-region": inventory["regions_scanned"] = ["europe-west2"]
+    elif mutation == "malformed-scopes": inventory["completed_scopes"] = {"unexpected": []}
+    elif mutation == "recovery-flag": recovery.attempt_id = "foreign-attempt"
+    journal.write_text(json.dumps(state))
+    assert check(record, saved, recovery, result, state) is None
+
+
+def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(tmp_path, monkeypatch):
+    import hashlib, json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from cloud_network_benchmark.contracts.admission import ExpiryRequest
+    from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark.lifecycle_cleanup import (cleanup_saved_provider,
+        reconcile_saved_cleanup_result, replay_saved_cleanup_receipt, save_cleanup_settings)
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+
+    deployment, driver = _cleanup_fixture(tmp_path)
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="gcp", action="stop",
+        expires_at=Evidence(value=deployment.reservation.value.expires_at.value-timedelta(seconds=30)),
+        reservation_id=deployment.reservation.value.reservation_id,
+        resource_namespace=deployment.run_id,
+        target_selector=(f"project={driver.settings.project_id};run_id={deployment.run_id};"
+            f"deployment_id={deployment.deployment_id};roles=vm_a,vm_b"))
+    settings_path = save_cleanup_settings(provider="gcp", deployment=deployment,
+        request=request, reservation=deployment.reservation.value, provider_lead_seconds=30.0,
+        settings=driver.settings, private_root=tmp_path/"cleanup-settings")
+    attempt = driver._attempt_dir(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id,
+        "binding_sha256": driver._binding_fingerprint(deployment),
+        "reservation_id": deployment.reservation.value.reservation_id.value,
+        "registration_may_have_started": True,
+        "unused_protection_destroy_attempted": True,
+        "protection_cleanup_state": "succeeded"})
+    inventory = {"pages_complete": True,
+        "completed_scopes": ["all_project_zones", deployment.vm_a.region, "global"],
+        "regions_scanned": [deployment.vm_a.region], "zone_scope": "all_project_zones",
+        "resources": [], "instances": [], "disks": [], "addresses": [], "support_resources": []}
+    terraform_calls = []
+    monkeypatch.setattr(GcpProviderDriver, "_inventory", lambda self, _d, **_kw: dict(inventory))
+    monkeypatch.setattr(GcpProviderDriver, "_terraform",
+        lambda self, _attempt, root, action, *_args: terraform_calls.append((root, action)) or {})
+    record = SimpleNamespace(provider="gcp", deployment_id=deployment.deployment_id,
+        journal_reference=str(attempt/"attempt.json"), cleanup_settings_reference=str(settings_path),
+        expiry_registered=False, creation_may_have_started=False)
+    result, saved, absent_ids = cleanup_saved_provider(record, runner=object())
+    assert result.cleanup_state == "succeeded" and result.expiry.value is None
+    assert result.expiry.unavailable_reason == "no native expiry was registered"
+    assert absent_ids == [] and terraform_calls == [("protection", "destroy")]
+
+    reservation_id = deployment.reservation.value.reservation_id.value
+    ledger_path = tmp_path/"ledger.json"
+    ledger_path.write_text("offline test ledger")
+    class Ledger:
+        path = ledger_path
+        scope_id = "offline-original-scope"
+        def __init__(self):
+            self.events = {}
+            self.state = {"reservations": {reservation_id: {
+                "evidence": deployment.reservation.value.model_dump(mode="json"),
+                "provider_cleanup": {}}}}
+        def inspect(self):
+            return json.loads(json.dumps(self.state))
+        def reconcile(self, event):
+            self.events.setdefault(event.event_id, event)
+            self.state["reservations"][event.reservation_id]["provider_cleanup"][event.provider] = event.cleanup_verified_absent
+        def event_count(self):
+            return len(self.events)
+    ledger = Ledger()
+    recovery = SimpleNamespace(attempt_id=deployment.campaign_id,
+        reservation_id=reservation_id, ledger_path=str(ledger_path), ledger_scope_id=ledger.scope_id)
+
+    # A prior failed receipt must remain failed and be skipped during replay.
+    bad = {"schema_version": 1, "provider": "gcp", "reservation_id": reservation_id,
+        "deployment_id": deployment.deployment_id, "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "cleanup_result": result.model_dump(mode="json"), "absence_proved": False,
+        "absent_resource_ids": []}
+    raw = (json.dumps(bad, sort_keys=True, indent=2)+"\n").encode()
+    bad_path = settings_path.with_name(f"{reservation_id}-gcp-cleanup-{hashlib.sha256(raw).hexdigest()[:16]}.json")
+    bad_path.write_bytes(raw); bad_path.chmod(0o600)
+    foreign = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
+        utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=["foreign-resource-id"])
+    assert foreign["absence_proved"] is False
+    assert foreign["ledger_event"].absent_resource_ids == ()
+    outcome = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
+        utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=absent_ids)
+    event = outcome["ledger_event"]
+    assert outcome["absence_proved"] is True
+    assert event.absent_resource_ids == (request.target_selector,)
+    assert event.cleanup_verified_absent is True
+    assert json.loads(Path(event.source_path).read_text())["absence_identity_kind"] == "source_bound_selector"
+    assert not outcome["billing_final"]
+    ledger.reconcile(event)
+    assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
+    assert ledger.event_count() == 1
+    assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
+    assert ledger.event_count() == 1 and terraform_calls == [("protection", "destroy")]
+
+
 def test_cleanup_verifies_compute_absence_before_removing_protection_and_is_idempotent(tmp_path, monkeypatch):
     from cloud_network_benchmark.contracts.admission import ExpiryEvidence
     from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
