@@ -693,7 +693,8 @@ def test_sleeping_controller_that_wakes_after_the_slot_never_launches_backfill(t
     assert {row["state"] for row in journal(stage)["entries"].values()} == {"missed"}
 
 
-@pytest.mark.parametrize("proof", ["all_absent", "missing_provider", "absence_unproved"])
+@pytest.mark.parametrize("proof", ["all_absent", "missing_provider", "absence_unproved",
+                                    "missing_reconciled", "missing_cleanup"])
 def test_restart_cleanup_needs_absence_proof_for_every_original_provider(tmp_path, monkeypatch, proof):
     import subprocess
     from types import SimpleNamespace
@@ -705,15 +706,22 @@ def test_restart_cleanup_needs_absence_proof_for_every_original_provider(tmp_pat
     recovery = private / "lifecycle-recovery.json"
     recovery.write_text("{}")
     (Path(stage["state_root"]) / stage["stage_id"]).mkdir(parents=True)
-    providers = {name: {"cleanup_open": False, "absence_proved": True} for name in entry["run_ids"]}
+    providers = {name: {"cleanup": "succeeded", "reconciled": True, "errors": [],
+        "launch_blocked": False, "cleanup_open": False, "absence_proved": True,
+        "billable_resources_present": False} for name in entry["run_ids"]}
     if proof == "missing_provider":
         providers.pop("gcp")
     elif proof == "absence_unproved":
         providers["gcp"]["absence_proved"] = False
+    elif proof == "missing_reconciled":
+        providers["gcp"].pop("reconciled")
+    elif proof == "missing_cleanup":
+        providers["gcp"].pop("cleanup")
 
     def cleanup(command, **kwargs):
         assert command[command.index("--recovery") + 1] == str(recovery)
-        kwargs["stdout"].write(json.dumps({"status": "complete", "providers": providers}).encode())
+        kwargs["stdout"].write(json.dumps({"status": "complete", "cleanup": "complete",
+            "execution": "not_resumed", "providers": providers}).encode())
         kwargs["stdout"].flush()
         return SimpleNamespace(returncode=0)
 
@@ -770,8 +778,10 @@ def test_restart_recognizes_completed_native_evidence_and_contradictions_fall_th
 
     def cleanup(command, **kwargs):
         cleanup_calls.append(command)
-        kwargs["stdout"].write(json.dumps({"status": "complete", "providers": {
-            provider: {"cleanup_open": False, "absence_proved": True}}}).encode())
+        kwargs["stdout"].write(json.dumps({"status": "complete", "cleanup": "complete",
+            "execution": "not_resumed", "providers": {provider: {
+                "cleanup": "succeeded", "reconciled": True, "errors": [], "launch_blocked": False,
+                "cleanup_open": False, "absence_proved": True, "billable_resources_present": False}}}).encode())
         kwargs["stdout"].flush()
         return SimpleNamespace(returncode=0)
 
