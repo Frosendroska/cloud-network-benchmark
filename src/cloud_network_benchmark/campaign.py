@@ -102,19 +102,22 @@ def _validate_acceptance_dispatch_policy(policy: Any) -> None:
 
 
 def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return the one normal S1/S3 pair; registered failure checks stay supervised."""
+    """Return the one normal S1/S3 pair under strict or explicitly waived scope."""
     _validate_acceptance_dispatch_policy(stage.get("dispatch_policy"))
     entries = stage.get("entries", [])
     ids = [entry.get("entry_id") for entry in entries]
-    expected = ["V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]
-    if ids != expected:
-        raise ValueError("acceptance stage must contain only the five registered V-S1/S3 and failure identities in order")
+    reduced = ids == ["V-S1", "V-S3"]
+    if not reduced and ids != ["V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]:
+        raise ValueError("acceptance stage must contain the five registered strict entries or the explicitly waived normal pair")
+    if reduced:
+        from .failure_waiver import validate_prepared_binding
+        validate_prepared_binding(stage.get("failure_waiver"), entries)
     pair = entries[:2]
     if ([row.get("entry_id") for row in pair] != ["V-S1", "V-S3"]
             or [row.get("scenario") for row in pair] != ["S1", "S3"]
             or any(row.get("requires_supervision") for row in pair)
             or any(not row.get("requires_supervision") for row in entries[2:])):
-        raise ValueError("acceptance dispatch is limited to one normal S1/S3 pair followed by supervised failures")
+        raise ValueError("acceptance dispatch requires the normal S1/S3 pair and supervised strict entries")
     barrier = stage.get("post_measurement_barrier")
     participants = barrier.get("expected_participants") if isinstance(barrier, dict) else None
     expected = {(entry["entry_id"], provider, run_id)

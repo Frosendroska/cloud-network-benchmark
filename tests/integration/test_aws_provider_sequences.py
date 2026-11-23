@@ -350,6 +350,41 @@ def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_p
     assert "aws-pair-apply" not in runner.actions
 
 
+def test_exact_30_second_iam_settle_is_one_bounded_wait_before_single_start(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
+    settings = settings.model_copy(update={"iam_settle_seconds": 30, "registration_timeout_seconds": 90})
+    runner = RegistrationRunner()
+    waits = []
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW, sleeper=waits.append)
+    reservation = deployment.reservation.value
+    regions = driver._regions(deployment)
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="aws", action="stop",
+        expires_at=Evidence[datetime](value=reservation.expires_at.value - timedelta(seconds=360)),
+        reservation_id=reservation.reservation_id,
+        resource_namespace=f"cnb-{deployment.run_id}-{deployment.deployment_id}",
+        target_selector=driver._target_selector(deployment, regions))
+
+    evidence = driver.register_expiry(deployment, request)
+
+    assert evidence.state == "registered"
+    assert waits == [30]
+    starts = [action for action in runner.actions if action.startswith("aws-expiry-start-")]
+    assert starts == [f"aws-expiry-start-{regions[0]}"]
+    assert driver._registration_deadline is not None
+    assert "aws-pair-apply" not in runner.actions
+
+
+def test_iam_settle_option_is_read_by_both_production_factories():
+    import inspect
+    from cloud_network_benchmark import lifecycle_runtime
+
+    first = inspect.getsource(lifecycle_runtime.build_aws_provider_workflows)
+    second = inspect.getsource(lifecycle_runtime.build_provider_workflows)
+    assert "iam_settle_seconds=options.get(\"iam_settle_seconds\", 0)" in first
+    assert "iam_settle_seconds=config.get(\"iam_settle_seconds\", 0)" in second
+
+
 def test_iam_settle_that_cannot_fit_registration_deadline_never_starts(tmp_path):
     deployment, settings = make_inter_region_attempt(tmp_path)
     runner = RegistrationRunner()

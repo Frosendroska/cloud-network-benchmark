@@ -111,11 +111,14 @@ def _now(clock):
     return (clock.utc_now() if hasattr(clock, "utc_now") else clock()).astimezone(timezone.utc)
 
 
-def _selected(plan):
+def _selected(plan, settings=None):
     stage = plan.get("stage")
     if stage not in STAGES:
         raise ValueError("stage must be acceptance, calibration, day or week")
     if stage == "acceptance":
+        from .failure_waiver import source_waiver
+        if source_waiver(settings) is not None:
+            return [("V-S1", "s1_acceptance"), ("V-S3", "s3_acceptance")]
         # One registered failure attempt per cloud, with supervised intervention.
         return [("V-S1", "s1_acceptance"), ("V-S3", "s3_acceptance"),
                 ("V-A-FAIL", "aws_failure"), ("V-Z-FAIL", "azure_failure"),
@@ -281,7 +284,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
     """Read-only preflight; an empty list is local readiness, not cloud acceptance."""
     errors = []
     try:
-        entries = _selected(plan)
+        entries = _selected(plan, settings)
         stage = plan["stage"]
         archive_sink = settings.get("archive_sink")
         if archive_sink is not None:
@@ -680,8 +683,28 @@ def _review_from_prepared(settings, prepared):
     internal review documents, attempt IDs and hashes are generated here.
     """
     entries = {entry["entry_id"]: entry for entry in prepared.get("entries", [])}
-    if prepared.get("stage") != "acceptance" or set(entries) != {"V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"}:
-        raise ValueError("paid_acceptance source must be the original complete prepared acceptance stage")
+    from .failure_waiver import (NORMAL_ENTRIES, bind_prepared_acceptance,
+        registered_failure_record, source_waiver, validate_prepared_binding)
+    selected_waiver = source_waiver(settings)
+    waived = set(entries) == set(NORMAL_ENTRIES)
+    if prepared.get("stage") != "acceptance" or not (
+            set(entries) == {"V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"}
+            or waived and selected_waiver is not None):
+        raise ValueError("paid_acceptance source must be a complete strict stage or an explicitly waived reduced stage")
+    if waived:
+        binding = bind_prepared_acceptance(selected_waiver, [entries[name] for name in NORMAL_ENTRIES])
+        declared = prepared.get("failure_waiver")
+        if declared is not None:
+            validate_prepared_binding(declared, [entries[name] for name in NORMAL_ENTRIES])
+            if declared != binding:
+                raise ValueError("prepared acceptance failure waiver does not match current source/run identities")
+        review = {"schema_version": 1, "repository_root": prepared["repository_root"],
+            "accepted_campaigns": [entries[name]["parent_manifest_path"] for name in NORMAL_ENTRIES],
+            "accepted_runtime_configs": {entries[name]["parent_manifest_path"]: {
+                "path": entries[name]["runtime_config_path"],
+                "sha256": _sha(_path(entries[name]["runtime_config_path"], "accepted runtime", file=True))}
+                for name in NORMAL_ENTRIES}}
+        return review, registered_failure_record(binding)
     checks = {}
     declarations = settings.get("stage_inputs", {}).get("acceptance", {}).get("failure_checks", {})
     for registered, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
@@ -874,7 +897,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     config_paths = {}
     schedule_rows = []
     source_configs = {}
-    for index, (entry_id, alias) in enumerate(_selected(plan)):
+    for index, (entry_id, alias) in enumerate(_selected(plan, settings)):
         template = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
         data = _frozen_config(yaml.safe_load(template.read_text()), alias, settings, entry_id)
         if stage == "acceptance" and entry_id.endswith("FAIL"):
@@ -1045,6 +1068,12 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "approval_refs": approvals, "cost_input_path": str(cost_path),
         "cost_input_sha256": _sha(cost_path),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
+    if stage == "acceptance":
+        from .failure_waiver import bind_prepared_acceptance, source_waiver
+        waiver = source_waiver(settings)
+        if waiver is not None:
+            normal_entries = [entry for entry in entries if entry["entry_id"] in {"V-S1", "V-S3"}]
+            stage_data["failure_waiver"] = bind_prepared_acceptance(waiver, normal_entries)
     if stage in {"day", "acceptance", "calibration"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),

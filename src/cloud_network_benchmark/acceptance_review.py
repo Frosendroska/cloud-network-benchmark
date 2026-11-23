@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -68,6 +69,13 @@ def _failure_review(reference: Mapping[str, Any], *, required_entries: set[str] 
     if _digest(path) != reference.get("sha256"):
         raise ValueError("registered supervised failure review changed")
     review = yaml.safe_load(path.read_text())
+    if isinstance(review, dict) and review.get("schema_version") == 2:
+        from .failure_waiver import (WAIVED_ENTRIES,
+            validate_registered_failure_record)
+        validate_registered_failure_record(review)
+        if required_entries is not None and not required_entries <= set(WAIVED_ENTRIES):
+            raise ValueError("waiver review does not cover the requested failure resource")
+        return
     checks = review.get("checks") if isinstance(review, dict) else None
     expected = {"V-A-FAIL": "aws", "V-Z-FAIL": "azure", "V-G-FAIL": "gcp"}
     required = set(expected) if required_entries is None else required_entries
@@ -211,3 +219,27 @@ def validate_acceptance_scope(evidence: Mapping[str, Any], campaign: Any) -> Non
     if not matched:
         raise ValueError("no completed acceptance covers this provider/scenario scope")
     _failure_review(evidence["registered_failure_review"])
+    failure_path = _regular(evidence["registered_failure_review"]["path"])
+    failure_review = yaml.safe_load(failure_path.read_text(encoding="utf-8"))
+    if isinstance(failure_review, dict) and failure_review.get("schema_version") == 2:
+        from .failure_waiver import NORMAL_ENTRIES, validate_later_stage
+        campaign_mode = getattr(campaign.mode, "value", campaign.mode)
+        validate_later_stage(failure_review, {"calibration": "calibration",
+            "diagnostic_day": "day"}.get(campaign_mode, "unsupported"))
+        rows = failure_review["checks"]["V-A-FAIL"]["normal_acceptance"]
+        if [row.get("entry_id") for row in rows] != list(NORMAL_ENTRIES):
+            raise ValueError("waiver evidence does not bind exactly V-S1 and V-S3")
+        if [row.get("path") for row in evidence["accepted_campaigns"]] != [
+                row.get("parent_manifest_path") for row in rows]:
+            raise ValueError("waiver evidence is bound to different normal acceptance source identities")
+        for reference, binding in zip(evidence["accepted_campaigns"], rows):
+            parent_path = _regular(reference["path"])
+            parent = json.loads(parent_path.read_text(encoding="utf-8"))
+            runtime_reference = declared.get("accepted_runtime_configs", {}).get(str(parent_path), {})
+            if (parent.get("campaign_id") != binding.get("parent_campaign_id")
+                    or parent.get("implementation_git_commit") != binding.get("implementation_git_commit")
+                    or parent.get("config_provenance", {}).get("sha256") != binding.get("config_sha256")
+                    or runtime_reference.get("sha256") != binding.get("runtime_config_sha256")
+                    or {str(child.get("provider")): child.get("run_id")
+                        for child in parent.get("child_runs", [])} != binding.get("run_ids")):
+                raise ValueError("waiver normal acceptance campaign identity changed")

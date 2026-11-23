@@ -25,26 +25,34 @@ def validate_fixed_batch_scope(stages: list[dict[str, Any]]) -> None:
     if len(stages) != 2 or set(by_stage) != {"acceptance", "calibration"}:
         raise ValueError("fixed pre-DAY draft requires exactly acceptance and calibration stages")
     acceptance = by_stage["acceptance"].get("entries", [])
-    if [row.get("entry_id") for row in acceptance] != [
-            "V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]:
-        raise ValueError("fixed pre-DAY acceptance requires the two normal pairs and three registered failure checks")
+    ids = [row.get("entry_id") for row in acceptance]
+    reduced = ids == ["V-S1", "V-S3"]
+    if not reduced and ids != ["V-S1", "V-S3", "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]:
+        raise ValueError("fixed pre-DAY acceptance requires the strict five entries or an explicitly waived normal pair")
+    if reduced:
+        from .failure_waiver import validate_prepared_binding
+        validate_prepared_binding(by_stage["acceptance"].get("failure_waiver"), acceptance)
+        if any(row.get("requires_supervision") for row in acceptance):
+            raise ValueError("waived acceptance entries must contain only the normal non-supervised pair")
     if any(set(row.get("run_ids", {})) != {"aws", "azure", "gcp"} for row in acceptance[:2]):
         raise ValueError("V-S1 and V-S3 must each freeze all three provider children")
     if ([row.get("scenario") for row in acceptance[:2]] != ["S1", "S3"]
             or any(row.get("requires_supervision") for row in acceptance[:2])):
         raise ValueError("normal acceptance must preserve the simultaneous S1/S3 pair")
-    for entry_id, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
-        row = acceptance[[item.get("entry_id") for item in acceptance].index(entry_id)]
-        if (set(row.get("run_ids", {})) != {provider} or row.get("requires_supervision") is not True):
-            raise ValueError(f"{entry_id} must remain one supervised single-provider failure check")
+    if not reduced:
+        for entry_id, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
+            row = acceptance[[item.get("entry_id") for item in acceptance].index(entry_id)]
+            if (set(row.get("run_ids", {})) != {provider} or row.get("requires_supervision") is not True):
+                raise ValueError(f"{entry_id} must remain one supervised single-provider failure check")
     calibration = by_stage["calibration"].get("entries", [])
     if (len(calibration) != 1 or calibration[0].get("entry_id") != "CAL-S1"
             or set(calibration[0].get("run_ids", {})) != {"aws", "azure", "gcp"}):
         raise ValueError("fixed pre-DAY calibration requires one retained all-cloud CAL-S1 parent")
     run_ids = [run_id for stage in stages for entry in stage["entries"]
                for run_id in entry.get("run_ids", {}).values()]
-    if len(run_ids) != 12 or len(set(run_ids)) != 12:
-        raise ValueError("fixed pre-DAY batch must freeze exactly 12 unique provider child run IDs")
+    expected_run_count = 9 if reduced else 12
+    if len(run_ids) != expected_run_count or len(set(run_ids)) != expected_run_count:
+        raise ValueError(f"fixed pre-DAY batch must freeze exactly {expected_run_count} unique provider child run IDs")
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -137,6 +145,11 @@ def _artifact_paths(stages: list[dict[str, Any]]) -> dict[str, str]:
             value = stage.get(key)
             if value:
                 paths.add(str(_safe_file(value, f"stage.{key}")))
+        waiver = stage.get("failure_waiver")
+        if waiver is not None:
+            source = waiver.get("source", {}).get("path") if isinstance(waiver, dict) else None
+            if source:
+                paths.add(str(_safe_file(source, "stage.failure_waiver.source")))
     return {path: _file_digest(Path(path)) for path in sorted(paths)}
 
 
