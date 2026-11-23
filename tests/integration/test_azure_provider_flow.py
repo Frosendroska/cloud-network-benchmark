@@ -263,7 +263,7 @@ class AutomationRunner:
             payload["location"]=self.d.vm_a.region
             payload.setdefault("properties",{}).update({"runbookType":"PowerShell","runtimeEnvironment":"PowerShell-5.1"})
             out=json.dumps(payload)
-        elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script
+        elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script+"\n"
         elif request.action_type in {"schedule_readback","expiry_schedule_recheck"}:
             p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True; out=json.dumps({"properties":p})
         elif request.action_type in {"job_binding_readback","expiry_binding_recheck"}:
@@ -988,6 +988,18 @@ def test_registration_polls_asynchronous_publication_within_bound(repository_roo
     expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now,sleep=lambda seconds:None)
     assert expiry.state=="registered"
     assert [r.action_type for r in runner.requests].count("runbook_readback")==2
+
+def test_azure_tsv_content_readback_removes_only_cli_record_terminator(repository_root):
+    from cloud_network_benchmark.azure_provider import _azure_tsv_content_matches
+    script=(repository_root/"terraform/azure/expiry/deallocate.ps1").read_bytes().decode("utf-8")
+    import hashlib
+    digest=hashlib.sha256(script.encode()).hexdigest()
+    # `az rest --output tsv` adds one final LF after the content's own final LF.
+    assert _azure_tsv_content_matches(script,digest)  # exact source response
+    assert _azure_tsv_content_matches(script+"\n",digest)  # one CLI terminator
+    assert not _azure_tsv_content_matches(script+"\n\n",digest)
+    assert not _azure_tsv_content_matches(script.replace("Assert-Target", "Assert-Tampered")+"\n",digest)
+
 
 
 def test_provision_rechecks_published_content_before_pair_apply(repository_root: Path, tmp_path: Path):

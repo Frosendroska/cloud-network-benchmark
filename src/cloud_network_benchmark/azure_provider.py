@@ -988,6 +988,16 @@ def _is_exact_missing_job_schedule(result: CommandResult) -> bool:
         and payload.get("message") == "Job Schedule not found.")
 
 
+def _azure_tsv_content_matches(stdout: str, expected_sha256: str) -> bool:
+    observed = stdout.encode()
+    if hashlib.sha256(observed).hexdigest() == expected_sha256:
+        return True
+    # `az rest --output tsv` appends one LF record terminator. Remove only that
+    # single framing byte; any additional bytes remain part of the content.
+    return (observed.endswith(b"\n")
+        and hashlib.sha256(observed[:-1]).hexdigest() == expected_sha256)
+
+
 def _azure_schedule_trigger(requested: datetime) -> datetime:
     """Floor Azure Automation OneTime schedules to their exact UTC minute."""
     if requested.tzinfo is None or requested.utcoffset() is None:
@@ -1532,8 +1542,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
             raise TimeoutError("runbook publication did not reach Published within the original command deadline")
         sleep(min(options.poll_seconds,remaining))
     content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{rb}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "published_content_readback", clock)
-    digest = hashlib.sha256(content.stdout.encode()).hexdigest()
-    if published.get("properties", {}).get("state") != "Published" or digest != hashlib.sha256(script.encode()).hexdigest():
+    digest = hashlib.sha256(script.encode()).hexdigest()
+    if published.get("properties", {}).get("state") != "Published" or not _azure_tsv_content_matches(content.stdout,digest):
         raise RuntimeError("runbook publication/content readback did not match uploaded script")
     sched_url = f"{account}/schedules/{sched}?api-version={AUTOMATION_API}"
     schedule_body = {"name":sched,"properties":{"frequency":"OneTime","startTime":trigger.isoformat().replace("+00:00","Z"),"timeZone":"UTC","description":deployment.deployment_id}}
@@ -1644,7 +1654,7 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     if account_read.get("identity",{}).get("type") != "SystemAssigned" or account_read.get("identity",{}).get("principalId","").lower() != str(m.get("managed_identity_principal_id","")).lower():
         raise RuntimeError("registered Automation system-assigned identity changed")
     content = _command(runner, options, root, ["az", "rest", "--method", "GET", "--url", f"{account}/runbooks/{m['runbook']}/content?api-version={AUTOMATION_API}", "--output", "tsv"], "expiry_content_recheck", clock)
-    if hashlib.sha256(content.stdout.encode()).hexdigest() != m.get("published_content_sha256"):
+    if not _azure_tsv_content_matches(content.stdout,m.get("published_content_sha256","")):
         raise RuntimeError("registered runbook content changed after expiry registration")
     schedule_url = f"{account}/schedules/{m['schedule']}?api-version={AUTOMATION_API}"
     schedule = json.loads(_command(runner, options, root, _azure_rest("GET", schedule_url), "expiry_schedule_recheck", clock).stdout or "{}")
