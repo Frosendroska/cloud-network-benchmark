@@ -475,7 +475,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 "current_session_id": result.current_session_id,
                 "providers": {provider: {key: value for key, value in item.items()
                     if key in {"cleanup", "reconciled", "absence_proved", "billable_resources_present",
-                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason"}}
+                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason",
+                               "acceptance_failed", "cleanup_timing_status", "cleanup_timing_failure"}}
                     for provider, item in result.providers.items()},
                 "external_calls": len(runner.actions) if runner is not None else 0}
         print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else

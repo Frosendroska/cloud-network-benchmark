@@ -1529,18 +1529,25 @@ class CampaignDriver:
         # acceptance failure while allowing the campaign journal to close its
         # cleanup liability and remain terminal/failed.
         physical_closure = (bool(expected_providers) and set(providers) == expected_providers
-            and all(item.get("cleanup_open") is False
+            and all(isinstance(item, dict) for item in providers.values())
+            and all(item.get("cleanup") in {"succeeded", "not_required"}
+                    and item.get("reconciled") is True
+                    and item.get("errors", []) == []
+                    and item.get("launch_blocked") is False
+                    and item.get("cleanup_open") is False
                     and item.get("absence_proved") is True
                     and item.get("billable_resources_present") is False
                     for item in providers.values()))
         cli_status = report.get("status") if isinstance(report, dict) else None
         cli_exit_matches = ((cli_status == "complete" and completed.returncode == 0)
             or (cli_status == "blocked" and completed.returncode == 1))
-        closed = (report.get("execution") == "not_resumed"
+        timing_only_block = (cli_status == "blocked"
+            and any(item.get("acceptance_failed") is True for item in providers.values()))
+        closed = (isinstance(report, dict) and report.get("execution") == "not_resumed"
             and physical_closure and cli_exit_matches)
         # Cleanup reconciliation never claims that an interrupted measurement completed.
         return {"status": "failed", "cleanup_open": not closed, "reconciliation": "cleanup_complete" if closed else "cleanup_unproved",
-                "cleanup_acceptance_failed": cli_status == "blocked",
+                "cleanup_acceptance_failed": timing_only_block,
                 "cleanup_report": report}
 
     @staticmethod

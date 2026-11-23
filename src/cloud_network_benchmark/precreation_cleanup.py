@@ -156,13 +156,13 @@ def _reservation_binding(record: dict[str, Any]) -> str:
 
 
 def _validate_reservation(*, recovery: Any, entry: dict[str, Any], runtime: dict[str, Any],
-                          campaign: Any, children: dict[str, Any], costs: Any,
+                          campaign_id: str, children: dict[str, Any], costs: Any,
                           ledger: Any, require_open: bool) -> tuple[Any, dict[str, Any], str]:
     if (not recovery.reservation_id or not recovery.ledger_path or not recovery.ledger_scope_id
             or Path(recovery.ledger_path).resolve() != Path(runtime["ledger"]["path"]).resolve()
             or recovery.ledger_scope_id != runtime["ledger"]["scope_id"]):
         raise ValueError("original recovery journal and runtime disagree on the F11 ledger")
-    if (recovery.attempt_id != campaign.campaign_id
+    if (recovery.attempt_id != campaign_id
             or recovery.controller_session_id != ledger.controller_session_id
             or Path(recovery.ledger_path).resolve() != ledger.path.resolve()):
         raise ValueError("original campaign, session or ledger identity differs")
@@ -195,7 +195,7 @@ def _validate_reservation(*, recovery: Any, entry: dict[str, Any], runtime: dict
             raise ValueError("recovery and F11 provider cleanup states disagree")
     from .contracts.admission import ReservationEvidence
     reservation = ReservationEvidence.model_validate(record["evidence"])
-    if (reservation.state != "reserved" or reservation.campaign_id != campaign.campaign_id
+    if (reservation.state != "reserved" or reservation.campaign_id != campaign_id
             or reservation.source_path != costs.source_path
             or reservation.source_sha256 != costs.payload_sha256
             or record.get("request", {}).get("source_path") != costs.source_path
@@ -280,7 +280,7 @@ def build_precreation_context(*, draft_path: Path, stage_id: str, entry_id: str,
         utc_now=clock.utc_now, monotonic_now=clock.monotonic,
         controller_session_id=recovery.controller_session_id)
     reservation, record, reservation_hash = _validate_reservation(recovery=recovery,
-        entry=entry, runtime=runtime, campaign=campaign, children=children,
+        entry=entry, runtime=runtime, campaign_id=parent.campaign_id, children=children,
         costs=costs, ledger=ledger, require_open=not allow_reconciled)
     context = build_provider_workflows(campaign=campaign, parent=parent, children=children,
         costs=costs, runtime=runtime, reservation=reservation, ledger=ledger,

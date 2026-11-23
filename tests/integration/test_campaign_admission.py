@@ -152,9 +152,11 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     assert len(namespaces) == len(set(namespaces)) == 9
 
 
+@pytest.mark.parametrize("fail_recovery_update", [False, True])
 def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_entry(
+        fail_recovery_update,
         repository_root, tmp_path, monkeypatch, request):
-    """Blocked CLI timing with verified physical closure does not reopen failed cleanup."""
+    """Blocked timing closes only when every recovery journal update succeeded."""
     from contextlib import redirect_stderr, redirect_stdout
     from io import StringIO
     from types import SimpleNamespace
@@ -179,6 +181,14 @@ def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_
             for provider, run_id in entry["run_ids"].items()])
     recovery_path.write_text(recovery.model_dump_json(indent=2) + "\n")
     recovery_path.chmod(0o600)
+    if fail_recovery_update:
+        import cloud_network_benchmark.orchestration as orchestration_module
+        original_update = orchestration_module.update_provider_recovery
+        def fail_close_update(path, provider, stage, status, **kwargs):
+            if provider == "aws" and stage == "cleanup" and status == "succeeded":
+                raise OSError("synthetic recovery journal write failure")
+            return original_update(path, provider, stage, status, **kwargs)
+        monkeypatch.setattr(orchestration_module, "update_provider_recovery", fail_close_update)
     state_root = Path(stage["state_root"])
     journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
     synthetic_cleanup_hook_calls = []
@@ -209,12 +219,23 @@ def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_
     outcome = driver.run(stage)
     saved = json.loads(journal_path.read_text())
     assert saved["entries"]["V-S1"]["state"] == "failed"
-    assert saved["entries"]["V-S1"]["result"]["cleanup_open"] is False
     assert saved["entries"]["V-S1"]["result"]["execution"] == "not_resumed"
-    assert saved["entries"]["V-S1"]["result"]["cleanup_acceptance_failed"] is True
-    assert saved["entries"]["V-S1"]["result"]["cleanup_report"]["status"] == "blocked"
-    assert all(not result["cleanup_open"] and result["absence_proved"]
-        for result in saved["entries"]["V-S1"]["result"]["cleanup_report"]["providers"].values())
+    cleanup_result = saved["entries"]["V-S1"]["result"]
+    if fail_recovery_update:
+        assert cleanup_result["cleanup_open"] is True
+        from cloud_network_benchmark.campaign import _last_json_object
+        failed_cli_report = _last_json_object(state_root / stage["stage_id"] / "V-S1-recovery.log")
+        assert failed_cli_report["status"] == "blocked"
+        assert failed_cli_report["providers"]["aws"]["absence_proved"] is True
+        assert failed_cli_report["providers"]["aws"]["reconciled"] is False
+        assert failed_cli_report["providers"]["aws"]["errors"]
+    else:
+        assert cleanup_result["cleanup_report"]["status"] == "blocked"
+        assert cleanup_result["cleanup_open"] is False
+        assert cleanup_result["cleanup_acceptance_failed"] is True
+        assert all(not result["cleanup_open"] and result["absence_proved"]
+            and result["reconciled"] and not result["errors"]
+            for result in cleanup_result["cleanup_report"]["providers"].values())
     assert saved["entries"]["V-S3"]["state"] == "missed"
     assert outcome["status"] == "awaiting_operator"
     assert len(synthetic_cleanup_hook_calls) == 3  # In-process test hooks; no provider SDK/CLI.
