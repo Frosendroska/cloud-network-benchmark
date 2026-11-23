@@ -1166,8 +1166,8 @@ def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root
     assert result.cleanup_state=="failed" and result.launch_blocked
     assert "role assignment inventory" in result.failures[0].message
     request=next(q for q in runner.requests if q.action_type=="role_cleanup_inventory")
-    assert request.argv == ["az","role","assignment","list","--scope",
-        runner.group_id,"--output","json"]
+    assert request.argv == ["az","role","assignment","list","--subscription",
+        o.subscription_id,"--scope",runner.group_id,"--output","json"]
     assert (o.attempt_root/"recovery.json").exists()
 
 
