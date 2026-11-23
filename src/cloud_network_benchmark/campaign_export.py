@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,22 @@ def _digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             value.update(block)
     return value.hexdigest()
+
+
+def _transport_inventory(root: Path) -> list[dict[str, Any]]:
+    """Describe every regular file below root without following links."""
+    rows: list[dict[str, Any]] = []
+    for item in root.rglob("*"):
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"export contains a symlink: {item.relative_to(root)}")
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"export contains a non-regular file: {item.relative_to(root)}")
+        relative = item.relative_to(root).as_posix()
+        rows.append({"path": relative, "size_bytes": info.st_size, "sha256": _digest(item)})
+    return sorted(rows, key=lambda row: row["path"])
 
 
 def _copy_verified(source: Path, destination: Path) -> None:
@@ -97,9 +115,13 @@ def export_selection(stage: dict[str, Any], destination: Path) -> Path | None:
         if selection_path:
             selection_path.write_text(json.dumps({"format_version": 1, "runs": run_rows},
                                                  indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (destination / "export-provenance.json").write_text(json.dumps({"schema_version": 1,
+        provenance = {"schema_version": 1,
             "stage_id": stage["stage_id"], "source_manifests": copied_sources,
-            "selection_sha256": _digest(selection_path) if selection_path else None}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            "selection_sha256": _digest(selection_path) if selection_path else None,
+            "evidence_status": "validated_selection" if selection_path else "not_validated",
+            "transport_status": "integrity_only",
+            "transport_inventory": _transport_inventory(destination)}
+        (destination / "export-provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return selection_path
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
@@ -123,6 +145,38 @@ def verify_export(destination: Path) -> bool:
         return False
     try:
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        inventory = provenance.get("transport_inventory")
+        if (provenance.get("evidence_status") == "not_validated"
+                and (not isinstance(inventory, list) or provenance.get("transport_status") != "integrity_only")):
+            return False
+        if inventory is not None:
+            expected_paths: set[str] = set()
+            for row in inventory:
+                relative = row.get("path")
+                if not isinstance(relative, str) or not relative or relative in expected_paths:
+                    return False
+                relative_path = Path(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts or relative_path.as_posix() != relative:
+                    return False
+                item = destination / relative_path
+                if item.is_symlink() or not item.is_file():
+                    return False
+                item.resolve(strict=True).relative_to(destination.resolve(strict=True))
+                if item.stat().st_size != row.get("size_bytes") or _digest(item) != row.get("sha256"):
+                    return False
+                expected_paths.add(relative)
+            actual_paths: set[str] = set()
+            for item in destination.rglob("*"):
+                info = item.lstat()
+                if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+                    actual_paths.add(item.relative_to(destination).as_posix())
+                elif not stat.S_ISDIR(info.st_mode):
+                    return False
+            actual_paths.discard("export-provenance.json")
+            if actual_paths != expected_paths:
+                return False
+            if provenance.get("transport_status") != "integrity_only":
+                return False
         for row in provenance.get("closed_exports", []):
             nested = destination.parent / row["export"]
             nested_provenance = nested / "export-provenance.json"
@@ -143,7 +197,8 @@ def verify_export(destination: Path) -> bool:
         if selection is not None and (not selection_path.is_file() or _digest(selection_path) != selection):
             return False
         checksum_indexes = list(destination.rglob("checksums.sha256"))
-        if (destination / "runs").is_dir() and not checksum_indexes:
+        if ((destination / "runs").is_dir() and not checksum_indexes
+                and provenance.get("evidence_status") != "not_validated"):
             return False
         for index in checksum_indexes:
             bundle_root = index.parent.resolve(strict=True)

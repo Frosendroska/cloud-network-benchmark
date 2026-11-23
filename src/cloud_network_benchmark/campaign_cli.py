@@ -49,6 +49,12 @@ def _parser() -> argparse.ArgumentParser:
     archive.add_argument("--stage-id", required=True)
     archive.add_argument("--entry-id", required=True)
     archive.add_argument("--receipt", required=True, type=Path)
+    export_repair = commands.add_parser("reconcile-export", help="preserve and rebuild one failed cleanup-closed local export")
+    export_repair.add_argument("--settings", type=Path)
+    export_repair.add_argument("--stage-id", required=True)
+    export_repair.add_argument("--entry-id", required=True)
+    export_repair.add_argument("--preserve-to", required=True, type=Path,
+                               help="new sibling path retaining the previous invalid export")
     # Private systemd entry point. It resumes the driver from its durable active pointer.
     runner = commands.add_parser("run", help=argparse.SUPPRESS)
     runner.add_argument("--state-root", required=True, type=Path)
@@ -85,11 +91,16 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
             elif args.action == "reconcile-archive":
                 result = campaign.reconcile_archive(Path(settings["state_root"]), args.stage_id,
                     args.entry_id, args.receipt)
+            elif args.action == "reconcile-export":
+                result = campaign.reconcile_export(Path(settings["state_root"]), args.stage_id,
+                    args.entry_id, args.preserve_to)
             else:
                 result = campaign.continue_supervised(Path(settings["state_root"]), args.stage_id,
                     args.entry_id, confirmed=args.confirm_supervision)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
         if args.action in {"status", "resume"}:
+            return 0
+        if args.action == "reconcile-export":
             return 0
         if args.action == "run":
             # A returned status means the durable journal handled the campaign

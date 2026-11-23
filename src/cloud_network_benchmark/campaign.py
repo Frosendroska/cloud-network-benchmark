@@ -995,6 +995,50 @@ class CampaignDriver:
             self._archive_closed_entry(stage, entry, record); _write_json(journal_path, journal)
             return _status_payload(stage, journal)
 
+    def reconcile_export(self, state_root: Path, stage_id: str, entry_id: str,
+                         preserve_to: Path) -> dict[str, Any]:
+        """Preserve and rebuild one failed, cleanup-closed local export; never dispatch work."""
+        root = Path(state_root); folder = root / stage_id
+        with _file_lock(root / ".campaign-driver.lock", blocking=False):
+            prepared = folder / "prepared-stage.json"
+            journal_path = folder / "campaign-journal.json"
+            if (prepared.is_symlink() or journal_path.is_symlink()
+                    or not prepared.is_file() or not journal_path.is_file()):
+                raise ValueError("campaign state is missing or unsafe")
+            stage = json.loads(prepared.read_text(encoding="utf-8"))
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            if stage.get("stage_id") != stage_id or journal.get("stage_id") != stage_id:
+                raise ValueError("prepared campaign stage identity differs")
+            record = journal.get("entries", {}).get(entry_id)
+            if (not record or record.get("state") != "failed"
+                    or (record.get("result") or {}).get("cleanup_open") is not False
+                    or not str(record.get("export_status", "")).startswith("failed:")):
+                raise ValueError("export repair requires a failed entry with cleanup closed and a failed export")
+            entry = next((item for item in stage.get("entries", []) if item.get("entry_id") == entry_id), None)
+            if entry is None:
+                raise ValueError("prepared stage no longer contains the failed entry")
+            from .campaign_export import export_entry, verify_export
+            export_root = Path(stage["results_root"]) / "closed" / entry_id / "export"
+            preserved = Path(preserve_to).expanduser()
+            if (export_root.is_symlink() or not export_root.is_dir() or verify_export(export_root)
+                    or preserved.parent.resolve() != export_root.parent.resolve()
+                    or preserved.exists() or preserved.is_symlink()):
+                raise ValueError("repair requires one invalid export and a new sibling preservation path")
+            os.rename(export_root, preserved)
+            export_entry(stage, entry, export_root)
+            if not verify_export(export_root):
+                record["export_status"] = "failed: rebuilt local export failed integrity check"
+                _write_json(journal_path, journal)
+                raise OSError("rebuilt local export failed integrity check; prior bytes remain preserved")
+            record["export_status"] = "verified"
+            record["export_repair_preserved"] = str(preserved)
+            record["export_repaired_at"] = _now(self.clock).isoformat()
+            journal["updated_at"] = _now(self.clock).isoformat()
+            _write_json(journal_path, journal)
+            return {"stage_id": stage_id, "entry_id": entry_id, "export_status": "verified",
+                    "evidence_status": json.loads((export_root / "export-provenance.json").read_text()).get("evidence_status"),
+                    "preserved_export": str(preserved), "dispatch_started": False}
+
     def _exclude_expired_slots(self, entries: list[dict[str, Any]], journal: dict[str, Any],
                                journal_path: Path, now: datetime) -> list[dict[str, Any]]:
         active: list[dict[str, Any]] = []
