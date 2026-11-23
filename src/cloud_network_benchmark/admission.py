@@ -70,6 +70,45 @@ _UNLAUNCHED_SOURCE_ARTIFACT_HASHES = {
     "306102d70d8e0cd0533e07e8d1ff4f06": ("b1464ed9ae2909e334bc41cd0af32ec3a4d6e4e68e0b843feb3ad1b24772c8d0", "ac19c357425e6ad85a0894d4baae953534438e5daf643a2d0f604b3578e34ceb"),
 }
 
+# Read-only native Linux observations documenting three same-UID host services
+# whose cwd links are protected by the container. These are exact process
+# identities and ancestry chains, never PID/command-name allowlists. The
+# monotonic cap starts come from the original reservation-side host receipt.
+_PROTECTED_PROC_OBSERVATION_SHA256 = "e800dd0f3cce9e3f17de397cacd6b0feb6db4db6e4e60bd459f2e0ae0dbcd9ad"
+_PROTECTED_PROC_ANCESTRY_SHA256 = "1003f50bf869526a4556327f42e6ec6e03c8e8722b2e1c9c1c4fc1fae78d7d49"
+_PROTECTED_PROC_BOOT_ID = "3cbf27e6-d29f-452c-b29f-05ec3eb5f237"
+_PROTECTED_PROC_UID = 25357
+_PROTECTED_PROC_CLK_TCK = 100
+_PROTECTED_PROC_CAP_START_MONOTONIC = {
+    "609687d8ec5928cde1915b7d2fc2cc49": 1058019.737221649,
+    "a331c6b0be290a7723782d478a4c4b33": 1058020.530756076,
+    "f26710f8218ba3061a480b21337feebd": 1059648.190493621,
+    "306102d70d8e0cd0533e07e8d1ff4f06": 1059649.057103963,
+}
+_PROTECTED_PROC_CAP_START_UTC = {
+    "609687d8ec5928cde1915b7d2fc2cc49": "2026-11-23T15:26:36.947817+00:00",
+    "a331c6b0be290a7723782d478a4c4b33": "2026-11-23T15:26:37.741353+00:00",
+    "f26710f8218ba3061a480b21337feebd": "2026-11-23T15:53:45.401097+00:00",
+    "306102d70d8e0cd0533e07e8d1ff4f06": "2026-11-23T15:53:46.267707+00:00",
+}
+_PROTECTED_PROC_CHAINS = {
+    65770: (
+        (65770, 25357, 65733, 103471150, "64f9f9dfb401d7753ae68f6e659375efefbfbf1e52721e571d07fc716a505744"),
+        (65733, 0, 3981, 103470968, "985d46efd0fbfdaea00309de54db5c770ef8caae78c9fbaed6e18f9e3832c114"),
+        (3981, 0, 1, 4207, "78f33eb567dbded8e0ed40803db83dc76ee5b132f1c0cb1c202865bbb7d34e26"),
+        (1, 0, 0, 221, "90ad10a68af6136035bdced327eba59509ab8f2e806699c3f6bd4fcd3ca7eac8"),
+    ),
+    3126005: (
+        (3126005, 25357, 1, 89452891, "3127082f907652bfa48e38fddcaf16c3e73b2da5a2d64602eafe88869c222925"),
+        (1, 0, 0, 221, "90ad10a68af6136035bdced327eba59509ab8f2e806699c3f6bd4fcd3ca7eac8"),
+    ),
+    3126006: (
+        (3126006, 25357, 3126005, 89452898, "971490059d839d27af3ded30a476216b92689d837b0236a700723fb13640e370"),
+        (3126005, 25357, 1, 89452891, "3127082f907652bfa48e38fddcaf16c3e73b2da5a2d64602eafe88869c222925"),
+        (1, 0, 0, 221, "90ad10a68af6136035bdced327eba59509ab8f2e806699c3f6bd4fcd3ca7eac8"),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class UnlaunchedCancellationEvidence:
@@ -609,7 +648,76 @@ def _cancellation_lock_paths(recovery: Mapping[str, Any], stage_id: str,
     return state_root / ".campaign-driver.lock", stage_root / "campaign-journal.lock"
 
 
-def _live_proc_quiescence(stage_id: str, attempt_id: str) -> Mapping[str, Any]:
+def _proc_identity(proc: Path, pid: int) -> dict[str, Any]:
+    stat_text = (proc / str(pid) / "stat").read_text()
+    close = stat_text.rfind(")")
+    if close < 0 or int(stat_text[:stat_text.find(" ")]) != pid:
+        raise ValueError("proc stat identity is malformed or reused")
+    fields = stat_text[close + 2:].split()
+    ppid, start_ticks = int(fields[1]), int(fields[19])
+    status = (proc / str(pid) / "status").read_text()
+    uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    proc_uid = int(uid_line.split()[1])
+    cmdline = (proc / str(pid) / "cmdline").read_bytes()
+    return {"pid": pid, "uid": proc_uid, "ppid": ppid, "start_ticks": start_ticks,
+        "cmdline_sha256": hashlib.sha256(cmdline).hexdigest()}
+
+
+def _protected_proc_exception(proc: Path, pid: int, reservation_id: str,
+                              boot_id: str) -> list[dict[str, Any]] | None:
+    """Return exact live ancestry only for the pinned preexisting host services."""
+    chain = _PROTECTED_PROC_CHAINS.get(pid)
+    cap_start = _PROTECTED_PROC_CAP_START_MONOTONIC.get(reservation_id)
+    if (chain is None or cap_start is None or boot_id != _PROTECTED_PROC_BOOT_ID
+            or os.getuid() != _PROTECTED_PROC_UID
+            or len(_PROTECTED_PROC_OBSERVATION_SHA256) != 64
+            or len(_PROTECTED_PROC_ANCESTRY_SHA256) != 64):
+        return None
+    if chain[0][3] / _PROTECTED_PROC_CLK_TCK >= cap_start:
+        return None
+    live: list[dict[str, Any]] = []
+    try:
+        for expected in chain:
+            observed = _proc_identity(proc, expected[0])
+            if (observed["pid"], observed["uid"], observed["ppid"], observed["start_ticks"],
+                    observed["cmdline_sha256"]) != expected:
+                return None
+            live.append(observed)
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+    return live
+
+
+def _valid_protected_exception_row(row: Mapping[str, Any], scan: Mapping[str, Any],
+                                   reservation_id: str) -> bool:
+    chain = _PROTECTED_PROC_CHAINS.get(row.get("pid"))
+    cap_start = _PROTECTED_PROC_CAP_START_MONOTONIC.get(reservation_id)
+    ancestry = row.get("infrastructure_ancestry")
+    evidence = row.get("infrastructure_evidence")
+    if (chain is None or cap_start is None or scan.get("boot_id") != _PROTECTED_PROC_BOOT_ID
+            or scan.get("uid") != _PROTECTED_PROC_UID
+            or row.get("cwd") is not None
+            or row.get("cwd_observation") != "permission_denied_preexisting_infrastructure"
+            or evidence != {"observation_sha256": _PROTECTED_PROC_OBSERVATION_SHA256,
+                "ancestry_sha256": _PROTECTED_PROC_ANCESTRY_SHA256,
+                "boot_id": _PROTECTED_PROC_BOOT_ID,
+                "uid": _PROTECTED_PROC_UID,
+                "clock_ticks": _PROTECTED_PROC_CLK_TCK,
+                "cap_started_at": _PROTECTED_PROC_CAP_START_UTC.get(reservation_id),
+                "cap_start_monotonic": cap_start}
+            or not isinstance(ancestry, list) or len(ancestry) != len(chain)
+            or chain[0][3] / _PROTECTED_PROC_CLK_TCK >= cap_start):
+        return False
+    expected = [{"pid": pid, "uid": uid, "ppid": ppid, "start_ticks": ticks,
+        "cmdline_sha256": cmd_sha} for pid, uid, ppid, ticks, cmd_sha in chain]
+    if ancestry != expected:
+        return False
+    return (row.get("uid"), row.get("start_ticks"), row.get("cmdline_sha256")) == (
+        chain[0][1], chain[0][3], chain[0][4])
+
+
+def _live_proc_quiescence(stage_id: str, attempt_id: str,
+                          reservation_id: str) -> Mapping[str, Any]:
     """Fail-closed Linux /proc inventory used while both original campaign locks are held."""
     proc = Path("/proc")
     if not proc.is_dir() or not Path("/proc/sys/kernel/random/boot_id").is_file():
@@ -617,7 +725,7 @@ def _live_proc_quiescence(stage_id: str, attempt_id: str) -> Mapping[str, Any]:
     uid = os.getuid()
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     rows: list[dict[str, Any]] = []
-    pids: dict[int, tuple[int, int, str, str]] = {}
+    pids: dict[int, tuple[int, int, str | None, str, list[dict[str, Any]] | None]] = {}
     complete = True
     # Read every same-UID process and its ancestry inputs. An unreadable row
     # invalidates the inventory instead of being silently omitted.
@@ -626,24 +734,36 @@ def _live_proc_quiescence(stage_id: str, attempt_id: str) -> Mapping[str, Any]:
             continue
         pid = int(entry.name)
         try:
-            stat_text = (entry / "stat").read_text()
-            close = stat_text.rfind(")")
-            fields = stat_text[close + 2:].split()
-            ppid, start_ticks = int(fields[1]), int(fields[19])
-            status = (entry / "status").read_text()
-            uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
-            proc_uid = int(uid_line.split()[1])
-            if proc_uid != uid:
+            # Filter unrelated owners before opening their proc files. This
+            # avoids turning an unrelated process exiting between directory
+            # enumeration and its stat/status reads into a false incomplete
+            # scan. Same-UID identities still require the full inventory.
+            if entry.stat().st_uid != uid:
                 continue
-            cwd = os.readlink(entry / "cwd")
-            cmdline = (entry / "cmdline").read_bytes()
-            cmd_sha = hashlib.sha256(cmdline).hexdigest()
-            pids[pid] = (ppid, start_ticks, cwd, cmd_sha)
+            identity = _proc_identity(proc, pid)
+            ppid, start_ticks, proc_uid = identity["ppid"], identity["start_ticks"], identity["uid"]
+            if proc_uid != uid:
+                # Ownership changed or the proc entry was reused during the
+                # read; do not infer that the previously observed PID is safe.
+                complete = False
+                continue
+            cmd = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+            cmd_sha = identity["cmdline_sha256"]
+            try:
+                cwd = os.readlink(entry / "cwd")
+                exemption = None
+            except PermissionError:
+                exemption = _protected_proc_exception(proc, pid, reservation_id, boot_id)
+                if exemption is None:
+                    complete = False
+                    continue
+                cwd = None
+            pids[pid] = (ppid, start_ticks, cwd, cmd_sha, exemption)
         except (OSError, ValueError, StopIteration, IndexError):
             # Processes can disappear during a walk; repeatability is part of
             # the proof, so even a race makes this pass inconclusive.
             complete = False
-    for pid, (ppid, start_ticks, cwd, cmd_sha) in sorted(pids.items()):
+    for pid, (ppid, start_ticks, cwd, cmd_sha, exemption) in sorted(pids.items()):
         ancestry: list[int] = []
         parent = ppid
         seen: set[int] = set()
@@ -652,10 +772,22 @@ def _live_proc_quiescence(stage_id: str, attempt_id: str) -> Mapping[str, Any]:
             ancestry.append(parent)
             parent = pids[parent][0] if parent in pids else 0
         cmd = (proc / str(pid) / "cmdline").read_bytes().decode("utf-8", "replace")
-        scope = attempt_id in cmd or stage_id in cmd or stage_id in cwd
-        rows.append({"pid": pid, "uid": uid, "start_ticks": start_ticks, "cwd": cwd,
+        scope = attempt_id in cmd or stage_id in cmd or bool(cwd and stage_id in cwd)
+        row = {"pid": pid, "uid": uid, "start_ticks": start_ticks, "cwd": cwd,
             "cmdline_sha256": cmd_sha, "ancestry_pids": ancestry,
-            "attempt_scope_match": scope})
+            "attempt_scope_match": scope}
+        if exemption is not None:
+            row["cwd_observation"] = "permission_denied_preexisting_infrastructure"
+            row["infrastructure_ancestry"] = exemption
+            row["infrastructure_evidence"] = {
+                "observation_sha256": _PROTECTED_PROC_OBSERVATION_SHA256,
+                "ancestry_sha256": _PROTECTED_PROC_ANCESTRY_SHA256,
+                "boot_id": _PROTECTED_PROC_BOOT_ID,
+                "uid": _PROTECTED_PROC_UID,
+                "clock_ticks": _PROTECTED_PROC_CLK_TCK,
+                "cap_started_at": _PROTECTED_PROC_CAP_START_UTC[reservation_id],
+                "cap_start_monotonic": _PROTECTED_PROC_CAP_START_MONOTONIC[reservation_id]}
+        rows.append(row)
     if not complete or any(row["attempt_scope_match"] for row in rows):
         raise ValueError("live /proc scan is incomplete or finds an active campaign process")
     return {"proc_root": "/proc", "complete": True, "uid": uid, "boot_id": boot_id,
@@ -692,6 +824,12 @@ def _verify_unlaunched_cancellation_proof(proof: UnlaunchedCancellationEvidence,
     campaign_id = record.get("request", {}).get("campaign_id")
     request = record.get("request", {})
     reservation_evidence = record.get("evidence", {})
+    pinned_cap_start = _PROTECTED_PROC_CAP_START_UTC.get(reservation_id)
+    try:
+        observed_cap_start = _utc(datetime.fromisoformat(
+            str(reservation_evidence.get("cap_started_at", {}).get("value", "")).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        observed_cap_start = None
     financial = record.get("financial", {})
     binding = financial.get("binding", {}) if isinstance(financial, Mapping) else {}
     runtime = binding.get("runtime", {}) if isinstance(binding, Mapping) else {}
@@ -702,6 +840,8 @@ def _verify_unlaunched_cancellation_proof(proof: UnlaunchedCancellationEvidence,
             or request.get("source_path") != reservation_evidence.get("source_path")
             or request.get("source_sha256") != reservation_evidence.get("source_sha256")
             or reservation_evidence.get("reservation_id", {}).get("value") != reservation_id
+            or pinned_cap_start is None or observed_cap_start is None
+            or observed_cap_start.isoformat(timespec="microseconds") != pinned_cap_start
             or reservation_evidence.get("campaign_id") != attempt_id
             or reservation_evidence.get("state") != "reserved"):
         raise ValueError("original reservation source, config, or campaign identity mismatch")
@@ -740,7 +880,8 @@ def _verify_unlaunched_cancellation_proof(proof: UnlaunchedCancellationEvidence,
         isinstance(row, Mapping) and isinstance(row.get("pid"), int) and row["pid"] > 0
         and isinstance(row.get("uid"), int) and row["uid"] >= 0
         and isinstance(row.get("start_ticks"), int) and row["start_ticks"] > 0
-        and isinstance(row.get("cwd"), str) and row["cwd"]
+        and ((isinstance(row.get("cwd"), str) and bool(row["cwd"]))
+            or _valid_protected_exception_row(row, scan, reservation_id))
         and isinstance(row.get("cmdline_sha256"), str) and len(row["cmdline_sha256"]) == 64
         and isinstance(row.get("ancestry_pids"), list)
         and all(isinstance(pid, int) and pid > 0 for pid in row["ancestry_pids"])
@@ -1173,7 +1314,7 @@ class BudgetLedger:
                 return rec["financial_cancellation"]
             verified["live_proc_quiescence"] = _live_proc_quiescence(
                 _UNLAUNCHED_RESERVATIONS[proof.reservation_id][0],
-                _UNLAUNCHED_RESERVATIONS[proof.reservation_id][2])
+                _UNLAUNCHED_RESERVATIONS[proof.reservation_id][2], proof.reservation_id)
             proof_payload = {**proof_base, "verified_evidence": verified}
             proof_digest = hashlib.sha256(json.dumps(proof_payload, sort_keys=True).encode()).hexdigest()
             actual_ledger_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()

@@ -24,7 +24,14 @@ must bind the saved attempt and controller-session IDs, terminal state, a fresh
 complete UID-scoped `/proc` inventory, and both campaign lock files' absolute
 paths, device numbers, inode numbers, and exclusive-held observations. Process
 rows include PID, UID, start ticks, cwd, cmdline SHA-256, ancestry PIDs, and the
-attempt-scope match result. Preview/apply derives the state-root
+attempt-scope match result. Three exact same-UID host-service identities have
+a narrow recorded exception for container-protected `cwd` links. It is bound
+to the observed boot ID, UID, process start ticks, NUL-preserving cmdline
+hashes, complete PID ancestry through PID 1, and the original reservation's
+pinned UTC and monotonic cap start. The proof records `cwd: null` and the
+permission-denied observation; it never substitutes a guessed path. Any PID
+reuse, ancestry/command drift, different boot or UID, post-cap start, or other
+unreadable same-UID process keeps the scan incomplete. Preview/apply derives the state-root
 `.campaign-driver.lock` and stage-root `campaign-journal.lock` from all three
 saved provider journal references, acquires them in the campaign runner's lock
 order, checks device/inode identity, and repeats a live `/proc` quiescence scan

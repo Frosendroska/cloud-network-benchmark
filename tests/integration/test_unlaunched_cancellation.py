@@ -160,7 +160,52 @@ def _proof_files(tmp_path: Path, book: BudgetLedger) -> UnlaunchedCancellationEv
 def _synthetic_apply(monkeypatch, proof):
     import cloud_network_benchmark.admission as admission
     monkeypatch.setattr(admission, "_live_proc_quiescence",
-        lambda stage_id, attempt_id: {"complete": True, "processes": [], "scan_sha256": "0" * 64})
+        lambda stage_id, attempt_id, reservation_id: {"complete": True, "processes": [], "scan_sha256": "0" * 64})
+
+
+def test_protected_cwd_exception_requires_exact_recorded_identity_and_ancestry():
+    import cloud_network_benchmark.admission as admission
+    chain = admission._PROTECTED_PROC_CHAINS[65770]
+    ancestry = [{"pid": pid, "uid": uid, "ppid": ppid, "start_ticks": ticks,
+        "cmdline_sha256": cmd_sha} for pid, uid, ppid, ticks, cmd_sha in chain]
+    row = {"pid": 65770, "uid": chain[0][1], "start_ticks": chain[0][3],
+        "cmdline_sha256": chain[0][4], "cwd": None,
+        "cwd_observation": "permission_denied_preexisting_infrastructure",
+        "infrastructure_ancestry": ancestry,
+        "infrastructure_evidence": {"observation_sha256": admission._PROTECTED_PROC_OBSERVATION_SHA256,
+            "ancestry_sha256": admission._PROTECTED_PROC_ANCESTRY_SHA256,
+            "boot_id": admission._PROTECTED_PROC_BOOT_ID, "uid": admission._PROTECTED_PROC_UID,
+            "clock_ticks": admission._PROTECTED_PROC_CLK_TCK,
+            "cap_started_at": admission._PROTECTED_PROC_CAP_START_UTC[RID],
+            "cap_start_monotonic": admission._PROTECTED_PROC_CAP_START_MONOTONIC[RID]}}
+    scan = {"boot_id": admission._PROTECTED_PROC_BOOT_ID,
+        "uid": admission._PROTECTED_PROC_UID}
+    assert admission._valid_protected_exception_row(row, scan, RID)
+    changed = dict(row, cmdline_sha256="0" * 64)
+    assert not admission._valid_protected_exception_row(changed, scan, RID)
+    changed_ancestry = [dict(item) for item in ancestry]
+    changed_ancestry[1]["ppid"] = 1
+    assert not admission._valid_protected_exception_row(
+        dict(row, infrastructure_ancestry=changed_ancestry), scan, RID)
+    assert not admission._valid_protected_exception_row(
+        row, dict(scan, boot_id="different-boot"), RID)
+    assert not admission._valid_protected_exception_row(row, scan, "unregistered-reservation")
+
+
+def test_protected_cwd_exception_reads_each_live_ancestry_identity(tmp_path, monkeypatch):
+    import cloud_network_benchmark.admission as admission
+    chain = admission._PROTECTED_PROC_CHAINS[65770]
+    identities = {pid: {"pid": pid, "uid": uid, "ppid": ppid,
+        "start_ticks": ticks, "cmdline_sha256": cmd_sha}
+        for pid, uid, ppid, ticks, cmd_sha in chain}
+    monkeypatch.setattr(admission, "_proc_identity", lambda _proc, pid: identities[pid])
+    monkeypatch.setattr(admission.os, "getuid", lambda: admission._PROTECTED_PROC_UID)
+    accepted = admission._protected_proc_exception(
+        tmp_path, 65770, RID, admission._PROTECTED_PROC_BOOT_ID)
+    assert accepted == list(identities.values())
+    identities[65733] = dict(identities[65733], start_ticks=identities[65733]["start_ticks"] + 1)
+    assert admission._protected_proc_exception(
+        tmp_path, 65770, RID, admission._PROTECTED_PROC_BOOT_ID) is None
 
 
 def _synthetic_validated_evidence(proof):
