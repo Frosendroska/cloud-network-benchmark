@@ -998,7 +998,18 @@ class CampaignDriver:
     def reconcile_export(self, state_root: Path, stage_id: str, entry_id: str,
                          preserve_to: Path) -> dict[str, Any]:
         """Preserve and rebuild one failed, cleanup-closed local export; never dispatch work."""
-        root = Path(state_root); folder = root / stage_id
+        if (not stage_id or stage_id in {".", ".."} or Path(stage_id).name != stage_id
+                or "/" in stage_id or "\\" in stage_id
+                or not entry_id or entry_id in {".", ".."} or Path(entry_id).name != entry_id
+                or "/" in entry_id or "\\" in entry_id):
+            raise ValueError("stage and entry IDs must be single safe path components")
+        root = Path(state_root).expanduser()
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("campaign state root is missing or unsafe")
+        root = root.resolve(strict=True)
+        folder = root / stage_id
+        if folder.is_symlink() or not folder.is_dir() or folder.resolve(strict=True).parent != root:
+            raise ValueError("campaign stage directory is missing or unsafe")
         with _file_lock(root / ".campaign-driver.lock", blocking=False):
             prepared = folder / "prepared-stage.json"
             journal_path = folder / "campaign-journal.json"
@@ -1006,9 +1017,11 @@ class CampaignDriver:
                     or not prepared.is_file() or not journal_path.is_file()):
                 raise ValueError("campaign state is missing or unsafe")
             stage = json.loads(prepared.read_text(encoding="utf-8"))
-            journal = json.loads(journal_path.read_text(encoding="utf-8"))
-            if stage.get("stage_id") != stage_id or journal.get("stage_id") != stage_id:
+            if stage.get("stage_id") != stage_id:
                 raise ValueError("prepared campaign stage identity differs")
+            # The journal already exists, so this canonical loader only validates
+            # frozen stage/input digests; it cannot create or reset campaign state.
+            journal = self._load_or_create_journal(stage, journal_path)
             record = journal.get("entries", {}).get(entry_id)
             if (not record or record.get("state") != "failed"
                     or (record.get("result") or {}).get("cleanup_open") is not False
@@ -1018,10 +1031,22 @@ class CampaignDriver:
             if entry is None:
                 raise ValueError("prepared stage no longer contains the failed entry")
             from .campaign_export import export_entry, verify_export
-            export_root = Path(stage["results_root"]) / "closed" / entry_id / "export"
+            results_root = Path(stage["results_root"]).expanduser()
+            if results_root.is_symlink() or not results_root.is_dir():
+                raise ValueError("prepared results root is missing or unsafe")
+            results_root = results_root.resolve(strict=True)
+            closed_root = results_root / "closed"
+            entry_root = closed_root / entry_id
+            export_root = entry_root / "export"
+            if (closed_root.is_symlink() or entry_root.is_symlink() or export_root.is_symlink()
+                    or not closed_root.is_dir() or not entry_root.is_dir() or not export_root.is_dir()
+                    or closed_root.resolve(strict=True).parent != results_root
+                    or entry_root.resolve(strict=True).parent != closed_root.resolve(strict=True)
+                    or export_root.resolve(strict=True).parent != entry_root.resolve(strict=True)):
+                raise ValueError("failed export path is missing, symlinked, or outside the prepared results root")
             preserved = Path(preserve_to).expanduser()
             if (export_root.is_symlink() or not export_root.is_dir() or verify_export(export_root)
-                    or preserved.parent.resolve() != export_root.parent.resolve()
+                    or preserved.name in {".", ".."} or preserved.parent.resolve(strict=True) != export_root.parent.resolve(strict=True)
                     or preserved.exists() or preserved.is_symlink()):
                 raise ValueError("repair requires one invalid export and a new sibling preservation path")
             os.rename(export_root, preserved)

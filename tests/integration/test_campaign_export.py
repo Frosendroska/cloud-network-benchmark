@@ -115,7 +115,8 @@ def _config_only_stage(tmp_path, *, add_native=False):
         parent = manifests / f"{suffix}-parent.json"
         parent.write_text(json.dumps({"child_runs": [{"run_id": run_id,
             "manifest_path": str(child.relative_to(repository))}]}))
-        entries.append({"entry_id": f"V-{suffix}", "parent_manifest_path": str(parent),
+        entries.append({"entry_id": f"V-{suffix}", "launch_at": "2026-11-23T00:00:00+00:00",
+                        "parent_manifest_path": str(parent),
                         "run_ids": {provider: run_id}})
     return {"stage_id": "failed-acceptance", "repository_root": str(repository),
             "results_root": str(results), "entries": entries}
@@ -165,7 +166,8 @@ def test_partial_export_integrity_fails_closed_on_changes_and_unsealed_native_fi
     assert verify_export(destination) is False
 
 
-def test_failed_cleanup_closed_export_reconciliation_preserves_old_copy_and_does_not_dispatch(tmp_path):
+@pytest.mark.parametrize("mutation", [None, "results_root", "run_ids", "parent_manifest_path", "symlink_entry"])
+def test_failed_cleanup_closed_export_reconciliation_preserves_old_copy_and_does_not_dispatch(tmp_path, mutation):
     from cloud_network_benchmark.campaign import CampaignDriver
 
     stage = _config_only_stage(tmp_path)
@@ -174,19 +176,54 @@ def test_failed_cleanup_closed_export_reconciliation_preserves_old_copy_and_does
     state = Path(stage["state_root"]) / stage_id
     state.mkdir(parents=True)
     (state / "prepared-stage.json").write_text(json.dumps(stage))
-    (state / "campaign-journal.json").write_text(json.dumps({"stage_id": stage_id, "entries": {
-        entry_id: {"state": "failed", "result": {"cleanup_open": False},
-                   "export_status": "failed: integrity check"}}}))
+    engine = CampaignDriver()
+    journal_path = state / "campaign-journal.json"
+    journal = engine._load_or_create_journal(stage, journal_path)
+    journal["entries"][entry_id].update(state="failed", result={"cleanup_open": False},
+                                         export_status="failed: integrity check")
+    journal_path.write_text(json.dumps(journal))
+    if mutation == "results_root":
+        stage["results_root"] = str(tmp_path / "substituted-results")
+    elif mutation == "run_ids":
+        stage["entries"][0]["run_ids"] = {"SUBSTITUTED": "substituted-run"}
+    elif mutation == "parent_manifest_path":
+        stage["entries"][0]["parent_manifest_path"] = str(tmp_path / "substituted-parent.json")
+    if mutation:
+        (state / "prepared-stage.json").write_text(json.dumps(stage))
     export_root = Path(stage["results_root"]) / "closed" / entry_id / "export"
     export_root.mkdir(parents=True)
     (export_root / "old-copy.txt").write_text("preserve these exact old bytes")
     preserved = export_root.with_name("export.previous-invalid")
-    result = CampaignDriver().reconcile_export(Path(stage["state_root"]), stage_id, entry_id, preserved)
+    if mutation == "symlink_entry":
+        import os
+        external_entry = tmp_path / "external-entry"
+        external_entry.mkdir()
+        os.rename(export_root, external_entry / "export")
+        export_root.parent.rmdir()
+        export_root.parent.symlink_to(external_entry, target_is_directory=True)
+    if mutation:
+        expected = "symlinked" if mutation == "symlink_entry" else "inputs changed"
+        with pytest.raises(ValueError, match=expected):
+            engine.reconcile_export(Path(stage["state_root"]), stage_id, entry_id, preserved)
+        if mutation == "symlink_entry":
+            assert (external_entry / "export" / "old-copy.txt").read_text() == "preserve these exact old bytes"
+        else:
+            assert export_root.is_dir()
+        assert not preserved.exists()
+        return
+    result = engine.reconcile_export(Path(stage["state_root"]), stage_id, entry_id, preserved)
     assert result["dispatch_started"] is False
     assert result["evidence_status"] == "not_validated"
     assert (preserved / "old-copy.txt").read_text() == "preserve these exact old bytes"
     from cloud_network_benchmark.campaign_export import verify_export
     assert verify_export(export_root)
+
+
+def test_reconcile_export_rejects_path_component_traversal_before_state_access(tmp_path):
+    from cloud_network_benchmark.campaign import CampaignDriver
+
+    with pytest.raises(ValueError, match="single safe path components"):
+        CampaignDriver().reconcile_export(tmp_path, "../outside", "V-S1", tmp_path / "saved")
 
 
 def test_failed_notification_hook_is_visible_without_hiding_stage_failure(tmp_path):
