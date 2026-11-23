@@ -28,7 +28,14 @@ attempt-scope match result. Three exact same-UID host-service identities have
 a narrow recorded exception for container-protected `cwd` links. It is bound
 to the observed boot ID, UID, process start ticks, NUL-preserving cmdline
 hashes, complete PID ancestry through PID 1, and the original reservation's
-pinned UTC and monotonic cap start. The proof records `cwd: null` and the
+pinned UTC and monotonic cap start. The OpenSSH listener entry additionally
+requires its exact PID/UID/parent/start ticks and one of the observed title
+forms `sshd -D [listener] N of 10-100 startups` or
+`sshd: /usr/sbin/sshd -D [listener] N of 10-100 startups` (`N` is exactly 0
+or 1, one argv element). Only the two observed listener command hashes are
+accepted, and each scan retains its current hash.
+The scanner reads each process's status UID before scoping it, because a
+nondumpable same-UID process can have a root-owned `/proc` directory. The proof records `cwd: null` and the
 permission-denied observation; it never substitutes a guessed path. Any PID
 reuse, ancestry/command drift, different boot or UID, post-cap start, or other
 unreadable same-UID process keeps the scan incomplete. Preview/apply derives the state-root

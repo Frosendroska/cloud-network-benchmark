@@ -167,7 +167,9 @@ def test_protected_cwd_exception_requires_exact_recorded_identity_and_ancestry()
     import cloud_network_benchmark.admission as admission
     chain = admission._PROTECTED_PROC_CHAINS[65770]
     ancestry = [{"pid": pid, "uid": uid, "ppid": ppid, "start_ticks": ticks,
-        "cmdline_sha256": cmd_sha} for pid, uid, ppid, ticks, cmd_sha in chain]
+        "cmdline_sha256": cmd_sha, "argv0": (
+            "sshd -D [listener] 1 of 10-100 startups" if pid == 3981 else "captured"),
+        "argc": 1} for pid, uid, ppid, ticks, cmd_sha in chain]
     row = {"pid": 65770, "uid": chain[0][1], "start_ticks": chain[0][3],
         "cmdline_sha256": chain[0][4], "cwd": None,
         "cwd_observation": "permission_denied_preexisting_infrastructure",
@@ -196,7 +198,9 @@ def test_protected_cwd_exception_reads_each_live_ancestry_identity(tmp_path, mon
     import cloud_network_benchmark.admission as admission
     chain = admission._PROTECTED_PROC_CHAINS[65770]
     identities = {pid: {"pid": pid, "uid": uid, "ppid": ppid,
-        "start_ticks": ticks, "cmdline_sha256": cmd_sha}
+        "start_ticks": ticks, "cmdline_sha256": cmd_sha,
+        "argv0": "sshd -D [listener] 1 of 10-100 startups" if pid == 3981 else "captured",
+        "argc": 1}
         for pid, uid, ppid, ticks, cmd_sha in chain}
     monkeypatch.setattr(admission, "_proc_identity", lambda _proc, pid: identities[pid])
     monkeypatch.setattr(admission.os, "getuid", lambda: admission._PROTECTED_PROC_UID)
@@ -206,6 +210,69 @@ def test_protected_cwd_exception_reads_each_live_ancestry_identity(tmp_path, mon
     identities[65733] = dict(identities[65733], start_ticks=identities[65733]["start_ticks"] + 1)
     assert admission._protected_proc_exception(
         tmp_path, 65770, RID, admission._PROTECTED_PROC_BOOT_ID) is None
+
+
+def test_sshd_listener_title_normalization_is_exact_and_retains_live_hash():
+    import cloud_network_benchmark.admission as admission
+    original = "sshd -D [listener] 1 of 10-100 startups"
+    current = "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups"
+    assert admission._is_pinned_sshd_listener_title(original)
+    assert admission._is_pinned_sshd_listener_title(current)
+    assert not admission._is_pinned_sshd_listener_title(
+        "sshd: /usr/sbin/sshd -D [listener] 2 of 10-100 startups")
+    assert not admission._is_pinned_sshd_listener_title(
+        "sshd: /usr/sbin/sshd -D [listener] 101 of 10-100 startups")
+    assert not admission._is_pinned_sshd_listener_title(
+        "sshd: /usr/sbin/sshd -D [listener] unrelated")
+    source_identity = admission._PROTECTED_PROC_CHAINS[65770][2]
+    observed = {"pid": source_identity[0], "uid": source_identity[1],
+        "ppid": source_identity[2], "start_ticks": source_identity[3],
+        "cmdline_sha256": "3bc4eb45b04e48e68e71fd8e2f9a9b03c375e334b52a767cd042a39721c05190",
+        "argv0": current, "argc": 1}
+    assert admission._matches_protected_chain_identity(observed, source_identity)
+    observed["cmdline_sha256"] = "0" * 64
+    assert not admission._matches_protected_chain_identity(observed, source_identity)
+    observed["cmdline_sha256"] = "3bc4eb45b04e48e68e71fd8e2f9a9b03c375e334b52a767cd042a39721c05190"
+    observed["argv0"] = "sshd: /usr/sbin/sshd -D [listener] arbitrary"
+    assert not admission._matches_protected_chain_identity(observed, source_identity)
+
+
+def test_proc_scan_does_not_skip_root_owned_directories_with_controller_uid(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import cloud_network_benchmark.admission as admission
+    proc = tmp_path / "proc"
+    (proc / "sys/kernel/random").mkdir(parents=True)
+    (proc / "sys/kernel/random/boot_id").write_text("fixture-boot\n")
+    process_dirs = []
+    for pid, status in ((123, "Name:\ttarget\nUid:\t25357\t25357\t25357\t25357\n"),
+                        (124, "Name:\tunknown\n")):
+        process = proc / str(pid)
+        process.mkdir()
+        fields = ["S", "1"] + ["0"] * 17 + ["500"]
+        (process / "stat").write_text(f"{pid} (fixture) " + " ".join(fields))
+        (process / "status").write_text(status)
+        (process / "cmdline").write_bytes(b"unrelated\x00")
+        (process / "cwd").write_text("placeholder")
+        process_dirs.append(process)
+    original_stat = Path.stat
+
+    def root_owned_proc_dir(path, *args, **kwargs):
+        if path in process_dirs:
+            return SimpleNamespace(st_uid=0)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", root_owned_proc_dir)
+    monkeypatch.setattr(admission.os, "getuid", lambda: 25357)
+    original_readlink = admission.os.readlink
+
+    def denied_process_cwd(path, *args, **kwargs):
+        if Path(path) == process_dirs[0] / "cwd":
+            raise PermissionError("fixture cwd denied")
+        return original_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(admission.os, "readlink", denied_process_cwd)
+    with pytest.raises(ValueError, match="incomplete"):
+        admission._live_proc_quiescence("stage", "attempt", RID, proc_root=proc)
 
 
 def _synthetic_validated_evidence(proof):

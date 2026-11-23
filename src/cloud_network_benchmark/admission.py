@@ -108,6 +108,10 @@ _PROTECTED_PROC_CHAINS = {
         (1, 0, 0, 221, "90ad10a68af6136035bdced327eba59509ab8f2e806699c3f6bd4fcd3ca7eac8"),
     ),
 }
+_PROTECTED_SSHD_LISTENER_CMDLINE_SHA256 = frozenset({
+    "78f33eb567dbded8e0ed40803db83dc76ee5b132f1c0cb1c202865bbb7d34e26",
+    "3bc4eb45b04e48e68e71fd8e2f9a9b03c375e334b52a767cd042a39721c05190",
+})
 
 
 @dataclass(frozen=True)
@@ -659,8 +663,40 @@ def _proc_identity(proc: Path, pid: int) -> dict[str, Any]:
     uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
     proc_uid = int(uid_line.split()[1])
     cmdline = (proc / str(pid) / "cmdline").read_bytes()
+    argv = cmdline.rstrip(b"\x00").split(b"\x00") if cmdline else []
+    argv0 = argv[0].decode("utf-8", "replace") if argv else ""
     return {"pid": pid, "uid": proc_uid, "ppid": ppid, "start_ticks": start_ticks,
-        "cmdline_sha256": hashlib.sha256(cmdline).hexdigest()}
+        "cmdline_sha256": hashlib.sha256(cmdline).hexdigest(), "argv0": argv0,
+        "argc": len(argv)}
+
+
+def _proc_status_uid(proc: Path, pid: int) -> int:
+    status = (proc / str(pid) / "status").read_text()
+    uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+    return int(uid_line.split()[1])
+
+
+def _is_pinned_sshd_listener_title(argv0: Any) -> bool:
+    """Match only the two observed OpenSSH listener title forms/counts."""
+    return isinstance(argv0, str) and re.fullmatch(
+        r"(?:sshd -D \[listener\]|sshd: /usr/sbin/sshd -D \[listener\]) "
+        r"[01] of 10-100 startups", argv0) is not None
+
+
+def _matches_protected_chain_identity(observed: Mapping[str, Any],
+                                      expected: tuple[int, int, int, int, str]) -> bool:
+    pid, uid, ppid, start_ticks, cmd_sha = expected
+    if (observed.get("pid"), observed.get("uid"), observed.get("ppid"),
+            observed.get("start_ticks")) != (pid, uid, ppid, start_ticks):
+        return False
+    if pid == 3981:
+        # OpenSSH rewrites the listener's argv title as its startup count
+        # changes. The process identity and its bounded title grammar remain
+        # fixed; its current, actual cmdline hash is retained in the receipt.
+        return (observed.get("argc") == 1
+            and observed.get("cmdline_sha256") in _PROTECTED_SSHD_LISTENER_CMDLINE_SHA256
+            and _is_pinned_sshd_listener_title(observed.get("argv0")))
+    return observed.get("cmdline_sha256") == cmd_sha
 
 
 def _protected_proc_exception(proc: Path, pid: int, reservation_id: str,
@@ -679,8 +715,7 @@ def _protected_proc_exception(proc: Path, pid: int, reservation_id: str,
     try:
         for expected in chain:
             observed = _proc_identity(proc, expected[0])
-            if (observed["pid"], observed["uid"], observed["ppid"], observed["start_ticks"],
-                    observed["cmdline_sha256"]) != expected:
+            if not _matches_protected_chain_identity(observed, expected):
                 return None
             live.append(observed)
     except (OSError, ValueError, StopIteration, IndexError):
@@ -708,22 +743,22 @@ def _valid_protected_exception_row(row: Mapping[str, Any], scan: Mapping[str, An
             or not isinstance(ancestry, list) or len(ancestry) != len(chain)
             or chain[0][3] / _PROTECTED_PROC_CLK_TCK >= cap_start):
         return False
-    expected = [{"pid": pid, "uid": uid, "ppid": ppid, "start_ticks": ticks,
-        "cmdline_sha256": cmd_sha} for pid, uid, ppid, ticks, cmd_sha in chain]
-    if ancestry != expected:
-        return False
+    for observed, expected in zip(ancestry, chain):
+        if not isinstance(observed, Mapping) or not _matches_protected_chain_identity(observed, expected):
+            return False
     return (row.get("uid"), row.get("start_ticks"), row.get("cmdline_sha256")) == (
         chain[0][1], chain[0][3], chain[0][4])
 
 
 def _live_proc_quiescence(stage_id: str, attempt_id: str,
-                          reservation_id: str) -> Mapping[str, Any]:
+                          reservation_id: str,
+                          proc_root: Path = Path("/proc")) -> Mapping[str, Any]:
     """Fail-closed Linux /proc inventory used while both original campaign locks are held."""
-    proc = Path("/proc")
-    if not proc.is_dir() or not Path("/proc/sys/kernel/random/boot_id").is_file():
+    proc = Path(proc_root)
+    if not proc.is_dir() or not (proc / "sys/kernel/random/boot_id").is_file():
         raise ValueError("live Linux /proc quiescence proof is unavailable")
     uid = os.getuid()
-    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    boot_id = (proc / "sys/kernel/random/boot_id").read_text().strip()
     rows: list[dict[str, Any]] = []
     pids: dict[int, tuple[int, int, str | None, str, list[dict[str, Any]] | None]] = {}
     complete = True
@@ -734,11 +769,10 @@ def _live_proc_quiescence(stage_id: str, attempt_id: str,
             continue
         pid = int(entry.name)
         try:
-            # Filter unrelated owners before opening their proc files. This
-            # avoids turning an unrelated process exiting between directory
-            # enumeration and its stat/status reads into a false incomplete
-            # scan. Same-UID identities still require the full inventory.
-            if entry.stat().st_uid != uid:
+            # /proc directory ownership can be root for a nondumpable process
+            # whose real UID is this controller. Scope by status UID first;
+            # unreadable/unknown UID remains inconclusive.
+            if _proc_status_uid(proc, pid) != uid:
                 continue
             identity = _proc_identity(proc, pid)
             ppid, start_ticks, proc_uid = identity["ppid"], identity["start_ticks"], identity["uid"]
