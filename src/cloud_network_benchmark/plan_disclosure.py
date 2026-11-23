@@ -112,7 +112,7 @@ def _terraform_provider_cache_link(path: Path, root: Path,
     if provider == "aws":
         layout = (len(parts) == 10 and parts[0].startswith("cnb-")
                   and parts[2].endswith("-deployment")
-                  and re.fullmatch(r"terraform-data-safety-[0-9a-f]{8}", data_name) is not None)
+                  and re.fullmatch(r"terraform-data-(?:safety|pair)-[0-9a-f]{8}", data_name) is not None)
     elif provider == "azurerm":
         layout = (len(parts) == 9 and parts[0].startswith("20")
                   and parts[1].endswith("-deployment")
@@ -195,12 +195,20 @@ def _request_inventory(roots: list[Path], mirror_snapshot=None,
     return inventory
 
 
+def _cache_links_are_append_only(previous: dict[Path, tuple], current: dict[Path, tuple]) -> bool:
+    return (previous.keys() <= current.keys()
+            and all(current[path] == signature for path, signature in previous.items()))
+
+
 def _assert_request_inventory(roots: list[Path], expected: dict[Path, str],
-                              mirror_snapshot=None, expected_cache_links=None) -> None:
+                              mirror_snapshot=None, expected_cache_links=None) -> dict[Path, tuple]:
     cache_links = {}
-    if (_request_inventory(roots, mirror_snapshot, cache_links) != expected
-            or (expected_cache_links is not None and cache_links != expected_cache_links)):
+    if _request_inventory(roots, mirror_snapshot, cache_links) != expected:
         raise tp.PlanReviewError("original request set changed during disclosure")
+    if (expected_cache_links is not None
+            and not _cache_links_are_append_only(expected_cache_links, cache_links)):
+        raise tp.PlanReviewError("Terraform provider cache links changed during disclosure")
+    return cache_links
 
 
 def _safe_root(path: Path) -> Path:
@@ -697,10 +705,10 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
     observed_cache_links = {}
     request_inventory = (_request_inventory(owned, mirror_snapshot, observed_cache_links)
                          if request_path is not None else None)
-    expected_cache_links = (dict(cache_links) if cache_links is not None
-                            else dict(observed_cache_links))
-    if cache_links is not None and observed_cache_links != cache_links:
+    if (cache_links is not None
+            and not _cache_links_are_append_only(cache_links, observed_cache_links)):
         raise tp.PlanReviewError("Terraform provider cache links changed before disclosure")
+    expected_cache_links = dict(observed_cache_links)
     checkpoint_root = checkpoint_root.absolute()
     if checkpoint_root.exists() or checkpoint_root.is_symlink():
         raise tp.PlanReviewError("checkpoint destination must not already exist")
@@ -789,6 +797,9 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
             raise tp.PlanReviewError("original plan-review deadline has elapsed")
         prepared.append((req_path, request_bytes, binding, plan_bytes, binary_bytes, variables_path, state_path,
                          state_bytes, root_path, source_inventory, canonical, sections))
+    if request_inventory is not None:
+        expected_cache_links = _assert_request_inventory(
+            owned, request_inventory, mirror_snapshot, expected_cache_links)
     # Atomic root creation; no existing target can be overwritten.
     if display_limit < 1024:
         raise tp.PlanReviewError("display limit must be at least 1024 bytes")
@@ -827,7 +838,8 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
                 raise tp.PlanReviewError("original plan-review deadline elapsed before checkpoint publication")
             _assert_pending_original(req_path, req_bytes)
             if request_inventory is not None:
-                _assert_request_inventory(owned, request_inventory, mirror_snapshot, expected_cache_links)
+                expected_cache_links = _assert_request_inventory(
+                    owned, request_inventory, mirror_snapshot, expected_cache_links)
             if digest(_regular(req_path.parent / "saved-plan.json")) != binding["json_sha256"] or digest(_regular(req_path.parent / "saved.tfplan")) != binding["plan_sha256"]:
                 raise tp.PlanReviewError("saved plan changed before checkpoint publication")
             if (digest(_regular(var_path)) != binding["variables_sha256"]
@@ -856,7 +868,8 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
             source = next(item for item in prepared if item[0].parent == Path(row["review_directory"]))
             _assert_pending_original(source[0], source[1])
             if request_inventory is not None:
-                _assert_request_inventory(owned, request_inventory, mirror_snapshot, expected_cache_links)
+                expected_cache_links = _assert_request_inventory(
+                    owned, request_inventory, mirror_snapshot, expected_cache_links)
             if time.time() >= deadline_epoch:
                 raise tp.PlanReviewError("original plan-review deadline elapsed before receipt command publication")
             print("human_review_required=true deadline_utc_epoch=" + str(deadline_epoch))

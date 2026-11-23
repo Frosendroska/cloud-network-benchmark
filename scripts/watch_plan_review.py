@@ -62,8 +62,9 @@ def _complete_binding(path: Path, roots: list[Path], baseline: dict[Path, str],
                 raise PlanReviewError("original producer closed or cancelled the review while publishing")
         cache_links = {}
         current = _requests(roots, mirror_snapshot, cache_links)
-        if cache_links != expected_cache_links:
+        if not plan_disclosure._cache_links_are_append_only(expected_cache_links, cache_links):
             raise PlanReviewError("Terraform provider cache links changed during request publication")
+        expected_cache_links.update(cache_links)
         if any(current.get(old_path) != old_hash for old_path, old_hash in baseline.items()):
             raise PlanReviewError("previous original request changed or disappeared during publication")
         new = [candidate for candidate in current if candidate not in baseline]
@@ -108,7 +109,8 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
         raise PlanReviewError("allowlisted provider roots must not overlap")
     watch_started = time.time()
     mirror_snapshot = plan_disclosure._provider_mirror_snapshot()
-    baseline = _requests(owned, mirror_snapshot)
+    baseline_cache_links = {}
+    baseline = _requests(owned, mirror_snapshot, baseline_cache_links)
     for request in baseline:
         if not any((request.parent / marker).exists() or (request.parent / marker).is_symlink()
                    for marker in ("accepted-review.json", "review-cancelled.json", "failure.json")):
@@ -119,6 +121,9 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
     while time.time() < watch_end_epoch:
         current_cache_links = {}
         current = _requests(owned, mirror_snapshot, current_cache_links)
+        if not plan_disclosure._cache_links_are_append_only(baseline_cache_links, current_cache_links):
+            raise PlanReviewError("Terraform provider cache links changed while watching")
+        baseline_cache_links.update(current_cache_links)
         for path, old_hash in seen.items():
             if current.get(path) != old_hash:
                 raise PlanReviewError("observed original request changed or disappeared while watching")
@@ -150,8 +155,10 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
                     or hashlib.sha256(request.read_bytes()).hexdigest() != request_hash):
                 raise PlanReviewError("original request hash or publication time changed while watching")
             if (latest.get(request) != request_hash or len(latest) != len(baseline) + 1
-                    or latest_cache_links != current_cache_links):
+                    or not plan_disclosure._cache_links_are_append_only(
+                        current_cache_links, latest_cache_links)):
                 raise PlanReviewError("review request set changed before disclosure began")
+            current_cache_links.update(latest_cache_links)
             result = plan_disclosure.disclose(
                 owned, checkpoint, cutoff, display_limit,
                 request_path=request, mirror_snapshot=mirror_snapshot,

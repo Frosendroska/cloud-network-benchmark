@@ -380,6 +380,169 @@ def test_nested_provider_cache_link_to_wrong_target_is_rejected(tmp_path, monkey
         watch_plan_review.watch([attempt], tmp_path / "checkpoint", time.time() + 2)
 
 
+@pytest.mark.parametrize(("provider", "root_name", "relative", "version"), [
+    ("aws", "safety", "cnb-fixture/fixture-aws/fixture-aws-deployment/terraform-data-safety-deadbeef", "6.70.0"),
+    ("aws", "pair", "cnb-fixture/fixture-aws/fixture-aws-deployment/terraform-data-pair-deadbeef", "6.70.0"),
+    ("azurerm", "expiry", "20261123T130643Z-exp-003/20261123T130643Z-exp-003-deployment/terraform-data-expiry", "4.81.0"),
+    ("azurerm", "pair", "20261123T130643Z-exp-003/20261123T130643Z-exp-003-deployment/terraform-data-pair", "4.81.0"),
+    ("google", "protection", "08eed51c16ef/20261123T130643Z-exp-003-gcp/20261123T130643Z-exp-003-gcp-deployment/protection/terraform-data-protection-e37f184c", "7.46.1"),
+    ("google", "pair", "08eed51c16ef/20261123T130643Z-exp-003-gcp/20261123T130643Z-exp-003-gcp-deployment/pair/terraform-data-pair-e37f184c", "7.46.1"),
+])
+def test_all_six_provider_cache_root_layouts_are_recognized(
+        tmp_path, monkeypatch, provider, root_name, relative, version):
+    root = tmp_path / "owned"
+    mirror = tmp_path / "mirror"
+    link = (root / relative / "providers" / "registry.terraform.io" /
+            "hashicorp" / provider / version / "linux_amd64")
+    target = mirror / "registry.terraform.io" / "hashicorp" / provider / version / "linux_amd64"
+    target.mkdir(parents=True)
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target, target_is_directory=True)
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    assert plan_disclosure._terraform_provider_cache_link(
+        link, root, plan_disclosure._provider_mirror_snapshot()) is True, (provider, root_name)
+
+
+@pytest.mark.parametrize(("provider", "relative", "version"), [
+    ("aws", "cnb-fixture/fixture-aws/fixture-aws-deployment/terraform-data-safety-deadbeef", "6.70.0"),
+    ("aws", "cnb-fixture/fixture-aws/fixture-aws-deployment/terraform-data-pair-deadbeef", "6.70.0"),
+    ("azurerm", "20261123T130643Z-exp-003/20261123T130643Z-exp-003-deployment/terraform-data-expiry", "4.81.0"),
+    ("azurerm", "20261123T130643Z-exp-003/20261123T130643Z-exp-003-deployment/terraform-data-pair", "4.81.0"),
+    ("google", "08eed51c16ef/20261123T130643Z-exp-003-gcp/20261123T130643Z-exp-003-gcp-deployment/protection/terraform-data-protection-e37f184c", "7.46.1"),
+    ("google", "08eed51c16ef/20261123T130643Z-exp-003-gcp/20261123T130643Z-exp-003-gcp-deployment/pair/terraform-data-pair-e37f184c", "7.46.1"),
+])
+def test_all_six_provider_cache_gates_reject_wrong_target_and_config_mutation(
+        tmp_path, monkeypatch, provider, relative, version):
+    root = tmp_path / "owned"
+    mirror = tmp_path / "mirror"
+    link = (root / relative / "providers" / "registry.terraform.io" /
+            "hashicorp" / provider / version / "linux_amd64")
+    target = mirror / "registry.terraform.io" / "hashicorp" / provider / version / "linux_amd64"
+    wrong_target = tmp_path / "wrong-target"
+    target.mkdir(parents=True)
+    wrong_target.mkdir()
+    link.parent.mkdir(parents=True)
+    link.symlink_to(wrong_target, target_is_directory=True)
+    config = tmp_path / "terraform.rc"
+    original_config = f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n'
+    config.write_text(original_config)
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    snapshot = plan_disclosure._provider_mirror_snapshot()
+    assert not plan_disclosure._terraform_provider_cache_link(link, root, snapshot)
+    link.unlink()
+    link.symlink_to(target, target_is_directory=True)
+    assert plan_disclosure._terraform_provider_cache_link(link, root, snapshot)
+    config.write_text(original_config + "\n")
+    assert not plan_disclosure._terraform_provider_cache_link(
+        link, root, snapshot), "mirror configuration mutation must invalidate the snapshot"
+
+
+def test_exact_disclosure_allows_only_append_only_valid_peer_cache_link(
+        tmp_path, monkeypatch):
+    attempt = tmp_path / "acceptance" / "V-S1" / "aws"
+    request = _request(attempt, "aws-safety-apply-review-selected",
+                       provider="aws", root="safety")
+    mirror = tmp_path / "mirror"
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    safety_target = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+    safety_target.mkdir(parents=True)
+    safety_link = (attempt / "cnb-fixture/fixture-aws/fixture-aws-deployment/"
+                   "terraform-data-safety-deadbeef/providers/registry.terraform.io/"
+                   "hashicorp/aws/6.70.0/linux_amd64")
+    safety_link.parent.mkdir(parents=True)
+    safety_link.symlink_to(safety_target, target_is_directory=True)
+    mirror_snapshot = plan_disclosure._provider_mirror_snapshot()
+    initial_links = {}
+    plan_disclosure._request_inventory([attempt], mirror_snapshot, initial_links)
+    original_inventory = plan_disclosure._request_inventory
+    calls = 0
+
+    def add_peer_cache_after_initial_inventory(roots, snapshot=None, cache_links=None):
+        nonlocal calls
+        inventory = original_inventory(roots, snapshot, cache_links)
+        calls += 1
+        if calls == 1:
+            pair_target = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+            pair_link = (attempt / "cnb-fixture/fixture-aws/fixture-aws-deployment/"
+                         "terraform-data-pair-afd3ac4c/providers/registry.terraform.io/"
+                         "hashicorp/aws/6.70.0/linux_amd64")
+            pair_link.parent.mkdir(parents=True)
+            pair_link.symlink_to(pair_target, target_is_directory=True)
+        return inventory
+
+    monkeypatch.setattr(plan_disclosure, "_request_inventory", add_peer_cache_after_initial_inventory)
+    checkpoint = tmp_path / "checkpoint"
+    plan_disclosure.disclose([attempt], checkpoint, time.time() + 10,
+                             request_path=request, mirror_snapshot=mirror_snapshot,
+                             cache_links=initial_links)
+    assert (checkpoint / "manifest.json").is_file()
+    assert not (request.parent / "operator-review.json").exists()
+
+
+def test_accepted_peer_cache_links_remain_bound_against_mutation_and_deletion(tmp_path):
+    safety = tmp_path / "safety-cache-link"
+    pair = tmp_path / "pair-cache-link"
+    original = {safety: ("target-a", "signature-a")}
+    appended = {**original, pair: ("target-b", "signature-b")}
+    assert plan_disclosure._cache_links_are_append_only(original, appended)
+    assert not plan_disclosure._cache_links_are_append_only(
+        appended, {**appended, pair: ("target-c", "signature-c")})
+    assert not plan_disclosure._cache_links_are_append_only(appended, original)
+
+
+def test_watcher_allows_peer_cache_initialization_during_selected_request_publication(
+        tmp_path, capsys, monkeypatch):
+    from scripts import watch_plan_review
+
+    attempt = tmp_path / "acceptance" / "V-S1" / "aws"
+    mirror = tmp_path / "mirror"
+    config = tmp_path / "terraform.rc"
+    config.write_text(f'provider_installation {{\n filesystem_mirror {{\n  path = "{mirror}"\n }}\n}}\n')
+    monkeypatch.setenv("TF_CLI_CONFIG_FILE", str(config))
+    target = mirror / "registry.terraform.io/hashicorp/aws/6.70.0/linux_amd64"
+    target.mkdir(parents=True)
+    safety_link = (attempt / "cnb-fixture/fixture-aws/fixture-aws-deployment/"
+                   "terraform-data-safety-deadbeef/providers/registry.terraform.io/"
+                   "hashicorp/aws/6.70.0/linux_amd64")
+    safety_link.parent.mkdir(parents=True)
+    safety_link.symlink_to(target, target_is_directory=True)
+    roots = _six_roots(tmp_path, attempt)
+    ready = Event()
+    checkpoint = tmp_path / "watcher-checkpoint"
+    original_complete = watch_plan_review._complete_binding
+
+    def initialize_pair_after_selection(path, owned, baseline, cutoff, watch_end, poll,
+                                        mirror_snapshot, expected_cache_links):
+        pair_link = (attempt / "cnb-fixture/fixture-aws/fixture-aws-deployment/"
+                     "terraform-data-pair-afd3ac4c/providers/registry.terraform.io/"
+                     "hashicorp/aws/6.70.0/linux_amd64")
+        pair_link.parent.mkdir(parents=True)
+        pair_link.symlink_to(target, target_is_directory=True)
+        return original_complete(path, owned, baseline, cutoff, watch_end, poll,
+                                 mirror_snapshot, expected_cache_links)
+
+    monkeypatch.setattr(watch_plan_review, "_complete_binding", initialize_pair_after_selection)
+
+    def publish_selected_request():
+        assert ready.wait(2)
+        return _request(attempt, "aws-safety-apply-review-concurrent",
+                        provider="aws", root="safety")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        producer = pool.submit(publish_selected_request)
+        published = watch_plan_review.watch(roots, checkpoint, time.time() + 5,
+                                            poll_seconds=0.005, on_ready=ready.set)
+        request = producer.result()
+    assert published == checkpoint / "aws-safety-apply"
+    assert (checkpoint / "manifest.json").is_file()
+    assert not (request.parent / "operator-review.json").exists()
+    assert "human_review_required=true" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(("provider_root", "relative", "namespace", "provider", "version"), [
     ("aws", "cnb-20261123T130643Z-exp-903-b45cdaa1-aws-20261123T1306-a356363d50c461a781edbf16/20261123T130643Z-exp-903-b45cdaa1-aws/20261123T130643Z-exp-903-b45cdaa1-aws-deployment/terraform-data-safety-365dda5a", "hashicorp", "aws", "6.70.0"),
     ("aws", "cnb-20261123T130643Z-exp-003-e83f53cd-aws-20261123T1306-721bfafb573b50f9cf8ea865/20261123T130643Z-exp-003-e83f53cd-aws/20261123T130643Z-exp-003-e83f53cd-aws-deployment/terraform-data-safety-365dda5a", "hashicorp", "aws", "6.70.0"),
