@@ -1292,6 +1292,21 @@ class CampaignDriver:
     def _reconcile_ambiguous(self, stage: dict[str, Any], journal: dict[str, Any], path: Path) -> None:
         by_id = {item["entry_id"]: item for item in stage["entries"]}
         for entry_id, record in journal["entries"].items():
+            # A terminal factory/lifecycle failure may have durable cleanup
+            # evidence completed after the campaign journal was written. Replay
+            # that evidence as cleanup-only while retaining FAILED and never
+            # dispatching or resuming measurement for this entry.
+            prior_result = record.get("result") or {}
+            if record.get("state") == "failed" and prior_result.get("cleanup_open") is True:
+                recovered = self.reconcile(by_id[entry_id], stage) if self.reconcile else None
+                if (isinstance(recovered, dict) and recovered.get("status") == "failed"
+                        and recovered.get("cleanup_open") is False
+                        and recovered.get("reconciliation") == "cleanup_complete"):
+                    record["result"] = {**prior_result, **recovered,
+                        "cleanup_open": False, "execution": "not_resumed"}
+                    record["cleanup_reconciled_at"] = _now(self.clock).isoformat()
+                    self._archive_closed_entry(stage, by_id[entry_id], record)
+                continue
             if record["state"] not in {"starting", "running"}:
                 continue
             recovered = self.reconcile(by_id[entry_id], stage) if self.reconcile else None

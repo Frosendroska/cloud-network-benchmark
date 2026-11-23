@@ -152,6 +152,38 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     assert len(namespaces) == len(set(namespaces)) == 9
 
 
+def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_entry(
+        repository_root, tmp_path, monkeypatch, request):
+    """A failed entry accepts cleanup reconciliation and remains failed/unresumed."""
+    from cloud_network_benchmark.campaign import CampaignDriver, _write_json
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+    assert [row["entry_id"] for row in stage["entries"][:2]] == ["V-S1", "V-S3"]
+    entry = stage["entries"][0]
+    state_root = Path(stage["state_root"])
+    journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
+    driver = CampaignDriver(clock=Clock(), reconcile=lambda *_: {
+        "status": "failed", "cleanup_open": False, "reconciliation": "cleanup_complete"},
+        launch=lambda *_: pytest.fail("terminal failed entry must never resume"))
+    journal = driver._load_or_create_journal(stage, journal_path)
+    journal["entries"]["V-S1"].update(state="failed", finished_at=Clock().utc_now().isoformat(),
+        error="provider factory failed before initialization completed",
+        result={"cleanup_open": True, "execution": "not_resumed"})
+    _write_json(journal_path, journal)
+    monkeypatch.setattr(CampaignDriver, "_archive_closed_entry", staticmethod(lambda *_: None))
+
+    outcome = driver.run(stage)
+    saved = json.loads(journal_path.read_text())
+    assert saved["entries"]["V-S1"]["state"] == "failed"
+    assert saved["entries"]["V-S1"]["result"]["cleanup_open"] is False
+    assert saved["entries"]["V-S1"]["result"]["execution"] == "not_resumed"
+    assert saved["entries"]["V-S3"]["state"] == "missed"
+    assert outcome["status"] == "awaiting_operator"
+
+
 def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
         repository_root, tmp_path, monkeypatch, request):
     """Exercise real stage generation and driver validation for the frozen all-ready pair."""

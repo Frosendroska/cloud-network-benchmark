@@ -262,6 +262,52 @@ def test_precreation_aws_absence_rejects_wrong_sts_account_before_inventory(tmp_
     assert not runner.requests
 
 
+def test_precreation_receipt_producer_rejects_wrong_frozen_selector(tmp_path):
+    from types import SimpleNamespace
+    from cloud_network_benchmark.precreation_cleanup import _persist_absence_receipt
+
+    record = SimpleNamespace(provider="aws", cleanup_settings_reference=str(tmp_path / "f09-cleanup" / "aws" / "run-deployment.json"))
+    recovery = SimpleNamespace(reservation_id="reservation-1")
+    binding = {"target_selectors": {"aws": "tag:deployment=expected"}}
+    with pytest.raises(ValueError, match="selector differs from frozen target"):
+        _persist_absence_receipt(record, recovery=recovery, binding=binding,
+            proof={"provider": "aws", "verified": True,
+                   "target_selector": "tag:deployment=foreign"}, utc_now=lambda: NOW)
+    assert not tmp_path.joinpath("f09-cleanup").exists()
+
+
+def test_precreation_source_config_uses_verified_repository_source_map(tmp_path):
+    import hashlib
+    from cloud_network_benchmark.precreation_cleanup import _verify_entry_paths
+
+    root = tmp_path / "repo"
+    source = root / "configs" / "source.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_text("source: frozen\n")
+    generated = {}
+    for name, content in (("config", "generated config\n"), ("runtime", "runtime\n"),
+                          ("parent", "manifest\n"), ("cost", "cost\n")):
+        path = tmp_path / f"{name}.json"
+        path.write_text(content)
+        generated[name] = (path, hashlib.sha256(path.read_bytes()).hexdigest())
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    entry = {"config_path": str(generated["config"][0]), "config_sha256": generated["config"][1],
+        "runtime_config_path": str(generated["runtime"][0]), "runtime_config_sha256": generated["runtime"][1],
+        "parent_manifest_path": str(generated["parent"][0]),
+        "source_config_path": str(source), "source_config_sha256": source_hash,
+        "cost_inputs_path": str(generated["cost"][0])}
+    artifacts = {str(path): digest for path, digest in generated.values()}
+    stage = {"repository_root": str(root), "entries": [entry]}
+    draft = {"artifacts": artifacts,
+        "repository_sources": {str(root): {"configs/source.yaml": source_hash}}, "stages": [stage]}
+    paths = {"config_path": generated["config"][0], "runtime_path": generated["runtime"][0],
+        "parent_manifest_path": generated["parent"][0]}
+    assert _verify_entry_paths(draft=draft, entry=entry, **paths)["source_config"] == source_hash
+    draft["repository_sources"][str(root)]["configs/source.yaml"] = "0" * 64
+    with pytest.raises(ValueError, match="repository source map omits"):
+        _verify_entry_paths(draft=draft, entry=entry, **paths)
+
+
 @pytest.mark.parametrize('tamper',[False,True])
 def test_pre_vm_cleanup_receipt_replays_only_original_support_targets(tmp_path,isolated_legacy_provider_financial_boundary,tamper):
     from cloud_network_benchmark.lifecycle_cleanup import replay_saved_cleanup_receipt

@@ -409,9 +409,18 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                         "launch_blocked": True, **cleanup_timing}
                     continue
             if isinstance(ledger_reservation, Mapping):
-                # A local journal flag or stale receipt cannot override an open
-                # original F11 provider cleanup liability.
-                liability = True
+                provider_cleanup = ledger_reservation.get("provider_cleanup", {})
+                acknowledged = provider_cleanup.get(record.provider) if isinstance(provider_cleanup, Mapping) else None
+                if acknowledged is True:
+                    # A closed F11 provider without its exact replayable source
+                    # receipt is blocked. Never repeat an inventory to replace
+                    # missing or corrupt closure evidence.
+                    outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
+                        "errors": ["F11 acknowledges cleanup but the bound receipt is unavailable"],
+                        "launch_blocked": True, **cleanup_timing}
+                    continue
+                if acknowledged is False:
+                    liability = True
         if not liability:
             outcomes[record.provider] = {"cleanup": "not_required", "reconciled": True,
                                          "reason": "journal proves no safety or compute allocation began",

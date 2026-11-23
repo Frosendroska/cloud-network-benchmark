@@ -120,8 +120,22 @@ def _verify_entry_paths(*, draft: dict[str, Any], entry: dict[str, Any],
         verified[name] = expected
     source = Path(entry["source_config_path"]).absolute()
     source_hash = entry["source_config_sha256"]
-    if artifacts.get(str(source)) != source_hash:
-        raise ValueError("frozen artifact map omits the original source configuration")
+    # Frozen campaign drafts bind original repository source files in the
+    # repository_sources tree map; artifacts binds generated/external files.
+    # Require the exact frozen root-relative path and digest from that map.
+    roots = [Path(stage["repository_root"]).resolve()
+        for stage in draft.get("stages", []) if entry in stage.get("entries", [])]
+    if len(roots) != 1:
+        raise ValueError("source configuration has no unique frozen repository root")
+    try:
+        relative_source = source.relative_to(roots[0]).as_posix()
+    except ValueError as exc:
+        raise ValueError("source configuration is outside its frozen repository root") from exc
+    repository_sources = draft.get("repository_sources", {})
+    source_map = repository_sources.get(str(roots[0])) if isinstance(repository_sources, dict) else None
+    if (not isinstance(repository_sources, dict)
+            or not isinstance(source_map, dict) or source_map.get(relative_source) != source_hash):
+        raise ValueError("frozen repository source map omits the original source configuration")
     _file(source, source_hash, "source configuration")
     cost = Path(entry["cost_inputs_path"]).absolute()
     cost_hash = artifacts.get(str(cost))
@@ -170,8 +184,15 @@ def _validate_reservation(*, recovery: Any, entry: dict[str, Any], runtime: dict
             or record.get("creation_claims") not in (None, [])
             or record.get("expiry_fingerprint") is not None
             or (require_open and record.get("provider_cleanup") != {provider: False for provider in children})
+            or not isinstance(record.get("provider_cleanup"), dict)
+            or set(record["provider_cleanup"]) != set(children)
+            or (not require_open and any(type(flag) is not bool for flag in record["provider_cleanup"].values()))
             or record.get("child_identities") != entry["run_ids"]):
         raise ValueError("original F11 reservation contains a claim or identity inconsistent with precreation failure")
+    for row in recovery.providers:
+        acknowledged = record["provider_cleanup"][row.provider]
+        if not row.cleanup_open and not acknowledged:
+            raise ValueError("recovery and F11 provider cleanup states disagree")
     from .contracts.admission import ReservationEvidence
     reservation = ReservationEvidence.model_validate(record["evidence"])
     if (reservation.state != "reserved" or reservation.campaign_id != campaign.campaign_id
@@ -216,8 +237,9 @@ def build_precreation_context(*, draft_path: Path, stage_id: str, entry_id: str,
     draft_path = Path(draft_path)
     source_draft = load_and_verify_draft(draft_path, allow_evidence_for=stage_id)
     entry = _entry(source_draft, stage_id, entry_id)
-    _assert_terminal_factory_and_idle_stage(recovery=recovery, draft=source_draft,
-        stage_id=stage_id, entry_id=entry_id)
+    if not allow_reconciled:
+        _assert_terminal_factory_and_idle_stage(recovery=recovery, draft=source_draft,
+            stage_id=stage_id, entry_id=entry_id)
     verified = _verify_entry_paths(draft=source_draft, entry=entry,
         config_path=config_path, runtime_path=runtime_path,
         parent_manifest_path=parent_manifest_path)
@@ -323,6 +345,8 @@ def _persist_absence_receipt(record: Any, *, recovery: Any, binding: dict[str, A
     provider = record.provider
     if proof.get("provider") != provider or proof.get("verified") is not True:
         raise ValueError("source-bound provider inventory did not prove absence")
+    if proof.get("target_selector") != binding.get("target_selectors", {}).get(provider):
+        raise ValueError("source-bound provider inventory selector differs from frozen target")
     absent_ids = _absence_resource_ids(binding, provider)
     payload = {"schema_version": 1, "kind": "precreation_source_bound_absence",
         "provider": provider, "reservation_id": recovery.reservation_id,
@@ -359,11 +383,13 @@ def replay_precreation_absence_receipt(record: Any, *, recovery: Any, ledger: An
     directory = _receipt_directory(record)
     candidates = sorted(directory.glob(
         f"{recovery.reservation_id}-{record.provider}-precreation-absence-*.json")) if directory.is_dir() else []
-    if len(candidates) != 1:
+    if not candidates:
         return False
+    if len(candidates) != 1:
+        raise ValueError("multiple source-bound precreation receipts are ambiguous")
     path = candidates[0]
     if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
-        return False
+        raise ValueError("source-bound precreation receipt is unsafe")
     raw = path.read_bytes()
     receipt = json.loads(raw)
     digest = hashlib.sha256(raw).hexdigest()
@@ -377,7 +403,7 @@ def replay_precreation_absence_receipt(record: Any, *, recovery: Any, ledger: An
             or receipt.get("incurred_usd") is not None
             or receipt.get("funding_released") is not False
             or receipt.get("binding_sha256") != _digest(receipt.get("binding"))):
-        return False
+        raise ValueError("source-bound precreation receipt failed its digest or identity checks")
     binding = receipt["binding"]
     from .contracts.execution import SubprocessCommandRunner
     try:
@@ -398,16 +424,14 @@ def replay_precreation_absence_receipt(record: Any, *, recovery: Any, ledger: An
             original_session_id=binding["original_session_id"],
             reservation_id=binding["reservation_id"], runner=SubprocessCommandRunner(),
             clock=Clock(), allow_reconciled=True)
-    except (OSError, ValueError, KeyError, TypeError):
-        # The replayer below has the original private recovery journal path in
-        # its caller. A missing source check is always a closed result.
-        return False
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("source-bound precreation receipt no longer matches frozen sources") from exc
     if (verified_binding != binding or binding["reservation_id"] != recovery.reservation_id
             or record.provider not in context
             or context[record.provider]["deployment"].deployment_id != record.deployment_id
             or receipt.get("target_selector") != binding["target_selectors"].get(record.provider)
             or receipt.get("absent_resource_ids") != _absence_resource_ids(binding, record.provider)):
-        return False
+        raise ValueError("source-bound precreation receipt differs from current deployment targets")
     return _reconcile_replayed_receipt(receipt, digest, record, recovery, ledger, path)
 
 
@@ -452,7 +476,7 @@ def run_precreation_cleanup(*, draft_path: Path, stage_id: str, entry_id: str,
         parent_manifest_path=parent_manifest_path, recovery_path=recovery_path,
         repository_root=repository_root, current_session_id=current_session_id,
         original_session_id=original_session_id, reservation_id=reservation_id,
-        runner=runner, clock=clock)
+        runner=runner, clock=clock, allow_reconciled=True)
     if any(Path(row.cleanup_settings_reference).exists()
             for row in recovery.providers if row.cleanup_settings_reference):
         raise ValueError("partial saved provider settings require the ordinary cleanup path")
