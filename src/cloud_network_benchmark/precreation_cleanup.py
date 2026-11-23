@@ -267,7 +267,9 @@ def build_precreation_context(*, draft_path: Path, stage_id: str, entry_id: str,
     if selected != set(children) or selected != {"aws", "azure", "gcp"}:
         raise ValueError("original parent manifest is not the exact three-provider entry")
     campaign, _ = resolve_campaign(Path(config_path), Path(repository_root))
-    if (campaign.mode.value != "acceptance" or campaign.scenario.value not in {"same_zone", "placement_optimization"}
+    mode = getattr(campaign.mode, "value", campaign.mode)
+    scenario = getattr(campaign.scenario, "value", campaign.scenario)
+    if (mode != "acceptance" or scenario not in {"same_zone", "placement_optimization"}
             or campaign.config_source.sha256 != entry["config_sha256"]):
         raise ValueError("frozen config is outside the bounded acceptance recovery scope")
     runtime = load_runtime_config(Path(runtime_path), selected_providers=selected)

@@ -154,8 +154,12 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
 
 def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_entry(
         repository_root, tmp_path, monkeypatch, request):
-    """A failed entry accepts cleanup reconciliation and remains failed/unresumed."""
+    """Blocked CLI timing with verified physical closure does not reopen failed cleanup."""
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+    from types import SimpleNamespace
     from cloud_network_benchmark.campaign import CampaignDriver, _write_json
+    from cloud_network_benchmark.orchestration import SavedLifecycleRecovery, SavedProviderRecovery
 
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
@@ -163,10 +167,37 @@ def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_
     register_generated_cleanup(stage, request)
     assert [row["entry_id"] for row in stage["entries"][:2]] == ["V-S1", "V-S3"]
     entry = stage["entries"][0]
+    recovery_path = Path(entry["private_root"]) / "lifecycle-recovery.json"
+    recovery_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="synthetic-factory-failure",
+        controller_session_id=stage["controller_session_id"], providers=[
+            SavedProviderRecovery(provider=provider, deployment_id=f"{run_id}-deployment",
+                journal_reference=str(recovery_path.parent / provider / "attempt.json"),
+                expiry_registered=False, creation_may_have_started=False, cleanup_open=True,
+                cleanup_timing_status=("late" if provider == "aws" else
+                    "unknown" if provider == "azure" else None))
+            for provider, run_id in entry["run_ids"].items()])
+    recovery_path.write_text(recovery.model_dump_json(indent=2) + "\n")
+    recovery_path.chmod(0o600)
     state_root = Path(stage["state_root"])
     journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
-    driver = CampaignDriver(clock=Clock(), reconcile=lambda *_: {
-        "status": "failed", "cleanup_open": False, "reconciliation": "cleanup_complete"},
+    synthetic_cleanup_hook_calls = []
+    def ordinary_cleanup_cli(command, *, cwd, stdout, stderr, check):
+        assert command[1:3] == ["lifecycle", "cleanup"]
+        from cloud_network_benchmark.lifecycle_cli import main
+        actions = {provider: (lambda _record: synthetic_cleanup_hook_calls.append(provider) or {})
+            for provider in entry["run_ids"]}
+        output = StringIO()
+        with redirect_stdout(output):
+            with redirect_stderr(output):
+                code = main(command[2:], cleanup_actions=actions,
+                    reconcile=lambda _record, _result: {"absence_proved": True,
+                        "billable_resources_present": False, "cleanup_open": False})
+        stdout.write(output.getvalue().encode())
+        return SimpleNamespace(returncode=code)
+    import cloud_network_benchmark.campaign as campaign_module
+    monkeypatch.setattr(campaign_module.subprocess, "run", ordinary_cleanup_cli)
+    driver = CampaignDriver(clock=Clock(), reconcile=CampaignDriver._reconcile_lifecycle,
         launch=lambda *_: pytest.fail("terminal failed entry must never resume"))
     journal = driver._load_or_create_journal(stage, journal_path)
     journal["entries"]["V-S1"].update(state="failed", finished_at=Clock().utc_now().isoformat(),
@@ -180,8 +211,13 @@ def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_
     assert saved["entries"]["V-S1"]["state"] == "failed"
     assert saved["entries"]["V-S1"]["result"]["cleanup_open"] is False
     assert saved["entries"]["V-S1"]["result"]["execution"] == "not_resumed"
+    assert saved["entries"]["V-S1"]["result"]["cleanup_acceptance_failed"] is True
+    assert saved["entries"]["V-S1"]["result"]["cleanup_report"]["status"] == "blocked"
+    assert all(not result["cleanup_open"] and result["absence_proved"]
+        for result in saved["entries"]["V-S1"]["result"]["cleanup_report"]["providers"].values())
     assert saved["entries"]["V-S3"]["state"] == "missed"
     assert outcome["status"] == "awaiting_operator"
+    assert len(synthetic_cleanup_hook_calls) == 3  # In-process test hooks; no provider SDK/CLI.
 
 
 def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
