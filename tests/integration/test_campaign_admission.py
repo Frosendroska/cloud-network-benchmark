@@ -136,7 +136,7 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
         utc_now=clock.utc_now, monotonic_now=clock.monotonic, controller_session_id=stage["controller_session_id"])
     book.initialize(load_cost_inputs(Path(stage["entries"][0]["cost_inputs_path"])))
     namespaces = []
-    for entry in stage["entries"][:2]:
+    for entry in stage["entries"]:
         runtime, parent, children, request, plan = load_entry(stage, entry, repository_root)
         assert runtime["observer"]["stage_id"] == stage["stage_id"]
         assert runtime["observer"]["entry_id"] == entry["entry_id"]
@@ -145,11 +145,11 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
         decision = book.reserve(request, plan=plan)
         assert decision.status == "rejected"
         assert decision.reasons == ("financial_authorization_invalid",)
-        assert len(children) == 3
+        assert len(children) == len(entry["run_ids"])
         assert all(child.mode == "acceptance" for child in children.values())
         assert all(Path(row["bootstrap_template"]).is_file() for row in runtime["providers"].values())
     assert len(book.inspect()["reservations"]) == 0
-    assert len(namespaces) == len(set(namespaces)) == 6
+    assert len(namespaces) == len(set(namespaces)) == 9
 
 
 def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
@@ -253,6 +253,38 @@ def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
     assert all(row["requires_supervision"] for row in stage["entries"] if row["entry_id"].endswith("FAIL"))
     assert all(not Path(path).exists() for path in stage["approval_refs"].values())
 
+    # The unapproved six-entry acceptance + calibration batch must write the
+    # same per-provider rounded estimate that lifecycle request construction
+    # and F11 reservation validation use. Check every provider envelope and
+    # cumulative funding against the generated source without activating it.
+    from decimal import Decimal, ROUND_CEILING
+    from cloud_network_benchmark.admission import rounded_provider_cost_total
+
+    all_entries = stage["entries"] + calibration["entries"]
+    source_payload = json.loads(Path(stage["cost_input_path"]).read_text())
+    templates = source_payload["provider_run_envelope_templates"]
+    cumulative_by_bucket = {}
+    total_provider_liability = Decimal("0")
+    for entry in all_entries:
+        config = yaml.safe_load(Path(entry["config_path"]).read_text())
+        priced = templates[config["config_id"]]
+        selected_rows = {provider: priced[provider] for provider in config["selected_providers"]}
+        estimate = rounded_provider_cost_total(selected_rows)
+        assert Decimal(str(config["admission"]["estimated_cost_usd"]["value"])) == estimate
+        for provider, row in selected_rows.items():
+            provider_total = rounded_provider_cost_total({provider: row})
+            total_provider_liability += provider_total
+            for component in row["components"].values():
+                bucket = component["funding_bucket"]
+                cumulative_by_bucket[bucket] = cumulative_by_bucket.get(bucket, Decimal("0")) + Decimal(
+                    str(component["amount_usd"]))
+    for bucket, amount in cumulative_by_bucket.items():
+        reserved = amount.quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
+        assert reserved <= Decimal(str(source_payload["funding"][bucket]))
+    assert len(all_entries) == 6
+    assert sum(len(entry["run_ids"]) for entry in all_entries) == 12
+    assert total_provider_liability > 0
+
 
 def test_generated_calibration_binds_runtime_observer_without_changing_workload(repository_root, tmp_path, monkeypatch, request):
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
@@ -271,6 +303,15 @@ def test_generated_calibration_binds_runtime_observer_without_changing_workload(
         repository_root=repository_root, config_path=Path(stage["entries"][0]["config_path"]))
     assert len(children) == 3
     assert all(child.mode == "calibration" for child in children.values())
+    runtime, parent, children, reservation_request, admission_plan = load_entry(
+        stage, stage["entries"][0], repository_root)
+    ledger = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
+        utc_now=clock.utc_now, monotonic_now=clock.monotonic,
+        controller_session_id=stage["controller_session_id"])
+    ledger.initialize(load_cost_inputs(Path(stage["entries"][0]["cost_inputs_path"])))
+    decision = ledger.reserve(reservation_request, plan=admission_plan)
+    assert decision.status == "rejected"
+    assert decision.reasons == ("financial_authorization_invalid",)
 
 
 def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repository_root, tmp_path, monkeypatch, request):

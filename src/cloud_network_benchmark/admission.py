@@ -88,6 +88,14 @@ COST_COMPONENTS = (
     "compute", "disks", "addresses", "traffic_export", "tax", "uncertainty", "expiry_cleanup_support",
 )
 
+
+def rounded_provider_cost_total(rows: Mapping[str, Mapping[str, Any]]) -> Decimal:
+    """Sum complete provider liabilities after each provider's USD ceiling."""
+    return sum((sum((Decimal(str(component["amount_usd"]))
+        for component in row["components"].values()), Decimal("0")).quantize(
+            Decimal("0.0001"), rounding=ROUND_CEILING)
+        for row in rows.values()), Decimal("0"))
+
 AZURE_EXP901_TIMING_PROFILE = "azure_exp901_sweden_acceptance_v1"
 AZURE_EXP901_ALLOWANCE = {
     "registration_seconds": 180, "provision_seconds": 240,

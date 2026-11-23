@@ -23,7 +23,8 @@ from typing import Any
 
 import yaml
 
-from .admission import COST_COMPONENTS, WorkflowAllowance, minimum_protocol_seconds
+from .admission import (COST_COMPONENTS, WorkflowAllowance, minimum_protocol_seconds,
+    rounded_provider_cost_total)
 from .config import resolve_campaign
 from .contracts.common import ExperimentMode
 from .manifests import initialize_campaign
@@ -894,8 +895,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         else:
             provider_registration = None
         priced_rows = cost_payload["provider_run_envelope_templates"][data["config_id"]]
-        estimated = sum(Decimal(str(component["amount_usd"]))
-            for provider in data["selected_providers"] for component in priced_rows[provider]["components"].values())
+        estimated = rounded_provider_cost_total({provider: priced_rows[provider]
+            for provider in data["selected_providers"]})
         data["admission"].update(cost_input_id=cost_payload["cost_input_id"],
             prices_checked_on=cost_payload["prices_checked_on"],
             cost_input_sha256={"value": cost_payload["source_sha256"]},

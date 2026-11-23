@@ -101,16 +101,23 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
 
 def test_f11_request_rounds_complete_provider_liabilities_before_aggregation():
     from decimal import ROUND_CEILING
+    from cloud_network_benchmark.admission import rounded_provider_cost_total
 
     raw = {
         "aws": "1.9002126961554286",
         "azure": "3.7598114621877015",
         "gcp": "1.8983905148983125",
     }
-    rounded = [Decimal(value).quantize(Decimal("0.0001"), rounding=ROUND_CEILING)
-        for value in raw.values()]
-    assert rounded == [Decimal("1.9003"), Decimal("3.7599"), Decimal("1.8984")]
-    assert sum(rounded, Decimal("0")) == Decimal("7.5586")
+    rows = {provider: {"components": {"complete": {"amount_usd": value}}}
+        for provider, value in raw.items()}
+    total = rounded_provider_cost_total(rows)
+    assert total == Decimal("7.5586")
+    per_entry = {provider: rounded_provider_cost_total({provider: row})
+        for provider, row in rows.items()}
+    four_fixed_slots = {provider: value * 4 for provider, value in per_entry.items()}
+    assert four_fixed_slots == {"aws": Decimal("7.6012"),
+        "azure": Decimal("15.0396"), "gcp": Decimal("7.5936")}
+    assert sum(four_fixed_slots.values(), Decimal("0")) == Decimal("30.2344")
     raw_sum = sum((Decimal(value) for value in raw.values()), Decimal("0"))
     assert raw_sum.quantize(Decimal("0.0001"), rounding=ROUND_CEILING) == Decimal("7.5585")
 
