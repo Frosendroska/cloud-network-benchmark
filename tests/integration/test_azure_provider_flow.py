@@ -74,6 +74,17 @@ def test_nested_resource_not_found_requires_exact_automation_child_message():
     assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"ambiguous"}),url)
     duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceNotFound","code":"AuthorizationFailed","message":"'+msg+'"}})'})
     assert not _is_exact_missing_automation_child(duplicate,url)
+    parent_message=("The Resource 'Microsoft.Automation/automationAccounts/cnb-attempt-auto' "
+        "under resource group 'cnb-attempt' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    parent_result=accepted.model_copy(update={"stderr":"ERROR: Not Found("+json.dumps(
+        {"error":{"code":"ResourceNotFound","message":parent_message}})+")"})
+    assert _is_exact_missing_automation_child(parent_result,url)
+    assert not _is_exact_missing_automation_child(parent_result.model_copy(update={"stderr":parent_result.stderr.replace("cnb-attempt-auto", "foreign-auto")}),url)
+    group_result=accepted.model_copy(update={"stderr":"ERROR: Not Found("+json.dumps(
+        {"error":{"code":"ResourceGroupNotFound","message":"Resource group 'cnb-attempt' could not be found."}})+")"})
+    assert _is_exact_missing_automation_child(group_result,url)
+    assert not _is_exact_missing_automation_child(group_result.model_copy(update={"stderr":group_result.stderr.replace("cnb-attempt'", "foreign'",1)}),url)
 
 
 def test_actual_job_schedule_absence_passes_production_cleanup_command(repository_root, tmp_path):
@@ -205,7 +216,8 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
             expected_missing_automation_child_url=expected_url)
 
 
-@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "nested_runbook", "authorization", "mixed", "duplicate", "wrong_target"])
+@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "nested_runbook",
+    "missing_parent_account", "missing_parent_group", "authorization", "mixed", "duplicate", "wrong_target"])
 def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
     from cloud_network_benchmark.azure_provider import _verify_profile_absence
     import hashlib
@@ -250,6 +262,14 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
             url=request.argv[request.argv.index("--url")+1]
             if case=="wrong_target" and url==account+"?api-version="+azure_provider.AUTOMATION_API:
                 stderr=actual; stdout=""
+            elif case=="missing_parent_account" and url.startswith(account+"/"):
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto' "
+                    f"under resource group '{_slug(d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"; stdout=""
+            elif case=="missing_parent_group" and url.startswith(account+"/"):
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceGroupNotFound",
+                    "message":f"Resource group '{_slug(d)}' could not be found."}})+")"; stdout=""
             elif url==child_url:
                 stderr=error; stdout="noise" if case=="mixed" else ""
             else:
@@ -257,7 +277,8 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
                 started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
     runner=Runner(); actions=[]
-    if case in {"actual","actual_schedule","actual_runbook","nested_runbook"}:
+    if case in {"actual","actual_schedule","actual_runbook","nested_runbook",
+            "missing_parent_account","missing_parent_group"}:
         _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
         request=next(r for r in runner.requests if "--url" in r.argv
             and f"/{collection}/" in r.argv[r.argv.index("--url")+1])
@@ -433,12 +454,14 @@ class AutomationRunner:
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
                  account_present=True, account_resource_id=None, account_absence="absent",
-                 present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
+                 present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]",
+                 missing_automation_account=False, **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
         self.account_resource_id=account_resource_id
         self.account_absence=account_absence
+        self.missing_automation_account=missing_automation_account
         self.role_definition_inventory=role_definition_inventory
         self.role_assignment_inventory=role_assignment_inventory
         self.present_children=set(present_children if present_children is not None else {"jobSchedules","schedules","runbooks"})
@@ -477,6 +500,13 @@ class CleanupRunner(AutomationRunner):
         elif request.action_type.endswith("_before_delete"):
             self.requests.append(request)
             child_url=request.argv[request.argv.index("--url")+1]
+            if self.missing_automation_account:
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(self.d)}-auto' "
+                    f"under resource group '{_slug(self.d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n"
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
             child=child_url.split("?",1)[0].rsplit("/",2)[-2]
             if child in self.deleted_children or child not in self.present_children:
                 return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr='{"error":{"code":"ResourceNotFound"}}')
@@ -678,6 +708,7 @@ class ProfileCleanupRunner(CleanupRunner):
             out=json.dumps({"value":values})
         elif request.action_type == "profile_absence_automation":
             self.requests.append(request)
+            url=request.argv[request.argv.index("--url")+1]
             if self.missing_group_error is not None:
                 group=("foreign-group" if self.missing_group_error=="foreign" else _slug(self.d))
                 message=f"Resource group '{group}' could not be found."
@@ -686,6 +717,13 @@ class ProfileCleanupRunner(CleanupRunner):
                 return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
                     started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,
                     stdout="",stderr=stderr)
+            if self.missing_automation_account and any(path in url for path in ("/jobSchedules/","/schedules/","/runbooks/")):
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(self.d)}-auto' "
+                    f"under resource group '{_slug(self.d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",
+                    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n")
             if self.corrupt_timer_on_final and any("/runbooks/" in arg for arg in request.argv):
                 self.o.cleanup_timing_path.write_text('{"schema_version":1,"sha256":"corrupt"}')
                 self.timer_corruptions+=1
@@ -733,6 +771,27 @@ def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
     assert any(r.action_type=="profile_absence_role_definitions" for r in runner.requests)
     assert any(r.action_type=="profile_absence_role_definitions_page_2" for r in runner.requests)
     assert any(r.action_type=="profile_absence_automation" for r in runner.requests)
+
+
+def test_cleanup_resume_accepts_exact_missing_automation_account_for_all_owned_children(
+        repository_root:Path,tmp_path:Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    expiry=register_profile_expiry(d,o,start,now,registration)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    runner=ProfileCleanupRunner(d,o,now,role_pages=True,missing_automation_account=True)
+    result=destroy(registered,o,runner,clock=lambda:1100.0,
+        utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked,result.failures
+    actions=[request.action_type for request in runner.requests]
+    assert all(actions.count(f"expiry_{collection}_before_delete")==1
+        for collection in ("jobSchedules","schedules","runbooks"))
+    assert not any(action in actions for action in
+        ("expiry_jobSchedules_delete","expiry_schedules_delete","expiry_runbooks_delete"))
+    assert "expiry_destroy" in actions and "automation_account_absence" in actions
+    assert actions.count("profile_absence_automation")==4
+    assert {"role_cleanup_inventory","role_definition_cleanup_inventory"}.issubset(actions)
 
 
 @pytest.mark.parametrize(("missing_group_error","expected_cleanup"), [

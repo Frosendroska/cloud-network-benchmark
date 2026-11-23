@@ -993,12 +993,19 @@ def _is_exact_missing_automation_child(result: CommandResult, expected_url: str)
     if nested_url is None or not isinstance(payload, dict) or set(payload) != {"error"}:
         return False
     parts=nested_url.groupdict()
-    expected_message=(f"The Resource 'Microsoft.Automation/automationAccounts/{parts['account']}/"
+    missing_resource_message=(f"The Resource 'Microsoft.Automation/automationAccounts/{parts['account']}/"
         f"{parts['collection']}/{parts['child']}' under resource group '{parts['group']}' was not found. "
         "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    missing_account_message=(f"The Resource 'Microsoft.Automation/automationAccounts/{parts['account']}' "
+        f"under resource group '{parts['group']}' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
     error=payload["error"]
-    return (isinstance(error,dict) and set(error)=={"code","message"}
-        and error.get("code")=="ResourceNotFound" and error.get("message")==expected_message)
+    if not isinstance(error,dict) or set(error)!={"code","message"}:
+        return False
+    return ((error.get("code")=="ResourceNotFound"
+            and error.get("message") in {missing_resource_message,missing_account_message})
+        or (error.get("code")=="ResourceGroupNotFound"
+            and error.get("message")==f"Resource group '{parts['group']}' could not be found."))
 
 
 def _azure_tsv_content_matches(stdout: str, expected_sha256: str) -> bool:
