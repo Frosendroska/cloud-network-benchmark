@@ -174,8 +174,12 @@ def _is_alive(item: ProcIdentity) -> bool:
         return True
     except ProcessLookupError:
         return False
+    except FileNotFoundError:
+        # A successful pidfd SIGKILL can reap `/proc/<pid>` before the next
+        # state poll. The held pidfd still identifies the original process.
+        return False
     except OSError as exc:
-        if exc.errno == 3:  # ESRCH
+        if exc.errno in {2, 3}:  # ENOENT / ESRCH
             return False
         raise
 
@@ -224,13 +228,20 @@ def freeze_tree(tree: dict[int, ProcIdentity]) -> list[ProcIdentity]:
 
 
 def freeze_fixed_point(root_pid: int, *, expected_uid: int | None = None,
-                       rounds: int = 8) -> tuple[dict[int, ProcIdentity], list[ProcIdentity]]:
+                       rounds: int = 8,
+                       expected_root_identity: ProcIdentity | None = None
+                       ) -> tuple[dict[int, ProcIdentity], list[ProcIdentity]]:
     """Freeze all descendants, including new-session children, to a stable set."""
     held: dict[int, ProcIdentity] = {}
     frozen_pids: set[int] = set()
     try:
         for _ in range(rounds):
             fresh = capture_tree(root_pid, expected_uid=expected_uid)
+            if expected_root_identity is not None:
+                fresh_root = fresh.get(root_pid)
+                if fresh_root is None or not expected_root_identity.same(fresh_root):
+                    close_tree(fresh)
+                    raise ValueError("root process identity changed before fixed-point freeze")
             duplicates: list[int] = []
             for pid, identity in fresh.items():
                 previous = held.get(pid)
@@ -438,8 +449,8 @@ def revalidate_before_freeze(binding: dict[str, Any]) -> None:
         raise ValueError("original provider expiry or cap changed before freeze")
 
 
-def campaign_supervisor_pid(binding: dict[str, Any]) -> int:
-    """Resolve the original campaign supervisor only from its prepared state PID file."""
+def campaign_supervisor_pid(binding: dict[str, Any]) -> ProcIdentity:
+    """Resolve and retain the original campaign supervisor's verified pidfd."""
     stage = json.loads(_bound_file(Path(binding["prepared_stage"])))
     pid_path = Path(stage["state_root"]) / "campaign-supervisor.pid"
     raw = _bound_file(pid_path).decode("ascii").strip()
@@ -447,6 +458,7 @@ def campaign_supervisor_pid(binding: dict[str, Any]) -> int:
         raise ValueError("campaign supervisor PID file is malformed")
     pid = int(raw)
     identity = _proc_identity(pid)
+    valid = False
     try:
         expected_root = str(Path(binding["repository_root"]).resolve(strict=True))
         args = identity.cmdline.decode("utf-8", errors="replace").split("\0")
@@ -455,9 +467,11 @@ def campaign_supervisor_pid(binding: dict[str, Any]) -> int:
                 or "--state-root" not in args
                 or str(Path(stage["state_root"]).resolve(strict=True)) not in args):
             raise ValueError("PID file does not identify the source-bound campaign supervisor process")
-        return pid
+        valid = True
+        return identity
     finally:
-        os.close(identity.fd)
+        if not valid:
+            os.close(identity.fd)
 
 
 def write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
@@ -788,20 +802,29 @@ def supervise_failure_entry(prepared_stage: Path, entry_id: str) -> dict[str, An
         campaign_journal=stage_dir / "campaign-journal.json",
         recovery=Path(entry["private_root"]) / "lifecycle-recovery.json",
         runtime_config=Path(entry["runtime_config_path"]), entry_id=entry_id)
-    pid = campaign_supervisor_pid(binding)
+    verified_supervisor = campaign_supervisor_pid(binding)
+    pid = verified_supervisor.pid
     attempt_dir = stage_dir / "operator-recovery" / entry_id
-    attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-    os.chmod(attempt_dir, 0o700)
-    checkpoint = attempt_dir / "checkpoint.json"
-    fault_path = attempt_dir / "server-fault-proof.json"
-    expiry_path = attempt_dir / "expiry-proof.json"
-    initial_tree = capture_tree(pid, expected_uid=os.getuid())
+    try:
+        attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        os.chmod(attempt_dir, 0o700)
+        checkpoint = attempt_dir / "checkpoint.json"
+        fault_path = attempt_dir / "server-fault-proof.json"
+        expiry_path = attempt_dir / "expiry-proof.json"
+        initial_tree = capture_tree(pid, expected_uid=os.getuid())
+        captured_supervisor = initial_tree.get(pid)
+        if captured_supervisor is None or not verified_supervisor.same(captured_supervisor):
+            close_tree(initial_tree)
+            raise ValueError("campaign supervisor PID changed after PID-file verification")
+    finally:
+        os.close(verified_supervisor.fd)
     supervisor = RecoverySupervisor(checkpoint=checkpoint, binding=binding, tree=initial_tree)
     tree: dict[int, ProcIdentity] = initial_tree
     frozen: list[ProcIdentity] = []
     fault_recorded = False
     try:
-        new_tree, frozen = freeze_fixed_point(pid, expected_uid=os.getuid())
+        new_tree, frozen = freeze_fixed_point(pid, expected_uid=os.getuid(),
+            expected_root_identity=tree[pid])
         for old_pid, old_identity in tree.items():
             newer = new_tree.get(old_pid)
             if newer is None or not old_identity.same(newer):

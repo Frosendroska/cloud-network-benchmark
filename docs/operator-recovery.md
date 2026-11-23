@@ -24,9 +24,11 @@ Use the registered entry matching the single provider: `V-A-FAIL` for AWS,
 `V-Z-FAIL` for Azure, or `V-G-FAIL` for GCP. The helper derives the campaign
 supervisor PID only from the original `campaign-supervisor.pid`, then verifies
 its UID, boot ID, start ticks, working directory, module command line, and state
-root. It holds pidfds in that helper process. It captures descendants by
-ancestry, including children in separate sessions, and freezes child-first to
-a stable process-tree fixed point. It does not use a shared process group.
+root. It retains that verified pidfd until the first ancestry capture confirms
+the same process identity, closing the PID-reuse gap before any stop signal. It
+captures descendants by ancestry, including children in separate sessions,
+and freezes child-first to a stable process-tree fixed point. It does not use a
+shared process group.
 After freezing, it revalidates the immutable prepared entry, parent/child IDs,
 source configs, runtime, saved cleanup settings, recovery liabilities, provider
 expiry, and original cap before accepting a guest fault receipt. Observer

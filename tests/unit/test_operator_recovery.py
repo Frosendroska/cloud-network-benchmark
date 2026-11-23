@@ -221,6 +221,138 @@ def test_missing_expiry_proof_claims_exact_cleanup_once(monkeypatch, tmp_path):
         supervisor.close()
 
 
+def test_supervise_missing_fault_at_cutoff_retires_then_runs_one_cleanup(monkeypatch, tmp_path):
+    import hashlib
+
+    stage_id = "acceptance-stage"
+    stage_root = tmp_path / "state" / stage_id
+    stage_root.mkdir(parents=True)
+    recovery_path = tmp_path / "private" / "lifecycle-recovery.json"
+    recovery_path.parent.mkdir(mode=0o700)
+    recovery_path.write_text("{}\n")
+    recovery_path.chmod(0o600)
+    source = tmp_path / "source-bound-input.json"
+    source.write_text('{"original":true}\n')
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text("{}\n")
+    stage = {"stage_id": stage_id, "state_root": str(tmp_path / "state"),
+        "entries": [{"entry_id": "V-A-FAIL", "private_root": str(recovery_path.parent),
+            "runtime_config_path": str(runtime)}]}
+    prepared = stage_root / "prepared-stage.json"
+    prepared.write_text(json.dumps(stage) + "\n")
+    prepared.chmod(0o600)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    cutoff = now - timedelta(seconds=2)
+    expiry_window = {"latest_safe_cleanup_start": cutoff.isoformat(),
+        "expiry_at": (cutoff - timedelta(minutes=10)).isoformat(),
+        "cap_at": (cutoff + timedelta(seconds=660)).isoformat(),
+        "cleanup_seconds": 660, "provider": "aws", "registration_id": "original-registration",
+        "target_selector": "exact-target", "expected_state": "stopped", "action": "stop",
+        "binding_sha256": "a" * 64}
+    binding = {"entry_id": "V-A-FAIL", "provider": "aws", "recovery": str(recovery_path),
+        "controller_session_id": "original-session", "repository_root": str(tmp_path),
+        "server_fault_unit": "cnb-original-deployment-iperf3.service",
+        "bindings": {str(source): source_hash}, "original_expiry_request": expiry_window}
+    monkeypatch.setattr(recovery, "bind_failure_attempt", lambda **_: binding)
+    pid = 987654321
+    identity_fields = (pid, 1, os.getuid(), "test-boot", 42, str(tmp_path), b"supervisor-cmdline")
+
+    def identity():
+        return recovery.ProcIdentity(*identity_fields, os.open(os.devnull, os.O_RDONLY))
+
+    verified, initial, frozen = identity(), identity(), identity()
+    monkeypatch.setattr(recovery, "campaign_supervisor_pid", lambda _: verified)
+    monkeypatch.setattr(recovery, "capture_tree", lambda *_, **__: {pid: initial})
+    monkeypatch.setattr(recovery, "freeze_fixed_point", lambda *_, **__: ({pid: frozen}, []))
+    monkeypatch.setattr(recovery, "_is_alive", lambda _: False)
+    monkeypatch.setattr(recovery, "terminate_tree", lambda _: None)
+    monkeypatch.setattr(recovery, "revalidate_before_freeze", lambda _: None)
+
+    original_retire = recovery.RecoverySupervisor.retire_after_unproved_fault
+
+    def retire_and_change_source(supervisor, reason):
+        original_retire(supervisor, reason)
+        source.write_text('{"changed_after_retirement":true}\n')
+
+    monkeypatch.setattr(recovery.RecoverySupervisor, "retire_after_unproved_fault",
+        retire_and_change_source)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        kwargs["stdout"].write(json.dumps({"execution": "not_resumed", "status": "complete",
+            "providers": {"aws": {"cleanup_open": False, "absence_proved": True,
+                "billable_resources_present": False}}}).encode())
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    result = recovery.supervise_failure_entry(prepared, "V-A-FAIL")
+    checkpoint_path = stage_root / "operator-recovery" / "V-A-FAIL" / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert len(calls) == 1
+    assert calls[0][0] == recovery.cleanup_command(recovery_path, "original-session")
+    assert result["expiry_status"] == "expiry_unproved_cleanup_priority"
+    assert result["cleanup_complete"] is True
+    assert checkpoint["phase"] == "cleanup_finished"
+    assert checkpoint["server_fault_status"] == "inconclusive"
+    assert checkpoint["reason"] == "server_fault_proof_missing_at_original_cleanup_cutoff"
+    assert checkpoint["source_integrity_status"] == "changed_or_unreadable"
+    assert checkpoint["source_integrity_paths"] == [str(source)]
+    assert "run" not in calls[0][0] and "campaign" not in calls[0][0]
+
+
+def test_supervise_refuses_pid_reuse_before_any_freeze_or_signal(monkeypatch, tmp_path):
+    stage_root = tmp_path / "state" / "stage-pid-reuse"
+    stage_root.mkdir(parents=True)
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text("{}\n")
+    prepared = stage_root / "prepared-stage.json"
+    prepared.write_text(json.dumps({"stage_id": "stage-pid-reuse", "state_root": str(tmp_path / "state"),
+        "entries": [{"entry_id": "V-A-FAIL", "private_root": str(private),
+            "runtime_config_path": str(runtime)}]}) + "\n")
+    pid = 987654322
+    binding = {"recovery": str(private / "lifecycle-recovery.json")}
+
+    def identity(start_ticks):
+        return recovery.ProcIdentity(pid, 1, os.getuid(), "test-boot", start_ticks,
+            str(tmp_path), b"supervisor-cmdline", os.open(os.devnull, os.O_RDONLY))
+
+    verified, reused = identity(42), identity(43)
+    monkeypatch.setattr(recovery, "bind_failure_attempt", lambda **_: binding)
+    monkeypatch.setattr(recovery, "campaign_supervisor_pid", lambda _: verified)
+    monkeypatch.setattr(recovery, "capture_tree", lambda *_, **__: {pid: reused})
+    monkeypatch.setattr(recovery, "freeze_fixed_point",
+        lambda *_, **__: pytest.fail("PID reuse must be rejected before freezing"))
+
+    with pytest.raises(ValueError, match="PID changed after PID-file verification"):
+        recovery.supervise_failure_entry(prepared, "V-A-FAIL")
+    for identity_fd in (verified.fd, reused.fd):
+        with pytest.raises(OSError):
+            os.fstat(identity_fd)
+
+
+def test_fixed_point_rejects_root_reuse_before_stop(monkeypatch, tmp_path):
+    pid = 987654323
+
+    def identity(start_ticks):
+        return recovery.ProcIdentity(pid, 1, os.getuid(), "test-boot", start_ticks,
+            str(tmp_path), b"supervisor-cmdline", os.open(os.devnull, os.O_RDONLY))
+
+    verified, reused = identity(42), identity(43)
+    monkeypatch.setattr(recovery, "capture_tree", lambda *_, **__: {pid: reused})
+    monkeypatch.setattr(recovery, "freeze_tree",
+        lambda _: pytest.fail("reused root must be rejected before any stop"))
+    with pytest.raises(ValueError, match="root process identity changed"):
+        recovery.freeze_fixed_point(pid, expected_uid=os.getuid(),
+            expected_root_identity=verified)
+    os.close(verified.fd)
+    with pytest.raises(OSError):
+        os.fstat(reused.fd)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux /proc and pidfds")
 def test_process_identity_comparison_detects_pid_reuse_or_mutation():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
