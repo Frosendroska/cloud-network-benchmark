@@ -40,16 +40,40 @@ def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_ke
 def test_missing_automation_child_wrapper_is_typed_and_unique():
     from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_child
     now=datetime.now(timezone.utc)
+    expected_url=("/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cnb-attempt"
+        "/providers/Microsoft.Automation/automationAccounts/cnb-attempt-auto/jobSchedules/"
+        "00000000-0000-0000-0000-000000000123?api-version="+azure_provider.AUTOMATION_API)
     stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
     accepted=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
         finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
-    assert _is_exact_missing_automation_child(accepted)
-    assert _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":""})'}))
-    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"unexpected"}))
-    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}))
-    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":null})'}))
+    assert _is_exact_missing_automation_child(accepted,expected_url)
+    assert _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":""})'}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"unexpected"}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":null})'}),expected_url)
     duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'})
-    assert not _is_exact_missing_automation_child(duplicate)
+    assert not _is_exact_missing_automation_child(duplicate,expected_url)
+
+
+def test_nested_resource_not_found_requires_exact_automation_child_message():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_child
+    now=datetime.now(timezone.utc)
+    url=("/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cnb-attempt"
+        "/providers/Microsoft.Automation/automationAccounts/cnb-attempt-auto/runbooks/"
+        "cnb-attempt-deallocate?api-version="+azure_provider.AUTOMATION_API)
+    msg=("The Resource 'Microsoft.Automation/automationAccounts/cnb-attempt-auto/runbooks/"
+        "cnb-attempt-deallocate' under resource group 'cnb-attempt' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":msg}})+")\n"
+    accepted=CommandResult(action_id="runbook-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    assert _is_exact_missing_automation_child(accepted,url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("cnb-attempt-deallocate", "foreign-runbook")}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("cnb-attempt' was", "foreign-group' was")}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("ResourceNotFound", "AuthorizationFailed", 1)}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"ambiguous"}),url)
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceNotFound","code":"AuthorizationFailed","message":"'+msg+'"}})'})
+    assert not _is_exact_missing_automation_child(duplicate,url)
 
 
 def test_actual_job_schedule_absence_passes_production_cleanup_command(repository_root, tmp_path):
@@ -119,6 +143,26 @@ def test_actual_blank_schedule_absence_passes_production_cleanup_command(reposit
     assert len(actions)==1 and actions[0]["outcome"]=="failed"
 
 
+def test_actual_nested_runbook_absence_passes_production_cleanup_command(repository_root,tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    runbook=_slug(d)+"-deallocate"
+    message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto/runbooks/{runbook}' "
+        f"under resource group '{_slug(d)}' was not found. For more details please go to "
+        "https://aka.ms/ARMResourceNotFoundFix")
+    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n"
+    result=CommandResult(action_id="runbook-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    class Runner:
+        def run(self,request):
+            assert request.action_type=="expiry_runbooks_before_delete"
+            return result.model_copy(update={"action_id":request.action_id})
+    actions=[]
+    azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,account,"runbooks",runbook,lambda:1.0,actions)
+    assert len(actions)==1 and actions[0]["outcome"]=="failed"
+
+
 @pytest.mark.parametrize("stderr,stdout,collection", [
     ('ERROR: Not Found({"code":"AuthorizationFailed","message":"Job Schedule not found."})\n', "", "jobSchedules"),
     ('ERROR: Not Found({"code":"NotFound","message":"Schedule not found."})\n', "", "jobSchedules"),
@@ -161,7 +205,7 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
             expected_missing_automation_child_url=expected_url)
 
 
-@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "authorization", "mixed", "duplicate", "wrong_target"])
+@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "nested_runbook", "authorization", "mixed", "duplicate", "wrong_target"])
 def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
     from cloud_network_benchmark.azure_provider import _verify_profile_absence
     import hashlib
@@ -170,7 +214,7 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
     job_id="00000000-0000-0000-0000-000000000123"
     collection=("schedules" if case=="actual_schedule" else
-        "runbooks" if case=="actual_runbook" else "jobSchedules")
+        "runbooks" if case in {"actual_runbook","nested_runbook"} else "jobSchedules")
     child_name=(_slug(d)+"-once" if collection=="schedules" else
         _slug(d)+"-deallocate" if collection=="runbooks" else job_id)
     child_url=f"{account}/{collection}/{child_name}?api-version={azure_provider.AUTOMATION_API}"
@@ -185,6 +229,11 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
     elif case=="mixed": error=actual
     elif case=="duplicate": error='ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'
     elif case in {"actual_schedule","actual_runbook"}: error='ERROR: Not Found({"code":"NotFound","message":""})'
+    elif case=="nested_runbook":
+        message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto/runbooks/{child_name}' "
+            f"under resource group '{_slug(d)}' was not found. For more details please go to "
+            "https://aka.ms/ARMResourceNotFoundFix")
+        error="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"
     else: error=actual
     class Runner:
         def __init__(self): self.requests=[]
@@ -208,7 +257,7 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
                 started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
     runner=Runner(); actions=[]
-    if case in {"actual","actual_schedule","actual_runbook"}:
+    if case in {"actual","actual_schedule","actual_runbook","nested_runbook"}:
         _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
         request=next(r for r in runner.requests if "--url" in r.argv
             and f"/{collection}/" in r.argv[r.argv.index("--url")+1])

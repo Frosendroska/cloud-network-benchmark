@@ -965,8 +965,8 @@ def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_gro
         and error.get("code") == "ResourceGroupNotFound" and error.get("message") == expected_message)
 
 
-def _is_exact_missing_automation_child(result: CommandResult) -> bool:
-    """Accept Azure CLI's typed NotFound wrapper; caller must bind the exact child URL."""
+def _is_exact_missing_automation_child(result: CommandResult, expected_url: str) -> bool:
+    """Accept typed CLI absence wrappers only with the exact owned child URL."""
     if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
         return False
     wrapped = re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*", result.stderr, re.DOTALL)
@@ -983,8 +983,22 @@ def _is_exact_missing_automation_child(result: CommandResult) -> bool:
         payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
     except (json.JSONDecodeError, ValueError):
         return False
-    return (isinstance(payload, dict) and set(payload) == {"code", "message"}
-        and payload.get("code") == "NotFound" and isinstance(payload.get("message"), str))
+    if (isinstance(payload, dict) and set(payload) == {"code", "message"}
+            and payload.get("code") == "NotFound" and isinstance(payload.get("message"), str)):
+        return True
+    nested_url = re.fullmatch(
+        r"/subscriptions/[^/?]+/resourceGroups/(?P<group>[^/?]+)/providers/Microsoft\.Automation/"
+        r"automationAccounts/(?P<account>[^/?]+)/(?P<collection>jobSchedules|schedules|runbooks)/"
+        r"(?P<child>[^/?]+)\?api-version="+re.escape(AUTOMATION_API), expected_url)
+    if nested_url is None or not isinstance(payload, dict) or set(payload) != {"error"}:
+        return False
+    parts=nested_url.groupdict()
+    expected_message=(f"The Resource 'Microsoft.Automation/automationAccounts/{parts['account']}/"
+        f"{parts['collection']}/{parts['child']}' under resource group '{parts['group']}' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    error=payload["error"]
+    return (isinstance(error,dict) and set(error)=={"code","message"}
+        and error.get("code")=="ResourceNotFound" and error.get("message")==expected_message)
 
 
 def _azure_tsv_content_matches(stdout: str, expected_sha256: str) -> bool:
@@ -1143,7 +1157,7 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         and not any(flag in argv for flag in ("--body","--headers","--query","--resource"))
         and subscription_values == [options.subscription_id]
         and child_identity_valid
-        and _is_exact_missing_automation_child(result))
+        and _is_exact_missing_automation_child(result,expected_missing_automation_child_url))
     accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
@@ -1313,7 +1327,8 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
         allow_not_found=True,expected_missing_automation_child_url=expected_missing_automation_child_url)
     actions.append(_safe_cleanup_action(options,read))
     if read.outcome=="failed" and (_is_exact_not_found(read)
-            or (expected_missing_automation_child_url is not None and _is_exact_missing_automation_child(read))): return
+            or (expected_missing_automation_child_url is not None
+                and _is_exact_missing_automation_child(read,expected_missing_automation_child_url))): return
     try: observed=json.loads(read.stdout)
     except (json.JSONDecodeError,TypeError) as exc: raise RuntimeError(f"Azure {collection} readback is malformed") from exc
     expected=base.split("?",1)[0]
@@ -1325,7 +1340,8 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
         allow_not_found=True,expected_missing_automation_child_url=expected_missing_automation_child_url)
     actions.append(_safe_cleanup_action(options,verify))
     if verify.outcome!="failed" or not (_is_exact_not_found(verify)
-            or (expected_missing_automation_child_url is not None and _is_exact_missing_automation_child(verify))):
+            or (expected_missing_automation_child_url is not None
+                and _is_exact_missing_automation_child(verify,expected_missing_automation_child_url))):
         raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 
@@ -1434,7 +1450,7 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
             if result.outcome != "failed" or not (_is_exact_not_found(result)
                     or _is_exact_missing_attempt_resource_group(result, state["resource_group"])
                     or (expected_missing_automation_child_url is not None
-                        and _is_exact_missing_automation_child(result))):
+                        and _is_exact_missing_automation_child(result,expected_missing_automation_child_url))):
                 raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
 
 
