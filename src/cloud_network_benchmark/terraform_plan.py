@@ -9,8 +9,8 @@ import hashlib
 import json
 import math
 import os
-import fcntl
 import re
+import fcntl
 from pathlib import Path
 import tempfile
 import time
@@ -271,6 +271,12 @@ def _gcp_scope(r: dict, root: str, v: dict) -> None:
         for role in ("a", "b"):
             _fields(r[f"google_compute_instance_from_template.vm_{role}"], {"project": v["project_id"], "name": v[f"name_{role}"], "zone": v[f"zone_{role}"], "source_instance_template": v[f"template_{role}"]}, f"GCP VM {role}")
         return
+    policy_name = v.get("placement_policy_name")
+    if v.get("scenario") == "placement_optimization":
+        if not isinstance(policy_name, str) or re.fullmatch(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?", policy_name) is None:
+            raise PlanReviewError("GCP S3 requires the exact valid registered placement policy name")
+    elif policy_name != "":
+        raise PlanReviewError("non-S3 GCP protection must not carry a placement policy name")
     for address, a in r.items():
         if address.startswith("google_compute_"):
             _same(a.get("project"), v["project_id"], address + " project")
@@ -308,7 +314,7 @@ def _gcp_scope(r: dict, root: str, v: dict) -> None:
         _fields(affinity[0], {"type": "NO_RESERVATION"}, "GCP reservation affinity")
     if "google_compute_resource_policy.compact[0]" in r:
         policy = r["google_compute_resource_policy.compact[0]"]
-        _fields(policy, {"name": v["namespace"] + "-compact", "region": v["zone_a"].rsplit("-", 1)[0]}, "GCP compact policy")
+        _fields(policy, {"name": v["placement_policy_name"], "region": v["zone_a"].rsplit("-", 1)[0]}, "GCP compact policy")
         groups = policy.get("group_placement_policy", [])
         if len(groups) != 1 or groups[0].get("max_distance"): raise PlanReviewError("unexpected GCP placement scope")
         _fields(groups[0], {"collocation": "COLLOCATED"}, "GCP placement")

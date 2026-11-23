@@ -580,6 +580,9 @@ class GcpProviderDriver:
             raise GcpProviderError("scenario zones must match the selected V2 topology", category="scenario_unsupported")
         if deployment.scenario == "placement_optimization" and deployment.placement.kind != "compact_placement_policy":
             raise GcpProviderError("S3 requires same-zone compact placement", category="scenario_unsupported")
+        if deployment.scenario == "placement_optimization" and (
+                not deployment.placement.name or not re.fullmatch(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?", deployment.placement.name)):
+            raise GcpProviderError("S3 requires a valid registered GCP compact placement policy name", category="placement_missing")
         if deployment.scenario == "inter_region" and deployment.vm_b.region != "europe-west2":
             raise GcpProviderError("S4 receiver must be in London", category="scenario_unsupported")
 
@@ -1069,6 +1072,7 @@ class GcpProviderDriver:
                 expected = {
                     "namespace": self._namespace(deployment),
                     "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario,
+                    "placement_policy_name": deployment.placement.name or "",
                     "image_a": self.settings.images.get(deployment.vm_a.region),
                     "image_b": self.settings.images.get(deployment.vm_b.region),
                 }
@@ -1082,7 +1086,7 @@ class GcpProviderDriver:
         if variables is not None:
             template = variables
         elif root == "protection":
-            template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
+            template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "placement_policy_name": deployment.placement.name or "", "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
         else:
             template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
         template.update(extra)
@@ -1196,8 +1200,11 @@ class GcpProviderDriver:
     def _selected_policy_path(self, deployment: ProviderDeploymentInput) -> str | None:
         if deployment.scenario != "placement_optimization":
             return None
+        name = deployment.placement.name
+        if not name:
+            raise GcpProviderError("S3 requires the registered compact placement policy name", category="placement_missing")
         region = deployment.vm_a.region
-        return f"projects/{self.settings.project_id}/regions/{region}/resourcePolicies/{self._namespace(deployment)}-compact"
+        return f"projects/{self.settings.project_id}/regions/{region}/resourcePolicies/{name}"
 
     @staticmethod
     def _namespace(deployment: ProviderDeploymentInput) -> str:

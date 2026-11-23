@@ -24,6 +24,10 @@ resource "terraform_data" "scope_guard" {
       can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_b)))
       error_message = "GCP protection requires two concrete pinned Ubuntu 24.04 amd64 images."
     }
+    precondition {
+      condition = var.scenario == "placement_optimization" ? can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.placement_policy_name)) : var.placement_policy_name == ""
+      error_message = "GCP protection requires exactly the registered compact policy name for S3 and none for other scenarios."
+    }
   }
 }
 resource "google_compute_network" "attempt" {
@@ -82,7 +86,7 @@ resource "google_compute_firewall" "pair_icmp" {
 resource "google_compute_resource_policy" "compact" {
   depends_on = [terraform_data.scope_guard]
   count      = var.scenario == "placement_optimization" ? 1 : 0
-  name       = "${var.namespace}-compact"
+  name       = var.placement_policy_name
   region     = local.region_a
   group_placement_policy {
     collocation = "COLLOCATED"

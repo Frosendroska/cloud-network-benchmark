@@ -30,7 +30,7 @@ def scope(provider, root, scenario="same_zone"):
             for role in ("a", "b"):
                 r["google_compute_instance_from_template.vm_" + role] = {"project": v["project_id"], "zone": v["zone_" + role], "name": v["name_" + role], "source_instance_template": v["template_" + role]}
             return v, r
-        v.update(namespace="scope", scenario=scenario, controller_cidr="203.0.113.4/32", public_key="fixture-public-key", labels={"cnb-run": "run", "cnb-deploy": "deploy"}, expiry_time="2026-11-14T00:20:00Z", image_a="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", image_b="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105")
+        v.update(namespace="scope", scenario=scenario, placement_policy_name="registered-s3-policy" if scenario == "placement_optimization" else "", controller_cidr="203.0.113.4/32", public_key="fixture-public-key", labels={"cnb-run": "run", "cnb-deploy": "deploy"}, expiry_time="2026-11-14T00:20:00Z", image_a="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", image_b="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105")
         if scenario == "inter_region": v["zone_b"] = "europe-west2-a"
         ips = ["10.80.1.10", "10.81.1.11" if scenario == "inter_region" else "10.80.1.11"]
         r = {"terraform_data.scope_guard": {"input": v["project_id"]}, "google_compute_network.attempt": {"project": v["project_id"], "name": "scope-net", "auto_create_subnetworks": False, "mtu": 1460}, "google_compute_subnetwork.a": {"project": v["project_id"], "name": "scope-a", "region": "europe-north1", "ip_cidr_range": "10.80.1.0/24"}}
@@ -39,7 +39,7 @@ def scope(provider, root, scenario="same_zone"):
         for i, role in enumerate(("a", "b")):
             r[f'google_compute_instance_template.role["vm_{role}"]'] = {"project": v["project_id"], "name": "scope-"+role, "machine_type": "n2-standard-4", "can_ip_forward": False, "labels": v["labels"], "scheduling": [{"provisioning_model": "STANDARD", "automatic_restart": False, "instance_termination_action": "STOP", "termination_time": v["expiry_time"]}], "disk": [{"source_image": v["image_"+role], "disk_size_gb": 32, "disk_type": "pd-balanced", "boot": True, "auto_delete": True}], "network_interface": [{"network_ip": ips[i], "nic_type": "GVNIC", "access_config": [{}]}], "reservation_affinity": [{"type": "NO_RESERVATION"}]}
         if scenario == "inter_region": r["google_compute_subnetwork.b[0]"] = {"project": v["project_id"], "name": "scope-b", "region": "europe-west2", "ip_cidr_range": "10.81.1.0/24"}
-        if scenario == "placement_optimization": r["google_compute_resource_policy.compact[0]"] = {"project": v["project_id"], "name": "scope-compact", "region": "europe-north1", "group_placement_policy": [{"collocation": "COLLOCATED"}]}
+        if scenario == "placement_optimization": r["google_compute_resource_policy.compact[0]"] = {"project": v["project_id"], "name": v["placement_policy_name"], "region": "europe-north1", "group_placement_policy": [{"collocation": "COLLOCATED"}]}
         return v, r
     v = dict(account_id="238360820461", resource_namespace="scope", run_id="run-aws", deployment_id="run-aws-deployment")
     if root == "safety":
@@ -74,6 +74,17 @@ def test_all_four_roots_have_exact_fresh_scope(provider, root):
     v, resources = scope(provider,root)
     checked = tp.validate_scope(plan_document(v,resources,provider), provider, ROOT/"terraform"/provider/root, v)
     assert len(checked) == len(resources)
+
+
+def test_gcp_s3_plan_requires_registered_policy_name():
+    v, resources = scope("gcp", "protection", "placement_optimization")
+    accepted = plan_document(v, resources, "gcp")
+    tp.validate_scope(accepted, "gcp", ROOT/"terraform/gcp/protection", v)
+    wrong = deepcopy(accepted)
+    policy = next(item for item in wrong["resource_changes"] if item["address"] == "google_compute_resource_policy.compact[0]")
+    policy["change"]["after"]["name"] = v["namespace"] + "-compact"
+    with pytest.raises(tp.PlanReviewError, match="GCP compact policy"):
+        tp.validate_scope(wrong, "gcp", ROOT/"terraform/gcp/protection", v)
 
 
 def test_aws_expiry_scope_binds_optional_permissions_boundary_to_configured_account():

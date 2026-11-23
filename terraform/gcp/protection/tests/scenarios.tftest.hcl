@@ -3,6 +3,7 @@ mock_provider "google" {}
 variables {
   project_id         = "cnb-test-12345"
   namespace          = "gcp-campaign-run-abcdef12"
+  placement_policy_name = ""
   scenario           = "same_zone"
   expiry_time        = "2026-10-23T18:00:00Z"
   image_a            = "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-v20261001"
@@ -64,14 +65,19 @@ run "finland_same_zone" {
 run "finland_s3_collocated_without_distance" {
   command = plan
   variables {
-    scenario = "placement_optimization"
-    zone_a   = "europe-north1-c"
-    zone_b   = "europe-north1-c"
+    scenario              = "placement_optimization"
+    placement_policy_name = "cnb-v-s3-0645901bca"
+    zone_a                = "europe-north1-c"
+    zone_b                = "europe-north1-c"
   }
   assert {
     condition = (length(google_compute_resource_policy.compact) == 1 &&
     google_compute_resource_policy.compact[0].group_placement_policy[0].collocation == "COLLOCATED")
     error_message = "Finland S3 uses the provider-native COLLOCATED placement policy"
+  }
+  assert {
+    condition     = google_compute_resource_policy.compact[0].name == var.placement_policy_name
+    error_message = "Finland S3 preserves the exact registered placement policy name"
   }
 }
 

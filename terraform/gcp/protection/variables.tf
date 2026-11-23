@@ -1,6 +1,7 @@
 variable "project_id" { type = string }
 variable "namespace" { type = string }
 variable "scenario" { type = string }
+variable "placement_policy_name" { type = string }
 variable "expiry_time" { type = string }
 variable "image_a" { type = string }
 variable "image_b" { type = string }

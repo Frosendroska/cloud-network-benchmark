@@ -98,7 +98,7 @@ def test_provider_rejects_noncanonical_scenario_zones(tmp_path):
 
 def test_finland_provider_scope_supports_research_identity_and_rejects_other_scenarios(tmp_path):
     from cloud_network_benchmark.providers.gcp import GcpProviderError
-    deployment, _ = _cleanup_fixture(tmp_path)
+    deployment, fixture_driver = _cleanup_fixture(tmp_path)
     deployment = deployment.model_copy(update={
         "vm_a": deployment.vm_a.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c"}),
         "vm_b": deployment.vm_b.model_copy(update={"region": "europe-north1", "zone": "europe-north1-c"}),
@@ -109,9 +109,14 @@ def test_finland_provider_scope_supports_research_identity_and_rejects_other_sce
     s3_acceptance = deployment.model_copy(update={
         "experiment_id": "EXP-003", "mode": "acceptance", "context": "standard",
         "scenario": "placement_optimization",
-        "placement": deployment.placement.model_copy(update={"kind": "compact_placement_policy", "name": "reviewed-s3", "collocated": True}),
+        "placement": deployment.placement.model_copy(update={"kind": "compact_placement_policy", "name": "cnb-v-s3-0645901bca", "collocated": True}),
     })
     GcpProviderDriver._validate_deployment(s3_acceptance)
+    assert fixture_driver._selected_policy_path(s3_acceptance) == "projects/cnb-test-12345/regions/europe-north1/resourcePolicies/cnb-v-s3-0645901bca"
+    with pytest.raises(GcpProviderError, match="valid registered"):
+        GcpProviderDriver._validate_deployment(s3_acceptance.model_copy(update={
+            "placement": s3_acceptance.placement.model_copy(update={"name": "Bad/Name"})
+        }))
     frankfurt_fallback = study.model_copy(update={
         "vm_a": study.vm_a.model_copy(update={"region": "europe-west3", "zone": "europe-west3-a"}),
         "vm_b": study.vm_b.model_copy(update={"region": "europe-west3", "zone": "europe-west3-a"}),
@@ -312,7 +317,7 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     if scenario == "cross_zone":
         vm_b = vm_b.model_copy(update={"zone": "europe-west3-b"})
     elif scenario == "placement_optimization":
-        placement = placement.model_copy(update={"kind": "compact_placement_policy", "collocated": True})
+        placement = placement.model_copy(update={"kind": "compact_placement_policy", "name": "cnb-v-s3-0645901bca", "collocated": True})
     elif scenario == "inter_region":
         vm_b = vm_b.model_copy(update={"region": "europe-west2", "zone": "europe-west2-a"})
     deployment = base.model_copy(update={"scenario": scenario, "vm_b": vm_b, "placement": placement})
@@ -325,7 +330,7 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
     now = datetime.now(timezone.utc)
     trigger = deployment.reservation.value.expires_at.value-timedelta(seconds=SAFETY_LEAD_SECONDS)
     namespace = f"gcp-{deployment.run_id[:25]}-{hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:8]}"
-    policy_id = f"projects/{settings.project_id}/regions/europe-west3/resourcePolicies/{namespace}-compact" if scenario == "placement_optimization" else None
+    policy_id = f"projects/{settings.project_id}/regions/{deployment.vm_a.region}/resourcePolicies/{deployment.placement.name}" if scenario == "placement_optimization" else None
     host_blob = base64.b64encode(struct.pack(">I", 11)+b"ssh-ed25519"+struct.pack(">I", 32)+b"h"*32).decode()
     class FakeRunner:
         def __init__(self): self.requests=[]
@@ -369,8 +374,8 @@ def test_full_fake_register_provision_trust_cleanup_trace_for_each_scenario(tmp_
                         "extra": [policy_id, extra],
                         "duplicate": [policy_id, policy_id],
                         "missing": [],
-                        "foreign": [f"projects/foreign-project/regions/europe-west3/resourcePolicies/{namespace}-compact"],
-                        "mismatched": [f"projects/{settings.project_id}/regions/europe-west2/resourcePolicies/{namespace}-compact"],
+                        "foreign": [f"projects/foreign-project/regions/{deployment.vm_a.region}/resourcePolicies/{deployment.placement.name}"],
+                        "mismatched": [f"projects/{settings.project_id}/regions/europe-west2/resourcePolicies/{deployment.placement.name}"],
                     }[policy_mutation]
                 return result(instance)
             if action == "gcp-guest-hostkeys": return result({"queryValue":{"items":[{"namespace":"hostkeys","key":"ssh-ed25519","value":host_blob}]}})
@@ -1212,7 +1217,7 @@ def test_scenario_matrix_requires_review_for_cross_zone_compact_and_inter_region
     cases = [deployment]
     cross_b = deployment.vm_b.model_copy(update={"zone": "europe-west3-b"})
     cases.append(deployment.model_copy(update={"scenario": Scenario.CROSS_ZONE, "vm_b": cross_b}))
-    compact = deployment.model_copy(update={"scenario": Scenario.PLACEMENT_OPTIMIZATION, "placement": deployment.placement.model_copy(update={"kind": "compact_placement_policy", "collocated": True})})
+    compact = deployment.model_copy(update={"scenario": Scenario.PLACEMENT_OPTIMIZATION, "placement": deployment.placement.model_copy(update={"kind": "compact_placement_policy", "name": "reviewed-s3", "collocated": True})})
     cases.append(compact)
     london_b = deployment.vm_b.model_copy(update={"region": "europe-west2", "zone": "europe-west2-a"})
     cases.append(deployment.model_copy(update={"scenario": Scenario.INTER_REGION, "vm_b": london_b}))
