@@ -20,7 +20,7 @@ from . import terraform_plan as tp
 
 
 # SHA-256 of terraform_plan.py at integrated core baseline def3a5cd922ccf034166070ed9eb76817f2703e6.
-PINNED_VALIDATOR_SHA256 = "45b2a0df8db281b1e7a7b0ebd7517982f1820c294f6b7ce767ea2f5bcab5675c"
+PINNED_VALIDATOR_SHA256 = "1665d4e3e414a0c81c6f480b5acd0b8b955584e5601afc57a7a48806cab7a205"
 
 
 def digest(data: bytes) -> str:
@@ -753,6 +753,8 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
         request_bytes = _regular(req_path)
         binding = json.loads(request_bytes)
         directory = req_path.parent
+        deadline_epoch = min(deadline_epoch,
+            tp.original_review_cutoff(directory, binding, deadline_epoch))
         plan_bytes = _regular(directory / "saved-plan.json")
         binary_bytes = _regular(directory / "saved.tfplan")
         if digest(plan_bytes) != binding.get("json_sha256") or digest(binary_bytes) != binding.get("plan_sha256"):
@@ -875,7 +877,8 @@ def disclose(roots: list[Path], checkpoint_root: Path, deadline_epoch: float,
             print("human_review_required=true deadline_utc_epoch=" + str(deadline_epoch))
             print(shlex.join(["python", "-m", "cloud_network_benchmark.terraform_plan", row["review_directory"],
                               "--request-sha256", row["request_sha256"], "--reviewer", "<human reviewer>",
-                              "--inspection", "Completed full payload and comparison; checkpoint " + manifest_hash]))
+                              "--inspection", "Completed full payload and comparison; checkpoint " + manifest_hash,
+                              "--deadline-utc-epoch", str(deadline_epoch)]))
         return published
     except BaseException:
         # Preserve any partial checkpoint for forensic inspection; never overwrite or erase it.

@@ -22,6 +22,16 @@ def _constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is forbidden: {value}")
 
 
+def _plan_review_timeout_seconds(options: dict[str, Any], workflow_profile: str | None) -> int:
+    """Resolve source-configured review time while preserving existing defaults."""
+    value = options.get("plan_review_timeout_seconds", 50 if workflow_profile else 0)
+    if type(value) is not int or not 0 <= value <= 600:
+        raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
+    if workflow_profile is not None and value == 0:
+        raise ValueError("plan_review_timeout_seconds must be positive for profiled runtime")
+    return value
+
+
 def _observer_progress_callback(observer_config: dict[str, Any] | None):
     if observer_config is None:
         return None
@@ -318,9 +328,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
         options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
         if "plan_review_timeout_seconds" in present:
-            seconds = options["plan_review_timeout_seconds"]
-            if type(seconds) is not int or not 0 <= seconds <= 600:
-                raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
+            _plan_review_timeout_seconds(options, workflow_profile)
         if "iam_settle_seconds" in present:
             seconds = options["iam_settle_seconds"]
             if type(seconds) is not int or not 0 <= seconds <= 60:
@@ -684,6 +692,11 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
         "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
             runtime["allowance"], "preparation").total_seconds),
         "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
+        "workflow_profile": runtime.get("workflow_profile"),
+        "workflow_cap_started_monotonic": float(record["cap_start_monotonic"])
+            if runtime.get("workflow_profile") else None,
+        "registration_allowance_seconds": ceil(runtime["allowance"].registration_seconds),
+        "provision_allowance_seconds": ceil(runtime["allowance"].provision_seconds),
         "registration_timeout_seconds": runtime.get("provider_registration_timeout_seconds", ceil(runtime["allowance"].registration_seconds))}
     if observation.admission.requires_primary_review:
         review = sources.get("primary_review_path")
@@ -701,7 +714,7 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
     settings = AwsRuntimeSettings(**settings_values,
         iam_settle_seconds=options.get("iam_settle_seconds", 0),
         expiry_role_permissions_boundary_arn=options.get("expiry_role_permissions_boundary_arn"),
-        plan_review_timeout_seconds=50 if runtime.get("workflow_profile") else options.get("plan_review_timeout_seconds", 0),
+        plan_review_timeout_seconds=_plan_review_timeout_seconds(options, runtime.get("workflow_profile")),
         plan_review_admission_path=runtime.get("plan_review_admission_path"),
         cleanup_routine_seconds=600 if runtime.get("workflow_profile") else None,
         cleanup_absence_seconds=60 if runtime.get("workflow_profile") else None)
@@ -950,6 +963,11 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
                     runtime["allowance"], "preparation").total_seconds),
                 "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
+                "workflow_profile": runtime.get("workflow_profile"),
+                "workflow_cap_started_monotonic": float(record["cap_start_monotonic"])
+                    if runtime.get("workflow_profile") else None,
+                "registration_allowance_seconds": ceil(runtime["allowance"].registration_seconds),
+                "provision_allowance_seconds": ceil(runtime["allowance"].provision_seconds),
                 "registration_timeout_seconds": runtime.get("provider_registration_timeout_seconds", ceil(runtime["allowance"].registration_seconds))}
             if observation.admission.requires_primary_review:
                 review = row["sources"].get("primary_review_path")
@@ -958,7 +976,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             settings = AwsRuntimeSettings(**settings_args,
                 iam_settle_seconds=config.get("iam_settle_seconds", 0),
                 expiry_role_permissions_boundary_arn=config.get("expiry_role_permissions_boundary_arn"),
-                plan_review_timeout_seconds=50 if runtime.get("workflow_profile") else config.get("plan_review_timeout_seconds", 0),
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
                 plan_review_admission_path=runtime.get("plan_review_admission_path"),
                 cleanup_routine_seconds=600 if runtime.get("workflow_profile") else None,
                 cleanup_absence_seconds=60 if runtime.get("workflow_profile") else None)
@@ -998,7 +1016,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
             settings = GcpRuntimeSettings(**settings_args,
                 registration_timeout_seconds=runtime.get("provider_registration_timeout_seconds", 180),
-                plan_review_timeout_seconds=50 if runtime.get("workflow_profile") else config.get("plan_review_timeout_seconds", 0),
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
                 plan_review_admission_path=runtime.get("plan_review_admission_path"))
             driver = GcpProviderDriver(runner, settings, clock=clock.utc_now,
                 monotonic_clock=clock.monotonic)
@@ -1061,7 +1079,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     if deployment.admission.timing_profile else None),
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
-                plan_review_timeout_seconds=50 if runtime.get("workflow_profile") else config.get("plan_review_timeout_seconds", 0),
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
                 plan_review_admission_path=runtime.get("plan_review_admission_path"))
             name, ids = azure_provider._validate_request(deployment, options,
                 reservation.cap_started_at.value, None, check_live_clock=False)

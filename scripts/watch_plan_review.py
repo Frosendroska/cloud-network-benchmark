@@ -137,15 +137,30 @@ def watch(roots: list[Path], checkpoint: Path, watch_end_epoch: float,
             publication = request.stat()
             if publication.st_mtime < watch_started or publication.st_mtime > time.time() + 1:
                 raise PlanReviewError("newly observed request predates this watcher and is stale")
-            cutoff = min(publication.st_mtime + 40.0, watch_end_epoch)
+            cutoff = min(publication.st_mtime + plan_disclosure.tp.LEGACY_PUBLICATION_REVIEW_SECONDS,
+                         watch_end_epoch)
+            try:
+                published_binding = json.loads(plan_disclosure._regular(request))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                published_binding = None
+            if isinstance(published_binding, dict):
+                timing_fields = {"review_window_seconds", "review_deadline_utc_epoch",
+                                 "review_published_at_utc_epoch"}
+                if timing_fields & published_binding.keys():
+                    cutoff = plan_disclosure.tp.original_review_cutoff(
+                        directory, published_binding, watch_end_epoch)
             if time.time() >= cutoff:
-                raise PlanReviewError("original publication-plus-40-second cutoff elapsed")
+                raise PlanReviewError("original producer review cutoff elapsed before disclosure")
             for marker in ("operator-review.json", "accepted-review.json", "review-cancelled.json", "failure.json"):
                 if (directory / marker).exists() or (directory / marker).is_symlink():
                     raise PlanReviewError("new request is accepted, cancelled, or no longer pending")
             binding, request_bytes, request_mtime_ns, request_hash = _complete_binding(
                 request, owned, baseline, cutoff, watch_end_epoch, poll_seconds,
                 mirror_snapshot, current_cache_links)
+            cutoff = plan_disclosure.tp.original_review_cutoff(
+                directory, binding, watch_end_epoch)
+            if time.time() >= cutoff:
+                raise PlanReviewError("original producer review cutoff elapsed before disclosure")
             if not isinstance(binding, dict) or not isinstance(binding.get("action_id"), str):
                 raise PlanReviewError("new original request has no valid action identity")
             current_publication = request.stat()

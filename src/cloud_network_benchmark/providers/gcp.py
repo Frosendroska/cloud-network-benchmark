@@ -101,6 +101,11 @@ class GcpRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
+        if self.workflow_cap_started_monotonic is not None and (
+                not isfinite(self.workflow_cap_started_monotonic)
+                or self.registration_allowance_seconds <= 0
+                or self.provision_allowance_seconds <= 0):
+            raise ValueError("profiled GCP review requires its original cap anchor and stage allowances")
         validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
@@ -184,6 +189,7 @@ class GcpProviderDriver:
 
     def register_expiry(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ExpiryEvidence:
         self._deadline = None
+        self._provider_stop_deadline = None
         reservation = self._validate(deployment, request)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
@@ -201,7 +207,20 @@ class GcpProviderDriver:
             return ExpiryEvidence.model_validate(journal["expiry"])
         if journal.get("registration_may_have_started"):
             raise GcpProviderError("an earlier interrupted registration cannot be restarted under this attempt", category="cleanup_open")
-        self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds, time.monotonic() + max(0.0, (trigger - self.clock()).total_seconds()))
+        self._provider_stop_deadline = time.monotonic() + max(0.0,
+            (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+        if self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            self._deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="registration", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        else:
+            self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds,
+                self._provider_stop_deadline)
         journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": CONTROLLER_SESSION_ID})
         self._save(attempt, journal)
         try:
@@ -291,7 +310,20 @@ class GcpProviderDriver:
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
         self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "preparation"))
-        self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds), time.monotonic() + max(0.0, (trigger-self.clock()).total_seconds()))
+        self._provider_stop_deadline = time.monotonic() + max(0.0,
+            (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+        if self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            self._deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        else:
+            self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds
+                or self.settings.registration_timeout_seconds), self._provider_stop_deadline)
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
@@ -936,28 +968,67 @@ class GcpProviderDriver:
             if os.path.exists(name): os.unlink(name)
 
     def _run(self, action: str, argv: list[str], cwd: Path, timeout: int | None = None) -> CommandResult:
-        limit = min(timeout or self.settings.command_timeout_seconds, self.settings.command_timeout_seconds)
-        if self._deadline is not None:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
-            limit = min(limit, remaining)
+        command_limit = min(timeout or self.settings.command_timeout_seconds,
+            self.settings.command_timeout_seconds)
+        reviewed_apply = "apply" in argv and any(a.startswith("-chdir=") for a in argv)
+        started = time.monotonic()
+        hard_deadline = self._deadline if self._deadline is not None else float("inf")
+        if reviewed_apply and self.settings.workflow_cap_started_monotonic is not None:
+            cap_start = self.settings.workflow_cap_started_monotonic
+            elapsed = started - cap_start
+            if not isfinite(elapsed) or elapsed < 0:
+                raise GcpProviderError("original monotonic workflow anchor is invalid", category="cap_order", action_id=action)
+            root_arg = next(a.split("=", 1)[1] for a in argv if a.startswith("-chdir="))
+            terraform_root = Path(root_arg).name
+            if terraform_root == "protection":
+                stage = "registration"
+            elif terraform_root == "pair":
+                stage = "provision"
+            else:
+                raise GcpProviderError("profiled reviewed apply has an unknown workflow stage", category="allowance_invalid", action_id=action)
+            from ..terraform_plan import workflow_review_stage_deadline
+            # Review queue time is charged to the original registered workflow
+            # stage. Provider API commands retain their own registration limits;
+            # every Terraform command remains capped below by command_limit.
+            if self._provider_stop_deadline is None:
+                raise GcpProviderError("registered provider STOP deadline is unavailable", category="stop_deadline_invalid", action_id=action)
+            hard_deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=cap_start,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage=stage, overall_deadline=cap_start + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        hard_remaining = hard_deadline - started
+        if hard_remaining <= 0:
+            raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
+        if not (reviewed_apply and self.settings.workflow_cap_started_monotonic is not None):
+            hard_remaining = min(hard_remaining, command_limit + (self.settings.plan_review_timeout_seconds
+                if reviewed_apply else 0))
+        total_deadline = started + hard_remaining
+        init_limit = min(command_limit, hard_remaining)
         from ..terraform_work import private_terraform_environment, initialize_terraform
-        command_deadline = time.monotonic() + limit
-        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
+        command_deadline = started + init_limit
+        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=init_limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
         if not hasattr(self, "_initialized_terraform"):
             self._initialized_terraform = set()
         initialize_terraform(self.runner, request, self._initialized_terraform)
         remaining_after_init = command_deadline - time.monotonic()
         if remaining_after_init <= 0:
             raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
-        request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
+        request_budget = (total_deadline - time.monotonic()) if reviewed_apply else min(
+            request.timeout_seconds, remaining_after_init)
+        if request_budget <= 0:
+            raise GcpProviderError("original workflow request budget elapsed during private Terraform initialization",
+                category="command_timeout", action_id=action)
+        request = request.model_copy(update={"timeout_seconds": request_budget})
         def execute(request):
             result = self.runner.run(request)
             self._record_command(request, result)
             return result
-        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+        if reviewed_apply:
             from ..terraform_plan import reviewed_apply
             return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                command_timeout_seconds=command_limit,
                 review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 

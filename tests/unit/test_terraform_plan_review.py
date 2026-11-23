@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,197 @@ def test_review_window_uses_legacy_request_budget_or_explicit_manual_window(
     tp.reviewed_apply(req, runner.run, review_seconds=review_seconds)
     assert observed == [expected_deadline]
     assert runner.requests[-1].argv[2] == "apply"
+
+
+@pytest.mark.parametrize(("request_budget", "expected_apply_budget"), [(240, 120), (180, 60)])
+def test_queued_review_debits_original_plan_queue_and_manual_budget(
+        tmp_path, monkeypatch, request_budget, expected_apply_budget):
+    elapsed = [100.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0] - 100.0)
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": request_budget})
+    original_run = runner.run
+
+    def timed_run(command):
+        if command.argv[2] in {"plan", "show"}:
+            elapsed[0] += 5
+        return original_run(command)
+
+    runner.run = timed_run
+    # This represents the earlier normal parent's 55-second inspection while
+    # this request waits for the campaign-wide review slot.
+    monkeypatch.setattr(tp, "_review_admission_lock",
+        lambda _path, _deadline: elapsed.__setitem__(0, elapsed[0] + 55))
+    observed = {}
+
+    def inspect(directory, binding, deadline):
+        observed.update(binding=binding, deadline=deadline)
+        publication_epoch = binding["review_published_at_utc_epoch"]
+        os.utime(directory / "review-request.json", (publication_epoch, publication_epoch))
+        assert binding["review_window_seconds"] == 120
+        cutoff = tp.original_review_cutoff(directory, binding, publication_epoch + 120)
+        assert cutoff <= binding["review_deadline_utc_epoch"]
+        assert cutoff <= publication_epoch + 120
+        elapsed[0] += 55  # a complete second normal root review
+        return {"decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "full bounded payload reviewed"}
+
+    monkeypatch.setattr(tp, "await_review", inspect)
+    result = tp.reviewed_apply(req, runner.run, review_seconds=120,
+        command_timeout_seconds=120, review_admission_path=tmp_path / "review.lock")
+    assert result.outcome == "succeeded"
+    assert runner.requests[-1].argv[2] == "apply"
+    assert runner.requests[-1].timeout_seconds == expected_apply_budget
+    assert observed["deadline"] == min(100.0 + request_budget, 165.0 + 120)
+
+
+@pytest.mark.parametrize(("registration_deadline", "expect_all_gates"), [(900, True), (300, False)])
+def test_six_child_protection_then_pair_reviews_fit_only_original_stages(
+        tmp_path, monkeypatch, registration_deadline, expect_all_gates):
+    """Six serialized 55s inspections consume the sourced stage clock; commands stay <=120s."""
+    elapsed = [0.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0])
+    original_private = tp._private
+    def private_at_fake_publication(path, content):
+        original_private(path, content)
+        if path.name == "review-request.json":
+            published = json.loads(content)["review_published_at_utc_epoch"]
+            os.utime(path, (published, published))
+    monkeypatch.setattr(tp, "_private", private_at_fake_publication)
+    review_calls = []
+    failures = []
+
+    def run_stage(stage_name, stage_deadline):
+        completed = 0
+        for child in range(6):
+            child_dir = tmp_path / f"{stage_name}-{child}"
+            child_dir.mkdir()
+            req, runner = request(child_dir)
+            starting = elapsed[0]
+            req = req.model_copy(update={"timeout_seconds": max(1, stage_deadline - starting)})
+            real_run = runner.run
+
+            def timed_run(command):
+                assert command.timeout_seconds <= 120
+                if command.argv[2] in {"plan", "show"}:
+                    elapsed[0] += 5
+                return real_run(command)
+
+            runner.run = timed_run
+
+            def inspect(directory, binding, deadline):
+                review_calls.append((stage_name, child, deadline))
+                elapsed[0] += 55
+                if elapsed[0] >= min(starting + req.timeout_seconds, stage_deadline):
+                    return {"decision": "approved", "binding": binding,
+                        "reviewer": "offline fixture", "inspection": "late review"}
+                return {"decision": "approved", "binding": binding,
+                    "reviewer": "offline fixture", "inspection": "bounded complete review"}
+
+            monkeypatch.setattr(tp, "await_review", inspect)
+            try:
+                tp.reviewed_apply(req, runner.run, review_seconds=120,
+                    command_timeout_seconds=120,
+                    review_admission_path=tmp_path / f"{stage_name}.lock")
+            except tp.PlanReviewError as exc:
+                failures.append((stage_name, child, str(exc)))
+                assert not any(command.argv[2] == "apply" for command in runner.requests)
+                assert not next(child_dir.glob("*-review-*")).joinpath("accepted-review.json").exists()
+                return completed
+            assert runner.requests[-1].argv[2] == "apply"
+            assert runner.requests[-1].timeout_seconds <= 120
+            completed += 1
+        return completed
+
+    protection = run_stage("protection", registration_deadline)
+    if expect_all_gates:
+        assert protection == 6, failures
+        # Pair gates use the original cumulative registration + provision cap.
+        pair = run_stage("pair", 1800)
+        assert pair == 6
+        assert len(review_calls) == 12
+        assert elapsed[0] < 1800
+    else:
+        assert protection < 6
+        assert failures
+
+
+@pytest.mark.parametrize(("stage", "overall", "stop", "expected"), [
+    ("registration", 3100.0, 2600.0, 1000.0),
+    ("provision", 3100.0, 2600.0, 1900.0),
+    ("provision", 1500.0, 2600.0, 1500.0),
+    ("provision", 3100.0, 1700.0, 1700.0),
+])
+def test_review_stage_deadline_preserves_original_stage_overall_and_stop_caps(
+        stage, overall, stop, expected):
+    assert tp.workflow_review_stage_deadline(cap_started_monotonic=100.0,
+        registration_allowance_seconds=900, provision_allowance_seconds=900,
+        stage=stage, overall_deadline=overall, stop_deadline=stop) == expected
+
+
+def test_failure_profile_review_deadline_keeps_300_second_registration_stage():
+    assert tp.workflow_review_stage_deadline(cap_started_monotonic=100.0,
+        registration_allowance_seconds=300, provision_allowance_seconds=900,
+        stage="registration", overall_deadline=3100.0, stop_deadline=2600.0) == 400.0
+
+
+def test_receipt_after_finite_review_cutoff_never_reaches_apply(tmp_path, monkeypatch):
+    elapsed = [100.0]
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": 240})
+
+    def late_receipt(directory, binding, deadline):
+        (directory / "operator-review.json").write_text(json.dumps({
+            "decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "completed"}))
+        elapsed[0] = deadline + 0.1
+        return {"decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "completed"}
+
+    monkeypatch.setattr(tp, "await_review", late_receipt)
+    with pytest.raises(tp.PlanReviewError, match="review cutoff"):
+        tp.reviewed_apply(req, runner.run, review_seconds=50)
+    assert not any(command.argv[2] == "apply" for command in runner.requests)
+    assert not next(tmp_path.glob("*-review-*")).joinpath("accepted-review.json").exists()
+
+
+@pytest.mark.parametrize("condition", ["late", "cancelled", "request_mutated"])
+def test_manual_receipt_helper_rejects_late_cancelled_or_mutated_review(
+        tmp_path, monkeypatch, condition):
+    elapsed = [100.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0] - 100.0)
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": 240})
+    request_hashes = []
+
+    def invoke_helper(directory, binding, deadline):
+        request_path = directory / "review-request.json"
+        publication = binding["review_published_at_utc_epoch"]
+        os.utime(request_path, (publication, publication))
+        request_hash = hashlib.sha256(request_path.read_bytes()).hexdigest()
+        request_hashes.append((directory, request_hash))
+        if condition == "late":
+            elapsed[0] = deadline + 1
+        elif condition == "cancelled":
+            (directory / "review-cancelled.json").write_text("{}")
+        else:
+            request_path.write_text("{}")
+        return tp.record_operator_review(directory, request_hash, "offline reviewer", "checked", deadline_utc_epoch=deadline)
+
+    monkeypatch.setattr(tp, "await_review", invoke_helper)
+    with pytest.raises(tp.PlanReviewError):
+        tp.reviewed_apply(req, runner.run, review_seconds=50,
+            review_admission_path=tmp_path / "review.lock")
+    directory = request_hashes[0][0]
+    assert not (directory / "operator-review.json").exists()
+    assert not any(command.argv[2] == "apply" for command in runner.requests)
 
 
 def test_saved_apply_uses_fresh_provider_budget_after_review(tmp_path, monkeypatch):

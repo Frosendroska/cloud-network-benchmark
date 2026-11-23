@@ -32,6 +32,20 @@ def test_runtime_config_requires_exact_provider_selection(tmp_path):
         load_runtime_config(path, selected_providers={"gcp"})
 
 
+def test_profile_review_timeout_is_source_configured_finite_and_keeps_legacy_default():
+    from cloud_network_benchmark.lifecycle_runtime import _plan_review_timeout_seconds
+
+    assert _plan_review_timeout_seconds({}, "all_cloud_acceptance_v1") == 50
+    assert _plan_review_timeout_seconds({"plan_review_timeout_seconds": 120},
+        "all_cloud_acceptance_v1") == 120
+    assert _plan_review_timeout_seconds({}, None) == 0
+    assert _plan_review_timeout_seconds({"plan_review_timeout_seconds": 30}, None) == 30
+    for value in (0, 601, 120.0, True, "120"):
+        with pytest.raises(ValueError, match="plan_review_timeout_seconds"):
+            _plan_review_timeout_seconds({"plan_review_timeout_seconds": value},
+                "all_cloud_acceptance_v1")
+
+
 def test_post_provision_remainder_uses_only_the_original_reserved_components():
     from cloud_network_benchmark.lifecycle_runtime import _post_provision_seconds
     allowance = WorkflowAllowance(registration_seconds=10, provision_seconds=20,

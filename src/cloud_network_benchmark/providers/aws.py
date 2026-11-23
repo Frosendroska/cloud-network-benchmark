@@ -99,6 +99,10 @@ class AwsRuntimeSettings(StrictModel):
     cost_source_path: str = Field(min_length=1)
     complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
+    workflow_profile: str | None = None
+    workflow_cap_started_monotonic: float | None = None
+    registration_allowance_seconds: int = Field(default=0, ge=0)
+    provision_allowance_seconds: int = Field(default=0, ge=0)
     post_registration_workflow_seconds: int = Field(gt=0)
     post_provision_workflow_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
@@ -129,6 +133,12 @@ class AwsRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_paths(self) -> "AwsRuntimeSettings":
+        profile_timing = self.workflow_profile is not None
+        if (profile_timing != (self.workflow_cap_started_monotonic is not None)
+                or (profile_timing and (not isfinite(self.workflow_cap_started_monotonic)
+                    or self.registration_allowance_seconds <= 0
+                    or self.provision_allowance_seconds <= 0))):
+            raise ValueError("profiled AWS review requires its original cap anchor and stage allowances")
         if set(self.ami_ids) - {"eu-central-1", "eu-west-2", "eu-north-1"} or not self.ami_ids:
             raise ValueError("ami_ids may identify only the selected AWS regions")
         if any(not re.fullmatch(r"ami-[a-f0-9]{8,17}", image) for image in self.ami_ids.values()):
@@ -196,6 +206,7 @@ class AwsProviderDriver:
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
+        self._registration_review_deadline: float | None = None
         self._cleanup_deadline: float | None = None
         self._cleanup_acceptance_deadlines: list[datetime] = []
         self._precreate_deadline: float | None = None
@@ -208,6 +219,21 @@ class AwsProviderDriver:
         try:
             self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
             regions, reservation, trigger = self._validate_registration(deployment, request)
+            if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+                from ..terraform_plan import workflow_review_stage_deadline
+                cap_start = self.settings.workflow_cap_started_monotonic
+                if cap_start > time.monotonic():
+                    raise AwsProviderError("original workflow cap anchor is invalid", category="cap_order")
+                stop_deadline = time.monotonic() + max(0.0,
+                    (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+                self._registration_deadline = workflow_review_stage_deadline(
+                    cap_started_monotonic=cap_start,
+                    registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                    provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                    stage="registration", overall_deadline=cap_start
+                        + self.settings.complete_workflow_remaining_seconds,
+                    stop_deadline=stop_deadline)
+            self._registration_review_deadline = self._registration_deadline
             actual_price = _expiry_price(self._root(), self.settings)
             attempt = self._attempt_dir(deployment)
             self._active_attempt = attempt
@@ -424,6 +450,17 @@ class AwsProviderDriver:
         if slack <= 0:
             raise AwsProviderError("no command budget remains before reserving the complete workflow", category="cap_insufficient")
         self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
+        if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            stop_remaining = max(0.0,
+                (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+            self._registration_deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=time.monotonic() + stop_remaining)
         for region, execution_id in journal["executions"].items():
             self._confirm_automation(region, execution_id, journal["safety"][region], self._automation_parameters(deployment, region, trigger, journal["safety"][region]["role_arn"]))
         now = self.clock().astimezone(timezone.utc)
@@ -443,12 +480,28 @@ class AwsProviderDriver:
         self._save_journal(attempt, journal)
         apply_result: CommandResult | None = None
         try:
+            pair_timeout = _pair_apply_timeout_seconds(provision_phase_seconds,
+                self.settings.command_timeout_seconds, self.settings.plan_review_timeout_seconds,
+                (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+            if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+                from ..terraform_plan import workflow_review_stage_deadline
+                stop_fit = ((trigger - self.clock().astimezone(timezone.utc)).total_seconds()
+                    - self.settings.post_provision_workflow_seconds)
+                pair_deadline = workflow_review_stage_deadline(
+                    cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                    registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                    provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                    stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                        + self.settings.complete_workflow_remaining_seconds,
+                    stop_deadline=time.monotonic() + max(0.0, stop_fit))
+                pair_timeout = max(0, min(provision_phase_seconds, int(pair_deadline - time.monotonic())))
+                if pair_timeout <= 0:
+                    raise AwsProviderError("AWS pair review has no remaining original provision-stage budget",
+                        category="cap_insufficient")
             apply_result = self._run(
                 "aws-pair-apply",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-                _pair_apply_timeout_seconds(provision_phase_seconds,
-                    self.settings.command_timeout_seconds, self.settings.plan_review_timeout_seconds,
-                    (trigger - self.clock().astimezone(timezone.utc)).total_seconds()),
+                pair_timeout,
                 cwd=attempt,
             )
             _restrict_private_file(Path(state_path))
@@ -923,10 +976,20 @@ class AwsProviderDriver:
             values["expiry_role_permissions_boundary_arn"] = self.settings.expiry_role_permissions_boundary_arn
         self._write_private(vars_path, json.dumps(values, sort_keys=True).encode())
         state_path = attempt / f"safety-{region}.tfstate"
+        review_total_timeout = min(self.settings.command_timeout_seconds
+            + self.settings.plan_review_timeout_seconds,
+            max(0, int(self._registration_deadline - time.monotonic()))
+            if self._registration_deadline is not None
+            else self.settings.command_timeout_seconds + self.settings.plan_review_timeout_seconds)
+        if self.settings.workflow_profile is not None and self._registration_review_deadline is not None:
+            review_total_timeout = max(0, int(self._registration_review_deadline - time.monotonic()))
+        if review_total_timeout <= 0:
+            raise AwsProviderError("AWS safety plan review has no remaining registration-stage budget",
+                category="expiry_registration_timeout")
         result = self._run(
             f"aws-safety-apply-{region}",
             [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-            self.settings.command_timeout_seconds,
+            review_total_timeout,
             cwd=attempt,
         )
         _restrict_private_file(state_path)
@@ -1637,10 +1700,24 @@ class AwsProviderDriver:
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
         registration_action = action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")) and "-cancel-" not in action_id
-        if self._registration_deadline is not None and (registration_action or action_id.startswith("aws-safety-apply-")):
+        reviewed_safety = (action_id.startswith("aws-safety-apply-")
+            and self.settings.plan_review_timeout_seconds > 0
+            and self._registration_review_deadline is not None)
+        if self._registration_deadline is not None and (registration_action or
+                (action_id.startswith("aws-safety-apply-") and not reviewed_safety)):
             remaining = int(self._registration_deadline - time.monotonic())
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
+            timeout = min(timeout, remaining)
+        if (self.settings.workflow_profile is not None
+                and self.settings.plan_review_timeout_seconds > 0
+                and registration_action):
+            timeout = min(timeout, self.settings.command_timeout_seconds)
+        if reviewed_safety:
+            remaining = int(self._registration_review_deadline - time.monotonic())
+            if remaining <= 0:
+                raise AwsProviderError("AWS protection review exceeded its original registration-stage deadline",
+                    category="expiry_registration_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
         if self._cleanup_deadline is not None:
             remaining = int(self._cleanup_deadline - time.monotonic())
@@ -1664,7 +1741,9 @@ class AwsProviderDriver:
             stdin=stdin,
             environment_classification="contains_secret_references" if self.settings.authentication_reference else "none",
         )
-        initialize_terraform(self.runner, request, self._initialized_terraform)
+        initialization_request = request.model_copy(update={"timeout_seconds": min(
+            timeout, self.settings.command_timeout_seconds)})
+        initialize_terraform(self.runner, initialization_request, self._initialized_terraform)
         remaining_after_init = command_deadline - time.monotonic()
         if remaining_after_init <= 0:
             raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
@@ -1708,6 +1787,7 @@ class AwsProviderDriver:
         if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
             from ..terraform_plan import reviewed_apply
             return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                command_timeout_seconds=self.settings.command_timeout_seconds,
                 review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
