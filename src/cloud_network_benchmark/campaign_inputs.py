@@ -1078,12 +1078,6 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "approval_refs": approvals, "cost_input_path": str(cost_path),
         "cost_input_sha256": _sha(cost_path),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
-    if stage == "acceptance":
-        from .failure_waiver import bind_prepared_acceptance, source_waiver
-        waiver = source_waiver(settings)
-        if waiver is not None:
-            normal_entries = [entry for entry in entries if entry["entry_id"] in {"V-S1", "V-S3"}]
-            stage_data["failure_waiver"] = bind_prepared_acceptance(waiver, normal_entries)
     if stage in {"day", "acceptance", "calibration"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),
@@ -1163,6 +1157,14 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         runtime["measurement_start_barrier"] = start_barrier
         atomic_write_json(runtime_path, runtime)
         entry["runtime_config_sha256"] = _sha(runtime_path)
+    if stage == "acceptance":
+        from .failure_waiver import bind_prepared_acceptance, source_waiver
+        waiver = source_waiver(settings)
+        if waiver is not None:
+            normal_entries = [entry for entry in entries if entry["entry_id"] in {"V-S1", "V-S3"}]
+            # Bind only after acceptance barriers and other runtime finalization
+            # have been written and entry runtime hashes updated.
+            stage_data["failure_waiver"] = bind_prepared_acceptance(waiver, normal_entries)
     if draft:
         stage_data["pending_prerequisites"] = [
             f"source-bound approval evidence: {key}" for key in sorted(approvals)]

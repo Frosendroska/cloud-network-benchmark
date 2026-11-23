@@ -1121,6 +1121,68 @@ def test_source_bound_waiver_uses_reduced_acceptance_and_calibration_profiles(
         cost_payload["provider_run_envelope_templates"])
 
 
+def test_supported_fixed_draft_binds_final_waiver_runtime_hashes_and_rejects_tampering(
+        repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.campaign import CampaignDriver
+    from cloud_network_benchmark.campaign_draft import load_and_verify_draft
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    source = tmp_path / "DECISIONS.md"
+    source.write_text("## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments\n")
+    settings["stage_inputs"]["acceptance"].update(
+        workflow_profile=ACCEPTANCE_PROFILE, failure_workflow_profile=FAILURE_PROFILE)
+    settings["stage_inputs"]["calibration"]["workflow_profile"] = CALIBRATION_PROFILE
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    settings["stage_inputs"]["acceptance"].pop("allowance", None)
+    settings["stage_inputs"]["calibration"].pop("allowance", None)
+    settings["stage_inputs"]["acceptance"]["failure_waiver"] = {
+        "confirmed": True, "source": str(source),
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
+
+    settings_path = tmp_path / "operator-settings.yaml"
+    settings_path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    generated_roots = [repository_root / "configs/tests/campaign-generated",
+        repository_root / "configs/experiments/campaign-generated"]
+    generated_before = {path: {item.name for item in path.iterdir()} if path.exists() else set()
+        for path in generated_roots}
+    def cleanup_generated():
+        for path, existing in generated_before.items():
+            if path.exists():
+                for item in path.iterdir():
+                    if item.name not in existing:
+                        shutil.rmtree(item, ignore_errors=True)
+    request.addfinalizer(cleanup_generated)
+
+    output_path = Path(settings["state_root"]) / "fixed-pre-day-draft.json"
+    driver = CampaignDriver(clock=Clock())
+    bundle = driver.draft([repository_root / "plans/acceptance.yaml",
+            repository_root / "plans/calibration.yaml"], settings_path=settings_path,
+        output_path=output_path, root=repository_root)
+
+    assert bundle["status"] == "DRAFT_UNAPPROVED"
+    acceptance = next(stage for stage in bundle["stages"] if stage["stage"] == "acceptance")
+    assert [row["entry_id"] for row in acceptance["entries"]] == ["V-S1", "V-S3"]
+    for binding, entry in zip(acceptance["failure_waiver"]["normal_acceptance"], acceptance["entries"]):
+        runtime_path = Path(entry["runtime_config_path"])
+        final_hash = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+        assert binding["runtime_config_path"] == str(runtime_path)
+        assert binding["runtime_config_sha256"] == entry["runtime_config_sha256"] == final_hash
+    load_and_verify_draft(output_path)
+
+    runtime_path = Path(acceptance["failure_waiver"]["normal_acceptance"][0]["runtime_config_path"])
+    runtime = json.loads(runtime_path.read_text())
+    runtime["tamper_marker"] = "changed after draft freeze"
+    runtime_path.write_text(json.dumps(runtime) + "\n")
+    with pytest.raises(ValueError, match="campaign draft source/config/runtime/cost/manifest artifacts changed"):
+        load_and_verify_draft(output_path)
+
+
 @pytest.mark.parametrize("waiver_state", ["absent", "malformed", "tampered", "wrong_scope"])
 def test_reduced_profiles_require_a_valid_source_bound_waiver(
         repository_root, tmp_path, monkeypatch, waiver_state):
