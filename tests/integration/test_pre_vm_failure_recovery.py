@@ -253,6 +253,15 @@ def test_maximum_legal_identity_components_fit_new_state_path(tmp_path):
     assert len(path.parent.parent.name)<=80 and path.name==d.deployment_id
 
 
+def test_precreation_aws_absence_rejects_wrong_sts_account_before_inventory(tmp_path):
+    from cloud_network_benchmark.providers.aws import AwsProviderError
+    deployment, settings, driver, runner, _ = direct_attempt(tmp_path, legacy=True)
+    driver._aws_json = lambda *_args: {"Account": "000000000000"}
+    with pytest.raises(AwsProviderError, match="caller account differs"):
+        driver.verify_unstarted_absence(deployment)
+    assert not runner.requests
+
+
 @pytest.mark.parametrize('tamper',[False,True])
 def test_pre_vm_cleanup_receipt_replays_only_original_support_targets(tmp_path,isolated_legacy_provider_financial_boundary,tamper):
     from cloud_network_benchmark.lifecycle_cleanup import replay_saved_cleanup_receipt

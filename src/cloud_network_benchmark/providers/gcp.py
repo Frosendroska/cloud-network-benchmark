@@ -448,6 +448,26 @@ class GcpProviderDriver:
             expiry = journal.get("expiry")
             return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure, primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
 
+    def verify_unstarted_absence(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+        """Read-only all-scope inventory for a source-proved pre-registration failure."""
+        self._active_attempt = None
+        original_settings = self.settings
+        # Provider private state must remain untouched. Use the existing
+        # controller directory as the subprocess cwd for read-only gcloud calls.
+        self.settings = self.settings.model_copy(update={"private_state_root": Path.cwd()})
+        self._deadline = time.monotonic() + max(1.0, float(self.settings.registration_timeout_seconds))
+        try:
+            inventory = self._inventory(deployment, journal={})
+        finally:
+            self.settings = original_settings
+        complete = (inventory.get("pages_complete") is True and not inventory.get("resources")
+            and all(not inventory.get(name) for name in ("instances", "disks", "addresses", "support_resources")))
+        return {"provider": "gcp", "verified": complete,
+            "target_selector": f"project={self.settings.project_id};run_id={deployment.run_id};deployment_id={deployment.deployment_id};roles=vm_a,vm_b",
+            "inventory": inventory, "query_count": len(getattr(self, "_active_commands", ())),
+            "timing_status": "late" if self.clock().astimezone(timezone.utc)
+                >= deployment.reservation.value.expires_at.value else "unknown"}
+
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
         self._validate_selected_images(deployment)
@@ -1129,11 +1149,12 @@ class GcpProviderDriver:
                  "workflow_remaining_seconds": self.settings.complete_workflow_remaining_seconds}
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
-    def _inventory(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+    def _inventory(self, deployment: ProviderDeploymentInput, *,
+                   journal: dict[str, Any] | None = None) -> dict[str, Any]:
         instances, disks, addresses, support = [], [], [], []
         dep_hash = hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]
         namespace = self._namespace(deployment)
-        journal = self._load(self._attempt_dir(deployment), deployment)
+        journal = self._load(self._attempt_dir(deployment), deployment) if journal is None else journal
         known_vms = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_resources", {}).values() if item.get("id") and item.get("name") and item.get("zone")}
         known_disks = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_disks", []) if item.get("id") and item.get("name") and item.get("zone")}
         known_templates = {(str(item.get("id")), item.get("name")) for item in journal.get("templates", {}).values() if item.get("id") and item.get("name")}

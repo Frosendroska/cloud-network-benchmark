@@ -388,7 +388,8 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
             ledger_reservation = ledger.inspect().get("reservations", {}).get(recovery.reservation_id)
             from .lifecycle_cleanup import replay_saved_cleanup_receipt
             try:
-                receipt_reconciled = replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
+                receipt_reconciled = replay_saved_cleanup_receipt(record, recovery=recovery,
+                    ledger=ledger, recovery_path=recovery_path)
             except (RuntimeError, ValueError, OSError) as exc:
                 outcomes[record.provider] = {"cleanup": "failed", "reconciled": False,
                     "errors": [str(exc)], "launch_blocked": True, **cleanup_timing}
@@ -430,7 +431,9 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
         cleanup_timing_row = (cleanup_inventory.get("cleanup_timing")
             if isinstance(cleanup_inventory, Mapping) else None)
         cleanup_timing_status = (cleanup_timing_row.get("status")
-            if isinstance(cleanup_timing_row, Mapping) else getattr(cleanup_result, "timing_status", None))
+            if isinstance(cleanup_timing_row, Mapping) else
+            cleanup_result.get("timing_status") if isinstance(cleanup_result, Mapping) else
+            getattr(cleanup_result, "timing_status", None))
         cleanup_timing_status = _sticky_cleanup_timing(record.cleanup_timing_status, cleanup_timing_status)
         cleanup_timing_failure = getattr(cleanup_result, "timing_failure", None)
         if cleanup_timing_failure is not None and not isinstance(cleanup_timing_failure, str):

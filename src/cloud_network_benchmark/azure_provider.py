@@ -2210,3 +2210,58 @@ def destroy(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, r
         _TIMING_OBSERVATION_FAILURE.reset(observation_token)
         _EXPLICIT_TIMING_IDENTITY.reset(identity_token)
         _EXPLICIT_UTC_NOW.reset(token)
+
+
+def verify_unstarted_absence(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+                             runner: CommandRunner, *, clock: Callable[[], float],
+                             utc_now: Callable[[], datetime]) -> dict[str, Any]:
+    """Prove exact Azure target absence without creating provider recovery state."""
+    original_root = options.attempt_root
+    if original_root.exists() or original_root.is_symlink():
+        raise ValueError("pre-provider Azure absence requires the original attempt root to remain absent")
+    now_mono = float(clock())
+    now_utc = utc_now().astimezone(UTC)
+    allowance = min(660.0, max(1.0, float(options.profile_allowance.get("cleanup_seconds", 60)
+        if options.profile_allowance else options.command_timeout_seconds * 4)))
+    invocation_options = options.model_copy(update={"attempt_root": Path.cwd(),
+        "cap_deadline_monotonic": now_mono + allowance,
+        "cleanup_timing_active": False, "cleanup_timing_phase": None})
+    root = Path.cwd()
+    actions: list[dict[str, Any]] = [_safe_cleanup_action(invocation_options,
+        _assert_subscription(runner, invocation_options, root, clock))]
+    group = _slug(deployment)
+    group_result = _command(runner, invocation_options, root,
+        ["az", "group", "exists", "--subscription", options.subscription_id,
+         "--name", group, "--output", "json"], "precreation_group_absence", clock)
+    if group_result.stderr.strip():
+        raise RuntimeError("Azure target resource-group absence returned a diagnostic")
+    exists = json.loads(group_result.stdout)
+    if type(exists) is not bool:
+        raise RuntimeError("Azure target resource-group inventory is not a boolean")
+    actions.append(_safe_cleanup_action(invocation_options, group_result))
+    resources: list[dict[str, Any]] = []
+    if exists:
+        resources, group_evidence = _read_arm_collection(runner, invocation_options, root,
+            f"/subscriptions/{options.subscription_id}/resourceGroups/{group}/resources?api-version=2021-04-01",
+            "precreation_group_resources", clock, ("id", "type"))
+        actions.extend(group_evidence)
+        for collection in ("roleAssignments", "roleDefinitions"):
+            rows, evidence = _read_arm_collection(runner, invocation_options, root,
+                f"/subscriptions/{options.subscription_id}/resourceGroups/{group}/providers/Microsoft.Authorization/{collection}?api-version=2022-04-01",
+                f"precreation_{collection}", clock, ("id",))
+            resources.extend(rows)
+            actions.extend(evidence)
+    vm_ids = [f"/subscriptions/{options.subscription_id}/resourceGroups/{group}/providers/Microsoft.Compute/virtualMachines/{group}-{role}"
+        for role in ("a", "b")]
+    for vm_id in vm_ids:
+        evidence = _prove_vm_absent(runner, invocation_options, root, vm_id, clock,
+            absent_parent_group=group if not exists else None)
+        actions.append(_safe_cleanup_action(invocation_options, evidence))
+    verified = not exists or not resources
+    # We do not have the original cleanup routine stop timestamp. An unexpired
+    # cap cannot establish a timing pass; keep it unknown until sourced.
+    status = "late" if now_utc >= deployment.reservation.value.expires_at.value else "unknown"
+    return {"provider": "azure", "verified": verified, "target_selector": ";".join(vm_ids),
+        "resource_group": group, "resource_group_exists": exists,
+        "remaining_resource_count": len(resources), "actions": actions,
+        "query_count": len(actions), "timing_status": status}

@@ -182,6 +182,14 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--private-root", type=Path,
         help="deprecated for cleanup; original private paths come from the private recovery journal")
     cleanup.add_argument("--controller-session", required=True)
+    cleanup.add_argument("--source-draft", type=Path,
+        help="frozen F11 draft for a pre-provider initialization failure")
+    cleanup.add_argument("--stage-id")
+    cleanup.add_argument("--entry-id")
+    cleanup.add_argument("--source-config", type=Path)
+    cleanup.add_argument("--parent-manifest", type=Path)
+    cleanup.add_argument("--original-session-id")
+    cleanup.add_argument("--reservation-id")
     cleanup.add_argument("--format", choices=("human", "json"), default="human")
     recommendation = commands.add_parser("recommend-common-n")
     recommendation.add_argument("--validation-results", required=True, type=Path,
@@ -440,11 +448,26 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 json.loads(args.recovery.read_text(encoding="utf-8")))
             clock = CleanupClock()
             runner = CountingRunner(cleanup_runner or SubprocessCommandRunner())
-            result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
-                current_session_id=args.controller_session,
-                runner=runner,
-                utc_now=cleanup_utc_now or clock.utc_now,
-                monotonic_now=cleanup_monotonic_now or clock.monotonic)
+            source_values = (args.source_draft, args.stage_id, args.entry_id, args.source_config,
+                args.runtime_config, args.parent_manifest, args.original_session_id, args.reservation_id)
+            if any(value is not None for value in source_values):
+                if any(value is None for value in source_values):
+                    raise ValueError("source-bound precreation cleanup requires all frozen identity arguments")
+                from .precreation_cleanup import run_precreation_cleanup
+                result = run_precreation_cleanup(draft_path=args.source_draft,
+                    stage_id=args.stage_id, entry_id=args.entry_id,
+                    config_path=args.source_config, runtime_path=args.runtime_config,
+                    parent_manifest_path=args.parent_manifest, recovery_path=args.recovery,
+                    repository_root=Path.cwd(), current_session_id=args.controller_session,
+                    original_session_id=args.original_session_id, reservation_id=args.reservation_id,
+                    runner=runner, utc_now=cleanup_utc_now or clock.utc_now,
+                    monotonic_now=cleanup_monotonic_now or clock.monotonic)
+            else:
+                result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
+                    current_session_id=args.controller_session,
+                    runner=runner,
+                    utc_now=cleanup_utc_now or clock.utc_now,
+                    monotonic_now=cleanup_monotonic_now or clock.monotonic)
         report = {"status": "complete" if result.complete else "blocked",
                 "execution": "not_resumed", "cleanup": "complete" if result.complete else "incomplete",
                 "attempt_id": result.attempt_id,

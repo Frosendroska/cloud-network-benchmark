@@ -720,6 +720,47 @@ class AwsProviderDriver:
             return self._failed_cleanup(inventory_by_region, [*failures, failure], primary, failure, deployment)
         return result
 
+    def verify_unstarted_absence(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+        """Read-only inventory for a source-proved pre-registration failure."""
+        # Empty inventories from a different credential account say nothing
+        # about the frozen target account. Keep the same STS identity gate used
+        # by ordinary cleanup before accepting any absence result.
+        identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
+        if not isinstance(identity, dict) or identity.get("Account") != self.settings.account_id:
+            raise AwsProviderError("AWS caller account differs from the frozen target account",
+                category="scope_mismatch")
+        self._active_attempt = None
+        self._active_commands = []
+        self._cleanup_deadline = time.monotonic() + max(1.0, float(
+            self.settings.cleanup_routine_seconds or self.settings.registration_timeout_seconds))
+        regions = self._regions(deployment)
+        namespace = _namespace(deployment)
+        attempt = self.settings.private_state_root / namespace / deployment.run_id / deployment.deployment_id
+        inventories: dict[str, Any] = {}
+        safety_targets: dict[str, Any] = {}
+        safety_absent: dict[str, bool] = {}
+        for region in regions:
+            failures: list[FailureEvidence] = []
+            inventories[region] = self._inventory_region(deployment, region, failures,
+                known_resource_ids={})
+            safety = self._prospective_safety(deployment, region, attempt, {})
+            safety_targets[region] = {"role": {"arn": safety["role_arn"]},
+                "document": {"arn": f"arn:aws:ssm:{region}:{self.settings.account_id}:document/{safety['document_name']}"}}
+            safety_absent[region] = self._verify_safety_absent(region, safety)
+        complete = (bool(inventories) and all(row.get("complete") is True
+            and not row.get("remaining") for row in inventories.values())
+            and all(safety_absent.values()))
+        return {"provider": "aws", "verified": complete,
+            "target_selector": self._target_selector(deployment, regions),
+            "inventory": {"regions": inventories, "safety_absent": safety_absent,
+                "safety_targets": safety_targets, "complete": complete},
+            "query_count": len(self._active_commands),
+            # The original routine stop time is not captured in this source.
+            # Expired caps prove lateness; before expiry the timing remains
+            # unknown rather than claiming a deadline pass.
+            "timing_status": "late" if self.clock().astimezone(timezone.utc)
+                >= deployment.reservation.value.expires_at.value else "unknown"}
+
     def _prospective_safety(self, deployment: ProviderDeploymentInput, region: str, attempt: Path, journal: dict) -> dict[str,str]:
         """Expected lookup targets, not evidence that resources were ever created."""
         namespace = attempt.parent.parent.name
@@ -1293,7 +1334,9 @@ class AwsProviderDriver:
             raise AwsProviderError("host trust has no active attempt context", category="host_identity_unavailable")
         return path
 
-    def _inventory_region(self, deployment: ProviderDeploymentInput, region: str, failures: list[FailureEvidence]) -> dict[str, Any]:
+    def _inventory_region(self, deployment: ProviderDeploymentInput, region: str,
+                          failures: list[FailureEvidence], *,
+                          known_resource_ids: dict[str, Any] | None = None) -> dict[str, Any]:
         filters = ["--filters", f"Name=tag:cnb_run_id,Values={deployment.run_id}", f"Name=tag:cnb_deployment_id,Values={deployment.deployment_id}", "--region", region, "--output", "json"]
         queries = {
             "instances": ["ec2", "describe-instances", *filters],
@@ -1318,7 +1361,8 @@ class AwsProviderDriver:
         }
         entries: dict[str, Any] = {}
         complete = True
-        known = self._load_journal(self._attempt_dir(deployment), deployment).get("known_resource_ids", {})
+        known = (self._load_journal(self._attempt_dir(deployment), deployment).get("known_resource_ids", {})
+                 if known_resource_ids is None else known_resource_ids)
         for name, argv in queries.items():
             try:
                 data = self._aws_json(*argv)

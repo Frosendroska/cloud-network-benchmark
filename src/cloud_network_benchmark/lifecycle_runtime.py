@@ -851,8 +851,9 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
 
 def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs: Any, runtime: dict[str, Any], reservation: Any, ledger: Any,
-        runner: Any, clock: Any, stages: dict[str, Any], private_root: Path,
-        cleanup_references: dict[str, str] | None = None) -> dict[str, Any]:
+        runner: Any, clock: Any, stages: dict[str, Any] | None, private_root: Path,
+        cleanup_references: dict[str, str] | None = None,
+        cleanup_only: bool = False) -> dict[str, Any]:
     """Bind every selected provider to one accepted F11 reservation and claim barrier."""
     from datetime import timedelta
     from math import ceil
@@ -873,7 +874,9 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
     selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
     validate_timing_profile_allowance(campaign.admission.timing_profile, runtime["allowance"], selected)
     validate_workflow_profile_allowance(campaign.admission.workflow_profile, runtime["allowance"], selected)
-    if set(children) != selected or set(stages) != selected:
+    if (set(children) != selected
+            or (not cleanup_only and (stages is None or set(stages) != selected))
+            or (cleanup_only and stages is not None)):
         raise ValueError("runtime workflows, stages and initialized provider set must match")
     if (reservation.state != "reserved" or reservation.source_path != costs.source_path
             or reservation.source_sha256 != costs.payload_sha256):
@@ -1070,11 +1073,20 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
                     deployment=deployment, request=requests[provider], reservation=reservation,
                     provider_lead_seconds=lead, settings=options, private_root=Path(private_root)))
-            # Local recovery and original Terraform inputs must exist before
-            # the advancing-clock preflight can fail. No provider calls here.
-            azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic, utc_now=clock.utc_now)
-            azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
+            if not cleanup_only:
+                # Local recovery and original Terraform inputs must exist before
+                # the advancing-clock preflight can fail. No provider calls here.
+                azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic, utc_now=clock.utc_now)
+                azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             options_by_provider[provider] = (options, None)
+
+    if cleanup_only:
+        # Return only source-derived target inputs. This path does not create
+        # provider journals, settings snapshots, expiry registrations or VMs.
+        return {provider: {"deployment": deployments[provider],
+            "expiry_request": requests[provider],
+            "driver_or_options": options_by_provider[provider][0]}
+            for provider in children}
 
     protected: dict[str, Any] = {}
     def on_protected(provider: str, evidence: Any) -> None:

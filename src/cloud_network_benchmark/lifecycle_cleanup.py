@@ -440,14 +440,22 @@ def reconcile_saved_cleanup_result(record: Any, result: Any, *, recovery: Any,
         "cleanup_open": not verified_absent, "billing_final": False, "incurred_usd": None}
 
 
-def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any) -> bool:
+def replay_saved_cleanup_receipt(record: Any, *, recovery: Any, ledger: Any,
+                                recovery_path: Path | None = None) -> bool:
     """Verify a durable cleanup receipt and idempotently reconcile its exact event."""
     from .admission import Reconciliation
 
     if not record.cleanup_settings_reference or not recovery.reservation_id:
         return False
-    directory = Path(record.cleanup_settings_reference).parent
-    saved = load_cleanup_settings(Path(record.cleanup_settings_reference))
+    settings_path = Path(record.cleanup_settings_reference)
+    if not settings_path.is_file() or settings_path.is_symlink():
+        if recovery_path is None:
+            return False
+        from .precreation_cleanup import replay_precreation_absence_receipt
+        return replay_precreation_absence_receipt(record, recovery=recovery,
+            ledger=ledger, recovery_path=Path(recovery_path))
+    directory = settings_path.parent
+    saved = load_cleanup_settings(settings_path)
     if (str(saved.provider) != record.provider or saved.deployment.deployment_id != record.deployment_id
             or saved.reservation.reservation_id.value != recovery.reservation_id):
         return False
