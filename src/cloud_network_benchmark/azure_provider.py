@@ -965,8 +965,8 @@ def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_gro
         and error.get("code") == "ResourceGroupNotFound" and error.get("message") == expected_message)
 
 
-def _is_exact_missing_job_schedule(result: CommandResult) -> bool:
-    """Accept only Azure CLI's structured NotFound for an absent Automation job schedule."""
+def _is_exact_missing_automation_child(result: CommandResult) -> bool:
+    """Accept Azure CLI's typed NotFound wrapper; caller must bind the exact child URL."""
     if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
         return False
     wrapped = re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*", result.stderr, re.DOTALL)
@@ -984,8 +984,7 @@ def _is_exact_missing_job_schedule(result: CommandResult) -> bool:
     except (json.JSONDecodeError, ValueError):
         return False
     return (isinstance(payload, dict) and set(payload) == {"code", "message"}
-        and payload.get("code") == "NotFound"
-        and payload.get("message") == "Job Schedule not found.")
+        and payload.get("code") == "NotFound" and isinstance(payload.get("message"), str))
 
 
 def _azure_tsv_content_matches(stdout: str, expected_sha256: str) -> bool:
@@ -1035,7 +1034,7 @@ def _validate_provider_registrations(runner: CommandRunner, options: AzureRuntim
 def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, argv: list[str], action: str,
              clock: Callable[[], float], *, allow_not_found: bool = False,
              allow_missing_resource_group: str | None = None,
-             expected_missing_job_schedule_url: str | None = None,
+             expected_missing_automation_child_url: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
     if options.cleanup_timing_active:
@@ -1120,16 +1119,32 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     method_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--method"]
     url_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--url"]
     subscription_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--subscription"]
-    expected_job_url_pattern=(r"/subscriptions/"+re.escape(options.subscription_id)
-        +r"/resourceGroups/[^/?]+/providers/Microsoft\.Automation/automationAccounts/[^/?]+"
-        +r"/jobSchedules/[^/?]+\?api-version="+re.escape(AUTOMATION_API))
-    exact_job_schedule_absence = (expected_missing_job_schedule_url is not None
-        and action in {"expiry_jobSchedules_before_delete", "expiry_jobSchedules_absence", "profile_absence_automation"}
-        and method_values == ["GET"] and url_values == [expected_missing_job_schedule_url]
+    output_values=[argv[i+1] for i,value in enumerate(argv[:-1]) if value=="--output"]
+    expected_job_url_pattern=(r"/subscriptions/(?P<subscription>[^/?]+)/resourceGroups/(?P<group>[^/?]+)"
+        +r"/providers/Microsoft\.Automation/automationAccounts/(?P<account>[^/?]+)"
+        +r"/(?P<collection>jobSchedules|schedules|runbooks)/(?P<child>[^/?]+)\?api-version="
+        +re.escape(AUTOMATION_API))
+    child_url_match=(re.fullmatch(expected_job_url_pattern,expected_missing_automation_child_url)
+        if expected_missing_automation_child_url is not None else None)
+    child_identity_valid=False
+    if child_url_match is not None:
+        groups=child_url_match.groupdict()
+        child_identity_valid=(groups["subscription"]==options.subscription_id
+            and groups["account"]==groups["group"]+"-auto"
+            and ((groups["collection"]=="jobSchedules" and _is_uuid_segment(groups["child"]))
+                or (groups["collection"]=="schedules" and groups["child"]==groups["group"]+"-once")
+                or (groups["collection"]=="runbooks" and groups["child"]==groups["group"]+"-deallocate")))
+    exact_automation_child_absence = (expected_missing_automation_child_url is not None
+        and action in {"expiry_jobSchedules_before_delete", "expiry_jobSchedules_absence",
+            "expiry_schedules_before_delete", "expiry_schedules_absence",
+            "expiry_runbooks_before_delete", "expiry_runbooks_absence", "profile_absence_automation"}
+        and argv[:2]==["az","rest"] and method_values == ["GET"]
+        and url_values == [expected_missing_automation_child_url] and output_values == ["json"]
+        and not any(flag in argv for flag in ("--body","--headers","--query","--resource"))
         and subscription_values == [options.subscription_id]
-        and re.fullmatch(expected_job_url_pattern, expected_missing_job_schedule_url) is not None
-        and _is_exact_missing_job_schedule(result))
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_job_schedule_absence or (
+        and child_identity_valid
+        and _is_exact_missing_automation_child(result))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1293,12 +1308,12 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
                             account: str, collection: str, child: str,
                             clock: Callable[[],float], actions: list[dict[str,Any]]) -> None:
     base=f"{account}/{collection}/{child}?api-version={AUTOMATION_API}"
-    expected_missing_job_schedule_url=base if collection=="jobSchedules" else None
+    expected_missing_automation_child_url=base if collection in {"jobSchedules","schedules","runbooks"} else None
     read=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_before_delete",clock,
-        allow_not_found=True,expected_missing_job_schedule_url=expected_missing_job_schedule_url)
+        allow_not_found=True,expected_missing_automation_child_url=expected_missing_automation_child_url)
     actions.append(_safe_cleanup_action(options,read))
     if read.outcome=="failed" and (_is_exact_not_found(read)
-            or (collection == "jobSchedules" and _is_exact_missing_job_schedule(read))): return
+            or (expected_missing_automation_child_url is not None and _is_exact_missing_automation_child(read))): return
     try: observed=json.loads(read.stdout)
     except (json.JSONDecodeError,TypeError) as exc: raise RuntimeError(f"Azure {collection} readback is malformed") from exc
     expected=base.split("?",1)[0]
@@ -1307,10 +1322,10 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
     deleted=_command(runner,options,root,_azure_rest("DELETE",base),f"expiry_{collection}_delete",clock,allow_not_found=True)
     actions.append(_safe_cleanup_action(options,deleted))
     verify=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_absence",clock,
-        allow_not_found=True,expected_missing_job_schedule_url=expected_missing_job_schedule_url)
+        allow_not_found=True,expected_missing_automation_child_url=expected_missing_automation_child_url)
     actions.append(_safe_cleanup_action(options,verify))
     if verify.outcome!="failed" or not (_is_exact_not_found(verify)
-            or (collection == "jobSchedules" and _is_exact_missing_job_schedule(verify))):
+            or (expected_missing_automation_child_url is not None and _is_exact_missing_automation_child(verify))):
         raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 
@@ -1400,21 +1415,26 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
         for collection, key in (("jobSchedules", "job_schedule_id"), ("schedules", "schedule"), ("runbooks", "runbook")):
             child = expiry.get(key) or expiry.get("metadata", {}).get(key)
             if child:
+                expected_child=(None if collection=="jobSchedules" else
+                    name+("-once" if collection=="schedules" else "-deallocate"))
+                if expected_child is not None and child!=expected_child:
+                    raise RuntimeError(f"independent Azure {collection} absence target is not the registered owned identity")
                 targets.append((f"{account}/{collection}/{child}", f"Automation {collection} child",
                     AUTOMATION_API, collection, child))
         for target, label, api, collection, child in targets:
             url=f"{target}?api-version={api}"
-            expected_missing_job_schedule_url=(url if collection=="jobSchedules" else None)
+            expected_missing_automation_child_url=(url if collection in {"jobSchedules","schedules","runbooks"} else None)
             if collection=="jobSchedules" and not _is_uuid_segment(str(child)):
                 raise RuntimeError("independent Azure job schedule absence target is not the registered owned identity")
             result = _command(runner, options, root, _azure_rest("GET", url),
                 "profile_absence_automation", clock, allow_not_found=True,
                 allow_missing_resource_group=state["resource_group"],
-                expected_missing_job_schedule_url=expected_missing_job_schedule_url)
+                expected_missing_automation_child_url=expected_missing_automation_child_url)
             actions.append(_safe_cleanup_action(options, result))
             if result.outcome != "failed" or not (_is_exact_not_found(result)
                     or _is_exact_missing_attempt_resource_group(result, state["resource_group"])
-                    or (expected_missing_job_schedule_url is not None and _is_exact_missing_job_schedule(result))):
+                    or (expected_missing_automation_child_url is not None
+                        and _is_exact_missing_automation_child(result))):
                 raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
 
 

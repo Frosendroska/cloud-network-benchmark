@@ -37,18 +37,19 @@ def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_ke
     assert not _is_exact_missing_attempt_resource_group(accepted.model_copy(update={"stdout":"unexpected"}),group)
 
 
-def test_missing_job_schedule_wrapper_is_typed_and_unique():
-    from cloud_network_benchmark.azure_provider import _is_exact_missing_job_schedule
+def test_missing_automation_child_wrapper_is_typed_and_unique():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_child
     now=datetime.now(timezone.utc)
     stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
     accepted=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
         finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
-    assert _is_exact_missing_job_schedule(accepted)
-    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stdout":"unexpected"}))
-    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}))
-    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stderr":stderr.replace("Job Schedule not found.", "Schedule not found.")}))
+    assert _is_exact_missing_automation_child(accepted)
+    assert _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":""})'}))
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"unexpected"}))
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}))
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":null})'}))
     duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'})
-    assert not _is_exact_missing_job_schedule(duplicate)
+    assert not _is_exact_missing_automation_child(duplicate)
 
 
 def test_actual_job_schedule_absence_passes_production_cleanup_command(repository_root, tmp_path):
@@ -64,14 +65,15 @@ def test_actual_job_schedule_absence_passes_production_cleanup_command(repositor
             assert request.argv[request.argv.index("--method")+1]=="GET"
             assert "/jobSchedules/" in request.argv[request.argv.index("--url")+1]
             return result.model_copy(update={"action_id":request.action_id})
-    url=account+"/jobSchedules/owned-once?api-version="+azure_provider.AUTOMATION_API
+    job_id="00000000-0000-0000-0000-000000000123"
+    url=account+"/jobSchedules/"+job_id+"?api-version="+azure_provider.AUTOMATION_API
     with pytest.raises(RuntimeError,match="expiry_jobSchedules_before_delete failed with failed"):
         azure_provider._command(Runner(),o,tmp_path,azure_provider._azure_rest("GET",url),
             "expiry_jobSchedules_before_delete",lambda:1.0)
     actions=[]
     azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,
         account,
-        "jobSchedules","owned-once",lambda:1.0,actions)
+        "jobSchedules",job_id,lambda:1.0,actions)
     assert len(actions)==1 and actions[0]["outcome"]=="failed"
 
 
@@ -79,7 +81,8 @@ def test_actual_job_schedule_absence_confirms_delete_through_production_command(
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
     account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
-    resource_id=account+"/jobSchedules/owned-once"
+    job_id="00000000-0000-0000-0000-000000000123"
+    resource_id=account+"/jobSchedules/"+job_id
     absent=CommandResult(action_id="absent",outcome=CommandOutcome.FAILED,started_at=now,
         finished_at=now,duration_seconds=0,exit_code=1,stdout="",
         stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n')
@@ -95,8 +98,25 @@ def test_actual_job_schedule_absence_confirms_delete_through_production_command(
             return absent.model_copy(update={"action_id":request.action_id})
     runner=Runner(); actions=[]
     azure_provider._delete_owned_arm_child(runner,o,tmp_path,account,
-        "jobSchedules","owned-once",lambda:1.0,actions)
+        "jobSchedules",job_id,lambda:1.0,actions)
     assert runner.calls==3 and len(actions)==3
+
+
+def test_actual_blank_schedule_absence_passes_production_cleanup_command(repository_root,tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    result=CommandResult(action_id="schedule-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",
+        stderr='ERROR: Not Found({"code":"NotFound","message":""})\n')
+    class Runner:
+        def run(self,request):
+            assert request.action_type=="expiry_schedules_before_delete"
+            assert request.argv[request.argv.index("--method")+1]=="GET"
+            return result.model_copy(update={"action_id":request.action_id})
+    actions=[]
+    azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,account,"schedules",_slug(d)+"-once",lambda:1.0,actions)
+    assert len(actions)==1 and actions[0]["outcome"]=="failed"
 
 
 @pytest.mark.parametrize("stderr,stdout,collection", [
@@ -104,7 +124,7 @@ def test_actual_job_schedule_absence_confirms_delete_through_production_command(
     ('ERROR: Not Found({"code":"NotFound","message":"Schedule not found."})\n', "", "jobSchedules"),
     ('ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})\n', "", "jobSchedules"),
     ('ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n', "unexpected", "jobSchedules"),
-    ('ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n', "", "schedules"),
+    ('ERROR: Not Found({"code":"NotFound","message":""})\n', "", "unknownCollection"),
 ])
 def test_job_schedule_absence_production_path_rejects_unrelated_errors(repository_root,tmp_path,stderr,stdout,collection):
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
@@ -119,16 +139,17 @@ def test_job_schedule_absence_production_path_rejects_unrelated_errors(repositor
 
 
 @pytest.mark.parametrize("url_suffix,argv_suffix", [
-    ("jobSchedules/foreign?api-version=2024-10-23", []),
-    ("jobSchedules/owned?api-version=2024-10-23", ["--method","GET"]),
-    ("jobSchedules/owned?api-version=2024-10-23", ["--url","/subscriptions/foreign/resourceGroups/rg/providers/Microsoft.Automation/automationAccounts/acct/jobSchedules/owned?api-version=2024-10-23"]),
+    ("jobSchedules/00000000-0000-0000-0000-000000000124?api-version=2024-10-23", []),
+    ("jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", ["--method","GET"]),
+    ("jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", ["--url","/subscriptions/foreign/resourceGroups/rg/providers/Microsoft.Automation/automationAccounts/acct/jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23"]),
+    ("schedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", []),
 ])
 def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_root,tmp_path,url_suffix,argv_suffix):
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
     account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
     request_url=account+"/"+url_suffix
-    expected_url=account+"/jobSchedules/owned?api-version=2024-10-23"
+    expected_url=account+"/jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23"
     result=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
         finished_at=now,duration_seconds=0,exit_code=1,stdout="",
         stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})')
@@ -137,26 +158,33 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
     argv=["az","rest","--method","GET","--url",request_url,"--output","json",*argv_suffix]
     with pytest.raises(RuntimeError,match="failed with failed"):
         azure_provider._command(Runner(),o,tmp_path,argv,"expiry_jobSchedules_before_delete",lambda:1.0,
-            expected_missing_job_schedule_url=expected_url)
+            expected_missing_automation_child_url=expected_url)
 
 
-@pytest.mark.parametrize("case", ["actual", "authorization", "mixed", "duplicate", "wrong_target"])
-def test_final_profile_absence_accepts_only_exact_owned_job_schedule_not_found(repository_root,tmp_path,case):
+@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "authorization", "mixed", "duplicate", "wrong_target"])
+def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
     from cloud_network_benchmark.azure_provider import _verify_profile_absence
     import hashlib
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
     account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
     job_id="00000000-0000-0000-0000-000000000123"
-    child_url=f"{account}/jobSchedules/{job_id}?api-version={azure_provider.AUTOMATION_API}"
+    collection=("schedules" if case=="actual_schedule" else
+        "runbooks" if case=="actual_runbook" else "jobSchedules")
+    child_name=(_slug(d)+"-once" if collection=="schedules" else
+        _slug(d)+"-deallocate" if collection=="runbooks" else job_id)
+    child_url=f"{account}/{collection}/{child_name}?api-version={azure_provider.AUTOMATION_API}"
     baseline={"groups":[],"watchers":[]}
     baseline["sha256"]=hashlib.sha256(json.dumps(baseline,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-    state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,"job_schedule_id":job_id},
+    expiry_child=({"schedule":child_name} if collection=="schedules" else
+        {"runbook":child_name} if collection=="runbooks" else {"job_schedule_id":job_id})
+    state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,**expiry_child},
         "profile_external_baseline":baseline}
     actual='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
     if case=="authorization": error='ERROR: Not Found({"code":"AuthorizationFailed","message":"Job Schedule not found."})'
     elif case=="mixed": error=actual
     elif case=="duplicate": error='ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'
+    elif case in {"actual_schedule","actual_runbook"}: error='ERROR: Not Found({"code":"NotFound","message":""})'
     else: error=actual
     class Runner:
         def __init__(self): self.requests=[]
@@ -180,10 +208,10 @@ def test_final_profile_absence_accepts_only_exact_owned_job_schedule_not_found(r
             return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
                 started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
     runner=Runner(); actions=[]
-    if case=="actual":
+    if case in {"actual","actual_schedule","actual_runbook"}:
         _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
         request=next(r for r in runner.requests if "--url" in r.argv
-            and "/jobSchedules/" in r.argv[r.argv.index("--url")+1])
+            and f"/{collection}/" in r.argv[r.argv.index("--url")+1])
         assert request.action_type=="profile_absence_automation"
         assert request.argv[request.argv.index("--url")+1]==child_url
     else:
