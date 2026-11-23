@@ -353,8 +353,11 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         if sys.version_info < (3, 12):
             raise ValueError("deploy the campaign driver with Python 3.12 or newer")
         gates = _gate_rows(settings, stage, draft=draft)
+        from .failure_waiver import source_waiver
+        acceptance_waived = stage == "acceptance" and source_waiver(settings) is not None
         if (stage == "acceptance"
                 and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") == ACCEPTANCE_PROFILE
+                and not acceptance_waived
                 and settings.get("stage_inputs", {}).get(stage, {}).get("failure_workflow_profile") != FAILURE_PROFILE):
             raise ValueError("the paired acceptance profile requires its separate finite registered-failure profile")
         if stage == "week":
@@ -519,10 +522,17 @@ def _cost_payload(settings, root):
     if date.fromisoformat(checked) > datetime.now(timezone.utc).date():
         raise ValueError("pricing.checked_on cannot be future-dated")
     workflow_profiles = set()
+    from .failure_waiver import source_waiver
+    acceptance_waived = source_waiver(settings) is not None
     for stage, inputs in settings.get("stage_inputs", {}).items():
         if stage not in STAGES or not isinstance(inputs, dict):
             continue
-        for name in ("workflow_profile", "failure_workflow_profile"):
+        profile_names = ("workflow_profile", "failure_workflow_profile")
+        if stage == "acceptance" and acceptance_waived:
+            # The source-bound waiver selects only V-S1/V-S3, so the registered
+            # failure profile is not part of this reduced campaign's priced scope.
+            profile_names = ("workflow_profile",)
+        for name in profile_names:
             profile = inputs.get(name)
             if profile is not None:
                 workflow_profiles.add(profile)

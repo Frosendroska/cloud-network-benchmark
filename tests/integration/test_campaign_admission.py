@@ -1081,6 +1081,75 @@ def test_production_preparer_builds_only_bound_normal_entries_when_user_waives_f
     assert [row["entry_id"] for row in stage["failure_waiver"]["normal_acceptance"]] == ["V-S1", "V-S3"]
 
 
+def test_source_bound_waiver_uses_reduced_acceptance_and_calibration_profiles(
+        repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    source = tmp_path / "DECISIONS.md"
+    source.write_text("## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments\n")
+    settings["stage_inputs"]["acceptance"].update(
+        workflow_profile=ACCEPTANCE_PROFILE, failure_workflow_profile=FAILURE_PROFILE)
+    settings["stage_inputs"]["calibration"]["workflow_profile"] = CALIBRATION_PROFILE
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    settings["stage_inputs"]["acceptance"].pop("allowance", None)
+    settings["stage_inputs"]["calibration"].pop("allowance", None)
+    settings["stage_inputs"]["acceptance"]["failure_waiver"] = {
+        "confirmed": True, "source": str(source),
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
+
+    acceptance = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    calibration = prepare_stage({"stage": "calibration"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(acceptance, request)
+    register_generated_cleanup(calibration, request)
+
+    assert acceptance["status"] == calibration["status"] == "DRAFT_UNAPPROVED"
+    assert [row["entry_id"] for row in acceptance["entries"]] == ["V-S1", "V-S3"]
+    assert acceptance["failure_waiver"]["status"] == "WAIVED"
+    assert acceptance["failure_waiver"]["not_tested"] == ["V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]
+    cost_payload = json.loads(Path(acceptance["cost_input_path"]).read_text())
+    assert [row["profile_id"] for row in cost_payload["workflow_profiles"]] == sorted(
+        [ACCEPTANCE_PROFILE, CALIBRATION_PROFILE])
+    assert not any("failure" in config_id for config_id in
+        cost_payload["provider_run_envelope_templates"])
+
+
+@pytest.mark.parametrize("waiver_state", ["absent", "malformed", "tampered", "wrong_scope"])
+def test_reduced_profiles_require_a_valid_source_bound_waiver(
+        repository_root, tmp_path, monkeypatch, waiver_state):
+    from cloud_network_benchmark.campaign_inputs import validate_stage_inputs
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["stage_inputs"]["acceptance"].update(workflow_profile=ACCEPTANCE_PROFILE)
+    if waiver_state != "absent":
+        source = tmp_path / "DECISIONS.md"
+        title = "## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments"
+        source.write_text(title + "\n")
+        declaration = {"confirmed": True, "source": str(source),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+        if waiver_state == "malformed":
+            declaration["unexpected"] = True
+        elif waiver_state == "tampered":
+            source.write_text("changed decision source\n")
+        elif waiver_state == "wrong_scope":
+            source.write_text("## unrelated decision with a different scope\n")
+            declaration["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        settings["stage_inputs"]["acceptance"]["failure_waiver"] = declaration
+
+    errors = validate_stage_inputs({"stage": "acceptance"}, settings, repository_root, draft=True)
+    assert errors
+    if waiver_state == "absent":
+        assert any("separate finite registered-failure profile" in error for error in errors)
+
+
 def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_attempt(repository_root, tmp_path,
         monkeypatch, request):
     import cloud_network_benchmark.campaign_inputs as inputs
