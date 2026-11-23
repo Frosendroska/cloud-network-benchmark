@@ -191,6 +191,105 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     assert _acceptance_pair(stage) == pair
 
 
+def test_operator_recovery_uses_entry_parent_campaign_not_stage_aggregation_id(
+        repository_root, tmp_path, monkeypatch, request):
+    """Production stage output binds recovery through the entry's real parent/child IDs."""
+    from types import SimpleNamespace
+    from cloud_network_benchmark import operator_recovery
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock())
+    register_generated_cleanup(stage, request)
+    entry = next(row for row in stage["entries"] if row["entry_id"] == "V-A-FAIL")
+    parent_manifest = json.loads(Path(entry["parent_manifest_path"]).read_text())
+    _, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+        repository_root=repository_root, config_path=Path(entry["config_path"]))
+    deployment = children["aws"]
+    provider_record = SimpleNamespace(provider="aws", deployment_id=deployment.deployment_id,
+        expiry_registered=True, cleanup_open=True, cleanup_settings_reference=None,
+        journal_reference=None)
+
+    assert stage["campaign_id"] == stage["stage_id"]
+    assert parent_manifest["campaign_id"] != stage["campaign_id"]
+    assert entry["run_ids"]["aws"] == deployment.run_id
+    operator_recovery._validate_campaign_identity(entry=entry,
+        recovery=SimpleNamespace(attempt_id=parent_manifest["campaign_id"]),
+        provider_record=provider_record, parent_manifest=parent_manifest,
+        saved_deployment=deployment)
+    with pytest.raises(ValueError, match="parent manifest campaign"):
+        operator_recovery._validate_campaign_identity(entry=entry,
+            recovery=SimpleNamespace(attempt_id=stage["campaign_id"]),
+            provider_record=provider_record, parent_manifest=parent_manifest,
+            saved_deployment=deployment)
+
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    prepared_path = stage_dir / "prepared-stage.json"
+    prepared_path.write_text(json.dumps(stage) + "\n")
+    prepared_path.chmod(0o600)
+    journal_path = stage_dir / "campaign-journal.json"
+    journal_path.write_text(json.dumps({"entries": {
+        row["entry_id"]: {"state": "running" if row is entry else "scheduled"}
+        for row in stage["entries"]}}) + "\n")
+    journal_path.chmod(0o600)
+    private_root = Path(entry["private_root"])
+    private_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    recovery_path = private_root / "lifecycle-recovery.json"
+    provider_journal = private_root / "provider-journal.json"
+    cleanup_settings = private_root / "cleanup-settings.json"
+    ledger_path = Path(stage["ledger_path"])
+    for path in (provider_journal, cleanup_settings, ledger_path):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_text("{}\n")
+        path.chmod(0o600)
+    provider_record.cleanup_settings_reference = str(cleanup_settings)
+    provider_record.journal_reference = str(provider_journal)
+    recovery_path.write_text(json.dumps({"schema_version": 1,
+        "attempt_id": parent_manifest["campaign_id"],
+        "controller_session_id": stage["controller_session_id"],
+        "ledger_path": str(ledger_path), "providers": [{
+            "provider": "aws", "deployment_id": deployment.deployment_id,
+            "journal_reference": str(provider_journal), "expiry_registered": True,
+            "creation_may_have_started": True, "cleanup_open": True,
+            "cleanup_settings_reference": str(cleanup_settings)}]}) + "\n")
+    recovery_path.chmod(0o600)
+    saved = SimpleNamespace(deployment=SimpleNamespace(provider="aws",
+        campaign_id=deployment.campaign_id, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id))
+    from cloud_network_benchmark import lifecycle_cleanup
+    monkeypatch.setattr(lifecycle_cleanup, "load_cleanup_settings", lambda _: saved)
+    monkeypatch.setattr(operator_recovery, "original_expiry_window", lambda _: {
+        "provider": "aws", "registration_id": "native-registration",
+        "target_selector": "exact-vm-pair", "action": "stop",
+        "expected_state": "stopped", "expiry_at": "2026-11-23T00:00:00+00:00",
+        "latest_safe_cleanup_start": "2026-11-23T01:00:00+00:00",
+        "cleanup_seconds": 660, "cap_at": "2026-11-23T01:11:00+00:00",
+        "binding_sha256": "a" * 64})
+    binding = operator_recovery.bind_failure_attempt(prepared_stage=prepared_path,
+        campaign_journal=journal_path, recovery=recovery_path,
+        runtime_config=Path(entry["runtime_config_path"]), entry_id="V-A-FAIL")
+    assert binding["attempt_id"] == parent_manifest["campaign_id"]
+    assert binding["attempt_id"] != stage["campaign_id"]
+    assert binding["server_fault_unit"] == f"cnb-{deployment.deployment_id}-iperf3.service"
+    published = json.loads(prepared_path.read_text())
+    published["observer_bindings_sha256"] = "b" * 64
+    prepared_path.write_text(json.dumps(published) + "\n")
+    prepared_path.chmod(0o600)
+    operator_recovery.revalidate_before_freeze(binding)
+    published["status"] = "MUTATED_AUTHORITY"
+    prepared_path.write_text(json.dumps(published) + "\n")
+    prepared_path.chmod(0o600)
+    with pytest.raises(ValueError, match="immutable authority changed"):
+        operator_recovery.revalidate_before_freeze(binding)
+    published["status"] = stage["status"]
+    prepared_path.write_text(json.dumps(published) + "\n")
+    prepared_path.chmod(0o600)
+    cleanup_settings.write_text('{"changed":true}\n')
+    cleanup_settings.chmod(0o600)
+    with pytest.raises(ValueError, match="input changed before freeze"):
+        operator_recovery.revalidate_before_freeze(binding)
+
+
 def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
         repository_root, tmp_path, monkeypatch, request):
     """Production drafting keeps plan overrides aligned with priced config identities."""
