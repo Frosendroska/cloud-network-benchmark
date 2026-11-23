@@ -965,6 +965,29 @@ def _is_exact_missing_attempt_resource_group(result: CommandResult, resource_gro
         and error.get("code") == "ResourceGroupNotFound" and error.get("message") == expected_message)
 
 
+def _is_exact_missing_job_schedule(result: CommandResult) -> bool:
+    """Accept only Azure CLI's structured NotFound for an absent Automation job schedule."""
+    if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
+        return False
+    wrapped = re.fullmatch(r"\s*ERROR:\s*Not Found\((\{.*\})\)\s*", result.stderr, re.DOTALL)
+    if wrapped is None:
+        return False
+    def unique_object(pairs):
+        output = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError("duplicate JSON key")
+            output[key] = value
+        return output
+    try:
+        payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return (isinstance(payload, dict) and set(payload) == {"code", "message"}
+        and payload.get("code") == "NotFound"
+        and payload.get("message") == "Job Schedule not found.")
+
+
 def _azure_schedule_trigger(requested: datetime) -> datetime:
     """Floor Azure Automation OneTime schedules to their exact UTC minute."""
     if requested.tzinfo is None or requested.utcoffset() is None:
@@ -1249,7 +1272,8 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
     base=f"{account}/{collection}/{child}?api-version={AUTOMATION_API}"
     read=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_before_delete",clock,allow_not_found=True)
     actions.append(_safe_cleanup_action(options,read))
-    if read.outcome=="failed" and _is_exact_not_found(read): return
+    if read.outcome=="failed" and (_is_exact_not_found(read)
+            or (collection == "jobSchedules" and _is_exact_missing_job_schedule(read))): return
     try: observed=json.loads(read.stdout)
     except (json.JSONDecodeError,TypeError) as exc: raise RuntimeError(f"Azure {collection} readback is malformed") from exc
     expected=base.split("?",1)[0]
@@ -1259,7 +1283,8 @@ def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions,
     actions.append(_safe_cleanup_action(options,deleted))
     verify=_command(runner,options,root,_azure_rest("GET",base),f"expiry_{collection}_absence",clock,allow_not_found=True)
     actions.append(_safe_cleanup_action(options,verify))
-    if verify.outcome!="failed" or not _is_exact_not_found(verify):
+    if verify.outcome!="failed" or not (_is_exact_not_found(verify)
+            or (collection == "jobSchedules" and _is_exact_missing_job_schedule(verify))):
         raise RuntimeError(f"Azure {collection} deletion is not confirmed")
 
 

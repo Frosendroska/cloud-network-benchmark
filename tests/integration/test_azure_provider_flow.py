@@ -37,6 +37,20 @@ def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_ke
     assert not _is_exact_missing_attempt_resource_group(accepted.model_copy(update={"stdout":"unexpected"}),group)
 
 
+def test_missing_job_schedule_wrapper_is_typed_and_unique():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_job_schedule
+    now=datetime.now(timezone.utc)
+    stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
+    accepted=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    assert _is_exact_missing_job_schedule(accepted)
+    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stdout":"unexpected"}))
+    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}))
+    assert not _is_exact_missing_job_schedule(accepted.model_copy(update={"stderr":stderr.replace("Job Schedule not found.", "Schedule not found.")}))
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'})
+    assert not _is_exact_missing_job_schedule(duplicate)
+
+
 def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: Path, tmp_path: Path):
     d=deployment(repository_root); o=options(tmp_path, d.admission.priority)
     class Runner:
