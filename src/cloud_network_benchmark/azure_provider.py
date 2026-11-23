@@ -63,6 +63,9 @@ class AzureRuntimeOptions(StrictModel):
     complete_workflow_seconds: float = Field(gt=0)
     post_registration_workflow_seconds: float = Field(gt=0)
     cap_deadline_monotonic: float = Field(gt=0)
+    # Original admission sample. Keeping this basis avoids remapping a fixed
+    # cap through a later UTC/monotonic pair during Azure expiry registration.
+    cap_started_monotonic: Optional[float] = Field(default=None, gt=0, exclude_if=lambda value: value is None)
     admission_evidence: dict[str, Any]
     retry_end_at: datetime
     poll_seconds: int = Field(ge=1, le=300)
@@ -373,6 +376,16 @@ def _profile_timing_identity(deployment: ProviderDeploymentInput) -> dict[str,st
         "config_sha256":deployment.config_sha256}
 
 
+def _source_cap_deadline(options: AzureRuntimeOptions, reservation: Any) -> float | None:
+    """Map the reservation cap from its original admission monotonic sample."""
+    if options.cap_started_monotonic is None:
+        return None
+    duration = (reservation.expires_at.value - reservation.cap_started_at.value).total_seconds()
+    if duration <= 0:
+        raise ValueError("original Azure reservation cap interval is invalid")
+    return float(options.cap_started_monotonic) + duration
+
+
 def _utc_from_clock(clock: Callable[[], float]) -> Callable[[], datetime]:
     owner = getattr(clock, "__self__", None)
     candidate = getattr(owner, "utc_now", None)
@@ -420,15 +433,22 @@ def _profile_timing_mutate(options: AzureRuntimeOptions, update: Callable[[dict[
 
 
 def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
-                               *, clock: Callable[[], float], utc_now: Callable[[], datetime]) -> None:
+                               *, clock: Callable[[], float], utc_now: Callable[[], datetime],
+                               origin_monotonic: float | None = None,
+                               origin_utc: datetime | None = None) -> None:
     profile_name = _profile_name(deployment)
     if profile_name is None:
         return
-    mono = float(clock()); wall = utc_now().astimezone(UTC)
+    mono = float(clock()) if origin_monotonic is None else float(origin_monotonic)
+    wall = (utc_now() if origin_utc is None else origin_utc).astimezone(UTC)
     if (options.cleanup_timing_path is not None and not options.cleanup_timing_path.exists()
             and (options.attempt_root / "recovery.json").exists()):
         raise ValueError("missing profile timing anchor cannot be recreated after provider recovery state exists")
     reservation = deployment.reservation.value
+    source_cap = _source_cap_deadline(options, reservation)
+    if (source_cap is not None
+            and options.cap_deadline_monotonic > source_cap + 1e-6):
+        raise ValueError("Azure runtime cap exceeds the original admission monotonic cap")
     body = {"schema_version": 1, "profile": profile_name,
         "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
         "reservation_id": reservation.reservation_id.value,
@@ -436,6 +456,8 @@ def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: Azu
         "clock_identity": _clock_identity(), "origin_monotonic": mono,
         "origin_utc": wall.isoformat(), "last_monotonic": mono, "last_utc": wall.isoformat(),
         "cap_deadline_monotonic": options.cap_deadline_monotonic,
+        "cap_started_monotonic": options.cap_started_monotonic,
+        "source_cap_deadline_monotonic": _source_cap_deadline(options, reservation),
         "cap_started_at": reservation.cap_started_at.value.isoformat(),
         "cap_expires_at": reservation.expires_at.value.isoformat(),
         "provider_stop_at": None, "first_cleanup_monotonic": None,
@@ -450,7 +472,8 @@ def _initialize_profile_timing(deployment: ProviderDeploymentInput, options: Azu
         if not current:
             return body
         if any(current.get(key) != body[key] for key in ("profile", "run_id", "deployment_id", "reservation_id", "config_sha256",
-                "clock_identity", "cap_deadline_monotonic", "cap_started_at", "cap_expires_at")):
+                "clock_identity", "cap_deadline_monotonic", "cap_started_monotonic",
+                "source_cap_deadline_monotonic", "cap_started_at", "cap_expires_at")):
             raise ValueError("existing Azure cleanup clock anchor differs from the original source-bound attempt")
         return current
     _profile_timing_mutate(options, initialize, create=True)
@@ -858,6 +881,7 @@ def build_pair_inputs(deployment: ProviderDeploymentInput, options: AzureRuntime
 def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, *,
                      clock: Callable[[], float] = time.monotonic,
                      utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
+                     timing_origin: tuple[float, datetime] | None = None,
                      initialize_timing: bool = True) -> tuple[Path, Path, Path, Path]:
     """Save the original local cleanup identity/inputs before live preflight.
 
@@ -865,7 +889,10 @@ def prepare_recovery(deployment: ProviderDeploymentInput, options: AzureRuntimeO
     claim, and does not require an unexpired approval, quote or launch cap.
     """
     if initialize_timing:
-        _initialize_profile_timing(deployment, options, clock=clock, utc_now=utc_now)
+        origin_kwargs = ({"origin_monotonic": timing_origin[0], "origin_utc": timing_origin[1]}
+            if timing_origin is not None else {})
+        _initialize_profile_timing(deployment, options, clock=clock, utc_now=utc_now,
+            **origin_kwargs)
     pair_values = build_pair_inputs(deployment, options)
     root, journal = _workspace(options, deployment)
     pair_vars = _persist_tfvars(root, journal, "pair", pair_values)
@@ -1319,13 +1346,24 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         anchor_origin_utc=datetime.fromisoformat(anchor["origin_utc"])
         anchor_origin_mono=float(anchor["origin_monotonic"])
         mapped_cap=anchor_origin_mono+(reservation.expires_at.value-anchor_origin_utc).total_seconds()
+        source_cap = _source_cap_deadline(options, reservation)
+        # Factory-created settings retain the admission cap-start monotonic
+        # sample. Compare against that immutable basis; a later UTC/monotonic
+        # sample can differ by clock-read latency even when the cap is valid.
+        # Keep the original one-microsecond guard and never raise the runtime cap.
+        cap_mapping_valid = float(anchor["cap_deadline_monotonic"]) <= mapped_cap + 1e-6
+        if source_cap is not None:
+            cap_mapping_valid = (cap_mapping_valid
+                and anchor.get("cap_started_monotonic") == options.cap_started_monotonic
+                and anchor.get("source_cap_deadline_monotonic") == source_cap
+                and float(anchor["cap_deadline_monotonic"]) <= source_cap + 1e-6)
         if (anchor.get("clock_identity") != _clock_identity()
                 or datetime.fromisoformat(anchor["cap_started_at"]) != reservation.cap_started_at.value
                 or datetime.fromisoformat(anchor["cap_expires_at"]) != reservation.expires_at.value
                 or anchor_origin_utc < reservation.cap_started_at.value or anchor_origin_utc > now
                 or anchor_origin_mono > mono
                 or float(anchor["cap_deadline_monotonic"]) != float(options.cap_deadline_monotonic)
-                or float(anchor["cap_deadline_monotonic"]) > mapped_cap + 1e-6
+                or not cap_mapping_valid
                 or anchor.get("provider_stop_at") is not None):
             raise ValueError("original Azure profile timing anchor is foreign, expired, or already bound")
     name, ids = _validate_request(deployment, options, now, mono)
