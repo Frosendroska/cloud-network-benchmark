@@ -1148,6 +1148,45 @@ def test_template_role_binding_rejects_swapped_foreign_or_weakened_properties(tm
         driver._validate_template(described,item,"vm_a",deployment,trigger)
 
 
+def test_s3_template_policy_mismatch_journals_bounded_exact_readback(tmp_path):
+    import hashlib, json
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+
+    deployment, driver = _cleanup_fixture(tmp_path)
+    policy_name = "cnb-v-s3-1d94726aea"
+    deployment = deployment.model_copy(update={
+        "scenario": "placement_optimization",
+        "placement": deployment.placement.model_copy(update={
+            "kind": "compact_placement_policy", "name": policy_name, "collocated": True}),
+    })
+    expected = driver._selected_policy_path(deployment)
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    described = _template_response(driver, deployment, "vm_a", "111", trigger,
+        datetime.now(timezone.utc) - timedelta(seconds=1))
+    observed = [expected, f"projects/{driver.settings.project_id}/regions/europe-west3/resourcePolicies/extra"]
+    described["properties"]["resourcePolicies"] = observed
+    name = f"{driver._namespace(deployment)}-a"
+    item = {"id": "111", "name": name, "zone": deployment.vm_a.zone,
+        "expected_policy": expected,
+        "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{name}?uniqueId=111"}
+
+    attempt = driver._attempt_dir(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id, "commands": []})
+    driver._active_attempt = attempt
+    with pytest.raises(GcpProviderError, match="resourcePolicies"):
+        driver._validate_template(described, item, "vm_a", deployment, trigger)
+
+    diagnostic = json.loads((attempt / "attempt.json").read_text())["template_validation_diagnostics"][-1]
+    assert diagnostic["mismatched_fields"] == ["resourcePolicies"]
+    assert diagnostic["observed_field_sha256"]["resourcePolicies"] == hashlib.sha256(
+        json.dumps(observed, sort_keys=True).encode()).hexdigest()
+    assert diagnostic["resourcePolicies_readback"] == {
+        "observed_type": "list",
+        "observed_sha256": diagnostic["observed_field_sha256"]["resourcePolicies"],
+        "observed_values": observed,
+    }
+
+
 def test_selected_topology_readback_checks_zone_addresses_disk_and_image(tmp_path, monkeypatch):
     import hashlib
     from cloud_network_benchmark.contracts.common import Scenario

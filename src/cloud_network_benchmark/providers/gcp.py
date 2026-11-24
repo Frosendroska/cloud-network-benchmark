@@ -723,6 +723,19 @@ class GcpProviderDriver:
                            mismatches: list[str], fields: dict[str, Any]) -> None:
         diagnostic = {"role": role, "mismatched_fields": mismatches,
             "observed_field_sha256": {key: hashlib.sha256(json.dumps(fields[key], sort_keys=True).encode()).hexdigest() for key in mismatches}}
+        if "resourcePolicies" in mismatches:
+            policies = fields.get("resourcePolicies")
+            policy_readback = {
+                "observed_type": type(policies).__name__,
+                "observed_sha256": diagnostic["observed_field_sha256"]["resourcePolicies"],
+            }
+            # Provider policy identifiers are safe to retain in the private
+            # attempt journal. Bound the diagnostic so malformed responses
+            # cannot turn it into an unbounded provider payload archive.
+            if (isinstance(policies, list) and len(policies) <= 16
+                    and all(isinstance(value, str) and len(value) <= 512 for value in policies)):
+                policy_readback["observed_values"] = policies
+            diagnostic["resourcePolicies_readback"] = policy_readback
         if self._active_attempt is not None:
             journal = self._load(self._active_attempt, deployment)
             journal.setdefault("template_validation_diagnostics", []).append(diagnostic)
