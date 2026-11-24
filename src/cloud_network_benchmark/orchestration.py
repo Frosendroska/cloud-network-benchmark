@@ -76,6 +76,10 @@ class ProviderHooks:
     stage_admission: Callable[[str], Any] | None = None
     cleanup_reconcile: Callable[[Any], Any] | None = None
     cleanup_resource_ids: Callable[[], list[str]] | None = None
+    # AWS-only source-bound cleanup identity captured by the production hook.
+    # This remains available when expiry registration partially succeeds or
+    # returns a failed outcome, so cleanup never has to trust its own payload.
+    aws_cleanup_identity: Callable[[], Mapping[str, Any] | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -747,6 +751,7 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
           *, before: Callable[[], None] | None = None,
           after: Callable[[Any, bool], None] | None = None,
           verify: Callable[[Any], None] | None = None,
+          aws_cleanup_identity: Callable[[], Mapping[str, Any] | None] | None = None,
           cleanup_window: list[datetime] | None = None) -> bool:
     try:
         if before is not None:
@@ -760,8 +765,11 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
         value = action()
         result.values[stage] = value
         outcome_window = (cleanup_window[0], cleanup_window[1]) if cleanup_window is not None and len(cleanup_window) == 2 else None
-        expected_identity = (_expected_aws_cleanup_identity(result)
-            if provider == "aws" and stage == "cleanup" else None)
+        if provider == "aws" and stage == "cleanup":
+            expected_identity = (aws_cleanup_identity() if aws_cleanup_identity is not None
+                else _expected_aws_cleanup_identity(result))
+        else:
+            expected_identity = None
         succeeded, reason = _typed_outcome(provider, stage, value,
             expected_cleanup_identity=expected_identity,
             cleanup_window=outcome_window)
@@ -959,6 +967,8 @@ def execute_provider_workflows(
                     return value
             succeeded = _call(provider, stage, action, results[provider], before=before,
                               after=after, verify=verify,
+                              aws_cleanup_identity=(workflows[provider].aws_cleanup_identity
+                                  if provider == "aws" and stage == "cleanup" else None),
                               cleanup_window=cleanup_times)
         except BaseException as exc:
             results[provider].stage_times[stage] = {

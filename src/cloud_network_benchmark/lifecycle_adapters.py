@@ -876,7 +876,28 @@ def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
               expiry_request: ExpiryRequest, *, stages: RemoteStages,
               reservation: Any = None, claim_data: Any = None, on_protected=None):
     from .orchestration import ProviderHooks
-    state: dict[str, Any] = {"deployment": _deployment_with(deployment, reservation=reservation)}
+    hook_deployment = _deployment_with(deployment, reservation=reservation)
+    state: dict[str, Any] = {"deployment": hook_deployment}
+
+    def cleanup_identity():
+        """Return cleanup scope from the original hook inputs, never a result payload."""
+        from .contracts.common import Provider
+        from .providers.aws import AwsProviderError, _namespace
+        try:
+            original = hook_deployment
+            regions = driver._regions(original)
+            if (getattr(original.provider, "value", original.provider) != Provider.AWS.value
+                    or expiry_request.provider != Provider.AWS
+                    or expiry_request.run_id != original.run_id
+                    or expiry_request.deployment_id != original.deployment_id
+                    or expiry_request.resource_namespace != _namespace(original)
+                    or expiry_request.target_selector != driver._target_selector(original, regions)):
+                return None
+            return {"account_id": driver.settings.account_id, "regions": regions,
+                "run_id": original.run_id, "deployment_id": original.deployment_id}
+        except (AttributeError, AwsProviderError, KeyError, TypeError, ValueError):
+            return None
+
     def protect():
         evidence = driver.register_expiry(state["deployment"], expiry_request)
         state["deployment"] = _deployment_with(state["deployment"], expiry=evidence)
@@ -896,6 +917,7 @@ def aws_hooks(driver: AwsProviderDriver, deployment: ProviderDeploymentInput,
         retrieve=lambda: stages.retrieve(state["deployment"], _last_result(state)),
         cleanup=lambda: driver.cleanup(state["deployment"]),
         cancel=stages.cancel,
+        aws_cleanup_identity=cleanup_identity,
     )
 
 
