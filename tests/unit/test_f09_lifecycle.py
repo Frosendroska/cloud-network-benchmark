@@ -26,6 +26,35 @@ from cloud_network_benchmark.admission import WorkflowAllowance
 from tests.fixtures.f09.helpers import FakeClock, Trace
 
 
+def _aws_cleanup_inventory(*, instance_state="terminated", run_id="run-1", deployment_id="deploy-1"):
+    resource_names = ("addresses", "instances", "internet_gateways", "key_pairs",
+        "network_interfaces", "peerings", "placement_groups", "route_tables",
+        "security_groups", "subnets", "volumes", "vpcs")
+    ownership_tags = [{"Key": "cnb_run_id", "Value": run_id},
+        {"Key": "cnb_deployment_id", "Value": deployment_id}]
+    resources = {name: [] for name in resource_names}
+    resources["instances"] = [
+        {"InstanceId": "i-1234567890abcdef0", "State": {"Name": instance_state},
+            "Tags": [*ownership_tags, {"Key": "cnb_role", "Value": "vm_a"}]},
+        {"InstanceId": "i-1234567890abcdef1", "State": {"Name": instance_state},
+            "Tags": [*ownership_tags, {"Key": "cnb_role", "Value": "vm_b"}]},
+    ]
+    resources["peerings"] = [{"VpcPeeringConnectionId": "pcx-123",
+        "Status": {"Code": "deleted"}, "Tags": ownership_tags}]
+    return {"complete": True, "safety_absent": {"eu-north-1": True},
+        "regions": {"eu-north-1": {"complete": True, "remaining": {},
+            "observed_at_utc": "2026-11-24T12:00:00+00:00",
+            "scope": {"account_id": "123456789012", "region": "eu-north-1",
+                "run_id": run_id, "deployment_id": deployment_id}, "resources": resources}}}
+
+
+def _aws_cleanup_expected():
+    return ({"account_id": "123456789012", "regions": ["eu-north-1"],
+        "run_id": "run-1", "deployment_id": "deploy-1"},
+        (datetime(2026, 11, 24, 11, 59, tzinfo=timezone.utc),
+         datetime(2026, 11, 24, 12, 1, tzinfo=timezone.utc)))
+
+
 def hooks(provider, trace, *, protect=None, fail=None, start_barrier=None):
     def run(stage):
         trace.add(provider, stage)
@@ -209,8 +238,7 @@ def test_claim_denial_reports_only_bounded_stage_decision_reason_codes():
 
 
 @pytest.mark.parametrize("provider,inventory", [
-    ("aws", {"complete": True, "safety_absent": {"eu-central-1": True},
-        "regions": {"eu-central-1": {"complete": True, "resources": {"instances": [], "known_ids": {}}}}}),
+    ("aws", _aws_cleanup_inventory()),
     ("gcp", {"pages_complete": True, "zone_scope": "all_project_zones",
         "completed_scopes": ["all_project_zones", "global"], "resources": []}),
     ("azure", []),
@@ -219,13 +247,71 @@ def test_cleanup_requires_provider_inventory_proving_absence(provider, inventory
     from types import SimpleNamespace
     valid = SimpleNamespace(cleanup_state="succeeded", launch_blocked=False,
         failures=[], inventory=SimpleNamespace(value=inventory), resources=inventory if provider == "azure" else None)
-    assert _typed_outcome(provider, "cleanup", valid)[0]
+    expected = _aws_cleanup_expected() if provider == "aws" else (None, None)
+    assert _typed_outcome(provider, "cleanup", valid,
+        expected_cleanup_identity=expected[0], cleanup_window=expected[1])[0]
     if provider == "azure":
         valid.resources = [{"id": "still-present"}]
     else:
         valid.inventory = SimpleNamespace(value={**inventory,
             ("safety_absent" if provider == "aws" else "resources"): {"zone": False} if provider == "aws" else [{"id": "still-present"}]})
-    assert not _typed_outcome(provider, "cleanup", valid)[0]
+    assert not _typed_outcome(provider, "cleanup", valid,
+        expected_cleanup_identity=expected[0], cleanup_window=expected[1])[0]
+
+
+@pytest.mark.parametrize("mutation", [
+    "live_instance", "foreign_tags", "missing_scope", "incomplete",
+    "remaining_live", "unknown_resource_type", "deleted_peerings_forged_live",
+    "coherent_foreign_scope", "stale_observation", "wrong_account", "wrong_regions",
+])
+def test_aws_cleanup_accepts_only_scoped_terminal_tombstones(mutation):
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    inventory = _aws_cleanup_inventory()
+    region = inventory["regions"]["eu-north-1"]
+    if mutation == "live_instance":
+        region["resources"]["instances"][0]["State"]["Name"] = "running"
+    elif mutation == "foreign_tags":
+        region["resources"]["instances"][0]["Tags"][0]["Value"] = "foreign-run"
+    elif mutation == "missing_scope":
+        del region["scope"]
+    elif mutation == "incomplete":
+        region["complete"] = False
+    elif mutation == "remaining_live":
+        region["remaining"] = {}
+        region["resources"]["volumes"] = [{"VolumeId": "vol-123", "Tags": [
+            {"Key": "cnb_run_id", "Value": "run-1"},
+            {"Key": "cnb_deployment_id", "Value": "deploy-1"}]}]
+    elif mutation == "unknown_resource_type":
+        region["resources"]["unknown"] = []
+    elif mutation == "deleted_peerings_forged_live":
+        region["resources"]["peerings"] = [{"VpcPeeringConnectionId": "pcx-123",
+            "Status": {"Code": "active"}, "Tags": [
+                {"Key": "cnb_run_id", "Value": "run-1"},
+                {"Key": "cnb_deployment_id", "Value": "deploy-1"}]}]
+    elif mutation == "coherent_foreign_scope":
+        region["scope"].update({"run_id": "foreign-run", "deployment_id": "foreign-deploy"})
+        for rows in region["resources"].values():
+            for row in rows:
+                for tag in row.get("Tags", []):
+                    if tag["Key"] == "cnb_run_id":
+                        tag["Value"] = "foreign-run"
+                    elif tag["Key"] == "cnb_deployment_id":
+                        tag["Value"] = "foreign-deploy"
+    elif mutation == "stale_observation":
+        region["observed_at_utc"] = "2026-11-24T11:58:59+00:00"
+    elif mutation == "wrong_account":
+        region["scope"]["account_id"] = "000000000000"
+    elif mutation == "wrong_regions":
+        inventory["regions"]["eu-west-2"] = inventory["regions"].pop("eu-north-1")
+        inventory["regions"]["eu-west-2"]["scope"]["region"] = "eu-west-2"
+        inventory["safety_absent"] = {"eu-west-2": True}
+    value = SimpleNamespace(cleanup_state="succeeded", launch_blocked=False,
+        failures=[], inventory=SimpleNamespace(value=deepcopy(inventory)))
+    expected, window = _aws_cleanup_expected()
+    assert not _typed_outcome("aws", "cleanup", value,
+        expected_cleanup_identity=expected, cleanup_window=window)[0]
 
 
 @pytest.mark.parametrize("now,deadline,trigger", [(999.0, 1000.0, 200.0), (201.0, 200.0, None)])

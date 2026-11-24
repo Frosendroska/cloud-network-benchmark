@@ -349,6 +349,10 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     ("instance", "instance identity"),
     ("account", "account differs"),
     ("zone", "physical AWS zone ID"),
+    ("empty_topology", "physical AWS zone ID"),
+    ("malformed_topology", "physical AWS zone ID"),
+    ("secret_topology", "physical AWS zone ID"),
+    ("diagnostic_write_failure", "physical AWS zone ID"),
     ("tags", "ownership tags differ"),
     ("image_owner", "Canonical Ubuntu"),
     ("disk", "32 GiB gp3"),
@@ -384,6 +388,16 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         instance["InstanceId"] = "i-foreign"
     elif mutation == "zone":
         responses["describe-instance-topology"]["Instances"][0]["ZoneId"] = "wrong-zone"
+    elif mutation == "empty_topology":
+        responses["describe-instance-topology"]["Instances"] = []
+    elif mutation == "malformed_topology":
+        responses["describe-instance-topology"]["Instances"] = ["unexpected-row"]
+    elif mutation == "secret_topology":
+        responses["describe-instance-topology"] = {"Instances": [{
+            "InstanceId": "AKIAIOSFODNN7EXAMPLE", "ZoneId": "aws_secret_access_key=secret-value",
+            "access_token": "secret-token-value"}]}
+    elif mutation == "diagnostic_write_failure":
+        responses["describe-instance-topology"]["Instances"][0]["ZoneId"] = "wrong-zone"
     elif mutation == "tags":
         instance["Tags"][1]["Value"] = "foreign-deployment"
     elif mutation == "image_owner":
@@ -392,20 +406,57 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         responses["describe-volumes"]["Volumes"][0]["Size"] = 64
 
     class Runner:
+        def __init__(self):
+            self.commands = []
+
         def run(self, request):
             operation = request.argv[2]
+            self.commands.append(operation)
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
                 finished_at=NOW, duration_seconds=0, exit_code=0,
                 stdout=json.dumps(responses.get(operation, {})), stderr="")
 
-    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    runner = Runner()
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=lambda: NOW)
     expected = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
         "private_ipv4": "10.60.1.10", "public_ipv4": "8.8.8.8", "zone": "eu-central-1a",
         "zone_id": "euc1-az2", "image_id": instance["ImageId"], "boot_volume_id": "vol-0123456789abcdef0",
         "placement_group": None}
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._active_deployment = deployment
+    if mutation == "diagnostic_write_failure":
+        driver._save_journal = lambda *_args: (_ for _ in ()).throw(OSError("journal unavailable"))
     if match:
         with pytest.raises(AwsProviderError, match=match):
             driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
+        if mutation in {"zone", "empty_topology", "malformed_topology", "secret_topology"}:
+            saved = json.loads((driver._active_attempt / "attempt.json").read_text())
+            diagnostic = saved["topology_diagnostics"][0]
+            assert diagnostic["expected_instance_id"] == expected["instance_id"]
+            assert diagnostic["expected_zone_id"] == expected["zone_id"]
+            assert diagnostic["response_type"] == "dict"
+            if mutation == "zone":
+                assert diagnostic["instance_count"] == 1
+                assert diagnostic["observations"][0]["zone_id"] is None
+                assert diagnostic["observations"][0]["zone_id_valid"] is False
+                assert diagnostic["observations"][0]["field_types"]["ZoneId"] == "str"
+            elif mutation == "empty_topology":
+                assert diagnostic["instance_count"] == 0
+                assert diagnostic["observations"] == []
+            elif mutation == "malformed_topology":
+                assert diagnostic["observations"] == [{"row_type": "str"}]
+            elif mutation == "secret_topology":
+                serialized = json.dumps(diagnostic)
+                assert diagnostic["observations"][0]["instance_id"] is None
+                assert diagnostic["observations"][0]["zone_id"] is None
+                assert diagnostic["observations"][0]["unexpected_field_count"] == 1
+                assert "AKIAIOSFODNN7EXAMPLE" not in serialized
+                assert "secret-value" not in serialized and "secret-token-value" not in serialized
+                assert "access_token" not in serialized
+            else:
+                assert "NetworkNodes" not in json.dumps(diagnostic)
+        if mutation == "diagnostic_write_failure":
+            assert len(runner.commands) == 3
     else:
         actual = driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
         assert actual["zone_id"] == "euc1-az2"
@@ -425,6 +476,29 @@ def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_pa
             "vm_a": detail("i-vm-a", "10.60.1.10", "8.8.8.8", "eu-west-2", "eu-west-2a"),
             "vm_b": detail("i-vm-b", "10.60.1.11", "1.1.1.1", "eu-central-1", "eu-central-1a"),
         }}, NOW, NOW)
+
+
+def test_topology_diagnostics_bound_total_records_and_row_summaries(tmp_path):
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    driver._active_attempt = driver._attempt_dir(deployment)
+    driver._active_deployment = deployment
+    driver._active_journal = driver._load_journal(driver._active_attempt, deployment)
+    rows = [{"InstanceId": f"i-{index:017x}", "ZoneId": "euc1-az1",
+        "secret_value": "never-retain-this"} for index in range(100)]
+    for _ in range(5):
+        driver._record_topology_diagnostic(
+            {"instance_id": "i-0123456789abcdef0", "zone_id": "euc1-az2"},
+            {"Instances": rows, "api_secret": "never-retain-this"}, rows)
+    saved = json.loads((driver._active_attempt / "attempt.json").read_text())
+    diagnostics = saved["topology_diagnostics"]
+    assert len(diagnostics) == 4
+    assert saved["topology_diagnostics_truncated"] is True
+    assert all(item["instance_count"] == 100 and len(item["observations"]) == 2 for item in diagnostics)
+    serialized = json.dumps(diagnostics)
+    assert "never-retain-this" not in serialized
+    assert "secret_value" not in serialized and "api_secret" not in serialized
+    assert all(len(json.dumps(item).encode("utf-8")) <= 4096 for item in diagnostics)
 
 
 @pytest.mark.parametrize("response,match", [

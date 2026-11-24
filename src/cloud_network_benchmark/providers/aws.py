@@ -411,9 +411,11 @@ class AwsProviderDriver:
             raise AwsProviderError("all-region expiry evidence must be registered before pair apply", category="expiry_required")
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
+        self._active_deployment = deployment
         self._active_commands = []
         self._active_primary_failure = None
         journal = self._load_journal(attempt, deployment)
+        self._active_journal = journal
         self._block_on_residual_cleanup(deployment)
         if journal.get("deployment_scope") and journal["deployment_scope"] != self._deployment_scope(deployment):
             raise AwsProviderError("deployment differs from the registered AWS scope", category="scope_mismatch")
@@ -1324,7 +1326,10 @@ class AwsProviderDriver:
             raise AwsProviderError("EFA network interfaces are not part of the selected protocol", category="acceleration_mismatch")
         zone = self._aws_json("ec2", "describe-instance-topology", "--instance-ids", expected["instance_id"], "--region", region, "--output", "json")
         topology = zone.get("Instances") or []
-        if len(topology) != 1 or topology[0].get("ZoneId") != expected["zone_id"]:
+        self._record_topology_diagnostic(expected, zone, topology)
+        if (not isinstance(topology, list) or len(topology) != 1
+                or not isinstance(topology[0], dict)
+                or topology[0].get("ZoneId") != expected["zone_id"]):
             raise AwsProviderError("physical AWS zone ID differs from observed instance topology", category="zone_identity_mismatch")
 
         images = self._aws_json("ec2", "describe-images", "--image-ids", instance["ImageId"], "--region", region, "--output", "json").get("Images", [])
@@ -1389,6 +1394,77 @@ class AwsProviderDriver:
             "scenario": str(scenario),
         }
 
+    def _record_topology_diagnostic(self, expected: dict[str, Any], response: dict[str, Any],
+                                    topology: Any) -> None:
+        """Persist bounded identity/count/type facts without retaining provider output."""
+        attempt = getattr(self, "_active_attempt", None)
+        deployment = getattr(self, "_active_deployment", None)
+        if attempt is None or deployment is None:
+            return
+        allowed_fields = ("InstanceId", "ZoneId", "InstanceType", "GroupName",
+                          "AvailabilityZone", "NetworkNodes", "CapacityBlockId")
+        allowed_response_fields = {"Instances", "NextToken", "nextToken"}
+        instance_id_pattern = r"i-(?:[a-f0-9]{8}|[a-f0-9]{17})"
+        zone_id_pattern = r"[a-z]{3}[0-9]-az[0-9]+"
+        def safe_identifier(value: Any, pattern: str) -> tuple[str | None, bool]:
+            if isinstance(value, str) and re.fullmatch(pattern, value):
+                return value, True
+            return None, False
+
+        rows = topology if isinstance(topology, list) else []
+        observations = []
+        for row in rows[:2]:
+            if not isinstance(row, dict):
+                observations.append({"row_type": type(row).__name__})
+                continue
+            instance_id, zone_id = row.get("InstanceId"), row.get("ZoneId")
+            safe_instance_id, instance_id_valid = safe_identifier(instance_id, instance_id_pattern)
+            safe_zone_id, zone_id_valid = safe_identifier(zone_id, zone_id_pattern)
+            observations.append({
+                "instance_id": safe_instance_id,
+                "instance_id_valid": instance_id_valid,
+                "zone_id": safe_zone_id,
+                "zone_id_valid": zone_id_valid,
+                "field_types": {key: type(row[key]).__name__ for key in allowed_fields if key in row},
+                "unexpected_field_count": sum(key not in allowed_fields for key in row),
+            })
+        expected_instance_id, expected_instance_id_valid = safe_identifier(
+            expected.get("instance_id"), instance_id_pattern)
+        expected_zone_id, expected_zone_id_valid = safe_identifier(expected.get("zone_id"), zone_id_pattern)
+        response_keys = [key for key in response if isinstance(key, str)]
+        record = {
+            "expected_instance_id": expected_instance_id,
+            "expected_instance_id_valid": expected_instance_id_valid,
+            "expected_zone_id": expected_zone_id,
+            "expected_zone_id_valid": expected_zone_id_valid,
+            "response_type": "dict",
+            "response_fields": sorted(key for key in response_keys if key in allowed_response_fields),
+            "unexpected_response_field_count": sum(key not in allowed_response_fields for key in response_keys),
+            "instances_type": type(response.get("Instances")).__name__,
+            "instance_count": len(rows) if isinstance(topology, list) else None,
+            "instances_truncated": len(rows) > 2 if isinstance(topology, list) else False,
+            "next_token_present": bool(response.get("NextToken") or response.get("nextToken")),
+            "observations": observations,
+        }
+        if len(json.dumps(record, separators=(",", ":")).encode("utf-8")) > 4096:
+            record["observations"] = []
+            record["observations_truncated"] = True
+        try:
+            journal = getattr(self, "_active_journal", None)
+            if not isinstance(journal, dict):
+                journal = self._load_journal(attempt, deployment)
+                self._active_journal = journal
+            diagnostics = journal.setdefault("topology_diagnostics", [])
+            if len(diagnostics) >= 4:
+                journal["topology_diagnostics_truncated"] = True
+                self._save_journal(attempt, journal)
+                return
+            diagnostics.append(record)
+            self._save_journal(attempt, journal)
+        except Exception:
+            # Diagnostics do not change topology acceptance or provisioning outcome.
+            return
+
     def _attempt_dir_for_details(self, _details: dict[str, Any]) -> Path:
         # _normalize_output has already created the deployment attempt directory. Resolve the
         # currently active attempt from the driver's single-call context set by provision().
@@ -1452,7 +1528,10 @@ class AwsProviderDriver:
         if known_remaining:
             complete = False
             entries["known_ids"] = known_remaining
-        return {"complete": complete, "remaining": _remaining_inventory(entries), "resources": entries}
+        return {"complete": complete, "remaining": _remaining_inventory(entries), "resources": entries,
+                "observed_at_utc": self.clock().astimezone(timezone.utc).isoformat(),
+                "scope": {"account_id": self.settings.account_id, "region": region, "run_id": deployment.run_id,
+                          "deployment_id": deployment.deployment_id}}
 
     def _verify_known_resource_ids(self, known: dict[str, Any], region: str, failures: list[FailureEvidence]) -> dict[str, Any]:
         remaining: dict[str, Any] = {}
