@@ -21,11 +21,18 @@ def test_protection_is_templates_and_network_only():
     assert 'nic_type   = "GVNIC"' in source
 
 
-def test_pair_has_exactly_two_template_inherited_instances_without_overrides():
+def test_pair_has_two_template_roles_with_explicit_selected_nic_overrides():
     source = (ROOT / "terraform/gcp/pair/main.tf").read_text()
     assert len(blocks(source, "google_compute_instance_from_template")) == 2
     assert source.count("source_instance_template =") == 2
-    assert not re.search(r'(?m)^\s*(scheduling|network_interface|boot_disk|metadata|machine_type)\s*[={]', source)
+    assert source.count('dynamic "network_interface"') == 2
+    assert "network_ip = var.network_ip_a" in source
+    assert "network_ip = var.network_ip_b" in source
+    assert source.count('dynamic "access_config"') == 2
+    assert "nic_type   = var.nic_type_a" in source
+    assert "nic_type   = var.nic_type_b" in source
+    assert "service_account" not in source
+    assert "resource_policies" not in source
     assert "self_link_unique" not in source
 
 

@@ -811,7 +811,7 @@ def test_same_attempt_prior_controller_session_blocks_reuse_and_provision_but_al
 
 
 @pytest.mark.parametrize("late_position", ["after_stop_before_cap", "after_cap"])
-def test_workflow_cleanup_uses_bounded_recovery_after_original_stop_deadline(tmp_path, monkeypatch, late_position):
+def test_workflow_cleanup_does_not_restart_expired_original_cumulative_deadline(tmp_path, monkeypatch, late_position):
     from cloud_network_benchmark.contracts.common import Evidence
     deployment, driver = _cleanup_fixture(tmp_path)
     cap_end = deployment.reservation.value.expires_at.value
@@ -842,11 +842,136 @@ def test_workflow_cleanup_uses_bounded_recovery_after_original_stop_deadline(tmp
         "pages_complete": True, "instances": [], "resources": [], "known": []})
     result = driver.cleanup(deployment)
     journal = driver._load(attempt, deployment)
-    assert result.cleanup_state == "succeeded"
-    assert ("pair", "destroy") in actions
-    assert result.inventory.value["cleanup_timing"]["status"] == "late"
-    assert journal["cleanup_acceptance_timing"]["status"] == "late"
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category == "cleanup_deadline_unknown"
+    assert actions == []
+    assert journal["cleanup_state"] == "failed"
     assert deployment.reservation.value.expires_at.value == cap_end
+
+
+@pytest.mark.parametrize(("utc_seconds", "mono_deadline", "remaining"), [
+    (500, 700.0, 500.0),  # UTC cap wins over the monotonic cap
+    (600, 400.0, 300.0),  # monotonic cap wins over the UTC cap
+])
+def test_cleanup_deadline_uses_original_cleanup_cap_and_utc_monotonic_minimum(
+        tmp_path, monkeypatch, utc_seconds, mono_deadline, remaining):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.contracts.common import Evidence
+    deployment, driver = _cleanup_fixture(tmp_path)
+    utc = [datetime.now(timezone.utc)]
+    mono = [100.0]
+    driver.clock = lambda: utc[0]
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    reservation = deployment.reservation.value.model_copy(update={
+        "expires_at": Evidence(value=utc[0] + timedelta(seconds=300))})
+    deployment = deployment.model_copy(update={"admission": admission,
+        "reservation": Evidence(value=reservation), "cleanup_timeout_seconds": 660})
+    attempt = driver._attempt_dir(deployment)
+    journal = {
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "cleanup_started_at": utc[0].isoformat(), "cleanup_started_monotonic": mono[0],
+        "cleanup_clock_binding": round(utc[0].timestamp()-mono[0], 3),
+        "cleanup_deadline_utc": (utc[0]+timedelta(seconds=utc_seconds)).isoformat(),
+        "cleanup_deadline_monotonic": mono_deadline,
+        "cleanup_deadline_binding_sha256": None,
+    }
+    deadline = driver._prepare_cleanup_deadline(attempt, journal, deployment, utc[0])
+    assert deadline == utc[0] + timedelta(seconds=utc_seconds)
+    assert driver._deadline == mono[0] + remaining
+    assert deadline <= utc[0] + timedelta(seconds=660)  # the original cleanup reserve is never exceeded
+
+
+@pytest.mark.parametrize("clock_case", ["expired", "naive_utc", "unknown_binding", "utc_rollback"])
+def test_cleanup_deadline_rejects_expired_unknown_or_unrepresentable_time(tmp_path, monkeypatch, clock_case):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    now = datetime.now(timezone.utc)
+    driver.clock = lambda: now.replace(tzinfo=None) if clock_case == "naive_utc" else now
+    mono = [200.0]
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
+    attempt = driver._attempt_dir(deployment)
+    journal = driver._load(attempt, deployment)
+    if clock_case == "expired":
+        deployment = deployment.model_copy(update={"cleanup_timeout_seconds": 120})
+        start = now - timedelta(seconds=121)
+        journal.update({"cleanup_started_at": start.isoformat(), "cleanup_started_monotonic": 79.0,
+            "cleanup_clock_binding": round(now.timestamp()-mono[0], 3),
+            "cleanup_deadline_utc": (now-timedelta(seconds=1)).isoformat(),
+            "cleanup_deadline_monotonic": 199.0, "cleanup_deadline_binding_sha256": None})
+    elif clock_case == "unknown_binding":
+        journal["binding_sha256"] = driver._binding_fingerprint(deployment)
+        driver._prepare_cleanup_deadline(attempt, journal, deployment, now)
+        journal = driver._load(attempt, deployment)
+        journal["cleanup_deadline_binding_sha256"] = "f" * 64
+    elif clock_case == "utc_rollback":
+        journal.update({"cleanup_started_at": (now+timedelta(seconds=1)).isoformat(),
+            "cleanup_started_monotonic": 199.0,
+            "cleanup_clock_binding": round(now.timestamp()-mono[0], 3)})
+    with pytest.raises(GcpProviderError):
+        driver._prepare_cleanup_deadline(attempt, journal, deployment,
+            driver.clock() if clock_case == "naive_utc" else now)
+
+
+def test_cleanup_runner_uses_only_remaining_original_deadline_and_keeps_other_limits(tmp_path, monkeypatch):
+    import json
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.contracts.execution import CommandResult
+    deployment, driver = _cleanup_fixture(tmp_path)
+    deployment = deployment.model_copy(update={"cleanup_timeout_seconds": 660})
+    attempt = driver._attempt_dir(deployment)
+    namespace = driver._namespace(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": True, "templates": {
+            "vm_a": {"id": "101", "name": f"{namespace}-a", "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-a?uniqueId=101"},
+            "vm_b": {"id": "202", "name": f"{namespace}-b", "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-b?uniqueId=202"}}})
+    original_run = driver._run
+    def fake_apply_run(action, _argv, _cwd, timeout=None):
+        now = datetime.now(timezone.utc)
+        stdout = '{"instances":{}}' if action == "gcp-pair-outputs" else ""
+        return CommandResult(action_id=action, outcome="succeeded", started_at=now,
+            finished_at=now, duration_seconds=0.0, exit_code=0, stdout=stdout, stderr="")
+    monkeypatch.setattr(driver, "_run", fake_apply_run)
+    driver._terraform(attempt, "pair", "apply", deployment, {
+        "template_a": f"projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-a?uniqueId=101",
+        "template_b": f"projects/{driver.settings.project_id}/global/instanceTemplates/{namespace}-b?uniqueId=202"})
+    monkeypatch.setattr(driver, "_run", original_run)
+    mono = [100.0]
+    utc = [datetime.now(timezone.utc)]
+    driver.clock = lambda: utc[0]
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
+
+    class Capture:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            now = utc[0]
+            if request.action_id == "gcp-pair-destroy":
+                mono[0] += 120
+                utc[0] += timedelta(seconds=120)
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
+                    finished_at=now, duration_seconds=0.0, exit_code=1, stdout="", stderr="synthetic failure")
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                finished_at=now, duration_seconds=0.0, exit_code=0, stdout="", stderr="")
+
+    capture = Capture()
+    driver.runner = capture
+    first = driver.cleanup(deployment)
+    second = driver.cleanup(deployment)
+    destroys = [request for request in capture.requests if request.action_id == "gcp-pair-destroy"]
+    assert first.cleanup_state == second.cleanup_state == "failed"
+    assert destroys[0].timeout_seconds > 120
+    assert destroys[0].timeout_seconds <= 660
+    assert destroys[1].timeout_seconds == destroys[0].timeout_seconds - 120
+    assert json.loads((attempt / "attempt.json").read_text())["cleanup_state"] == "failed"
+
+    driver._deadline = 760.0
+    read = driver._run("gcp-readonly-check", ["gcloud", "compute", "instances", "list"],
+        tmp_path, timeout=660)
+    assert read.outcome == "succeeded"
+    assert capture.requests[-1].timeout_seconds == 120
 
 
 @pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
@@ -1067,6 +1192,53 @@ def test_pair_apply_records_exact_template_binding_input_hash(tmp_path,monkeypat
     binding=json.loads((attempt/"attempt.json").read_text())["pair_binding"]
     assert binding["config_sha256"]==hashlib.sha256(variables).hexdigest()
     assert binding["template_a"].endswith("unique-a") and binding["template_b"].endswith("unique-b")
+    assert json.loads(variables)["network_ip_a"] == "10.80.1.10"
+    assert json.loads(variables)["network_ip_b"] == "10.80.1.11"
+    assert json.loads(variables)["nic_type_a"] == json.loads(variables)["nic_type_b"] == "GVNIC"
+    assert json.loads(variables)["public_management_a"] is True
+    assert json.loads(variables)["public_management_b"] is True
+
+
+@pytest.mark.parametrize(("scenario", "region_b", "zone_b", "expected_b", "subnet_b"), [
+    ("same_zone", "europe-west3", "europe-west3-a", "10.80.1.11", "a"),
+    ("placement_optimization", "europe-west3", "europe-west3-a", "10.80.1.11", "a"),
+    ("inter_region", "europe-west2", "europe-west2-a", "10.81.1.11", "b"),
+])
+def test_pair_factory_binds_selected_role_network_overrides(tmp_path, scenario, region_b, zone_b, expected_b, subnet_b):
+    deployment, driver = _cleanup_fixture(tmp_path)
+    vm_b = deployment.vm_b.model_copy(update={"region": region_b, "zone": zone_b})
+    deployment = deployment.model_copy(update={"scenario": scenario, "vm_b": vm_b})
+    links = {"template_a": "projects/test/global/instanceTemplates/template-a?uniqueId=101",
+        "template_b": "projects/test/global/instanceTemplates/template-b?uniqueId=202"}
+    variables = driver._pair_variables(deployment, links)
+    namespace = driver._namespace(deployment)
+    assert variables["template_a"] == links["template_a"]
+    assert variables["template_b"] == links["template_b"]
+    assert variables["network_a"] == variables["network_b"] == (
+        f"projects/{driver.settings.project_id}/global/networks/{namespace}-net")
+    assert variables["subnetwork_a"] == (
+        f"projects/{driver.settings.project_id}/regions/{deployment.vm_a.region}/subnetworks/{namespace}-a")
+    assert variables["subnetwork_b"] == (
+        f"projects/{driver.settings.project_id}/regions/{region_b}/subnetworks/{namespace}-{subnet_b}")
+    assert variables["network_ip_a"] == "10.80.1.10"
+    assert variables["network_ip_b"] == expected_b
+    assert variables["nic_type_a"] == variables["nic_type_b"] == "GVNIC"
+    assert variables["public_management_a"] is variables["public_management_b"] is True
+
+
+@pytest.mark.parametrize(("scenario", "role", "wrong_ip"), [
+    ("same_zone", "vm_a", "10.80.1.2"),
+    ("placement_optimization", "vm_b", "10.80.1.2"),
+])
+def test_gcp_observed_instance_still_rejects_actual_retained_state_ips(tmp_path, scenario, role, wrong_ip):
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    deployment = deployment.model_copy(update={"scenario": scenario})
+    instance = _instance_response(driver, deployment, role)
+    instance["networkInterfaces"][0]["networkIP"] = wrong_ip
+    with pytest.raises(GcpProviderError) as failure:
+        driver._validate_instance(instance, deployment, role)
+    assert failure.value.category == "instance_shape_mismatch"
 
 
 def test_s1_fake_provision_normalizes_authenticated_vm_disk_image_and_hostkey_readbacks(tmp_path,monkeypatch):
