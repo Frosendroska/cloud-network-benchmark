@@ -24,6 +24,7 @@ from .common import (
     StructuredEvidence,
     utc_datetime,
 )
+from ..validation_profiles import PROFILE_SPECS
 
 
 class ScheduleEntry(StrictModel):
@@ -88,7 +89,8 @@ def _is_secret_field_name(value: str) -> bool:
 
 class AdmissionRequirements(StrictModel):
     priority: Literal["P0", "P1", "P2", "P3"]
-    lifetime_cap_seconds: Literal[1200, 1800, 87600]
+    lifetime_cap_seconds: Literal[1200, 1800, 3900, 4200, 5100, 87600]
+    workflow_profile: Optional[Literal["all_cloud_acceptance_v1", "all_cloud_calibration_v1", "all_cloud_failure_acceptance_v1"]] = Field(default=None, exclude_if=lambda value: value is None)
     timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
         default=None, exclude_if=lambda value: value is None)
     hard_budget_usd: Literal[300] = 300
@@ -103,7 +105,8 @@ class AdmissionRequirements(StrictModel):
     requires_expiry: bool
 
     @staticmethod
-    def expected_for(mode: ExperimentMode, scenario: Scenario, timing_profile: str | None = None) -> dict[str, object]:
+    def expected_for(mode: ExperimentMode, scenario: Scenario, timing_profile: str | None = None,
+                     workflow_profile: str | None = None) -> dict[str, object]:
         mode, scenario = ExperimentMode(mode), Scenario(scenario)
         priority = {
             Scenario.SAME_ZONE: "P0",
@@ -123,10 +126,17 @@ class AdmissionRequirements(StrictModel):
             cap = 1800
         elif timing_profile is not None:
             raise ValueError("unsupported timing profile")
-        scheduled = mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+        if workflow_profile is not None:
+            spec = PROFILE_SPECS.get(workflow_profile)
+            if spec is None or spec["mode"] != mode.value or timing_profile is not None:
+                raise ValueError("workflow profile is unsupported for this mode or timing profile")
+            cap = spec["cap_seconds"]
+        scheduled = (mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.CALIBRATION, ExperimentMode.DIAGNOSTIC_DAY}
+            and workflow_profile is None)
         return {
             "priority": priority,
             "lifetime_cap_seconds": cap,
+            "workflow_profile": workflow_profile,
             "requires_common_n": mode in {ExperimentMode.SHORT_STUDY, ExperimentMode.DIAGNOSTIC_DAY},
             "requires_schedule": scheduled,
             "requires_primary_review": scheduled and priority in {"P2", "P3"},
@@ -157,8 +167,9 @@ class ReservationRequest(StrictModel):
     selected_providers: list[Provider] = Field(min_length=1)
     mode: ExperimentMode
     priority: Literal["P0", "P1", "P2", "P3"]
-    lifetime_cap_seconds: Literal[1200, 1800, 87600]
+    lifetime_cap_seconds: Literal[1200, 1800, 3900, 4200, 5100, 87600]
     timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(default=None, exclude_if=lambda value: value is None)
+    workflow_profile: Optional[Literal["all_cloud_acceptance_v1", "all_cloud_calibration_v1", "all_cloud_failure_acceptance_v1"]] = Field(default=None, exclude_if=lambda value: value is None)
     experiment_id: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
     context: Optional[Literal["standard", "failure_check", "replacement"]] = Field(default=None, exclude_if=lambda value: value is None)
     scenario: Optional[Scenario] = Field(default=None, exclude_if=lambda value: value is None)
@@ -189,6 +200,11 @@ class ReservationRequest(StrictModel):
             expected_cap = 1800
         elif self.timing_profile is not None:
             raise ValueError("unsupported timing profile")
+        if self.workflow_profile is not None:
+            spec = PROFILE_SPECS.get(self.workflow_profile)
+            if spec is None or spec["mode"] != ExperimentMode(self.mode).value or self.timing_profile is not None:
+                raise ValueError("workflow profile is unsupported for this mode or timing profile")
+            expected_cap = spec["cap_seconds"]
         if self.lifetime_cap_seconds != expected_cap:
             raise ValueError("lifetime_cap_seconds must match reservation mode")
         if self.schedule_entry_id.value is not None and not re.fullmatch(IDENTIFIER_PATTERN, self.schedule_entry_id.value):
@@ -214,12 +230,24 @@ class ReservationRequest(StrictModel):
                 "resolved_sha256": {"type": "string", "pattern": SHA256_PATTERN}},
                 "required": ["experiment_id", "context", "scenario", "config_sha256", "resolved_sha256"]}
         })
+        for profile, spec in PROFILE_SPECS.items():
+            schema["allOf"].append({"if": {"properties": {"workflow_profile": {"const": profile}}, "required": ["workflow_profile"]},
+                "then": {"properties": {"mode": {"const": spec["mode"]}, "lifetime_cap_seconds": {"const": spec["cap_seconds"]}}}})
         for mode, cap in (("acceptance", 1200), ("short_study", 1200),
                           ("calibration", 1800), ("diagnostic_day", 87600)):
             condition = {"properties": {"mode": {"const": mode}}, "required": ["mode"]}
             if mode == "acceptance":
                 condition["not"] = {"properties": {"timing_profile": {
                     "const": "azure_exp901_sweden_acceptance_v1"}}, "required": ["timing_profile"]}
+            profiles = {"acceptance": ("all_cloud_acceptance_v1", "all_cloud_failure_acceptance_v1"),
+                        "calibration": ("all_cloud_calibration_v1",)}.get(mode, ())
+            if profiles:
+                existing = condition.get("not")
+                profile_guards = [{"properties": {"workflow_profile": {"const": profile}}, "required": ["workflow_profile"]}
+                                  for profile in profiles]
+                if existing:
+                    profile_guards.append(existing)
+                condition["not"] = {"anyOf": profile_guards}
             schema["allOf"].append({"if": condition,
                 "then": {"properties": {"lifetime_cap_seconds": {"const": cap}}}})
         return schema
@@ -230,6 +258,7 @@ class ReservationEvidence(StrictModel):
     campaign_id: str = Field(pattern=IDENTIFIER_PATTERN)
     timing_profile: Optional[Literal["azure_exp901_sweden_acceptance_v1"]] = Field(
         default=None, exclude_if=lambda value: value is None)
+    workflow_profile: Optional[Literal["all_cloud_acceptance_v1", "all_cloud_calibration_v1", "all_cloud_failure_acceptance_v1"]] = Field(default=None, exclude_if=lambda value: value is None)
     reservation_id: Evidence[str]
     state: Literal["not_evaluated", "reserved", "rejected", "released"]
     reserved_cost_usd: Evidence[float]

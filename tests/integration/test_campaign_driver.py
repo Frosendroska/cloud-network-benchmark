@@ -6,6 +6,7 @@ These cases do not establish provider acceptance or Linux service readiness.
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -43,12 +44,18 @@ class FakeClock:
 def stage_fixture(tmp_path, *, slots=28):
     (tmp_path / "results").mkdir(exist_ok=True)
     entries = []
+    approval_source = tmp_path / "weekly-concurrency-source.json"
+    approval_source.write_text('{"fixture":"SYNTHETIC OFFLINE TEST ONLY"}\n')
+    evidence = tmp_path / "weekly-concurrency-evidence.json"
+    evidence.write_text(json.dumps({"mode": "paired_s1_s3", "max_parallel_entries": 2,
+        "source_path": str(approval_source), "source_sha256": hashlib.sha256(approval_source.read_bytes()).hexdigest()}) + "\n")
     for index in range(slots):
         slot = START + timedelta(hours=6 * index)
-        for priority in ("P0", "P1"):
+        for priority, scenario in (("P0", "S1"), ("P1", "S3")):
             eid = f"{priority}-{index:02}"
             entries.append({
-                "entry_id": eid, "config_path": str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"),
+                "entry_id": eid, "scenario": scenario, "priority": priority,
+                "config_path": str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml"),
                 "schedule_path": str(tmp_path / "schedule.csv"), "row_id": eid,
                 "scheduled_start": (slot + timedelta(seconds=120)).isoformat(),
                 "launch_at": slot.isoformat(),
@@ -59,6 +66,9 @@ def stage_fixture(tmp_path, *, slots=28):
                 "private_root": str(tmp_path / "private" / eid),
             })
     return {"stage_id": "offline-week", "stage": "week", "controller_session_id": "stable-session",
+            "dispatch_policy": {"policy_id": "weekly-paired-s1-s3-v1", "group_by": "launch_at",
+                "scenarios": ["S1", "S3"], "priorities": ["P0", "P1"], "max_parallel_entries": 2,
+                "evidence_path": str(evidence), "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()},
             "ledger_path": str(tmp_path / "ledger.json"), "scope_id": "offline-week-scope",
             "state_root": str(tmp_path / "state"), "results_root": str(tmp_path / "results"),
             "entries": entries, "minimum_free_bytes": 1024}
@@ -136,14 +146,260 @@ def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budge
     driver(clock, lambda *_: pytest.fail("completed observation relaunched")).run(stage)
 
 
+def acceptance_stage_fixture(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["stage"] = "acceptance"
+    pair = stage["entries"]
+    pair[0].update(entry_id="V-S1", scenario="S1", requires_supervision=False)
+    pair[1].update(entry_id="V-S3", scenario="S3", requires_supervision=False)
+    pair[0]["priority"], pair[1]["priority"] = "P0", "P1"
+    for entry_id in ("V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"):
+        pair.append({**pair[0], "entry_id": entry_id, "scenario": None,
+                     "requires_supervision": True, "private_root": str(tmp_path / entry_id),
+                     "run_ids": {p: f"{entry_id}-{p}" for p in ("aws", "azure", "gcp")}})
+    approval_source = tmp_path / "acceptance-concurrency-source.json"
+    approval_source.write_text('{"fixture":"SYNTHETIC OFFLINE TEST ONLY"}\n')
+    evidence = tmp_path / "acceptance-concurrency-evidence.json"
+    fixed_start = pair[0]["scheduled_start"]
+    evidence.write_text(json.dumps({"mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
+        "start_utc": fixed_start,
+        "source_path": str(approval_source),
+        "source_sha256": hashlib.sha256(approval_source.read_bytes()).hexdigest()}) + "\n")
+    stage["dispatch_policy"] = {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
+        "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_utc": fixed_start,
+        "evidence_path": str(evidence), "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}
+    stage["post_measurement_barrier"] = {"schema_version": 1,
+        "barrier_id": f"{stage['stage_id']}-normal-measurement-terminal",
+        "barrier_root": str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-terminal"),
+        "expected_participants": [
+            {"entry_id": entry["entry_id"], "provider": provider, "run_id": run_id}
+            for entry in pair[:2] for provider, run_id in entry["run_ids"].items()]}
+    stage["measurement_start_barrier"] = {"schema_version": 1,
+        "barrier_id": f"{stage['stage_id']}-normal-measurement-start",
+        "barrier_root": str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-start"),
+        "start_utc": pair[0]["scheduled_start"],
+        "expected_participants": stage["post_measurement_barrier"]["expected_participants"]}
+    return stage
+
+
+def test_acceptance_s1_s3_entries_run_as_one_bounded_parallel_slot(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def launch(entry, _):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        threading.Event().wait(0.01)
+        with lock:
+            active -= 1
+        return {"status": "complete", "cleanup_open": False}
+
+    driver(FakeClock(), launch).run(stage)
+    assert peak == 2
+    saved = journal(stage)
+    assert saved["entries"]["V-A-FAIL"]["state"] == "scheduled"
+    assert saved["entries"]["V-Z-FAIL"]["state"] == "scheduled"
+    assert saved["entries"]["V-G-FAIL"]["state"] == "scheduled"
+
+
+def test_acceptance_rejects_incomplete_pair_before_launch(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    stage["entries"].pop(1)
+    launched = []
+    with pytest.raises(ValueError, match="five registered"):
+        driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert launched == []
+
+
+def test_acceptance_rejects_changed_pair_admission_before_launch(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    Path(stage["dispatch_policy"]["evidence_path"]).write_text("{}\n")
+    launched = []
+    with pytest.raises(ValueError, match="evidence is missing or changed"):
+        driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert launched == []
+
+
+def test_acceptance_does_not_shift_fixed_start_after_aggregate_admission(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    launched = []
+    clock = FakeClock()
+
+    def pre_admit(_entries, _stage):
+        clock.current = datetime.fromisoformat(stage["measurement_start_barrier"]["start_utc"].replace("Z", "+00:00"))
+
+    result = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+        launch=lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"},
+        pre_admit=pre_admit, clock=clock, sleep=clock.sleep).run(stage)
+    assert launched == []
+    assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+
+
+def test_supervised_continue_reuses_exact_completed_failure_without_launch(tmp_path):
+    import yaml
+    from cloud_network_benchmark.acceptance_review import _runtime_scope_sha256
+
+    stage = acceptance_stage_fixture(tmp_path)
+    entry = next(row for row in stage["entries"] if row["entry_id"] == "V-A-FAIL")
+    entry["config_path"] = str(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml")
+    entry["config_sha256"] = hashlib.sha256(Path(entry["config_path"]).read_bytes()).hexdigest()
+    entry["source_config_sha256"] = entry["config_sha256"]
+    runtime = tmp_path / "V-A-FAIL-runtime.json"
+    runtime.write_text('{"schema_version": 1, "ledger": {"scope_id": "reuse"}}\n')
+    entry["runtime_config_path"] = str(runtime)
+    entry["runtime_config_sha256"] = hashlib.sha256(runtime.read_bytes()).hexdigest()
+    parent = tmp_path / "V-A-FAIL-parent.json"
+    attempt = "synthetic-reused-aws-attempt"
+    commit = {"value": "a" * 40, "unavailable_reason": None}
+    parent.write_text(json.dumps({"campaign_id": attempt, "implementation_git_commit": commit}))
+    entry["parent_manifest_path"] = str(parent)
+    evidence = {}
+    for action in ("server_failure", "expiry", "cleanup", "ordinary_recovery"):
+        source = tmp_path / f"reused-{action}.txt"
+        source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: {action}\n")
+        evidence[action] = {"status": "passed", "source_path": str(source),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    waiver = tmp_path / "reused-waiver.txt"
+    waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: physical loss waived\n")
+    evidence["controller_loss"] = {"status": "waived", "reason": "Explicitly waived.",
+        "source_path": str(waiver), "source_sha256": hashlib.sha256(waiver.read_bytes()).hexdigest()}
+    evidence["config_identity"] = {"config_path": entry["config_path"], "config_sha256": entry["config_sha256"],
+        "source_config_sha256": entry["source_config_sha256"], "runtime_config_path": str(runtime),
+        "runtime_config_sha256": entry["runtime_config_sha256"],
+        "runtime_scope_sha256": _runtime_scope_sha256(runtime), "implementation_git_commit": commit}
+    review = tmp_path / "reused-failure-review.yaml"
+    review.write_text(yaml.safe_dump({"schema_version": 1,
+        "checks": {"V-A-FAIL": {"provider": "aws", "attempt_id": attempt, **evidence}}}))
+    entry["reused_failure_check"] = {"source_path": str(review),
+        "source_sha256": hashlib.sha256(review.read_bytes()).hexdigest(), "attempt_id": attempt}
+    folder = Path(stage["state_root"]) / stage["stage_id"]
+    folder.mkdir(parents=True, exist_ok=True)
+    prepared = folder / "prepared-stage.json"
+    prepared.write_text(json.dumps(stage))
+    engine = driver(FakeClock(), lambda *_: pytest.fail("reused failure attempted provider lifecycle"),
+        dispatch=lambda *_: pytest.fail("reused failure dispatched supervisor"))
+    journal_path = folder / "campaign-journal.json"
+    journal = engine._load_or_create_journal(stage, journal_path)
+    for entry_id in ("V-S1", "V-S3"):
+        journal["entries"][entry_id].update(state="complete", result={"cleanup_open": False})
+    journal_path.write_text(json.dumps(journal))
+    result = engine.continue_supervised(Path(stage["state_root"]), stage["stage_id"], "V-A-FAIL", confirmed=True)
+    assert result["status"] == "reused"
+    saved = json.loads(journal_path.read_text())["entries"]["V-A-FAIL"]
+    assert saved["state"] == "failed" and saved["result"]["measurement_reused"] is True
+    assert saved["export_status"] == "verified"
+
+
+def test_completed_acceptance_pair_restarts_without_remeasurement(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    launched = []
+    first = driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or
+        {"status": "complete", "cleanup_open": False})
+    first.run(stage)
+    assert set(launched) == {"V-S1", "V-S3"}
+    restarted = driver(FakeClock(), lambda *_: pytest.fail("completed acceptance pair was measured twice"))
+    restarted.run(stage)
+
+
+@pytest.mark.parametrize("one_cent_under", [False, True])
+def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_root, tmp_path, monkeypatch, one_cent_under):
+    import copy
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from cloud_network_benchmark.admission import BudgetLedger, load_cost_inputs
+    from cloud_network_benchmark.config import resolve_campaign
+    from cloud_network_benchmark.contracts.common import Evidence, Provider
+    from tests.integration.test_f11_ledger import scheduled_request_and_plan
+
+    stage = acceptance_stage_fixture(tmp_path)
+    stage["repository_root"] = str(repository_root)
+    stage["scope_id"] = "offline-acceptance-pair"
+    stage["controller_session_id"] = "offline-acceptance-controller"
+    costs_path = ROOT / "tests/fixtures/f11/cost-inputs.json"
+    clock = FakeClock()
+    providers = [Provider.AWS, Provider.AZURE, Provider.GCP]
+    for entry in stage["entries"][:2]:
+        entry["runtime_config_path"] = str(tmp_path / f"{entry['entry_id']}-runtime.json")
+        entry["parent_manifest_path"] = str(tmp_path / f"{entry['entry_id']}-parent.json")
+        entry["cost_inputs_path"] = str(costs_path)
+
+    costs = load_cost_inputs(costs_path)
+    campaign, _ = resolve_campaign(ROOT / "configs/tests/exp-903-three-provider-smoke.yaml", ROOT)
+    runtime = {"ledger": {"path": stage["ledger_path"], "scope_id": stage["scope_id"],
+                          "initialize_if_missing": True}}
+
+    def runtime_loader(_path, *, selected_providers=None):
+        assert selected_providers == {"aws", "azure", "gcp"}
+        return copy.deepcopy(runtime)
+
+    initialized_ids = iter(("V-S1", "V-S3"))
+    def initialized(_path, *, repository_root, config_path, schedule_path):
+        assert schedule_path is None
+        entry_id = next(initialized_ids)
+        parent = SimpleNamespace(campaign_id=entry_id)
+        return parent, {provider.value: SimpleNamespace(run_id=f"{entry_id}-{provider.value}") for provider in providers}
+
+    def admission_inputs(*, campaign, parent, children, costs, runtime, ledger_state, controller_session_id):
+        request, plan = scheduled_request_and_plan(campaign, costs, campaign_id=parent.campaign_id,
+            providers=providers, child_prefix=parent.campaign_id, namespace_prefix=parent.campaign_id,
+            funding={"primary": "50.20"}, measurement_seconds=76)
+        request = request.model_copy(update={
+            "incurred_cost_usd": Evidence[float](unavailable_reason="ledger derives pair spend"),
+            "active_reserved_usd": Evidence[float](unavailable_reason="ledger derives pair holds")})
+        return request, plan
+
+    import cloud_network_benchmark.lifecycle_runtime as lifecycle_runtime
+    import cloud_network_benchmark.config as config_module
+    monkeypatch.setattr(lifecycle_runtime, "load_runtime_config", runtime_loader)
+    monkeypatch.setattr(lifecycle_runtime, "load_initialized_campaign", initialized)
+    monkeypatch.setattr(lifecycle_runtime, "build_admission_request", admission_inputs)
+    monkeypatch.setattr(config_module, "resolve_campaign", lambda *_: (campaign, None))
+
+    book = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
+        utc_now=clock.utc_now, monotonic_now=clock.monotonic, controller_session_id=stage["controller_session_id"])
+    book.initialize(costs)
+    if one_cent_under:
+        request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="prior-one-cent",
+            providers=providers, child_prefix="prior-one-cent", namespace_prefix="prior-one-cent",
+            funding={"primary": "0.01"}, measurement_seconds=76)
+        request = request.model_copy(update={
+            "incurred_cost_usd": Evidence[float](unavailable_reason="ledger derives pair spend"),
+            "active_reserved_usd": Evidence[float](unavailable_reason="ledger derives pair holds")})
+        assert book.reserve(request, plan=plan).status == "reserved"
+
+    launched = []
+    engine = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+        launch=lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}, clock=clock,
+        sleep=clock.sleep)
+    engine.pre_admit = engine._pre_admit_acceptance_pair
+    if one_cent_under:
+        result = engine.run(stage)
+        assert launched == []
+        assert len(book.inspect()["reservations"]) == 2  # prior + first paired liability; no VM call occurred
+        assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+    else:
+        result = engine.run(stage)
+        reservations = book.inspect()["reservations"]
+        assert len(reservations) == 2
+        assert all(set(row["plan"]["providers"]) == {"aws", "azure", "gcp"} for row in reservations.values())
+        assert len({tuple(sorted(row["child_identities"].items())) for row in reservations.values()}) == 2
+        assert len({tuple(sorted(row["plan"]["namespaces"].items())) for row in reservations.values()}) == 2
+        assert set(launched) == {"V-S1", "V-S3"}
+        assert all(result["entries"][entry_id]["aggregate_reservation_ids"] for entry_id in ("V-S1", "V-S3"))
+
+
 def test_missed_slots_are_recorded_and_never_backfilled(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock(START + timedelta(hours=1))
     launched = []
     driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
     states = {key: value["state"] for key, value in journal(stage)["entries"].items()}
-    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "complete", "P1-01": "complete"}
-    assert set(launched) == {"P0-01", "P1-01"}
+    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "missed", "P1-01": "missed"}
+    assert launched == []
 
 
 @pytest.mark.parametrize("uncertain_state", ["starting", "running"])
@@ -299,7 +555,9 @@ def test_restart_rejects_changed_frozen_ownership_or_schedule(tmp_path, changed)
         modified["entries"][0][changed] = (START + timedelta(hours=1)).isoformat()
     else:
         modified["entries"][0][changed] = str(tmp_path / "wrong-private-state")
-    with pytest.raises(ValueError, match="changed|match|frozen"):
+    expected_error = (r"WEEK slot .* must contain exactly one P0/S1 and one P1/S3 entry"
+                      if changed == "launch_at" else r"changed|match|frozen")
+    with pytest.raises(ValueError, match=expected_error):
         driver(clock, lambda *_: pytest.fail("altered frozen observation launched")).run(modified)
 
 
@@ -368,7 +626,7 @@ def test_lifecycle_records_sampled_disk_highwater_even_when_space_recovers_befor
     assert result["peak_process_rss_bytes"] == 50 * 1024
 
 
-def test_week_measurement_failure_with_verified_cleanup_keeps_later_independent_slots(tmp_path):
+def test_week_measurement_failure_with_verified_cleanup_blocks_later_slots(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock()
     launched = []
@@ -379,9 +637,45 @@ def test_week_measurement_failure_with_verified_cleanup_keeps_later_independent_
 
     driver(clock, launch).run(stage)
     saved = journal(stage)
-    assert set(launched) == {"P0-00", "P1-00", "P0-01", "P1-01"}
+    assert set(launched) == {"P0-00", "P1-00"}
     assert saved["entries"]["P0-00"]["state"] == "failed"
-    assert all(saved["entries"][name]["state"] == "complete" for name in ("P1-00", "P0-01", "P1-01"))
+    assert saved["entries"]["P1-00"]["state"] == "complete"
+    assert all(saved["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
+
+
+def test_week_rejects_incomplete_or_duplicate_pair_before_launch(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["entries"][1]["scenario"] = "S1"
+    called = []
+    with pytest.raises(ValueError, match="exactly one P0/S1 and one P1/S3"):
+        driver(FakeClock(), lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+
+
+def test_week_rejects_changed_concurrency_evidence_before_launch(tmp_path):
+    stage = stage_fixture(tmp_path, slots=1)
+    Path(stage["dispatch_policy"]["evidence_path"]).write_text("{}\n")
+    called = []
+    with pytest.raises(ValueError, match="evidence is missing or changed"):
+        driver(FakeClock(), lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+
+
+def test_week_restart_does_not_launch_a_single_remaining_pair_member(tmp_path):
+    stage = stage_fixture(tmp_path, slots=2)
+    clock = FakeClock()
+    engine = driver(clock, lambda *_: {"status": "complete"})
+    path = Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    saved["entries"]["P1-00"]["state"] = "complete"
+    saved["entries"]["P1-00"]["finished_at"] = clock.utc_now().isoformat()
+    path.write_text(json.dumps(saved))
+    called = []
+    result = driver(clock, lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    assert called == []
+    assert result["entries"]["P0-00"]["state"] == "missed"
+    assert result["entries"]["P1-00"]["state"] == "complete"
+    assert all(result["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
 
 
 def test_sleeping_controller_that_wakes_after_the_slot_never_launches_backfill(tmp_path):
@@ -399,7 +693,8 @@ def test_sleeping_controller_that_wakes_after_the_slot_never_launches_backfill(t
     assert {row["state"] for row in journal(stage)["entries"].values()} == {"missed"}
 
 
-@pytest.mark.parametrize("proof", ["all_absent", "missing_provider", "absence_unproved"])
+@pytest.mark.parametrize("proof", ["all_absent", "missing_provider", "absence_unproved",
+                                    "missing_reconciled", "missing_cleanup"])
 def test_restart_cleanup_needs_absence_proof_for_every_original_provider(tmp_path, monkeypatch, proof):
     import subprocess
     from types import SimpleNamespace
@@ -411,15 +706,22 @@ def test_restart_cleanup_needs_absence_proof_for_every_original_provider(tmp_pat
     recovery = private / "lifecycle-recovery.json"
     recovery.write_text("{}")
     (Path(stage["state_root"]) / stage["stage_id"]).mkdir(parents=True)
-    providers = {name: {"cleanup_open": False, "absence_proved": True} for name in entry["run_ids"]}
+    providers = {name: {"cleanup": "succeeded", "reconciled": True, "errors": [],
+        "launch_blocked": False, "cleanup_open": False, "absence_proved": True,
+        "billable_resources_present": False} for name in entry["run_ids"]}
     if proof == "missing_provider":
         providers.pop("gcp")
     elif proof == "absence_unproved":
         providers["gcp"]["absence_proved"] = False
+    elif proof == "missing_reconciled":
+        providers["gcp"].pop("reconciled")
+    elif proof == "missing_cleanup":
+        providers["gcp"].pop("cleanup")
 
     def cleanup(command, **kwargs):
         assert command[command.index("--recovery") + 1] == str(recovery)
-        kwargs["stdout"].write(json.dumps({"status": "complete", "providers": providers}).encode())
+        kwargs["stdout"].write(json.dumps({"status": "complete", "cleanup": "complete",
+            "execution": "not_resumed", "providers": providers}).encode())
         kwargs["stdout"].flush()
         return SimpleNamespace(returncode=0)
 
@@ -476,8 +778,10 @@ def test_restart_recognizes_completed_native_evidence_and_contradictions_fall_th
 
     def cleanup(command, **kwargs):
         cleanup_calls.append(command)
-        kwargs["stdout"].write(json.dumps({"status": "complete", "providers": {
-            provider: {"cleanup_open": False, "absence_proved": True}}}).encode())
+        kwargs["stdout"].write(json.dumps({"status": "complete", "cleanup": "complete",
+            "execution": "not_resumed", "providers": {provider: {
+                "cleanup": "succeeded", "reconciled": True, "errors": [], "launch_blocked": False,
+                "cleanup_open": False, "absence_proved": True, "billable_resources_present": False}}}).encode())
         kwargs["stdout"].flush()
         return SimpleNamespace(returncode=0)
 
@@ -610,3 +914,87 @@ def test_status_projects_next_slot_and_recorded_export_backup_notification_resul
         assert status["stage_summary"] == summary and status["exports"]["stage"] == "verified"
     else:
         assert not status["stage_summary"] and "stage" not in status["exports"]
+
+
+def test_restart_blocks_all_later_slots_while_archive_validation_is_pending(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    launched = []
+    engine = driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"})
+    path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    first = stage["entries"][0]["entry_id"]
+    saved["entries"][first].update(state="archive_pending_validation",
+        finished_at=clock.utc_now().isoformat(), result={"cleanup_open": False,
+            "replay_capsule": {"status": "archive_pending_replay"}})
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    result = engine.run(stage)
+
+    assert launched == []
+    assert result["counts"]["archive_pending_validation"] == 1
+    assert result["counts"]["missed"] == 1
+
+
+def test_archive_reconciliation_rejects_open_cleanup_and_handwritten_receipt(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["repository_root"] = str(ROOT)
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    engine = driver(clock, lambda *_: pytest.fail("reconciliation must not launch"))
+    journal_path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, journal_path)
+    entry = stage["entries"][0]
+    capsule_path = tmp_path / "capsule.json"
+    capsule_doc = {"schema_version": 2, "status": "archive_pending_replay"}
+    capsule_path.write_text(json.dumps(capsule_doc), encoding="utf-8")
+    capsule_sha = hashlib.sha256(capsule_path.read_bytes()).hexdigest()
+    receipt_path = tmp_path / "handwritten-receipt.json"
+    receipt_path.write_text(json.dumps({"status": "replayed", "capsule_sha256": capsule_sha,
+        "archives": {}, "validation": {}, "analysis": {"status": "completed"}}), encoding="utf-8")
+    record = saved["entries"][entry["entry_id"]]
+    record.update(state="archive_pending_validation", result={"cleanup_open": True,
+        "run_ids": entry["run_ids"], "replay_capsule": {"status": "archive_pending_replay",
+            "path": str(capsule_path), "sha256": capsule_sha}})
+    journal_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="closed cleanup"):
+        engine.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], receipt_path)
+    assert journal(stage)["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+
+    record["result"]["cleanup_open"] = False
+    journal_path.write_text(json.dumps(saved), encoding="utf-8")
+    with pytest.raises((ValueError, OSError)):
+        engine.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], receipt_path)
+    assert journal(stage)["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+
+
+def test_active_supervised_pointer_does_not_dispatch_archive_pending_entry(tmp_path):
+    clock = FakeClock()
+    stage = stage_fixture(tmp_path, slots=1)
+    stage["stage"] = "acceptance"
+    stage["entries"][0]["requires_supervision"] = True
+    stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+    stage_dir.mkdir(parents=True)
+    dispatched = []
+    engine = driver(clock, lambda *_: pytest.fail("pending archive must not launch"),
+        dispatch=lambda *_: dispatched.append(True) or {"started": True})
+    path = stage_dir / "campaign-journal.json"
+    saved = engine._load_or_create_journal(stage, path)
+    entry_id = stage["entries"][0]["entry_id"]
+    saved["entries"][entry_id].update(state="archive_pending_validation",
+        result={"cleanup_open": False})
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    pointer = Path(stage["state_root"]) / "active-stage.json"
+    pointer.write_text(json.dumps({"stage_id": stage["stage_id"],
+        "stage_path": str(stage_dir / "prepared-stage.json"), "supervised_entry_id": entry_id}), encoding="utf-8")
+
+    result = engine.run_active(Path(stage["state_root"]))
+
+    assert result["counts"]["archive_pending_validation"] == 1
+    assert dispatched == []

@@ -32,6 +32,29 @@ def test_runtime_config_requires_exact_provider_selection(tmp_path):
         load_runtime_config(path, selected_providers={"gcp"})
 
 
+def test_profile_review_timeout_is_source_configured_finite_and_keeps_legacy_default():
+    from cloud_network_benchmark.lifecycle_runtime import _plan_review_timeout_seconds
+
+    assert _plan_review_timeout_seconds({}, "all_cloud_acceptance_v1") == 50
+    assert _plan_review_timeout_seconds({"plan_review_timeout_seconds": 120},
+        "all_cloud_acceptance_v1") == 120
+    assert _plan_review_timeout_seconds({}, None) == 0
+    assert _plan_review_timeout_seconds({"plan_review_timeout_seconds": 30}, None) == 30
+    for value in (0, 601, 120.0, True, "120"):
+        with pytest.raises(ValueError, match="plan_review_timeout_seconds"):
+            _plan_review_timeout_seconds({"plan_review_timeout_seconds": value},
+                "all_cloud_acceptance_v1")
+
+
+def test_post_provision_remainder_uses_only_the_original_reserved_components():
+    from cloud_network_benchmark.lifecycle_runtime import _post_provision_seconds
+    allowance = WorkflowAllowance(registration_seconds=10, provision_seconds=20,
+        readiness_seconds=30, stabilization_seconds=40, measurement_seconds=50,
+        measurement_shutdown_seconds=5, retrieval_seconds=15, cleanup_seconds=25,
+        source_id="synthetic-test", provider_leads_seconds={"aws": 1})
+    assert _post_provision_seconds(allowance) == 165
+
+
 def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_root, tmp_path):
     campaign, _ = resolve_campaign(repository_root / "configs/tests/exp-900-single-provider.yaml",
                                    repository_root)
@@ -88,6 +111,29 @@ def test_f11_request_uses_initialized_child_ids_and_exact_cost_rows(repository_r
             "cleanup_open": True, "session": "prior-session"}}},
         controller_session_id="current-session")
     assert blocked.outstanding_cleanup is True
+
+
+def test_f11_request_rounds_complete_provider_liabilities_before_aggregation():
+    from decimal import ROUND_CEILING
+    from cloud_network_benchmark.admission import rounded_provider_cost_total
+
+    raw = {
+        "aws": "1.9002126961554286",
+        "azure": "3.7598114621877015",
+        "gcp": "1.8983905148983125",
+    }
+    rows = {provider: {"components": {"complete": {"amount_usd": value}}}
+        for provider, value in raw.items()}
+    total = rounded_provider_cost_total(rows)
+    assert total == Decimal("7.5586")
+    per_entry = {provider: rounded_provider_cost_total({provider: row})
+        for provider, row in rows.items()}
+    four_fixed_slots = {provider: value * 4 for provider, value in per_entry.items()}
+    assert four_fixed_slots == {"aws": Decimal("7.6012"),
+        "azure": Decimal("15.0396"), "gcp": Decimal("7.5936")}
+    assert sum(four_fixed_slots.values(), Decimal("0")) == Decimal("30.2344")
+    raw_sum = sum((Decimal(value) for value in raw.values()), Decimal("0"))
+    assert raw_sum.quantize(Decimal("0.0001"), rounding=ROUND_CEILING) == Decimal("7.5585")
 
 
 def test_aws_workflow_factory_binds_actual_reservation_and_source_hash(repository_root, tmp_path, monkeypatch):

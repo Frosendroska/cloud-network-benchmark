@@ -26,14 +26,7 @@ def _materialize_review(repository_root, tmp_path, frozen_clock, deterministic_t
 
     # Materialize every selected provider in this actual one-provider scope,
     # rather than falsely marking untouched siblings of a three-cloud parent done.
-    config_name = f"campaign-review-{tmp_path.name}.yaml"
-    config_path = repository_root / "configs/experiments" / config_name
-    config = yaml.safe_load((repository_root / "configs/experiments/exp-001-multi-provider.yaml").read_text())
-    config["selected_providers"] = ["aws"]
-    config["context"] = "failure_check"
-    config["provider_configs"] = {"aws": config["provider_configs"]["aws"]}
-    config_path.write_text(yaml.safe_dump(config))
-    request.addfinalizer(lambda: config_path.unlink(missing_ok=True))
+    config_name = "exp-900-single-provider-north.yaml"
     value, result, _ = materialize_f08_pair(repository_root, tmp_path, frozen_clock,
         deterministic_token, fake_git_commits, request, mode="acceptance", config_name=config_name)
     raw = Path(value.child_result_root)
@@ -61,7 +54,7 @@ def _materialize_review(repository_root, tmp_path, frozen_clock, deterministic_t
         checks[name] = row
     failures = tmp_path / "synthetic-failure-review.yaml"
     failures.write_text(yaml.safe_dump({"schema_version": 1, "checks": checks}))
-    accepted_options = {"account_id": "123456789012", "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}}
+    accepted_options = {"account_id": "123456789012", "ami_ids": {"eu-north-1": "ami-0123456789abcdef0"}}
     runtime_path = tmp_path / "synthetic-accepted-runtime.json"
     runtime_path.write_text(json.dumps({"initialized_campaign_manifest": str(parent_path),
         "providers": {"aws": {"options": accepted_options}}}))
@@ -85,6 +78,81 @@ def test_materialized_native_acceptance_and_exact_failure_sources_cover_matching
     _validate_paid_acceptance_evidence(evidence, campaign)
 
 
+def test_registered_failure_review_accepts_explicit_physical_loss_waiver_with_ordinary_recovery(tmp_path):
+    from cloud_network_benchmark.acceptance_review import _failure_review, _runtime_scope_sha256
+
+    checks = {}
+    for registered, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
+        attempt = f"synthetic-{provider}-attempt"
+        config = tmp_path / f"{registered}-config.yaml"
+        config.write_text("SYNTHETIC OFFLINE TEST ONLY: registered config\n")
+        runtime = tmp_path / f"{registered}-runtime.json"
+        runtime.write_text('{"synthetic": true}\n')
+        row = {"provider": provider, "attempt_id": attempt, "config_identity": {
+            "config_path": str(config), "config_sha256": _sha(config), "source_config_sha256": "a" * 64,
+            "runtime_config_path": str(runtime), "runtime_config_sha256": _sha(runtime),
+            "runtime_scope_sha256": _runtime_scope_sha256(runtime), "implementation_git_commit": {"value": "a" * 40}}}
+        for action in ("server_failure", "expiry", "cleanup", "ordinary_recovery"):
+            source = tmp_path / f"{registered}-{action}.txt"
+            source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {attempt}: {action}\n")
+            row[action] = {"status": "passed", "source_path": str(source), "source_sha256": _sha(source)}
+        waiver = tmp_path / f"{registered}-waiver.txt"
+        waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: the physical controller-loss check is waived.\n")
+        row["controller_loss"] = {"status": "waived", "reason": "Physical Halle loss is explicitly waived.",
+            "source_path": str(waiver), "source_sha256": _sha(waiver)}
+        checks[registered] = row
+    review = tmp_path / "failure-review.yaml"
+    review.write_text(yaml.safe_dump({"schema_version": 1, "checks": checks}))
+    _failure_review({"path": str(review), "sha256": _sha(review)})
+
+
+@pytest.mark.parametrize("damage", ["no_waiver", "missing_recovery", "missing_expiry",
+    "missing_server_failure", "missing_cleanup", "wrong_attempt", "wrong_source_hash", "changed_config"])
+def test_physical_loss_waiver_does_not_bypass_registered_failure_outcomes(tmp_path, damage):
+    from cloud_network_benchmark.acceptance_review import _failure_review, _runtime_scope_sha256
+
+    checks = {}
+    for registered, provider in (("V-A-FAIL", "aws"), ("V-Z-FAIL", "azure"), ("V-G-FAIL", "gcp")):
+        attempt = f"synthetic-{provider}-attempt"
+        config = tmp_path / f"{registered}-{damage}-config.yaml"
+        config.write_text("SYNTHETIC OFFLINE TEST ONLY: registered config\n")
+        runtime = tmp_path / f"{registered}-{damage}-runtime.json"
+        runtime.write_text('{"synthetic": true}\n')
+        row = {"provider": provider, "attempt_id": attempt, "config_identity": {
+            "config_path": str(config), "config_sha256": _sha(config), "source_config_sha256": "b" * 64,
+            "runtime_config_path": str(runtime), "runtime_config_sha256": _sha(runtime),
+            "runtime_scope_sha256": _runtime_scope_sha256(runtime), "implementation_git_commit": {"value": "b" * 40}}}
+        for action in ("server_failure", "expiry", "cleanup", "ordinary_recovery"):
+            if damage == "missing_recovery" and action == "ordinary_recovery":
+                continue
+            if damage == "missing_expiry" and action == "expiry":
+                continue
+            if damage == "missing_server_failure" and action == "server_failure":
+                continue
+            if damage == "missing_cleanup" and action == "cleanup":
+                continue
+            source = tmp_path / f"{registered}-{damage}-{action}.txt"
+            token = "some-other-attempt" if damage == "wrong_attempt" and action == "ordinary_recovery" else attempt
+            source.write_text(f"SYNTHETIC OFFLINE TEST ONLY: {token}: {action}\n")
+            row[action] = {"status": "passed", "source_path": str(source), "source_sha256": _sha(source)}
+            if damage == "wrong_source_hash" and action == "cleanup":
+                row[action]["source_sha256"] = "0" * 64
+        waiver = tmp_path / f"{registered}-{damage}-waiver.txt"
+        waiver.write_text("SYNTHETIC OFFLINE TEST ONLY: physical controller loss was waived.\n")
+        if damage == "no_waiver":
+            row["controller_loss"] = {"status": "missing"}
+        else:
+            row["controller_loss"] = {"status": "waived", "reason": "Explicitly waived.",
+                "source_path": str(waiver), "source_sha256": _sha(waiver)}
+        checks[registered] = row
+        if damage == "changed_config":
+            config.write_text("SYNTHETIC OFFLINE TEST ONLY: changed registered config\n")
+    review = tmp_path / f"failure-review-{damage}.yaml"
+    review.write_text(yaml.safe_dump({"schema_version": 1, "checks": checks}))
+    with pytest.raises(ValueError):
+        _failure_review({"path": str(review), "sha256": _sha(review)})
+
+
 @pytest.mark.parametrize("corruption", ["arbitrary_failure_file", "changed_snapshot", "forged_review_wrapper", "changed_image_intent", "changed_account", "changed_concrete_image", "changed_accepted_runtime"])
 def test_acceptance_scope_rejects_unverified_or_mismatched_sources(repository_root, tmp_path,
         frozen_clock, deterministic_token, fake_git_commits, request, corruption):
@@ -106,7 +174,7 @@ def test_acceptance_scope_rejects_unverified_or_mismatched_sources(repository_ro
     elif corruption == "changed_account":
         evidence["requested_provider_scope"]["aws"]["account_id"] = "999999999999"
     elif corruption == "changed_concrete_image":
-        evidence["requested_provider_scope"]["aws"]["ami_ids"] = {"eu-central-1": "ami-fedcba98765432100"}
+        evidence["requested_provider_scope"]["aws"]["ami_ids"] = {"eu-north-1": "ami-fedcba98765432100"}
     elif corruption == "changed_accepted_runtime":
         runtime = tmp_path / "synthetic-accepted-runtime.json"
         runtime.write_text(runtime.read_text() + " ")

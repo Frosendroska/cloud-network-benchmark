@@ -112,6 +112,7 @@ def prepared(tmp_path, provider, *, support="0", clock=None, command_timeout_sec
         "source_path":ref["path"],"source_sha256":ref["sha256"]}
         for k in ("paid_authorization","f10_offline","quota_review")}
     return SimpleNamespace(config=config,parent=parent,children=children,campaign=campaign,costs=costs,
+        request=req,plan=plan,
         runtime=runtime,clock=clock,private=tmp_path / "private",results=tmp_path / "results",card=card,cardpath=cardpath)
 
 
@@ -137,6 +138,31 @@ def test_gcp_priced_zero_native_support_reserves_with_real_source_and_financial_
     assert row["reserved_cost_usd"] == "0.6000" and row["cleanup_open"]
     assert row["plan"]["support"]["gcp"]["included_usd"] == "0"
     assert float(row["financial"]["gross_eur"]) > 0 and row["financial"]["cash_eur"] == row["financial"]["gross_eur"]
+
+
+def test_builder_estimate_matches_source_bound_validator_and_rejects_tampering(tmp_path):
+    """Exercise the production request builder and strict F11 cost validator together."""
+    import cloud_network_benchmark.admission as admission
+
+    fixture = prepared(tmp_path, "gcp")
+    total, _buckets, _support = admission._validate_cost_envelopes(
+        fixture.plan, fixture.request)
+    assert fixture.request.estimated_cost_usd.value == pytest.approx(float(total))
+
+    wrong_estimate = fixture.request.model_copy(update={
+        "estimated_cost_usd": fixture.request.estimated_cost_usd.model_copy(
+            update={"value": fixture.request.estimated_cost_usd.value + 0.0001})})
+    with pytest.raises(ValueError, match="request estimate differs"):
+        admission._validate_cost_envelopes(fixture.plan, wrong_estimate)
+
+    source = Path(fixture.costs.source_path)
+    original = source.read_bytes()
+    try:
+        source.write_bytes(original + b" ")
+        with pytest.raises(ValueError, match="saved cost input changed"):
+            admission._validate_cost_envelopes(fixture.plan, fixture.request)
+    finally:
+        source.write_bytes(original)
 
 
 @pytest.mark.parametrize("case", ["missing","negative","mismatch","source","path","unpriced","wrong_provider","boolean","null"])
@@ -183,6 +209,16 @@ def test_real_sequential_clock_anchor_never_extends_utc_cap(tmp_path,clock_type)
     settings=json.loads(next((fixture.private / "f09-cleanup/azure").glob("*.json")).read_text())
     assert settings["settings"]["cap_deadline_monotonic"] <= row["cap_start_monotonic"]+1200
     assert fixture.clock.utc_now()+timedelta(seconds=settings["settings"]["cap_deadline_monotonic"]-fixture.clock.monotonic()) <= expires
+    timing_path=settings["settings"].get("cleanup_timing_path")
+    if timing_path:
+        timing=json.loads(Path(timing_path).read_text())
+        source_cap=row["cap_start_monotonic"]+(expires-decision.evidence.cap_started_at.value).total_seconds()
+        mapped_cap=timing["origin_monotonic"]+(expires-datetime.fromisoformat(timing["origin_utc"])).total_seconds()
+        assert settings["settings"]["cap_started_monotonic"] == row["cap_start_monotonic"]
+        assert timing["cap_started_monotonic"] == row["cap_start_monotonic"]
+        assert timing["source_cap_deadline_monotonic"] == source_cap
+        assert timing["cap_deadline_monotonic"] <= mapped_cap+1e-6
+        assert timing["cap_deadline_monotonic"] <= source_cap+1e-6
 
 
 @pytest.mark.parametrize("issue", ["after_settings","before_settings"])

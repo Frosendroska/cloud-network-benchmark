@@ -12,6 +12,7 @@ from cloud_network_benchmark.azure_provider import AzureRuntimeOptions, _slug, r
 from cloud_network_benchmark.contracts.admission import ExpiryRequest
 from cloud_network_benchmark.contracts.common import CommandOutcome
 from cloud_network_benchmark.contracts.execution import CommandResult
+from cloud_network_benchmark.terraform_plan import reviewed_apply as _real_reviewed_apply
 pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
 from tests.fixtures.f06 import RESPONSE_FIXTURES
@@ -34,6 +35,298 @@ def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_ke
     duplicate_message=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceGroupNotFound","message":"foreign","message":"Resource group \'cnb-attempt\' could not be found."}})'})
     assert not _is_exact_missing_attempt_resource_group(duplicate_message,group)
     assert not _is_exact_missing_attempt_resource_group(accepted.model_copy(update={"stdout":"unexpected"}),group)
+    cli=(f"ERROR: (ResourceGroupNotFound) Resource group '{group}' could not be found.\n"
+        f"Code: ResourceGroupNotFound\nMessage: Resource group '{group}' could not be found.\n")
+    cli_result=accepted.model_copy(update={"stderr":cli})
+    assert _is_exact_missing_attempt_resource_group(cli_result,group)
+    assert not _is_exact_missing_attempt_resource_group(cli_result.model_copy(update={"stderr":cli.replace(group,"foreign-group")}),group)
+    assert not _is_exact_missing_attempt_resource_group(cli_result.model_copy(update={"stderr":cli+"AuthorizationFailed"}),group)
+    assert not _is_exact_missing_attempt_resource_group(cli_result.model_copy(update={"stdout":"unexpected"}),group)
+
+
+def test_missing_automation_child_wrapper_is_typed_and_unique():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_child
+    now=datetime.now(timezone.utc)
+    expected_url=("/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cnb-attempt"
+        "/providers/Microsoft.Automation/automationAccounts/cnb-attempt-auto/jobSchedules/"
+        "00000000-0000-0000-0000-000000000123?api-version="+azure_provider.AUTOMATION_API)
+    stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
+    accepted=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    assert _is_exact_missing_automation_child(accepted,expected_url)
+    assert _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":""})'}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"unexpected"}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("NotFound", "AuthorizationFailed", 1)}),expected_url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","message":null})'}),expected_url)
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'})
+    assert not _is_exact_missing_automation_child(duplicate,expected_url)
+
+
+def test_nested_resource_not_found_requires_exact_automation_child_message():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_child
+    now=datetime.now(timezone.utc)
+    url=("/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cnb-attempt"
+        "/providers/Microsoft.Automation/automationAccounts/cnb-attempt-auto/runbooks/"
+        "cnb-attempt-deallocate?api-version="+azure_provider.AUTOMATION_API)
+    msg=("The Resource 'Microsoft.Automation/automationAccounts/cnb-attempt-auto/runbooks/"
+        "cnb-attempt-deallocate' under resource group 'cnb-attempt' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":msg}})+")\n"
+    accepted=CommandResult(action_id="runbook-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    assert _is_exact_missing_automation_child(accepted,url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("cnb-attempt-deallocate", "foreign-runbook")}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("cnb-attempt' was", "foreign-group' was")}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stderr":stderr.replace("ResourceNotFound", "AuthorizationFailed", 1)}),url)
+    assert not _is_exact_missing_automation_child(accepted.model_copy(update={"stdout":"ambiguous"}),url)
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceNotFound","code":"AuthorizationFailed","message":"'+msg+'"}})'})
+    assert not _is_exact_missing_automation_child(duplicate,url)
+    parent_message=("The Resource 'Microsoft.Automation/automationAccounts/cnb-attempt-auto' "
+        "under resource group 'cnb-attempt' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    parent_result=accepted.model_copy(update={"stderr":"ERROR: Not Found("+json.dumps(
+        {"error":{"code":"ResourceNotFound","message":parent_message}})+")"})
+    assert _is_exact_missing_automation_child(parent_result,url)
+    assert not _is_exact_missing_automation_child(parent_result.model_copy(update={"stderr":parent_result.stderr.replace("cnb-attempt-auto", "foreign-auto")}),url)
+    group_result=accepted.model_copy(update={"stderr":"ERROR: Not Found("+json.dumps(
+        {"error":{"code":"ResourceGroupNotFound","message":"Resource group 'cnb-attempt' could not be found."}})+")"})
+    assert _is_exact_missing_automation_child(group_result,url)
+    assert not _is_exact_missing_automation_child(group_result.model_copy(update={"stderr":group_result.stderr.replace("cnb-attempt'", "foreign'",1)}),url)
+
+
+def test_missing_automation_account_wrapper_requires_exact_account_identity():
+    from cloud_network_benchmark.azure_provider import _is_exact_missing_automation_account
+    now=datetime.now(timezone.utc)
+    account=("/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cnb-attempt"
+        "/providers/Microsoft.Automation/automationAccounts/cnb-attempt-auto")
+    msg=("The Resource 'Microsoft.Automation/automationAccounts/cnb-attempt-auto' "
+        "under resource group 'cnb-attempt' was not found. "
+        "For more details please go to https://aka.ms/ARMResourceNotFoundFix")
+    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":msg}})+")\n"
+    accepted=CommandResult(action_id="account-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    assert _is_exact_missing_automation_account(accepted,account)
+    assert not _is_exact_missing_automation_account(accepted,account.replace("cnb-attempt-auto","foreign-auto"))
+    assert not _is_exact_missing_automation_account(accepted.model_copy(update={"stderr":stderr.replace("cnb-attempt-auto", "foreign-auto")}),account)
+    assert not _is_exact_missing_automation_account(accepted.model_copy(update={"stderr":stderr.replace("ResourceNotFound", "AuthorizationFailed",1)}),account)
+    assert not _is_exact_missing_automation_account(accepted.model_copy(update={"stdout":"ambiguous"}),account)
+    duplicate=accepted.model_copy(update={"stderr":'ERROR: Not Found({"error":{"code":"ResourceNotFound","code":"AuthorizationFailed","message":"'+msg+'"}})'})
+    assert not _is_exact_missing_automation_account(duplicate,account)
+
+
+def test_actual_job_schedule_absence_passes_production_cleanup_command(repository_root, tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    result=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",
+        stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n')
+    class Runner:
+        def run(self, request):
+            assert request.action_type=="expiry_jobSchedules_before_delete"
+            assert request.argv[request.argv.index("--method")+1]=="GET"
+            assert "/jobSchedules/" in request.argv[request.argv.index("--url")+1]
+            return result.model_copy(update={"action_id":request.action_id})
+    job_id="00000000-0000-0000-0000-000000000123"
+    url=account+"/jobSchedules/"+job_id+"?api-version="+azure_provider.AUTOMATION_API
+    with pytest.raises(RuntimeError,match="expiry_jobSchedules_before_delete failed with failed"):
+        azure_provider._command(Runner(),o,tmp_path,azure_provider._azure_rest("GET",url),
+            "expiry_jobSchedules_before_delete",lambda:1.0)
+    actions=[]
+    azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,
+        account,
+        "jobSchedules",job_id,lambda:1.0,actions)
+    assert len(actions)==1 and actions[0]["outcome"]=="failed"
+
+
+def test_actual_job_schedule_absence_confirms_delete_through_production_command(repository_root,tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    job_id="00000000-0000-0000-0000-000000000123"
+    resource_id=account+"/jobSchedules/"+job_id
+    absent=CommandResult(action_id="absent",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",
+        stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n')
+    def success(request,stdout=""):
+        return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+            started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout=stdout,stderr="")
+    class Runner:
+        def __init__(self): self.calls=0
+        def run(self,request):
+            self.calls+=1
+            if request.argv[request.argv.index("--method")+1]=="DELETE": return success(request)
+            if self.calls==1: return success(request,json.dumps({"id":resource_id}))
+            return absent.model_copy(update={"action_id":request.action_id})
+    runner=Runner(); actions=[]
+    azure_provider._delete_owned_arm_child(runner,o,tmp_path,account,
+        "jobSchedules",job_id,lambda:1.0,actions)
+    assert runner.calls==3 and len(actions)==3
+
+
+def test_actual_blank_schedule_absence_passes_production_cleanup_command(repository_root,tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    result=CommandResult(action_id="schedule-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",
+        stderr='ERROR: Not Found({"code":"NotFound","message":""})\n')
+    class Runner:
+        def run(self,request):
+            assert request.action_type=="expiry_schedules_before_delete"
+            assert request.argv[request.argv.index("--method")+1]=="GET"
+            return result.model_copy(update={"action_id":request.action_id})
+    actions=[]
+    azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,account,"schedules",_slug(d)+"-once",lambda:1.0,actions)
+    assert len(actions)==1 and actions[0]["outcome"]=="failed"
+
+
+def test_actual_nested_runbook_absence_passes_production_cleanup_command(repository_root,tmp_path):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    runbook=_slug(d)+"-deallocate"
+    message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto/runbooks/{runbook}' "
+        f"under resource group '{_slug(d)}' was not found. For more details please go to "
+        "https://aka.ms/ARMResourceNotFoundFix")
+    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n"
+    result=CommandResult(action_id="runbook-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
+    class Runner:
+        def run(self,request):
+            assert request.action_type=="expiry_runbooks_before_delete"
+            return result.model_copy(update={"action_id":request.action_id})
+    actions=[]
+    azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,account,"runbooks",runbook,lambda:1.0,actions)
+    assert len(actions)==1 and actions[0]["outcome"]=="failed"
+
+
+@pytest.mark.parametrize("stderr,stdout,collection", [
+    ('ERROR: Not Found({"code":"AuthorizationFailed","message":"Job Schedule not found."})\n', "", "jobSchedules"),
+    ('ERROR: Not Found({"code":"NotFound","message":"Schedule not found."})\n', "", "jobSchedules"),
+    ('ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})\n', "", "jobSchedules"),
+    ('ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})\n', "unexpected", "jobSchedules"),
+    ('ERROR: Not Found({"code":"NotFound","message":""})\n', "", "unknownCollection"),
+])
+def test_job_schedule_absence_production_path_rejects_unrelated_errors(repository_root,tmp_path,stderr,stdout,collection):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    result=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
+    class Runner:
+        def run(self, request): return result.model_copy(update={"action_id":request.action_id})
+    with pytest.raises(RuntimeError,match="failed with failed"):
+        azure_provider._delete_owned_arm_child(Runner(),o,tmp_path,
+            "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Automation/automationAccounts/acct",
+            collection,"owned-once",lambda:1.0,[])
+
+
+@pytest.mark.parametrize("url_suffix,argv_suffix", [
+    ("jobSchedules/00000000-0000-0000-0000-000000000124?api-version=2024-10-23", []),
+    ("jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", ["--method","GET"]),
+    ("jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", ["--url","/subscriptions/foreign/resourceGroups/rg/providers/Microsoft.Automation/automationAccounts/acct/jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23"]),
+    ("schedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23", []),
+])
+def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_root,tmp_path,url_suffix,argv_suffix):
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    request_url=account+"/"+url_suffix
+    expected_url=account+"/jobSchedules/00000000-0000-0000-0000-000000000123?api-version=2024-10-23"
+    result=CommandResult(action_id="job-absence",outcome=CommandOutcome.FAILED,started_at=now,
+        finished_at=now,duration_seconds=0,exit_code=1,stdout="",
+        stderr='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})')
+    class Runner:
+        def run(self,request): return result.model_copy(update={"action_id":request.action_id})
+    argv=["az","rest","--method","GET","--url",request_url,"--output","json",*argv_suffix]
+    with pytest.raises(RuntimeError,match="failed with failed"):
+        azure_provider._command(Runner(),o,tmp_path,argv,"expiry_jobSchedules_before_delete",lambda:1.0,
+            expected_missing_automation_child_url=expected_url)
+
+
+@pytest.mark.parametrize("case", ["actual", "actual_schedule", "actual_runbook", "nested_runbook",
+    "missing_parent_account", "missing_parent_group", "missing_account", "wrong_account",
+    "mixed_account", "duplicate_account", "authorization", "mixed", "duplicate", "wrong_target"])
+def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
+    from cloud_network_benchmark.azure_provider import _verify_profile_absence
+    import hashlib
+    now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
+        f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
+    job_id="00000000-0000-0000-0000-000000000123"
+    collection=("schedules" if case=="actual_schedule" else
+        "runbooks" if case in {"actual_runbook","nested_runbook"} else "jobSchedules")
+    child_name=(_slug(d)+"-once" if collection=="schedules" else
+        _slug(d)+"-deallocate" if collection=="runbooks" else job_id)
+    child_url=f"{account}/{collection}/{child_name}?api-version={azure_provider.AUTOMATION_API}"
+    baseline={"groups":[],"watchers":[]}
+    baseline["sha256"]=hashlib.sha256(json.dumps(baseline,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    expiry_child=({"schedule":child_name} if collection=="schedules" else
+        {"runbook":child_name} if collection=="runbooks" else {"job_schedule_id":job_id})
+    state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,**expiry_child},
+        "profile_external_baseline":baseline}
+    actual='ERROR: Not Found({"code":"NotFound","message":"Job Schedule not found."})'
+    if case=="authorization": error='ERROR: Not Found({"code":"AuthorizationFailed","message":"Job Schedule not found."})'
+    elif case=="mixed": error=actual
+    elif case=="duplicate": error='ERROR: Not Found({"code":"NotFound","code":"AuthorizationFailed","message":"Job Schedule not found."})'
+    elif case in {"actual_schedule","actual_runbook"}: error='ERROR: Not Found({"code":"NotFound","message":""})'
+    elif case=="nested_runbook":
+        message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto/runbooks/{child_name}' "
+            f"under resource group '{_slug(d)}' was not found. For more details please go to "
+            "https://aka.ms/ARMResourceNotFoundFix")
+        error="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"
+    else: error=actual
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            now_result=now
+            if request.action_type=="profile_absence_group":
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                    started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=0,stdout="false",stderr="")
+            if request.action_type in {"profile_absence_resources","profile_absence_groups",
+                    "profile_absence_role_assignments","profile_absence_role_definitions"}:
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                    started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=0,stdout='{"value":[]}',stderr="")
+            url=request.argv[request.argv.index("--url")+1]
+            if case=="wrong_target" and url==account+"?api-version="+azure_provider.AUTOMATION_API:
+                stderr=actual; stdout=""
+            elif case in {"missing_account","wrong_account","mixed_account","duplicate_account"} and url==account+"?api-version="+azure_provider.AUTOMATION_API:
+                account_name="foreign-auto" if case=="wrong_account" else _slug(d)+"-auto"
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{account_name}' "
+                    f"under resource group '{_slug(d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                if case=="duplicate_account":
+                    stderr='ERROR: Not Found({"error":{"code":"ResourceNotFound","code":"AuthorizationFailed","message":"'+message+'"}})'; stdout=""
+                elif case=="mixed_account":
+                    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"; stdout="ambiguous"
+                else:
+                    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"; stdout=""
+            elif case=="missing_parent_account" and url.startswith(account+"/"):
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(d)}-auto' "
+                    f"under resource group '{_slug(d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")"; stdout=""
+            elif case=="missing_parent_group" and url.startswith(account+"/"):
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceGroupNotFound",
+                    "message":f"Resource group '{_slug(d)}' could not be found."}})+")"; stdout=""
+            elif url==child_url:
+                stderr=error; stdout="noise" if case=="mixed" else ""
+            else:
+                stderr='{"error":{"code":"ResourceNotFound"}}'; stdout=""
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                started_at=now_result,finished_at=now_result,duration_seconds=0,exit_code=1,stdout=stdout,stderr=stderr)
+    runner=Runner(); actions=[]
+    if case in {"actual","actual_schedule","actual_runbook","nested_runbook","missing_account",
+            "missing_parent_account","missing_parent_group"}:
+        _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+        request=next(r for r in runner.requests if "--url" in r.argv
+            and f"/{collection}/" in r.argv[r.argv.index("--url")+1])
+        assert request.action_type=="profile_absence_automation"
+        assert request.argv[request.argv.index("--url")+1]==child_url
+    else:
+        with pytest.raises(RuntimeError):
+            _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+
 
 
 def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: Path, tmp_path: Path):
@@ -43,6 +336,65 @@ def test_missing_expiry_is_rejected_before_workspace_mutation(repository_root: P
     with pytest.raises(ValueError, match="confirmed Azure deallocation"):
         provision(d,o,Runner(),clock=lambda:1.0,utc_now=lambda:datetime.now(timezone.utc))
     assert not o.attempt_root.exists()
+
+
+@pytest.mark.parametrize("started,should_apply", [(800.0, True), (840.0, False)])
+def test_azure_saved_review_uses_stage_budget_and_clamps_each_command(
+        repository_root: Path, tmp_path: Path, monkeypatch, started: float, should_apply: bool):
+    """Queue and manual review share the stage budget; Terraform calls stay <=120s."""
+    import cloud_network_benchmark.terraform_plan as plan_review
+    monkeypatch.setattr(plan_review, "reviewed_apply", _real_reviewed_apply)
+
+    d = deployment(repository_root)
+    o = options(tmp_path / "attempt", d.admission.priority)
+    o = o.model_copy(update={"command_timeout_seconds": 120,
+        "plan_review_timeout_seconds": 120,
+        "plan_review_admission_path": tmp_path / "review-queue",
+        "workflow_stage_deadline_monotonic": 1000.0})
+    root = repository_root / "terraform" / "azure" / "pair"
+    vars_file = tmp_path / "vars.json"
+    vars_file.write_text("{}")
+    state = tmp_path / "state.tfstate"
+    elapsed = [started]
+    monkeypatch.setattr(plan_review.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(plan_review.time, "time", lambda: 1_800_000_000 + elapsed[0])
+    monkeypatch.setattr(plan_review, "validate_scope", lambda *args: {"resource_changes": []})
+    monkeypatch.setattr(plan_review, "original_review_cutoff", lambda *args: 9_999_999_999.0)
+    monkeypatch.setattr(plan_review, "_review_admission_lock",
+        lambda *args: elapsed.__setitem__(0, elapsed[0] + 110) or None)
+
+    def wait_for_review(directory, binding, deadline):
+        elapsed[0] += 55
+        if elapsed[0] >= deadline:
+            raise TimeoutError("review exceeded original stage budget")
+        return {"decision": "approved", "binding": binding}
+
+    monkeypatch.setattr(plan_review, "await_review", wait_for_review)
+    class Runner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            argv = request.argv
+            if "plan" in argv:
+                Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("-out="))).write_bytes(b"plan")
+            elapsed[0] += 5
+            out = "{}" if "show" in argv else "{}"
+            now = datetime.now(timezone.utc)
+            return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
+                started_at=now, finished_at=now, duration_seconds=0, exit_code=0, stdout=out, stderr="")
+    runner = Runner()
+    command = ["terraform", f"-chdir={root}", "apply", "-input=false",
+        f"-state={state}", f"-var-file={vars_file}"]
+    if should_apply:
+        result = azure_provider._command(runner, o, tmp_path, command, "pair_apply", lambda: elapsed[0])
+        assert result.outcome == CommandOutcome.SUCCEEDED
+        assert ["apply" in request.argv for request in runner.requests].count(True) == 1
+    else:
+        with pytest.raises((TimeoutError, ValueError)):
+            azure_provider._command(runner, o, tmp_path, command, "pair_apply", lambda: elapsed[0])
+        assert not any("apply" in request.argv for request in runner.requests)
+    assert runner.requests
+    assert all(request.timeout_seconds <= 120 for request in runner.requests)
 
 
 class AutomationRunner:
@@ -99,7 +451,7 @@ class AutomationRunner:
             payload["location"]=self.d.vm_a.region
             payload.setdefault("properties",{}).update({"runbookType":"PowerShell","runtimeEnvironment":"PowerShell-5.1"})
             out=json.dumps(payload)
-        elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script
+        elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script+"\n"
         elif request.action_type in {"schedule_readback","expiry_schedule_recheck"}:
             p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True; out=json.dumps({"properties":p})
         elif request.action_type in {"job_binding_readback","expiry_binding_recheck"}:
@@ -141,12 +493,14 @@ class AutomationRunner:
 class CleanupRunner(AutomationRunner):
     def __init__(self, *args, residual=False, secret_output="", blank_inventory=False, fail_delete_once=None,
                  account_present=True, account_resource_id=None, account_absence="absent",
-                 present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]", **kwargs):
+                 present_children=None, role_definition_inventory="[]", role_assignment_inventory="[]",
+                 missing_automation_account=False, **kwargs):
         super().__init__(*args, **kwargs); self.residual=residual; self.secret_output=secret_output; self.blank_inventory=blank_inventory
         self.fail_delete_once=fail_delete_once; self.failed_delete=False; self.deleted_children=set(); self.absent_children=set()
         self.account_present=account_present
         self.account_resource_id=account_resource_id
         self.account_absence=account_absence
+        self.missing_automation_account=missing_automation_account
         self.role_definition_inventory=role_definition_inventory
         self.role_assignment_inventory=role_assignment_inventory
         self.present_children=set(present_children if present_children is not None else {"jobSchedules","schedules","runbooks"})
@@ -173,6 +527,11 @@ class CleanupRunner(AutomationRunner):
         elif request.action_type=="role_definition_cleanup_inventory": self.requests.append(request); out=self.role_definition_inventory
         elif request.action_type=="automation_account_absence":
             self.requests.append(request)
+            if self.account_absence == "resource_group_missing_cli":
+                group=_slug(self.d); message=f"Resource group '{group}' could not be found."
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",
+                    stderr=f"ERROR: (ResourceGroupNotFound) {message}\nCode: ResourceGroupNotFound\nMessage: {message}\n")
             if self.account_absence == "present":
                 return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
                     started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=0,
@@ -185,6 +544,13 @@ class CleanupRunner(AutomationRunner):
         elif request.action_type.endswith("_before_delete"):
             self.requests.append(request)
             child_url=request.argv[request.argv.index("--url")+1]
+            if self.missing_automation_account:
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(self.d)}-auto' "
+                    f"under resource group '{_slug(self.d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n"
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr=stderr)
             child=child_url.split("?",1)[0].rsplit("/",2)[-2]
             if child in self.deleted_children or child not in self.present_children:
                 return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",stderr='{"error":{"code":"ResourceNotFound"}}')
@@ -240,6 +606,72 @@ def register_profile_expiry(d,o,start,now,runner,*,clock=1000.0):
     azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:start)
     return register_expiry(d,expiry_request(d,o,start+timedelta(seconds=1680)),o,runner,
         clock=lambda:clock,utc_now=lambda:now)
+
+
+def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository_root,tmp_path,monkeypatch):
+    """Offline replay of the preserved S3 timing values with a fake runner."""
+    from cloud_network_benchmark.contracts.common import Evidence
+
+    origin_utc=datetime.fromisoformat("2026-11-23T15:53:48.107353+00:00")
+    origin_mono=1059650.89673908
+    cap_started_at=datetime.fromisoformat("2026-11-23T15:53:46.267707+00:00")
+    cap_expires_at=datetime.fromisoformat("2026-11-23T17:03:46.267707+00:00")
+    cap_deadline=1063849.057103963
+    second_sample_cap=origin_mono+(cap_expires_at-origin_utc).total_seconds()
+    factory_cap=min(cap_deadline,second_sample_cap)
+    now=origin_utc+timedelta(seconds=1)
+    d=deployment(repository_root,"exp-903-three-provider-smoke.yaml")
+    reservation=d.reservation.value.model_copy(update={
+        "workflow_profile":"all_cloud_acceptance_v1",
+        "cap_started_at":Evidence(value=cap_started_at),"expires_at":Evidence(value=cap_expires_at)})
+    admission=d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "lifetime_cap_seconds":4200})
+    d=d.model_copy(update={"admission":admission,"reservation":Evidence(value=reservation)})
+    value=options(tmp_path,d.admission.priority).model_dump(mode="python")
+    value.update(complete_workflow_seconds=3535,post_registration_workflow_seconds=2635,
+        cap_deadline_monotonic=factory_cap,cap_started_monotonic=cap_deadline-4200.0,
+        retry_end_at=cap_expires_at,workflow_profile="all_cloud_acceptance_v1",
+        cleanup_timing_path=tmp_path/"private"/"azure-clock-map.json",
+        profile_allowance={"registration_seconds":900,"provision_seconds":900,
+            "readiness_seconds":600,"stabilization_seconds":60,"measurement_seconds":100,
+            "measurement_shutdown_seconds":15,"retrieval_seconds":300,"cleanup_seconds":660,
+            "azure_provider_lead_seconds":120})
+    o=AzureRuntimeOptions.model_validate(value)
+
+    # The old second-sample comparison rejects these original numbers by 10.88us.
+    assert cap_deadline > second_sample_cap+1e-6
+    assert o.cap_deadline_monotonic == second_sample_cap
+    assert o.cap_deadline_monotonic < cap_deadline
+    assert o.cap_deadline_monotonic <= azure_provider._source_cap_deadline(o,reservation)+1e-6
+
+    monkeypatch.setattr(azure_provider,"_clock_identity",lambda:
+        "9b1cc84e4aaa6905066a2c10c49aaf2d277d8eb394364da05ec60206638994fd")
+    azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:origin_utc,
+        origin_monotonic=origin_mono,origin_utc=origin_utc)
+    runner=AutomationRunner(d,o,now)
+    result=register_expiry(d,expiry_request(d,o,cap_expires_at-timedelta(seconds=120)),o,runner,
+        clock=lambda:origin_mono+1.0,utc_now=lambda:now)
+    assert result.state=="registered",result.failure
+    assert runner.requests
+
+
+def test_original_cap_monotonic_sample_rejects_overlong_runtime_cap(repository_root,tmp_path):
+    from cloud_network_benchmark.contracts.common import Evidence
+
+    now=datetime(2026,11,23,15,53,49,tzinfo=timezone.utc)
+    d,o,_=profile_attempt(repository_root,tmp_path,now)
+    cap_started_at=datetime.fromisoformat("2026-11-23T15:53:46.267707+00:00")
+    cap_expires_at=datetime.fromisoformat("2026-11-23T17:03:46.267707+00:00")
+    reservation=d.reservation.value.model_copy(update={
+        "cap_started_at":Evidence(value=cap_started_at),"expires_at":Evidence(value=cap_expires_at)})
+    d=d.model_copy(update={"reservation":Evidence(value=reservation)})
+    original_start_mono=1059649.057103963
+    o=o.model_copy(update={"cap_started_monotonic":original_start_mono,
+        "cap_deadline_monotonic":original_start_mono+4200.000002})
+    with pytest.raises(ValueError,match="exceeds the original admission monotonic cap"):
+        azure_provider._initialize_profile_timing(d,o,clock=lambda:1059650.0,
+            utc_now=lambda:datetime.fromisoformat("2026-11-23T15:53:47.0+00:00"))
+    assert not o.cleanup_timing_path.exists()
 
 
 @pytest.mark.parametrize("anchor_state", ["missing","corrupt","foreign"])
@@ -320,6 +752,7 @@ class ProfileCleanupRunner(CleanupRunner):
             out=json.dumps({"value":values})
         elif request.action_type == "profile_absence_automation":
             self.requests.append(request)
+            url=request.argv[request.argv.index("--url")+1]
             if self.missing_group_error is not None:
                 group=("foreign-group" if self.missing_group_error=="foreign" else _slug(self.d))
                 message=f"Resource group '{group}' could not be found."
@@ -328,6 +761,13 @@ class ProfileCleanupRunner(CleanupRunner):
                 return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
                     started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,
                     stdout="",stderr=stderr)
+            if self.missing_automation_account and any(path in url for path in ("/jobSchedules/","/schedules/","/runbooks/")):
+                message=(f"The Resource 'Microsoft.Automation/automationAccounts/{_slug(self.d)}-auto' "
+                    f"under resource group '{_slug(self.d)}' was not found. For more details please go to "
+                    "https://aka.ms/ARMResourceNotFoundFix")
+                return CommandResult(action_id=request.action_id,outcome=CommandOutcome.FAILED,
+                    started_at=self.now,finished_at=self.now,duration_seconds=0,exit_code=1,stdout="",
+                    stderr="ERROR: Not Found("+json.dumps({"error":{"code":"ResourceNotFound","message":message}})+")\n")
             if self.corrupt_timer_on_final and any("/runbooks/" in arg for arg in request.argv):
                 self.o.cleanup_timing_path.write_text('{"schema_version":1,"sha256":"corrupt"}')
                 self.timer_corruptions+=1
@@ -375,6 +815,28 @@ def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
     assert any(r.action_type=="profile_absence_role_definitions" for r in runner.requests)
     assert any(r.action_type=="profile_absence_role_definitions_page_2" for r in runner.requests)
     assert any(r.action_type=="profile_absence_automation" for r in runner.requests)
+
+
+def test_cleanup_resume_accepts_exact_missing_automation_account_for_all_owned_children(
+        repository_root:Path,tmp_path:Path):
+    now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
+    d,o,start=profile_attempt(repository_root,tmp_path,now)
+    registration=AutomationRunner(d,o,now)
+    expiry=register_profile_expiry(d,o,start,now,registration)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    runner=ProfileCleanupRunner(d,o,now,role_pages=True,missing_automation_account=True,
+        account_absence="resource_group_missing_cli")
+    result=destroy(registered,o,runner,clock=lambda:1100.0,
+        utc_now=lambda:now+timedelta(seconds=100))
+    assert result.cleanup_state=="succeeded" and not result.launch_blocked,result.failures
+    actions=[request.action_type for request in runner.requests]
+    assert all(actions.count(f"expiry_{collection}_before_delete")==1
+        for collection in ("jobSchedules","schedules","runbooks"))
+    assert not any(action in actions for action in
+        ("expiry_jobSchedules_delete","expiry_schedules_delete","expiry_runbooks_delete"))
+    assert "expiry_destroy" in actions and "automation_account_absence" in actions
+    assert actions.count("profile_absence_automation")==4
+    assert {"role_cleanup_inventory","role_definition_cleanup_inventory"}.issubset(actions)
 
 
 @pytest.mark.parametrize(("missing_group_error","expected_cleanup"), [
@@ -552,6 +1014,51 @@ def test_unchanged_unfiltered_builtin_catalog_reproduces_size_limit(repository_r
             "profile_absence_role_definitions",lambda:1100.0,("id",))
 
 
+def test_workflow_cleanup_after_original_stop_uses_bounded_emergency_window(
+        repository_root: Path, tmp_path: Path):
+    from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark import azure_provider
+    from cloud_network_benchmark.validation_profiles import FAILURE_PROFILE
+    start = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    d, o, _ = profile_attempt(repository_root, tmp_path, start + timedelta(seconds=100))
+    cap_end = start + timedelta(seconds=3900)
+    reservation = d.reservation.value.model_copy(update={"timing_profile": None,
+        "expires_at": Evidence(value=cap_end)})
+    admission = d.admission.model_copy(update={"timing_profile": None,
+        "workflow_profile": FAILURE_PROFILE, "lifetime_cap_seconds": 3900})
+    d = d.model_copy(update={"admission": admission, "reservation": Evidence(value=reservation)})
+    stop = cap_end - timedelta(seconds=720)
+    o = o.model_copy(update={"timing_profile": None, "workflow_profile": FAILURE_PROFILE,
+        "cap_deadline_monotonic": 4900.0, "retry_end_at": cap_end})
+    azure_provider._initialize_profile_timing(d, o, clock=lambda: 1000.0, utc_now=lambda: start)
+    azure_provider._bind_profile_stop(d, o, stop)
+    late_now = start + timedelta(seconds=3181)
+    deadline, state, note = azure_provider._begin_profile_cleanup(d, o,
+        clock=lambda: 4181.0, utc_now=lambda: late_now, invocation_seconds=660)
+    assert note and state["timing_status"] == "late"
+    assert deadline == 4841.0
+    assert deadline < o.cap_deadline_monotonic + 1
+    assert state["cap_expires_at"] == cap_end.isoformat()
+    assert state["provider_stop_at"] == stop.isoformat()
+
+    class EmergencyRunner:
+        def __init__(self): self.requests = []
+        def run(self, request):
+            from cloud_network_benchmark.contracts.execution import CommandResult
+            self.requests.append(request)
+            return CommandResult(action_id=request.action_id, outcome="succeeded",
+                started_at=late_now, finished_at=late_now, duration_seconds=0,
+                exit_code=0, stdout="ok", stderr="")
+
+    runner = EmergencyRunner()
+    emergency_options = o.model_copy(update={"cap_deadline_monotonic": deadline,
+        "cleanup_timing_active": True, "cleanup_timing_phase": "emergency"})
+    azure_provider._command(runner, emergency_options, tmp_path, ["az", "group", "exists"],
+        "cleanup-recovery-probe", lambda: 4181.0)
+    assert len(runner.requests) == 1
+    assert runner.requests[0].timeout_seconds <= 660
+
+
 def test_profile_absence_recovery_uses_separate_window_without_replaying_destroy(
         repository_root: Path,tmp_path: Path):
     now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
@@ -713,6 +1220,18 @@ def test_registration_polls_asynchronous_publication_within_bound(repository_roo
     expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now,sleep=lambda seconds:None)
     assert expiry.state=="registered"
     assert [r.action_type for r in runner.requests].count("runbook_readback")==2
+
+def test_azure_tsv_content_readback_removes_only_cli_record_terminator(repository_root):
+    from cloud_network_benchmark.azure_provider import _azure_tsv_content_matches
+    script=(repository_root/"terraform/azure/expiry/deallocate.ps1").read_bytes().decode("utf-8")
+    import hashlib
+    digest=hashlib.sha256(script.encode()).hexdigest()
+    # `az rest --output tsv` adds one final LF after the content's own final LF.
+    assert _azure_tsv_content_matches(script,digest)  # exact source response
+    assert _azure_tsv_content_matches(script+"\n",digest)  # one CLI terminator
+    assert not _azure_tsv_content_matches(script+"\n\n",digest)
+    assert not _azure_tsv_content_matches(script.replace("Assert-Target", "Assert-Tampered")+"\n",digest)
+
 
 
 def test_provision_rechecks_published_content_before_pair_apply(repository_root: Path, tmp_path: Path):
@@ -1109,7 +1628,8 @@ def test_malformed_or_unexpected_custom_role_inventory_retains_recovery_and_bloc
     assert (o.attempt_root/"recovery.json").exists()
 
 
-@pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]}"])
+@pytest.mark.parametrize("inventory", ["[null]", "[{\"id\":\"\"}]", "{\"value\":[]} ",
+    "[{\"id\":\"/subscriptions/foreign/providers/Microsoft.Authorization/roleAssignments/x\",\"scope\":\"/subscriptions/foreign\",\"principalId\":\"p\",\"roleDefinitionId\":\"r\"}]"])
 def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root:Path,tmp_path:Path,inventory):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
     o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
@@ -1119,6 +1639,9 @@ def test_malformed_role_assignment_inventory_also_blocks_cleanup(repository_root
     result=destroy(d.model_copy(update={"expiry":type(d.expiry)(value=expiry)}),o,runner,clock=lambda:2.,utc_now=lambda:now+timedelta(seconds=1))
     assert result.cleanup_state=="failed" and result.launch_blocked
     assert "role assignment inventory" in result.failures[0].message
+    request=next(q for q in runner.requests if q.action_type=="role_cleanup_inventory")
+    assert request.argv == ["az","role","assignment","list","--subscription",
+        o.subscription_id,"--scope",runner.group_id,"--output","json"]
     assert (o.attempt_root/"recovery.json").exists()
 
 

@@ -51,6 +51,7 @@ def test_admission_requirements_use_only_declared_caps_and_source_evidence() -> 
     assert expected == {
         "priority": "P0", "lifetime_cap_seconds": 87600, "requires_common_n": True,
         "requires_schedule": True, "requires_primary_review": False, "requires_expiry": True,
+        "workflow_profile": None,
     }
     requirements = AdmissionRequirements(
         **expected, hard_budget_usd=300, protected_buffer_usd=50, cost_input_id="input-2026-10-20",

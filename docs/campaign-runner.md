@@ -381,23 +381,16 @@ gcloud projects describe ACTUAL_PROJECT_ID --format='value(projectId)'
 `authentication_reference` in settings is the absolute benchmark **SSH private-key path**, not a cloud token. Do not overwrite an existing key/settings file when resuming this runbook. Do not paste private keys into Codex.
 
 ```sh
-sudo install -d -o "$USER" -g "$(id -gn)" /etc/cloud-network-benchmark
-install -m 600 plans/operator-settings.example.yaml /etc/cloud-network-benchmark/operator.yaml
-install -m 600 /dev/null /etc/cloud-network-benchmark/controller.env
-editor /etc/cloud-network-benchmark/operator.yaml
-editor /etc/cloud-network-benchmark/controller.env
-mkdir -p ~/.config/systemd/user
-install -m 644 deploy/cloud-network-benchmark-campaign.service ~/.config/systemd/user/
-sudo loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable cloud-network-benchmark-campaign.service
+mkdir -p -m 700 ~/cnb/private
+install -m 600 plans/operator-settings.example.yaml ~/cnb/private/operator.yaml
+editor ~/cnb/private/operator.yaml
 ```
 
-Fill **one operator YAML** with actual account/image IDs, controller `/32`, SSH paths, measured interface names, quoted complete-workflow prices, funding, allowances and review-source paths. Nulls/false confirmations deliberately block launch. Use the [field/evidence table](campaign-developer.md#one-settings-file-real-evidence). Confirm an approval only after its named review exists. The driver generates internal JSON/configs; do not handcraft runtime manifests.
+Fill **one operator YAML** with actual account/image IDs, controller `/32`, SSH paths, measured interface names, quoted complete-workflow prices, funding, allowances and review-source paths. Set `state_root` and `results_root` to durable, quota-approved Halle paths. Nulls/false confirmations deliberately block launch. Use the [field/evidence table](campaign-developer.md#one-settings-file-real-evidence). Confirm an approval only after its named review exists. The driver generates internal JSON/configs; do not handcraft runtime manifests.
 
-`controller.env` uses systemd `NAME=value` lines (no `export`), with actual absolute credential references, for example `AWS_PROFILE=cnb`, `GOOGLE_APPLICATION_CREDENTIALS=/srv/cnb/credentials/gcp-wif.json`, and `AZURE_CONFIG_DIR`/`CLOUDSDK_CONFIG` if custom. Terraform may need additional identity-specific variables; review those with Codex. The service does **not** inherit SSH-shell exports. Prove renewal beyond initial token lifetime in the service environment and retain evidence before setting `credential_refresh.confirmed`.
+The campaign runs as one detached user process in a new session; it does not require systemd user linger or sudo. Its environment comes from the invoking shell, so source a private, mode-600 environment file before `check` and `start`. The process survives SSH disconnect and logout while Halle stays up; reboot and physical host loss are not covered. The observer rechecks AWS/Azure/GCP identity, the reviewed credential-valid-through horizon and Terraform every five minutes, writing `observer-status.json`. Renewal beyond initial token lifetime must be demonstrated and recorded in `credential_refresh` before `start`.
 
-For persistent host logs, ask the controller administrator to enable bounded persistent journald storage (e.g. `Storage=persistent`, `SystemMaxUse=512M` in a journald drop-in; see [systemd settings](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html)). Preserve private journals and the shared ledger in an access-controlled off-machine backup, separately from public results; these contain recovery-sensitive paths/state. Never publish that backup. A results export is not a recovery-state backup.
+The supervisor log, observer snapshot, campaign journal and shared ledger are under the configured private state root. Protect and back them up through an approved Halle mechanism; a results export is not a recovery-state backup.
 
 ## 4. Run acceptance, calibration and DAY with reviews
 
@@ -406,31 +399,24 @@ After every new SSH login:
 ```sh
 export PATH="/srv/cnb/venv/bin:$PATH"
 cd /srv/cnb/repository
-cloud-network-benchmark campaign check --plan plans/acceptance.yaml
+cloud-network-benchmark campaign check --plan plans/acceptance.yaml --settings ~/cnb/private/operator.yaml
 ```
 
 `check` creates no resources; it checks inputs, tools/storage and bounded read-only identities. It does not prove IAM/quota/expiry or readiness. **Ask Codex to review the check, native test logs and real authorization/price evidence before this first paid command:**
 
 ```sh
-cloud-network-benchmark campaign start --plan plans/acceptance.yaml --execute
-cloud-network-benchmark campaign status
-cloud-network-benchmark campaign logs --follow
+cloud-network-benchmark campaign start --plan plans/acceptance.yaml --settings ~/cnb/private/operator.yaml --execute
+cloud-network-benchmark campaign status --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign logs --settings ~/cnb/private/operator.yaml --follow
 ```
 
-Acceptance runs V-S1/V-S3 at 10 seconds/phase, N=4, then waits for supervised failure entries. Verify actual AWS Cluster Placement Group, Azure **Standard** PPG and GCP **COLLOCATED** policy membership; inspect native data and full deletion. Follow the [physical failure/controller-loss procedure](campaign-developer.md#supervised-registered-failure-checks), including original expiry deadlines and independent absence evidence, before continuing each attempt:
-
-```sh
-cloud-network-benchmark campaign continue --stage-id ACTUAL_STAGE_ID --entry-id V-A-FAIL --confirm-supervision
-# Repeat explicitly for V-Z-FAIL and V-G-FAIL after the previous attempt is reviewed/recovered.
-```
-
-During supervised acceptance, disconnect/reconnect SSH and verify the same session/journal continues; exercise supervisor restart under the physical-loss procedure. Do not improvise restart/power-loss tests during research. Normal success alone does not pass a failure check.
+The current reduced pre-DAY prompt explicitly waives the deliberate provider/server failure, expiry-wait, controller-loss and host-loss exercises. Record those entries as **WAIVED / NOT TESTED**; do not launch or continue them from this historical runbook. No physical-host reboot recovery is provided. The detached supervisor continues across SSH disconnect/logout only while Halle remains available; it does not authorize a replay or a second measurement after uncertain state.
 
 **Review acceptance/native builds/renewal/cleanup with Codex**, then prepare the future start and measured allowance in the operator file:
 
 ```sh
-cloud-network-benchmark campaign check --plan plans/calibration.yaml
-cloud-network-benchmark campaign start --plan plans/calibration.yaml --execute
+cloud-network-benchmark campaign check --plan plans/calibration.yaml --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign start --plan plans/calibration.yaml --settings ~/cnb/private/operator.yaml --execute
 ```
 
 Calibration uses one separate retained pair/cloud, 1/2/4/8 streams × three loaded 60-second trials in fixed order. Download the closed stage (step 6). On the **laptop**, use the downloaded calibration stage's final selection (`CNB_LOCAL` is its local directory):
@@ -452,8 +438,8 @@ cloud-network-benchmark lifecycle recommend-common-n --validation-results calibr
 **Ask Codex to review/freeze common N and storage/export evidence**; copy the reviewed recommendation back and set `common_n_recommendation`. Fill future DAY start/reviews and check before launch:
 
 ```sh
-cloud-network-benchmark campaign check --plan plans/day.yaml
-cloud-network-benchmark campaign start --plan plans/day.yaml --execute
+cloud-network-benchmark campaign check --plan plans/day.yaml --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign start --plan plans/day.yaml --settings ~/cnb/private/operator.yaml --execute
 ```
 
 DAY uses separate retained pairs, uninterrupted 86,400-second aggregate TCP, local RTT chunks ≤300 seconds and one-second diagnostics. Its raw files are retrieved **after measurement**. A live controller log does not prove complete guest data. Before launch, measure both guests' file growth/free space from acceptance/calibration, conservatively project all output to 24 hours plus overhead, verify 32 GiB guest disks and the 20 GiB/cloud export allowance, and demonstrate checksum-verified transfer within the cap. Controller free space must cover original data **and closed exports** plus headroom (at least twice projected raw bytes, and retained weekly data/software). 200 GB is provisional; enlarge before admission if needed. No automatic deletion or disk rescue is provided.
@@ -463,30 +449,30 @@ DAY uses separate retained pairs, uninterrupted 86,400-second aggregate TCP, loc
 **Review DAY with Codex:** full TCP duration, ≥99% RTT time coverage, missing data, sustained throughput, costs, exact four UTC windows and feasible seven-day dates. Incomplete DAY requires review; no automatic repeat. Set `first_day_utc`, four `windows_utc`, reviewed allowances/authorization; keep common N fixed.
 
 ```sh
-cloud-network-benchmark campaign check --plan plans/week.yaml
-cloud-network-benchmark campaign start --plan plans/week.yaml --execute
+cloud-network-benchmark campaign check --plan plans/week.yaml --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign start --plan plans/week.yaml --settings ~/cnb/private/operator.yaml --execute
 ```
 
-WEEK makes 28 P0/S1 + 28 P1/S3 independent all-cloud calls, concurrent in the same slots, with fresh resources and cleanup after each observation (168 child runs total). `start` hands off to systemd and returns. Leave SSH normally; the controller must stay available. Missed slots stay missed; uncertain launches/cleanup liabilities block new work. No automatic paid replacements or P2/P3.
+WEEK makes 28 P0/S1 + 28 P1/S3 independent all-cloud calls, concurrent in the same slots, with fresh resources and cleanup after each observation (168 child runs total). `start` launches the detached user-space supervisor and returns. SSH disconnect/logout does not stop it while Halle stays up. Missed slots stay missed; uncertain launches/cleanup liabilities block new work. No automatic paid replacements or P2/P3.
 
 Run these after the first slot and at least daily; inspect count changes after each expected slot:
 
 ```sh
-cloud-network-benchmark campaign status
-cloud-network-benchmark campaign logs --follow
-systemctl --user status cloud-network-benchmark-campaign.service --no-pager
-journalctl --user -u cloud-network-benchmark-campaign.service --since today --no-pager
-# Add -f to journalctl for live service output; Ctrl-C only stops the viewer.
+cloud-network-benchmark campaign status --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign resume --settings ~/cnb/private/operator.yaml
+cloud-network-benchmark campaign logs --settings ~/cnb/private/operator.yaml --follow
 date -u
 timedatectl status
 df -h /srv/cnb/results /srv/cnb/private
 du -sh /srv/cnb/results/*
 ```
 
+`resume` is observational: it returns the existing campaign/journal and observer snapshot and never starts work. Do not rerun `start` to reconnect. `observer-status.json` records campaign IDs, state/results paths, missed slots, disk, output freshness and cleanup liabilities. It is local and cannot report through a Halle outage.
+
 | Evidence | Location / meaning |
 | --- | --- |
 | Controller events | `/srv/cnb/private/campaign.log`; rotates at 5 MiB, three backups |
-| Service stdout/restarts | `journalctl --user -u cloud-network-benchmark-campaign.service`; retention depends on host journald |
+| Detached supervisor output | The stage/entry log under the configured private state root; inspect the saved process/journal identity and observer snapshot |
 | Detailed entry output | `/srv/cnb/private/STAGE_ID/ENTRY_ID.log` |
 | Durable launch/cleanup state | `/srv/cnb/private/STAGE_ID/campaign-journal.json`, per-entry `lifecycle-recovery.json`; keep private |
 | Original native results | `/srv/cnb/results/STAGE_ID/raw/RUN_ID/`; closed copies include native files, diagnostics, manifests, config/schedule, validation and checksums |

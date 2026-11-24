@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import queue
+import math
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Optional, Protocol, Sequence
+from typing import BinaryIO, Callable, Mapping, Optional, Protocol, Sequence
 
 from .contracts import CommandOutcome, CommandRequest, CommandResult
 
@@ -52,6 +53,9 @@ class LocalProcess:
     stderr_file: BinaryIO
     events: "queue.Queue[ProcessEvent]"
     preview_limit: int
+    observer_record: Mapping[str, object] | None = None
+    observer_callback: Callable[[Mapping[str, object]], None] | None = None
+    observer_errors: list[str] = field(default_factory=list)
     preview: dict[str, bytearray] = field(default_factory=lambda: {"stdout": bytearray(), "stderr": bytearray()})
     stream_errors: list[str] = field(default_factory=list)
     threads: list[threading.Thread] = field(default_factory=list)
@@ -70,9 +74,14 @@ class MeasurementProcesses(Protocol):
 class LocalMeasurementProcesses:
     """Shell-free Popen runner which saves full streams while retaining bounded previews."""
 
-    def __init__(self, clock: MeasurementClock, *, preview_bytes: int = 8192) -> None:
+    def __init__(self, clock: MeasurementClock, *, preview_bytes: int = 8192,
+                 observer_callback: Callable[[Mapping[str, object]], None] | None = None,
+                 proc_root: Path = Path("/proc"), finalization_grace_seconds: float | None = None) -> None:
         self.clock = clock
         self.preview_bytes = preview_bytes
+        self.observer_callback = observer_callback
+        self.proc_root = Path(proc_root)
+        self.finalization_grace_seconds = finalization_grace_seconds
         self._events: "queue.Queue[ProcessEvent]" = queue.Queue(maxsize=32)
 
     def start(self, request: CommandRequest, *, stdout_path: Path, stderr_path: Path) -> LocalProcess:
@@ -96,17 +105,37 @@ class LocalMeasurementProcesses:
             out.close()
             err.close()
             raise
-        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events, self.preview_bytes)
+        handle = LocalProcess(request, proc, started_mono, started_at, out, err, self._events,
+                              self.preview_bytes, None, self.observer_callback)
+        for name, pipe, target in (("stdout", proc.stdout, out), ("stderr", proc.stderr, err)):
+            thread = threading.Thread(target=self._drain, args=(handle, name, pipe, target), daemon=True)
+            handle.threads.append(thread)
+            thread.start()
+        try:
+            observer_record = self._observer_record(request, proc.pid, stdout_path=stdout_path,
+                proc_root=self.proc_root, finalization_grace_seconds=self.finalization_grace_seconds) if self.observer_callback else None
+        except BaseException as start_error:
+            try:
+                self.stop(handle, started_mono + request.timeout_seconds)
+            except BaseException as cleanup_error:
+                raise RuntimeError("observer process identity failed and bounded process cleanup failed") from cleanup_error
+            raise start_error
+        handle.observer_record = observer_record
+        if observer_record is not None:
+            try:
+                self.observer_callback({"event": "started", **observer_record})
+            except BaseException as start_error:
+                try:
+                    self.stop(handle, started_mono + request.timeout_seconds)
+                except BaseException as cleanup_error:
+                    raise RuntimeError("observer publication failed and bounded process cleanup failed") from cleanup_error
+                raise start_error
         if request.stdin is not None and proc.stdin is not None:
             try:
                 proc.stdin.write(request.stdin.encode())
                 proc.stdin.close()
             except OSError:
                 pass
-        for name, pipe, target in (("stdout", proc.stdout, out), ("stderr", proc.stderr, err)):
-            thread = threading.Thread(target=self._drain, args=(handle, name, pipe, target), daemon=True)
-            handle.threads.append(thread)
-            thread.start()
         waiter = threading.Thread(target=self._watch_exit, args=(handle,), daemon=True)
         handle.threads.append(waiter)
         waiter.start()
@@ -114,6 +143,12 @@ class LocalMeasurementProcesses:
 
     def _watch_exit(self, handle: LocalProcess) -> None:
         handle.process.wait()
+        if handle.observer_record is not None and handle.observer_callback is not None:
+            try:
+                handle.observer_callback({"event": "completed", "exit_code": handle.process.returncode,
+                    **handle.observer_record})
+            except BaseException as exc:
+                handle.observer_errors.append(f"observer progress update failed: {type(exc).__name__}")
         event = ProcessEvent(handle, "exit", "", self.clock.monotonic(), self.clock.utc_now())
         while True:
             try:
@@ -122,6 +157,57 @@ class LocalMeasurementProcesses:
             except queue.Full:
                 # The event is only a wake-up; process state is available from poll().
                 return
+
+    @staticmethod
+    def _observer_record(request: CommandRequest, pid: int, *, stdout_path: Path,
+                         proc_root: Path = Path("/proc"),
+                         finalization_grace_seconds: float | None = None) -> Mapping[str, object] | None:
+        """Capture actual client processes and the paths already owned by F03."""
+        if not request.argv:
+            return None
+        tool = Path(request.argv[0]).name
+        if tool == "sockperf":
+            kind = "producer"
+        elif tool == "iperf3" and "-c" in request.argv:
+            kind = "tcp_client"
+        else:
+            return None
+        try:
+            if kind == "producer":
+                index = request.argv.index("--full-log")
+                output = Path(request.argv[index + 1])
+            else:
+                output = Path(stdout_path)
+            workspace = Path(request.cwd).resolve(strict=True)
+            output = output.resolve(strict=False)
+            relative = output.relative_to(workspace).as_posix()
+            stat = proc_root / str(pid) / "stat"
+            stat = stat.read_text(encoding="ascii")
+            fields = stat[stat.rfind(")") + 2:].split()
+            ticks = int(fields[19])
+            boot_id = (proc_root / "sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except (OSError, ValueError, IndexError, TypeError) as exc:
+            raise RuntimeError("actual Sockperf observer process identity/path is unavailable") from exc
+        if not relative or relative.startswith("../") or ticks <= 0 or len(boot_id) != 36:
+            raise RuntimeError("actual Sockperf observer process identity/path is invalid")
+        action_id = request.action_id
+        prefix = "sockperf-" if kind == "producer" else "iperf3-"
+        if not action_id.startswith(prefix) or len(action_id) == len(prefix):
+            raise RuntimeError("actual measurement observer action identity is invalid")
+        try:
+            duration = int(request.argv[request.argv.index("-t") + 1])
+        except (ValueError, IndexError, TypeError):
+            raise RuntimeError("actual measurement observer duration is unavailable") from None
+        if (isinstance(finalization_grace_seconds, bool)
+                or not isinstance(finalization_grace_seconds, (int, float))
+                or not math.isfinite(finalization_grace_seconds) or finalization_grace_seconds <= 0):
+            raise RuntimeError("actual measurement observer finalization grace is unavailable")
+        return {"kind": kind, "pid": pid, "boot_id": boot_id, "start_ticks": ticks,
+                "path": relative, "action_id": action_id, "unit_id": action_id[len(prefix):],
+                "timeout_seconds": request.timeout_seconds, "requested_seconds": duration,
+                "finalization_grace_seconds": float(finalization_grace_seconds),
+                "streaming_output": kind == "tcp_client" and "--json-stream" in request.argv
+                    and "--forceflush" in request.argv}
 
     def _drain(self, handle: LocalProcess, channel: str, pipe: object, target: BinaryIO) -> None:
         try:
@@ -143,13 +229,17 @@ class LocalMeasurementProcesses:
                         if handle.process.poll() is not None:
                             # Keep the durable file complete; event pressure must not block reaping.
                             break
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             handle.stream_errors.append(f"{channel} stream write/read failed: {type(exc).__name__}: {exc}")
         finally:
             try:
                 pipe.close()  # type: ignore[attr-defined]
-            finally:
+            except (OSError, ValueError) as exc:
+                handle.stream_errors.append(f"{channel} pipe close failed: {type(exc).__name__}: {exc}")
+            try:
                 target.flush()
+            except (OSError, ValueError) as exc:
+                handle.stream_errors.append(f"{channel} output flush failed: {type(exc).__name__}: {exc}")
 
     def next_event(self, handles: Sequence[object], deadline_monotonic: float) -> Optional[ProcessEvent]:
         del handles  # events are tagged by their owning handle
@@ -182,9 +272,13 @@ class LocalMeasurementProcesses:
                     proc.terminate()
                 except BaseException as exc:
                     shutdown_errors.append(f"terminate failed: {type(exc).__name__}: {exc}")
-            remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
+            # Keep explicit portions of the original command window for SIGKILL,
+            # reap, and draining. A stopped or TERM-resistant process must not
+            # consume the entire window before escalation can run.
+            available = max(0.0, deadline_monotonic - self.clock.monotonic())
+            term_budget = available / 3.0
             try:
-                proc.wait(timeout=remaining)
+                proc.wait(timeout=term_budget)
             except subprocess.TimeoutExpired:
                 pass
             except BaseException as exc:
@@ -196,9 +290,9 @@ class LocalMeasurementProcesses:
                 except BaseException as exc:
                     shutdown_errors.append(f"kill failed: {type(exc).__name__}: {exc}")
             if kill_attempted:
-                remaining = max(0.0, deadline_monotonic - self.clock.monotonic())
+                reap_budget = max(0.0, deadline_monotonic - self.clock.monotonic()) / 2.0
                 try:
-                    proc.wait(timeout=remaining)
+                    proc.wait(timeout=reap_budget)
                 except subprocess.TimeoutExpired as exc:
                     shutdown_errors.append(f"reap failed: {type(exc).__name__}: {exc}")
                 except BaseException as exc:
@@ -263,8 +357,9 @@ class LocalMeasurementProcesses:
         stderr = bytes(item.preview["stderr"]).decode("utf-8", errors="replace")
         item.finished_at = finished_at
         item.finished_monotonic = finished_monotonic
-        if item.stream_errors:
-            stderr = (stderr + "\n" + "\n".join(item.stream_errors))[-self.preview_bytes:]
+        errors = [*item.stream_errors, *item.observer_errors]
+        if errors:
+            stderr = (stderr + "\n" + "\n".join(errors))[-self.preview_bytes:]
             if outcome != CommandOutcome.FAILED:
                 outcome, code = CommandOutcome.FAILED, 125
         for secret in sorted((s for s in item.request.redactions if s), key=len, reverse=True):

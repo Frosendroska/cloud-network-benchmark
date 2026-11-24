@@ -936,7 +936,7 @@ def run_measurement(observation: ResolvedObservation, context: MeasurementContex
     result = _Runner(validated, context, processes, clock).run()
     from .bootstrap import materialize_build_identity_artifacts
     build_records = materialize_build_identity_artifacts(Path(context.root), context.identity.deployment_id,
-        context.build_observations)
+        context.build_observations, include_controller_bundle=False)
     if build_records:
         result = replace(result, artifact_records=build_records)
     if not context.source_artifact_records or not context.build_observations:

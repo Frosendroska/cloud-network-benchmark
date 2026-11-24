@@ -55,6 +55,17 @@ run "reject_stockholm_cross_zone" {
   expect_failures = [terraform_data.account_guard]
 }
 
+run "stockholm_s3_cluster_pair" {
+  command = plan
+  variables { scenario = "placement_optimization" }
+  assert {
+    condition = (length(aws_placement_group.cluster) == 1 &&
+      aws_instance.vm_a.placement_group == var.placement_group_name &&
+    aws_instance.vm_b_frankfurt[0].placement_group == var.placement_group_name)
+    error_message = "Stockholm S3 must use the selected cluster placement group on both roles"
+  }
+}
+
 run "reject_stockholm_zone_mismatch" {
   command = plan
   variables { primary_zone = "eu-central-1a" }

@@ -94,7 +94,18 @@ def package_tree_sha256(root: Path) -> str:
 def execute_request(request: GuestRequest, *, processes=None, clock=None) -> GuestOutcome:
     request = GuestRequest.model_validate(request.model_dump(mode="python"))
     clock = clock or SystemMeasurementClock()
-    processes = processes or LocalMeasurementProcesses(clock)
+    if processes is None:
+        from .contracts.common import ExperimentMode
+        observer_callback = None
+        if request.observation.mode in {ExperimentMode.DIAGNOSTIC_DAY,
+                                       ExperimentMode.ACCEPTANCE, ExperimentMode.CALIBRATION}:
+            from .observer_publisher import GuestObserverProgress
+            observer_callback = GuestObserverProgress(
+                request.output_root / ".observer-progress.json",
+                deployment_id=request.identity.deployment_id,
+                observation=request.observation)
+        processes = LocalMeasurementProcesses(clock, observer_callback=observer_callback,
+            finalization_grace_seconds=request.shutdown_grace_seconds)
     if request.observation.provider != request.identity.provider:
         raise ValueError("provider identity mismatch")
     if package_tree_sha256(request.package_root) != request.package_sha256:

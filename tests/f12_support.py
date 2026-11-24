@@ -15,7 +15,8 @@ def materialize_f08_pair(repository_root, tmp_path, frozen_clock, deterministic_
     from tests.unit.test_validation import NOW
 
     config_name = config_name or {"calibration": "exp-001-calibration.yaml",
-        "diagnostic_day": "exp-001-diagnostic-day.yaml"}.get(mode, "exp-001-multi-provider.yaml")
+        "diagnostic_day": "exp-001-diagnostic-day.yaml",
+        "acceptance": "exp-903-three-provider-smoke.yaml"}.get(mode, "exp-001-multi-provider.yaml")
     complete, result = _materialize_complete_bundle(
         repository_root, tmp_path, frozen_clock, deterministic_token, fake_git_commits,
         request, mode_override="acceptance" if mode == "acceptance" else None,

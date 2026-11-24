@@ -93,6 +93,139 @@ def test_corrupted_export_copy_is_rejected_and_original_bytes_remain(tmp_path, m
     assert native.read_bytes() == b"immutable original native output\n"
 
 
+def _config_only_stage(tmp_path, *, add_native=False):
+    import json
+
+    repository = tmp_path / "repo"
+    results = repository / "results"
+    manifests = repository / "manifests"
+    manifests.mkdir(parents=True)
+    entries = []
+    providers = {"aws": "AWS", "azure": "AZURE", "gcp": "GCP"}
+    for suffix, provider in providers.items():
+        run_id = f"failed-{suffix}"
+        raw = results / "raw" / run_id
+        raw.mkdir(parents=True)
+        (raw / "config.yaml").write_text(f"experiment: {suffix}\n")
+        (raw / "config.resolved.json").write_text(json.dumps({"provider": provider}))
+        if add_native:
+            (raw / "sockperf.csv").write_text("timestamp,rtt\n")
+        child = manifests / f"{run_id}.json"
+        child.write_text(json.dumps({"run_id": run_id, "provider": provider}))
+        parent = manifests / f"{suffix}-parent.json"
+        parent.write_text(json.dumps({"child_runs": [{"run_id": run_id,
+            "manifest_path": str(child.relative_to(repository))}]}))
+        entries.append({"entry_id": f"V-{suffix}", "launch_at": "2026-11-23T00:00:00+00:00",
+                        "parent_manifest_path": str(parent),
+                        "run_ids": {provider: run_id}})
+    return {"stage_id": "failed-acceptance", "repository_root": str(repository),
+            "results_root": str(results), "entries": entries}
+
+
+def test_unmeasured_config_only_exports_are_transport_verified_but_not_selected(tmp_path):
+    from cloud_network_benchmark.campaign_export import export_selection, verify_export
+
+    stage = _config_only_stage(tmp_path)
+    destination = tmp_path / "export"
+    assert export_selection(stage, destination) is None
+    provenance = json.loads((destination / "export-provenance.json").read_text())
+    assert provenance["evidence_status"] == "not_validated"
+    assert provenance["selection_sha256"] is None
+    assert provenance["transport_status"] == "integrity_only"
+    assert len(provenance["transport_inventory"]) >= 10
+    assert verify_export(destination) is True
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "native", "symlink", "no_inventory", "fifo"])
+def test_partial_export_integrity_fails_closed_on_changes_and_unsealed_native_files(tmp_path, mutation):
+    from cloud_network_benchmark.campaign_export import export_selection, verify_export
+    import os
+
+    stage = _config_only_stage(tmp_path, add_native=(mutation == "native"))
+    destination = tmp_path / "export"
+    assert export_selection(stage, destination) is None
+    if mutation == "native":
+        assert verify_export(destination) is True  # Transport is verified; it is never a replay selection.
+        assert not (destination / "selection.json").exists()
+        assert json.loads((destination / "export-provenance.json").read_text())["evidence_status"] == "not_validated"
+        return
+    assert verify_export(destination) is True
+    if mutation == "missing":
+        next((destination / "runs").rglob("config.yaml")).unlink()
+    elif mutation == "extra":
+        (destination / "runs" / "unexpected.txt").write_text("untracked")
+    elif mutation == "symlink":
+        (destination / "runs" / "linked-config").symlink_to("config.yaml")
+    elif mutation == "no_inventory":
+        provenance_path = destination / "export-provenance.json"
+        provenance = json.loads(provenance_path.read_text())
+        provenance.pop("transport_inventory")
+        provenance_path.write_text(json.dumps(provenance))
+    elif mutation == "fifo" and hasattr(os, "mkfifo"):
+        os.mkfifo(destination / "runs" / "unexpected-pipe")
+    assert verify_export(destination) is False
+
+
+@pytest.mark.parametrize("mutation", [None, "results_root", "run_ids", "parent_manifest_path", "symlink_entry"])
+def test_failed_cleanup_closed_export_reconciliation_preserves_old_copy_and_does_not_dispatch(tmp_path, mutation):
+    from cloud_network_benchmark.campaign import CampaignDriver
+
+    stage = _config_only_stage(tmp_path)
+    stage["state_root"] = str(tmp_path / "state")
+    stage_id, entry_id = stage["stage_id"], stage["entries"][0]["entry_id"]
+    state = Path(stage["state_root"]) / stage_id
+    state.mkdir(parents=True)
+    (state / "prepared-stage.json").write_text(json.dumps(stage))
+    engine = CampaignDriver()
+    journal_path = state / "campaign-journal.json"
+    journal = engine._load_or_create_journal(stage, journal_path)
+    journal["entries"][entry_id].update(state="failed", result={"cleanup_open": False},
+                                         export_status="failed: integrity check")
+    journal_path.write_text(json.dumps(journal))
+    if mutation == "results_root":
+        stage["results_root"] = str(tmp_path / "substituted-results")
+    elif mutation == "run_ids":
+        stage["entries"][0]["run_ids"] = {"SUBSTITUTED": "substituted-run"}
+    elif mutation == "parent_manifest_path":
+        stage["entries"][0]["parent_manifest_path"] = str(tmp_path / "substituted-parent.json")
+    if mutation:
+        (state / "prepared-stage.json").write_text(json.dumps(stage))
+    export_root = Path(stage["results_root"]) / "closed" / entry_id / "export"
+    export_root.mkdir(parents=True)
+    (export_root / "old-copy.txt").write_text("preserve these exact old bytes")
+    preserved = export_root.with_name("export.previous-invalid")
+    if mutation == "symlink_entry":
+        import os
+        external_entry = tmp_path / "external-entry"
+        external_entry.mkdir()
+        os.rename(export_root, external_entry / "export")
+        export_root.parent.rmdir()
+        export_root.parent.symlink_to(external_entry, target_is_directory=True)
+    if mutation:
+        expected = "symlinked" if mutation == "symlink_entry" else "inputs changed"
+        with pytest.raises(ValueError, match=expected):
+            engine.reconcile_export(Path(stage["state_root"]), stage_id, entry_id, preserved)
+        if mutation == "symlink_entry":
+            assert (external_entry / "export" / "old-copy.txt").read_text() == "preserve these exact old bytes"
+        else:
+            assert export_root.is_dir()
+        assert not preserved.exists()
+        return
+    result = engine.reconcile_export(Path(stage["state_root"]), stage_id, entry_id, preserved)
+    assert result["dispatch_started"] is False
+    assert result["evidence_status"] == "not_validated"
+    assert (preserved / "old-copy.txt").read_text() == "preserve these exact old bytes"
+    from cloud_network_benchmark.campaign_export import verify_export
+    assert verify_export(export_root)
+
+
+def test_reconcile_export_rejects_path_component_traversal_before_state_access(tmp_path):
+    from cloud_network_benchmark.campaign import CampaignDriver
+
+    with pytest.raises(ValueError, match="single safe path components"):
+        CampaignDriver().reconcile_export(tmp_path, "../outside", "V-S1", tmp_path / "saved")
+
+
 def test_failed_notification_hook_is_visible_without_hiding_stage_failure(tmp_path):
     from cloud_network_benchmark.campaign import _finalize_exports
 

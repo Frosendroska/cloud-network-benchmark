@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import json
 from threading import Barrier
 
 import pytest
 
 from cloud_network_benchmark.orchestration import (
     LifecycleContext,
+    cleanup_lifecycle,
     ProviderHooks,
     ProviderStageOutcome,
     SavedLifecycleRecovery,
@@ -15,6 +18,8 @@ from cloud_network_benchmark.orchestration import (
     consume_retry_attempt,
     write_recovery_journal,
     _remaining_f11_allowance,
+    _stage_budget_name,
+    update_provider_recovery,
     _typed_outcome,
 )
 from cloud_network_benchmark.admission import WorkflowAllowance
@@ -85,6 +90,41 @@ def test_healthy_providers_overlap_and_failed_peer_does_not_skip_cleanup():
     assert result.provider_results["gcp"].execution_state == "succeeded"
     assert result.provider_results["aws"].execution_state == "failed"
     assert {p for p, stage in trace.events if stage == "cleanup"} == {"aws", "gcp"}
+
+
+@pytest.mark.parametrize("archive_ok", [True, False])
+def test_archive_verification_controls_retrieval_success_then_cleanup_without_remeasurement(archive_ok):
+    from cloud_network_benchmark.retrieval import RetrievalResult
+    trace = Trace()
+    base = hooks("aws", trace)
+    retrieval = RetrievalResult(complete=archive_ok,
+        failures=[] if archive_ok else [{"reason": "remote verification failed"}],
+        archive_status={"status": "verified" if archive_ok else "failed", "verified": archive_ok})
+    result = ProviderHooks(**{**base.__dict__,
+        "retrieve": lambda: (trace.add("aws", "retrieve") or
+            ProviderStageOutcome("retrieve", archive_ok, retrieval))})
+    outcome = execute_provider_workflows({"aws": result},
+        context=LifecycleContext("session-archive", 100, 1000, 1200), clock=FakeClock())
+    stages = [stage for provider, stage in trace.events if provider == "aws"]
+    assert stages.count("measure") == 1
+    assert stages.count("cleanup") == 1 and stages[-1] == "cleanup"
+    assert (outcome.provider_results["aws"].execution_state == "succeeded") is archive_ok
+    assert outcome.provider_results["aws"].cleanup_state == "succeeded"
+    if not archive_ok:
+        assert outcome.provider_results["aws"].primary_failure
+
+
+def test_lifecycle_cli_projects_only_nonsecret_archive_status():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_cli import _archive_status_projection
+    evidence = SimpleNamespace(archive_status={"status": "failed", "verified": False,
+        "bucket": "research-archive", "prefix": "cnb/v1/aws/exp/run/",
+        "partial_objects": [{"key": "manifest.json", "generation": "4"}],
+        "session_uri": "must-not-escape"})
+    result = SimpleNamespace(values={"retrieve": SimpleNamespace(evidence=evidence)})
+    projected = _archive_status_projection(result)
+    assert projected["status"] == "failed" and projected["verified"] is False
+    assert "partial_objects" in projected and "session_uri" not in projected
 
 
 def test_claim_failure_is_provider_local_after_complete_protection():
@@ -195,6 +235,19 @@ def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
     measurement = _remaining_f11_allowance(full, "measurement")
     retrieval = _remaining_f11_allowance(full, "retrieval")
     assert registration == full
+    consumed = _remaining_f11_allowance(full, "registration", registration_elapsed=7)
+    assert consumed.registration_seconds == 3
+    assert consumed.provision_seconds == full.provision_seconds
+    shared = WorkflowAllowance(900, 900, 600, 60, 100, 15, 300, 660,
+        "sourced", {"aws": 360, "azure": 180, "gcp": 60})
+    assert _stage_budget_name("protect") == "registration"
+    assert _remaining_f11_allowance(shared, "registration", registration_elapsed=200 + 180).registration_seconds == 520
+    assert _remaining_f11_allowance(shared, "registration", registration_elapsed=900).registration_seconds == 0
+    remaining_after_serial = _remaining_f11_allowance(shared, "registration", registration_elapsed=380)
+    assert shared.fit_seconds(now=datetime.now(timezone.utc)) == 3535
+    assert shared.fit_seconds(now=datetime.now(timezone.utc)) > 3460
+    assert remaining_after_serial.fit_seconds(now=datetime.now(timezone.utc)) == 3155
+    assert remaining_after_serial.fit_seconds(now=datetime.now(timezone.utc)) <= 3460
     assert preparation.completed_stages == ("registration",)
     assert (preparation.registration_seconds, preparation.provision_seconds,
             preparation.readiness_seconds, preparation.stabilization_seconds) == (0, 20, 30, 40)
@@ -205,6 +258,67 @@ def test_f11_stage_fit_receives_exact_remaining_lifecycle_remainder():
     assert retrieval.completed_stages == ("registration", "preparation", "measurement")
     assert retrieval.measurement_seconds == 0 and retrieval.measurement_shutdown_seconds == 0
     assert retrieval.retrieval_seconds == 12 and retrieval.cleanup_seconds == 8
+
+
+@pytest.mark.parametrize(("provider_elapsed", "gcp_eligible", "remaining_seconds", "expected_vector"), [
+    ((200, 180), True, 520, [900, 700, 520]),
+    ((500, 400), False, 0, [900, 400, 0])])
+def test_run_lifecycle_registration_admission_debits_shared_budget(
+        tmp_path, monkeypatch, provider_elapsed, gcp_eligible, remaining_seconds, expected_vector):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    import cloud_network_benchmark.orchestration as orchestration
+    from cloud_network_benchmark.orchestration import LifecycleResult
+    from cloud_network_benchmark.admission import StageDecision
+
+    allowance = WorkflowAllowance(900, 900, 600, 60, 100, 15, 300, 660,
+        "sourced", {"aws": 360, "azure": 180, "gcp": 60})
+    clock = FakeClock(monotonic=100.0)
+    evidence = SimpleNamespace(reservation_id=SimpleNamespace(value="reservation-1"))
+    class Ledger:
+        controller_session_id = "session"
+        def __init__(self): self.fits = []
+        def reserve(self, *_args, **_kwargs):
+            return SimpleNamespace(status="reserved", evidence=evidence, reasons=())
+        def inspect(self):
+            return {"reservations": {"reservation-1": {"cap_start_monotonic": 100.0,
+                "cap_seconds": 4200.0, "provider_trigger_monotonic": 3940.0}}}
+        def check_stage_fit(self, _reservation_id, *, stage, remaining):
+            live = 3840.0 - (clock.monotonic - 100.0)
+            fits = (remaining.registration_seconds > 0 and remaining.fit_seconds(
+                now=datetime(2026, 11, 22, tzinfo=timezone.utc)) <= live)
+            self.fits.append((stage, remaining.registration_seconds, fits))
+            return StageDecision(fits, () if fits else ("workflow_time_insufficient",), None)
+
+    ledger = Ledger()
+    plan = SimpleNamespace(execution_scope="paid_request", resolved_campaign=None)
+    request = SimpleNamespace(selected_providers=["aws", "azure", "gcp"])
+    context = LifecycleContext("session", 100.0, 4300.0, 4200.0)
+    def recovery_factory(_evidence, _workflows):
+        return SavedLifecycleRecovery(schema_version=1, attempt_id="attempt",
+            controller_session_id="session", reservation_id="reservation-1",
+            providers=[{"provider": name, "deployment_id": f"{name}-deployment",
+                "journal_reference": f"{name}.json", "expiry_registered": False,
+                "creation_may_have_started": False, "cleanup_open": False}
+                for name in ("aws", "azure", "gcp")])
+
+    def execute(workflows, **_kwargs):
+        for provider, spent in zip(("aws", "azure", "gcp"), (*provider_elapsed, 0)):
+            decision = workflows[provider].stage_admission("registration")
+            if provider == "gcp":
+                assert decision.eligible is gcp_eligible
+                assert ledger.fits[-1][1] == remaining_seconds
+            clock.monotonic += spent
+        return LifecycleResult({}, False, "fake registration admission")
+
+    monkeypatch.setattr(orchestration, "execute_provider_workflows", execute)
+    workflows = {name: hooks(name, Trace()) for name in ("aws", "azure", "gcp")}
+    result = run_lifecycle(ledger=ledger, reservation_request=request, admission_plan=plan,
+        allowance=allowance, workflow_factory=lambda _evidence: workflows, context=context,
+        clock=clock, recovery_path=tmp_path/"recovery.json", recovery_factory=recovery_factory)
+    assert [item[1] for item in ledger.fits[1:]] == expected_vector, (
+        result.primary_failure, result.admission_reasons, result.provider_results)
+    assert result.admission_status == "reserved"
 
 
 def test_recovery_journal_durably_consumes_each_retry_once(tmp_path):
@@ -218,6 +332,59 @@ def test_recovery_journal_durably_consumes_each_retry_once(tmp_path):
     assert consume_retry_attempt(path, "native-artifact") is False
     saved = SavedLifecycleRecovery.validate_unique(__import__("json").loads(path.read_text()))
     assert saved.retry_consumed_ids == ["native-artifact"]
+
+
+def test_late_cleanup_timing_is_durable_without_reopening_absence_liability(tmp_path):
+    path = tmp_path / "private" / "recovery.json"
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-timing",
+        controller_session_id="session", reservation_id="reservation-timing",
+        providers=[{"provider": "aws", "deployment_id": "aws-deployment",
+            "journal_reference": "private/aws.json", "expiry_registered": True,
+            "creation_may_have_started": True, "cleanup_open": True}])
+    write_recovery_journal(path, recovery)
+    update_provider_recovery(path, "aws", "cleanup", "succeeded",
+        cleanup_timing_status="late")
+    saved = SavedLifecycleRecovery.validate_unique(__import__("json").loads(path.read_text()))
+    row = saved.providers[0]
+    assert row.cleanup_open is False and row.expiry_registered is False
+    assert row.creation_may_have_started is False and row.cleanup_timing_status == "late"
+    result = cleanup_lifecycle(path, current_session_id="session", cleanup_actions={},
+        reconcile=lambda *_args: None)
+    assert result.providers["aws"]["acceptance_failed"] is True
+    assert result.providers["aws"]["cleanup"] == "not_required"
+    assert result.complete is False
+
+
+@pytest.mark.parametrize(("previous_status", "timing_status", "expected_status", "acceptance_failed"), [
+    (None, "late", "late", True),
+    (None, "within_deadline", "within_deadline", False),
+    ("late", "within_deadline", "late", True),
+    ("unknown", "within_deadline", "unknown", True)])
+def test_cleanup_recovery_projects_new_receipt_timing_after_absence_proof(
+        tmp_path, previous_status, timing_status, expected_status, acceptance_failed):
+    path = tmp_path / "private" / "recovery.json"
+    recovery = SavedLifecycleRecovery(schema_version=1, attempt_id="attempt-recovered-timing",
+        controller_session_id="session", reservation_id="reservation-recovered-timing",
+        providers=[{"provider": "aws", "deployment_id": "aws-deployment",
+            "journal_reference": "private/aws.json", "expiry_registered": True,
+            "creation_may_have_started": True, "cleanup_open": True,
+            "cleanup_timing_status": previous_status,
+            "cleanup_timing_failure": "earlier acceptance timing was unresolved"
+                if previous_status else None}])
+    write_recovery_journal(path, recovery)
+    from types import SimpleNamespace
+    cleanup = SimpleNamespace(cleanup_state="succeeded",
+        inventory=SimpleNamespace(value={"cleanup_timing": {"status": timing_status}}))
+    reconciliation = {"absence_proved": True, "billable_resources_present": False,
+        "cleanup_open": False, "billing_final": False, "incurred_usd": 0.0}
+    result = cleanup_lifecycle(path, current_session_id="recovery-session",
+        cleanup_actions={"aws": lambda _record: cleanup}, reconcile=lambda *_args: reconciliation)
+    row = SavedLifecycleRecovery.validate_unique(json.loads(path.read_text())).providers[0]
+    assert row.cleanup_open is False
+    assert row.cleanup_timing_status == expected_status
+    assert result.providers["aws"]["absence_proved"] is True
+    assert result.providers["aws"]["acceptance_failed"] is acceptance_failed
+    assert result.complete is (not acceptance_failed)
 
 
 def test_admission_is_reserved_before_provider_factory_and_offline_scope_never_dispatches():

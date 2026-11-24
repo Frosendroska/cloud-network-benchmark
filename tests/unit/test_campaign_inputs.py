@@ -37,6 +37,31 @@ def test_expired_credential_refresh_evidence_cannot_pass_preflight(tmp_path, mon
     assert blockers and any("credential" in value.lower() or "refresh" in value.lower() for value in blockers)
 
 
+def test_archive_paths_must_not_overlap_results_or_private_state(tmp_path, monkeypatch):
+    import hashlib, json
+    import cloud_network_benchmark.campaign_inputs as inputs
+    monkeypatch.setattr(inputs, "_selected", lambda _: [])
+    quota_path = tmp_path / "quota-evidence.json"
+    quota_payload = json.dumps({"measured_free_bytes": 8192}, sort_keys=True).encode()
+    quota_path.write_bytes(quota_payload)
+    settings = {"state_root": str(tmp_path / "private"), "results_root": str(tmp_path / "results"),
+        "archive_sink": {"bucket": "valid-bucket", "maximum_staging_bytes": 8192,
+            "maximum_archive_bytes": 1_000_000, "minimum_controller_free_bytes": 1024,
+            "minimum_guest_free_bytes": 1024, "maximum_capsule_bytes": 4096,
+            "controller_quota_free_bytes": 8192,
+            "controller_quota_evidence_path": str(quota_path),
+            "controller_quota_evidence_sha256": hashlib.sha256(quota_payload).hexdigest(),
+            "source_credentials_file": str(tmp_path / "synthetic-adc.json"),
+            "expected_source_principal": "katyabraun0@gmail.com",
+            "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+            "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
+            "restore_path": str(tmp_path / "restore"),
+            "archive_root": str(tmp_path / "results" / "archive"),
+            "staging_directory": str(tmp_path / "stage")}}
+    blockers = validate_stage_inputs({"stage": "acceptance"}, settings, tmp_path)
+    assert any("must not overlap results_root" in item for item in blockers)
+
+
 def test_runner_uses_locally_frozen_common_n_without_running_measurement_analysis(tmp_path, monkeypatch):
     import json
     import cloud_network_benchmark.campaign_inputs as inputs

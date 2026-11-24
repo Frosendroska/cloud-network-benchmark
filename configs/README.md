@@ -14,12 +14,19 @@ configurations describe intent only and do not authorize admission or resource c
 | `experiments/exp-001-calibration.yaml` | `exp-001-calibration` | `EXP-001` | calibration / same_zone (P0) | [EXP-001 retained modes](../Thesis/experiments/EXPERIMENTS.md#L30) |
 | `experiments/exp-001-diagnostic-day.yaml` | `exp-001-day` | `EXP-001` | diagnostic_day / same_zone (P0) | [DAY stage](../Thesis/experiments/EXPERIMENTS.md#L17) |
 | `tests/exp-900-single-provider.yaml` | `exp-900-acceptance` | `EXP-900` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-900-single-provider-north.yaml` | `exp-900-north-acceptance` | `EXP-900` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-901-azure-single-provider.yaml` | `exp-901-acceptance` | `EXP-901` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/azure-901-single-provider-north.yaml` | `exp-901-north-acceptance` | `EXP-901` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 | `tests/exp-902-gcp-single-provider.yaml` | `exp-902-acceptance` | `EXP-902` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
-| `tests/exp-903-three-provider-smoke.yaml` | `exp-903-acceptance` | `EXP-903` | acceptance / failure_check | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-902-gcp-single-provider-north.yaml` | `exp-902-north-acceptance` | `EXP-902` | acceptance / failure_check (northern-zone variant) | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
+| `tests/exp-903-three-provider-smoke.yaml` | `exp-903-acceptance` | `EXP-903` | acceptance / standard | [validation identities](../Thesis/experiments/EXPERIMENTS.md#L34) |
 
-The four ordinary research configs select AWS, Azure and GCP. Acceptance validation configs are
-registered `failure_check` cases and may exercise one selected provider. S1/P0 and S3/P1 remain
+The ordinary research configs select AWS, Azure and GCP. Primary S1/S3 short, calibration,
+diagnostic-day, acceptance and paired-WEEK configs use the exercised northern locations: AWS
+Stockholm `eu-north-1a`, Azure Sweden Central zone `1`, and GCP Finland `europe-north1-c`.
+Frankfurt remains last-resort only and is never selected silently. S2/P2 and S4/P3 retain their
+existing deferred configurations.
+S1/P0 and S3/P1 remain
 the primary research scenarios; S2/P2 and S4/P3 are configured for offline support but gated from
 execution. Calibration and diagnostic_day retain their own S1 pair and use separate configs.
 

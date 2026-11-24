@@ -23,6 +23,7 @@ from ..contracts.admission import ExpiryEvidence, ExpiryRequest, ReservationEvid
 from ..contracts.common import CleanupState, Evidence, FailureEvidence, StrictModel, StructuredEvidence, StringEvidence
 from ..contracts.deployment import ProviderDeploymentInput, ProviderDeploymentOutput, ProviderVmOutput, RemoteConnectionData, IdentityContext
 from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
+from ..validation_profiles import provider_lead_seconds
 
 SAFETY_LEAD_SECONDS = 30
 CONTROLLER_SESSION_ID = str(uuid.uuid4())
@@ -30,10 +31,21 @@ NETWORK_LIMIT = {"maximum_gbit_per_second": 10, "is_ceiling_not_observation": Tr
 REGION_ZONES = {
     "europe-west3": ("europe-west3-a", "europe-west3-b"),
     "europe-west2": ("europe-west2-a",),
-    "europe-north1": ("europe-north1-a",),
+    "europe-north1": ("europe-north1-c",),
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
+GCP_CLEANUP_INVENTORY_COMMANDS = (
+    ("gcp-inventory-all-zones", ("compute", "instances", "list")),
+    ("gcp-disk-inventory-all-zones", ("compute", "disks", "list")),
+    ("gcp-addresses-inventory-all-scopes", ("compute", "addresses", "list")),
+    ("gcp-subnet-inventory-all-scopes", ("compute", "networks", "subnets", "list")),
+    ("gcp-instance_templates-inventory-all-scopes", ("compute", "instance-templates", "list")),
+    ("gcp-networks-inventory-all-scopes", ("compute", "networks", "list")),
+    ("gcp-firewalls-inventory-all-scopes", ("compute", "firewall-rules", "list")),
+    ("gcp-routes-inventory-all-scopes", ("compute", "routes", "list")),
+    ("gcp-policy-inventory-all-scopes", ("compute", "resource-policies", "list")),
+)
 
 
 def validate_ubuntu_image_identities(images: dict[str, str], *, selected_regions: set[str] | None = None) -> None:
@@ -65,8 +77,12 @@ class GcpRuntimeSettings(StrictModel):
     complete_workflow_cost_handoff: StructuredEvidence
     support_cost_evidence: StructuredEvidence
     complete_workflow_remaining_seconds: float = Field(gt=0)
+    workflow_cap_started_monotonic: float | None = Field(default=None, gt=0)
+    registration_allowance_seconds: float = Field(default=0, ge=0)
+    provision_allowance_seconds: float = Field(default=0, ge=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    plan_review_admission_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=180, gt=0, le=600)
 
@@ -96,6 +112,11 @@ class GcpRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_complete(self) -> "GcpRuntimeSettings":
+        if self.workflow_cap_started_monotonic is not None and (
+                not isfinite(self.workflow_cap_started_monotonic)
+                or self.registration_allowance_seconds <= 0
+                or self.provision_allowance_seconds <= 0):
+            raise ValueError("profiled GCP review requires its original cap anchor and stage allowances")
         validate_ubuntu_image_identities(self.images)
         handoff = self.complete_workflow_cost_handoff.value or {}
         for field in ("source_path", "source_sha256", "prices_checked_on", "estimated_total_usd", "units"):
@@ -154,8 +175,11 @@ class GcpProviderError(RuntimeError):
 
 
 class GcpProviderDriver:
-    def __init__(self, runner: CommandRunner, settings: GcpRuntimeSettings, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+    def __init__(self, runner: CommandRunner, settings: GcpRuntimeSettings,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), *,
+                 monotonic_clock: Callable[[], float] = time.monotonic) -> None:
         self.runner, self.settings, self.clock = runner, settings, clock
+        self.monotonic_clock = monotonic_clock
         self._command_context = local()
 
     @property
@@ -176,14 +200,16 @@ class GcpProviderDriver:
 
     def register_expiry(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ExpiryEvidence:
         self._deadline = None
+        self._provider_stop_deadline = None
         reservation = self._validate(deployment, request)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=lead)
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "registration"))
         if journal.get("registered"):
             if journal.get("controller_session_id") != CONTROLLER_SESSION_ID:
                 raise GcpProviderError("an earlier controller session cannot reuse registered protection; resolve the attempt through cleanup", category="cleanup_open")
@@ -192,7 +218,20 @@ class GcpProviderDriver:
             return ExpiryEvidence.model_validate(journal["expiry"])
         if journal.get("registration_may_have_started"):
             raise GcpProviderError("an earlier interrupted registration cannot be restarted under this attempt", category="cleanup_open")
-        self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds, time.monotonic() + max(0.0, (trigger - self.clock()).total_seconds()))
+        self._provider_stop_deadline = time.monotonic() + max(0.0,
+            (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+        if self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            self._deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="registration", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        else:
+            self._deadline = min(time.monotonic() + self.settings.registration_timeout_seconds,
+                self._provider_stop_deadline)
         journal.update({"cap_started_at": reservation.cap_started_at.value.isoformat(), "cap_expires_at": reservation.expires_at.value.isoformat(), "trigger": trigger.isoformat(), "registration_may_have_started": True, "binding_sha256": self._binding_fingerprint(deployment), "reservation_id": reservation.reservation_id.value, "controller_session_id": CONTROLLER_SESSION_ID})
         self._save(attempt, journal)
         try:
@@ -223,7 +262,7 @@ class GcpProviderDriver:
             if now.tzinfo is None or now.utcoffset() is None:
                 raise GcpProviderError("registration clock must be timezone-aware", category="cap_order")
             now = now.astimezone(timezone.utc)
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "registration"))
             if not reservation.cap_started_at.value <= now <= trigger:
                 raise GcpProviderError("expiry registration is outside the original reservation window", category="cap_order")
             cap_start = reservation.cap_started_at.value.astimezone(timezone.utc)
@@ -275,19 +314,33 @@ class GcpProviderDriver:
         if reservation.reservation_id.value != journal.get("reservation_id") or reservation.source_sha256 != self.settings.cost_input_sha256 or reservation.source_path != self.settings.cost_source_path:
             raise GcpProviderError("reservation, project or cost-source identity changed after registration", category="state_identity_mismatch")
         self._assert_no_open_cleanup(deployment)
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+        trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+            deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
+        self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "preparation"))
         self._verify_registered_templates(journal, trigger, deployment)
         if deployment.scenario in {"cross_zone", "inter_region"}:
             self._validate_review(deployment)
-        self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
-        self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds or self.settings.registration_timeout_seconds), time.monotonic() + max(0.0, (trigger-self.clock()).total_seconds()))
+        self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "preparation"))
+        self._provider_stop_deadline = time.monotonic() + max(0.0,
+            (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+        if self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            self._deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        else:
+            self._deadline = min(time.monotonic() + (deployment.provisioning_timeout_seconds
+                or self.settings.registration_timeout_seconds), self._provider_stop_deadline)
         journal["creation_may_have_started"] = True
         self._save(attempt, journal)
         started = self.clock().astimezone(timezone.utc)
         try:
             templates = journal["templates"]
-            self._fit(reservation, trigger, self.settings.complete_workflow_remaining_seconds)
+            self._fit(deployment, reservation, trigger, self._remaining_workflow_seconds(deployment, "preparation"))
             pair = self._terraform(attempt, "pair", "apply", deployment, {"template_a": templates["vm_a"]["self_link_unique"], "template_b": templates["vm_b"]["self_link_unique"]})
             values = self._outputs(pair).get("instances", {})
             if set(values) != {"vm_a", "vm_b"} or len({str(item.get("id")) for item in values.values()}) != 2 or len({item.get("name") for item in values.values()}) != 2:
@@ -341,10 +394,37 @@ class GcpProviderDriver:
 
     def cleanup(self, deployment: ProviderDeploymentInput) -> GcpCleanupResult:
         self._deadline = None
+        self._cleanup_acceptance_deadlines = []
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
-        self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
         journal = self._load(attempt, deployment)
+        cleanup_now = self.clock().astimezone(timezone.utc)
+        if deployment.admission.workflow_profile:
+            started_at = journal.get("cleanup_started_at")
+            if started_at is None:
+                started_at = cleanup_now.isoformat()
+                journal["cleanup_started_at"] = started_at
+                self._save(attempt, journal)
+            started_utc = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+            from ..validation_profiles import provider_lead_seconds
+            lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
+            # Keep the registered acceptance deadline immutable; allow bounded
+            # owned-resource recovery after it has elapsed.
+            routine_end = min(started_utc+timedelta(seconds=600),
+                deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead+60))
+            self._cleanup_acceptance_deadlines = [routine_end]
+            previous_timing = journal.get("cleanup_acceptance_timing", {})
+            timing_status = previous_timing.get("status")
+            if timing_status not in {"late", "unknown"}:
+                timing_status = "late" if cleanup_now >= routine_end else "within_deadline"
+            journal["cleanup_acceptance_timing"] = {
+                "routine_deadline_utc": routine_end.isoformat(),
+                "status": timing_status,
+            }
+            # Execution gets a separate per-invocation recovery window.
+            self._deadline = time.monotonic()+600.0
+        else:
+            self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
         if journal.get("cleanup_state") == "succeeded":
             return GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=journal["inventory"]), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])) if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"), primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None)
         failure = None
@@ -359,6 +439,21 @@ class GcpProviderDriver:
                 raise GcpProviderError("owned compute remains; protection must stay installed", category="residual_compute")
             if journal.get("registered") or journal.get("registration_may_have_started"):
                 self._terraform(attempt, "protection", "destroy", deployment, {})
+            if deployment.admission.workflow_profile:
+                if self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[0]:
+                    journal["cleanup_acceptance_timing"]["status"] = "late"
+                absence_started = journal.get("cleanup_absence_started_at")
+                if absence_started is None:
+                    absence_started = self.clock().astimezone(timezone.utc).isoformat()
+                    journal["cleanup_absence_started_at"] = absence_started
+                    self._save(attempt, journal)
+                absence_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
+                absence_end = min(absence_utc+timedelta(seconds=60),
+                    deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead))
+                self._cleanup_acceptance_deadlines.append(absence_end)
+                if self.clock().astimezone(timezone.utc) >= absence_end:
+                    journal["cleanup_acceptance_timing"]["status"] = "late"
+                self._deadline = time.monotonic()+60.0
             inventory = self._inventory(deployment)
             if not inventory["pages_complete"] or inventory["resources"]:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
@@ -374,16 +469,47 @@ class GcpProviderDriver:
                 else:
                     expiry = {**expiry, "provider_metadata": {"value": {**metadata, "trigger_due_at_cleanup": True, "trigger_outcome": "unverified", "policy_removed_after_full_deletion": True}}}
                 journal["expiry"] = expiry
+            timing = journal.get("cleanup_acceptance_timing")
+            if timing and self._cleanup_acceptance_deadlines and self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[-1]:
+                timing["status"] = "late"
+            if timing:
+                inventory["cleanup_timing"] = timing
             result = GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"), primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None)
             journal.update({"cleanup_state": "succeeded", "launch_blocked": False, "inventory": inventory})
             self._save(attempt, journal)
             return result
         except Exception as exc:
             failure = self._failure(exc)
+            timing = journal.get("cleanup_acceptance_timing")
+            deadlines = getattr(self, "_cleanup_acceptance_deadlines", [])
+            if timing and deadlines and self.clock().astimezone(timezone.utc) >= deadlines[-1]:
+                timing["status"] = "late"
+            if timing:
+                inventory["cleanup_timing"] = timing
             journal.update({"cleanup_state": "failed", "launch_blocked": True, "cleanup_failure": failure.model_dump(mode="json"), "inventory": inventory})
             self._save(attempt, journal)
             expiry = journal.get("expiry")
             return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure, primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+
+    def verify_unstarted_absence(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+        """Read-only all-scope inventory for a source-proved pre-registration failure."""
+        self._active_attempt = None
+        original_settings = self.settings
+        # Provider private state must remain untouched. Use the existing
+        # controller directory as the subprocess cwd for read-only gcloud calls.
+        self.settings = self.settings.model_copy(update={"private_state_root": Path.cwd()})
+        self._deadline = time.monotonic() + max(1.0, float(self.settings.registration_timeout_seconds))
+        try:
+            inventory = self._inventory(deployment, journal={})
+        finally:
+            self.settings = original_settings
+        complete = (inventory.get("pages_complete") is True and not inventory.get("resources")
+            and all(not inventory.get(name) for name in ("instances", "disks", "addresses", "support_resources")))
+        return {"provider": "gcp", "verified": complete,
+            "target_selector": f"project={self.settings.project_id};run_id={deployment.run_id};deployment_id={deployment.deployment_id};roles=vm_a,vm_b",
+            "inventory": inventory, "query_count": len(getattr(self, "_active_commands", ())),
+            "timing_status": "late" if self.clock().astimezone(timezone.utc)
+                >= deployment.reservation.value.expires_at.value else "unknown"}
 
     def _validate(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> ReservationEvidence:
         self._validate_deployment(deployment)
@@ -391,7 +517,8 @@ class GcpProviderDriver:
         reservation = deployment.reservation.value
         if reservation is None or reservation.state != "reserved":
             raise GcpProviderError("active reservation evidence is required", category="reservation_required")
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+            deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
         if request.provider != "gcp" or request.action != "stop" or request.run_id != deployment.run_id or request.deployment_id != deployment.deployment_id:
             raise GcpProviderError("expiry request identity/action does not match GCP deployment", category="identity_mismatch")
         if request.reservation_id.value != reservation.reservation_id.value or request.expires_at.value != trigger:
@@ -432,13 +559,29 @@ class GcpProviderDriver:
     def _validate_deployment(deployment: ProviderDeploymentInput) -> None:
         if deployment.provider != "gcp" or deployment.schema_version != 2 or deployment.provider_options != {"provisioning_model": "STANDARD", "instance_termination_action": "STOP"}:
             raise GcpProviderError("deployment must use schema v2 GCP STANDARD/STOP", category="deployment_invalid")
-        northern = (deployment.scenario == "same_zone" and deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
-                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-a")
-        if northern and not (deployment.mode == "acceptance" and deployment.context == "failure_check"
-                            and deployment.experiment_id == "EXP-902"):
-            raise GcpProviderError("Finland is limited to the reviewed EXP-902 acceptance check", category="scenario_unsupported")
+        northern = (deployment.vm_a.region == deployment.vm_b.region == "europe-north1"
+                    and deployment.vm_a.zone == deployment.vm_b.zone == "europe-north1-c"
+                    and deployment.scenario in {"same_zone", "placement_optimization"})
+        northern_research = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
+                    and deployment.mode in {"short_study", "calibration", "diagnostic_day"} and deployment.context == "standard")
+        northern_replacement = (northern and deployment.experiment_id in {"EXP-001", "EXP-003"}
+                    and deployment.mode == "short_study" and deployment.context == "replacement"
+                    and deployment.replaces_run_id is not None and deployment.replaces_run_id.endswith("-gcp"))
+        northern_acceptance = (northern and deployment.mode == "acceptance"
+                    and ((deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-902" and deployment.context == "failure_check")
+                         or (deployment.scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
+                         or (deployment.scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
+        required_north = ((deployment.experiment_id in {"EXP-001", "EXP-003"}
+                           and deployment.mode in {"short_study", "calibration", "diagnostic_day"})
+                          or (deployment.mode == "acceptance" and
+                              ((deployment.experiment_id == "EXP-903" and deployment.scenario == "same_zone")
+                               or (deployment.experiment_id == "EXP-003" and deployment.scenario == "placement_optimization"))))
+        if required_north and not (northern_research or northern_replacement or northern_acceptance):
+            raise GcpProviderError("primary S1/S3 cannot fall back from Finland without a reviewed region-specific exception", category="scenario_unsupported")
+        if northern and not (northern_research or northern_replacement or northern_acceptance):
+            raise GcpProviderError("Finland locality is outside the registered S1/S3 research or acceptance scope", category="scenario_unsupported")
         if not northern and (deployment.vm_a.region != "europe-west3" or deployment.vm_b.region not in {"europe-west3", "europe-west2"}):
-            raise GcpProviderError("only the selected Frankfurt/London topology or Finland same-zone pair is supported", category="scenario_unsupported")
+            raise GcpProviderError("only the selected baseline topology or Finland same-zone S1/S3 pair is supported", category="scenario_unsupported")
         if deployment.vm_a.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"} or deployment.vm_b.vm_shape.lower() not in {"n2-standard-4", "n2_standard_4"}:
             raise GcpProviderError("GCP roles must use selected n2-standard-4 shape", category="shape_unsupported")
         if deployment.vm_a.role != "vm_a" or deployment.vm_b.role != "vm_b" or deployment.vm_a.function != "client_traffic_generator" or deployment.vm_b.function != "server_receiver":
@@ -448,6 +591,9 @@ class GcpProviderDriver:
             raise GcpProviderError("scenario zones must match the selected V2 topology", category="scenario_unsupported")
         if deployment.scenario == "placement_optimization" and deployment.placement.kind != "compact_placement_policy":
             raise GcpProviderError("S3 requires same-zone compact placement", category="scenario_unsupported")
+        if deployment.scenario == "placement_optimization" and (
+                not deployment.placement.name or not re.fullmatch(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?", deployment.placement.name)):
+            raise GcpProviderError("S3 requires a valid registered GCP compact placement policy name", category="placement_missing")
         if deployment.scenario == "inter_region" and deployment.vm_b.region != "europe-west2":
             raise GcpProviderError("S4 receiver must be in London", category="scenario_unsupported")
 
@@ -634,7 +780,7 @@ class GcpProviderDriver:
             raise GcpProviderError("template creation must fall after reservation activation and before registration", category="cap_order")
         return created
 
-    def _fit(self, reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
+    def _fit(self, deployment: ProviderDeploymentInput, reservation: ReservationEvidence, trigger: datetime, seconds: float) -> None:
         now = self.clock()
         if now.tzinfo is None or now.utcoffset() is None or trigger.tzinfo is None or trigger.utcoffset() is None:
             raise GcpProviderError("reservation and trigger times must be timezone-aware", category="cap_order")
@@ -644,10 +790,46 @@ class GcpProviderDriver:
         cap_end = reservation.expires_at.value.astimezone(timezone.utc)
         if not isfinite(seconds) or seconds <= 0:
             raise GcpProviderError("complete remaining workflow estimate must be positive and finite", category="cap_insufficient")
-        if trigger != cap_end - timedelta(seconds=SAFETY_LEAD_SECONDS):
+        if trigger != cap_end - timedelta(seconds=provider_lead_seconds(
+                deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)):
             raise GcpProviderError("native STOP trigger must remain tied to the original reservation cap", category="cap_mismatch")
         if cap_start > now or now > trigger or now + timedelta(seconds=seconds) > trigger:
             raise GcpProviderError("whole remaining workflow must fit before original native STOP initiation lead", category="cap_insufficient")
+
+    def _elapsed_workflow_seconds(self, deployment: ProviderDeploymentInput) -> float:
+        """Elapsed monotonic time within the original reservation epoch."""
+        started = self.settings.workflow_cap_started_monotonic
+        if deployment.admission.workflow_profile is None or started is None:
+            return 0.0
+        elapsed = self.monotonic_clock() - started
+        if not isfinite(elapsed) or elapsed < 0:
+            raise GcpProviderError("original monotonic workflow anchor is invalid", category="cap_order")
+        return elapsed
+
+    def _remaining_workflow_seconds(self, deployment: ProviderDeploymentInput, stage: str = "registration") -> float:
+        """Return the stage view of the fixed workflow vector after completed work."""
+        total = self.settings.complete_workflow_remaining_seconds
+        if deployment.admission.workflow_profile is None or self.settings.workflow_cap_started_monotonic is None:
+            return total
+        elapsed = self._elapsed_workflow_seconds(deployment)
+        registration = self.settings.registration_allowance_seconds
+        if stage == "registration":
+            completed = elapsed
+        elif stage == "preparation":
+            completed = max(registration, elapsed)
+        elif stage == "post_provision":
+            completed = max(registration+self.settings.provision_allowance_seconds, elapsed)
+        else:
+            raise ValueError("unknown GCP workflow fit stage")
+        return max(0.0, total-completed)
+
+    def _remaining_after_provision_seconds(self, deployment: ProviderDeploymentInput) -> float:
+        total = self.settings.complete_workflow_remaining_seconds
+        if deployment.admission.workflow_profile is None or self.settings.workflow_cap_started_monotonic is None:
+            return total
+        completed = max(self.settings.registration_allowance_seconds+self.settings.provision_allowance_seconds,
+            self._elapsed_workflow_seconds(deployment))
+        return max(0.0, total-completed)
 
     def _attempt_dir(self, deployment: ProviderDeploymentInput) -> Path:
         root = self.settings.private_state_root.expanduser().absolute()
@@ -800,28 +982,68 @@ class GcpProviderDriver:
             if os.path.exists(name): os.unlink(name)
 
     def _run(self, action: str, argv: list[str], cwd: Path, timeout: int | None = None) -> CommandResult:
-        limit = min(timeout or self.settings.command_timeout_seconds, self.settings.command_timeout_seconds)
-        if self._deadline is not None:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0: raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
-            limit = min(limit, remaining)
+        command_limit = min(timeout or self.settings.command_timeout_seconds,
+            self.settings.command_timeout_seconds)
+        reviewed_apply = "apply" in argv and any(a.startswith("-chdir=") for a in argv)
+        started = time.monotonic()
+        hard_deadline = self._deadline if self._deadline is not None else float("inf")
+        if reviewed_apply and self.settings.workflow_cap_started_monotonic is not None:
+            cap_start = self.settings.workflow_cap_started_monotonic
+            elapsed = started - cap_start
+            if not isfinite(elapsed) or elapsed < 0:
+                raise GcpProviderError("original monotonic workflow anchor is invalid", category="cap_order", action_id=action)
+            root_arg = next(a.split("=", 1)[1] for a in argv if a.startswith("-chdir="))
+            terraform_root = Path(root_arg).name
+            if terraform_root == "protection":
+                stage = "registration"
+            elif terraform_root == "pair":
+                stage = "provision"
+            else:
+                raise GcpProviderError("profiled reviewed apply has an unknown workflow stage", category="allowance_invalid", action_id=action)
+            from ..terraform_plan import workflow_review_stage_deadline
+            # Review queue time is charged to the original registered workflow
+            # stage. Provider API commands retain their own registration limits;
+            # every Terraform command remains capped below by command_limit.
+            if self._provider_stop_deadline is None:
+                raise GcpProviderError("registered provider STOP deadline is unavailable", category="stop_deadline_invalid", action_id=action)
+            hard_deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=cap_start,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage=stage, overall_deadline=cap_start + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=self._provider_stop_deadline)
+        hard_remaining = hard_deadline - started
+        if hard_remaining <= 0:
+            raise GcpProviderError("absolute GCP command deadline elapsed", category="command_timeout", action_id=action)
+        if not (reviewed_apply and self.settings.workflow_cap_started_monotonic is not None):
+            hard_remaining = min(hard_remaining, command_limit + (self.settings.plan_review_timeout_seconds
+                if reviewed_apply else 0))
+        total_deadline = started + hard_remaining
+        init_limit = min(command_limit, hard_remaining)
         from ..terraform_work import private_terraform_environment, initialize_terraform
-        command_deadline = time.monotonic() + limit
-        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
+        command_deadline = started + init_limit
+        request = CommandRequest(action_id=action, action_type="gcp_provider_control", argv=argv, cwd=str(cwd), timeout_seconds=init_limit, environment=private_terraform_environment(argv, cwd), environment_classification="contains_secret_references")
         if not hasattr(self, "_initialized_terraform"):
             self._initialized_terraform = set()
         initialize_terraform(self.runner, request, self._initialized_terraform)
         remaining_after_init = command_deadline - time.monotonic()
         if remaining_after_init <= 0:
             raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
-        request = request.model_copy(update={"timeout_seconds": min(request.timeout_seconds, remaining_after_init)})
+        request_budget = (total_deadline - time.monotonic()) if reviewed_apply else min(
+            request.timeout_seconds, remaining_after_init)
+        if request_budget <= 0:
+            raise GcpProviderError("original workflow request budget elapsed during private Terraform initialization",
+                category="command_timeout", action_id=action)
+        request = request.model_copy(update={"timeout_seconds": request_budget})
         def execute(request):
             result = self.runner.run(request)
             self._record_command(request, result)
             return result
-        if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
+        if reviewed_apply:
             from ..terraform_plan import reviewed_apply
-            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                command_timeout_seconds=command_limit,
+                review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
     def _record_command(self, request: CommandRequest, result: CommandResult) -> None:
@@ -861,6 +1083,7 @@ class GcpProviderDriver:
                 expected = {
                     "namespace": self._namespace(deployment),
                     "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario,
+                    "placement_policy_name": deployment.placement.name or "",
                     "image_a": self.settings.images.get(deployment.vm_a.region),
                     "image_b": self.settings.images.get(deployment.vm_b.region),
                 }
@@ -874,7 +1097,7 @@ class GcpProviderDriver:
         if variables is not None:
             template = variables
         elif root == "protection":
-            template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
+            template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "placement_policy_name": deployment.placement.name or "", "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
         else:
             template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
         template.update(extra)
@@ -886,8 +1109,9 @@ class GcpProviderDriver:
             self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         if root == "pair" and action == "apply":
-            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
-            slack = (trigger - self.clock()).total_seconds() - self.settings.complete_workflow_remaining_seconds
+            trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=provider_lead_seconds(
+                deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
+            slack = (trigger - self.clock()).total_seconds() - self._remaining_after_provision_seconds(deployment)
             self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
         rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
@@ -900,7 +1124,7 @@ class GcpProviderDriver:
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
         if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
-        if args and args[0] == "compute" and len(args) > 1 and args[1] == "instances" and args[2:3] == ["list"] or args and args[0] == "compute" and len(args) > 2 and args[2] == "list":
+        if args[:1] == ["compute"] and "list" in args and "--format=json" in args:
             if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
         try:
@@ -987,8 +1211,11 @@ class GcpProviderDriver:
     def _selected_policy_path(self, deployment: ProviderDeploymentInput) -> str | None:
         if deployment.scenario != "placement_optimization":
             return None
+        name = deployment.placement.name
+        if not name:
+            raise GcpProviderError("S3 requires the registered compact placement policy name", category="placement_missing")
         region = deployment.vm_a.region
-        return f"projects/{self.settings.project_id}/regions/{region}/resourcePolicies/{self._namespace(deployment)}-compact"
+        return f"projects/{self.settings.project_id}/regions/{region}/resourcePolicies/{name}"
 
     @staticmethod
     def _namespace(deployment: ProviderDeploymentInput) -> str:
@@ -1011,21 +1238,23 @@ class GcpProviderDriver:
                  "workflow_remaining_seconds": self.settings.complete_workflow_remaining_seconds}
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
-    def _inventory(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+    def _inventory(self, deployment: ProviderDeploymentInput, *,
+                   journal: dict[str, Any] | None = None) -> dict[str, Any]:
         instances, disks, addresses, support = [], [], [], []
         dep_hash = hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]
         namespace = self._namespace(deployment)
-        journal = self._load(self._attempt_dir(deployment), deployment)
+        journal = self._load(self._attempt_dir(deployment), deployment) if journal is None else journal
         known_vms = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_resources", {}).values() if item.get("id") and item.get("name") and item.get("zone")}
         known_disks = {(str(item.get("id")), item.get("name"), item.get("zone")) for item in journal.get("observed_disks", []) if item.get("id") and item.get("name") and item.get("zone")}
         known_templates = {(str(item.get("id")), item.get("name")) for item in journal.get("templates", {}).values() if item.get("id") and item.get("name")}
         owned_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": dep_hash}
         expected_instance_names = {f"{namespace}-a", f"{namespace}-b"}
-        response = self._gcloud_json(["compute", "instances", "list", "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
+        command_args = dict(GCP_CLEANUP_INVENTORY_COMMANDS)
+        response = self._gcloud_json([*command_args["gcp-inventory-all-zones"], "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
         if not isinstance(response, list): raise GcpProviderError("all-zone instance inventory pagination shape unknown", category="inventory_unknown")
         self._validate_inventory_items(response, "instances")
         instances.extend(item for item in response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_vms or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()) or item.get("name") in expected_instance_names)
-        disk_response = self._gcloud_json(["compute", "disks", "list", "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
+        disk_response = self._gcloud_json([*command_args["gcp-disk-inventory-all-zones"], "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
         if not isinstance(disk_response, list): raise GcpProviderError("all-zone disk inventory pagination shape unknown", category="inventory_unknown")
         self._validate_inventory_items(disk_response, "disks")
         expected_disk_names = {f"{namespace}-a-boot", f"{namespace}-b-boot"}
@@ -1034,13 +1263,16 @@ class GcpProviderDriver:
         # --regions on addresses is not a supported complete-list query and can
         # produce warnings even for empty output. Never suppress such warnings.
         collections = (
-            ("addresses", "addresses", addresses), ("subnetworks", "subnet", support),
-            ("instance-templates", "instance_templates", support), ("networks", "networks", support),
-            ("firewall-rules", "firewalls", support), ("routes", "routes", support),
-            ("resource-policies", "policy", support))
-        for command, action, target in collections:
-            result = self._gcloud_json(["compute", command, "list", "--project", self.settings.project_id, "--format=json"],
-                f"gcp-{action}-inventory-all-scopes")
+            ("addresses", "gcp-addresses-inventory-all-scopes", addresses),
+            ("subnetworks", "gcp-subnet-inventory-all-scopes", support),
+            ("instance-templates", "gcp-instance_templates-inventory-all-scopes", support),
+            ("networks", "gcp-networks-inventory-all-scopes", support),
+            ("firewall-rules", "gcp-firewalls-inventory-all-scopes", support),
+            ("routes", "gcp-routes-inventory-all-scopes", support),
+            ("resource-policies", "gcp-policy-inventory-all-scopes", support))
+        for command, action_id, target in collections:
+            result = self._gcloud_json([*command_args[action_id], "--project", self.settings.project_id, "--format=json"],
+                action_id)
             if not isinstance(result, list):
                 raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")
             self._validate_inventory_items(result, command)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,48 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _plan_review_timeout_seconds(options: dict[str, Any], workflow_profile: str | None) -> int:
+    """Resolve source-configured review time while preserving existing defaults."""
+    value = options.get("plan_review_timeout_seconds", 50 if workflow_profile else 0)
+    if type(value) is not int or not 0 <= value <= 600:
+        raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
+    if workflow_profile is not None and value == 0:
+        raise ValueError("plan_review_timeout_seconds must be positive for profiled runtime")
+    return value
+
+
+def _observer_progress_callback(observer_config: dict[str, Any] | None):
+    if observer_config is None:
+        return None
+    from .observer_publisher import (invalidate_runtime_observer_snapshot,
+        publish_runtime_observer_snapshot)
+
+    def publish(deployment, pair, connection, bootstrap, diagnostics, progress):
+        try:
+            return publish_runtime_observer_snapshot(observer_config, deployment=deployment,
+                pair=pair, connection=connection, bootstrap=bootstrap,
+                diagnostics=diagnostics, progress=progress)
+        except Exception as exc:
+            # Observer publication is read-only side evidence. An incomplete
+            # receipt invalidates the snapshot and leaves health unknown.
+            try:
+                invalidate_runtime_observer_snapshot(observer_config, participant=(
+                    observer_config.get("entry_id"),
+                    getattr(deployment.provider, "value", deployment.provider), deployment.run_id))
+            except Exception:
+                pass
+            return {"status": "incomplete", "error_type": type(exc).__name__}
+    return publish
+
+
+def _post_provision_seconds(allowance: Any) -> float:
+    """Bound remaining work after registration and the reserved VM provision phase."""
+    remaining = float(allowance.total_seconds) - float(allowance.registration_seconds) - float(allowance.provision_seconds)
+    if not math.isfinite(remaining) or remaining < 0:
+        raise ValueError("F11 post-provision remainder is invalid")
+    return remaining
 
 
 def _keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
@@ -55,7 +98,8 @@ def _read_review_decision(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_runtime_config(path: Path, *, selected_providers: set[str] | None = None) -> dict[str, Any]:
+def load_runtime_config(path: Path, *, selected_providers: set[str] | None = None,
+                       allow_missing_approval_evidence: bool = False) -> dict[str, Any]:
     """Load only the bounded F09 runtime vocabulary and resolve local references.
 
     This parser does not create credentials or grant admission. F11 still
@@ -69,8 +113,12 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
                          parse_constant=_constant)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError("runtime configuration is not valid UTF-8 JSON") from exc
-    root = _keys(raw, {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
-        "copy_retry_seconds", "access", "providers", "approval_refs"}, "runtime config")
+    root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
+        "copy_retry_seconds", "access", "providers", "approval_refs"}
+    optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
+        "measurement_start_barrier", "observer", "workflow_profile",
+        "provider_registration_timeout_seconds", "plan_review_admission_path") if isinstance(raw, dict) and key in raw}
+    root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
     root["initialized_campaign_manifest"] = _source_path(path.parent,
@@ -83,12 +131,137 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("ledger.initialize_if_missing must be boolean")
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
+    if "archive_sink" in root:
+        sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+            "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+            "controller_quota_free_bytes", "controller_quota_evidence_path",
+            "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
+            "source_credentials_file", "expected_source_principal", "expected_project_id",
+            "expected_service_account_email"},
+            "archive_sink")
+        from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
+        if (not valid_bucket_name(sink["bucket"])
+                or not isinstance(sink["expected_source_principal"], str)
+                or not valid_archive_source(sink["expected_source_principal"])
+                or not isinstance(sink["expected_project_id"], str)
+                or not isinstance(sink["expected_service_account_email"], str)
+                or not valid_archive_identity(sink["expected_project_id"], sink["expected_service_account_email"])
+                or type(sink["maximum_staging_bytes"]) is not int or sink["maximum_staging_bytes"] <= 0
+                or type(sink["maximum_archive_bytes"]) is not int or sink["maximum_archive_bytes"] <= 0
+                or type(sink["minimum_controller_free_bytes"]) is not int
+                or sink["minimum_controller_free_bytes"] < 0
+                or type(sink["minimum_guest_free_bytes"]) is not int or sink["minimum_guest_free_bytes"] < 0
+                or type(sink["maximum_capsule_bytes"]) is not int or sink["maximum_capsule_bytes"] <= 0
+                or type(sink["controller_quota_free_bytes"]) is not int or sink["controller_quota_free_bytes"] < 0):
+            raise ValueError("archive_sink requires valid bucket syntax and positive measured size bounds")
+        for field in ("controller_quota_evidence_path", "archive_root", "staging_directory"):
+            sink[field] = _source_path(path.parent, sink[field], f"archive_sink.{field}", must_exist=False)
+        sink["source_credentials_file"] = _source_path(path.parent, sink["source_credentials_file"],
+            "archive_sink.source_credentials_file", must_exist=False)
+        if "restore_path" in sink:
+            sink["restore_path"] = _source_path(path.parent, sink["restore_path"], "archive_sink.restore_path", must_exist=False)
+        from .storage_admission import validate_controller_quota_evidence
+        validate_controller_quota_evidence(sink["controller_quota_free_bytes"],
+            sink["controller_quota_evidence_path"], sink["controller_quota_evidence_sha256"])
+    if "observer" in root:
+        observer = _keys(root["observer"], {"stage_id", "campaign_id", "entry_id", "workspace",
+            "state_path", "journal_path", "prepared_stage_path", "bindings_path", "launch_receipt_root"},
+            "observer runtime")
+        if any(not isinstance(observer[key], str) or not observer[key].strip()
+               for key in ("stage_id", "campaign_id", "entry_id", "workspace")):
+            raise ValueError("observer stage identity and workspace must be explicit")
+        for field in ("state_path", "journal_path", "prepared_stage_path", "bindings_path", "launch_receipt_root"):
+            observer[field] = _source_path(path.parent, observer[field], f"observer.{field}", must_exist=False)
+        if observer["workspace"] != root["access"]["bootstrap"]["workspace"]:
+            raise ValueError("observer workspace must match the source-bound guest workspace")
+    if "post_measurement_barrier" in root:
+        barrier = _keys(root["post_measurement_barrier"],
+            {"schema_version", "barrier_id", "barrier_root", "expected_participants"},
+            "post-measurement barrier")
+        participants = barrier["expected_participants"]
+        if (type(barrier["schema_version"]) is not int or barrier["schema_version"] != 1
+                or not isinstance(barrier["barrier_id"], str) or not barrier["barrier_id"]
+                or not isinstance(barrier["barrier_root"], str) or not Path(barrier["barrier_root"]).is_absolute()
+                or not isinstance(participants, list) or len(participants) != 6):
+            raise ValueError("post-measurement barrier must identify exactly six initialized acceptance children")
+        normalized = set()
+        for participant in participants:
+            row = _keys(participant, {"entry_id", "provider", "run_id"}, "barrier participant")
+            if (row["entry_id"] not in {"V-S1", "V-S3"} or row["provider"] not in {"aws", "azure", "gcp"}
+                    or not isinstance(row["run_id"], str) or not row["run_id"]):
+                raise ValueError("post-measurement barrier participant is outside the registered normal acceptance pair")
+            identity = (row["entry_id"], row["provider"], row["run_id"])
+            if identity in normalized:
+                raise ValueError("post-measurement barrier participants must be unique")
+            normalized.add(identity)
+        if ({(entry, provider) for entry, provider, _ in normalized}
+                != {(entry, provider) for entry in ("V-S1", "V-S3") for provider in ("aws", "azure", "gcp")}):
+            raise ValueError("post-measurement barrier must cover every provider child of both registered entries")
+    if "measurement_start_barrier" in root:
+        raw_barrier = root["measurement_start_barrier"]
+        ready_policy = isinstance(raw_barrier, dict) and raw_barrier.get("start_policy") == "all_ready"
+        barrier_keys = {"schema_version", "barrier_id", "barrier_root", "expected_participants",
+            "start_policy", "execution_window", "ready_window_seconds"} if ready_policy else {
+            "schema_version", "barrier_id", "barrier_root", "expected_participants", "start_utc"}
+        barrier = _keys(raw_barrier, barrier_keys, "measurement start barrier")
+        participants = barrier["expected_participants"]
+        calibration_entry = (root.get("workflow_profile") == "all_cloud_calibration_v1"
+            or (isinstance(root.get("observer"), dict)
+                and root["observer"].get("entry_id") == "CAL-S1"))
+        expected_count = 3 if calibration_entry else 6
+        start = None
+        if not ready_policy:
+            try:
+                start = datetime.fromisoformat(str(barrier["start_utc"]).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("measurement start barrier needs its fixed reviewed UTC start") from exc
+        if (type(barrier["schema_version"]) is not int or barrier["schema_version"] != 1
+                or not isinstance(barrier["barrier_id"], str) or not barrier["barrier_id"]
+                or not isinstance(barrier["barrier_root"], str) or not Path(barrier["barrier_root"]).is_absolute()
+                or (not ready_policy and (start.tzinfo is None or start.utcoffset() is None or start.utcoffset().total_seconds() != 0))
+                or not isinstance(participants, list) or len(participants) != expected_count):
+            raise ValueError("measurement start barrier participant set or timing policy is invalid")
+        if ready_policy and (root.get("workflow_profile") not in {"all_cloud_acceptance_v1", "all_cloud_calibration_v1"}
+                or barrier["ready_window_seconds"] != 600 or barrier["start_policy"] != "all_ready"):
+            raise ValueError("ready-triggered measurement barriers require the fixed validation profile window")
+        if ready_policy:
+            window = _keys(barrier["execution_window"], {"not_before_utc", "not_after_utc"},
+                "measurement start execution window")
+            try:
+                window_start = datetime.fromisoformat(window["not_before_utc"].replace("Z", "+00:00"))
+                window_end = datetime.fromisoformat(window["not_after_utc"].replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as exc:
+                raise ValueError("ready-triggered barrier execution window must use UTC timestamps") from exc
+            if (window_start.tzinfo is None or window_start.utcoffset() is None
+                    or window_end.tzinfo is None or window_end.utcoffset() is None
+                    or window_start.utcoffset().total_seconds() != 0
+                    or window_end.utcoffset().total_seconds() != 0
+                    or window_end <= window_start):
+                raise ValueError("ready-triggered barrier execution window is invalid")
+        expected_entries = {"CAL-S1"} if calibration_entry else {"V-S1", "V-S3"}
+        expected_pairs = {(entry, provider) for entry in expected_entries for provider in {"aws", "azure", "gcp"}}
+        identities = set()
+        pairs = set()
+        for participant in participants:
+            row = _keys(participant, {"entry_id", "provider", "run_id"}, "measurement start participant")
+            if (row["entry_id"] not in expected_entries or row["provider"] not in {"aws", "azure", "gcp"}
+                    or not isinstance(row["run_id"], str) or not row["run_id"]):
+                raise ValueError("measurement start participant is outside the registered normal acceptance pair")
+            identity = (row["entry_id"], row["provider"], row["run_id"])
+            if identity in identities:
+                raise ValueError("measurement start barrier participants must be unique")
+            identities.add(identity)
+            pairs.add(identity[:2])
+        if pairs != expected_pairs:
+            raise ValueError("measurement start barrier must cover the exact registered validation participants")
     allowance = _keys(root["allowance"], {"registration_seconds", "provision_seconds",
         "readiness_seconds", "stabilization_seconds", "measurement_seconds",
         "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds",
         "source_id", "provider_leads_seconds", "completed_stages"}, "allowance")
     access = _keys(root["access"], {"timeouts", "readiness", "bootstrap", "guest_remote_root",
         "diagnostic_interfaces"}, "access")
+    if root.get("workflow_profile"):
+        access["readiness"] = {**access["readiness"], "attempt_ceiling": 300}
     remote_root = access["guest_remote_root"]
     if (not isinstance(remote_root, str) or not remote_root.startswith("/")
             or Path(remote_root).as_posix() != remote_root
@@ -115,6 +288,22 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         root["allowance"] = WorkflowAllowance(**allowance)
     except (TypeError, ValueError) as exc:
         raise ValueError("allowance does not match the strict F11 workflow contract") from exc
+    workflow_profile = root.get("workflow_profile")
+    from .validation_profiles import PROFILE_SPECS, validate_profile_allowance
+    if workflow_profile is not None:
+        if workflow_profile not in PROFILE_SPECS:
+            raise ValueError("runtime workflow_profile is unsupported")
+        validate_profile_allowance(workflow_profile, root["allowance"], set(providers))
+        registration_timeout = root.get("provider_registration_timeout_seconds")
+        if type(registration_timeout) is not int or registration_timeout != PROFILE_SPECS[workflow_profile]["provider_registration_seconds"]:
+            raise ValueError("runtime per-provider registration timeout does not match the fixed profile")
+        review_path = root.get("plan_review_admission_path")
+        if not isinstance(review_path, str) or not Path(review_path).is_absolute():
+            raise ValueError("profiled runtime requires an absolute shared plan-review admission path")
+        root["plan_review_admission_path"] = _source_path(path.parent, review_path,
+            "plan_review_admission_path", must_exist=False)
+    elif any(key in root for key in ("provider_registration_timeout_seconds", "plan_review_admission_path")):
+        raise ValueError("profile runtime bindings require workflow_profile")
     from .access import TimeoutPolicy
     from .bootstrap import BootstrapConfig
     from .readiness import ReadinessConfig
@@ -134,13 +323,16 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         row = _keys(value, {"options", "bootstrap_template", "terraform_directory", "sources"}, f"providers.{provider}")
         optional = {"plan_review_timeout_seconds"}
         if provider == "aws":
+            optional.add("iam_settle_seconds")
             optional.add("expiry_role_permissions_boundary_arn")
         present = optional & set(row["options"]) if isinstance(row["options"], dict) else set()
         options = _keys(row["options"], option_keys[provider] | present, f"providers.{provider}.options")
         if "plan_review_timeout_seconds" in present:
-            seconds = options["plan_review_timeout_seconds"]
-            if type(seconds) is not int or not 0 <= seconds <= 600:
-                raise ValueError("plan_review_timeout_seconds must be an integer in 0..600")
+            _plan_review_timeout_seconds(options, workflow_profile)
+        if "iam_settle_seconds" in present:
+            seconds = options["iam_settle_seconds"]
+            if type(seconds) is not int or not 0 <= seconds <= 60:
+                raise ValueError("iam_settle_seconds must be an integer in 0..60")
         for name in ("public_key_path", "ssh_public_key_path"):
             if name in options:
                 options[name] = _source_path(path.parent, options[name], f"providers.{provider}.{name}")
@@ -159,13 +351,17 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs must be a map of existing F11 gate names to evidence files")
     allowed_gates = {"f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n",
         "study_window", "calibration_authorized", "diagnostic_day_authorized", "size_export_review",
-        "optional_review", "original_failure"}
+        "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance"}
     if set(root["approval_refs"]) - allowed_gates:
         raise ValueError("approval_refs names an unknown F11 gate")
-    root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}")
+    root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}",
+                                must_exist=not allow_missing_approval_evidence)
                               for key, value in root["approval_refs"].items()}
     root["approval_evidence"] = {}
     for key, reference in root["approval_refs"].items():
+        if (allow_missing_approval_evidence and not reference.exists()
+                and not reference.is_symlink()):
+            continue
         try:
             evidence = json.loads(reference.read_text(encoding="utf-8"), object_pairs_hook=_object,
                                   parse_constant=_constant)
@@ -245,7 +441,8 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
                             controller_session_id: str | None = None):
     """Build F11 inputs from the initialized identities and exact sourced cost rows."""
     from decimal import Decimal
-    from .admission import AdmissionPlan, WorkflowAllowance, validate_timing_profile_allowance
+    from .admission import (AdmissionPlan, WorkflowAllowance, rounded_provider_cost_total,
+        validate_timing_profile_allowance)
     from .contracts.admission import ReservationRequest
     from .contracts.common import Evidence, Provider
     from .contracts.deployment import ProviderDeploymentInput
@@ -285,10 +482,14 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
             except Exception as exc:
                 raise ValueError("cost envelope amount is invalid") from exc
             funding[bucket] = funding.get(bucket, Decimal("0")) + amount
-    estimated = sum((Decimal(str(component["amount_usd"]))
-        for row in rows.values() for component in row["components"].values()), Decimal("0"))
+    # Admission reserves each complete provider liability independently. Keep
+    # request construction on the same four-decimal USD ceiling basis so a
+    # multi-provider request cannot understate the sum of those reservations.
+    estimated = rounded_provider_cost_total(rows)
     allowance = runtime["allowance"]
     validate_timing_profile_allowance(campaign.admission.timing_profile, allowance, set(child_ids))
+    from .admission import validate_workflow_profile_allowance
+    validate_workflow_profile_allowance(campaign.admission.workflow_profile, allowance, set(child_ids))
     if set(allowance.provider_leads_seconds) != set(child_ids):
         raise ValueError("allowance provider set differs from initialized campaign")
     schedule = campaign.schedule_entry.value
@@ -309,6 +510,7 @@ def build_admission_request(*, campaign: Any, parent: Any, children: dict[str, A
         selected_providers=[Provider(name) for name in child_ids], mode=campaign.mode,
         priority=campaign.admission.priority, lifetime_cap_seconds=campaign.admission.lifetime_cap_seconds,
         timing_profile=campaign.admission.timing_profile,
+        workflow_profile=campaign.admission.workflow_profile,
         experiment_id=campaign.experiment_id if campaign.admission.timing_profile else None,
         context=campaign.context if campaign.admission.timing_profile else None,
         scenario=campaign.scenario if campaign.admission.timing_profile else None,
@@ -401,6 +603,13 @@ def _financial_runtime_binding(runtime, children):
     source = runtime.get("runtime_source")
     if source:
         sources[source["path"]] = source["sha256"]
+    bundle = getattr(runtime.get("access", {}).get("bootstrap"), "prebuilt_bundle", None)
+    if bundle is not None:
+        bundle_path = Path(bundle.path)
+        if (not bundle_path.is_file() or bundle_path.is_symlink()
+                or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.sha256):
+            raise ValueError("prebuilt tool bundle changed after runtime admission validation")
+        sources[str(bundle_path)] = bundle.sha256
     return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
         "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
                                          for c in children.values()}),
@@ -479,7 +688,16 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
         "cost_input_id": costs.cost_input_id, "cost_input_sha256": reservation.source_sha256,
         "cost_source_path": reservation.source_path,
         "complete_workflow_cost_handoff": StructuredEvidence(value=support),
-        "complete_workflow_remaining_seconds": ceil(remaining.total_seconds)}
+        "complete_workflow_remaining_seconds": ceil(remaining.total_seconds),
+        "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
+            runtime["allowance"], "preparation").total_seconds),
+        "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
+        "workflow_profile": runtime.get("workflow_profile"),
+        "workflow_cap_started_monotonic": float(record["cap_start_monotonic"])
+            if runtime.get("workflow_profile") else None,
+        "registration_allowance_seconds": ceil(runtime["allowance"].registration_seconds),
+        "provision_allowance_seconds": ceil(runtime["allowance"].provision_seconds),
+        "registration_timeout_seconds": runtime.get("provider_registration_timeout_seconds", ceil(runtime["allowance"].registration_seconds))}
     if observation.admission.requires_primary_review:
         review = sources.get("primary_review_path")
         if review is None:
@@ -493,10 +711,17 @@ def build_aws_provider_workflows(*, campaign: Any, parent: Any, children: dict[s
                 or hashlib.sha256(review_source.read_bytes()).hexdigest() != declared_hash):
             raise ValueError("AWS primary review source hash does not match its bytes")
         settings_values["primary_review_decision"] = StructuredEvidence(value=decision)
-    settings = AwsRuntimeSettings(**settings_values, plan_review_timeout_seconds=options.get("plan_review_timeout_seconds", 0),
-        expiry_role_permissions_boundary_arn=options.get("expiry_role_permissions_boundary_arn"))
+    settings = AwsRuntimeSettings(**settings_values,
+        iam_settle_seconds=options.get("iam_settle_seconds", 0),
+        expiry_role_permissions_boundary_arn=options.get("expiry_role_permissions_boundary_arn"),
+        plan_review_timeout_seconds=_plan_review_timeout_seconds(options, runtime.get("workflow_profile")),
+        plan_review_admission_path=runtime.get("plan_review_admission_path"),
+        cleanup_routine_seconds=600 if runtime.get("workflow_profile") else None,
+        cleanup_absence_seconds=60 if runtime.get("workflow_profile") else None)
     driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
-    trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
+    from .validation_profiles import provider_lead_seconds
+    trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+        campaign.admission.workflow_profile, "aws", aws_provider.SAFETY_LEAD_SECONDS))
     request = ExpiryRequest(schema_version=2, run_id=child.run_id,
         deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
         expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
@@ -559,13 +784,16 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
         actual_stages = stages
         if actual_stages is None:
             from .lifecycle_remote import build_provider_remote_stages
+            observer_callback = _observer_progress_callback(runtime.get("observer"))
             actual_stages = {}
             for provider, child in children.items():
                 actual_stages[provider] = build_provider_remote_stages(provider=provider,
-                    campaign=campaign, parent=parent, children={provider: child}, runtime=runtime,
+                    campaign=campaign, parent=parent, children=children, runtime=runtime,
                     ledger=ledger, reservation=reservation, runner=runner, clock=clock,
                     repository_root=repository_root or Path.cwd(),
                     recovery_path=Path(private_root) / "lifecycle-recovery.json",
+                    archive_sink=runtime.get("archive_sink"),
+                    observer_progress_callback=observer_callback,
                     sleep=runtime.get("sleep", __import__("time").sleep))
         workflows = build_provider_workflows(campaign=campaign, parent=parent,
             children=children, costs=costs, runtime=runtime, reservation=reservation,
@@ -636,8 +864,9 @@ def build_runtime(*, campaign: Any, parent: Any, children: dict[str, Any],
 
 def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, Any],
         costs: Any, runtime: dict[str, Any], reservation: Any, ledger: Any,
-        runner: Any, clock: Any, stages: dict[str, Any], private_root: Path,
-        cleanup_references: dict[str, str] | None = None) -> dict[str, Any]:
+        runner: Any, clock: Any, stages: dict[str, Any] | None, private_root: Path,
+        cleanup_references: dict[str, str] | None = None,
+        cleanup_only: bool = False) -> dict[str, Any]:
     """Bind every selected provider to one accepted F11 reservation and claim barrier."""
     from datetime import timedelta
     from math import ceil
@@ -651,12 +880,16 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
     from .providers.gcp import GcpProviderDriver, GcpRuntimeSettings
     from .admission import aws_expiry_cost_handoff
     from .admission import validate_timing_profile_allowance
+    from .admission import validate_workflow_profile_allowance
     from .lifecycle_cleanup import save_cleanup_settings
     from . import azure_provider
 
     selected = {str(getattr(p, "value", p)) for p in campaign.selected_providers}
     validate_timing_profile_allowance(campaign.admission.timing_profile, runtime["allowance"], selected)
-    if set(children) != selected or set(stages) != selected:
+    validate_workflow_profile_allowance(campaign.admission.workflow_profile, runtime["allowance"], selected)
+    if (set(children) != selected
+            or (not cleanup_only and (stages is None or set(stages) != selected))
+            or (cleanup_only and stages is not None)):
         raise ValueError("runtime workflows, stages and initialized provider set must match")
     if (reservation.state != "reserved" or reservation.source_path != costs.source_path
             or reservation.source_sha256 != costs.payload_sha256):
@@ -711,7 +944,9 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
         config = row["options"]
         if provider == "aws":
             namespace = aws_provider._namespace(deployment)
-            trigger = reservation.expires_at.value - timedelta(seconds=aws_provider.SAFETY_LEAD_SECONDS)
+            from .validation_profiles import provider_lead_seconds
+            trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+                campaign.admission.workflow_profile, "aws", aws_provider.SAFETY_LEAD_SECONDS))
             expiry_fixture = row["sources"]["expiry_cost_path"]
             support = aws_expiry_cost_handoff(costs, expiry_fixture,
                 sorted(set((observation.vm_a.region, observation.vm_b.region))),
@@ -724,13 +959,27 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "cost_source_path": reservation.source_path,
                 "complete_workflow_cost_handoff": StructuredEvidence(value=support),
                 "complete_workflow_remaining_seconds": ceil(_remaining_f11_allowance(
-                    runtime["allowance"], "registration").total_seconds)}
+                    runtime["allowance"], "registration").total_seconds),
+                "post_registration_workflow_seconds": ceil(_remaining_f11_allowance(
+                    runtime["allowance"], "preparation").total_seconds),
+                "post_provision_workflow_seconds": ceil(_post_provision_seconds(runtime["allowance"])),
+                "workflow_profile": runtime.get("workflow_profile"),
+                "workflow_cap_started_monotonic": float(record["cap_start_monotonic"])
+                    if runtime.get("workflow_profile") else None,
+                "registration_allowance_seconds": ceil(runtime["allowance"].registration_seconds),
+                "provision_allowance_seconds": ceil(runtime["allowance"].provision_seconds),
+                "registration_timeout_seconds": runtime.get("provider_registration_timeout_seconds", ceil(runtime["allowance"].registration_seconds))}
             if observation.admission.requires_primary_review:
                 review = row["sources"].get("primary_review_path")
                 if review is None: raise ValueError("AWS scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = AwsRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0),
-                expiry_role_permissions_boundary_arn=config.get("expiry_role_permissions_boundary_arn"))
+            settings = AwsRuntimeSettings(**settings_args,
+                iam_settle_seconds=config.get("iam_settle_seconds", 0),
+                expiry_role_permissions_boundary_arn=config.get("expiry_role_permissions_boundary_arn"),
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
+                plan_review_admission_path=runtime.get("plan_review_admission_path"),
+                cleanup_routine_seconds=600 if runtime.get("workflow_profile") else None,
+                cleanup_absence_seconds=60 if runtime.get("workflow_profile") else None)
             driver = AwsProviderDriver(runner, settings, clock=clock.utc_now)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.AWS, action="stop",
@@ -745,6 +994,7 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
             options_by_provider[provider] = (driver, None)
         elif provider == "gcp":
             from .providers.gcp import SAFETY_LEAD_SECONDS
+            from .validation_profiles import provider_lead_seconds
             sources = row["sources"]
             handoff = json.loads(sources["workflow_cost_handoff_path"].read_text())
             support_evidence = json.loads(sources["support_cost_path"].read_text())
@@ -756,14 +1006,22 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 "cost_source_path": reservation.source_path,
                 "complete_workflow_cost_handoff": StructuredEvidence(value=handoff),
                 "support_cost_evidence": StructuredEvidence(value=support_evidence),
-                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds)}
+                "complete_workflow_remaining_seconds": float(runtime["allowance"].total_seconds),
+                "workflow_cap_started_monotonic": float(record["cap_start_monotonic"]),
+                "registration_allowance_seconds": float(runtime["allowance"].registration_seconds),
+                "provision_allowance_seconds": float(runtime["allowance"].provision_seconds)}
             if observation.admission.requires_primary_review:
                 review = sources.get("primary_review_path")
                 if review is None: raise ValueError("GCP scenario requires source-bound primary review")
                 settings_args["primary_review_decision"] = StructuredEvidence(value=_read_review_decision(review))
-            settings = GcpRuntimeSettings(**settings_args, plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
-            driver = GcpProviderDriver(runner, settings, clock=clock.utc_now)
-            trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+            settings = GcpRuntimeSettings(**settings_args,
+                registration_timeout_seconds=runtime.get("provider_registration_timeout_seconds", 180),
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
+                plan_review_admission_path=runtime.get("plan_review_admission_path"))
+            driver = GcpProviderDriver(runner, settings, clock=clock.utc_now,
+                monotonic_clock=clock.monotonic)
+            trigger = reservation.expires_at.value - timedelta(seconds=provider_lead_seconds(
+                campaign.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
                 deployment_id=child.deployment_id, provider=Provider.GCP, action="stop",
                 expires_at=Evidence(value=trigger), reservation_id=reservation.reservation_id,
@@ -804,10 +1062,13 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 complete_workflow_seconds=float(runtime["allowance"].total_seconds),
                 post_registration_workflow_seconds=float(_remaining_f11_allowance(
                     runtime["allowance"], "preparation").total_seconds),
-                cap_deadline_monotonic=cap_end, admission_evidence=admission_evidence,
+                cap_deadline_monotonic=cap_end,
+                cap_started_monotonic=float(record["cap_start_monotonic"]),
+                admission_evidence=admission_evidence,
                 timing_profile=deployment.admission.timing_profile,
+                workflow_profile=deployment.admission.workflow_profile,
                 cleanup_timing_path=(Path(private_root) / "azure-cleanup-timing" / child.run_id
-                    / f"{child.deployment_id}.json") if deployment.admission.timing_profile else None,
+                    / f"{child.deployment_id}.json") if (deployment.admission.timing_profile or deployment.admission.workflow_profile) else None,
                 profile_allowance=({"registration_seconds": float(runtime["allowance"].registration_seconds),
                     "provision_seconds": float(runtime["allowance"].provision_seconds),
                     "readiness_seconds": float(runtime["allowance"].readiness_seconds),
@@ -817,10 +1078,11 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                     "retrieval_seconds": float(runtime["allowance"].retrieval_seconds),
                     "cleanup_seconds": float(runtime["allowance"].cleanup_seconds),
                     "azure_provider_lead_seconds": float(runtime["allowance"].provider_leads_seconds["azure"])}
-                    if deployment.admission.timing_profile else None),
+                    if (deployment.admission.timing_profile or deployment.admission.workflow_profile) else None),
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
-                plan_review_timeout_seconds=config.get("plan_review_timeout_seconds", 0))
+                plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
+                plan_review_admission_path=runtime.get("plan_review_admission_path"))
             name, ids = azure_provider._validate_request(deployment, options,
                 reservation.cap_started_at.value, None, check_live_clock=False)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,
@@ -831,11 +1093,21 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 cleanup_references[provider] = str(save_cleanup_settings(provider=provider,
                     deployment=deployment, request=requests[provider], reservation=reservation,
                     provider_lead_seconds=lead, settings=options, private_root=Path(private_root)))
-            # Local recovery and original Terraform inputs must exist before
-            # the advancing-clock preflight can fail. No provider calls here.
-            azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic, utc_now=clock.utc_now)
-            azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
+            if not cleanup_only:
+                # Local recovery and original Terraform inputs must exist before
+                # the advancing-clock preflight can fail. No provider calls here.
+                azure_provider.prepare_recovery(deployment, options, clock=clock.monotonic,
+                    utc_now=clock.utc_now, timing_origin=(anchor_mono, anchor_utc))
+                azure_provider._validate_request(deployment, options, clock.utc_now(), clock.monotonic())
             options_by_provider[provider] = (options, None)
+
+    if cleanup_only:
+        # Return only source-derived target inputs. This path does not create
+        # provider journals, settings snapshots, expiry registrations or VMs.
+        return {provider: {"deployment": deployments[provider],
+            "expiry_request": requests[provider],
+            "driver_or_options": options_by_provider[provider][0]}
+            for provider in children}
 
     protected: dict[str, Any] = {}
     def on_protected(provider: str, evidence: Any) -> None:

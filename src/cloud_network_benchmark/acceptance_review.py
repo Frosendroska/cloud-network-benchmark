@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,29 +32,109 @@ def _digest(path: Path, identity: str | None = None) -> str:
     return sha.hexdigest()
 
 
-def _failure_review(reference: Mapping[str, Any]) -> None:
+def _runtime_scope_sha256(path: str | Path) -> str:
+    """Hash execution-relevant runtime scope while excluding attempt-local paths."""
+    source = _regular(path)
+    import json
+    try:
+        runtime = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("failure receipt runtime source is unreadable") from exc
+    if not isinstance(runtime, dict):
+        raise ValueError("failure receipt runtime source is malformed")
+    scope = dict(runtime)
+    scope.pop("initialized_campaign_manifest", None)
+    ledger = scope.get("ledger")
+    if isinstance(ledger, dict):
+        scope["ledger"] = {key: value for key, value in ledger.items() if key != "path"}
+    providers = scope.get("providers")
+    if isinstance(providers, dict):
+        normalized_providers = {}
+        for name, row in providers.items():
+            retained = {key: value for key, value in row.items() if key not in {"sources", "bootstrap_template"}}
+            template = row.get("bootstrap_template")
+            if template is not None:
+                retained["bootstrap_template_sha256"] = _digest(_regular(template))
+            normalized_providers[name] = retained
+        scope["providers"] = normalized_providers
+    refs = scope.get("approval_refs")
+    if isinstance(refs, dict):
+        scope["approval_refs"] = {name: _digest(_regular(value)) for name, value in refs.items()}
+    raw = json.dumps(scope, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _failure_review(reference: Mapping[str, Any], *, required_entries: set[str] | None = None) -> None:
     path = _regular(reference["path"])
     if _digest(path) != reference.get("sha256"):
         raise ValueError("registered supervised failure review changed")
     review = yaml.safe_load(path.read_text())
+    if isinstance(review, dict) and review.get("schema_version") == 2:
+        from .failure_waiver import (WAIVED_ENTRIES,
+            validate_registered_failure_record)
+        validate_registered_failure_record(review)
+        if required_entries is not None and not required_entries <= set(WAIVED_ENTRIES):
+            raise ValueError("waiver review does not cover the requested failure resource")
+        return
     checks = review.get("checks") if isinstance(review, dict) else None
     expected = {"V-A-FAIL": "aws", "V-Z-FAIL": "azure", "V-G-FAIL": "gcp"}
-    if not isinstance(checks, dict) or set(checks) != set(expected) or review.get("schema_version") != 1:
-        raise ValueError("registered failure review must cover V-A-FAIL, V-Z-FAIL and V-G-FAIL")
+    required = set(expected) if required_entries is None else required_entries
+    if (not required or not required <= set(expected) or not isinstance(checks, dict)
+            or not required <= set(checks) or set(checks) - set(expected) or review.get("schema_version") != 1):
+        raise ValueError("registered failure review has missing or unregistered checks")
     attempts = set()
     for registered, provider in expected.items():
+        if registered not in required:
+            continue
         row = checks[registered]
         attempt = row.get("attempt_id")
         if row.get("provider") != provider or not isinstance(attempt, str) or not attempt or attempt in attempts:
             raise ValueError("registered failure review requires distinct actual provider attempt identities")
         attempts.add(attempt)
-        for action in ("server_failure", "controller_loss", "expiry", "cleanup"):
+        identity = row.get("config_identity")
+        if identity is not None:
+            if (not isinstance(identity, dict)
+                    or any(not isinstance(identity.get(field), str) or len(identity[field]) != 64
+                        or any(char not in "0123456789abcdef" for char in identity[field])
+                        for field in ("source_config_sha256", "config_sha256", "runtime_config_sha256", "runtime_scope_sha256"))):
+                raise ValueError(f"registered {registered} config identity is malformed")
+            config = _regular(identity.get("config_path", ""))
+            runtime = _regular(identity.get("runtime_config_path", ""))
+            if (_digest(config) != identity.get("config_sha256")
+                    or _digest(runtime) != identity.get("runtime_config_sha256")
+                    or _runtime_scope_sha256(runtime) != identity.get("runtime_scope_sha256")):
+                raise ValueError(f"registered {registered} config or runtime identity changed")
+        for action in ("server_failure", "expiry", "cleanup"):
             evidence = row.get(action)
             if not isinstance(evidence, dict) or evidence.get("status") != "passed":
                 raise ValueError(f"supervised {registered}/{action} has not passed")
             source = _regular(evidence.get("source_path", ""))
             if _digest(source, attempt) != evidence.get("source_sha256"):
                 raise ValueError(f"supervised {registered}/{action} source hash differs")
+        controller = row.get("controller_loss")
+        if not isinstance(controller, dict):
+            raise ValueError(f"supervised {registered}/controller_loss requires actual proof or an explicit waiver")
+        if controller.get("status") == "passed":
+            source = _regular(controller.get("source_path", ""))
+            if _digest(source, attempt) != controller.get("source_sha256"):
+                raise ValueError(f"supervised {registered}/controller_loss source hash differs")
+        elif controller.get("status") == "waived":
+            reason = controller.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"supervised {registered}/controller_loss waiver needs an explicit reason")
+            waiver_source = _regular(controller.get("source_path", ""))
+            if _digest(waiver_source) != controller.get("source_sha256"):
+                raise ValueError(f"supervised {registered}/controller_loss waiver source hash differs")
+            recovery = row.get("ordinary_recovery")
+            if not isinstance(recovery, dict) or recovery.get("status") != "passed":
+                raise ValueError(f"supervised {registered}/ordinary_recovery has not passed")
+            recovery_source = _regular(recovery.get("source_path", ""))
+            if _digest(recovery_source, attempt) != recovery.get("source_sha256"):
+                raise ValueError(f"supervised {registered}/ordinary_recovery source hash differs")
+            if identity is None:
+                raise ValueError(f"supervised {registered} waiver review lacks exact config and runtime identity")
+        else:
+            raise ValueError(f"supervised {registered}/controller_loss has not passed or been explicitly waived")
 
 
 def validate_acceptance_scope(evidence: Mapping[str, Any], campaign: Any) -> None:
@@ -138,3 +219,27 @@ def validate_acceptance_scope(evidence: Mapping[str, Any], campaign: Any) -> Non
     if not matched:
         raise ValueError("no completed acceptance covers this provider/scenario scope")
     _failure_review(evidence["registered_failure_review"])
+    failure_path = _regular(evidence["registered_failure_review"]["path"])
+    failure_review = yaml.safe_load(failure_path.read_text(encoding="utf-8"))
+    if isinstance(failure_review, dict) and failure_review.get("schema_version") == 2:
+        from .failure_waiver import NORMAL_ENTRIES, validate_later_stage
+        campaign_mode = getattr(campaign.mode, "value", campaign.mode)
+        validate_later_stage(failure_review, {"calibration": "calibration",
+            "diagnostic_day": "day"}.get(campaign_mode, "unsupported"))
+        rows = failure_review["checks"]["V-A-FAIL"]["normal_acceptance"]
+        if [row.get("entry_id") for row in rows] != list(NORMAL_ENTRIES):
+            raise ValueError("waiver evidence does not bind exactly V-S1 and V-S3")
+        if [row.get("path") for row in evidence["accepted_campaigns"]] != [
+                row.get("parent_manifest_path") for row in rows]:
+            raise ValueError("waiver evidence is bound to different normal acceptance source identities")
+        for reference, binding in zip(evidence["accepted_campaigns"], rows):
+            parent_path = _regular(reference["path"])
+            parent = json.loads(parent_path.read_text(encoding="utf-8"))
+            runtime_reference = declared.get("accepted_runtime_configs", {}).get(str(parent_path), {})
+            if (parent.get("campaign_id") != binding.get("parent_campaign_id")
+                    or parent.get("implementation_git_commit") != binding.get("implementation_git_commit")
+                    or parent.get("config_provenance", {}).get("sha256") != binding.get("config_sha256")
+                    or runtime_reference.get("sha256") != binding.get("runtime_config_sha256")
+                    or {str(child.get("provider")): child.get("run_id")
+                        for child in parent.get("child_runs", [])} != binding.get("run_ids")):
+                raise ValueError("waiver normal acceptance campaign identity changed")

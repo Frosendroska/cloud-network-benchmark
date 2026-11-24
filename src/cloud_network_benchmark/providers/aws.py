@@ -37,6 +37,7 @@ from ..contracts.deployment import (
     RemoteConnectionData,
 )
 from ..contracts.execution import CommandRequest, CommandResult, CommandRunner
+from ..validation_profiles import provider_lead_seconds
 
 
 SAFETY_LEAD_SECONDS = 360
@@ -68,10 +69,19 @@ ALLOWED_SCENARIO_LOCALITIES = {
         (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a")),
     },
     "cross_zone": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1b"))},
-    "placement_optimization": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a"))},
+    "placement_optimization": {(("eu-central-1", "eu-central-1"), ("eu-central-1a", "eu-central-1a")), (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a"))},
     "inter_region": {(("eu-central-1", "eu-west-2"), ("eu-central-1a", "eu-west-2a"))},
 }
 TERMINAL_AUTOMATION_STATES = {"Success", "Cancelled", "TimedOut", "Failed"}
+
+
+def _pair_apply_timeout_seconds(provision_seconds: int, command_timeout_seconds: int,
+        plan_review_seconds: int, trigger_remaining_seconds: float) -> int:
+    """Bound saved-plan review and apply by the sourced provisioning phase."""
+    if min(provision_seconds, command_timeout_seconds) <= 0 or plan_review_seconds < 0:
+        raise ValueError("AWS provisioning phase timeout inputs are invalid")
+    return max(1, min(provision_seconds,
+        command_timeout_seconds + plan_review_seconds, int(trigger_remaining_seconds)))
 
 
 class AwsRuntimeSettings(StrictModel):
@@ -89,10 +99,20 @@ class AwsRuntimeSettings(StrictModel):
     cost_source_path: str = Field(min_length=1)
     complete_workflow_cost_handoff: StructuredEvidence
     complete_workflow_remaining_seconds: int = Field(gt=0)
+    workflow_profile: str | None = None
+    workflow_cap_started_monotonic: float | None = None
+    registration_allowance_seconds: int = Field(default=0, ge=0)
+    provision_allowance_seconds: int = Field(default=0, ge=0)
+    post_registration_workflow_seconds: int = Field(gt=0)
+    post_provision_workflow_seconds: int = Field(gt=0)
     primary_review_decision: Optional[StructuredEvidence] = None
     plan_review_timeout_seconds: int = Field(default=0, ge=0, le=600)
+    plan_review_admission_path: Optional[Path] = Field(default=None, exclude_if=lambda value: value is None)
     command_timeout_seconds: int = Field(default=120, gt=0, le=1800)
     registration_timeout_seconds: int = Field(default=90, gt=0, le=600)
+    cleanup_routine_seconds: Optional[int] = Field(default=None, gt=0, le=600, exclude_if=lambda value: value is None)
+    cleanup_absence_seconds: Optional[int] = Field(default=None, gt=0, le=60, exclude_if=lambda value: value is None)
+    iam_settle_seconds: int = Field(default=0, ge=0, le=60)
 
     @field_validator("controller_cidr")
     @classmethod
@@ -113,6 +133,12 @@ class AwsRuntimeSettings(StrictModel):
 
     @model_validator(mode="after")
     def source_paths(self) -> "AwsRuntimeSettings":
+        profile_timing = self.workflow_profile is not None
+        if (profile_timing != (self.workflow_cap_started_monotonic is not None)
+                or (profile_timing and (not isfinite(self.workflow_cap_started_monotonic)
+                    or self.registration_allowance_seconds <= 0
+                    or self.provision_allowance_seconds <= 0))):
+            raise ValueError("profiled AWS review requires its original cap anchor and stage allowances")
         if set(self.ami_ids) - {"eu-central-1", "eu-west-2", "eu-north-1"} or not self.ami_ids:
             raise ValueError("ami_ids may identify only the selected AWS regions")
         if any(not re.fullmatch(r"ami-[a-f0-9]{8,17}", image) for image in self.ami_ids.values()):
@@ -126,6 +152,8 @@ class AwsRuntimeSettings(StrictModel):
                 raise ValueError("expiry_role_permissions_boundary_arn must be a customer-managed IAM policy ARN with a valid path")
             if match.group(1) != self.account_id:
                 raise ValueError("expiry role permissions boundary account must match the configured AWS account")
+        if (self.cleanup_routine_seconds is None) != (self.cleanup_absence_seconds is None):
+            raise ValueError("AWS routine cleanup and independent absence allowances must be supplied together")
         return self
 
 
@@ -169,14 +197,18 @@ class AwsProviderDriver:
         runner: CommandRunner,
         settings: AwsRuntimeSettings,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.runner = runner
         self.settings = settings
         self.clock = clock
+        self.sleeper = sleeper
         self._active_attempt: Path | None = None
         self._active_commands: list[dict[str, Any]] = []
         self._registration_deadline: float | None = None
+        self._registration_review_deadline: float | None = None
         self._cleanup_deadline: float | None = None
+        self._cleanup_acceptance_deadlines: list[datetime] = []
         self._precreate_deadline: float | None = None
         self._active_primary_failure: FailureEvidence | None = None
         self._initialized_terraform: set[str] = set()
@@ -187,6 +219,21 @@ class AwsProviderDriver:
         try:
             self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
             regions, reservation, trigger = self._validate_registration(deployment, request)
+            if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+                from ..terraform_plan import workflow_review_stage_deadline
+                cap_start = self.settings.workflow_cap_started_monotonic
+                if cap_start > time.monotonic():
+                    raise AwsProviderError("original workflow cap anchor is invalid", category="cap_order")
+                stop_deadline = time.monotonic() + max(0.0,
+                    (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+                self._registration_deadline = workflow_review_stage_deadline(
+                    cap_started_monotonic=cap_start,
+                    registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                    provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                    stage="registration", overall_deadline=cap_start
+                        + self.settings.complete_workflow_remaining_seconds,
+                    stop_deadline=stop_deadline)
+            self._registration_review_deadline = self._registration_deadline
             actual_price = _expiry_price(self._root(), self.settings)
             attempt = self._attempt_dir(deployment)
             self._active_attempt = attempt
@@ -220,6 +267,20 @@ class AwsProviderDriver:
                 outputs[region] = self._apply_safety_root(deployment, region, attempt)
                 # Save each role/document identity before external registration calls.
                 journal.setdefault("safety", {})[region] = outputs[region]
+                self._save_journal(attempt, journal)
+
+            settle_seconds = self.settings.iam_settle_seconds
+            if settle_seconds:
+                remaining = (self._registration_deadline or time.monotonic()) - time.monotonic()
+                if remaining < settle_seconds:
+                    journal["iam_settle"] = {"seconds": settle_seconds, "status": "insufficient_registration_time"}
+                    self._save_journal(attempt, journal)
+                    raise AwsProviderError("AWS IAM settle delay does not fit the original registration deadline",
+                        category="registration_deadline")
+                journal["iam_settle"] = {"seconds": settle_seconds, "status": "started"}
+                self._save_journal(attempt, journal)
+                self.sleeper(settle_seconds)
+                journal["iam_settle"]["status"] = "completed"
                 self._save_journal(attempt, journal)
 
             for region in regions:
@@ -374,18 +435,40 @@ class AwsProviderDriver:
         trigger = deployment.expiry.value.expires_at.value
         if trigger is None or now >= trigger:
             raise AwsProviderError("AWS expiry trigger has passed", category="cap_expired")
-        if self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
+        if self.settings.post_registration_workflow_seconds > self.settings.complete_workflow_remaining_seconds:
+            raise AwsProviderError("post-registration workflow allowance exceeds the complete workflow allowance", category="allowance_invalid")
+        if (self.settings.post_provision_workflow_seconds > self.settings.post_registration_workflow_seconds
+                or self.settings.post_provision_workflow_seconds > self.settings.complete_workflow_remaining_seconds):
+            raise AwsProviderError("post-provision workflow allowance exceeds an earlier workflow allowance", category="allowance_invalid")
+        provision_phase_seconds = (self.settings.post_registration_workflow_seconds
+            - self.settings.post_provision_workflow_seconds)
+        if provision_phase_seconds <= 0:
+            raise AwsProviderError("source-bound provision phase allowance is empty", category="allowance_invalid")
+        if self.settings.post_registration_workflow_seconds > (trigger - now).total_seconds():
             raise AwsProviderError("complete remaining workflow does not fit before the earlier expiry trigger", category="cap_insufficient")
-        slack = (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds
+        slack = (trigger - now).total_seconds() - self.settings.post_registration_workflow_seconds
         if slack <= 0:
             raise AwsProviderError("no command budget remains before reserving the complete workflow", category="cap_insufficient")
         self._registration_deadline = time.monotonic() + self.settings.registration_timeout_seconds
+        if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+            from ..terraform_plan import workflow_review_stage_deadline
+            stop_remaining = max(0.0,
+                (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+            self._registration_deadline = workflow_review_stage_deadline(
+                cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                    + self.settings.complete_workflow_remaining_seconds,
+                stop_deadline=time.monotonic() + stop_remaining)
         for region, execution_id in journal["executions"].items():
             self._confirm_automation(region, execution_id, journal["safety"][region], self._automation_parameters(deployment, region, trigger, journal["safety"][region]["role_arn"]))
         now = self.clock().astimezone(timezone.utc)
-        if now >= trigger or self.settings.complete_workflow_remaining_seconds > (trigger - now).total_seconds():
+        if now >= trigger or self.settings.post_registration_workflow_seconds > (trigger - now).total_seconds():
             raise AwsProviderError("complete remaining workflow no longer fits after expiry readback", category="cap_insufficient")
-        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.complete_workflow_remaining_seconds)
+        # Bound pair apply by reserving all source-declared work after provisioning.
+        # This leaves the full provision allowance available to apply itself.
+        self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.post_provision_workflow_seconds)
 
         variables = self._pair_variables(deployment)
         vars_path = attempt / "pair.tfvars.json"
@@ -397,10 +480,28 @@ class AwsProviderDriver:
         self._save_journal(attempt, journal)
         apply_result: CommandResult | None = None
         try:
+            pair_timeout = _pair_apply_timeout_seconds(provision_phase_seconds,
+                self.settings.command_timeout_seconds, self.settings.plan_review_timeout_seconds,
+                (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
+            if self.settings.workflow_profile is not None and self.settings.workflow_cap_started_monotonic is not None:
+                from ..terraform_plan import workflow_review_stage_deadline
+                stop_fit = ((trigger - self.clock().astimezone(timezone.utc)).total_seconds()
+                    - self.settings.post_provision_workflow_seconds)
+                pair_deadline = workflow_review_stage_deadline(
+                    cap_started_monotonic=self.settings.workflow_cap_started_monotonic,
+                    registration_allowance_seconds=self.settings.registration_allowance_seconds,
+                    provision_allowance_seconds=self.settings.provision_allowance_seconds,
+                    stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
+                        + self.settings.complete_workflow_remaining_seconds,
+                    stop_deadline=time.monotonic() + max(0.0, stop_fit))
+                pair_timeout = max(0, min(provision_phase_seconds, int(pair_deadline - time.monotonic())))
+                if pair_timeout <= 0:
+                    raise AwsProviderError("AWS pair review has no remaining original provision-stage budget",
+                        category="cap_insufficient")
             apply_result = self._run(
                 "aws-pair-apply",
                 [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/pair'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-                max(1, min(self.settings.command_timeout_seconds, int((trigger - self.clock().astimezone(timezone.utc)).total_seconds()))),
+                pair_timeout,
                 cwd=attempt,
             )
             _restrict_private_file(Path(state_path))
@@ -468,7 +569,39 @@ class AwsProviderDriver:
             failure = _failure(AwsProviderError("cleanup account or regions differ from registered AWS scope", category="scope_mismatch"), self.clock())
             return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
         self._registration_deadline = None
-        self._cleanup_deadline = time.monotonic() + self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
+        self._cleanup_acceptance_deadlines = []
+        routine_seconds = self.settings.cleanup_routine_seconds or self.settings.registration_timeout_seconds * max(3, len(regions) * 3)
+        cleanup_now = self.clock().astimezone(timezone.utc)
+        started_at = journal.get("cleanup_started_at")
+        if started_at is None:
+            started_at = cleanup_now.isoformat()
+            journal["cleanup_started_at"] = started_at
+            try:
+                self._save_journal(attempt, journal)
+            except Exception as exc:
+                failure = _failure(exc, self.clock())
+                return self._failed_cleanup(inventory_by_region, [failure], primary, failure, deployment)
+        started_utc = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+        cap_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)
+        from ..validation_profiles import provider_lead_seconds
+        lead = provider_lead_seconds(deployment.admission.workflow_profile, "aws", SAFETY_LEAD_SECONDS)
+        # Cleanup is a bounded recovery action even when the acceptance clock is late.
+        # The immutable reservation and provider trigger remain evidence bounds; this
+        # execution window does not move either deadline or make cleanup timely.
+        acceptance_routine_end = min(cap_end - timedelta(seconds=lead),
+            started_utc + timedelta(seconds=routine_seconds))
+        self._cleanup_acceptance_deadlines = [acceptance_routine_end]
+        previous_timing = journal.get("cleanup_acceptance_timing", {})
+        timing_status = previous_timing.get("status")
+        if timing_status not in {"late", "unknown"}:
+            timing_status = "late" if cleanup_now >= acceptance_routine_end else "within_deadline"
+        journal["cleanup_acceptance_timing"] = {
+            "routine_deadline_utc": acceptance_routine_end.isoformat(),
+            "status": timing_status,
+        }
+        # Execution gets a separate per-invocation recovery window. It never changes
+        # the original reservation/STOP deadline or the recorded acceptance status.
+        self._cleanup_deadline = time.monotonic() + max(1.0, float(routine_seconds))
 
         try:
             identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
@@ -550,6 +683,24 @@ class AwsProviderDriver:
         if failures:
             return self._failed_cleanup(inventory_by_region, failures, primary, failures[0], deployment)
 
+        if self.settings.cleanup_absence_seconds is not None:
+            routine_finished_at = self.clock().astimezone(timezone.utc)
+            if routine_finished_at >= acceptance_routine_end:
+                journal["cleanup_acceptance_timing"]["status"] = "late"
+            absence_started = journal.get("cleanup_absence_started_at")
+            if absence_started is None:
+                absence_started = self.clock().astimezone(timezone.utc).isoformat()
+                journal["cleanup_absence_started_at"] = absence_started
+                self._save_journal(attempt, journal)
+            absence_started_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
+            absence_end = min(cap_end-timedelta(seconds=lead),
+                absence_started_utc+timedelta(seconds=self.settings.cleanup_absence_seconds))
+            self._cleanup_acceptance_deadlines.append(absence_end)
+            absence_now = self.clock().astimezone(timezone.utc)
+            journal["cleanup_acceptance_timing"]["absence_deadline_utc"] = absence_end.isoformat()
+            if absence_now >= absence_end:
+                journal["cleanup_acceptance_timing"]["status"] = "late"
+            self._cleanup_deadline = time.monotonic() + max(1.0, float(self.settings.cleanup_absence_seconds))
         safety_absent: dict[str, bool] = {}
         safety_targets: dict[str, Any] = {}
         for region in regions:
@@ -596,9 +747,20 @@ class AwsProviderDriver:
             failure = _failure(AwsProviderError("one or more regional expiry executions failed or timed out", category="expiry_execution_failed"), self.clock()) if state == "failed" else None
             expiry = expiry.model_copy(update={"state": state, "failure": failure, "provider_metadata": StructuredEvidence(value={**(expiry.provider_metadata.value or {}), "regional_outcomes": outcomes, "launch_authorization": "cleared_after_protection_removal"})})
             journal["expiry_evidence"] = expiry.model_dump(mode="json")
+        timing = dict(journal.get("cleanup_acceptance_timing", {}))
+        timing["routine_deadline_utc"] = acceptance_routine_end.isoformat()
+        if (len(self._cleanup_acceptance_deadlines) == 1
+                and timing.get("status") not in {"late", "unknown"}
+                and self.clock().astimezone(timezone.utc) >= acceptance_routine_end):
+            timing["status"] = "late"
+        if len(self._cleanup_acceptance_deadlines) > 1:
+            timing["absence_deadline_utc"] = self._cleanup_acceptance_deadlines[-1].isoformat()
+            if self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[-1]:
+                timing["status"] = "late"
+        journal["cleanup_acceptance_timing"] = timing
         result = AwsCleanupResult(
             cleanup_state=CleanupState.SUCCEEDED,
-            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "safety_targets": safety_targets, "complete": True}),
+            inventory=StructuredEvidence(value={"regions": inventory_by_region, "safety_absent": safety_absent, "safety_targets": safety_targets, "cleanup_timing": timing, "complete": True}),
             expiry=Evidence[ExpiryEvidence](value=expiry) if expiry else Evidence[ExpiryEvidence](unavailable_reason="expiry not registered"),
             primary_failure=primary,
         )
@@ -610,6 +772,47 @@ class AwsProviderDriver:
             failure = _failure(exc, self.clock())
             return self._failed_cleanup(inventory_by_region, [*failures, failure], primary, failure, deployment)
         return result
+
+    def verify_unstarted_absence(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
+        """Read-only inventory for a source-proved pre-registration failure."""
+        # Empty inventories from a different credential account say nothing
+        # about the frozen target account. Keep the same STS identity gate used
+        # by ordinary cleanup before accepting any absence result.
+        identity = self._aws_json("sts", "get-caller-identity", "--output", "json")
+        if not isinstance(identity, dict) or identity.get("Account") != self.settings.account_id:
+            raise AwsProviderError("AWS caller account differs from the frozen target account",
+                category="scope_mismatch")
+        self._active_attempt = None
+        self._active_commands = []
+        self._cleanup_deadline = time.monotonic() + max(1.0, float(
+            self.settings.cleanup_routine_seconds or self.settings.registration_timeout_seconds))
+        regions = self._regions(deployment)
+        namespace = _namespace(deployment)
+        attempt = self.settings.private_state_root / namespace / deployment.run_id / deployment.deployment_id
+        inventories: dict[str, Any] = {}
+        safety_targets: dict[str, Any] = {}
+        safety_absent: dict[str, bool] = {}
+        for region in regions:
+            failures: list[FailureEvidence] = []
+            inventories[region] = self._inventory_region(deployment, region, failures,
+                known_resource_ids={})
+            safety = self._prospective_safety(deployment, region, attempt, {})
+            safety_targets[region] = {"role": {"arn": safety["role_arn"]},
+                "document": {"arn": f"arn:aws:ssm:{region}:{self.settings.account_id}:document/{safety['document_name']}"}}
+            safety_absent[region] = self._verify_safety_absent(region, safety)
+        complete = (bool(inventories) and all(row.get("complete") is True
+            and not row.get("remaining") for row in inventories.values())
+            and all(safety_absent.values()))
+        return {"provider": "aws", "verified": complete,
+            "target_selector": self._target_selector(deployment, regions),
+            "inventory": {"regions": inventories, "safety_absent": safety_absent,
+                "safety_targets": safety_targets, "complete": complete},
+            "query_count": len(self._active_commands),
+            # The original routine stop time is not captured in this source.
+            # Expired caps prove lateness; before expiry the timing remains
+            # unknown rather than claiming a deadline pass.
+            "timing_status": "late" if self.clock().astimezone(timezone.utc)
+                >= deployment.reservation.value.expires_at.value else "unknown"}
 
     def _prospective_safety(self, deployment: ProviderDeploymentInput, region: str, attempt: Path, journal: dict) -> dict[str,str]:
         """Expected lookup targets, not evidence that resources were ever created."""
@@ -647,6 +850,10 @@ class AwsProviderDriver:
 
     def _validate_registration(self, deployment: ProviderDeploymentInput, request: ExpiryRequest) -> tuple[list[str], ReservationEvidence, datetime]:
         _validate_deployment(deployment)
+        if (self.settings.post_registration_workflow_seconds > self.settings.complete_workflow_remaining_seconds
+                or self.settings.post_provision_workflow_seconds > self.settings.post_registration_workflow_seconds
+                or self.settings.post_registration_workflow_seconds <= self.settings.post_provision_workflow_seconds):
+            raise AwsProviderError("AWS source-bound phase allowances are inconsistent", category="allowance_invalid")
         if request.provider != Provider.AWS or request.action != "stop":
             raise AwsProviderError("AWS expiry request must be stop", category="request_invalid")
         if (request.run_id, request.deployment_id) != (deployment.run_id, deployment.deployment_id):
@@ -671,12 +878,13 @@ class AwsProviderDriver:
         self._validate_expiry_cost_coverage(reservation, regions)
         if request.reservation_id.value != reservation.reservation_id.value:
             raise AwsProviderError("expiry reservation identity does not match active reservation", category="reservation_mismatch")
-        trigger = reservation.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+        lead_seconds = provider_lead_seconds(deployment.admission.workflow_profile, "aws", SAFETY_LEAD_SECONDS)
+        trigger = reservation.expires_at.value - timedelta(seconds=lead_seconds)
         selector = self._target_selector(deployment, regions)
         if request.target_selector != selector or request.resource_namespace != _namespace(deployment):
             raise AwsProviderError("expiry target selector or isolated namespace is not exact", category="selector_mismatch")
         if request.expires_at.value != trigger:
-            raise AwsProviderError("expiry trigger must equal reserved cap end minus the 360-second safety lead", category="trigger_mismatch")
+            raise AwsProviderError("expiry trigger must equal the admitted cap end minus its registered provider lead", category="trigger_mismatch")
         now = self.clock().astimezone(timezone.utc)
         if reservation.cap_started_at.value > now:
             raise AwsProviderError("reservation cap start has not occurred", category="cap_not_started")
@@ -768,10 +976,20 @@ class AwsProviderDriver:
             values["expiry_role_permissions_boundary_arn"] = self.settings.expiry_role_permissions_boundary_arn
         self._write_private(vars_path, json.dumps(values, sort_keys=True).encode())
         state_path = attempt / f"safety-{region}.tfstate"
+        review_total_timeout = min(self.settings.command_timeout_seconds
+            + self.settings.plan_review_timeout_seconds,
+            max(0, int(self._registration_deadline - time.monotonic()))
+            if self._registration_deadline is not None
+            else self.settings.command_timeout_seconds + self.settings.plan_review_timeout_seconds)
+        if self.settings.workflow_profile is not None and self._registration_review_deadline is not None:
+            review_total_timeout = max(0, int(self._registration_review_deadline - time.monotonic()))
+        if review_total_timeout <= 0:
+            raise AwsProviderError("AWS safety plan review has no remaining registration-stage budget",
+                category="expiry_registration_timeout")
         result = self._run(
             f"aws-safety-apply-{region}",
             [self.settings.terraform, f"-chdir={self._root() / 'terraform/aws/safety'}", "apply", "-input=false", "-auto-approve", f"-state={state_path}", f"-var-file={vars_path}"],
-            self.settings.command_timeout_seconds,
+            review_total_timeout,
             cwd=attempt,
         )
         _restrict_private_file(state_path)
@@ -835,7 +1053,7 @@ class AwsProviderDriver:
         if lookup is not None and len(lookup[0]) == 1:
             return lookup[0][0]
         rejected = (start.outcome == "failed" and start.exit_code not in (None, 0) and not start.stdout.strip()
-            and re.match(r"\s*An error occurred \(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
+            and re.match(r"\s*(?:aws: \[ERROR\]:\s*)?An error occurred \(InvalidAutomationExecutionParametersException\)\s+when calling the StartAutomationExecution operation:", start.stderr))
         if rejected and lookup is not None and lookup[1] == 0:
             exc = AwsProviderError("AWS rejected expiry start; complete lookup found no exact-document execution",
                 category="expiry_start_rejected", action_id=start.action_id)
@@ -1179,7 +1397,9 @@ class AwsProviderDriver:
             raise AwsProviderError("host trust has no active attempt context", category="host_identity_unavailable")
         return path
 
-    def _inventory_region(self, deployment: ProviderDeploymentInput, region: str, failures: list[FailureEvidence]) -> dict[str, Any]:
+    def _inventory_region(self, deployment: ProviderDeploymentInput, region: str,
+                          failures: list[FailureEvidence], *,
+                          known_resource_ids: dict[str, Any] | None = None) -> dict[str, Any]:
         filters = ["--filters", f"Name=tag:cnb_run_id,Values={deployment.run_id}", f"Name=tag:cnb_deployment_id,Values={deployment.deployment_id}", "--region", region, "--output", "json"]
         queries = {
             "instances": ["ec2", "describe-instances", *filters],
@@ -1204,7 +1424,8 @@ class AwsProviderDriver:
         }
         entries: dict[str, Any] = {}
         complete = True
-        known = self._load_journal(self._attempt_dir(deployment), deployment).get("known_resource_ids", {})
+        known = (self._load_journal(self._attempt_dir(deployment), deployment).get("known_resource_ids", {})
+                 if known_resource_ids is None else known_resource_ids)
         for name, argv in queries.items():
             try:
                 data = self._aws_json(*argv)
@@ -1334,6 +1555,18 @@ class AwsProviderDriver:
     def _failed_cleanup(self, inventory: dict[str, Any], secondary: list[FailureEvidence], primary: FailureEvidence | None, failure: FailureEvidence, deployment: ProviderDeploymentInput) -> AwsCleanupResult:
         journal = self._load_journal(self._attempt_dir(deployment), deployment)
         expiry = self._expiry_from_journal(deployment, journal)
+        timing = dict(journal.get("cleanup_acceptance_timing", {}))
+        if timing.get("status") not in {"late", "unknown"}:
+            final_phase_deadline = (self._cleanup_acceptance_deadlines[-1]
+                if self._cleanup_acceptance_deadlines else None)
+            timing["status"] = ("late" if final_phase_deadline is not None
+                and self.clock().astimezone(timezone.utc) >= final_phase_deadline
+                else "within_deadline")
+        if self._cleanup_acceptance_deadlines:
+            timing["routine_deadline_utc"] = self._cleanup_acceptance_deadlines[0].isoformat()
+            if len(self._cleanup_acceptance_deadlines) > 1:
+                timing["absence_deadline_utc"] = self._cleanup_acceptance_deadlines[-1].isoformat()
+        journal["cleanup_acceptance_timing"] = timing
         journal["cleanup_state"] = "failed"
         journal["last_cleanup_inventory"] = inventory
         journal["cleanup_attempted_at"] = self.clock().astimezone(timezone.utc).isoformat()
@@ -1347,7 +1580,7 @@ class AwsProviderDriver:
         return AwsCleanupResult(
             cleanup_state=CleanupState.FAILED,
             cleanup_failure=failure,
-            inventory=StructuredEvidence(value={"regions": inventory, "complete": False}),
+            inventory=StructuredEvidence(value={"regions": inventory, "cleanup_timing": timing, "complete": False}),
             expiry=Evidence[ExpiryEvidence](value=expiry) if expiry else Evidence[ExpiryEvidence](unavailable_reason="expiry registration not available"),
             primary_failure=primary,
             secondary_failures=secondary,
@@ -1358,11 +1591,31 @@ class AwsProviderDriver:
         actual = ((deployment.vm_a.region, deployment.vm_b.region), (deployment.vm_a.zone, deployment.vm_b.zone))
         if actual not in ALLOWED_SCENARIO_LOCALITIES.get(scenario, set()) or any(REGION_FOR_ZONE.get(zone) != region for region, zone in zip(*actual)):
             raise AwsProviderError(f"AWS scenario region/zone combination is unsupported: {actual}", category="scenario_mismatch")
-        if "eu-north-1" in actual[0] and not (
-            scenario == "same_zone" and deployment.mode == "acceptance"
-            and deployment.context == "failure_check" and deployment.experiment_id == "EXP-900"
-        ):
-            raise AwsProviderError("Stockholm is limited to the reviewed EXP-900 acceptance check", category="scenario_mismatch")
+        research_identity = ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                             or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+        acceptance_identity = ((scenario == "same_zone" and deployment.experiment_id == "EXP-903")
+                               or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+        if ((research_identity and deployment.mode in {"short_study", "calibration", "diagnostic_day"})
+                or (acceptance_identity and deployment.mode == "acceptance" and deployment.context == "standard")):
+            expected = (("eu-north-1", "eu-north-1"), ("eu-north-1a", "eu-north-1a"))
+            if actual != expected:
+                raise AwsProviderError("primary S1/S3 cannot fall back from Stockholm without a reviewed region-specific exception", category="scenario_mismatch")
+        if "eu-north-1" in actual[0]:
+            research = (deployment.mode in {"short_study", "calibration", "diagnostic_day"}
+                        and deployment.context == "standard"
+                        and ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                             or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003")))
+            replacement = (deployment.mode == "short_study" and deployment.context == "replacement"
+                           and ((scenario == "same_zone" and deployment.experiment_id == "EXP-001")
+                                or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003"))
+                           and deployment.replaces_run_id is not None
+                           and deployment.replaces_run_id.endswith("-aws"))
+            acceptance = (deployment.mode == "acceptance"
+                          and ((scenario == "same_zone" and deployment.experiment_id == "EXP-900" and deployment.context == "failure_check")
+                               or (scenario == "same_zone" and deployment.experiment_id == "EXP-903" and deployment.context == "standard")
+                               or (scenario == "placement_optimization" and deployment.experiment_id == "EXP-003" and deployment.context == "standard")))
+            if not (research or replacement or acceptance):
+                raise AwsProviderError("Stockholm locality is outside the registered S1/S3 research or acceptance scope", category="scenario_mismatch")
         return list(dict.fromkeys(actual[0]))
 
     def _deployment_scope(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
@@ -1447,15 +1700,29 @@ class AwsProviderDriver:
 
     def _run(self, action_id: str, argv: list[str], timeout: int, *, cwd: Path | None = None, stdin: str | None = None) -> CommandResult:
         registration_action = action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")) and "-cancel-" not in action_id
-        if self._registration_deadline is not None and (registration_action or action_id.startswith("aws-safety-apply-")):
+        reviewed_safety = (action_id.startswith("aws-safety-apply-")
+            and self.settings.plan_review_timeout_seconds > 0
+            and self._registration_review_deadline is not None)
+        if self._registration_deadline is not None and (registration_action or
+                (action_id.startswith("aws-safety-apply-") and not reviewed_safety)):
             remaining = int(self._registration_deadline - time.monotonic())
             if remaining <= 0:
                 raise AwsProviderError("AWS expiry registration exceeded its absolute deadline", category="expiry_registration_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
-        if self._cleanup_deadline is not None and action_id.startswith("aws-expiry-"):
+        if (self.settings.workflow_profile is not None
+                and self.settings.plan_review_timeout_seconds > 0
+                and registration_action):
+            timeout = min(timeout, self.settings.command_timeout_seconds)
+        if reviewed_safety:
+            remaining = int(self._registration_review_deadline - time.monotonic())
+            if remaining <= 0:
+                raise AwsProviderError("AWS protection review exceeded its original registration-stage deadline",
+                    category="expiry_registration_timeout", action_id=action_id)
+            timeout = min(timeout, remaining)
+        if self._cleanup_deadline is not None:
             remaining = int(self._cleanup_deadline - time.monotonic())
             if remaining <= 0:
-                raise AwsProviderError("AWS expiry cleanup exceeded its bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
+                raise AwsProviderError("AWS cleanup exceeded its original bounded deadline", category="expiry_cleanup_timeout", action_id=action_id)
             timeout = min(timeout, remaining)
         if self._precreate_deadline is not None and action_id == "aws-pair-apply":
             remaining = int(self._precreate_deadline - time.monotonic())
@@ -1474,7 +1741,9 @@ class AwsProviderDriver:
             stdin=stdin,
             environment_classification="contains_secret_references" if self.settings.authentication_reference else "none",
         )
-        initialize_terraform(self.runner, request, self._initialized_terraform)
+        initialization_request = request.model_copy(update={"timeout_seconds": min(
+            timeout, self.settings.command_timeout_seconds)})
+        initialize_terraform(self.runner, initialization_request, self._initialized_terraform)
         remaining_after_init = command_deadline - time.monotonic()
         if remaining_after_init <= 0:
             raise AwsProviderError("original command deadline elapsed during private Terraform initialization", category="cap_insufficient", action_id=action_id)
@@ -1517,7 +1786,9 @@ class AwsProviderDriver:
             return result
         if "apply" in request.argv and any(a.startswith("-chdir=") for a in request.argv):
             from ..terraform_plan import reviewed_apply
-            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds)
+            return reviewed_apply(request, execute, review_seconds=self.settings.plan_review_timeout_seconds,
+                command_timeout_seconds=self.settings.command_timeout_seconds,
+                review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
     def _aws_json(self, *argv: str) -> dict[str, Any]:

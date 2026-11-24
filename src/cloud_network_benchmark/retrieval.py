@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import gzip
 import math
 from pathlib import Path, PurePosixPath
 import re
 import shlex
 import os
+import shutil
 import subprocess
 import time
 from typing import Callable, Dict, List, Optional
@@ -18,6 +20,7 @@ from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidenc
 from .contracts.artifacts import ArtifactInput, ArtifactRecord, resolve_artifact_path
 from .contracts.common import ArtifactExpectation, CommandOutcome, Evidence, FailureEvidence, StrictModel, StringEvidence, VmRole
 from .contracts.execution import BOUNDED_COPY_EOF_MARKER, CommandRequest, CommandResult, CommandRunner
+from .closed_archive import FAT32_FILE_LIMIT
 
 
 def _request(action_id, connection, argv, timeout, action_type="ssh") -> CommandRequest:
@@ -153,6 +156,9 @@ class TransferAttempt(StrictModel):
     size_bytes: Optional[int] = None
     sha256: Optional[str] = None
     reason: Optional[str] = None
+    transport_encoding: str = "identity"
+    archive_bytes: Optional[int] = None
+    archive_sha256: Optional[str] = None
 
 
 class RetrievalResult(StrictModel):
@@ -165,6 +171,7 @@ class RetrievalResult(StrictModel):
     failures: List[dict] = Field(default_factory=list)
     attempts: List[TransferAttempt] = Field(default_factory=list)
     failure: AccessFailureEvidence | None = None
+    archive_status: dict = Field(default_factory=lambda: {"status": "not_configured", "verified": False})
 
 
 def _inventory_script(source_path: str) -> str:
@@ -187,6 +194,62 @@ def _bounded_stream_script(source_path: str, maximum_bytes: int) -> str:
             "python3 -c 'import os,sys; sys.exit(0 if os.read(3, 1) == b\"\" else 1)' || exit 1; "
             f"printf '{BOUNDED_COPY_EOF_MARKER}\\n' >&2; "
             "else exit 1; fi")
+
+
+def _bounded_gzip_script(item: RetrievalItem) -> str:
+    """Create a deterministic per-file gzip archive on the guest, then stream it.
+
+    Source bytes and digest are rechecked before compression. The temporary
+    archive is on the same guest workspace, bounded by the original size, and
+    removed by the shell trap. Native source files are never modified/deleted.
+    """
+    path = shlex.quote(item.source_path)
+    folder = shlex.quote(str(PurePosixPath(item.source_path).parent))
+    ancestors = " && ".join(f"[ ! -L {shlex.quote(str(parent))} ]"
+        for parent in reversed(PurePosixPath(item.source_path).parents) if str(parent) != "/")
+    digest = shlex.quote(item.expected_sha256)
+    return ("set -eu; "
+        f"if {ancestors} && [ -f {path} ] && [ ! -L {path} ]; then :; else exit 1; fi; "
+        f"actual_size=$(wc -c < {path}); [ \"$actual_size\" -eq {item.expected_size_bytes} ] || exit 1; "
+        f"actual_hash=$(sha256sum {path}); set -- $actual_hash; [ \"$1\" = {digest} ] || exit 1; source_digest=$1; "
+        f"free_kib=$(df -Pk {folder} | awk 'END {{print $4}}'); "
+        f"[ \"$free_kib\" -ge {max(1, (item.expected_size_bytes + 1048576 + 1023) // 1024)} ] || exit 1; "
+        f"tmp=$(mktemp {folder}/.cnb-archive.XXXXXX); "
+        "trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; "
+        f"gzip -n -c {path} > \"$tmp\"; size=$(wc -c < \"$tmp\"); "
+        f"if [ \"$size\" -le {item.expected_size_bytes} ]; then "
+        "archive_hash=$(sha256sum \"$tmp\"); set -- $archive_hash; "
+        "printf 'CNB_ARCHIVE %s %s\\n' \"$size\" \"$1\" >&2; "
+        f"dd bs=65536 count={item.expected_size_bytes} iflag=count_bytes status=none < \"$tmp\" || exit 1; "
+        "else "
+        f"printf 'CNB_IDENTITY {item.expected_size_bytes} %s\\n' \"$source_digest\" >&2; "
+        f"exec 3< {path} || exit 1; "
+        f"dd bs=65536 count={item.expected_size_bytes} iflag=count_bytes status=none <&3 || exit 1; "
+        "python3 -c 'import os,sys; sys.exit(0 if os.read(3, 1) == b\"\" else 1)' || exit 1; "
+        "fi; "
+        f"printf '{BOUNDED_COPY_EOF_MARKER}\\n' >&2")
+
+
+def _decode_gzip_verified(source: Path, destination: Path, item: RetrievalItem) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with gzip.open(source, "rb") as compressed, destination.open("xb") as output:
+            while block := compressed.read(1024 * 1024):
+                size += len(block)
+                if size > item.expected_size_bytes:
+                    raise ValueError("decompressed archive exceeds the inventoried source size")
+                digest.update(block)
+                output.write(block)
+            output.flush()
+            os.fsync(output.fileno())
+    except (OSError, EOFError) as exc:
+        destination.unlink(missing_ok=True)
+        raise ValueError("compressed archive is corrupt or incomplete") from exc
+    if size != item.expected_size_bytes or digest.hexdigest() != item.expected_sha256:
+        destination.unlink(missing_ok=True)
+        raise ValueError("decompressed payload size or SHA-256 differs from closed source manifest")
+    return size, digest.hexdigest()
 
 
 def _failure_record(item: RetrievalItem, category: str, message: str, action_id: str | None = None) -> FailureEvidence:
@@ -223,7 +286,7 @@ def _evidence_failure(item: RetrievalItem, category: str, message: str, action_i
     return FailureEvidence(category=category, message=message, action_id=action_id, occurred_at=datetime.now(timezone.utc), details={"artifact_id": item.artifact_id})
 
 
-def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic, max_attempts: int = 2, attempt_offset: int = 0, retry_admission: Callable[[RetrievalItem], bool] | None = None, transfer_admission: Callable[[RetrievalItem, int], bool] | None = None) -> RetrievalResult:
+def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, runner: CommandRunner, filesystem: Path, *, deadline: RemoteDeadline, clock: Callable[[], float] = time.monotonic, max_attempts: int = 2, attempt_offset: int = 0, retry_admission: Callable[[RetrievalItem], bool] | None = None, transfer_admission: Callable[[RetrievalItem, int], bool] | None = None, compressed_transfer: bool = False) -> RetrievalResult:
     # Keep the historical two-attempt default for existing F02 callers. F09
     # supplies an explicit one-retry ceiling and a fresh F11 check immediately
     # before that retry. Validate before path creation or command execution.
@@ -231,6 +294,8 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
         raise ValueError("max_attempts must be the strict integer 1 or 2")
     if isinstance(attempt_offset, bool) or not isinstance(attempt_offset, int) or attempt_offset not in (0, 1) or attempt_offset + max_attempts > 2:
         raise ValueError("attempt_offset and max_attempts must keep the total attempt number at or below 2")
+    if type(compressed_transfer) is not bool:
+        raise ValueError("compressed_transfer must be a strict boolean")
     if manifest.deployment_id != connection.deployment_id or manifest.identity != connection.identity.model_dump():
         raise ValueError("retrieval manifest identity does not match connection")
     child_root = filesystem.resolve()
@@ -261,6 +326,8 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             destination_paths[item.artifact_id] = resolved
         except (ValueError, OSError) as exc:
             preflight_errors[item.artifact_id] = str(exc)
+        if compressed_transfer and item.expected_size_bytes > FAT32_FILE_LIMIT:
+            preflight_errors[item.artifact_id] = "single-file compressed transfer exceeds FAT32-safe bound; archive must be split before copying"
     entries = list(destination_paths.items())
     for index, (artifact_id, path) in enumerate(entries):
         for other_id, other in entries[index + 1:]:
@@ -330,6 +397,28 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
             records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path, kind=item.kind, producer=item.source_role, unit_id=item.unit_id, deployment_id=item.deployment_id, closed=True, size_bytes=Evidence[int](unavailable_reason="not copied"), sha256=StringEvidence(unavailable_reason="not copied"), retrieval_state="failed", failure=failure_record))
             stop = True
             continue
+        if compressed_transfer:
+            try:
+                # At peak this item has its compressed transfer stage plus the
+                # verified raw staging file. Previously published items are
+                # already reflected in the current free-space observation.
+                required_free = item.expected_size_bytes * 2 + 1024 * 1024
+                if shutil.disk_usage(child_root).free < required_free:
+                    raise OSError("destination free space is below raw-plus-archive peak headroom")
+            except OSError as exc:
+                reason = "destination_low_disk"
+                failure = _evidence_failure(item, reason, str(exc))
+                failures.append(failure.model_dump(mode="json"))
+                primary_failure = primary_failure or AccessFailureEvidence(stage="retrieval", vm_id=vm.host,
+                    role=item.source_role, category=reason, message="compressed transfer stopped before remote copy",
+                    source_path=item.source_path, occurred_at=datetime.now(timezone.utc))
+                records.append(ArtifactRecord(artifact_id=item.artifact_id, path=item.destination_path,
+                    kind=item.kind, producer=item.source_role, unit_id=item.unit_id,
+                    deployment_id=item.deployment_id, closed=True,
+                    size_bytes=Evidence[int](unavailable_reason=reason),
+                    sha256=StringEvidence(unavailable_reason=reason), retrieval_state="failed", failure=failure))
+                stop = True
+                continue
         # Reserve the first attempt before even observing this artifact. This
         # also stops inventory/control work once the shared payload cap is gone.
         first_attempt = attempt_offset + 1
@@ -425,7 +514,15 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                     reason = "cleanup_allowance_reached_before_transfer"
                     stop = True
                     break
-                if transfer_admission is None:
+                if compressed_transfer:
+                    req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm,
+                        ["sh", "-c", _bounded_gzip_script(item)],
+                        min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "ssh")
+                    if req.argv[-1] != "[request-construction-failed]":
+                        req = req.model_copy(update={"argv": [req.argv[0], "-T", *req.argv[1:]]})
+                    result = (_execute(runner, req) if req.argv[-1] == "[request-construction-failed]"
+                        else runner.run_bounded_copy(req, staging, item.expected_size_bytes))
+                elif transfer_admission is None:
                     remote = f"{vm.user}@{vm.host}:{item.source_path}"
                     req = _request(f"f02r-retrieve-{item.artifact_id}-{attempt}", vm,
                         [remote, str(staging)], min(item.timeout_seconds, connection.timeouts.transfer_seconds, remaining), "scp")
@@ -446,13 +543,44 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                 continue
             actions.append(_action(req.action_id, req.action_type, vm, req, result))
             size = digest = None
+            archive_bytes = archive_digest = None
+            transport_encoding = "identity"
             reason = None
             if req.argv and req.argv[-1] == "[request-construction-failed]":
                 reason = "transport_preflight_failed"
             elif not staging.is_file() or staging.is_symlink():
                 reason = f"copy_{result.outcome}" if result.outcome != CommandOutcome.SUCCEEDED else "copy_not_materialized"
+            elif compressed_transfer and result.outcome != CommandOutcome.SUCCEEDED:
+                reason = f"copy_{result.outcome}"
             else:
                 try:
+                    if compressed_transfer:
+                        archive_proofs = [line.split() for line in result.stderr.splitlines()
+                                          if line.startswith("CNB_ARCHIVE ")]
+                        identity_proofs = [line.split() for line in result.stderr.splitlines()
+                                           if line.startswith("CNB_IDENTITY ")]
+                        if len(archive_proofs) == 1 and not identity_proofs:
+                            transport_encoding = "gzip"
+                            archive_bytes, archive_digest = _hash_file(staging, deadline=deadline, clock=clock)
+                            proof = archive_proofs[0]
+                            if (len(proof) != 3 or not proof[1].isdigit()
+                                    or int(proof[1]) != archive_bytes or proof[2] != archive_digest):
+                                raise ValueError("remote archive byte count or SHA-256 proof mismatch")
+                            decoded = staging.with_name(staging.name + ".decoded")
+                            try:
+                                size, digest = _decode_gzip_verified(staging, decoded, item)
+                            except ValueError as exc:
+                                raise ValueError(f"compressed archive verification failed: {exc}") from exc
+                            staging.unlink()
+                            os.replace(decoded, staging)
+                        elif len(identity_proofs) == 1 and not archive_proofs:
+                            proof = identity_proofs[0]
+                            if (len(proof) != 3 or not proof[1].isdigit()
+                                    or int(proof[1]) != item.expected_size_bytes
+                                    or proof[2] != item.expected_sha256):
+                                raise ValueError("remote identity byte count or SHA-256 proof mismatch")
+                        else:
+                            raise ValueError("remote transfer encoding proof is missing or ambiguous")
                     size, digest = _hash_file(staging, deadline=deadline, clock=clock)
                     if result.outcome != CommandOutcome.SUCCEEDED:
                         reason = f"copy_{result.outcome}"
@@ -467,9 +595,16 @@ def run_retrieval(connection: ConnectionOutput, manifest: RetrievalManifest, run
                     size, digest = exc.size, exc.sha256
                     reason = "cleanup_allowance_reached_during_local_verification"
                     stop = True
+                except ValueError:
+                    reason = "compressed_archive_integrity_mismatch"
                 except OSError:
                     reason = "staging_read_failed"
-            attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt, staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed", size_bytes=size, sha256=digest, reason=reason))
+            attempts.append(TransferAttempt(artifact_id=item.artifact_id, attempt=attempt,
+                staging_path=str(staging.relative_to(child_root)), outcome="verified" if reason is None else "failed",
+                size_bytes=size, sha256=digest, reason=reason,
+                transport_encoding=transport_encoding,
+                archive_bytes=archive_bytes,
+                archive_sha256=archive_digest))
             if reason == "transport_preflight_failed":
                 stop = True
             if reason is None:

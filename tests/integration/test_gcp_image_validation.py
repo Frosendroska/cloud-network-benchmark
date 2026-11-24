@@ -13,7 +13,7 @@ from tests.unit.test_gcp_provider import settings as runtime_settings
 PREFIX = "projects/ubuntu-os-cloud/global/images/"
 OBSERVED = PREFIX + "ubuntu-2404-noble-amd64-v20261105"
 LEGACY = PREFIX + "ubuntu-2404-lts-amd64-v20261001"
-REGIONS = ("europe-west3", "europe-west2")
+REGIONS = ("europe-west3", "europe-west2", "europe-north1")
 
 
 @pytest.fixture(params=["provider", "campaign"])
@@ -49,12 +49,18 @@ def test_concrete_ubuntu_images_are_accepted_by_both_entrypoints(validate_images
 
 
 def test_regions_can_pin_distinct_concrete_image_names(validate_images):
-    assert validate_images({"europe-west3": OBSERVED, "europe-west2": LEGACY}) == []
+    assert validate_images({"europe-west3": OBSERVED, "europe-west2": LEGACY,
+                            "europe-north1": OBSERVED}) == []
 
 
 def test_explicit_finland_image_can_join_baseline_map(validate_images):
     assert validate_images({"europe-west3": LEGACY, "europe-west2": LEGACY,
                             "europe-north1": OBSERVED}) == []
+
+
+def test_provider_accepts_its_baseline_region_map(tmp_path):
+    model = runtime_settings(tmp_path, images={"europe-west3": OBSERVED, "europe-west2": LEGACY})
+    assert model.images == {"europe-west3": OBSERVED, "europe-west2": LEGACY}
 
 
 def test_finland_only_image_map_requires_finland_selected_region():
@@ -90,7 +96,7 @@ def test_finland_only_image_map_requires_finland_selected_region():
         "latest-suffix", "traversal", "trailing-path", "encoded-path", "query", "fragment",
         "url", "newline", "space"])
 def test_aliases_wrong_images_and_unsafe_references_are_rejected(validate_images, image):
-    errors = validate_images({"europe-west3": LEGACY, "europe-west2": image})
+    errors = validate_images({"europe-west3": LEGACY, "europe-west2": LEGACY, "europe-north1": image})
     assert errors and "image" in errors[0]
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -13,7 +15,106 @@ from .admission import load_cost_inputs
 from .config import resolve_campaign
 from .scheduling import load_schedule
 from .lifecycle_bundle import recommend_calibration_common_n
-from .lifecycle_runtime import load_runtime_config, load_initialized_campaign
+from .lifecycle_runtime import _constant, _object, load_runtime_config, load_initialized_campaign
+
+
+def _archive_status_projection(result: Any) -> dict[str, Any]:
+    """Keep durable nonsecret archive outcome without request/session data."""
+    outcome = result.values.get("retrieve")
+    evidence = getattr(outcome, "evidence", None)
+    status = getattr(evidence, "archive_status", None)
+    if not isinstance(status, dict):
+        return {"status": "not_configured", "verified": False}
+    keys = {"status", "verified", "bucket", "prefix", "manifest_sha256", "archive_bytes",
+        "controller_archive_disk_bytes", "staging_peak_bytes", "staging_filesystem_free_bytes",
+        "completion_generation", "reason", "error", "partial_objects"}
+    return {key: status[key] for key in sorted(keys & status.keys())}
+
+
+def _verified_replay_entry(*, capsule_path: Path, capsule_sha256: str,
+                           observer: dict[str, Any], repository_root: Path) -> tuple[str, Path]:
+    """Bind replay export reuse to this runtime's registered archive-pending entry."""
+    capsule_path = Path(capsule_path)
+    if capsule_path.is_symlink() or not capsule_path.is_file():
+        raise ValueError("replay capsule must be a regular non-symlink file")
+    capsule_bytes = capsule_path.read_bytes()
+    if hashlib.sha256(capsule_bytes).hexdigest() != capsule_sha256:
+        raise ValueError("replay capsule bytes differ from their separately bound digest")
+    capsule = json.loads(capsule_bytes)
+    if capsule.get("schema_version") != 2 or capsule.get("status") != "archive_pending_replay":
+        raise ValueError("replay capsule is not a batch archive-pending capsule")
+    stage_path = Path(observer["prepared_stage_path"])
+    journal_path = Path(observer["journal_path"])
+    if any(path.is_symlink() or not path.is_file() for path in (stage_path, journal_path)):
+        raise ValueError("registered prepared stage or campaign journal is unavailable")
+    stage = json.loads(stage_path.read_text(encoding="utf-8"))
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if (stage.get("stage_id") != observer.get("stage_id")
+            or stage.get("stage_id") != journal.get("stage_id")
+            or Path(stage.get("repository_root", "")).resolve(strict=True) != repository_root.resolve(strict=True)):
+        raise ValueError("registered stage identity or repository root differs from replay runtime")
+    results_root = Path(stage.get("results_root", ""))
+    if (not results_root.is_absolute() or results_root.is_symlink() or not results_root.is_dir()
+            or results_root.resolve(strict=True) != results_root.absolute()):
+        raise ValueError("registered stage results root must be an existing real directory")
+    results_root = results_root.resolve(strict=True)
+    entry_id = observer.get("entry_id")
+    entries = [row for row in stage.get("entries", [])
+        if isinstance(row, dict) and row.get("entry_id") == entry_id]
+    if len(entries) != 1:
+        raise ValueError("runtime does not identify exactly one registered campaign entry")
+    entry = entries[0]
+    capsule_runs = {provider: str(child.get("run_id"))
+        for provider, child in capsule.get("child_manifests", {}).items() if isinstance(child, dict)}
+    if not capsule_runs or entry.get("run_ids") != capsule_runs:
+        raise ValueError("registered campaign run ids differ from the replay capsule")
+    parent_relative = Path(capsule.get("parent_path", ""))
+    if parent_relative.is_absolute() or ".." in parent_relative.parts:
+        raise ValueError("replay capsule parent path is unsafe")
+    capsule_parent = (repository_root / parent_relative).resolve(strict=True)
+    registered_parent = Path(entry.get("parent_manifest_path", "")).resolve(strict=True)
+    if capsule_parent != registered_parent:
+        raise ValueError("registered parent manifest differs from replay capsule")
+    record = journal.get("entries", {}).get(entry_id)
+    result = record.get("result") if isinstance(record, dict) else None
+    replay_ref = result.get("replay_capsule") if isinstance(result, dict) else None
+    if (not isinstance(record, dict) or record.get("state") != "archive_pending_validation"
+            or not isinstance(result, dict) or result.get("cleanup_open") is not False
+            or not isinstance(replay_ref, dict)
+            or replay_ref.get("sha256") != capsule_sha256
+            or Path(replay_ref.get("path", "")).resolve(strict=True) != capsule_path.resolve(strict=True)):
+        raise ValueError("campaign journal does not bind this capsule to a closed archive-pending entry")
+    result_paths = capsule.get("result_paths")
+    if not isinstance(result_paths, dict) or set(result_paths) != set(capsule_runs):
+        raise ValueError("replay capsule result roots do not match its registered provider set")
+    for relative in result_paths.values():
+        if not isinstance(relative, str):
+            raise ValueError("replay capsule has an invalid result path")
+        result_path = (repository_root / relative).resolve(strict=True)
+        try:
+            result_path.relative_to(results_root)
+        except ValueError as exc:
+            raise ValueError("replay capsule result path is outside the registered stage results root") from exc
+    return entry_id, results_root
+
+
+def _read_replay_quota_evidence(path: Path, expected_sha256: str) -> dict[str, Any]:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("fresh quota evidence must be a regular non-symlink file")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise ValueError("fresh quota evidence differs from its separately bound SHA-256")
+    document = json.loads(content, object_pairs_hook=_object, parse_constant=_constant)
+    fields = ("measured_free_bytes", "measured_at", "metadata_headroom_bytes",
+        "projected_other_growth_bytes", "reserve_bytes")
+    if (not isinstance(document, dict) or any(key not in document for key in fields)
+            or any(type(document[key]) is not int or document[key] <= 0
+                for key in ("measured_free_bytes", "metadata_headroom_bytes",
+                    "projected_other_growth_bytes", "reserve_bytes"))
+            or not isinstance(document["measured_at"], str)):
+        raise ValueError("quota evidence must bind measured bytes/time, metadata, other growth, and reserve")
+    return document
 
 
 def preview_lifecycle(*, config_path: Path, repository_root: Path,
@@ -81,11 +182,32 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--private-root", type=Path,
         help="deprecated for cleanup; original private paths come from the private recovery journal")
     cleanup.add_argument("--controller-session", required=True)
+    cleanup.add_argument("--source-draft", type=Path,
+        help="frozen F11 draft for a pre-provider initialization failure")
+    cleanup.add_argument("--stage-id")
+    cleanup.add_argument("--entry-id")
+    cleanup.add_argument("--source-config", type=Path)
+    cleanup.add_argument("--parent-manifest", type=Path)
+    cleanup.add_argument("--original-session-id")
+    cleanup.add_argument("--reservation-id")
     cleanup.add_argument("--format", choices=("human", "json"), default="human")
     recommendation = commands.add_parser("recommend-common-n")
     recommendation.add_argument("--validation-results", required=True, type=Path,
         help="JSON array of saved F08 calibration ValidationResult objects")
     recommendation.add_argument("--format", choices=("human", "json"), default="human")
+    replay = commands.add_parser("replay-archives")
+    replay.add_argument("--capsule", required=True, type=Path)
+    replay.add_argument("--capsule-sha256", required=True)
+    replay.add_argument("--runtime-config", required=True, type=Path)
+    replay.add_argument("--restore-path", required=True, type=Path,
+        help="current roomy destination; free space is checked again at restore time")
+    replay.add_argument("--prune-verified-scratch", action="store_true",
+        help="after valid replay and verified export, remove only generation-verified downloaded archive/native scratch")
+    replay.add_argument("--quota-evidence", type=Path,
+        help="fresh user-quota JSON receipt for opt-in pruning (must be measured within 15 minutes)")
+    replay.add_argument("--quota-evidence-sha256",
+        help="separate SHA-256 binding for --quota-evidence")
+    replay.add_argument("--format", choices=("human", "json"), default="json")
     return parser
 
 
@@ -171,11 +293,43 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     recovery_factory=built["recovery_factory"])
                 validations = {}
                 finalization_failure = None
+                replay_capsule = None
+                archive_pending = bool(runtime.get("archive_sink"))
                 if lifecycle.provider_results and lifecycle.reservation_evidence is not None:
                     try:
-                        validations = finalize_production_batch(
-                            parent_path=runtime["initialized_campaign_manifest"], children=children,
-                            parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
+                        if archive_pending:
+                            from .archive_replay import write_batch_replay_capsule
+                            archives = {}
+                            result_roots = {}
+                            child_manifest_paths = {}
+                            for provider, provider_result in lifecycle.provider_results.items():
+                                retrieve = provider_result.values.get("retrieve")
+                                retrieval = getattr(retrieve, "evidence", None)
+                                receipt = getattr(retrieval, "archive_status", None)
+                                if not isinstance(receipt, dict) or receipt.get("status") != "verified":
+                                    raise ValueError("archive sink did not return a verified complete provider receipt")
+                                archives[provider] = receipt
+                                child_ref = next(row for row in initialized.child_runs
+                                    if str(row.provider) == provider)
+                                child_path = Path(child_ref.manifest_path)
+                                result_root = Path(child_ref.result_path)
+                                if not child_path.is_absolute(): child_path = Path.cwd() / child_path
+                                if not result_root.is_absolute(): result_root = Path.cwd() / result_root
+                                child_manifest_paths[provider] = child_path.resolve(strict=True)
+                                result_roots[provider] = result_root.resolve(strict=True)
+                            capsule_root = Path(runtime["archive_sink"]["archive_root"]) / "replay-capsules"
+                            capsule_root.mkdir(parents=True, exist_ok=True)
+                            capsule_path = capsule_root / f"{initialized.campaign_id}-{lifecycle.reservation_evidence.reservation_id.value}.json"
+                            replay_capsule = write_batch_replay_capsule(capsule_path,
+                                archives=archives, parent_manifest_path=runtime["initialized_campaign_manifest"],
+                                child_manifest_paths=child_manifest_paths,
+                                result_roots=result_roots, provider_results=lifecycle.provider_results,
+                                reservation=lifecycle.reservation_evidence, repository_root=Path.cwd(),
+                                maximum_capsule_bytes=runtime["archive_sink"]["maximum_capsule_bytes"])
+                        else:
+                            validations = finalize_production_batch(
+                                parent_path=runtime["initialized_campaign_manifest"], children=children,
+                                parent=initialized, lifecycle=lifecycle, repository_root=Path.cwd())
                     except (OSError, ValueError) as exc:
                         finalization_failure = {"category":"post_cleanup_validation_failed","message":str(exc)}
                 data_valid = bool(validations) and all(
@@ -183,7 +337,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                     for value in validations.values())
                 unevaluated = {"f11_reservation_not_evaluated", "paid_acceptance_prerequisites_not_evaluated",
                     "provider_expiry_not_registered", "complete_workflow_allowance_not_supplied"}
-                report.update(status=("complete" if lifecycle.completed and data_valid else
+                report.update(status=("archive_pending_validation" if lifecycle.completed and replay_capsule else
+                    "complete" if lifecycle.completed and data_valid else
                     "rejected" if lifecycle.admission_status != "reserved" else "failed"),
                     reason_codes=sorted((({"post_cleanup_validation_failed"} if finalization_failure else set()) | set(lifecycle.admission_reasons)
                         | ({lifecycle.primary_failure} if lifecycle.primary_failure else set()))
@@ -195,16 +350,18 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         if lifecycle.reservation_evidence is not None else None),
                     providers={provider: {"execution_state": item.execution_state,
                         "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
+                        "archive_status": _archive_status_projection(item),
                         "secondary_failures": item.secondary_failures,
                         "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
                             if provider in validations else None)}
                         for provider, item in lifecycle.provider_results.items()},
                     finalization_failure=finalization_failure,
+                    replay_capsule=replay_capsule,
                     external_calls=len(runner.actions))
                 print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                       f"Lifecycle run {report['status']}; admission: {report['admission_status']}; external calls: {report['external_calls']}",
-                      file=sys.stdout if report["status"] == "complete" else sys.stderr)
-                return 0 if report["status"] == "complete" else 1
+                      file=sys.stdout if report["status"] in {"complete", "archive_pending_validation"} else sys.stderr)
+                return 0 if report["status"] in {"complete", "archive_pending_validation"} else 1
             print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
                   f"Lifecycle preview: {report['status']}; paid eligible: no; external calls: 0")
             return 0 if report["status"] != "invalid" else 2
@@ -229,6 +386,52 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                   (f"Recommended common N: {recommendation.common_n.value}" if recommendation.common_n.value is not None
                    else f"Common N pending: {recommendation.unavailable_reason}"))
             return 0 if recommendation.common_n.value is not None else 1
+        if args.action == "replay-archives":
+            if not args.runtime_config.is_file() or args.runtime_config.is_symlink():
+                raise ValueError("runtime config must be a regular non-symlink file")
+            runtime = load_runtime_config(args.runtime_config)
+            sink = runtime.get("archive_sink")
+            if sink is None:
+                raise ValueError("runtime config has no archive sink")
+            replay_options = {}
+            if args.prune_verified_scratch:
+                if args.quota_evidence is None or not args.quota_evidence_sha256:
+                    raise ValueError("opt-in replay pruning requires --quota-evidence and --quota-evidence-sha256")
+                if not re.fullmatch(r"[a-f0-9]{64}", args.quota_evidence_sha256):
+                    raise ValueError("quota evidence SHA-256 must be a lowercase SHA-256 digest")
+                quota = _read_replay_quota_evidence(args.quota_evidence, args.quota_evidence_sha256)
+                observer = runtime.get("observer")
+                if not isinstance(observer, dict):
+                    raise ValueError("opt-in replay pruning requires the registered observer entry identity")
+                entry_id, results_root = _verified_replay_entry(capsule_path=args.capsule,
+                    capsule_sha256=args.capsule_sha256, observer=observer,
+                    repository_root=Path.cwd())
+                if quota["reserve_bytes"] < int(sink["minimum_controller_free_bytes"]):
+                    raise ValueError("fresh quota reserve is below the frozen runtime controller minimum")
+                replay_options = {"prune_verified_scratch": True,
+                    "closed_export_entry_id": entry_id,
+                    "closed_export_results_root": results_root,
+                    "controller_quota_free_bytes": quota["measured_free_bytes"],
+                    "controller_quota_evidence_path": args.quota_evidence,
+                    "controller_quota_evidence_sha256": args.quota_evidence_sha256,
+                    "metadata_headroom_bytes": quota["metadata_headroom_bytes"],
+                    "projected_other_growth_bytes": quota["projected_other_growth_bytes"],
+                    "minimum_free_bytes": quota["reserve_bytes"]}
+            elif args.quota_evidence is not None or args.quota_evidence_sha256 is not None:
+                raise ValueError("quota evidence arguments require --prune-verified-scratch")
+            from .gcs_archive import google_cloud_storage_backend
+            from .archive_replay import restore_and_finalize_batch_capsule
+            output = restore_and_finalize_batch_capsule(capsule_path=args.capsule,
+                expected_capsule_sha256=args.capsule_sha256,
+                backend=None, backend_factory=lambda: google_cloud_storage_backend(sink), bucket=sink["bucket"],
+                archive_staging_root=sink["staging_directory"],
+                materialization_root=args.restore_path, repository_root=Path.cwd(),
+                maximum_part_bytes=sink["maximum_staging_bytes"],
+                minimum_free_bytes=replay_options.get("minimum_free_bytes",
+                    sink["minimum_controller_free_bytes"]), **{key: value for key, value in replay_options.items()
+                        if key != "minimum_free_bytes"})
+            print(json.dumps(output, indent=2, sort_keys=True))
+            return 0 if output["status"] == "replayed" else 1
         # Cleanup is rebuilt only from the private recovery journal, its saved
         # source-bound provider settings and the original F11 ledger reference.
         if not args.recovery.is_file() or args.recovery.is_symlink():
@@ -245,11 +448,26 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 json.loads(args.recovery.read_text(encoding="utf-8")))
             clock = CleanupClock()
             runner = CountingRunner(cleanup_runner or SubprocessCommandRunner())
-            result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
-                current_session_id=args.controller_session,
-                runner=runner,
-                utc_now=cleanup_utc_now or clock.utc_now,
-                monotonic_now=cleanup_monotonic_now or clock.monotonic)
+            source_values = (args.source_draft, args.stage_id, args.entry_id, args.source_config,
+                args.runtime_config, args.parent_manifest, args.original_session_id, args.reservation_id)
+            if any(value is not None for value in source_values):
+                if any(value is None for value in source_values):
+                    raise ValueError("source-bound precreation cleanup requires all frozen identity arguments")
+                from .precreation_cleanup import run_precreation_cleanup
+                result = run_precreation_cleanup(draft_path=args.source_draft,
+                    stage_id=args.stage_id, entry_id=args.entry_id,
+                    config_path=args.source_config, runtime_path=args.runtime_config,
+                    parent_manifest_path=args.parent_manifest, recovery_path=args.recovery,
+                    repository_root=Path.cwd(), current_session_id=args.controller_session,
+                    original_session_id=args.original_session_id, reservation_id=args.reservation_id,
+                    runner=runner, utc_now=cleanup_utc_now or clock.utc_now,
+                    monotonic_now=cleanup_monotonic_now or clock.monotonic)
+            else:
+                result = build_cleanup_runtime(recovery_path=args.recovery, recovery=recovery,
+                    current_session_id=args.controller_session,
+                    runner=runner,
+                    utc_now=cleanup_utc_now or clock.utc_now,
+                    monotonic_now=cleanup_monotonic_now or clock.monotonic)
         report = {"status": "complete" if result.complete else "blocked",
                 "execution": "not_resumed", "cleanup": "complete" if result.complete else "incomplete",
                 "attempt_id": result.attempt_id,
@@ -257,7 +475,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 "current_session_id": result.current_session_id,
                 "providers": {provider: {key: value for key, value in item.items()
                     if key in {"cleanup", "reconciled", "absence_proved", "billable_resources_present",
-                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason"}}
+                               "cleanup_open", "billing_final", "incurred_usd", "errors", "launch_blocked", "reason",
+                               "acceptance_failed", "cleanup_timing_status", "cleanup_timing_failure"}}
                     for provider, item in result.providers.items()},
                 "external_calls": len(runner.actions) if runner is not None else 0}
         print(json.dumps(report, indent=2, sort_keys=True) if args.format == "json" else
@@ -272,7 +491,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
             error_report.update(primary_failure=lifecycle.primary_failure,
                 campaign_id=initialized.campaign_id,run_ids={key:value.run_id for key,value in children.items()},
                 providers={key:{"execution_state":value.execution_state,"cleanup_state":value.cleanup_state,
-                    "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures}
+                    "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures,
+                    "archive_status":_archive_status_projection(value)}
                     for key,value in lifecycle.provider_results.items()})
         print(json.dumps(error_report,sort_keys=True),file=sys.stderr)
         return 1 if lifecycle is not None else 2

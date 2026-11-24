@@ -4,6 +4,14 @@ mock_provider "azurerm" {
   }
 }
 
+override_resource {
+  target = azurerm_proximity_placement_group.pair[0]
+  values = {
+    id = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06/providers/Microsoft.Compute/proximityPlacementGroups/sweden-s3-standard-ppg"
+  }
+  override_during = plan
+}
+
 variables {
   subscription_id     = "00000000-0000-0000-0000-000000000001"
   resource_group_name = "f06"
@@ -154,5 +162,33 @@ run "sweden_component" {
   assert {
     condition     = length(local.vnets) == 1 && length(azurerm_proximity_placement_group.pair) == 0 && length(azurerm_virtual_network_peering.a_to_b) == 0
     error_message = "The Sweden component has one VNet and no placement group or peering."
+  }
+}
+
+run "sweden_s3_standard_ppg" {
+  command = plan
+  variables {
+    scenario             = "placement_optimization"
+    location             = "swedencentral"
+    region_a             = "swedencentral"
+    region_b             = "swedencentral"
+    zone_a               = "1"
+    zone_b               = "1"
+    selected_image       = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
+    admin_username       = "azureuser"
+    create_ppg           = true
+    placement_group_name = "sweden-s3-standard-ppg"
+  }
+  assert {
+    condition     = length(azurerm_proximity_placement_group.pair) == 1 && azurerm_proximity_placement_group.pair[0].location == "swedencentral" && toset(["Standard_D4s_v5"]) == azurerm_proximity_placement_group.pair[0].allowed_vm_sizes && azurerm_proximity_placement_group.pair[0].id == "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06/providers/Microsoft.Compute/proximityPlacementGroups/sweden-s3-standard-ppg"
+    error_message = "Sweden S3 uses one Standard D4s_v5 PPG in Sweden Central."
+  }
+  assert {
+    condition     = length(azurerm_linux_virtual_machine.pair) == 2 && alltrue([for vm in values(azurerm_linux_virtual_machine.pair) : vm.location == "swedencentral" && vm.zone == "1" && vm.size == "Standard_D4s_v5" && vm.source_image_reference[0].version == "24.04.202610250" && vm.proximity_placement_group_id == "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/f06/providers/Microsoft.Compute/proximityPlacementGroups/sweden-s3-standard-ppg"])
+    error_message = "Both Sweden roles use the exact image, zone, shape, and same Standard PPG."
+  }
+  assert {
+    condition     = length(local.vnets) == 1 && length(azurerm_virtual_network_peering.a_to_b) == 0 && length(azurerm_virtual_network_peering.b_to_a) == 0
+    error_message = "Sweden S3 uses one VNet with no peering."
   }
 }

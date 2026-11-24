@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import gzip
 import json
 import re
 import shlex
@@ -240,14 +241,23 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         remote_argv = shlex.split(request.argv[-1])
         assert remote_argv[:2] == ["sh", "-c"] and len(remote_argv) == 3
         script = remote_argv[2]
-        match = re.search(
-            r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
-            script,
-        )
-        assert match is not None, script
-        assert int(match.group(2)) == maximum_payload_bytes
-        assert "os.read(3, 1)" in script and BOUNDED_COPY_EOF_MARKER in script
-        source_tokens = shlex.split(match.group(1))
+        compressed = "gzip -n -c " in script
+        if compressed:
+            source_match = re.search(r"gzip -n -c (.*?) >", script)
+            assert source_match is not None, script
+            assert "CNB_ARCHIVE %s %s\\n" in script
+            assert "CNB_IDENTITY" in script
+            source_tokens = shlex.split(source_match.group(1))
+        else:
+            match = re.search(
+                r"exec 3< (.*?) \|\| exit 1; dd bs=65536 count=(\d+) iflag=count_bytes status=none <&3 \|\| exit 1;",
+                script,
+            )
+            assert match is not None, script
+            assert int(match.group(2)) == maximum_payload_bytes
+            assert "os.read(3, 1)" in script
+            source_tokens = shlex.split(match.group(1))
+        assert BOUNDED_COPY_EOF_MARKER in script
         assert len(source_tokens) == 1
         relative = PurePosixPath(source_tokens[0]).relative_to("/var/lib/cnb/work")
         root = self.workspace_roots[role]
@@ -255,14 +265,30 @@ class FakePreparedAwsRunner(FakeAwsRunner):
         assert source.resolve().is_relative_to(root.resolve())
         assert source.is_file() and not source.is_symlink()
         self.actions.append(request.action_id)
-        with source.open("rb") as remote, Path(destination).open("xb") as local:
-            local.write(remote.read(maximum_payload_bytes))
-        within_cap = source.stat().st_size <= maximum_payload_bytes
+        source_bytes = source.read_bytes()
+        if compressed:
+            archive = gzip.compress(source_bytes, mtime=0)
+            if len(archive) <= maximum_payload_bytes:
+                with Path(destination).open("xb") as local:
+                    local.write(archive)
+                within_cap = len(source_bytes) <= maximum_payload_bytes
+                proof = f"CNB_ARCHIVE {len(archive)} {hashlib.sha256(archive).hexdigest()}\n"
+            else:
+                with Path(destination).open("xb") as local:
+                    local.write(source_bytes[:maximum_payload_bytes])
+                within_cap = len(source_bytes) <= maximum_payload_bytes
+                proof = f"CNB_IDENTITY {len(source_bytes)} {hashlib.sha256(source_bytes).hexdigest()}\n"
+        else:
+            with Path(destination).open("xb") as local:
+                local.write(source_bytes[:maximum_payload_bytes])
+            within_cap = len(source_bytes) <= maximum_payload_bytes
+            proof = ""
         return CommandResult(action_id=request.action_id,
             outcome="succeeded" if within_cap else "failed", started_at=self._now(),
             finished_at=self._now(), duration_seconds=0,
             exit_code=0 if within_cap else 1, stdout="",
-            stderr="" if within_cap else "remote source exceeds charged payload cap")
+            stderr=(proof + BOUNDED_COPY_EOF_MARKER + "\n") if within_cap
+                else "remote source exceeds charged payload cap")
 
     def run(self, request):
         from tests.fixtures.f02r.support import nft_listing
@@ -810,14 +836,279 @@ def _runtime(tmp_path, repository_root, cost_path, initialized_parent, cost_dige
             "sources": {"expiry_cost_path": aws_fixture, "primary_review_path": None}}}}
 
 
-@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region"), [
-    ("failure_check", False, False, "partial", "eu-central-1"),
-    ("failure_check", True, False, "partial", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-central-1"),
-    ("failure_check", True, True, "valid", "eu-north-1"),
+def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, child,
+        child_ref, parent, lifecycle, runner, clock, recovery_path, fault=None):
+    """Capture the actual F09 fake lifecycle outputs, then exercise capsule replay."""
+    import shutil
+    from cloud_network_benchmark.archive_replay import (write_batch_replay_capsule,
+        restore_and_finalize_batch_capsule)
+    from cloud_network_benchmark.closed_archive import create_closed_archive
+    from cloud_network_benchmark.gcs_archive import publish_guest_archive_parts
+    from cloud_network_benchmark.lifecycle_bundle import build_closed_inventory, lifecycle_declarations
+    from cloud_network_benchmark.diagnostics import _declarations as diagnostic_declarations
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    provider = "aws"
+    provider_result = lifecycle.provider_results[provider]
+    root = (repository_root / child_ref.result_path).resolve()
+    child_path = repository_root / child_ref.manifest_path
+    outcome = provider_result.values["measure"].evidence.outcome
+    builds = provider_result.values["prepare"].evidence["bootstrap"].builds
+    declarations = lifecycle_declarations(child.artifacts, mode=child.mode,
+        measurement_units=child.measurement_units,
+        schedule_supplied=child.schedule_entry.value is not None, build_observations=builds)
+    declared_ids = {item.artifact_id for item in declarations}
+    for role in ("vm_a", "vm_b"):
+        for item in diagnostic_declarations(role):
+            if item.artifact_id not in declared_ids:
+                declarations.append(item)
+                declared_ids.add(item.artifact_id)
+    declarations = [item for item in declarations if item.kind != "build-identity"]
+    if fault == "invalid_native":
+        sockperf_csv = next(item for item in declarations
+            if item.producer == "vm_a" and item.kind == "sockperf-csv")
+        (runner.workspace_roots["vm_a"] / sockperf_csv.path).write_text(
+            "this is not a Sockperf CSV\n", encoding="utf-8")
+    create = provider_result.values["create"]
+    deployment = getattr(create, "deployment", create)
+    vm_ids = {"vm_a": deployment.vm_a.resource_id, "vm_b": deployment.vm_b.resource_id}
+    close_evidence = provider_result.values["close"].evidence
+    close_times = {role: close_evidence["diagnostics"][role].closed_at for role in ("vm_a", "vm_b")}
+    closed = build_closed_inventory(identity={"experiment_id": child.experiment_id,
+            "config_id": child.config_id, "campaign_id": child.campaign_id,
+            "observation_id": child.observation_id, "run_id": child.run_id,
+            "deployment_id": child.deployment_id, "provider": provider,
+            "replaces_run_id": child.replaces_run_id},
+        deployment_id=child.deployment_id, remote_workspace="/var/lib/cnb/work",
+        declarations=declarations, source_roots=runner.workspace_roots, source_vm_ids=vm_ids,
+        measurement_ended_at=outcome.guest_finished_at, closure=close_times)
+    assert not closed.unavailable_items, closed.unavailable_items
+    retrieved = provider_result.values["retrieve"].evidence.records
+    retrieved_native = {(record.artifact_id, record.path, record.unit_id)
+        for record in retrieved if str(record.producer) in {"vm_a", "vm_b"}
+        and record.kind != "build-identity"}
+    inventoried_native = {(item.artifact_id, item.destination_path, item.unit_id) for item in closed.items}
+    assert inventoried_native == retrieved_native, {
+        "missing_from_inventory": sorted(retrieved_native - inventoried_native),
+        "not_retrieved": sorted(inventoried_native - retrieved_native)}
+    guest_archives = []
+    archive_root = tmp_path / "capsule-guest-archives"
+    selected_root = tmp_path / "capsule-selected-native"
+    for item in closed.items:
+        relative = Path(item.destination_path)
+        source = runner.workspace_roots[item.source_role] / relative
+        target = selected_root / item.source_role / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    for role in ("vm_a", "vm_b"):
+        source_root = selected_root / role
+        destination = archive_root / role
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        guest_archives.append({"role": role, "archive_directory": str(destination),
+            "manifest": create_closed_archive(source_root, destination, max_part_bytes=2_000_000)})
+
+    capsule_closed = closed.model_copy(update={"measurement_ended_at": outcome.guest_finished_at,
+        "producers_closed_at": max(close_times.values()),
+        "closure_evidence": "F09 fake guest close and flush evidence"})
+    backend, staging = FakeGCS(), tmp_path / "capsule-upload-staging"
+    staging.mkdir()
+    def fetch(role, part):
+        source = Path(next(row["archive_directory"] for row in guest_archives if row["role"] == role)) / part["path"]
+        target = staging / f"{role}-{part['path']}"
+        shutil.copyfile(source, target)
+        return target
+    receipt = publish_guest_archive_parts(guest_archives=guest_archives, fetch_part=fetch,
+        staging_directory=staging, backend=backend, bucket="f09-fixture-archive",
+        provider=provider, experiment_id=child.experiment_id, run_id=child.run_id,
+        closed_inventory=capsule_closed.model_dump(mode="json"), maximum_part_bytes=2_000_000,
+        maximum_archive_bytes=16_000_000, minimum_controller_free_bytes=0,
+        controller_quota_free_bytes=32_000_000,
+        deadline=type("Deadline", (), {"remaining": lambda self, _clock, **_kwargs: 600.0})(),
+        clock=clock.monotonic)
+
+    # Model the real archive-pending controller state: retain initialized
+    # context, but leave all producer bytes to be materialized from the archive.
+    original_context = {path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
+    original_child = child_path.read_bytes()
+    original_parent = parent_path.read_bytes()
+    for item in closed.items:
+        (root / item.destination_path).unlink(missing_ok=True)
+    child_doc = json.loads(child_path.read_text(encoding="utf-8"))
+    child_doc["artifact_records"] = []
+    child_path.write_text(json.dumps(child_doc, sort_keys=True), encoding="utf-8")
+    reservation = lifecycle.reservation_evidence
+    capsule_path = tmp_path / "archive-pending.json"
+    capsule = write_batch_replay_capsule(capsule_path, archives={provider: receipt},
+        parent_manifest_path=parent_path, child_manifest_paths={provider: child_path},
+        result_roots={provider: root}, provider_results={provider: provider_result},
+        reservation=reservation, repository_root=repository_root, maximum_capsule_bytes=8_000_000)
+    if fault in {"nested_stage", "nested_stage_prune"}:
+        from cloud_network_benchmark.lifecycle_cli import _verified_replay_entry
+        stage_id, entry_id = "acceptance-nested-stage", "V-S1"
+        stage_root = root.parent.parent
+        stage_dir = tmp_path / "registered-stage"
+        stage_dir.mkdir()
+        prepared_path, journal_path = stage_dir / "prepared-stage.json", stage_dir / "campaign-journal.json"
+        stage = {"stage_id": stage_id, "repository_root": str(repository_root),
+            "results_root": str(stage_root), "entries": [{"entry_id": entry_id,
+                "parent_manifest_path": str(parent_path), "run_ids": {provider: child.run_id}}]}
+        record = {"state": "archive_pending_validation", "result": {"cleanup_open": False,
+            "replay_capsule": {"path": str(capsule_path), "sha256": capsule["sha256"]}}}
+        prepared_path.write_text(json.dumps(stage), encoding="utf-8")
+        journal_path.write_text(json.dumps({"stage_id": stage_id,
+            "entries": {entry_id: record}}), encoding="utf-8")
+        verified = _verified_replay_entry(capsule_path=capsule_path,
+            capsule_sha256=capsule["sha256"], observer={"stage_id": stage_id,
+                "entry_id": entry_id, "prepared_stage_path": str(prepared_path),
+                "journal_path": str(journal_path)}, repository_root=repository_root)
+        assert verified == (entry_id, stage_root)
+    restore_staging, materialized = tmp_path / "capsule-restore-staging", tmp_path / "capsule-native"
+    restore_staging.mkdir(); materialized.mkdir()
+    integrity_faults = {"missing_part", "mutated_part", "wrong_generation"}
+    quota_args = {}
+    if fault in {"prune_and_reconcile", "quota_underflow", "nested_stage_prune"}:
+        registered_entry_id = "V-S1"
+        free_bytes = 10**9
+        metadata_bytes = 1_000_000
+        growth_bytes = 900_000_000 if fault == "quota_underflow" else 1_000_000
+        reserve_bytes = 512 * 1024 * 1024
+        quota_path = tmp_path / "fresh-user-quota.json"
+        quota_path.write_text(json.dumps({"measured_free_bytes": free_bytes,
+            "metadata_headroom_bytes": metadata_bytes,
+            "projected_other_growth_bytes": growth_bytes,
+            "reserve_bytes": reserve_bytes,
+            "measured_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        quota_args = {"prune_verified_scratch": True,
+            "closed_export_entry_id": registered_entry_id,
+            "closed_export_results_root": (repository_root / "results" / "nested-stage"
+                if fault == "nested_stage_prune" else repository_root / "results"),
+            "controller_quota_free_bytes": free_bytes,
+            "controller_quota_evidence_path": quota_path,
+            "controller_quota_evidence_sha256": hashlib.sha256(quota_path.read_bytes()).hexdigest(),
+            "metadata_headroom_bytes": metadata_bytes, "projected_other_growth_bytes": growth_bytes,
+            "minimum_free_bytes": reserve_bytes}
+    remote_objects_before = dict(backend.objects)
+    if fault == "quota_underflow":
+        with pytest.raises(OSError, match="user quota cannot cover"):
+            restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+                expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+                archive_staging_root=restore_staging, materialization_root=materialized,
+                repository_root=repository_root, maximum_part_bytes=2_000_000, **quota_args)
+        assert not list(restore_staging.iterdir())
+        assert not list(materialized.iterdir())
+        restored = {"status": "quota_rejected_before_materialization"}
+    elif fault in integrity_faults:
+        object_ref = receipt["objects"][0]
+        stored = backend.objects[object_ref["key"]]
+        if fault == "missing_part":
+            del backend.objects[object_ref["key"]]
+        elif fault == "mutated_part":
+            backend.objects[object_ref["key"]] = (stored[0] + b"tampered", stored[1])
+        else:
+            backend.objects[object_ref["key"]] = (stored[0], "different-generation")
+        with pytest.raises((ValueError, RuntimeError, FileNotFoundError)):
+            restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+                expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+                archive_staging_root=restore_staging, materialization_root=materialized,
+                repository_root=repository_root, maximum_part_bytes=2_000_000,
+                evaluated_at=clock.utc_now() + timedelta(minutes=1), **quota_args)
+        restored = {"status": "archive_integrity_rejected"}
+    else:
+        restored = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+            expected_capsule_sha256=capsule["sha256"], backend=backend, bucket="f09-fixture-archive",
+            archive_staging_root=restore_staging, materialization_root=materialized,
+            repository_root=repository_root, maximum_part_bytes=2_000_000,
+            evaluated_at=clock.utc_now() + timedelta(minutes=1), **quota_args)
+    if fault in {None, "nested_stage", "nested_stage_prune"}:
+        assert restored["status"] == "replayed", restored.get("validation")
+        assert restored["validation"][provider]["status"]["data_validity"] == "valid"
+        assert Path(restored["analysis"]["report_path"]).is_file()
+        assert Path(restored["replay_receipt"]["path"]).is_file()
+    if fault in {"prune_and_reconcile", "nested_stage_prune"}:
+        assert restored["scratch_prune"]["status"] == "complete"
+        assert not Path(restored["native_roots"][provider]).exists()
+        archive_scratch = restore_staging / provider / (
+            f"{provider}-{receipt['manifest']['experiment_id']}-{receipt['run_id']}.guest-archive")
+        assert not archive_scratch.exists()
+        assert backend.objects == remote_objects_before
+        closed_results = (repository_root / "results" / "nested-stage"
+            if fault == "nested_stage_prune" else repository_root / "results")
+        export_root = closed_results / "closed" / "V-S1" / "export"
+        assert export_root.is_dir()
+        for item in closed.items:
+            target = root / item.destination_path
+            assert hashlib.sha256(target.read_bytes()).hexdigest() == item.expected_sha256
+            assert (export_root / "runs" / child.run_id / item.destination_path).read_bytes() == target.read_bytes()
+    if fault in {"reconcile_campaign", "prune_and_reconcile"}:
+        from cloud_network_benchmark.campaign import CampaignDriver
+        from tests.integration.test_campaign_driver import FakeClock as CampaignClock, stage_fixture
+        campaign_clock = CampaignClock()
+        stage = stage_fixture(tmp_path, slots=1)
+        stage.update(stage_id="archive-positive-reconcile", stage="calibration",
+            repository_root=str(repository_root), results_root=str(repository_root / "results"),
+            controller_session_id="fake-session")
+        entry = stage["entries"][0]
+        if fault == "prune_and_reconcile":
+            entry["entry_id"] = "V-S1"
+            assert entry["entry_id"] != str(parent.campaign_id)
+        entry.update(run_ids={provider: child.run_id}, parent_manifest_path=str(parent_path),
+            private_root=str(Path(recovery_path).parent),
+            result_path=str(repository_root / child_ref.result_path))
+        stage["entries"] = [entry]
+        stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        prepared_path = stage_dir / "prepared-stage.json"
+        prepared_path.write_text(json.dumps(stage), encoding="utf-8")
+        driver = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+            launch=lambda *_: pytest.fail("archive reconciliation must not launch"),
+            clock=campaign_clock, sleep=campaign_clock.sleep)
+        journal_path = stage_dir / "campaign-journal.json"
+        saved = driver._load_or_create_journal(stage, journal_path)
+        capsule_bytes = capsule_path.read_bytes()
+        saved["entries"][entry["entry_id"]].update(state="archive_pending_validation",
+            finished_at=campaign_clock.utc_now().isoformat(), result={
+                "cleanup_open": False, "run_ids": entry["run_ids"],
+                "replay_capsule": {"status": "archive_pending_replay", "path": str(capsule_path),
+                    "sha256": hashlib.sha256(capsule_bytes).hexdigest()}})
+        journal_path.write_text(json.dumps(saved), encoding="utf-8")
+        reconciled = driver.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], Path(restored["replay_receipt"]["path"]))
+        assert reconciled["counts"]["complete"] == 1
+        assert reconciled["entries"][entry["entry_id"]]["result"]["archive_validation"] == "valid"
+    elif fault == "invalid_native":
+        assert restored["status"] == "replayed_invalid", restored.get("validation")
+        assert restored["validation"][provider]["status"]["data_validity"] == "invalid"
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink() and path.relative_to(root) not in original_context:
+            path.unlink()
+    for relative, data in original_context.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    child_path.write_bytes(original_child)
+    parent_path.write_bytes(original_parent)
+    return restored
+
+
+@pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "archive_fault"), [
+    ("failure_check", False, False, "partial", "eu-central-1", None),
+    ("failure_check", True, False, "partial", "eu-central-1", None),
+    ("failure_check", True, True, "valid", "eu-central-1", None),
+    ("failure_check", True, True, "valid", "eu-north-1", None),
+    ("failure_check", True, True, "valid", "eu-north-1", "invalid_native"),
+    ("failure_check", True, True, "valid", "eu-north-1", "missing_part"),
+    ("failure_check", True, True, "valid", "eu-north-1", "mutated_part"),
+    ("failure_check", True, True, "valid", "eu-north-1", "wrong_generation"),
+    ("failure_check", True, True, "valid", "eu-north-1", "nested_stage"),
+    ("failure_check", True, True, "valid", "eu-north-1", "nested_stage_prune"),
+    ("failure_check", True, True, "valid", "eu-north-1", "reconcile_campaign"),
+    ("failure_check", True, True, "valid", "eu-north-1", "prune_and_reconcile"),
+    ("failure_check", True, True, "valid", "eu-north-1", "quota_underflow"),
 ])
 def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_only(
-        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail, expected_validity, region):
+        tmp_path, repository_root, request, fake_git_commits, context_name, full_native, late_tail,
+        expected_validity, region, archive_fault):
     from cloud_network_benchmark.manifests import initialize_campaign
     from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
 
@@ -831,7 +1122,31 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     # Keep real implementation identity for the staged-source guard. Only the
     # design identity belongs to this explicitly synthetic, cloud-free fixture.
     from cloud_network_benchmark.manifests import StaticGitProvenance
-    initialized = initialize_campaign(config, repository_root, tmp_path / "results",
+    archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
+        and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
+            "mutated_part", "wrong_generation", "nested_stage", "nested_stage_prune",
+            "reconcile_campaign", "prune_and_reconcile",
+            "quota_underflow"})
+    if archive_roundtrip:
+        import shutil
+        results_root = (repository_root / "results" / "nested-stage"
+            if archive_fault in {"nested_stage", "nested_stage_prune"} else repository_root / "results")
+        existing_results = set(results_root.rglob("*")) if results_root.exists() else set()
+        analysis_root = repository_root / "results" / "analysis" / "archive-replays"
+        existing_analysis = set(analysis_root.rglob("*")) if analysis_root.exists() else set()
+        def cleanup_test_results():
+            for target, baseline in ((results_root, existing_results),
+                    (analysis_root, existing_analysis)):
+                for path in sorted(set(target.rglob("*")) - baseline,
+                        key=lambda item: len(item.parts), reverse=True):
+                    if path.is_dir() and not path.is_symlink():
+                        path.rmdir()
+                    else:
+                        path.unlink(missing_ok=True)
+        request.addfinalizer(cleanup_test_results)
+    else:
+        results_root = tmp_path / "results"
+    initialized = initialize_campaign(config, repository_root, results_root,
         clock=lambda: NOW, token_source=lambda: "campaign",
         design_git=StaticGitProvenance(fake_git_commits["design"]))
     parent_path = Path(initialized.parent_manifest_path)
@@ -896,6 +1211,10 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     assert provider_result.values["retrieve"].stage == "retrieve"
     assert provider_result.values["retrieve"].succeeded is True, getattr(provider_result.values["retrieve"].evidence, "failures", provider_result.values["retrieve"].evidence)
     assert any(action.startswith("f02r-retrieve-") for action in runner.actions)
+    assert any(attempt.transport_encoding == "gzip"
+        for attempt in provider_result.values["retrieve"].evidence.attempts)
+    assert any(attempt.transport_encoding == "identity"
+        for attempt in provider_result.values["retrieve"].evidence.attempts)
     assert any(action.startswith("f02r-") for action in runner.actions)
     assert f"aws-expiry-start-{region}" in runner.actions
     assert "aws-pair-apply" in runner.actions
@@ -921,6 +1240,12 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.lifecycle_projection import finalize_production_batch
     from cloud_network_benchmark.contracts.validation import ValidatorInput
     from cloud_network_benchmark.validation import validate_bundle
+    if archive_roundtrip:
+        child_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+        _roundtrip_f09_archive_capsule(tmp_path=tmp_path, repository_root=repository_root,
+            parent_path=parent_path, child=child, child_ref=child_ref, parent=parent,
+            lifecycle=result, runner=runner, clock=clock, recovery_path=built["recovery_path"],
+            fault=archive_fault)
     finalized = finalize_production_batch(parent_path=parent_path, children={"aws": child},
         parent=parent, lifecycle=result, repository_root=repository_root, evaluated_at=NOW + timedelta(minutes=1))
     result_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
@@ -944,6 +1269,225 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
             assert any(item.unit_id == "idle_latency" and item.code == "timing.coverage_unavailable"
                 for item in replay.findings), replay.findings
     assert (result_file.parent.parent / "checksums.sha256").is_file()
+
+
+@pytest.mark.parametrize("receive_fault", [None, "overflow", "cancelled", "readback", "unknown_create"])
+def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_only(
+        tmp_path, repository_root, fake_git_commits, request, receive_fault):
+    """Exercise the production retrieve callback with an injected transport and GCS backend."""
+    import shutil
+    from cloud_network_benchmark.archive_replay import (
+        restore_and_finalize_batch_capsule, write_batch_replay_capsule)
+    from cloud_network_benchmark.guest_archive import create_guest_archive
+    from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+    from cloud_network_benchmark.manifests import StaticGitProvenance, initialize_campaign
+    from tests.unit.test_gcs_archive import FakeGCS
+
+    config_data = yaml.safe_load((repository_root / "configs/tests/exp-900-single-provider-north.yaml").read_text())
+    config_data["context"] = "failure_check"
+    config = repository_root / "configs/tests" / f"{tmp_path.name}-archive-sink-f09.yaml"
+    request.addfinalizer(lambda: config.unlink(missing_ok=True))
+    config.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    campaign_token = "archive-sink-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    isolated_results = repository_root / "results" / f"archive-sink-test-{hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]}"
+    initialized = initialize_campaign(config, repository_root, repository_root / "results",
+        clock=lambda: NOW, token_source=lambda: campaign_token,
+        design_git=StaticGitProvenance(fake_git_commits["design"]))
+    parent_path = Path(initialized.parent_manifest_path)
+    parent, children = load_initialized_campaign(parent_path, repository_root=repository_root,
+        config_path=config)
+    owned_result_paths = [parent_path]
+    owned_result_paths.extend(Path(row.manifest_path) for row in parent.child_runs)
+    owned_result_paths.extend(Path(row.result_path) for row in parent.child_runs)
+    replay_campaign_id = str(parent.campaign_id)
+    def cleanup_archive_sink_workspace():
+        for path in owned_result_paths:
+            candidate = path if path.is_absolute() else repository_root / path
+            try:
+                candidate.resolve(strict=False).relative_to((repository_root / "results").resolve())
+            except ValueError:
+                continue
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink(missing_ok=True)
+        if isolated_results.is_dir() and not isolated_results.is_symlink():
+            shutil.rmtree(isolated_results)
+        closed_export = repository_root / "results" / "closed" / replay_campaign_id / "export"
+        if closed_export.is_dir() and not closed_export.is_symlink():
+            shutil.rmtree(closed_export)
+            closed_export.parent.rmdir()
+        analysis_export = repository_root / "results" / "analysis" / "archive-replays" / replay_campaign_id
+        if analysis_export.is_dir() and not analysis_export.is_symlink():
+            shutil.rmtree(analysis_export)
+    request.addfinalizer(cleanup_archive_sink_workspace)
+    child = children["aws"]
+    if receive_fault == "readback":
+        class ReadbackFailureGCS(FakeGCS):
+            def download(self, key, destination, **kwargs):
+                if "/parts/" in key:
+                    raise TimeoutError("synthetic archive part readback timeout")
+                return super().download(key, destination, **kwargs)
+        backend = ReadbackFailureGCS()
+    else:
+        backend = FakeGCS()
+    if receive_fault == "unknown_create":
+        backend.interrupt_after = 1
+
+    class ArchiveSinkAwsRunner(FakePreparedAwsRunner):
+        def __init__(self):
+            super().__init__()
+            self.archive_roots = {role: tmp_path / "remote-archives" / role for role in ("vm_a", "vm_b")}
+            self.archive_helpers = {role: tmp_path / "remote-helpers" / role for role in ("vm_a", "vm_b")}
+            self.archive_receive_ids = []
+
+        def _archive_role(self, action_id):
+            role = next((candidate for candidate in ("vm_a", "vm_b") if f"-{candidate}" in action_id), None)
+            assert role is not None, action_id
+            return role
+
+        def _mapped_guest_path(self, role, remote_path):
+            helper_prefix = f"/tmp/cnb-guest-archive-{self.deployment_id}-{role}"
+            archive_prefix = f"/tmp/cnb-closed-{self.deployment_id}-{role}"
+            if remote_path == helper_prefix or remote_path.startswith(helper_prefix + "/"):
+                return self.archive_helpers[role] / remote_path.removeprefix(helper_prefix).lstrip("/")
+            if remote_path == archive_prefix or remote_path.startswith(archive_prefix + "/"):
+                return self.archive_roots[role] / remote_path.removeprefix(archive_prefix).lstrip("/")
+            raise AssertionError(f"unexpected archive guest path: {remote_path}")
+
+        def run(self, request):
+            action = request.action_id
+            if action.startswith("f09-guest-archive-"):
+                self.actions.append(action)
+                role = self._archive_role(action)
+                if "-mkdir-" in action:
+                    self.archive_helpers[role].mkdir(parents=True, exist_ok=True)
+                    self.archive_roots[role].parent.mkdir(parents=True, exist_ok=True)
+                    return _aws_command_result(self, request)
+                if request.action_type == "scp":
+                    source = Path(request.argv[-2])
+                    destination = self._mapped_guest_path(role, request.argv[-1].split(":", 1)[1])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination)
+                    return _aws_command_result(self, request)
+                remote_argv = shlex.split(shlex.split(request.argv[-1])[-1])
+                def option(name): return remote_argv[remote_argv.index(name) + 1]
+                inventory_path = self._mapped_guest_path(role, option("--inventory"))
+                manifest = create_guest_archive(self.workspace_roots[role], self.archive_roots[role],
+                    maximum_part_bytes=int(option("--maximum-part-bytes")),
+                    maximum_archive_bytes=int(option("--maximum-archive-bytes")),
+                    minimum_free_bytes=int(option("--minimum-free-bytes")),
+                    expected_inventory=json.loads(inventory_path.read_text(encoding="utf-8")))
+                return _aws_command_result(self, request, stdout=json.dumps(manifest, sort_keys=True))
+            return super().run(request)
+
+        def run_bounded_copy(self, request, destination, maximum_payload_bytes):
+            if not request.action_id.startswith("f09-guest-part-"):
+                return super().run_bounded_copy(request, destination, maximum_payload_bytes)
+            self.actions.append(request.action_id)
+            self.archive_receive_ids.append(request.action_id)
+            role_by_host = {self.public_a: "vm_a", self.public_b: "vm_b"}
+            role = role_by_host[request.argv[-2].rsplit("@", 1)[-1]]
+            remote_argv = shlex.split(request.argv[-1])
+            script = remote_argv[-1]
+            match = re.search(r"exec 3< (.*?) \|\| exit 1;", script)
+            assert match is not None, script
+            guest_path = shlex.split(match.group(1))[0]
+            source = self._mapped_guest_path(role, guest_path)
+            payload = source.read_bytes()
+            if receive_fault == "cancelled":
+                raise KeyboardInterrupt()
+            if receive_fault == "overflow":
+                Path(destination).write_bytes(payload[:maximum_payload_bytes])
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=self._now(),
+                    finished_at=self._now(), duration_seconds=0, exit_code=1, stdout="", stderr="source grew")
+            Path(destination).write_bytes(payload)
+            return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=self._now(),
+                finished_at=self._now(), duration_seconds=0, exit_code=0, stdout="",
+                stderr=BOUNDED_COPY_EOF_MARKER + "\n")
+
+    def _aws_command_result(runner, request, *, stdout=""):
+        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=runner._now(),
+            finished_at=runner._now(), duration_seconds=0, exit_code=0, stdout=stdout, stderr="")
+
+    runner = ArchiveSinkAwsRunner()
+    runner.region, runner.zone, runner.complete_cleanup = "eu-north-1", "eu-north-1a", True
+    runner.full_native, runner.late_tail = True, True
+    runner.workspace_roots = {"vm_a": tmp_path / "remote-vm-a", "vm_b": tmp_path / "remote-vm-b"}
+    runner.native_root = runner.workspace_roots["vm_a"]
+    runner.run_id, runner.deployment_id = child.run_id, child.deployment_id
+    cost_path = tmp_path / "refreshed-costs.json"
+    campaign, _ = resolve_campaign(config, repository_root)
+    _cost_source(cost_path, child.run_id, campaign.admission.cost_input_id, region="eu-north-1")
+    costs = load_cost_inputs(cost_path)
+    runtime = _runtime(tmp_path, repository_root, cost_path, parent_path, costs.payload_sha256,
+        full_native=True, region="eu-north-1")
+    staging_root = tmp_path / "archive-staging"
+    archive_root = tmp_path / "archive-root"
+    staging_root.mkdir()
+    archive_root.mkdir()
+    runtime["archive_sink"] = {"bucket": "f09-fixture-archive", "maximum_staging_bytes": 2_000_000,
+        "maximum_archive_bytes": 16_000_000, "minimum_controller_free_bytes": 0,
+        "minimum_guest_free_bytes": 0, "controller_quota_free_bytes": 32_000_000,
+        "staging_directory": staging_root, "archive_root": archive_root,
+        "maximum_capsule_bytes": 8_000_000}
+    clock = FakeClock()
+    runtime["sleep"] = clock.sleep
+    built = build_runtime(campaign=campaign, parent=parent, children={"aws": child}, costs=costs,
+        runtime=runtime, controller_session_id="archive-sink-session", runner=runner, clock=clock,
+        private_root=tmp_path / "private", repository_root=repository_root)
+    runtime["archive_sink"]["backend"] = backend
+    lifecycle = run_lifecycle(ledger=built["ledger"], reservation_request=built["request"],
+        admission_plan=built["plan"], allowance=built["allowance"],
+        workflow_factory=built["workflow_factory"], clock=clock,
+        recovery_path=built["recovery_path"], recovery_factory=built["recovery_factory"])
+    provider_result = lifecycle.provider_results["aws"]
+    retrieval = provider_result.values["retrieve"]
+    assert "f09-guest-part-" in " ".join(runner.archive_receive_ids)
+    assert provider_result.values["cleanup"] is not None
+    assert provider_result.cleanup_state == "succeeded"
+    if receive_fault:
+        assert retrieval.succeeded is False
+        assert not list(staging_root.iterdir())
+        if receive_fault in {"readback", "unknown_create"}:
+            archive_status = retrieval.evidence.archive_status
+            assert archive_status["status"] == "failed"
+            assert archive_status["partial_objects"]
+            saved = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
+            saved_status = saved["providers"][0]["archive_status"]
+            assert saved_status["partial_objects"] == archive_status["partial_objects"]
+            if receive_fault == "unknown_create":
+                assert saved_status["partial_objects"][0]["create_outcome"] == "unknown"
+                assert saved_status["partial_objects"][0]["generation"] == "unknown"
+            assert backend.deleted == []
+        else:
+            assert not backend.objects
+        return
+
+    receipt = retrieval.evidence.archive_status
+    assert receipt["status"] == "verified"
+    assert receipt["validation_state"] == "archive_pending_validation"
+    child_ref = next(row for row in parent.child_runs if str(row.provider) == "aws")
+    child_path = Path(child_ref.manifest_path)
+    result_root = Path(child_ref.result_path)
+    capsule_path = archive_root / "replay-capsules" / "archive-sink-capsule.json"
+    capsule = write_batch_replay_capsule(capsule_path, archives={"aws": receipt},
+        parent_manifest_path=parent_path, child_manifest_paths={"aws": child_path},
+        result_roots={"aws": result_root}, provider_results=lifecycle.provider_results,
+        reservation=lifecycle.reservation_evidence, repository_root=repository_root,
+        maximum_capsule_bytes=runtime["archive_sink"]["maximum_capsule_bytes"])
+    materialization_root = tmp_path / "restored-results"
+    materialization_root.mkdir()
+    replay = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+        expected_capsule_sha256=capsule["sha256"], backend=backend,
+        bucket=runtime["archive_sink"]["bucket"], archive_staging_root=staging_root,
+        materialization_root=materialization_root, repository_root=repository_root,
+        maximum_part_bytes=runtime["archive_sink"]["maximum_staging_bytes"],
+        evaluated_at=clock.utc_now() + timedelta(minutes=1))
+    assert replay["status"] == "replayed", replay
+    assert replay["scratch_prune"] == {"status": "not_requested", "items": []}
+    assert Path(replay["native_roots"]["aws"]).is_dir()
+    assert (staging_root / "aws" / f"aws-{child.experiment_id}-{child.run_id}.guest-archive").is_dir()
 
 
 def test_default_factory_stabilizes_for_full_minimum_with_fake_clock(tmp_path, repository_root, monkeypatch):

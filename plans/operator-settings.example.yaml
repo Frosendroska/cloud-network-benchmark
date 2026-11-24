@@ -6,6 +6,10 @@ schema_version: 1
 state_root: /srv/cnb/private
 results_root: /srv/cnb/results
 minimum_free_bytes: null
+# Optional accepted, controller-built Ubuntu24.04 x86-64 tools archive.
+# Supplying it binds both VM installs to this exact local path and digest; the
+# selected bootstrap has no source-build fallback on any bundle failure.
+prebuilt_bundle: null # {path: /absolute/path/controller-tools.tar.gz, sha256: <64 lowercase hex>}
 ledger:
   path: /srv/cnb/private/budget-ledger.json
   scope_id: thesis-primary
@@ -20,7 +24,7 @@ providers:
   aws:
     account_id: null
     controller_cidr: null
-    ami_ids: {eu-central-1: null}
+    ami_ids: {eu-north-1: ami-084df9e6ad4622caf}
     public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     diagnostic_interfaces: {vm_a: null, vm_b: null}
@@ -28,7 +32,7 @@ providers:
     subscription_id: null
     tenant_id: null
     controller_cidr: null
-    selected_image: null # concrete Ubuntu24.04 publisher:offer:sku:version, never latest
+    selected_image: Canonical:ubuntu-24_04-lts:server:24.04.202610250 # exercised Sweden image, concrete version
     ssh_public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     poll_seconds: 2
@@ -37,7 +41,7 @@ providers:
   gcp:
     project_id: null
     controller_cidr: null
-    images: {europe-west3: null, europe-west2: null} # provider contract requires both; same pinned global Ubuntu image may be used
+    images: {europe-north1: projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105} # exercised Finland image
     public_key_path: /srv/cnb/credentials/id_ed25519.pub
     authentication_reference: /srv/cnb/credentials/id_ed25519
     diagnostic_interfaces: {vm_a: null, vm_b: null}
@@ -54,6 +58,12 @@ approvals:
   diagnostic_day_authorized: *pending_approval
   size_export_review: *pending_approval
   study_window: *pending_approval
+  weekly_concurrency:
+    confirmed: false
+    source: null
+    fields:
+      mode: paired_s1_s3
+      max_parallel_entries: 2
 pricing:
   reviewed: false
   id: null
@@ -67,6 +77,9 @@ pricing:
     working_limit: 250
     protected_buffer: 50
     total_limit: 300
+  # Finite validation profiles require a fresh priced source bound to the
+  # exact profile IDs. Leave empty to retain standard stage limits.
+  workflow_profiles: []
   expiry:
     aws: {automation_step_price: null, script_second_price: null}
     azure: {automation_rate_per_job_minute: null, job_minutes_bound: null}
@@ -105,6 +118,10 @@ pricing:
       gcp: *pending_components
 stage_inputs:
   acceptance:
+    # Explicit opt-in only. These profiles do not grant paid authority.
+    workflow_profile: null # all_cloud_acceptance_v1 for the paired S1/S3 parents
+    failure_workflow_profile: null # all_cloud_failure_acceptance_v1 for the three registered checks
+    execution_window_utc: null # {not_before_utc: ..., not_after_utc: ...} bound by paired_acceptance approval
     # Fill ONLY after physically supervising each registered attempt.
     failure_checks:
       V-A-FAIL:
@@ -134,6 +151,8 @@ stage_inputs:
       cleanup_seconds: null
       provider_leads_seconds: {aws: 360, azure: null, gcp: 30}
   calibration:
+    workflow_profile: null # all_cloud_calibration_v1 for retained calibration
+    execution_window_utc: null # {not_before_utc: ..., not_after_utc: ...} bound by calibration approval
     start_utc: null
     allowance:
       source_id: null
@@ -153,11 +172,17 @@ stage_inputs:
         confirmed: false
         source: null
         fields:
-          measured_log_bytes: null
-          measured_seconds: null
+          measured_run_raw_bytes: null
+          measured_run_seconds: null
           expected_raw_bytes: null
-          export_verified_bytes: null
-          export_checksum_verified: false
+          expected_archive_bytes: null
+          expected_archive_part_count: null
+          max_guest_raw_bytes: null
+          measured_guest_free_bytes: null
+          guest_headroom_bytes: null
+          destination_headroom_bytes: null
+          archive_manifest_sha256: null
+          archive_checksum_verified: false
     allowance:
       source_id: null
       registration_seconds: null
@@ -172,6 +197,22 @@ stage_inputs:
   week:
     first_day_utc: null
     windows_utc: {night: null, morning: null, afternoon: null, evening: null}
+    approvals:
+      size_export_review:
+        confirmed: false
+        source: null
+        fields:
+          measured_run_raw_bytes: null
+          measured_run_seconds: null
+          expected_raw_bytes: null
+          expected_archive_bytes: null
+          expected_archive_part_count: null
+          max_guest_raw_bytes: null
+          measured_guest_free_bytes: null
+          guest_headroom_bytes: null
+          destination_headroom_bytes: null
+          archive_manifest_sha256: null
+          archive_checksum_verified: false
     allowance:
       source_id: null
       registration_seconds: null

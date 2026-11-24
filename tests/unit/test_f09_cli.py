@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from cloud_network_benchmark.lifecycle_cli import main, preview_lifecycle
 from cloud_network_benchmark.orchestration import SavedLifecycleRecovery, write_recovery_journal
@@ -52,7 +56,7 @@ def test_cli_requires_explicit_paid_scope_for_run():
 
 def test_root_cli_keeps_existing_commands_and_delegates_lifecycle_help(capsys):
     for args, expected in ((["--help"], ("validate", "resolve", "dry-run", "init", "analyze", "lifecycle")),
-                           (["lifecycle", "--help"], ("preview", "run", "cleanup", "recommend-common-n"))):
+                           (["lifecycle", "--help"], ("preview", "run", "cleanup", "recommend-common-n", "replay-archives"))):
         try:
             root_main(args)
         except SystemExit as exc:
@@ -112,3 +116,180 @@ def test_common_n_command_exposes_existing_recommendation_without_freezing_confi
     report = json.loads(capsys.readouterr().out)
     assert code == 1 and report["status"] == "pending"
     assert report["common_n"]["value"] is None and report["config_mutated"] is False
+
+
+def _replay_cli_context(tmp_path, *, archives=None):
+    repository = tmp_path / "repo"
+    manifests = repository / "results" / "manifests"
+    manifests.mkdir(parents=True)
+    parent_path = manifests / "parent.json"
+    parent_path.write_text(json.dumps({"campaign_id": "generated-campaign-91"}), encoding="utf-8")
+    results_root = repository / "private-results" / "P0"
+    (results_root / "raw" / "run-aws-91").mkdir(parents=True)
+    capsule_path = tmp_path / "capsule.json"
+    capsule = {"schema_version": 2, "status": "archive_pending_replay",
+        "parent_path": "results/manifests/parent.json",
+        "parent_manifest": {"campaign_id": "generated-campaign-91"},
+        "result_paths": {"aws": "private-results/P0/raw/run-aws-91"},
+        "child_manifests": {"aws": {"run_id": "run-aws-91"}},
+        "archives": archives or {"aws": {"manifest": {}}}}
+    capsule_path.write_text(json.dumps(capsule, sort_keys=True), encoding="utf-8")
+    capsule_sha256 = hashlib.sha256(capsule_path.read_bytes()).hexdigest()
+    private = tmp_path / "private"
+    private.mkdir()
+    stage_path, journal_path = private / "prepared-stage.json", private / "journal.json"
+    stage = {"stage_id": "P0", "repository_root": str(repository),
+        "results_root": str(results_root), "entries": [{
+        "entry_id": "V-S1", "parent_manifest_path": str(parent_path),
+        "run_ids": {"aws": "run-aws-91"}}]}
+    stage_path.write_text(json.dumps(stage), encoding="utf-8")
+    journal = {"stage_id": "P0", "entries": {"V-S1": {"state": "archive_pending_validation",
+        "result": {"cleanup_open": False, "replay_capsule": {"path": str(capsule_path),
+            "sha256": capsule_sha256}}}}}
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    staging, restore = tmp_path / "staging", tmp_path / "restore"
+    staging.mkdir(); restore.mkdir()
+    runtime_path = tmp_path / "runtime.json"
+    runtime_path.write_text("{}", encoding="utf-8")
+    runtime = {"archive_sink": {"bucket": "fixture-bucket", "staging_directory": staging,
+            "maximum_staging_bytes": 4096, "minimum_controller_free_bytes": 512},
+        "observer": {"stage_id": "P0", "campaign_id": "P0", "entry_id": "V-S1",
+            "workspace": "/var/lib/cnb/work", "prepared_stage_path": stage_path,
+            "journal_path": journal_path}}
+    return {"repository": repository, "runtime_path": runtime_path, "runtime": runtime,
+        "capsule_path": capsule_path, "capsule_sha256": capsule_sha256,
+        "restore_path": restore, "staging": staging, "results_root": results_root}
+
+
+def _replay_cli_args(context, *extra):
+    return ["replay-archives", "--capsule", str(context["capsule_path"]),
+        "--capsule-sha256", context["capsule_sha256"], "--runtime-config", str(context["runtime_path"]),
+        "--restore-path", str(context["restore_path"]), *extra]
+
+
+def test_replay_cli_default_retains_scratch_and_keeps_existing_export_mode(tmp_path, monkeypatch, capsys):
+    from cloud_network_benchmark import archive_replay, gcs_archive, lifecycle_cli
+    context = _replay_cli_context(tmp_path)
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    called = {}
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail("default route defers backend until replay API calls it"))
+    def restore(**kwargs):
+        called.update(kwargs)
+        return {"status": "replayed"}
+    monkeypatch.setattr(archive_replay, "restore_and_finalize_batch_capsule", restore)
+    code = main(_replay_cli_args(context))
+    capsys.readouterr()
+    assert code == 0
+    assert called["backend"] is None and callable(called["backend_factory"])
+    assert called["minimum_free_bytes"] == 512
+    assert "prune_verified_scratch" not in called
+    assert "closed_export_entry_id" not in called
+
+
+def test_replay_cli_opt_in_binds_registered_entry_and_explicit_quota_receipt(
+        tmp_path, monkeypatch, capsys):
+    from cloud_network_benchmark import archive_replay, gcs_archive, lifecycle_cli
+    context = _replay_cli_context(tmp_path)
+    quota_path = tmp_path / "fresh-quota.json"
+    quota = {"measured_free_bytes": 50_000, "measured_at": datetime.now(timezone.utc).isoformat(),
+        "metadata_headroom_bytes": 4096, "projected_other_growth_bytes": 8192,
+        "reserve_bytes": 512 * 1024 * 1024}
+    quota_path.write_text(json.dumps(quota), encoding="utf-8")
+    quota_sha256 = hashlib.sha256(quota_path.read_bytes()).hexdigest()
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail("backend must remain lazy in CLI handoff test"))
+    called = {}
+    monkeypatch.setattr(archive_replay, "restore_and_finalize_batch_capsule",
+        lambda **kwargs: called.update(kwargs) or {"status": "replayed"})
+    code = main(_replay_cli_args(context, "--prune-verified-scratch", "--quota-evidence",
+        str(quota_path), "--quota-evidence-sha256", quota_sha256))
+    capsys.readouterr()
+    assert code == 0
+    assert called["prune_verified_scratch"] is True
+    assert called["closed_export_entry_id"] == "V-S1"
+    assert called["closed_export_results_root"] == context["results_root"]
+    assert called["closed_export_entry_id"] != "generated-campaign-91"
+    assert called["controller_quota_free_bytes"] == quota["measured_free_bytes"]
+    assert called["metadata_headroom_bytes"] == quota["metadata_headroom_bytes"]
+    assert called["projected_other_growth_bytes"] == quota["projected_other_growth_bytes"]
+    assert called["minimum_free_bytes"] == quota["reserve_bytes"]
+
+
+def test_replay_cli_rejects_reserve_below_frozen_runtime_minimum_before_backend(
+        tmp_path, monkeypatch, capsys):
+    from cloud_network_benchmark import gcs_archive, lifecycle_cli
+    context = _replay_cli_context(tmp_path)
+    quota_path = tmp_path / "low-reserve.json"
+    quota = {"measured_free_bytes": 50_000, "measured_at": datetime.now(timezone.utc).isoformat(),
+        "metadata_headroom_bytes": 4096, "projected_other_growth_bytes": 8192, "reserve_bytes": 1}
+    quota_path.write_text(json.dumps(quota), encoding="utf-8")
+    quota_sha256 = hashlib.sha256(quota_path.read_bytes()).hexdigest()
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail("under-floor reserve must be rejected before backend creation"))
+    code = main(_replay_cli_args(context, "--prune-verified-scratch", "--quota-evidence",
+        str(quota_path), "--quota-evidence-sha256", quota_sha256))
+    error = json.loads(capsys.readouterr().err)
+    assert code == 2 and "below the frozen runtime controller minimum" in error["error"]
+
+
+def test_replay_cli_rejects_missing_fresh_quota_before_backend(tmp_path, monkeypatch, capsys):
+    from cloud_network_benchmark import gcs_archive, lifecycle_cli
+    context = _replay_cli_context(tmp_path)
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail("missing quota must be rejected before backend creation"))
+    code = main(_replay_cli_args(context, "--prune-verified-scratch"))
+    error = json.loads(capsys.readouterr().err)
+    assert code == 2 and "quota-evidence" in error["error"]
+
+
+@pytest.mark.parametrize("freshness", ["stale", "underquota"])
+def test_replay_cli_rejects_stale_or_underquota_evidence_before_backend(
+        tmp_path, monkeypatch, capsys, freshness):
+    from cloud_network_benchmark import gcs_archive, lifecycle_cli
+    archives = {"aws": {"manifest": {"closed_inventory": {}, "roles": [
+        {"role": "vm_a", "archive_bytes": 1}, {"role": "vm_b", "archive_bytes": 1}]}}}
+    if freshness == "underquota":
+        from cloud_network_benchmark.contracts.artifacts import ArtifactInput
+        from cloud_network_benchmark.contracts.common import ArtifactExpectation, VmRole
+        from cloud_network_benchmark.retrieval import RetrievalItem, RetrievalManifest
+        now = datetime.now(timezone.utc)
+        declaration = ArtifactInput(artifact_id="native", path="native.csv", kind="sockperf-csv",
+            producer=VmRole.VM_A, expectation=ArtifactExpectation.REQUIRED)
+        item = RetrievalItem(artifact_id="native", deployment_id="dep", source_vm="vm-a",
+            source_role="vm_a", source_path="/work/native.csv", destination_path="native.csv",
+            kind="sockperf-csv", expected_size_bytes=1000, expected_sha256="a" * 64,
+            timeout_seconds=1)
+        closed = RetrievalManifest(identity={}, deployment_id="dep", remote_workspace="/work",
+            declarations=[declaration], items=[item], measurement_ended_at=now,
+            producers_closed_at=now, closure_evidence="closed fixture")
+        archives["aws"]["manifest"]["closed_inventory"] = closed.model_dump(mode="json")
+    context = _replay_cli_context(tmp_path, archives=archives)
+    quota_path = tmp_path / "quota.json"
+    quota = {"measured_free_bytes": 1000, "measured_at": "2020-01-01T00:00:00+00:00"
+            if freshness == "stale" else datetime.now(timezone.utc).isoformat(),
+        "metadata_headroom_bytes": 100, "projected_other_growth_bytes": 100,
+            "reserve_bytes": 512}
+    quota_path.write_text(json.dumps(quota), encoding="utf-8")
+    quota_sha256 = hashlib.sha256(quota_path.read_bytes()).hexdigest()
+    monkeypatch.chdir(context["repository"])
+    monkeypatch.setattr(lifecycle_cli, "load_runtime_config", lambda *_args, **_kwargs: context["runtime"])
+    monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+        lambda _sink: pytest.fail(f"{freshness} quota must fail before backend creation"))
+    code = main(_replay_cli_args(context, "--prune-verified-scratch", "--quota-evidence",
+        str(quota_path), "--quota-evidence-sha256", quota_sha256))
+    error = json.loads(capsys.readouterr().err)
+    assert code == 2
+    if freshness == "stale":
+        assert "15 minutes" in error["error"]
+    else:
+        assert "user quota cannot cover" in error["error"]
+    assert list(context["staging"].iterdir()) == []
+    assert list(context["restore_path"].iterdir()) == []

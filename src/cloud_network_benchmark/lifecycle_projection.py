@@ -321,7 +321,7 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
 
 
 def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: Path,
-                     root: Path, result: Any, reservation: Any) -> Any:
+                     root: Path, repository_root: Path, result: Any, reservation: Any) -> Any:
     from .contracts.common import Evidence, IdentityContext, VmRole
     from .contracts.measurements import CommandEvidence, DiagnosticSample, MeasurementTiming, VmMetadata
     from .contracts.validation import ValidatorInput
@@ -401,8 +401,16 @@ def _validator_input(*, parent: Any, parent_path: Path, child: Any, child_path: 
             else:
                 clock_mappings.extend(parsed)
     receiver_commands = list(getattr(remote, "receiver_command_evidence", ()) or ())
-    resolved_path = root / child.config_provenance.resolved_snapshot_path
-    config_path = root / child.config_provenance.snapshot_path
+    def snapshot_path(value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        # Manifest snapshot paths are repository relative when the result tree
+        # lives inside the owning checkout, and result relative otherwise.
+        repository_path = repository_root / path
+        return repository_path if repository_path.is_file() else root / path
+    resolved_path = snapshot_path(child.config_provenance.resolved_snapshot_path)
+    config_path = snapshot_path(child.config_provenance.snapshot_path)
     schedule_path = (Evidence[str](value=str(root / "schedule.csv"))
         if child.schedule_entry.value is not None and child.config_provenance.schedule_sha256.value
         else Evidence[str](unavailable_reason="no schedule row supplied"))
@@ -470,7 +478,7 @@ def finalize_production_batch(*, parent_path: Path, children: Mapping[str, Any],
             child = _sync_manifest(parent_path=parent_path, child_path=child_path,
                 root=root, child=child, result=result, reservation=reservation, evaluated_at=fixed_at)
         value, builds, receiver_commands, clock_mappings = _validator_input(parent=parent, parent_path=parent_path, child=child,
-            child_path=child_path, root=root, result=result, reservation=reservation)
+            child_path=child_path, root=root, repository_root=repository_root, result=result, reservation=reservation)
         value = ValidatorInput.model_validate(value.model_dump(mode="python"))
         from .lifecycle_bundle import bind_retrieved_acquisition_sources
         from .contracts.common import Evidence, StringEvidence

@@ -33,6 +33,23 @@ def lifecycle_declarations(layout, *, mode, measurement_units, schedule_supplied
                 path=f"metadata/build/{role}-{tool}.identity", kind="build-identity",
                 producer=role, unit_id=None, expectation="required"))
             seen.add(artifact_id)
+    origins = ({(item.role, item.tool) for item in build_observations
+                if getattr(item, "build_origin", "guest-source-build") == "controller-prebuilt"
+                and getattr(item, "origin_proof_bytes", None) is not None
+                and getattr(item, "origin_artifact_id", None) is not None}
+        if build_observations is not None else set())
+    for role, tool in sorted(origins):
+        artifact_id = f"f02r-{role}-{tool}-origin"
+        if artifact_id not in seen:
+            additions.append(ArtifactInput(artifact_id=artifact_id,
+                path=f"metadata/build/{role}-{tool}.origin.json", kind="build-origin",
+                producer=role, unit_id=None, expectation="required"))
+            seen.add(artifact_id)
+    if origins and "f02r-controller-prebuilt-bundle" not in seen:
+        additions.append(ArtifactInput(artifact_id="f02r-controller-prebuilt-bundle",
+            path="metadata/build/controller-prebuilt-tools.tar.gz", kind="controller-prebuilt-bundle",
+            producer="controller", unit_id=None, expectation="required"))
+        seen.add("f02r-controller-prebuilt-bundle")
     if str(getattr(mode, "value", mode)) != "diagnostic_day":
         for unit in measurement_units:
             unit_id = unit.unit_id
@@ -281,7 +298,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
                            reservation_id: str, provider_trigger: datetime,
                            retry_seconds: float, now_utc: Callable[[], datetime],
                            clock: Callable[[], float],
-                           already_retried: Sequence[str] = ()) -> RetrievalResult:
+                           already_retried: Sequence[str] = (),
+                           compressed_transfer: bool = False) -> RetrievalResult:
     """Retrieve once, then re-admit and retry each failed concrete item once.
 
     Each F02 call is explicitly limited to one attempt. F09 makes a fresh
@@ -290,7 +308,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
     throughout, so the cleanup reserve is not reset between rounds.
     """
     first = run_retrieval(connection, manifest, runner, filesystem, deadline=deadline,
-                          clock=clock, max_attempts=1, transfer_admission=transfer_admission)
+                          clock=clock, max_attempts=1, transfer_admission=transfer_admission,
+                          compressed_transfer=compressed_transfer)
     merged = first
     consumed = set(already_retried)
     # Without a durable consumer, refuse retries rather than allow repeated
@@ -328,7 +347,8 @@ def retrieve_closed_bundle(*, connection: Any, manifest: RetrievalManifest, runn
         one_item = retry_manifest(manifest, (artifact_id,))
         second = run_retrieval(connection, one_item, runner, filesystem, deadline=deadline,
                                clock=clock, max_attempts=1, attempt_offset=1,
-                               transfer_admission=transfer_admission)
+                               transfer_admission=transfer_admission,
+                               compressed_transfer=compressed_transfer)
         attempts = [*merged.attempts, *second.attempts]
         by_id = {record.artifact_id: record for record in merged.records}
         by_id.update({record.artifact_id: record for record in second.records})

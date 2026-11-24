@@ -49,21 +49,42 @@ def _source_bound_test_common_n(tmp_path, request, frozen_clock, deterministic_t
 
 class Clock:
     def __init__(self):
-        self._owner = threading.get_ident()
+        self._owner = threading.current_thread()
         self._offsets = {self._owner: 0.0}
         self._lock = threading.Lock()
-    def _offset(self):
-        ident = threading.get_ident()
+    def _offset_for(self, worker):
         with self._lock:
-            if ident == self._owner:
+            if worker is self._owner:
                 return max(self._offsets.values())
-            return self._offsets.setdefault(ident, self._offsets[self._owner])
+            return self._offsets.setdefault(worker, max(self._offsets.values()))
+    def _offset(self):
+        return self._offset_for(threading.current_thread())
+    def _sleep_for(self, worker, seconds):
+        with self._lock:
+            current = max(self._offsets.values()) if worker is self._owner else self._offsets.setdefault(
+                worker, max(self._offsets.values()))
+            self._offsets[worker] = current + seconds
     def utc_now(self): return NOW + timedelta(seconds=self._offset())
     def monotonic(self): return 100.0 + self._offset()
     def sleep(self, seconds):
-        ident = threading.get_ident()
-        with self._lock:
-            self._offsets[ident] = self._offsets.get(ident, max(self._offsets.values())) + seconds
+        self._sleep_for(threading.current_thread(), seconds)
+
+
+def test_clock_phase_workers_inherit_highwater_without_serializing_parallel_workers():
+    clock = Clock()
+    day_seconds = 86_400
+    phase_one = [threading.Thread() for _ in range(3)]
+    assert [clock._offset_for(worker) for worker in phase_one] == [0, 0, 0]
+    for worker, elapsed in zip(phase_one, (day_seconds, day_seconds - 10, day_seconds - 20)):
+        clock._sleep_for(worker, elapsed)
+    assert clock._offset() == day_seconds
+
+    phase_two = [threading.Thread() for _ in range(3)]
+    assert [clock._offset_for(worker) for worker in phase_two] == [day_seconds] * 3
+    for worker, elapsed in zip(phase_two, (12, 10, 8)):
+        clock._sleep_for(worker, elapsed)
+    assert clock._offset() == day_seconds + 12
+    assert clock._offset_for(phase_one[1]) == day_seconds - 10
 
 
 class FailedExternalCommands:
@@ -238,7 +259,7 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
     assert "gcp-pair-destroy" in [request.action_id for request in runner.requests]
     if north:
         assert runner.deployment.vm_a.region == runner.deployment.vm_b.region == "europe-north1"
-        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-a"
+        assert runner.deployment.vm_a.zone == runner.deployment.vm_b.zone == "europe-north1-c"
         assert runner.driver.settings.images == runtime["providers"]["gcp"]["options"]["images"]
         assert all("europe-west3" not in request.argv and "europe-west2" not in request.argv
             for request in runner.requests if request.action_id.startswith("gcp-"))
@@ -424,7 +445,7 @@ def _costs(path: Path, campaign, children):
     "all-provider-calibration",
     "all-provider-short-study", "all-provider-diagnostic-day"])
 def test_default_three_provider_factory_reserves_and_enforces_global_claim_barrier(
-        tmp_path, monkeypatch, request, frozen_clock, deterministic_token, fake_git_commits,
+        tmp_path, monkeypatch, request, capsys, frozen_clock, deterministic_token, fake_git_commits,
         successful_protection, config_name, interrupt_f11_cleanup, interrupt_controller,
         interrupt_stop_verified):
     config = ROOT / config_name
@@ -536,20 +557,22 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 for p in ("aws", "azure", "gcp")}},
         "providers": {
             "aws": {"options": {"account_id": "123456789012", "controller_cidr": "203.0.113.4/32",
-                "ami_ids": {"eu-central-1": "ami-0123456789abcdef0"}, "public_key_path": pub,
+                "ami_ids": {"eu-central-1": "ami-0123456789abcdef0",
+                    "eu-north-1": "ami-084df9e6ad4622caf"}, "public_key_path": pub,
                 "authentication_reference": str(identities["aws"])}, "bootstrap_template": ROOT / "terraform/aws/pair/main.tf",
                 "terraform_directory": ROOT / "terraform/aws", "sources": {"expiry_cost_path": aws_cost,
                     "primary_review_path": None}},
             "azure": {"options": {"subscription_id": "00000000-0000-0000-0000-000000000001",
                 "tenant_id": "00000000-0000-0000-0000-000000000002", "controller_cidr": "203.0.113.4/32",
-                "selected_image": "Canonical:0001-com-ubuntu-server-noble:24_04-lts:2026.10.01",
+                "selected_image": "Canonical:ubuntu-24_04-lts:server:24.04.202610250",
                 "ssh_public_key_path": pub, "authentication_reference": str(identities["azure"]),
                 "poll_seconds": 15, "command_timeout_seconds": 60, "plan_review_timeout_seconds": 30},
                 "bootstrap_template": ROOT / "terraform/azure/pair/main.tf", "terraform_directory": ROOT / "terraform/azure",
                 "sources": {"expiry_cost_path": azure_cost, "primary_review_path": None}},
             "gcp": {"options": {"project_id": "benchmark-project1", "controller_cidr": "203.0.113.4/32",
                 "images": {"europe-west3": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
-                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001"},
+                    "europe-west2": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-lts-amd64-20261001",
+                    "europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105"},
                 "public_key_path": pub, "authentication_reference": str(identities["gcp"])},
                 "bootstrap_template": ROOT / "terraform/gcp/pair/main.tf", "terraform_directory": ROOT / "terraform/gcp",
                 "sources": {"workflow_cost_handoff_path": gcp_handoff,
@@ -578,6 +601,9 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             def __init__(self, root):
                 self.clock = clock
                 self.aws = FakePreparedAwsRunner()
+                self.aws.region = "eu-north-1"
+                self.aws.zone = "eu-north-1a"
+                self.aws.image_id = runtime["providers"]["aws"]["options"]["ami_ids"][self.aws.region]
                 self.gcp = GcpSourceRunner()
                 self.gcp.clock = clock
                 self.azure = None
@@ -676,15 +702,32 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                 if request.action_id.startswith("azure-"):
                     assert self.azure is not None
                     self.azure.now = clock.utc_now()
+                    if request.action_type == "image_preflight":
+                        publisher, offer, sku, version = self.azure.o.selected_image.split(":")
+                        image_id = (f"/subscriptions/{self.azure.o.subscription_id}/providers/Microsoft.Compute/locations/swedencentral/"
+                            f"publishers/{publisher}/artifacttypes/vmimage/offers/{offer}/skus/{sku}/versions/{version}")
+                        payload = {"id": image_id, "name": version, "location": "swedencentral",
+                            "architecture": "x64", "osDiskImage": {"operatingSystem": "Linux"}}
+                        now = clock.utc_now()
+                        return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
+                            finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
                     if request.action_type == "vm_image_observation":
                         self.azure.requests.append(request)
                         publisher, offer, sku, version = self.azure.o.selected_image.split(":")
-                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"germanywestcentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
+                        payload = {"id":request.argv[request.argv.index("--ids")+1],"location":"swedencentral","zones":["1"],"hardwareProfile":{"vmSize":"Standard_D4s_v5"},"osProfile":{"adminUsername":"azureuser"},"storageProfile": {"imageReference": {"publisher": publisher,
                             "offer": offer, "sku": sku, "exactVersion": version}}}
                         now = clock.utc_now()
                         return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
                             finished_at=now, duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
                     outcome = self.azure.run(request)
+                    if request.action_type == "pair_output" and outcome.outcome == "succeeded":
+                        output = json.loads(outcome.stdout)
+                        for role in ("vm_a", "vm_b"):
+                            output[role]["value"]["region"] = "swedencentral"
+                        outcome = CommandResult(action_id=outcome.action_id, outcome=outcome.outcome,
+                            started_at=outcome.started_at, finished_at=outcome.finished_at,
+                            duration_seconds=outcome.duration_seconds, exit_code=outcome.exit_code,
+                            stdout=json.dumps(output), stderr=outcome.stderr)
                     if request.action_type == "pair_destroy" and outcome.outcome == "succeeded":
                         self.azure.account_present = False
                         self.azure.present_children.clear()
@@ -914,7 +957,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             assert provider_result.values["protect"].state == "registered", (provider_name, provider_result.values)
             assert provider_result.values["claim"].eligible is True, (provider_name, provider_result.values["claim"])
             assert provider_result.values["claim"].creation_granted is True, (provider_name, provider_result.values["claim"])
-            assert provider_result.values["create"] is not None, (provider_name, provider_result.primary_failure, provider_result.values)
+            assert provider_result.values.get("create") is not None, (provider_name, provider_result.primary_failure, provider_result.values)
             created = provider_result.values["create"]
             if provider_name == "azure":
                 created = created.deployment
@@ -979,6 +1022,29 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
             cleanup_runner=NoUnexpectedCleanupCommand(), cleanup_utc_now=clock.utc_now,
             cleanup_monotonic_now=clock.monotonic)
         assert cleanup_status == 0
+        cleanup_report = json.loads(capsys.readouterr().out)
+        assert all(cleanup_report["providers"][provider]["cleanup_open"] is False for provider in children)
+        from tests.integration.test_campaign_driver import stage_fixture
+        from cloud_network_benchmark.campaign import CampaignDriver
+        import subprocess
+        consumer_root = tmp_path / "campaign-consumer"
+        consumer_root.mkdir()
+        consumer_stage = stage_fixture(consumer_root, slots=1)
+        consumer_entry = consumer_stage["entries"][0]
+        consumer_private = Path(consumer_entry["private_root"])
+        consumer_private.mkdir(parents=True)
+        (consumer_private / "lifecycle-recovery.json").write_text("{}")
+        consumer_state = Path(consumer_stage["state_root"]) / consumer_stage["stage_id"]
+        consumer_state.mkdir(parents=True)
+        consumer_stage["repository_root"] = str(ROOT)
+        def feed_actual_cleanup_report(command, **kwargs):
+            kwargs["stdout"].write(json.dumps(cleanup_report).encode())
+            return type("Completed", (), {"returncode": cleanup_status})()
+        with monkeypatch.context() as consumer_patch:
+            consumer_patch.setattr(subprocess, "run", feed_actual_cleanup_report)
+            reconciled = CampaignDriver._reconcile_lifecycle(consumer_entry, consumer_stage)
+        assert reconciled["status"] == "failed" and reconciled["cleanup_open"] is False
+        assert reconciled["cleanup_report"] == cleanup_report
         recovered = json.loads(built["recovery_path"].read_text(encoding="utf-8"))
         assert all(not row["cleanup_open"] and not row["expiry_registered"]
             and not row["creation_may_have_started"] for row in recovered["providers"])

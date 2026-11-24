@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -22,14 +23,14 @@ def result(req, stdout="", failed=False):
 
 def scope(provider, root, scenario="same_zone"):
     if provider == "gcp":
-        v = dict(project_id="review-project", zone_a="europe-north1-a", zone_b="europe-north1-a")
+        v = dict(project_id="review-project", zone_a="europe-north1-c", zone_b="europe-north1-c")
         if root == "pair":
             v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102")
             r = {"terraform_data.scope_guard": {"input": v["project_id"]}}
             for role in ("a", "b"):
                 r["google_compute_instance_from_template.vm_" + role] = {"project": v["project_id"], "zone": v["zone_" + role], "name": v["name_" + role], "source_instance_template": v["template_" + role]}
             return v, r
-        v.update(namespace="scope", scenario=scenario, controller_cidr="203.0.113.4/32", public_key="fixture-public-key", labels={"cnb-run": "run", "cnb-deploy": "deploy"}, expiry_time="2026-11-14T00:20:00Z", image_a="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", image_b="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105")
+        v.update(namespace="scope", scenario=scenario, placement_policy_name="registered-s3-policy" if scenario == "placement_optimization" else "", controller_cidr="203.0.113.4/32", public_key="fixture-public-key", labels={"cnb-run": "run", "cnb-deploy": "deploy"}, expiry_time="2026-11-14T00:20:00Z", image_a="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105", image_b="projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105")
         if scenario == "inter_region": v["zone_b"] = "europe-west2-a"
         ips = ["10.80.1.10", "10.81.1.11" if scenario == "inter_region" else "10.80.1.11"]
         r = {"terraform_data.scope_guard": {"input": v["project_id"]}, "google_compute_network.attempt": {"project": v["project_id"], "name": "scope-net", "auto_create_subnetworks": False, "mtu": 1460}, "google_compute_subnetwork.a": {"project": v["project_id"], "name": "scope-a", "region": "europe-north1", "ip_cidr_range": "10.80.1.0/24"}}
@@ -38,7 +39,7 @@ def scope(provider, root, scenario="same_zone"):
         for i, role in enumerate(("a", "b")):
             r[f'google_compute_instance_template.role["vm_{role}"]'] = {"project": v["project_id"], "name": "scope-"+role, "machine_type": "n2-standard-4", "can_ip_forward": False, "labels": v["labels"], "scheduling": [{"provisioning_model": "STANDARD", "automatic_restart": False, "instance_termination_action": "STOP", "termination_time": v["expiry_time"]}], "disk": [{"source_image": v["image_"+role], "disk_size_gb": 32, "disk_type": "pd-balanced", "boot": True, "auto_delete": True}], "network_interface": [{"network_ip": ips[i], "nic_type": "GVNIC", "access_config": [{}]}], "reservation_affinity": [{"type": "NO_RESERVATION"}]}
         if scenario == "inter_region": r["google_compute_subnetwork.b[0]"] = {"project": v["project_id"], "name": "scope-b", "region": "europe-west2", "ip_cidr_range": "10.81.1.0/24"}
-        if scenario == "placement_optimization": r["google_compute_resource_policy.compact[0]"] = {"project": v["project_id"], "name": "scope-compact", "region": "europe-north1", "group_placement_policy": [{"collocation": "COLLOCATED"}]}
+        if scenario == "placement_optimization": r["google_compute_resource_policy.compact[0]"] = {"project": v["project_id"], "name": v["placement_policy_name"], "region": "europe-north1", "group_placement_policy": [{"collocation": "COLLOCATED"}]}
         return v, r
     v = dict(account_id="238360820461", resource_namespace="scope", run_id="run-aws", deployment_id="run-aws-deployment")
     if root == "safety":
@@ -47,7 +48,7 @@ def scope(provider, root, scenario="same_zone"):
         trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ssm.amazonaws.com"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"aws:SourceAccount": v["account_id"]}, "ArnLike": {"aws:SourceArn": "arn:aws:ssm:eu-north-1:238360820461:automation-execution/*"}}}]}
         policy = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["ec2:DescribeInstances"], "Resource": "*"}, {"Effect": "Allow", "Action": ["ec2:StopInstances"], "Resource": "arn:aws:ec2:eu-north-1:238360820461:instance/*", "Condition": {"StringEquals": {"ec2:ResourceTag/cnb_run_id": v["run_id"], "ec2:ResourceTag/cnb_deployment_id": v["deployment_id"]}}}]}
         body = {"assumeRole": "{{ AutomationAssumeRole }}", "parameters": {k: {"type": "String"} for k in ("AutomationAssumeRole", "ExpiryTriggerUtc", "RunId", "DeploymentId", "Region")}, "mainSteps": [{"name": "waitUntilExpiry", "action": "aws:sleep", "inputs": {"Timestamp": "{{ ExpiryTriggerUtc }}"}}, {"name": "discoverAndStopOwnedInstances", "action": "aws:executeScript", "inputs": {"Runtime": "python3.11", "Handler": "handler", "Script": (ROOT/"terraform/aws/safety/expiry.py").read_text(), "InputPayload": {"run_id": "{{ RunId }}", "deployment_id": "{{ DeploymentId }}", "region": "{{ Region }}"}}, "timeoutSeconds": 330}]}
-        return v, {"aws_iam_role.expiry": {"name": name, "permissions_boundary": None, "tags": {}, "assume_role_policy": json.dumps(trust)}, "aws_iam_role_policy.expiry": {"name": "cnb-expiry-stop-owned-instances", "policy": json.dumps(policy)}, "aws_ssm_document.expiry": {"name": name, "document_type": "Automation", "document_format": "JSON", "content": json.dumps(body)}}
+        return v, {"aws_iam_role.expiry": {"name": name, "assume_role_policy": json.dumps(trust)}, "aws_iam_role_policy.expiry": {"name": "cnb-expiry-stop-owned-instances", "policy": json.dumps(policy)}, "aws_ssm_document.expiry": {"name": name, "document_type": "Automation", "document_format": "JSON", "content": json.dumps(body)}}
     v.update(scenario=scenario, primary_region="eu-north-1", primary_zone="eu-north-1a", image_id_primary="ami-084df9e6ad4622caf", image_id_london="ami-fixture-london", controller_cidr="203.0.113.4/32", placement_group_name="scope-cluster")
     # Independently enumerated same-zone layout (no EIP, placement or London resources).
     names = ["terraform_data.account_guard", "aws_vpc.frankfurt", "aws_internet_gateway.frankfurt", "aws_route_table.frankfurt", "aws_subnet.a", "aws_route_table_association.a", "aws_security_group.vm_a", "aws_security_group.vm_b_frankfurt[0]", "aws_instance.vm_a", "aws_instance.vm_b_frankfurt[0]", "aws_ec2_tag.eni_a", "aws_ec2_tag.eni_a_deployment", "aws_ec2_tag.eni_b_frankfurt[0]", "aws_ec2_tag.eni_b_frankfurt_deployment[0]"]
@@ -75,50 +76,70 @@ def test_all_four_roots_have_exact_fresh_scope(provider, root):
     assert len(checked) == len(resources)
 
 
+def test_gcp_s3_plan_requires_registered_policy_name():
+    v, resources = scope("gcp", "protection", "placement_optimization")
+    accepted = plan_document(v, resources, "gcp")
+    tp.validate_scope(accepted, "gcp", ROOT/"terraform/gcp/protection", v)
+    wrong = deepcopy(accepted)
+    policy = next(item for item in wrong["resource_changes"] if item["address"] == "google_compute_resource_policy.compact[0]")
+    policy["change"]["after"]["name"] = v["namespace"] + "-compact"
+    with pytest.raises(tp.PlanReviewError, match="GCP compact policy"):
+        tp.validate_scope(wrong, "gcp", ROOT/"terraform/gcp/protection", v)
+
+
+def test_aws_expiry_scope_binds_optional_permissions_boundary_to_configured_account():
+    v, resources = scope("aws", "safety")
+    boundary = f"arn:aws:iam::{v['account_id']}:policy/cnb/ExpiryBoundary"
+    v["expiry_role_permissions_boundary_arn"] = boundary
+    resources["aws_iam_role.expiry"]["permissions_boundary"] = boundary
+    resources["aws_iam_role.expiry"]["tags"] = {
+        "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]}
+    plan = plan_document(v, resources, "aws")
+    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == 3
+
+    changed = deepcopy(resources)
+    changed["aws_iam_role.expiry"]["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/Other"
+    with pytest.raises(tp.PlanReviewError, match="permissions boundary"):
+        tp.validate_scope(plan_document(v, changed, "aws"), "aws", ROOT/"terraform/aws/safety", v)
+
+    foreign = deepcopy(v)
+    foreign["expiry_role_permissions_boundary_arn"] = "arn:aws:iam::111122223333:policy/Other"
+    foreign_resources = deepcopy(resources)
+    foreign_resources["aws_iam_role.expiry"]["permissions_boundary"] = foreign["expiry_role_permissions_boundary_arn"]
+    with pytest.raises(tp.PlanReviewError, match="configured account"):
+        tp.validate_scope(plan_document(foreign, foreign_resources, "aws"), "aws", ROOT/"terraform/aws/safety", foreign)
+
+    for mutation in ("wrong_account", "wrong_boundary", "missing_tag", "wrong_tag_value"):
+        changed = deepcopy(plan)
+        role = next(item for item in changed["resource_changes"]
+                    if item["address"] == "aws_iam_role.expiry")["change"]["after"]
+        if mutation == "wrong_account":
+            role["permissions_boundary"] = "arn:aws:iam::999999999999:policy/cnb/ExpiryBoundary"
+        elif mutation == "wrong_boundary":
+            role["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/cnb/Other"
+        elif mutation == "missing_tag":
+            role["tags"].pop("cnb_deployment_id")
+        else:
+            role["tags"]["cnb_run_id"] = "another-run"
+        with pytest.raises(tp.PlanReviewError):
+            tp.validate_scope(changed, "aws", ROOT/"terraform/aws/safety", v)
+
+
 def test_legacy_aws_safety_plan_accepts_only_declared_null_default():
     v, resources = scope("aws", "safety")
     plan = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
     assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == len(resources)
 
 
-def test_configured_aws_safety_boundary_is_bound_to_arn_and_ownership_tags():
-    v, resources = scope("aws", "safety")
-    arn = f"arn:aws:iam::{v['account_id']}:policy/team/ExpiryBoundary"
-    v["expiry_role_permissions_boundary_arn"] = arn
-    resources["aws_iam_role.expiry"].update(permissions_boundary=arn, tags={
-        "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]
-    })
-    plan = plan_document(v, resources, "aws")
-    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == len(resources)
-    for mutation in ("wrong_account", "wrong_boundary", "missing_tag", "wrong_tag_value"):
-        changed = deepcopy(plan)
-        role = next(x for x in changed["resource_changes"] if x["address"] == "aws_iam_role.expiry")["change"]["after"]
-        if mutation == "wrong_account": role["permissions_boundary"] = "arn:aws:iam::999999999999:policy/team/ExpiryBoundary"
-        elif mutation == "wrong_boundary": role["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/team/Other"
-        elif mutation == "missing_tag": role["tags"].pop("cnb_deployment_id")
-        else: role["tags"]["cnb_run_id"] = "another-run"
-        with pytest.raises(tp.PlanReviewError): tp.validate_scope(changed, "aws", ROOT/"terraform/aws/safety", v)
-
-
-def test_configured_aws_safety_boundary_must_be_customer_policy_in_approved_account():
-    v, resources = scope("aws", "safety")
-    v["expiry_role_permissions_boundary_arn"] = "arn:aws:iam::999999999999:policy/team/Foreign"
-    resources["aws_iam_role.expiry"].update(
-        permissions_boundary=v["expiry_role_permissions_boundary_arn"],
-        tags={"cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]},
-    )
-    with pytest.raises(tp.PlanReviewError, match="approved AWS account"):
-        tp.validate_scope(plan_document(v, resources, "aws"), "aws", ROOT/"terraform/aws/safety", v)
-
-
 @pytest.mark.parametrize("extra", [
-    {"expiry_role_permissions_boundary_arn": "arn:aws:iam::999999999999:policy/foreign"},
     {"unapproved_null_input": None},
+    {"expiry_role_permissions_boundary_arn": "arn:aws:iam::111122223333:policy/Other"},
 ])
 def test_aws_safety_plan_rejects_unexpected_variables(extra):
     v, resources = scope("aws", "safety")
     plan = plan_document({**v, **extra}, resources, "aws")
-    with pytest.raises(tp.PlanReviewError): tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)
+    with pytest.raises(tp.PlanReviewError):
+        tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)
 
 
 @pytest.mark.parametrize("scenario,count", [("same_zone",8),("cross_zone",8),("placement_optimization",9),("inter_region",9)])
@@ -213,12 +234,12 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert runner.requests[-1].timeout_seconds <= runner.requests[0].timeout_seconds
 
 
-def test_reviewed_apply_accepts_legacy_aws_safety_tfvars_with_null_default(tmp_path,operator):
+def test_reviewed_apply_accepts_legacy_aws_safety_tfvars_with_null_default(tmp_path, operator):
     req, runner = request(tmp_path, "aws", "safety")
     v, resources = scope("aws", "safety")
     runner.document = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
     assert tp.reviewed_apply(req, runner.run).outcome == "succeeded"
-    assert [r.argv[2] for r in runner.requests] == ["plan", "show", "apply"]
+    assert [item.argv[2] for item in runner.requests] == ["plan", "show", "apply"]
 
 
 def test_missing_operator_receipt_never_applies_and_preserves_files(tmp_path):
@@ -264,6 +285,218 @@ def test_operator_wait_cannot_extend_command_deadline(tmp_path,monkeypatch):
     req,runner=request(tmp_path)
     with pytest.raises(tp.PlanReviewError,match="deadline elapsed"): tp.reviewed_apply(req,runner.run,review_seconds=600)
     assert not any("apply" in r.argv for r in runner.requests)
+
+
+@pytest.mark.parametrize("review_seconds,expected_deadline", [(0, 160.0), (5, 105.0)])
+def test_review_window_uses_legacy_request_budget_or_explicit_manual_window(
+        tmp_path, monkeypatch, review_seconds, expected_deadline):
+    monkeypatch.setattr(tp.time, "monotonic", lambda: 100.0)
+    original_await = tp.await_review
+    observed = []
+
+    def approve(directory, binding, deadline):
+        observed.append(deadline)
+        (directory / "operator-review.json").write_text(json.dumps({
+            "decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "checked complete JSON and approved source scope"}))
+        return original_await(directory, binding, deadline)
+
+    monkeypatch.setattr(tp, "await_review", approve)
+    req, runner = request(tmp_path)
+    tp.reviewed_apply(req, runner.run, review_seconds=review_seconds)
+    assert observed == [expected_deadline]
+    assert runner.requests[-1].argv[2] == "apply"
+
+
+@pytest.mark.parametrize(("request_budget", "expected_apply_budget"), [(240, 120), (180, 60)])
+def test_queued_review_debits_original_plan_queue_and_manual_budget(
+        tmp_path, monkeypatch, request_budget, expected_apply_budget):
+    elapsed = [100.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0] - 100.0)
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": request_budget})
+    original_run = runner.run
+
+    def timed_run(command):
+        if command.argv[2] in {"plan", "show"}:
+            elapsed[0] += 5
+        return original_run(command)
+
+    runner.run = timed_run
+    # This represents the earlier normal parent's 55-second inspection while
+    # this request waits for the campaign-wide review slot.
+    monkeypatch.setattr(tp, "_review_admission_lock",
+        lambda _path, _deadline: elapsed.__setitem__(0, elapsed[0] + 55))
+    observed = {}
+
+    def inspect(directory, binding, deadline):
+        observed.update(binding=binding, deadline=deadline)
+        publication_epoch = binding["review_published_at_utc_epoch"]
+        os.utime(directory / "review-request.json", (publication_epoch, publication_epoch))
+        assert binding["review_window_seconds"] == 120
+        cutoff = tp.original_review_cutoff(directory, binding, publication_epoch + 120)
+        assert cutoff <= binding["review_deadline_utc_epoch"]
+        assert cutoff <= publication_epoch + 120
+        elapsed[0] += 55  # a complete second normal root review
+        return {"decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "full bounded payload reviewed"}
+
+    monkeypatch.setattr(tp, "await_review", inspect)
+    result = tp.reviewed_apply(req, runner.run, review_seconds=120,
+        command_timeout_seconds=120, review_admission_path=tmp_path / "review.lock")
+    assert result.outcome == "succeeded"
+    assert runner.requests[-1].argv[2] == "apply"
+    assert runner.requests[-1].timeout_seconds == expected_apply_budget
+    assert observed["deadline"] == min(100.0 + request_budget, 165.0 + 120)
+
+
+@pytest.mark.parametrize(("registration_deadline", "expect_all_gates"), [(900, True), (300, False)])
+def test_six_child_protection_then_pair_reviews_fit_only_original_stages(
+        tmp_path, monkeypatch, registration_deadline, expect_all_gates):
+    """Six serialized 55s inspections consume the sourced stage clock; commands stay <=120s."""
+    elapsed = [0.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0])
+    original_private = tp._private
+    def private_at_fake_publication(path, content):
+        original_private(path, content)
+        if path.name == "review-request.json":
+            published = json.loads(content)["review_published_at_utc_epoch"]
+            os.utime(path, (published, published))
+    monkeypatch.setattr(tp, "_private", private_at_fake_publication)
+    review_calls = []
+    failures = []
+
+    def run_stage(stage_name, stage_deadline):
+        completed = 0
+        for child in range(6):
+            child_dir = tmp_path / f"{stage_name}-{child}"
+            child_dir.mkdir()
+            req, runner = request(child_dir)
+            starting = elapsed[0]
+            req = req.model_copy(update={"timeout_seconds": max(1, stage_deadline - starting)})
+            real_run = runner.run
+
+            def timed_run(command):
+                assert command.timeout_seconds <= 120
+                if command.argv[2] in {"plan", "show"}:
+                    elapsed[0] += 5
+                return real_run(command)
+
+            runner.run = timed_run
+
+            def inspect(directory, binding, deadline):
+                review_calls.append((stage_name, child, deadline))
+                elapsed[0] += 55
+                if elapsed[0] >= min(starting + req.timeout_seconds, stage_deadline):
+                    return {"decision": "approved", "binding": binding,
+                        "reviewer": "offline fixture", "inspection": "late review"}
+                return {"decision": "approved", "binding": binding,
+                    "reviewer": "offline fixture", "inspection": "bounded complete review"}
+
+            monkeypatch.setattr(tp, "await_review", inspect)
+            try:
+                tp.reviewed_apply(req, runner.run, review_seconds=120,
+                    command_timeout_seconds=120,
+                    review_admission_path=tmp_path / f"{stage_name}.lock")
+            except tp.PlanReviewError as exc:
+                failures.append((stage_name, child, str(exc)))
+                assert not any(command.argv[2] == "apply" for command in runner.requests)
+                assert not next(child_dir.glob("*-review-*")).joinpath("accepted-review.json").exists()
+                return completed
+            assert runner.requests[-1].argv[2] == "apply"
+            assert runner.requests[-1].timeout_seconds <= 120
+            completed += 1
+        return completed
+
+    protection = run_stage("protection", registration_deadline)
+    if expect_all_gates:
+        assert protection == 6, failures
+        # Pair gates use the original cumulative registration + provision cap.
+        pair = run_stage("pair", 1800)
+        assert pair == 6
+        assert len(review_calls) == 12
+        assert elapsed[0] < 1800
+    else:
+        assert protection < 6
+        assert failures
+
+
+@pytest.mark.parametrize(("stage", "overall", "stop", "expected"), [
+    ("registration", 3100.0, 2600.0, 1000.0),
+    ("provision", 3100.0, 2600.0, 1900.0),
+    ("provision", 1500.0, 2600.0, 1500.0),
+    ("provision", 3100.0, 1700.0, 1700.0),
+])
+def test_review_stage_deadline_preserves_original_stage_overall_and_stop_caps(
+        stage, overall, stop, expected):
+    assert tp.workflow_review_stage_deadline(cap_started_monotonic=100.0,
+        registration_allowance_seconds=900, provision_allowance_seconds=900,
+        stage=stage, overall_deadline=overall, stop_deadline=stop) == expected
+
+
+def test_failure_profile_review_deadline_keeps_300_second_registration_stage():
+    assert tp.workflow_review_stage_deadline(cap_started_monotonic=100.0,
+        registration_allowance_seconds=300, provision_allowance_seconds=900,
+        stage="registration", overall_deadline=3100.0, stop_deadline=2600.0) == 400.0
+
+
+def test_receipt_after_finite_review_cutoff_never_reaches_apply(tmp_path, monkeypatch):
+    elapsed = [100.0]
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": 240})
+
+    def late_receipt(directory, binding, deadline):
+        (directory / "operator-review.json").write_text(json.dumps({
+            "decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "completed"}))
+        elapsed[0] = deadline + 0.1
+        return {"decision": "approved", "binding": binding,
+            "reviewer": "offline fixture", "inspection": "completed"}
+
+    monkeypatch.setattr(tp, "await_review", late_receipt)
+    with pytest.raises(tp.PlanReviewError, match="review cutoff"):
+        tp.reviewed_apply(req, runner.run, review_seconds=50)
+    assert not any(command.argv[2] == "apply" for command in runner.requests)
+    assert not next(tmp_path.glob("*-review-*")).joinpath("accepted-review.json").exists()
+
+
+@pytest.mark.parametrize("condition", ["late", "cancelled", "request_mutated"])
+def test_manual_receipt_helper_rejects_late_cancelled_or_mutated_review(
+        tmp_path, monkeypatch, condition):
+    elapsed = [100.0]
+    wall_start = time.time()
+    monkeypatch.setattr(tp.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(tp.time, "time", lambda: wall_start + elapsed[0] - 100.0)
+    req, runner = request(tmp_path)
+    req = req.model_copy(update={"timeout_seconds": 240})
+    request_hashes = []
+
+    def invoke_helper(directory, binding, deadline):
+        request_path = directory / "review-request.json"
+        publication = binding["review_published_at_utc_epoch"]
+        os.utime(request_path, (publication, publication))
+        request_hash = hashlib.sha256(request_path.read_bytes()).hexdigest()
+        request_hashes.append((directory, request_hash))
+        if condition == "late":
+            elapsed[0] = deadline + 1
+        elif condition == "cancelled":
+            (directory / "review-cancelled.json").write_text("{}")
+        else:
+            request_path.write_text("{}")
+        return tp.record_operator_review(directory, request_hash, "offline reviewer", "checked", deadline_utc_epoch=deadline)
+
+    monkeypatch.setattr(tp, "await_review", invoke_helper)
+    with pytest.raises(tp.PlanReviewError):
+        tp.reviewed_apply(req, runner.run, review_seconds=50,
+            review_admission_path=tmp_path / "review.lock")
+    directory = request_hashes[0][0]
+    assert not (directory / "operator-review.json").exists()
+    assert not any(command.argv[2] == "apply" for command in runner.requests)
 
 
 def test_saved_apply_uses_fresh_provider_budget_after_review(tmp_path, monkeypatch):

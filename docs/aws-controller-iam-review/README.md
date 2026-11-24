@@ -25,8 +25,19 @@ No `StartInstances`, VPC peering, Elastic IP, key-pair creation, `ssm:SendComman
 
 Before attaching the controller policy, an administrator must inspect all existing `cnb-expiry-*` roles and confirm they are absent or already have the exact boundary. Stop for review if any existing role is unbounded; this draft intentionally does not grant boundary changes or automatic deletion to retrofit one. The controller includes `iam:ListRoles` for prefix preflight, but IAM does not enforce that prefix filter in the permission itself. Do not allow another principal to create unbounded roles in the reserved prefix.
 
-## Code integration and validation status
+## Code integration and evidence status
 
-`src/cloud_network_benchmark/terraform_plan.py` now accepts Terraform's explicit null default for the new nullable AWS safety boundary when a legacy reviewed tfvars file omits that variable. The remaining plan variables still use exact equality. `_aws_scope` binds a configured boundary to the reviewed AWS account and exact role attribute, and requires the expiry role's run/deployment ownership tags. Focused source-shaped plan tests cover the legacy null default, configured boundary and tags, and wrong-account, wrong-boundary, and tag mutations.
+The current candidate validates the configured AWS expiry-role boundary ARN,
+planned boundary readback, and the run/deployment ownership tags. It also
+accepts Terraform's declared nullable `expiry_role_permissions_boundary_arn`
+default only when that exact variable is absent from legacy reviewed scope;
+all other missing or additional plan variables remain rejected. Focused local
+regression identities cover the nullable-default path, foreign boundary and
+tag mutations. Run the final integrated test suite before relying on that
+offline result.
 
-These checks use synthetic Terraform plan documents. No Terraform CLI was available, so native plan JSON generation and provider-native apply remain unproved. AWS policy simulation and live acceptance are also pending.
+The plans and policy documents in this directory remain offline review
+artifacts. They do not establish that IAM resources or permissions exist, that
+the current identity can call them, that policy simulation passes, or that any
+provider lifecycle is accepted. Native Linux and paid provider acceptance
+remain separate evidence stages.

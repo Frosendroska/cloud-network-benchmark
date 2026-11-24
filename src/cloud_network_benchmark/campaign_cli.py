@@ -20,9 +20,22 @@ def _parser() -> argparse.ArgumentParser:
         item = commands.add_parser(action)
         item.add_argument("--plan", required=True, type=Path)
         item.add_argument("--settings", type=Path)
-        item.add_argument("--execute", action="store_true", help="required to hand off a campaign to systemd")
+        item.add_argument("--execute", action="store_true", help="required to detach the user-space campaign supervisor")
+    draft = commands.add_parser("draft", help="freeze the fixed acceptance/calibration batch for review; does not authorize execution")
+    draft.add_argument("--plan", required=True, action="append", type=Path,
+                       help="provide one acceptance and one calibration plan")
+    draft.add_argument("--settings", type=Path)
+    draft.add_argument("--output", required=True, type=Path)
+    activate = commands.add_parser("activate", help="recheck and dispatch one stage from an authorized frozen draft")
+    activate.add_argument("--draft", required=True, type=Path)
+    activate.add_argument("--stage-id", required=True)
+    activate.add_argument("--settings", type=Path)
+    activate.add_argument("--execute", action="store_true",
+                          help="required to activate and dispatch after genuine approval and all gates pass")
     status = commands.add_parser("status")
     status.add_argument("--settings", type=Path)
+    resume = commands.add_parser("resume", help="read current durable state without starting or dispatching work")
+    resume.add_argument("--settings", type=Path)
     logs = commands.add_parser("logs")
     logs.add_argument("--settings", type=Path)
     logs.add_argument("--follow", action="store_true")
@@ -31,6 +44,17 @@ def _parser() -> argparse.ArgumentParser:
     continuation.add_argument("--stage-id", required=True)
     continuation.add_argument("--entry-id", required=True)
     continuation.add_argument("--confirm-supervision", action="store_true")
+    archive = commands.add_parser("reconcile-archive", help="close an archive-pending entry from its native replay receipt")
+    archive.add_argument("--settings", type=Path)
+    archive.add_argument("--stage-id", required=True)
+    archive.add_argument("--entry-id", required=True)
+    archive.add_argument("--receipt", required=True, type=Path)
+    export_repair = commands.add_parser("reconcile-export", help="preserve and rebuild one failed cleanup-closed local export")
+    export_repair.add_argument("--settings", type=Path)
+    export_repair.add_argument("--stage-id", required=True)
+    export_repair.add_argument("--entry-id", required=True)
+    export_repair.add_argument("--preserve-to", required=True, type=Path,
+                               help="new sibling path retaining the previous invalid export")
     # Private systemd entry point. It resumes the driver from its durable active pointer.
     runner = commands.add_parser("run", help=argparse.SUPPRESS)
     runner.add_argument("--state-root", required=True, type=Path)
@@ -44,22 +68,39 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
         if args.action in {"check", "start"}:
             result = (campaign.check(args.plan, settings_path=args.settings) if args.action == "check"
                       else campaign.start(args.plan, settings_path=args.settings, execute=args.execute))
+        elif args.action == "draft":
+            result = campaign.draft(args.plan, settings_path=args.settings, output_path=args.output)
+        elif args.action == "activate":
+            result = campaign.activate_frozen_draft(args.draft, stage_id=args.stage_id,
+                settings_path=args.settings, execute=args.execute)
         elif args.action == "run":
             result = campaign.run_active(args.state_root)
         else:
             settings = load_operator_settings(args.settings or DEFAULT_SETTINGS)
-            if args.action == "status":
+            if args.action in {"status", "resume"}:
                 result = campaign.status(Path(settings["state_root"]))
+                observer = Path(settings["state_root"]) / "observer-status.json"
+                result = {"campaigns": result, "observer": json.loads(observer.read_text(encoding="utf-8"))
+                          if observer.is_file() and not observer.is_symlink() else None,
+                          "starts_work": False}
             elif args.action == "logs":
                 path = Path(settings.get("operator_log_path") or Path(settings["state_root"]) / "campaign.log")
                 for line in campaign.logs(path, follow=args.follow):
                     sys.stdout.write(line)
                 return 0
+            elif args.action == "reconcile-archive":
+                result = campaign.reconcile_archive(Path(settings["state_root"]), args.stage_id,
+                    args.entry_id, args.receipt)
+            elif args.action == "reconcile-export":
+                result = campaign.reconcile_export(Path(settings["state_root"]), args.stage_id,
+                    args.entry_id, args.preserve_to)
             else:
                 result = campaign.continue_supervised(Path(settings["state_root"]), args.stage_id,
                     args.entry_id, confirmed=args.confirm_supervision)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
-        if args.action == "status":
+        if args.action in {"status", "resume"}:
+            return 0
+        if args.action == "reconcile-export":
             return 0
         if args.action == "run":
             # A returned status means the durable journal handled the campaign
@@ -67,7 +108,8 @@ def main(argv: Sequence[str] | None = None, *, driver: CampaignDriver | None = N
             # terminal failed/missed observation must not loop the service.
             return 0
         status = result.get("status") if isinstance(result, dict) else None
-        return 0 if status in {"ready", "dispatched", "complete", "active", "awaiting_operator"} else 1
-    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        return 0 if status in {"ready", "dispatched", "complete", "active", "awaiting_operator",
+                               "DRAFT_UNAPPROVED"} else 1
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(f"Campaign error: {exc}", file=sys.stderr)
         return 2

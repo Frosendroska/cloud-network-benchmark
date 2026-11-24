@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import fcntl
 from pathlib import Path
 import tempfile
 import time
@@ -19,6 +21,31 @@ from .contracts.execution import CommandRequest, CommandResult
 
 class PlanReviewError(ValueError):
     category = "terraform_plan_review"
+
+
+LEGACY_PUBLICATION_REVIEW_SECONDS = 40
+MAX_SOURCE_BOUND_REVIEW_SECONDS = 600
+
+
+def workflow_review_stage_deadline(*, cap_started_monotonic: float,
+        registration_allowance_seconds: float, provision_allowance_seconds: float,
+        stage: str, overall_deadline: float, stop_deadline: float) -> float:
+    """Return the immutable original stage cutoff clipped by overall cap and STOP."""
+    values = (cap_started_monotonic, registration_allowance_seconds,
+        provision_allowance_seconds, overall_deadline, stop_deadline)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) for value in values):
+        raise PlanReviewError("workflow review stage timing inputs must be finite")
+    if cap_started_monotonic < 0 or registration_allowance_seconds <= 0 or provision_allowance_seconds < 0:
+        raise PlanReviewError("workflow review stage allowances are invalid")
+    if stage == "registration":
+        stage_deadline = cap_started_monotonic + registration_allowance_seconds
+    elif stage == "provision":
+        stage_deadline = (cap_started_monotonic + registration_allowance_seconds
+            + provision_allowance_seconds)
+    else:
+        raise PlanReviewError("workflow review stage is unsupported")
+    return min(stage_deadline, float(overall_deadline), float(stop_deadline))
 
 
 def _json(value: Any) -> bytes:
@@ -50,6 +77,64 @@ def source_hash(root: Path) -> str:
 def _same(actual: Any, expected: Any, label: str) -> None:
     if actual != expected:
         raise PlanReviewError(f"saved plan differs from approved {label}")
+
+
+def original_review_cutoff(directory: Path, binding: dict,
+                           approved_horizon_epoch: float | None = None) -> float:
+    """Bound review by original publication, producer deadline, and stage horizon.
+
+    Old requests without timing metadata retain the publication-plus-40-second
+    cutoff. New requests carry their finite setting and original deadline.
+    """
+    horizon = approved_horizon_epoch
+    if (horizon is not None and (isinstance(horizon, bool)
+            or not isinstance(horizon, (int, float)) or not math.isfinite(horizon))):
+        raise PlanReviewError("approved review horizon must be a finite epoch")
+    horizon = float("inf") if horizon is None else float(horizon)
+    request_path = Path(directory) / "review-request.json"
+    _hash(request_path)
+    publication_mtime = request_path.stat().st_mtime
+    has_window = "review_window_seconds" in binding
+    has_deadline = "review_deadline_utc_epoch" in binding
+    has_publication = "review_published_at_utc_epoch" in binding
+    if not (has_window == has_deadline == has_publication):
+        raise PlanReviewError("original review timing metadata is incomplete")
+    if not has_window:
+        return min(publication_mtime + LEGACY_PUBLICATION_REVIEW_SECONDS, float(horizon))
+    window = binding["review_window_seconds"]
+    producer_deadline = binding["review_deadline_utc_epoch"]
+    producer_publication = binding["review_published_at_utc_epoch"]
+    if (type(window) is not int or not 1 <= window <= MAX_SOURCE_BOUND_REVIEW_SECONDS
+            or isinstance(producer_deadline, bool)
+            or not isinstance(producer_deadline, (int, float))
+            or not math.isfinite(producer_deadline) or producer_deadline <= 0
+            or isinstance(producer_publication, bool)
+            or not isinstance(producer_publication, (int, float))
+            or not math.isfinite(producer_publication) or producer_publication <= 0):
+        raise PlanReviewError("original review timing metadata is invalid")
+    return min(float(producer_publication) + window, publication_mtime + window,
+               float(producer_deadline), float(horizon))
+
+
+def _deadline_epoch(deadline_monotonic: float) -> float:
+    # Sampling wall time before monotonic time makes the conversion conservative.
+    wall_now = time.time()
+    monotonic_now = time.monotonic()
+    epoch = wall_now + deadline_monotonic - monotonic_now
+    if not math.isfinite(epoch) or epoch <= 0:
+        raise PlanReviewError("original review deadline cannot be represented as an epoch")
+    return epoch
+
+
+def _review_request_matches(directory: Path, binding: dict) -> None:
+    request_path = directory / "review-request.json"
+    _same(_hash(request_path), hashlib.sha256(_json(binding)).hexdigest(),
+          "immutable review request bytes")
+
+
+def _review_is_closed(directory: Path) -> bool:
+    return any((directory / name).exists() or (directory / name).is_symlink()
+               for name in ("review-cancelled.json", "failure.json", "accepted-review.json"))
 
 
 def _fields(actual: dict, expected: dict, label: str) -> None:
@@ -96,15 +181,16 @@ def validate_scope(plan: dict, provider: str, root: Path, v: dict) -> list[dict]
     """Require fresh exact scope; unknown critical inputs fail via missing values."""
     if not str(plan.get("format_version", "")).startswith("1.") or plan.get("errored") or plan.get("deferred_changes") or plan.get("resource_drift"):
         raise PlanReviewError("unsupported, incomplete or drifted Terraform plan")
-    actual_variables = {k: item["value"] for k, item in plan.get("variables", {}).items()}
+    plan_variables = {k: item["value"] for k, item in plan.get("variables", {}).items()}
     expected_variables = dict(v)
-    if provider == "aws" and root.name == "safety" and "expiry_role_permissions_boundary_arn" not in expected_variables:
-        # Terraform includes a newly declared nullable default in plan JSON even
-        # when a legacy reviewed tfvars file omitted it. Accept only that exact
-        # null default; all other missing or additional inputs remain exact.
-        if actual_variables.get("expiry_role_permissions_boundary_arn") is None:
-            actual_variables.pop("expiry_role_permissions_boundary_arn", None)
-    _same(actual_variables, expected_variables, "input variables")
+    if (provider == "aws" and root.name == "safety"
+            and "expiry_role_permissions_boundary_arn" not in expected_variables
+            and plan_variables.get("expiry_role_permissions_boundary_arn") is None):
+        # Terraform emits a declared nullable default in plan JSON when older
+        # reviewed tfvars omit the option. Accept only this exact null default;
+        # all other missing and unexpected variables remain rejected.
+        plan_variables.pop("expiry_role_permissions_boundary_arn", None)
+    _same(plan_variables, expected_variables, "input variables")
     for check in plan.get("checks", []):
         if check.get("status") in {"fail", "error"}: raise PlanReviewError("Terraform plan checks failed")
     resources = {}
@@ -139,16 +225,14 @@ def _aws_scope(r: dict, root: Path, v: dict) -> None:
         role = r["aws_iam_role.expiry"]
         _same(role.get("name"), name, "expiry role name")
         boundary = v.get("expiry_role_permissions_boundary_arn")
-        if boundary is not None and (
-            not isinstance(boundary, str)
-            or not boundary.startswith(f"arn:aws:iam::{v['account_id']}:policy/")
-            or not boundary.removeprefix(f"arn:aws:iam::{v['account_id']}:policy/")
-        ):
-            raise PlanReviewError("expiry role permissions boundary must be a customer-managed policy in the approved AWS account")
+        if boundary is not None:
+            if (not isinstance(boundary, str)
+                    or not re.fullmatch(rf"arn:aws:iam::{re.escape(v['account_id'])}:policy/(?:[A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+", boundary)):
+                raise PlanReviewError("AWS expiry permissions boundary must be a customer-managed policy in the configured account")
         _same(role.get("permissions_boundary"), boundary, "expiry role permissions boundary")
-        _same(role.get("tags", {}), {} if boundary is None else {
-            "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]
-        }, "expiry role ownership tags")
+        expected_role_tags = ({} if boundary is None else {
+            "cnb_run_id": v["run_id"], "cnb_deployment_id": v["deployment_id"]})
+        _same(role.get("tags") or {}, expected_role_tags, "expiry role identity tags")
         _same(json.loads(role["assume_role_policy"]), {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ssm.amazonaws.com"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"aws:SourceAccount": v["account_id"]}, "ArnLike": {"aws:SourceArn": f"arn:aws:ssm:{v['region']}:{v['account_id']}:automation-execution/*"}}}]}, "expiry trust")
         policy = r["aws_iam_role_policy.expiry"]
         _same(policy.get("name"), "cnb-expiry-stop-owned-instances", "expiry policy name")
@@ -196,6 +280,12 @@ def _gcp_scope(r: dict, root: str, v: dict) -> None:
         for role in ("a", "b"):
             _fields(r[f"google_compute_instance_from_template.vm_{role}"], {"project": v["project_id"], "name": v[f"name_{role}"], "zone": v[f"zone_{role}"], "source_instance_template": v[f"template_{role}"]}, f"GCP VM {role}")
         return
+    policy_name = v.get("placement_policy_name")
+    if v.get("scenario") == "placement_optimization":
+        if not isinstance(policy_name, str) or re.fullmatch(r"[a-z]([-a-z0-9]{0,61}[a-z0-9])?", policy_name) is None:
+            raise PlanReviewError("GCP S3 requires the exact valid registered placement policy name")
+    elif policy_name != "":
+        raise PlanReviewError("non-S3 GCP protection must not carry a placement policy name")
     for address, a in r.items():
         if address.startswith("google_compute_"):
             _same(a.get("project"), v["project_id"], address + " project")
@@ -233,7 +323,7 @@ def _gcp_scope(r: dict, root: str, v: dict) -> None:
         _fields(affinity[0], {"type": "NO_RESERVATION"}, "GCP reservation affinity")
     if "google_compute_resource_policy.compact[0]" in r:
         policy = r["google_compute_resource_policy.compact[0]"]
-        _fields(policy, {"name": v["namespace"] + "-compact", "region": v["zone_a"].rsplit("-", 1)[0]}, "GCP compact policy")
+        _fields(policy, {"name": v["placement_policy_name"], "region": v["zone_a"].rsplit("-", 1)[0]}, "GCP compact policy")
         groups = policy.get("group_placement_policy", [])
         if len(groups) != 1 or groups[0].get("max_distance"): raise PlanReviewError("unexpected GCP placement scope")
         _fields(groups[0], {"collocation": "COLLOCATED"}, "GCP placement")
@@ -243,6 +333,11 @@ def await_review(directory: Path, binding: dict, deadline: float) -> dict:
     """Operator writes receipt atomically from a separate controller session."""
     receipt_path = directory / "operator-review.json"
     while True:
+        if time.monotonic() >= deadline:
+            raise PlanReviewError(f"operator inspection required before saved-plan apply; deadline expired at {directory}")
+        if _review_is_closed(directory):
+            raise PlanReviewError("operator review was cancelled or closed before acceptance")
+        _review_request_matches(directory, binding)
         if receipt_path.exists() or receipt_path.is_symlink():
             _hash(receipt_path)
             receipt = json.loads(receipt_path.read_bytes())
@@ -250,27 +345,61 @@ def await_review(directory: Path, binding: dict, deadline: float) -> dict:
                     or not isinstance(receipt.get("reviewer"), str) or not receipt["reviewer"].strip()
                     or not isinstance(receipt.get("inspection"), str) or not receipt["inspection"].strip()):
                 raise PlanReviewError("operator review rejected or bound to different plan/source/input/state bytes")
+            if time.monotonic() >= deadline:
+                raise PlanReviewError("operator receipt arrived after the original review cutoff")
+            if _review_is_closed(directory):
+                raise PlanReviewError("operator review was cancelled or closed before acceptance")
+            _review_request_matches(directory, binding)
             os.chmod(receipt_path, 0o600)
             return receipt
-        if time.monotonic() >= deadline:
-            raise PlanReviewError(f"operator saved-plan inspection required at {directory}")
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 
-def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 0,
+def _review_admission_lock(path: Path, deadline: float):
+    """Acquire the campaign-wide review slot before publishing a review request."""
+    path = Path(path)
+    if not path.is_absolute() or any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise PlanReviewError("shared review admission path must be absolute and symlink-free")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise PlanReviewError("shared review admission lock is unavailable") from exc
+    os.fchmod(fd, 0o600)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise PlanReviewError("shared review admission window expired before publication")
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
+def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], CommandResult], *, review_seconds: int = 60,
+                   command_timeout_seconds: int | None = None,
                    apply_timeout_seconds: float | None = None,
-                   before_apply: Callable[[], float] | None = None) -> CommandResult:
+                   before_apply: Callable[[], float] | None = None,
+                   review_admission_path: Path | None = None) -> CommandResult:
     """Plan -> JSON/scope -> bounded operator inspection -> same saved-plan apply."""
     if (apply_timeout_seconds is None) != (before_apply is None):
         raise PlanReviewError("split saved-apply deadlines require both a stage ceiling and a fresh-fit callback")
-    if (isinstance(review_seconds, bool) or not isinstance(review_seconds, (int, float))
-            or not math.isfinite(review_seconds) or review_seconds < 0):
-        raise PlanReviewError("saved-plan review timeout must be finite and nonnegative")
+    if type(review_seconds) is not int or not 0 <= review_seconds <= MAX_SOURCE_BOUND_REVIEW_SECONDS:
+        raise PlanReviewError("saved-plan review timeout must be an integer in 0..600")
+    if (command_timeout_seconds is not None
+            and (type(command_timeout_seconds) is not int or command_timeout_seconds <= 0)):
+        raise PlanReviewError("per-command saved-plan timeout must be a positive integer")
     if (apply_timeout_seconds is not None and (isinstance(apply_timeout_seconds, bool)
             or not isinstance(apply_timeout_seconds, (int, float))
             or not math.isfinite(apply_timeout_seconds) or apply_timeout_seconds <= 0)):
         raise PlanReviewError("saved-apply stage ceiling must be finite and positive")
-    deadline = time.monotonic() + request.timeout_seconds
+    started = time.monotonic()
+    deadline = started + request.timeout_seconds
+    # The shared queue consumes only the original command/stage budget. A
+    # fresh operator window begins after this request actually owns the slot.
+    review_runtime_deadline = deadline if review_admission_path is not None else None
+    review_deadline = None
     argv = request.argv
     root = Path(next(x.split("=", 1)[1] for x in argv if x.startswith("-chdir=")))
     provider = root.parent.name
@@ -288,8 +417,10 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
     def execute(action: str, command: list[str]) -> CommandResult:
         remaining = deadline - time.monotonic()
         if remaining <= 0: raise PlanReviewError("original apply deadline elapsed during plan review")
-        return run(request.model_copy(update={"action_id": action, "argv": command, "timeout_seconds": remaining}))
+        budget = min(remaining, command_timeout_seconds) if command_timeout_seconds is not None else remaining
+        return run(request.model_copy(update={"action_id": action, "argv": command, "timeout_seconds": budget}))
 
+    lock_fd = None
     try:
         prefix = argv[:2]
         plan = execute(request.action_id + "-plan", [*prefix, "plan", "-input=false", "-no-color", f"-state={state}", f"-var-file={variables}", f"-out={binary}"])
@@ -307,18 +438,46 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         binding = {"action_id": request.action_id, "root": str(root), "state": str(state), "state_sha256": state_hash,
                    "plan_sha256": binary_hash, "json_sha256": _hash(json_path), "variables_sha256": inputs_hash,
                    "source_sha256": sources_hash, "scope": scope}
+        if review_admission_path is not None:
+            lock_fd = _review_admission_lock(review_admission_path, review_runtime_deadline)
+            review_deadline = min(review_runtime_deadline, time.monotonic() + (review_seconds if review_seconds > 0 else request.timeout_seconds))
+        else:
+            # A zero review_seconds is the legacy mode: operator review is
+            # bounded by the original request deadline. Positive values set
+            # a shorter manual-review window, still capped by that deadline.
+            review_window = review_seconds if review_seconds > 0 else request.timeout_seconds
+            review_deadline = min(deadline, time.monotonic() + review_window)
+        if time.monotonic() >= review_deadline:
+            raise PlanReviewError("saved-plan review window expired before request publication")
+        if review_seconds > 0:
+            binding.update(review_window_seconds=review_seconds,
+                review_deadline_utc_epoch=_deadline_epoch(review_deadline))
+            binding["review_published_at_utc_epoch"] = time.time()
         _private(directory / "review-request.json", _json(binding))
-        receipt = await_review(directory, binding, min(deadline, time.monotonic() + review_seconds))
-        _private(directory / "accepted-review.json", _json(receipt))
+        if review_seconds > 0 and time.time() >= original_review_cutoff(directory, binding):
+            raise PlanReviewError("original review cutoff elapsed before request publication completed")
+        receipt = await_review(directory, binding, review_deadline)
+        if time.monotonic() >= review_deadline or time.monotonic() >= deadline or _review_is_closed(directory):
+            raise PlanReviewError("original apply deadline elapsed or review cutoff/cancellation before acceptance")
+        _review_request_matches(directory, binding)
         _same((_hash(binary), _hash(json_path), _hash(variables), source_hash(root), _hash(state) if state.exists() or state.is_symlink() else None),
               (binary_hash, binding["json_sha256"], inputs_hash, sources_hash, state_hash), "reviewed artifact hashes")
+        if time.monotonic() >= review_deadline or time.monotonic() >= deadline or _review_is_closed(directory):
+            raise PlanReviewError("original apply deadline elapsed or review cutoff/cancellation before acceptance")
+        _private(directory / "accepted-review.json", _json(receipt))
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+            lock_fd = None
         # The legacy local -state override is not carried into a saved plan's
         # backend configuration. Keep apply on the original attempt state too.
         if time.monotonic() >= deadline:
             raise PlanReviewError("original apply deadline elapsed during saved-plan review")
         apply_budget = deadline - time.monotonic()
+        if command_timeout_seconds is not None:
+            apply_budget = min(apply_budget, command_timeout_seconds)
         if apply_timeout_seconds is not None:
-            apply_budget = apply_timeout_seconds
+            apply_budget = min(apply_budget, apply_timeout_seconds)
             if before_apply is not None:
                 fresh_budget = before_apply()
                 if (isinstance(fresh_budget, bool) or not isinstance(fresh_budget, (int, float))
@@ -335,26 +494,65 @@ def reviewed_apply(request: CommandRequest, run: Callable[[CommandRequest], Comm
         return result
     except BaseException as exc:
         _private(directory / "failure.json", _json({"category": "terraform_plan_review", "error_type": type(exc).__name__}))
+        cancelled_path = directory / "review-cancelled.json"
+        if (lock_fd is not None and (directory / "review-request.json").exists()
+                and not cancelled_path.exists() and not cancelled_path.is_symlink()):
+            _private(directory / "review-cancelled.json", _json({"reason": "review deadline expired or operation failed",
+                "action_id": request.action_id, "cancelled_at_monotonic": time.monotonic()}))
         raise
+    finally:
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
 
-def record_operator_review(directory: Path, request_sha256: str, reviewer: str, inspection: str) -> Path:
+def record_operator_review(directory: Path, request_sha256: str, reviewer: str, inspection: str,
+                           deadline_utc_epoch: float | None = None) -> Path:
     """Record an operator's completed inspection; never execute Terraform."""
     directory = directory.absolute()
     if directory.is_symlink() or any(p.is_symlink() for p in directory.parents):
         raise PlanReviewError("review directory must not traverse symlinks")
-    _same(_hash(directory / "review-request.json"), request_sha256, "inspection request hash")
-    binding = json.loads((directory / "review-request.json").read_bytes())
+    request_path = directory / "review-request.json"
+    _same(_hash(request_path), request_sha256, "inspection request hash")
+    binding = json.loads(request_path.read_bytes())
+    cutoff = original_review_cutoff(directory, binding, deadline_utc_epoch)
+    if time.time() >= cutoff:
+        raise PlanReviewError("operator receipt arrived after the original review cutoff")
+    if (_review_is_closed(directory) or (directory / "operator-review.json").exists()
+            or (directory / "operator-review.json").is_symlink()):
+        raise PlanReviewError("review is cancelled, closed, or already has a receipt")
     _same(_hash(directory / "saved.tfplan"), binding["plan_sha256"], "plan hash")
     _same(_hash(directory / "saved-plan.json"), binding["json_sha256"], "plan JSON hash")
     _same(source_hash(Path(binding["root"])), binding["source_sha256"], "source hash")
-    if not reviewer.strip() or not inspection.strip():
+    state_path = Path(binding["state"])
+    state_hash = _hash(state_path) if state_path.exists() or state_path.is_symlink() else None
+    _same(state_hash, binding["state_sha256"], "state hash")
+    variable_candidates = sorted({candidate for base in (directory, directory.parent)
+        for pattern in ("*.auto.tfvars.json", "*.tfvars.json", "*.tfvars", "vars.json")
+        for candidate in base.glob(pattern) if not candidate.is_symlink() and candidate.is_file()
+        and _hash(candidate) == binding["variables_sha256"]})
+    if len(variable_candidates) != 1:
+        raise PlanReviewError("original variable file does not uniquely match the review request")
+    if (not isinstance(reviewer, str) or not reviewer.strip()
+            or not isinstance(inspection, str) or not inspection.strip()):
         raise PlanReviewError("reviewer and completed inspection description are required")
     receipt = {"decision": "approved", "binding": binding, "reviewer": reviewer, "inspection": inspection}
     # Atomic publication prevents a waiting controller reading partial JSON.
     pending = directory / "operator-review.pending"
     _private(pending, _json(receipt))
     target = directory / "operator-review.json"
+    if (time.time() >= cutoff or _review_is_closed(directory)
+            or _hash(request_path) != request_sha256
+            or _hash(directory / "saved.tfplan") != binding["plan_sha256"]
+            or _hash(directory / "saved-plan.json") != binding["json_sha256"]
+            or source_hash(Path(binding["root"])) != binding["source_sha256"]
+            or (_hash(state_path) if state_path.exists() or state_path.is_symlink() else None) != binding["state_sha256"]
+            or _hash(variable_candidates[0]) != binding["variables_sha256"]):
+        raise PlanReviewError("review cutoff, cancellation, or bound plan inputs changed before receipt publication")
+    # Hash verification can be expensive. Recheck the original cutoff and
+    # request identity at the final publication boundary too.
+    if time.time() >= cutoff or _review_is_closed(directory) or _hash(request_path) != request_sha256:
+        raise PlanReviewError("review cutoff or request changed at receipt publication")
     if target.exists() or target.is_symlink():
         raise PlanReviewError("an operator receipt already exists; reviews are not overwritten")
     os.link(pending, target)
@@ -369,8 +567,11 @@ def main(argv=None) -> int:
     parser.add_argument("--request-sha256", required=True)
     parser.add_argument("--reviewer", required=True)
     parser.add_argument("--inspection", required=True)
+    parser.add_argument("--deadline-utc-epoch", type=float,
+                        help="approved review horizon from the original disclosure command")
     args = parser.parse_args(argv)
-    record_operator_review(args.directory, args.request_sha256, args.reviewer, args.inspection)
+    record_operator_review(args.directory, args.request_sha256, args.reviewer, args.inspection,
+                           args.deadline_utc_epoch)
     return 0
 
 

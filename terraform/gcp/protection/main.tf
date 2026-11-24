@@ -14,14 +14,19 @@ resource "terraform_data" "scope_guard" {
         "cross_zone|europe-west3-a|europe-west3-b",
         "placement_optimization|europe-west3-a|europe-west3-a",
         "inter_region|europe-west3-a|europe-west2-a",
-        "same_zone|europe-north1-a|europe-north1-a",
+        "same_zone|europe-north1-c|europe-north1-c",
+        "placement_optimization|europe-north1-c|europe-north1-c",
       ], "${var.scenario}|${var.zone_a}|${var.zone_b}")
-      error_message = "GCP protection accepts only the selected baseline topology or Finland same-zone pair."
+      error_message = "GCP protection accepts only the selected baseline topology or Finland zone c S1/S3 pair."
     }
     precondition {
       condition = (can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_a)) &&
       can(regex("^projects/ubuntu-os-cloud/global/images/ubuntu-2404-(noble-amd64-v|lts-amd64-v?)[0-9]{8}$", var.image_b)))
       error_message = "GCP protection requires two concrete pinned Ubuntu 24.04 amd64 images."
+    }
+    precondition {
+      condition = var.scenario == "placement_optimization" ? can(regex("^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.placement_policy_name)) : var.placement_policy_name == ""
+      error_message = "GCP protection requires exactly the registered compact policy name for S3 and none for other scenarios."
     }
   }
 }
@@ -81,7 +86,7 @@ resource "google_compute_firewall" "pair_icmp" {
 resource "google_compute_resource_policy" "compact" {
   depends_on = [terraform_data.scope_guard]
   count      = var.scenario == "placement_optimization" ? 1 : 0
-  name       = "${var.namespace}-compact"
+  name       = var.placement_policy_name
   region     = local.region_a
   group_placement_policy {
     collocation = "COLLOCATED"

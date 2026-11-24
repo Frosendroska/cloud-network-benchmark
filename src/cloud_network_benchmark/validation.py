@@ -1474,12 +1474,171 @@ def _sequence_timing_findings(value: ValidatorInput, parsed: dict[str, NativePar
     return findings
 
 
+
+def _prebuilt_origin_errors(value: ValidatorInput) -> list[str]:
+    """Require a complete paired origin chain whenever any prebuilt marker exists."""
+    roles, tools = ("vm_a", "vm_b"), ("sockperf", "iperf3")
+    metadata_by_role = {role: [m for m in value.vm_metadata_records if str(m.vm_role) == role]
+        for role in roles}
+    origin_records = [r for r in value.artifact_records if r.kind == "build-origin"
+        or (isinstance(r.artifact_id, str) and r.artifact_id.endswith("-origin"))]
+    supplied_any = False
+    for group in metadata_by_role.values():
+        for metadata in group:
+            builds = metadata.source_builds.value if isinstance(metadata.source_builds.value, dict) else {}
+            for row in builds.values():
+                if not isinstance(row, dict):
+                    continue
+                supplied = row.get("supplied", row)
+                if isinstance(supplied, dict) and (supplied.get("build_origin") == "controller-prebuilt"
+                        or supplied.get("origin_artifact_id") is not None):
+                    supplied_any = True
+    declared_any = any(d.kind == "build-origin" or d.artifact_id.endswith("-origin")
+        for d in value.artifacts.values())
+    if not origin_records and not supplied_any and not declared_any:
+        return []
+    errors: list[str] = []
+    expected_origin_ids = {f"f02r-{role}-{tool}-origin" for role in roles for tool in tools}
+    observed_origin_ids = {r.artifact_id for r in origin_records}
+    if observed_origin_ids != expected_origin_ids or len(origin_records) != len(expected_origin_ids):
+        errors.append("prebuilt origin evidence must contain exactly one declared artifact for each tool and VM role")
+    paired: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {tool: [] for tool in tools}
+    from .acquisition import _expected_build_identity, _parse_build_identity
+    for role in roles:
+        if len(metadata_by_role[role]) != 1:
+            errors.append(f"{role} prebuilt provenance requires exactly one VM metadata record")
+            continue
+        metadata = metadata_by_role[role][0]
+        builds = metadata.source_builds.value if isinstance(metadata.source_builds.value, dict) else {}
+        for tool in tools:
+            origin_id = f"f02r-{role}-{tool}-origin"
+            build_id = f"f02r-{role}-{tool}-build"
+            row = builds.get(tool, {})
+            supplied = row.get("supplied", row) if isinstance(row, dict) else {}
+            matches = [r for r in value.artifact_records if r.artifact_id == origin_id]
+            build_records = [r for r in value.artifact_records if r.artifact_id == build_id]
+            if (supplied.get("build_origin") != "controller-prebuilt"
+                    or supplied.get("origin_artifact_id") != origin_id or len(matches) != 1
+                    or len(build_records) != 1):
+                errors.append(f"{role}/{tool} prebuilt origin, metadata and V1 build artifacts must all be present exactly once")
+                continue
+            origin_record, build_record = matches[0], build_records[0]
+            if (str(origin_record.producer) != role or origin_record.kind != "build-origin"
+                    or origin_record.deployment_id != value.identity.deployment_id
+                    or origin_record.unit_id is not None or origin_record.closed is not True
+                    or str(origin_record.retrieval_state) != "verified"):
+                errors.append(f"{role}/{tool} origin artifact is not a closed verified same-role artifact")
+                continue
+            try:
+                origin_record.verify_materialized_file(Path(value.child_result_root))
+                build_record.verify_materialized_file(Path(value.child_result_root))
+                proof_bytes = _artifact_path(value, origin_record).read_bytes()
+                proof = json.loads(proof_bytes)
+                identity = _parse_build_identity(_artifact_path(value, build_record).read_bytes())
+            except Exception:
+                errors.append(f"{role}/{tool} origin or V1 receipt bytes are invalid")
+                continue
+            try:
+                commit, patch_path, patch_sha, source_sha = _expected_build_identity(tool)
+                expected_source = ("sockperf-" if tool == "sockperf" else "iperf-") + commit
+                controller = proof.get("controller_receipt", {})
+                guest = proof.get("guest_verification", {})
+                evidence_text = controller.get("operational_build_evidence_json")
+                evidence = json.loads(evidence_text) if isinstance(evidence_text, str) else {}
+                raw_binary = evidence.get("binary", {})
+                supplied_hash = supplied.get("binary_sha256")
+                if isinstance(supplied_hash, dict): supplied_hash = supplied_hash.get("value")
+                supplied_version = supplied.get("binary_version")
+                if isinstance(supplied_version, dict): supplied_version = supplied_version.get("value")
+                valid = (
+                    proof.get("schema") == "CNB_PREBUILT_V1" and proof.get("origin") == "controller-prebuilt"
+                    and proof.get("role") == role and proof.get("tool") == tool
+                    and proof.get("binary_sha256") == identity.get("binary_sha256") == guest.get("binary_sha256") == supplied_hash
+                    and proof.get("bundle_sha256") and re.fullmatch(r"[a-f0-9]{64}", str(proof.get("bundle_sha256")))
+                    and proof.get("bundle_artifact_id") == "f02r-controller-prebuilt-bundle"
+                    and identity.get("tool") == tool and identity.get("source_reference") == expected_source
+                    and identity.get("source_sha256") == source_sha and identity.get("upstream_commit") == commit
+                    and identity.get("patch_path") == patch_path and identity.get("patch_sha256") == patch_sha
+                    and identity.get("observation_capability") == "CNB_ACQ_V1"
+                    and identity.get("binary_path") == f"/var/lib/cnb/install/bin/{tool}"
+                    and guest.get("binary_version") == identity.get("binary_version") == supplied_version
+                    and guest.get("binary_path") == identity.get("binary_path")
+                    and controller.get("tool") == tool and controller.get("source_sha256") == source_sha
+                    and controller.get("upstream_commit") == commit and controller.get("patch_path") == patch_path
+                    and controller.get("patch_sha256") == patch_sha
+                    and controller.get("binary_sha256") == identity.get("binary_sha256")
+                    and isinstance(evidence_text, str)
+                    and hashlib.sha256(evidence_text.encode("utf-8")).hexdigest() == controller.get("build_evidence_sha256")
+                    and evidence.get("origin") == "controller-prebuilt" and evidence.get("provider_calls") == 0
+                    and evidence.get("success") is True and evidence.get("binary", {}).get("sha256") == identity.get("binary_sha256")
+                    and raw_binary.get("acquisition_marker_present") is True
+                    and "ELF64" in guest.get("elf_header", "")
+                    and "Advanced Micro Devices X86-64" in guest.get("elf_header", "")
+                    and "2.39" in guest.get("guest_glibc", "")
+                    and "not found" not in guest.get("guest_dependencies", "")
+                    and supplied.get("origin_proof_sha256") == hashlib.sha256(proof_bytes).hexdigest()
+                )
+                if not valid:
+                    raise ValueError("prebuilt receipt fields did not agree")
+                expected_version = lambda text: text.splitlines()[0].strip() if isinstance(text, str) and text.splitlines() else ""
+                if expected_version(controller.get("binary_version")) != expected_version(guest.get("binary_version")):
+                    raise ValueError("controller and guest stable version lines differ")
+                paired[tool].append((controller, proof))
+            except Exception:
+                errors.append(f"{role}/{tool} prebuilt build receipt, guest proof and V1 identity disagree")
+    for tool, rows in paired.items():
+        if len(rows) != 2:
+            if not any(f"{role}/{tool}" in error for role in roles for error in errors):
+                errors.append(f"both VM roles must retain {tool} prebuilt provenance")
+            continue
+        if rows[0][0] != rows[1][0] or rows[0][1].get("bundle_sha256") != rows[1][1].get("bundle_sha256"):
+            errors.append(f"paired {tool} controller receipt, evidence SHA and bundle identity differ by role")
+    bundle_hashes = {proof.get("bundle_sha256") for rows in paired.values() for _, proof in rows}
+    if len(bundle_hashes) != 1 or not bundle_hashes:
+        errors.append("both tools and both roles must identify the same controller-prebuilt bundle")
+    else:
+        bundle_id = "f02r-controller-prebuilt-bundle"
+        bundle_rows = [r for r in value.artifact_records if r.artifact_id == bundle_id]
+        if len(bundle_rows) != 1:
+            errors.append("the exact controller-prebuilt bundle must be retained once as a closed raw artifact")
+        else:
+            bundle_record = bundle_rows[0]
+            try:
+                if (bundle_record.kind != "controller-prebuilt-bundle" or str(bundle_record.producer) != "controller"
+                        or bundle_record.deployment_id != value.identity.deployment_id or bundle_record.unit_id is not None
+                        or bundle_record.closed is not True or str(bundle_record.retrieval_state) != "verified"):
+                    raise ValueError("bundle artifact declaration mismatch")
+                bundle_record.verify_materialized_file(Path(value.child_result_root))
+                bundle_path = _artifact_path(value, bundle_record)
+                from .bootstrap import SourceBuild
+                sources = []
+                for tool in tools:
+                    commit, patch_path, patch_sha, source_sha = _expected_build_identity(tool)
+                    prefix = "sockperf-" if tool == "sockperf" else "iperf-"
+                    repo = "Mellanox/sockperf" if tool == "sockperf" else "esnet/iperf"
+                    url = f"https://codeload.github.com/{repo}/tar.gz/{commit}"
+                    archive = "sockperf.tar.gz" if tool == "sockperf" else "iperf3.tar.gz"
+                    sources.append(SourceBuild(tool=tool, source_url=url, source_reference=prefix + commit,
+                        archive_name=archive, source_sha256=source_sha, upstream_commit=commit,
+                        observation_patch_path=patch_path, observation_patch_sha256=patch_sha))
+                from .build_bundle import validate_bundle
+                digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+                if digest not in bundle_hashes:
+                    raise ValueError("bundle raw artifact SHA differs from both guest roles")
+                validate_bundle(bundle_path, digest, sources)
+            except Exception:
+                errors.append("retained controller bundle bytes do not validate against role proofs and production pins")
+    return errors
+
+
 def validate_bundle(value: ValidatorInput, *, evaluated_at: datetime) -> ValidationResult:
     if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
         raise ValueError("evaluated_at must be timezone-aware")
     findings, records, provenance = _validate_artifacts(value)
     findings.extend(_validate_materialized_records(value, records))
     findings.extend(_validate_manifests(value))
+    findings.extend(_finding("provenance.prebuilt_origin_invalid", "error", error)
+        for error in _prebuilt_origin_errors(value))
     resolved_findings, resolved_obj = _resolved_snapshot_findings(value)
     findings.extend(resolved_findings)
     findings.extend(_command_findings(value))

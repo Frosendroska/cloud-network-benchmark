@@ -145,7 +145,8 @@ def make_inter_region_attempt(tmp_path, scenario="inter_region"):
     )
     settings_values = dict(
         account_id="123456789012", controller_cidr="203.0.113.4/32",
-        ami_ids={"eu-central-1": "ami-0123456789abcdef0", "eu-west-2": "ami-0abcdef0123456789"},
+        ami_ids={"eu-central-1": "ami-0123456789abcdef0", "eu-west-2": "ami-0abcdef0123456789",
+            "eu-north-1": "ami-084df9e6ad4622caf"},
         public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA fake-key",
         authentication_reference="private-ssh-key:attempt-only", private_state_root=tmp_path / "state",
         aws_cli="aws", terraform="terraform", cost_input_id=observation.admission.cost_input_id,
@@ -158,6 +159,8 @@ def make_inter_region_attempt(tmp_path, scenario="inter_region"):
             "expiry_cost_included_usd": round(EXPIRY_COST_PER_REGION * len(set((deployment.vm_a.region, deployment.vm_b.region))), 4),
         }),
         complete_workflow_remaining_seconds=120,
+        post_registration_workflow_seconds=120,
+        post_provision_workflow_seconds=100,
     )
     if observation.admission.requires_primary_review:
         settings_values["primary_review_decision"] = StructuredEvidence(value={"decision": "approved", "scenario": scenario,
@@ -193,7 +196,8 @@ def terminal_automation(execution_id, document_name, parameters, status="Cancell
 
 def test_expiry_start_uses_one_request_and_returns_execution_identity(tmp_path):
     runner = QueueRunner([(0, '{"AutomationExecutionId":"exec-1"}', "")])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     result = driver._start_or_recover_automation(
         "eu-central-1",
         {"document_name": "cnb-expiry", "document_version": "1"},
@@ -282,7 +286,8 @@ def test_lost_expiry_start_recovers_only_one_exact_inprogress_match(tmp_path):
         (0, json.dumps(described), ""),
         (0, json.dumps({"AutomationExecution": {**execution, "AutomationExecutionId": "exec-1", "Parameters": {**params, "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "Region": ["eu-central-1"]}}}), ""),
     ])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     recovered = driver._start_or_recover_automation(
         "eu-central-1",
         {"document_name": "cnb-expiry", "document_version": "1", "role_arn": "arn:aws:iam::123456789012:role/expiry"},
@@ -305,7 +310,8 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
         (0, "{}", ""),
         (0, "{}", ""),
     ])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     assert driver._start_or_recover_automation(
         "eu-central-1", {"document_name": "expiry", "document_version": "1", "role_arn":"arn:aws:iam::123456789012:role/expiry"}, params, "token"
     ) is None
@@ -314,7 +320,16 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
 def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_path):
     deployment, settings = make_inter_region_attempt(tmp_path)
     runner = RegistrationRunner()
-    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW)
+    settle_calls = []
+    settings = settings.model_copy(update={"iam_settle_seconds": 30})
+    deadline_during_settle = []
+    def settle(seconds):
+        journal = driver._load_journal(driver._attempt_dir(deployment), deployment)
+        assert set(journal["safety"]) == {"eu-central-1", "eu-west-2"}
+        deadline_during_settle.append(driver._registration_deadline)
+        settle_calls.append(seconds)
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW,
+        sleeper=settle)
     reservation = deployment.reservation.value
     regions = driver._regions(deployment)
     request = ExpiryRequest(
@@ -327,6 +342,8 @@ def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_p
     )
     evidence = driver.register_expiry(deployment, request)
     assert evidence.state == "registered"
+    assert settle_calls == [30]
+    assert deadline_during_settle == [driver._registration_deadline]
     assert {action for action in runner.actions if action.startswith("aws-expiry-confirm-")} == {
         "aws-expiry-confirm-eu-central-1", "aws-expiry-confirm-eu-west-2",
     }
@@ -334,6 +351,61 @@ def test_s4_registration_confirms_both_regions_before_reporting_registered(tmp_p
         index for index, action in enumerate(runner.actions) if action.startswith("aws-expiry-start-")
     )
     assert "aws-pair-apply" not in runner.actions
+
+
+def test_exact_30_second_iam_settle_is_one_bounded_wait_before_single_start(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
+    settings = settings.model_copy(update={"iam_settle_seconds": 30, "registration_timeout_seconds": 90})
+    runner = RegistrationRunner()
+    waits = []
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW, sleeper=waits.append)
+    reservation = deployment.reservation.value
+    regions = driver._regions(deployment)
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="aws", action="stop",
+        expires_at=Evidence[datetime](value=reservation.expires_at.value - timedelta(seconds=360)),
+        reservation_id=reservation.reservation_id,
+        resource_namespace=f"cnb-{deployment.run_id}-{deployment.deployment_id}",
+        target_selector=driver._target_selector(deployment, regions))
+
+    evidence = driver.register_expiry(deployment, request)
+
+    assert evidence.state == "registered"
+    assert waits == [30]
+    starts = [action for action in runner.actions if action.startswith("aws-expiry-start-")]
+    assert starts == [f"aws-expiry-start-{regions[0]}"]
+    assert driver._registration_deadline is not None
+    assert "aws-pair-apply" not in runner.actions
+
+
+def test_iam_settle_option_is_read_by_both_production_factories():
+    import inspect
+    from cloud_network_benchmark import lifecycle_runtime
+
+    first = inspect.getsource(lifecycle_runtime.build_aws_provider_workflows)
+    second = inspect.getsource(lifecycle_runtime.build_provider_workflows)
+    assert "iam_settle_seconds=options.get(\"iam_settle_seconds\", 0)" in first
+    assert "iam_settle_seconds=config.get(\"iam_settle_seconds\", 0)" in second
+
+
+def test_iam_settle_that_cannot_fit_registration_deadline_never_starts(tmp_path):
+    deployment, settings = make_inter_region_attempt(tmp_path)
+    runner = RegistrationRunner()
+    settings = settings.model_copy(update={"iam_settle_seconds": 2, "registration_timeout_seconds": 1})
+    driver = AwsProviderDriver(runner, settings, clock=lambda: NOW, sleeper=lambda _seconds: pytest.fail("must not sleep"))
+    reservation = deployment.reservation.value
+    regions = driver._regions(deployment)
+    request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
+        deployment_id=deployment.deployment_id, provider="aws", action="stop",
+        expires_at=Evidence[datetime](value=reservation.expires_at.value - timedelta(seconds=360)),
+        reservation_id=reservation.reservation_id,
+        resource_namespace=f"cnb-{deployment.run_id}-{deployment.deployment_id}",
+        target_selector=driver._target_selector(deployment, regions))
+
+    result = driver.register_expiry(deployment, request)
+
+    assert result.state == "failed"
+    assert not any(action.startswith("aws-expiry-start-") for action in runner.actions)
 
 
 def test_s4_uncertain_second_region_registration_keeps_pair_launch_blocked(tmp_path):
@@ -534,17 +606,22 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
                 Path(state).write_text("fake-terraform-state")
                 stdout = ""
             elif request.action_id == "aws-pair-output":
+                a_region, a_zone = deployment.vm_a.region, deployment.vm_a.zone
+                a_zone_id = f"test-{a_region}-{a_zone.split('-')[-1]}"
+                a_ip = "10.62.1.10" if a_region == "eu-north-1" else "10.60.1.10"
                 if scenario == "cross_zone":
                     b_region, b_zone, b_zone_id, b_ip = "eu-central-1", "eu-central-1b", "test-euc1-az1", "10.60.2.10"
                 elif scenario == "inter_region":
                     b_region, b_zone, b_zone_id, b_ip = "eu-west-2", "eu-west-2a", "test-euw2-az1", "10.61.1.10"
                 else:
-                    b_region, b_zone, b_zone_id, b_ip = "eu-central-1", "eu-central-1a", "test-euc1-az2", "10.60.1.11"
+                    b_region, b_zone = deployment.vm_b.region, deployment.vm_b.zone
+                    b_zone_id = f"test-{b_region}-{b_zone.split('-')[-1]}"
+                    b_ip = "10.62.1.11" if b_region == "eu-north-1" else "10.60.1.11"
                 placement_group = f"cnb-{deployment.run_id}-{deployment.deployment_id}-cluster" if scenario == "placement_optimization" else None
                 roles = {
-                    "vm_a": {"instance_id": "i-vm-a", "private_ipv4": "10.60.1.10", "public_ipv4": "8.8.8.8",
-                        "region": "eu-central-1", "zone": "eu-central-1a", "zone_id": "test-euc1-az2",
-                        "image_id": "ami-0123456789abcdef0", "image_owner_id": "099720109477",
+                    "vm_a": {"instance_id": "i-vm-a", "private_ipv4": a_ip, "public_ipv4": "8.8.8.8",
+                        "region": a_region, "zone": a_zone, "zone_id": a_zone_id,
+                        "image_id": settings.ami_ids[a_region], "image_owner_id": "099720109477",
                         "architecture": "x86_64", "shape": "m7i.xlarge", "boot_volume_id": "vol-a",
                         "placement_group": placement_group,
                         "placement_group_strategy": "cluster" if placement_group else None},
@@ -595,12 +672,17 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
     assert sequence[:len(regions)] == [f"expiry-confirm-{region}" for region in regions]
     assert sequence.index("aws-pair-apply") > len(regions) - 1
     assert str(result.scenario) == scenario
-    assert result.vm_a.region == "eu-central-1"
-    assert result.vm_b.region == ("eu-west-2" if scenario == "inter_region" else "eu-central-1")
-    assert result.vm_a.private_ipv4 == "10.60.1.10"
-    assert result.vm_b.private_ipv4 == ("10.60.2.10" if scenario == "cross_zone" else "10.61.1.10" if scenario == "inter_region" else "10.60.1.11")
-    assert result.vm_a.physical_zone_id.value == "test-euc1-az2"
-    assert result.vm_b.physical_zone_id.value in {"test-euc1-az1", "test-euc1-az2", "test-euw2-az1"}
+    assert result.vm_a.region == deployment.vm_a.region
+    assert result.vm_b.region == deployment.vm_b.region
+    assert result.vm_a.private_ipv4 == ("10.62.1.10" if deployment.vm_a.region == "eu-north-1" else "10.60.1.10")
+    expected_b_ip = ("10.60.2.10" if scenario == "cross_zone" else "10.61.1.10" if scenario == "inter_region"
+                     else "10.62.1.11" if deployment.vm_b.region == "eu-north-1" else "10.60.1.11")
+    assert result.vm_b.private_ipv4 == expected_b_ip
+    assert result.vm_a.physical_zone_id.value == f"test-{deployment.vm_a.region}-{deployment.vm_a.zone.split('-')[-1]}"
+    expected_b_zone_id = ("test-euc1-az1" if scenario == "cross_zone" else
+                          "test-euw2-az1" if scenario == "inter_region" else
+                          f"test-{deployment.vm_b.region}-{deployment.vm_b.zone.split('-')[-1]}")
+    assert result.vm_b.physical_zone_id.value == expected_b_zone_id
     assert result.documented_network_limit.value["baseline_gbit_per_second"] == 1.562
     assert (attempt / "pair.tfstate").stat().st_mode & 0o777 == 0o600
     assert (attempt / "pair.tfvars.json").stat().st_mode & 0o777 == 0o600
@@ -702,9 +784,6 @@ def test_cleanup_reports_destroy_failure_and_retries_idempotently(tmp_path):
 def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, expiry_state, sleep_status, stop_status):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
 
-    regions = ["eu-central-1"]
-    parameters = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"], "ExpiryTriggerUtc": ["2026-10-22T12:10:00Z"],
-        "RunId": [deployment.run_id], "DeploymentId": [deployment.deployment_id], "Region": [regions[0]]}
     class TerminalRunner:
         def run(self, request):
             identity = legacy_cleanup_read_reply(request)
@@ -720,6 +799,9 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
                 finished_at=NOW, duration_seconds=0, exit_code=0, stdout=json.dumps(output), stderr="")
 
     driver = AwsProviderDriver(TerminalRunner(), settings, clock=lambda: NOW)
+    regions = driver._regions(deployment)
+    parameters = {"AutomationAssumeRole": [f"arn:aws:iam::123456789012:role/expiry-{regions[0]}"], "ExpiryTriggerUtc": ["2026-10-22T12:10:00Z"],
+        "RunId": [deployment.run_id], "DeploymentId": [deployment.deployment_id], "Region": [regions[0]]}
     attempt = driver._attempt_dir(deployment)
     (attempt / "pair.tfvars.json").write_text("{}")
     regions = driver._regions(deployment)
@@ -754,7 +836,8 @@ def test_cleanup_records_terminal_state_and_action_outputs(tmp_path, terminal, e
 
 def test_cleanup_cancels_active_stop_step_after_sleep_completed(tmp_path):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
-    region = "eu-central-1"
+    driver = AwsProviderDriver(runner := RegistrationRunner(), settings, clock=lambda: NOW)
+    region = driver._regions(deployment)[0]
     parameters = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"],
         "ExpiryTriggerUtc": ["2026-10-22T12:10:00Z"], "RunId": [deployment.run_id],
         "DeploymentId": [deployment.deployment_id], "Region": [region]}
@@ -803,7 +886,7 @@ def test_cleanup_cancels_active_stop_step_after_sleep_completed(tmp_path):
     result = driver.cleanup(deployment)
     assert result.cleanup_state == "succeeded", result.model_dump(mode="json")
     assert result.expiry.value.state == "cancelled"
-    assert "aws-expiry-cancel-eu-central-1" in runner.actions
+    assert f"aws-expiry-cancel-{region}" in runner.actions
     assert result.expiry.value.provider_metadata.value["regional_outcomes"][region]["steps"][1]["StepStatus"] == "Cancelled"
 
 
@@ -869,10 +952,10 @@ def test_cleanup_preserves_mixed_s4_expiry_outcomes_truthfully(tmp_path, statuse
 @pytest.mark.parametrize("tamper", [False, True])
 def test_provision_revalidates_registered_evidence_and_time_after_readback(tmp_path, tamper):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario="same_zone")
-    region = "eu-central-1"
-    driver_clock = [NOW]
     runner = RegistrationRunner()
+    driver_clock = [NOW]
     driver = AwsProviderDriver(runner, settings, clock=lambda: driver_clock[0])
+    region = driver._regions(deployment)[0]
     expires = NOW + timedelta(seconds=840)
     expiry = ExpiryEvidence(schema_version=2, run_id=deployment.run_id, deployment_id=deployment.deployment_id,
         provider="aws", action="stop", state="registered",
