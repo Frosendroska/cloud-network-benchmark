@@ -196,7 +196,8 @@ def terminal_automation(execution_id, document_name, parameters, status="Cancell
 
 def test_expiry_start_uses_one_request_and_returns_execution_identity(tmp_path):
     runner = QueueRunner([(0, '{"AutomationExecutionId":"exec-1"}', "")])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     result = driver._start_or_recover_automation(
         "eu-central-1",
         {"document_name": "cnb-expiry", "document_version": "1"},
@@ -285,7 +286,8 @@ def test_lost_expiry_start_recovers_only_one_exact_inprogress_match(tmp_path):
         (0, json.dumps(described), ""),
         (0, json.dumps({"AutomationExecution": {**execution, "AutomationExecutionId": "exec-1", "Parameters": {**params, "AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "Region": ["eu-central-1"]}}}), ""),
     ])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     recovered = driver._start_or_recover_automation(
         "eu-central-1",
         {"document_name": "cnb-expiry", "document_version": "1", "role_arn": "arn:aws:iam::123456789012:role/expiry"},
@@ -308,7 +310,8 @@ def test_lost_expiry_start_with_duplicate_recovery_matches_fails_closed():
         (0, "{}", ""),
         (0, "{}", ""),
     ])
-    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90, authentication_reference="fake-ref"), clock=lambda: NOW)
+    driver = AwsProviderDriver(runner, SimpleNamespace(aws_cli="aws", registration_timeout_seconds=90,
+        authentication_reference="fake-ref", workflow_profile=None, plan_review_timeout_seconds=0, command_timeout_seconds=90), clock=lambda: NOW)
     assert driver._start_or_recover_automation(
         "eu-central-1", {"document_name": "expiry", "document_version": "1", "role_arn":"arn:aws:iam::123456789012:role/expiry"}, params, "token"
     ) is None

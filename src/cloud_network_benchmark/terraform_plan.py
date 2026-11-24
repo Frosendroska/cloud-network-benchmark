@@ -181,7 +181,16 @@ def validate_scope(plan: dict, provider: str, root: Path, v: dict) -> list[dict]
     """Require fresh exact scope; unknown critical inputs fail via missing values."""
     if not str(plan.get("format_version", "")).startswith("1.") or plan.get("errored") or plan.get("deferred_changes") or plan.get("resource_drift"):
         raise PlanReviewError("unsupported, incomplete or drifted Terraform plan")
-    _same({k: item["value"] for k, item in plan.get("variables", {}).items()}, v, "input variables")
+    plan_variables = {k: item["value"] for k, item in plan.get("variables", {}).items()}
+    expected_variables = dict(v)
+    if (provider == "aws" and root.name == "safety"
+            and "expiry_role_permissions_boundary_arn" not in expected_variables
+            and plan_variables.get("expiry_role_permissions_boundary_arn") is None):
+        # Terraform emits a declared nullable default in plan JSON when older
+        # reviewed tfvars omit the option. Accept only this exact null default;
+        # all other missing and unexpected variables remain rejected.
+        plan_variables.pop("expiry_role_permissions_boundary_arn", None)
+    _same(plan_variables, expected_variables, "input variables")
     for check in plan.get("checks", []):
         if check.get("status") in {"fail", "error"}: raise PlanReviewError("Terraform plan checks failed")
     resources = {}

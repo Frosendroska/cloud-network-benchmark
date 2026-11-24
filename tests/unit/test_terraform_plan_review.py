@@ -109,6 +109,38 @@ def test_aws_expiry_scope_binds_optional_permissions_boundary_to_configured_acco
     with pytest.raises(tp.PlanReviewError, match="configured account"):
         tp.validate_scope(plan_document(foreign, foreign_resources, "aws"), "aws", ROOT/"terraform/aws/safety", foreign)
 
+    for mutation in ("wrong_account", "wrong_boundary", "missing_tag", "wrong_tag_value"):
+        changed = deepcopy(plan)
+        role = next(item for item in changed["resource_changes"]
+                    if item["address"] == "aws_iam_role.expiry")["change"]["after"]
+        if mutation == "wrong_account":
+            role["permissions_boundary"] = "arn:aws:iam::999999999999:policy/cnb/ExpiryBoundary"
+        elif mutation == "wrong_boundary":
+            role["permissions_boundary"] = f"arn:aws:iam::{v['account_id']}:policy/cnb/Other"
+        elif mutation == "missing_tag":
+            role["tags"].pop("cnb_deployment_id")
+        else:
+            role["tags"]["cnb_run_id"] = "another-run"
+        with pytest.raises(tp.PlanReviewError):
+            tp.validate_scope(changed, "aws", ROOT/"terraform/aws/safety", v)
+
+
+def test_legacy_aws_safety_plan_accepts_only_declared_null_default():
+    v, resources = scope("aws", "safety")
+    plan = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
+    assert len(tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)) == len(resources)
+
+
+@pytest.mark.parametrize("extra", [
+    {"unapproved_null_input": None},
+    {"expiry_role_permissions_boundary_arn": "arn:aws:iam::111122223333:policy/Other"},
+])
+def test_aws_safety_plan_rejects_unexpected_variables(extra):
+    v, resources = scope("aws", "safety")
+    plan = plan_document({**v, **extra}, resources, "aws")
+    with pytest.raises(tp.PlanReviewError):
+        tp.validate_scope(plan, "aws", ROOT/"terraform/aws/safety", v)
+
 
 @pytest.mark.parametrize("scenario,count", [("same_zone",8),("cross_zone",8),("placement_optimization",9),("inter_region",9)])
 def test_gcp_protection_scenario_scope(scenario,count):
@@ -200,6 +232,14 @@ def test_applies_exact_reviewed_binary_without_vars_or_replanning(tmp_path,opera
     assert all(p.stat().st_mode & 0o077 == 0 for p in directory.iterdir())
     assert directory.stat().st_mode & 0o077 == 0
     assert runner.requests[-1].timeout_seconds <= runner.requests[0].timeout_seconds
+
+
+def test_reviewed_apply_accepts_legacy_aws_safety_tfvars_with_null_default(tmp_path, operator):
+    req, runner = request(tmp_path, "aws", "safety")
+    v, resources = scope("aws", "safety")
+    runner.document = plan_document({**v, "expiry_role_permissions_boundary_arn": None}, resources, "aws")
+    assert tp.reviewed_apply(req, runner.run).outcome == "succeeded"
+    assert [item.argv[2] for item in runner.requests] == ["plan", "show", "apply"]
 
 
 def test_missing_operator_receipt_never_applies_and_preserves_files(tmp_path):

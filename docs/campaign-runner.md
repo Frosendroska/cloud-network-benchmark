@@ -410,14 +410,7 @@ cloud-network-benchmark campaign status --settings ~/cnb/private/operator.yaml
 cloud-network-benchmark campaign logs --settings ~/cnb/private/operator.yaml --follow
 ```
 
-Acceptance runs V-S1/V-S3 at 10 seconds/phase, N=4, then waits for supervised failure entries. Verify actual AWS Cluster Placement Group, Azure **Standard** PPG and GCP **COLLOCATED** policy membership; inspect native data and full deletion. Test provider/server failure, original expiry deadlines, saved-state recovery and independent absence; physical Halle loss/reboot recovery is explicitly not tested:
-
-```sh
-cloud-network-benchmark campaign continue --stage-id ACTUAL_STAGE_ID --entry-id V-A-FAIL --confirm-supervision
-# Repeat explicitly for V-Z-FAIL and V-G-FAIL after the previous attempt is reviewed/recovered.
-```
-
-During supervised acceptance, disconnect/reconnect SSH and verify the same session/journal continues; exercise supervisor restart under the physical-loss procedure. Do not improvise restart/power-loss tests during research. Normal success alone does not pass a failure check.
+The current reduced pre-DAY prompt explicitly waives the deliberate provider/server failure, expiry-wait, controller-loss and host-loss exercises. Record those entries as **WAIVED / NOT TESTED**; do not launch or continue them from this historical runbook. No physical-host reboot recovery is provided. The detached supervisor continues across SSH disconnect/logout only while Halle remains available; it does not authorize a replay or a second measurement after uncertain state.
 
 **Review acceptance/native builds/renewal/cleanup with Codex**, then prepare the future start and measured allowance in the operator file:
 
@@ -479,7 +472,7 @@ du -sh /srv/cnb/results/*
 | Evidence | Location / meaning |
 | --- | --- |
 | Controller events | `/srv/cnb/private/campaign.log`; rotates at 5 MiB, three backups |
-| Service stdout/restarts | `journalctl --user -u cloud-network-benchmark-campaign.service`; retention depends on host journald |
+| Detached supervisor output | The stage/entry log under the configured private state root; inspect the saved process/journal identity and observer snapshot |
 | Detailed entry output | `/srv/cnb/private/STAGE_ID/ENTRY_ID.log` |
 | Durable launch/cleanup state | `/srv/cnb/private/STAGE_ID/campaign-journal.json`, per-entry `lifecycle-recovery.json`; keep private |
 | Original native results | `/srv/cnb/results/STAGE_ID/raw/RUN_ID/`; closed copies include native files, diagnostics, manifests, config/schedule, validation and checksums |

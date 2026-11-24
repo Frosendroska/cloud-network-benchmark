@@ -25,6 +25,19 @@ No `StartInstances`, VPC peering, Elastic IP, key-pair creation, `ssm:SendComman
 
 Before attaching the controller policy, an administrator must inspect all existing `cnb-expiry-*` roles and confirm they are absent or already have the exact boundary. Stop for review if any existing role is unbounded; this draft intentionally does not grant boundary changes or automatic deletion to retrofit one. The controller includes `iam:ListRoles` for prefix preflight, but IAM does not enforce that prefix filter in the permission itself. Do not allow another principal to create unbounded roles in the reserved prefix.
 
-## Code integration blocker
+## Code integration and evidence status
 
-This branch intentionally does not edit `src/cloud_network_benchmark/terraform_plan.py`. `validate_scope` currently requires exact plan-variable equality (`_same` over all plan variables and the supplied scope map), and `_aws_scope` checks the expiry role name/trust but does not yet validate `permissions_boundary` or conditional role tags. The owning reviewer must update that narrow scope guard to accept the new boundary variable only when explicitly configured, preserve the omitted default in legacy inputs, and compare the planned role boundary/tag attributes to the reviewed values. Until that lands, configured-boundary reviewed applies are blocked even though the local safety root and runtime option are prepared.
+The current candidate validates the configured AWS expiry-role boundary ARN,
+planned boundary readback, and the run/deployment ownership tags. It also
+accepts Terraform's declared nullable `expiry_role_permissions_boundary_arn`
+default only when that exact variable is absent from legacy reviewed scope;
+all other missing or additional plan variables remain rejected. Focused local
+regression identities cover the nullable-default path, foreign boundary and
+tag mutations. Run the final integrated test suite before relying on that
+offline result.
+
+The plans and policy documents in this directory remain offline review
+artifacts. They do not establish that IAM resources or permissions exist, that
+the current identity can call them, that policy simulation passes, or that any
+provider lifecycle is accepted. Native Linux and paid provider acceptance
+remain separate evidence stages.
