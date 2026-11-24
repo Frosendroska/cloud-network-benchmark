@@ -36,6 +36,34 @@ def _template_response(driver, deployment, role, template_id, trigger, created_a
     }
 
 
+def _s3_template_case(tmp_path):
+    deployment, driver = _cleanup_fixture(tmp_path)
+    north_network = deployment.vm_a.network.model_copy(update={
+        "address_spaces": {"europe-north1": "10.80.1.0/24"},
+        "subnets": {"europe-north1": ["10.80.1.0/24"]},
+    })
+    vm_a = deployment.vm_a.model_copy(update={
+        "region": "europe-north1", "zone": "europe-north1-c", "network": north_network,
+    })
+    vm_b = deployment.vm_b.model_copy(update={
+        "region": "europe-north1", "zone": "europe-north1-c", "network": north_network,
+    })
+    placement = deployment.placement.model_copy(update={
+        "kind": "compact_placement_policy", "name": "cnb-v-s3-1d94726aea", "collocated": True,
+    })
+    deployment = deployment.model_copy(update={
+        "scenario": "placement_optimization", "vm_a": vm_a, "vm_b": vm_b, "placement": placement,
+    })
+    driver.settings = driver.settings.model_copy(update={
+        "project_id": "project-a70f8497-3463-4ef2-9cd",
+        "images": {
+            **driver.settings.images,
+            "europe-north1": "projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20261105",
+        },
+    })
+    return deployment, driver
+
+
 def _instance_response(driver, deployment, role):
     intent = deployment.vm_a if role == "vm_a" else deployment.vm_b
     suffix = "a" if role == "vm_a" else "b"
@@ -1152,13 +1180,8 @@ def test_s3_template_policy_mismatch_journals_bounded_exact_readback(tmp_path):
     import hashlib, json
     from cloud_network_benchmark.providers.gcp import GcpProviderError
 
-    deployment, driver = _cleanup_fixture(tmp_path)
+    deployment, driver = _s3_template_case(tmp_path)
     policy_name = "cnb-v-s3-1d94726aea"
-    deployment = deployment.model_copy(update={
-        "scenario": "placement_optimization",
-        "placement": deployment.placement.model_copy(update={
-            "kind": "compact_placement_policy", "name": policy_name, "collocated": True}),
-    })
     expected = driver._selected_policy_path(deployment)
     trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
     described = _template_response(driver, deployment, "vm_a", "111", trigger,
@@ -1185,6 +1208,115 @@ def test_s3_template_policy_mismatch_journals_bounded_exact_readback(tmp_path):
         "observed_sha256": diagnostic["observed_field_sha256"]["resourcePolicies"],
         "observed_values": observed,
     }
+
+
+def test_s3_template_short_policy_name_matches_saved_readback_and_validates_contextually(tmp_path):
+    import hashlib, json
+
+    deployment, driver = _s3_template_case(tmp_path)
+    policy_name = "cnb-v-s3-1d94726aea"
+    expected = driver._selected_policy_path(deployment)
+    assert expected == "projects/project-a70f8497-3463-4ef2-9cd/regions/europe-north1/resourcePolicies/" + policy_name
+    # This independently retained Terraform state value hashes to the exact
+    # resourcePolicies mismatch recorded by the original gcloud readback.
+    raw_policies = [policy_name]
+    assert hashlib.sha256(json.dumps(raw_policies, sort_keys=True).encode()).hexdigest() == (
+        "8ad7f3d93fe87f5127167b3fefc876df33d85c42f6e3b35e3c8c269ae6974127")
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    described = _template_response(driver, deployment, "vm_a", "111", trigger,
+        datetime.now(timezone.utc) - timedelta(seconds=1))
+    described["properties"]["resourcePolicies"] = raw_policies
+    name = f"{driver._namespace(deployment)}-a"
+    item = {"id": "111", "name": name, "zone": deployment.vm_a.zone,
+        "expected_policy": expected,
+        "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{name}?uniqueId=111"}
+
+    assert driver._validate_template(described, item, "vm_a", deployment, trigger) is None
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing", "wrong_name", "duplicate", "extra", "wrong_binding", "missing_binding",
+    "wrong_project", "wrong_region", "malformed_query", "malformed_fragment", "non_string",
+])
+def test_s3_template_policy_short_name_does_not_weaken_scope_or_membership(tmp_path, mutation):
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+
+    deployment, driver = _s3_template_case(tmp_path)
+    policy_name = "cnb-v-s3-1d94726aea"
+    expected = driver._selected_policy_path(deployment)
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    described = _template_response(driver, deployment, "vm_a", "111", trigger,
+        datetime.now(timezone.utc) - timedelta(seconds=1))
+    item_policy = expected
+    other = f"projects/{driver.settings.project_id}/regions/europe-north1/resourcePolicies/extra"
+    if mutation == "missing":
+        raw_policies = []
+    elif mutation == "wrong_name":
+        raw_policies = ["cnb-v-s3-other"]
+    elif mutation == "duplicate":
+        raw_policies = [policy_name, policy_name]
+    elif mutation == "extra":
+        raw_policies = [policy_name, other]
+    elif mutation == "wrong_binding":
+        raw_policies = [policy_name]
+        item_policy = expected.replace("europe-north1", "europe-west2")
+    elif mutation == "missing_binding":
+        raw_policies = [policy_name]
+        item_policy = None
+    elif mutation == "wrong_project":
+        raw_policies = ["https://www.googleapis.com/compute/v1/projects/foreign-project/regions/europe-north1/resourcePolicies/" + policy_name]
+    elif mutation == "wrong_region":
+        raw_policies = [f"projects/{driver.settings.project_id}/regions/europe-west2/resourcePolicies/{policy_name}"]
+    elif mutation == "malformed_query":
+        raw_policies = [f"https://www.googleapis.com/compute/v1/{expected}?ignored=1"]
+    elif mutation == "malformed_fragment":
+        raw_policies = [f"https://www.googleapis.com/compute/v1/{expected}#ignored"]
+    else:
+        raw_policies = [None]
+    described["properties"]["resourcePolicies"] = raw_policies
+    name = f"{driver._namespace(deployment)}-a"
+    item = {"id": "111", "name": name, "zone": deployment.vm_a.zone,
+        "expected_policy": item_policy,
+        "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{name}?uniqueId=111"}
+
+    with pytest.raises(GcpProviderError, match="resourcePolicies"):
+        driver._validate_template(described, item, "vm_a", deployment, trigger)
+
+
+@pytest.mark.parametrize("representation", ["canonical_path", "google_api_url"])
+def test_s3_template_accepts_exact_selected_policy_path_representations(tmp_path, representation):
+    deployment, driver = _s3_template_case(tmp_path)
+    expected = driver._selected_policy_path(deployment)
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    described = _template_response(driver, deployment, "vm_a", "111", trigger,
+        datetime.now(timezone.utc) - timedelta(seconds=1))
+    described["properties"]["resourcePolicies"] = [
+        expected if representation == "canonical_path"
+        else f"https://www.googleapis.com/compute/v1/{expected}"
+    ]
+    name = f"{driver._namespace(deployment)}-a"
+    item = {"id": "111", "name": name, "zone": deployment.vm_a.zone,
+        "expected_policy": expected,
+        "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{name}?uniqueId=111"}
+
+    assert driver._validate_template(described, item, "vm_a", deployment, trigger) is None
+
+
+def test_s1_template_still_rejects_any_resource_policy(tmp_path):
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+
+    deployment, driver = _cleanup_fixture(tmp_path)
+    trigger = deployment.reservation.value.expires_at.value - timedelta(seconds=SAFETY_LEAD_SECONDS)
+    described = _template_response(driver, deployment, "vm_a", "111", trigger,
+        datetime.now(timezone.utc) - timedelta(seconds=1))
+    described["properties"]["resourcePolicies"] = ["cnb-v-s3-1d94726aea"]
+    name = f"{driver._namespace(deployment)}-a"
+    item = {"id": "111", "name": name, "zone": deployment.vm_a.zone,
+        "expected_policy": None,
+        "self_link_unique": f"projects/{driver.settings.project_id}/global/instanceTemplates/{name}?uniqueId=111"}
+
+    with pytest.raises(GcpProviderError, match="resourcePolicies"):
+        driver._validate_template(described, item, "vm_a", deployment, trigger)
 
 
 def test_selected_topology_readback_checks_zone_addresses_disk_and_image(tmp_path, monkeypatch):

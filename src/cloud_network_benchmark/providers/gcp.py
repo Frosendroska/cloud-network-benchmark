@@ -673,8 +673,24 @@ class GcpProviderDriver:
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
         expected_policy = self._selected_policy_path(deployment)
         raw_policies = props.get("resourcePolicies", [])
-        policy_paths = [self._compute_path(policy) for policy in raw_policies] if isinstance(raw_policies, list) else None
-        policy_matches = policy_paths == ([expected_policy] if expected_policy else [])
+        item_policy_matches = (
+            self._compute_path(item.get("expected_policy")) == expected_policy
+            if expected_policy else not item.get("expected_policy")
+        )
+        if expected_policy:
+            # Compute's InstanceProperties contract returns policy names for
+            # templates, while Terraform's selected policy output is a full
+            # project/region path. Bind that one short name to the already
+            # validated selected path; retain exact path checks for URL forms.
+            policy_matches = (
+                isinstance(raw_policies, list) and len(raw_policies) == 1
+                and (
+                    self._compute_path(raw_policies[0]) == expected_policy
+                    or (raw_policies[0] == deployment.placement.name and item_policy_matches)
+                )
+            )
+        else:
+            policy_matches = raw_policies == []
         # Named predicates keep mismatch evidence precise without persisting raw
         # metadata (which includes SSH keys and bootstrap input contents).
         checks = {
@@ -707,7 +723,7 @@ class GcpProviderDriver:
                 and metadata.get("cnb-network-intent") == json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
                 and metadata.get("ssh-keys") == f"benchmark:{self.settings.public_key}"),
             "reservationAffinity": props.get("reservationAffinity", {}).get("consumeReservationType") == "NO_RESERVATION",
-            "resourcePolicies": bool(policy_matches and (not item.get("expected_policy") or self._compute_path(item["expected_policy"]) == expected_policy)),
+            "resourcePolicies": bool(policy_matches and item_policy_matches),
             "labels": labels in (expected_labels, {**expected_labels, "goog-terraform-provisioned": "true"}),
             "maxRunDuration": "maxRunDuration" not in props,
             "guestAccelerators": not props.get("guestAccelerators"),
