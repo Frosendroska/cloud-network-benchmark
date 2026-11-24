@@ -217,6 +217,14 @@ class GcpProviderDriver:
         self._command_context.cleanup_absence_deadline_utc = value
 
     @property
+    def _cleanup_routine_deadline_utc(self) -> datetime | None:
+        return getattr(self._command_context, "cleanup_routine_deadline_utc", None)
+
+    @_cleanup_routine_deadline_utc.setter
+    def _cleanup_routine_deadline_utc(self, value: datetime | None) -> None:
+        self._command_context.cleanup_routine_deadline_utc = value
+
+    @property
     def _active_attempt(self) -> Path | None:
         return getattr(self._command_context, "attempt", None)
 
@@ -422,6 +430,7 @@ class GcpProviderDriver:
         self._deadline = None
         self._cleanup_deadline_utc = None
         self._cleanup_absence_deadline_utc = None
+        self._cleanup_routine_deadline_utc = None
         self._cleanup_clock_binding = None
         self._cleanup_acceptance_deadlines = []
         attempt = self._attempt_dir(deployment)
@@ -458,7 +467,9 @@ class GcpProviderDriver:
                 absence_end = self._prepare_absence_deadline(attempt, journal, deployment, lead)
                 self._cleanup_absence_deadline_utc = absence_end
                 absence_remaining = (absence_end-cleanup_now).total_seconds()
-                self._deadline = min(self._deadline or float("inf"),
+                overall_remaining = (cleanup_deadline-cleanup_now).total_seconds()
+                self._deadline = min(float(journal["cleanup_deadline_monotonic"]),
+                    time.monotonic()+overall_remaining,
                     float(journal["cleanup_absence_deadline_monotonic"]),
                     time.monotonic()+max(0.0, absence_remaining))
                 self._save(attempt, journal)
@@ -479,6 +490,27 @@ class GcpProviderDriver:
             from ..validation_profiles import provider_lead_seconds
             lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
             routine_end = min(started_utc + timedelta(seconds=600), reservation_end-timedelta(seconds=lead+60))
+            routine_mono = float(journal["cleanup_started_monotonic"]) + (routine_end-started_utc).total_seconds()
+            saved_routine_utc = journal.get("cleanup_routine_deadline_utc")
+            saved_routine_mono = journal.get("cleanup_routine_deadline_monotonic")
+            if saved_routine_utc is not None or saved_routine_mono is not None:
+                if saved_routine_utc is None or saved_routine_mono is None:
+                    raise GcpProviderError("original cleanup routine deadline is incomplete", category="cleanup_deadline_unknown")
+                try:
+                    parsed_routine_utc = datetime.fromisoformat(str(saved_routine_utc).replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise GcpProviderError("original cleanup routine deadline is malformed", category="cleanup_deadline_unknown") from exc
+                if (parsed_routine_utc.tzinfo is None or parsed_routine_utc.utcoffset() is None
+                        or parsed_routine_utc.astimezone(timezone.utc) != routine_end
+                        or isinstance(saved_routine_mono, bool) or not isinstance(saved_routine_mono, (int, float))
+                        or not isfinite(float(saved_routine_mono)) or abs(float(saved_routine_mono)-routine_mono) > 0.01):
+                    raise GcpProviderError("original cleanup routine deadline changed", category="cleanup_deadline_invalid")
+            else:
+                journal["cleanup_routine_deadline_utc"] = routine_end.isoformat()
+                journal["cleanup_routine_deadline_monotonic"] = routine_mono
+            if self._cleanup_absence_deadline_utc is None:
+                self._cleanup_routine_deadline_utc = routine_end
+                self._deadline = min(self._deadline, routine_mono)
             self._cleanup_acceptance_deadlines = [routine_end]
             previous_timing = journal.get("cleanup_acceptance_timing", {})
             timing_status = previous_timing.get("status")
@@ -511,7 +543,10 @@ class GcpProviderDriver:
                     journal["cleanup_acceptance_timing"]["status"] = "late"
                 remaining_utc = (absence_end-self.clock().astimezone(timezone.utc)).total_seconds()
                 absence_mono = journal["cleanup_absence_deadline_monotonic"]
-                self._deadline = min(self._deadline or float("inf"), float(absence_mono),
+                overall_deadline_utc = datetime.fromisoformat(journal["cleanup_deadline_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                overall_remaining = (overall_deadline_utc-self.clock().astimezone(timezone.utc)).total_seconds()
+                self._deadline = min(float(journal["cleanup_deadline_monotonic"]),
+                    time.monotonic()+overall_remaining, float(absence_mono),
                     time.monotonic()+max(0.0, remaining_utc))
                 self._save(attempt, journal)
             inventory = self._inventory(deployment)
@@ -718,6 +753,8 @@ class GcpProviderDriver:
         deadlines = [deadline_utc]
         if self._cleanup_absence_deadline_utc is not None:
             deadlines.append(self._cleanup_absence_deadline_utc)
+        elif self._cleanup_routine_deadline_utc is not None:
+            deadlines.append(self._cleanup_routine_deadline_utc)
         remaining = min((deadline-now_utc).total_seconds() for deadline in deadlines)
         if not isfinite(remaining) or remaining <= 0 or self._deadline <= now_mono:
             raise GcpProviderError("original cumulative cleanup deadline elapsed",
@@ -1128,7 +1165,7 @@ class GcpProviderDriver:
             current = json.loads(target.read_text(encoding="utf-8"))
             if (current.get("run_id"), current.get("deployment_id")) != (journal.get("run_id"), journal.get("deployment_id")):
                 raise GcpProviderError("journal identity changed during update", category="state_identity_mismatch")
-            immutable = ("run_id", "deployment_id", "binding_sha256", "reservation_id", "cap_started_at", "cap_expires_at", "trigger", "controller_session_id", "cleanup_started_at", "cleanup_started_monotonic", "cleanup_clock_binding", "cleanup_deadline_utc", "cleanup_deadline_monotonic", "cleanup_deadline_binding_sha256", "cleanup_absence_started_at", "cleanup_absence_started_monotonic", "cleanup_absence_clock_binding", "cleanup_absence_deadline_utc", "cleanup_absence_deadline_monotonic")
+            immutable = ("run_id", "deployment_id", "binding_sha256", "reservation_id", "cap_started_at", "cap_expires_at", "trigger", "controller_session_id", "cleanup_started_at", "cleanup_started_monotonic", "cleanup_clock_binding", "cleanup_deadline_utc", "cleanup_deadline_monotonic", "cleanup_deadline_binding_sha256", "cleanup_routine_deadline_utc", "cleanup_routine_deadline_monotonic", "cleanup_absence_started_at", "cleanup_absence_started_monotonic", "cleanup_absence_clock_binding", "cleanup_absence_deadline_utc", "cleanup_absence_deadline_monotonic")
             for key in immutable:
                 if key in current and key in journal and current[key] != journal[key]:
                     raise GcpProviderError(f"journal immutable ownership field {key} changed", category="state_identity_mismatch")

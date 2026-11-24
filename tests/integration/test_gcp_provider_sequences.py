@@ -915,12 +915,81 @@ def test_cleanup_deadline_rejects_expired_unknown_or_unrepresentable_time(tmp_pa
             driver.clock() if clock_case == "naive_utc" else now)
 
 
+@pytest.mark.parametrize("clock_change", ["utc_forward", "monotonic_reset"])
+def test_cleanup_command_deadline_rejects_clock_identity_changes(tmp_path, monkeypatch, clock_change):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.providers.gcp import GcpProviderError
+    deployment, driver = _cleanup_fixture(tmp_path)
+    now = datetime.now(timezone.utc)
+    monotonic = [100.0]
+    driver.clock = lambda: now + (timedelta(seconds=31) if clock_change == "utc_forward" else timedelta())
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: monotonic[0])
+    driver._cleanup_deadline_utc = now + timedelta(seconds=660)
+    driver._cleanup_clock_binding = round(now.timestamp()-100.0, 3)
+    driver._deadline = 760.0
+    if clock_change == "monotonic_reset":
+        monotonic[0] = 0.0
+    with pytest.raises(GcpProviderError) as error:
+        driver._check_cleanup_deadline("gcp-pair-destroy")
+    assert error.value.category in {"cleanup_clock_changed", "cleanup_deadline_unknown"}
+
+
+def test_resumed_cleanup_rejects_expired_absence_deadline_before_any_command(tmp_path, monkeypatch):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    deployment, driver = _cleanup_fixture(tmp_path)
+    now = datetime.now(timezone.utc)
+    mono = [100.0]
+    driver.clock = lambda: now
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    deployment = deployment.model_copy(update={"admission": admission,
+        "cleanup_timeout_seconds": 660})
+    attempt = driver._attempt_dir(deployment)
+    clock_binding = round(now.timestamp()-mono[0], 3)
+    cleanup_start = now-timedelta(seconds=30)
+    absence_start = now-timedelta(seconds=61)
+    driver._save(attempt, {
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "creation_may_have_started": True, "registered": True,
+        "cleanup_started_at": cleanup_start.isoformat(),
+        "cleanup_started_monotonic": 70.0,
+        "cleanup_clock_binding": clock_binding,
+        "cleanup_deadline_utc": (cleanup_start+timedelta(seconds=660)).isoformat(),
+        "cleanup_deadline_monotonic": 730.0,
+        "cleanup_deadline_binding_sha256": None,
+        "cleanup_absence_started_at": absence_start.isoformat(),
+        "cleanup_absence_started_monotonic": 39.0,
+        "cleanup_absence_clock_binding": clock_binding,
+        "cleanup_absence_deadline_utc": (absence_start+timedelta(seconds=60)).isoformat(),
+        "cleanup_absence_deadline_monotonic": 99.0,
+    })
+    driver = GcpProviderDriver(object(), driver.settings)
+    driver.clock = lambda: now
+    actions = []
+    monkeypatch.setattr(driver, "_terraform", lambda _attempt, root, action, _deployment, _extra:
+        actions.append((root, action)) or {})
+    monkeypatch.setattr(driver, "_inventory", lambda _deployment:
+        actions.append(("inventory", "read")) or {
+            "pages_complete": True, "instances": [], "resources": [], "known": []})
+
+    result = driver.cleanup(deployment)
+
+    assert result.cleanup_state == "failed"
+    assert result.cleanup_failure.category == "command_timeout"
+    assert actions == []
+
+
 def test_cleanup_runner_uses_only_remaining_original_deadline_and_keeps_other_limits(tmp_path, monkeypatch):
     import json
     import cloud_network_benchmark.providers.gcp as gcp_provider
     from cloud_network_benchmark.contracts.execution import CommandResult
     deployment, driver = _cleanup_fixture(tmp_path)
-    deployment = deployment.model_copy(update={"cleanup_timeout_seconds": 660})
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    deployment = deployment.model_copy(update={"cleanup_timeout_seconds": 660,
+        "admission": admission})
     attempt = driver._attempt_dir(deployment)
     namespace = driver._namespace(deployment)
     driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
@@ -963,7 +1032,7 @@ def test_cleanup_runner_uses_only_remaining_original_deadline_and_keeps_other_li
     destroys = [request for request in capture.requests if request.action_id == "gcp-pair-destroy"]
     assert first.cleanup_state == second.cleanup_state == "failed"
     assert destroys[0].timeout_seconds > 120
-    assert destroys[0].timeout_seconds <= 660
+    assert destroys[0].timeout_seconds <= 600
     assert destroys[1].timeout_seconds == destroys[0].timeout_seconds - 120
     assert json.loads((attempt / "attempt.json").read_text())["cleanup_state"] == "failed"
 
