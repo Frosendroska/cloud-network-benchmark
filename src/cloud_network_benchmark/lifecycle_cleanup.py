@@ -142,6 +142,76 @@ def _expected_journal(saved: SavedProviderCleanupSettings) -> Path:
     return options.attempt_root / "recovery.json"
 
 
+def _gcp_cleanup_inventory_commands_valid(commands: Any, settings: Any) -> bool:
+    """Accept only repeated, successful read-only inventory polls for this project."""
+    import re
+    from .contracts.execution import CommandRequest, CommandResult
+    from .providers.gcp import GCP_CLEANUP_INVENTORY_COMMANDS
+
+    actions = [action for action, _ in GCP_CLEANUP_INVENTORY_COMMANDS]
+    if not isinstance(commands, list):
+        return False
+    observed: list[str] = []
+    request_keys = {"action_id", "action_type", "argv", "cwd", "environment_classification",
+        "acquisition_invocation_id", "timeout_seconds", "environment_keys", "stdin_supplied"}
+    result_keys = {"action_id", "outcome", "started_at", "finished_at", "duration_seconds",
+        "duration_basis", "monotonic_started", "monotonic_finished", "utc_elapsed_discrepancy_seconds",
+        "exit_code", "stdout", "stderr", "redactions_applied"}
+    command_args = dict(GCP_CLEANUP_INVENTORY_COMMANDS)
+    for event in commands:
+        if not isinstance(event, dict) or set(event) != {"request", "result"}:
+            return False
+        request_view, result_view = event["request"], event["result"]
+        if not isinstance(request_view, dict) or set(request_view) != request_keys:
+            return False
+        if not isinstance(result_view, dict) or set(result_view) != result_keys:
+            return False
+        action_id = request_view.get("action_id")
+        if action_id not in command_args:
+            return False
+        expected_argv = [settings.gcloud, *command_args[action_id], "--project", settings.project_id, "--format=json"]
+        if (request_view.get("action_type") != "gcp_provider_control"
+                or request_view.get("argv") != expected_argv
+                or request_view.get("cwd") != str(settings.private_state_root)
+                or request_view.get("stdin_supplied") is not False
+                or not isinstance(request_view.get("environment_keys"), list)
+                or any(not isinstance(key, str) for key in request_view["environment_keys"])):
+            return False
+        request_payload = dict(request_view)
+        request_payload.pop("environment_keys")
+        request_payload.pop("stdin_supplied")
+        try:
+            CommandRequest.model_validate(request_payload)
+        except (TypeError, ValueError):
+            return False
+        if result_view.get("redactions_applied") is not False:
+            return False
+        if any(not isinstance(result_view.get(field), str)
+                or re.fullmatch(r"\[omitted sha256=[a-f0-9]{64} bytes=[0-9]+\]", result_view[field]) is None
+                for field in ("stdout", "stderr")):
+            return False
+        result_payload = dict(result_view)
+        result_payload.pop("redactions_applied")
+        try:
+            result = CommandResult.model_validate(result_payload)
+        except (TypeError, ValueError):
+            return False
+        if (result.action_id != action_id or getattr(result.outcome, "value", result.outcome) != "succeeded"
+                or result.exit_code != 0):
+            return False
+        observed.append(action_id)
+    # A supervisor can stop during an earlier poll; the recovered cleanup must
+    # still contain at least two full, ordered all-scope polls after any prefix.
+    for prefix_len in range(len(actions)):
+        tail = observed[prefix_len:]
+        if (observed[:prefix_len] == actions[:prefix_len] and len(tail) >= 2*len(actions)
+                and len(tail) % len(actions) == 0
+                and all(tail[index:index+len(actions)] == actions
+                    for index in range(0, len(tail), len(actions)))):
+            return True
+    return False
+
+
 def _validate_request(saved: SavedProviderCleanupSettings) -> None:
     d, r, reservation = saved.deployment, saved.expiry_request, saved.reservation
     from datetime import timedelta
@@ -361,7 +431,7 @@ def _gcp_precreation_selector(record: Any, saved: SavedProviderCleanupSettings,
             "cleanup_acceptance_timing"}
         required = {"run_id", "deployment_id", "commands", "cleanup_state", "launch_blocked", "inventory"}
         if (not required.issubset(state) or not set(state).issubset(allowed)
-                or state.get("commands") != []
+                or not _gcp_cleanup_inventory_commands_valid(state.get("commands"), settings)
                 or state.get("cleanup_state") != "succeeded"
                 or state.get("launch_blocked") is not False
                 or state.get("inventory") != getattr(getattr(result, "inventory", None), "value", None)):

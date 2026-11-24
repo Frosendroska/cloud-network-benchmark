@@ -584,9 +584,10 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
     from types import SimpleNamespace
     from cloud_network_benchmark.contracts.admission import ExpiryRequest
     from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark.contracts.execution import CommandRequest, CommandResult
     from cloud_network_benchmark.lifecycle_cleanup import (cleanup_saved_provider,
         reconcile_saved_cleanup_result, replay_saved_cleanup_receipt, save_cleanup_settings)
-    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    from cloud_network_benchmark.providers.gcp import GCP_CLEANUP_INVENTORY_COMMANDS, GcpProviderDriver
 
     deployment, driver = _cleanup_fixture(tmp_path)
     request = ExpiryRequest(schema_version=2, run_id=deployment.run_id,
@@ -621,6 +622,24 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
     assert cleanup_journal["deployment_id"] == deployment.deployment_id
     assert cleanup_journal["commands"] == []
     assert "binding_sha256" not in cleanup_journal and "reservation_id" not in cleanup_journal
+    action_prefixes = dict(GCP_CLEANUP_INVENTORY_COMMANDS)
+    action_order = [action for action, _ in GCP_CLEANUP_INVENTORY_COMMANDS]
+    command_events = []
+    observed_at = datetime.now(timezone.utc)
+    for action_id in action_order[:6] + action_order + action_order:
+        command_request = CommandRequest(action_id=action_id, action_type="gcp_provider_control",
+            argv=[driver.settings.gcloud, *action_prefixes[action_id], "--project", driver.settings.project_id,
+                "--format=json"], cwd=str(driver.settings.private_state_root), timeout_seconds=30,
+            environment_classification="contains_secret_references")
+        command_result = CommandResult(action_id=action_id, outcome="succeeded", started_at=observed_at,
+            finished_at=observed_at, duration_seconds=0.0, exit_code=0, stdout="[]", stderr="")
+        request_view = command_request.durable_view()
+        result_view = command_result.durable_view()
+        result_view["stdout"] = "[omitted sha256=" + hashlib.sha256(b"[]").hexdigest() + " bytes=2]"
+        result_view["stderr"] = "[omitted sha256=" + hashlib.sha256(b"").hexdigest() + " bytes=0]"
+        command_events.append({"request": request_view, "result": result_view})
+    cleanup_journal["commands"] = command_events
+    (attempt/"attempt.json").write_text(json.dumps(cleanup_journal))
 
     reservation_id = deployment.reservation.value.reservation_id.value
     ledger_path = tmp_path/"ledger.json"
@@ -666,7 +685,6 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
         lambda row: row.update(run_id="foreign-run"),
         lambda row: row.update(unrecognized_identity="ambiguous"),
         lambda row: row["inventory"].update(resources=[{"id": "foreign-resource"}]),
-        lambda row: row.update(commands=[{"action": "unknown"}]),
     )
     for mutate in mutations:
         changed_journal = json.loads(journal_bytes)
@@ -675,8 +693,24 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
         partial = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
             utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=[])
         assert partial["absence_proved"] is False
-    journal_path.write_bytes(journal_bytes)
 
+    command_mutations = (
+        lambda event: event["request"].update(action_id="gcp-unrecognized-read"),
+        lambda event: event["request"].update(action_id="gcp-pair-destroy",
+            argv=[driver.settings.terraform, "-chdir=pair", "destroy", "-auto-approve"]),
+        lambda event: event["result"].update(outcome="failed", exit_code=1),
+        lambda event: event["request"]["argv"].__setitem__(event["request"]["argv"].index("--project")+1,
+            "foreign-project"),
+        lambda event: event["result"].update(stdout="[]"),
+    )
+    for mutate in command_mutations:
+        changed_journal = json.loads(journal_bytes)
+        mutate(changed_journal["commands"][0])
+        journal_path.write_text(json.dumps(changed_journal))
+        partial = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
+            utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=[])
+        assert partial["absence_proved"] is False
+    journal_path.write_bytes(journal_bytes)
     outcome = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
         utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=absent_ids)
     event = outcome["ledger_event"]

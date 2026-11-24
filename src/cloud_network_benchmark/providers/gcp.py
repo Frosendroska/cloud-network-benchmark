@@ -35,6 +35,17 @@ REGION_ZONES = {
 }
 BASELINE_IMAGE_REGIONS = frozenset({"europe-west3", "europe-west2"})
 NORTHERN_IMAGE_REGIONS = frozenset({"europe-north1"})
+GCP_CLEANUP_INVENTORY_COMMANDS = (
+    ("gcp-inventory-all-zones", ("compute", "instances", "list")),
+    ("gcp-disk-inventory-all-zones", ("compute", "disks", "list")),
+    ("gcp-addresses-inventory-all-scopes", ("compute", "addresses", "list")),
+    ("gcp-subnet-inventory-all-scopes", ("compute", "networks", "subnets", "list")),
+    ("gcp-instance_templates-inventory-all-scopes", ("compute", "instance-templates", "list")),
+    ("gcp-networks-inventory-all-scopes", ("compute", "networks", "list")),
+    ("gcp-firewalls-inventory-all-scopes", ("compute", "firewall-rules", "list")),
+    ("gcp-routes-inventory-all-scopes", ("compute", "routes", "list")),
+    ("gcp-policy-inventory-all-scopes", ("compute", "resource-policies", "list")),
+)
 
 
 def validate_ubuntu_image_identities(images: dict[str, str], *, selected_regions: set[str] | None = None) -> None:
@@ -1238,11 +1249,12 @@ class GcpProviderDriver:
         known_templates = {(str(item.get("id")), item.get("name")) for item in journal.get("templates", {}).values() if item.get("id") and item.get("name")}
         owned_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": dep_hash}
         expected_instance_names = {f"{namespace}-a", f"{namespace}-b"}
-        response = self._gcloud_json(["compute", "instances", "list", "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
+        command_args = dict(GCP_CLEANUP_INVENTORY_COMMANDS)
+        response = self._gcloud_json([*command_args["gcp-inventory-all-zones"], "--project", self.settings.project_id, "--format=json"], "gcp-inventory-all-zones")
         if not isinstance(response, list): raise GcpProviderError("all-zone instance inventory pagination shape unknown", category="inventory_unknown")
         self._validate_inventory_items(response, "instances")
         instances.extend(item for item in response if (str(item.get("id")), item.get("name"), item.get("zone", "").rsplit("/", 1)[-1]) in known_vms or all(item.get("labels", {}).get(key) == value for key, value in owned_labels.items()) or item.get("name") in expected_instance_names)
-        disk_response = self._gcloud_json(["compute", "disks", "list", "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
+        disk_response = self._gcloud_json([*command_args["gcp-disk-inventory-all-zones"], "--project", self.settings.project_id, "--format=json"], "gcp-disk-inventory-all-zones")
         if not isinstance(disk_response, list): raise GcpProviderError("all-zone disk inventory pagination shape unknown", category="inventory_unknown")
         self._validate_inventory_items(disk_response, "disks")
         expected_disk_names = {f"{namespace}-a-boot", f"{namespace}-b-boot"}
@@ -1251,16 +1263,16 @@ class GcpProviderDriver:
         # --regions on addresses is not a supported complete-list query and can
         # produce warnings even for empty output. Never suppress such warnings.
         collections = (
-            ("addresses", "addresses", ["compute", "addresses", "list"], addresses),
-            ("subnetworks", "subnet", ["compute", "networks", "subnets", "list"], support),
-            ("instance-templates", "instance_templates", ["compute", "instance-templates", "list"], support),
-            ("networks", "networks", ["compute", "networks", "list"], support),
-            ("firewall-rules", "firewalls", ["compute", "firewall-rules", "list"], support),
-            ("routes", "routes", ["compute", "routes", "list"], support),
-            ("resource-policies", "policy", ["compute", "resource-policies", "list"], support))
-        for command, action, argv, target in collections:
-            result = self._gcloud_json([*argv, "--project", self.settings.project_id, "--format=json"],
-                f"gcp-{action}-inventory-all-scopes")
+            ("addresses", "gcp-addresses-inventory-all-scopes", addresses),
+            ("subnetworks", "gcp-subnet-inventory-all-scopes", support),
+            ("instance-templates", "gcp-instance_templates-inventory-all-scopes", support),
+            ("networks", "gcp-networks-inventory-all-scopes", support),
+            ("firewall-rules", "gcp-firewalls-inventory-all-scopes", support),
+            ("routes", "gcp-routes-inventory-all-scopes", support),
+            ("resource-policies", "gcp-policy-inventory-all-scopes", support))
+        for command, action_id, target in collections:
+            result = self._gcloud_json([*command_args[action_id], "--project", self.settings.project_id, "--format=json"],
+                action_id)
             if not isinstance(result, list):
                 raise GcpProviderError(f"{command} inventory pagination shape unknown", category="inventory_unknown")
             self._validate_inventory_items(result, command)
