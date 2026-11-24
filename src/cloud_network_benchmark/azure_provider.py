@@ -1174,8 +1174,11 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     environment["TF_DATA_DIR"] = str(root / ("terraform-data-" + Path(tf_root).name))
     reviewed_apply = ("apply" in argv and any(arg.startswith("-chdir=") for arg in argv)
         and options.plan_review_timeout_seconds > 0)
+    bounded_terraform_destroy = ("terraform" in argv[:1] and "destroy" in argv
+        and action.endswith("_destroy") and options.cleanup_timing_active
+        and options.cleanup_timing_phase in {"routine", "emergency"})
     req = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type=action, argv=argv,
-        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=(remaining if reviewed_apply else min(
+        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=(remaining if reviewed_apply or bounded_terraform_destroy else min(
             options.command_timeout_seconds, 180.0 if options.timing_profile else options.command_timeout_seconds, remaining)),
         environment=environment, environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
     def execute(req: CommandRequest) -> CommandResult:
