@@ -893,6 +893,63 @@ def test_terminal_expiry_accepts_sleep_complete_while_stop_is_running():
     _validate_terminal_execution(execution, "exec", "eu-central-1", {"document_name": "expiry", "document_version": "1"}, params)
 
 
+def _queued_expiry_execution(params, status="InProgress", stop_status="Pending"):
+    execution = {"AutomationExecutionId": "exec", "DocumentName": "expiry", "DocumentVersion": "1",
+        "Parameters": params, "StepExecutionsTruncated": False, "AutomationExecutionStatus": status,
+        "StepExecutions": [
+            {"StepName": "waitUntilExpiry", "Action": "aws:sleep", "StepStatus": "InProgress",
+                "Inputs": {"Timestamp": json.dumps(params["ExpiryTriggerUtc"][0])}},
+            {"StepName": "discoverAndStopOwnedInstances", "Action": "aws:executeScript", "StepStatus": stop_status,
+                "Inputs": {}, "OverriddenParameters": {}, "TimeoutSeconds": 330},
+        ]}
+    if status == "InProgress":
+        execution.update(CurrentAction="aws:sleep", CurrentStepName="waitUntilExpiry")
+    return execution
+
+
+def test_terminal_expiry_accepts_only_unstarted_pending_placeholder_during_wait():
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    safety = {"document_name": "expiry", "document_version": "1"}
+    _validate_terminal_execution(_queued_expiry_execution(params), "exec", "eu-central-1", safety, params)
+    _validate_terminal_execution(_queued_expiry_execution(params, "Cancelled", "Cancelled"), "exec", "eu-central-1", safety, params)
+    for inputs in ({"InputPayload": "{}"}, {"InputPayload": json.dumps({"run_id": "wrong"})}):
+        malformed = _queued_expiry_execution(params)
+        malformed["StepExecutions"][1]["Inputs"] = inputs
+        with pytest.raises(AwsProviderError, match="identity differs"):
+            _validate_terminal_execution(malformed, "exec", "eu-central-1", safety, params)
+    active_missing_inputs = _queued_expiry_execution(params)
+    active_missing_inputs["StepExecutions"][1]["StepStatus"] = "InProgress"
+    with pytest.raises(AwsProviderError, match="identity differs"):
+        _validate_terminal_execution(active_missing_inputs, "exec", "eu-central-1", safety, params)
+    for execution_status in ("Failed", "TimedOut"):
+        contradictory = _queued_expiry_execution(params, execution_status)
+        with pytest.raises(AwsProviderError):
+            _validate_terminal_execution(contradictory, "exec", "eu-central-1", safety, params)
+
+
+def test_cancel_or_confirm_terminal_cancels_real_shaped_queued_placeholder_once(tmp_path):
+    params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
+        "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
+    before = _queued_expiry_execution(params)
+    after = _queued_expiry_execution(params, "Cancelled", "Pending")
+    calls = []
+
+    def fake_run(action_id, argv, timeout):
+        calls.append(action_id)
+        payload = {"AutomationExecution": before if "read-terminal" in action_id else after}
+        return CommandResult(action_id=action_id, outcome="succeeded", started_at=NOW, finished_at=NOW,
+            duration_seconds=0, exit_code=0, stdout=json.dumps(payload), stderr="")
+
+    driver = AwsProviderDriver(object(), make_settings(tmp_path), clock=lambda: NOW)
+    driver._run = fake_run
+    result = driver._cancel_or_confirm_terminal("eu-central-1", "exec",
+        {"document_name": "expiry", "document_version": "1"}, params)
+    assert result["state"] == "Cancelled"
+    assert calls == ["aws-expiry-read-terminal-eu-central-1", "aws-expiry-cancel-eu-central-1",
+        "aws-expiry-confirm-cancel-eu-central-1"]
+
+
 def test_automation_confirmation_retries_pending_with_one_execution_id_and_scalar_inputs(tmp_path):
     params = {"AutomationAssumeRole": ["arn:aws:iam::123456789012:role/expiry"],
         "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"], "RunId": ["campaign-aws"],
