@@ -71,3 +71,4 @@ cloud-network-benchmark analyze --selection selection.json --output results/proc
 ```
 
 See [native analysis](docs/native-analysis.md) for the selection format, output files, and evidence limits.
+For the clean Halle checkout and scratch/durable-report layout, see [Halle checkout and scratch](docs/halle-checkout-and-scratch.md).
