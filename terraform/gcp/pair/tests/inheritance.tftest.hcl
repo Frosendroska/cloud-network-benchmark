@@ -1,24 +1,24 @@
 mock_provider "google" {}
 
 variables {
-  project_id = "cnb-test-12345"
-  name_a     = "gcp-campaign-run-abcdef12-a"
-  name_b     = "gcp-campaign-run-abcdef12-b"
-  zone_a     = "europe-west3-a"
-  zone_b     = "europe-west3-a"
-  template_a = "projects/cnb-test-12345/global/instanceTemplates/template-a?uniqueId=111"
-  template_b = "projects/cnb-test-12345/global/instanceTemplates/template-b?uniqueId=222"
-  scenario   = "same_zone"
-  region_a   = "europe-west3"
-  region_b   = "europe-west3"
-  network_a  = "projects/cnb-test-12345/global/networks/gcp-campaign-run-abcdef12-net"
-  network_b  = "projects/cnb-test-12345/global/networks/gcp-campaign-run-abcdef12-net"
-  subnetwork_a = "projects/cnb-test-12345/regions/europe-west3/subnetworks/gcp-campaign-run-abcdef12-a"
-  subnetwork_b = "projects/cnb-test-12345/regions/europe-west3/subnetworks/gcp-campaign-run-abcdef12-a"
-  network_ip_a = "10.80.1.10"
-  network_ip_b = "10.80.1.11"
-  nic_type_a = "GVNIC"
-  nic_type_b = "GVNIC"
+  project_id          = "cnb-test-12345"
+  name_a              = "gcp-campaign-run-abcdef12-a"
+  name_b              = "gcp-campaign-run-abcdef12-b"
+  zone_a              = "europe-west3-a"
+  zone_b              = "europe-west3-a"
+  template_a          = "projects/cnb-test-12345/global/instanceTemplates/template-a?uniqueId=111"
+  template_b          = "projects/cnb-test-12345/global/instanceTemplates/template-b?uniqueId=222"
+  scenario            = "same_zone"
+  region_a            = "europe-west3"
+  region_b            = "europe-west3"
+  network_a           = "projects/cnb-test-12345/global/networks/gcp-campaign-run-abcdef12-net"
+  network_b           = "projects/cnb-test-12345/global/networks/gcp-campaign-run-abcdef12-net"
+  subnetwork_a        = "projects/cnb-test-12345/regions/europe-west3/subnetworks/gcp-campaign-run-abcdef12-a"
+  subnetwork_b        = "projects/cnb-test-12345/regions/europe-west3/subnetworks/gcp-campaign-run-abcdef12-a"
+  network_ip_a        = "10.80.1.10"
+  network_ip_b        = "10.80.1.11"
+  nic_type_a          = "GVNIC"
+  nic_type_b          = "GVNIC"
   public_management_a = true
   public_management_b = true
 }
@@ -57,12 +57,12 @@ run "exactly_two_template_roles_with_selected_nics" {
 run "finland_same_zone_retains_template_binding_and_explicit_nics" {
   command = plan
   variables {
-    zone_a        = "europe-north1-c"
-    zone_b        = "europe-north1-c"
-    region_a      = "europe-north1"
-    region_b      = "europe-north1"
-    subnetwork_a  = "projects/cnb-test-12345/regions/europe-north1/subnetworks/gcp-campaign-run-abcdef12-a"
-    subnetwork_b  = "projects/cnb-test-12345/regions/europe-north1/subnetworks/gcp-campaign-run-abcdef12-a"
+    zone_a       = "europe-north1-c"
+    zone_b       = "europe-north1-c"
+    region_a     = "europe-north1"
+    region_b     = "europe-north1"
+    subnetwork_a = "projects/cnb-test-12345/regions/europe-north1/subnetworks/gcp-campaign-run-abcdef12-a"
+    subnetwork_b = "projects/cnb-test-12345/regions/europe-north1/subnetworks/gcp-campaign-run-abcdef12-a"
   }
   assert {
     condition = (google_compute_instance_from_template.vm_a.project == var.project_id &&
@@ -72,7 +72,7 @@ run "finland_same_zone_retains_template_binding_and_explicit_nics" {
       google_compute_instance_from_template.vm_a.source_instance_template == var.template_a &&
       google_compute_instance_from_template.vm_b.source_instance_template == var.template_b &&
       google_compute_instance_from_template.vm_a.network_interface[0].network_ip == "10.80.1.10" &&
-      google_compute_instance_from_template.vm_b.network_interface[0].network_ip == "10.80.1.11")
+    google_compute_instance_from_template.vm_b.network_interface[0].network_ip == "10.80.1.11")
     error_message = "Finland pair must retain exact templates, zones and role addresses"
   }
 }
@@ -82,7 +82,7 @@ run "legacy_cleanup_omits_new_override_blocks" {
   variables { cleanup_mode = true }
   assert {
     condition = (length(google_compute_instance_from_template.vm_a.network_interface) == 0 &&
-      length(google_compute_instance_from_template.vm_b.network_interface) == 0)
+    length(google_compute_instance_from_template.vm_b.network_interface) == 0)
     error_message = "legacy cleanup may destroy from registered templates without rewriting old inputs"
   }
 }
