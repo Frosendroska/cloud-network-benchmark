@@ -1348,13 +1348,19 @@ def test_v15_original_clock_mapping_preserves_deadlines_and_fails_closed(
         provision_utc = cap_start_utc - timedelta(seconds=1)
     provision_elapsed = (provision_utc - origin_utc).total_seconds()
     provision_mono = origin_mono + provision_elapsed
-    state = {"provision": False, "mono_calls": 0, "utc_calls": 0}
+    state = {"provision": False, "mono_calls": 0, "utc_calls": 0,
+        "stage_started_monotonic": None, "validation_monotonic": None}
 
     def fake_clock():
         if not state["provision"]:
             return origin_mono + 100
         state["mono_calls"] += 1
-        return provision_mono + (0.0001 if state["utc_calls"] else 0.0)
+        value = provision_mono + (0.0001 if state["utc_calls"] else 0.0)
+        if state["mono_calls"] == 1:
+            state["stage_started_monotonic"] = value
+        elif state["mono_calls"] == 2:
+            state["validation_monotonic"] = value
+        return value
 
     def fake_utc_now():
         if not state["provision"]:
@@ -1387,7 +1393,17 @@ def test_v15_original_clock_mapping_preserves_deadlines_and_fails_closed(
         assert runtime_options.cap_started_monotonic == cap_start_mono
         assert runtime_options.cap_deadline_monotonic == cap_end_mono
         assert runtime_options.retry_end_at == cap_end_utc
-        assert runtime_options.workflow_stage_deadline_monotonic == cap_start_mono + 1800
+        provision_stage_seconds = float(d.provisioning_timeout_seconds or o.command_timeout_seconds)
+        profile_stage_deadline = cap_start_mono + 900 + 900
+        effective_stop_deadline = cap_start_mono + (stop - cap_start_utc).total_seconds()
+        expected_stage_deadline = min(
+            state["stage_started_monotonic"] + provision_stage_seconds,
+            profile_stage_deadline, cap_end_mono, effective_stop_deadline)
+        second_sample_deadline = min(
+            state["validation_monotonic"] + provision_stage_seconds,
+            profile_stage_deadline, cap_end_mono, effective_stop_deadline)
+        assert runtime_options.workflow_stage_deadline_monotonic == expected_stage_deadline
+        assert runtime_options.workflow_stage_deadline_monotonic != second_sample_deadline
         assert evidence.expires_at.value == stop
         anchor = json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
         assert anchor["provider_stop_at"] == stop.isoformat()
