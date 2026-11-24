@@ -1253,6 +1253,158 @@ def test_pre_vm_recheck_accepts_etc_utc_schedule_name(repository_root: Path,tmp_
     assert "pair_apply" in [request.action_type for request in runner.requests]
 
 
+@pytest.mark.parametrize("case,expected_error", [
+    ("expired", "reservation/deadline has expired"),
+    ("changed_identity", "registered expiry metadata is not bound to this reservation source"),
+    ("missing_stop", "actual registered STOP is absent from the original cleanup timing anchor"),
+    ("changed_stop", "actual registered STOP is absent from the original cleanup timing anchor"),
+    ("backwards_clock", "reservation chronology or original mode lifetime ceiling is invalid"),
+    ("changed_clock", "original monotonic deadline extends beyond the reserved UTC cap"),
+    ("changed_clock_identity", "Azure cleanup timing anchor clock identity changed"),
+    ("valid", None),
+])
+def test_v15_original_clock_mapping_preserves_deadlines_and_fails_closed(
+        repository_root: Path, tmp_path: Path, monkeypatch, case, expected_error):
+    """Exercise V15 UTC/monotonic bounds through Azure hooks and provision."""
+    from cloud_network_benchmark.contracts.admission import ExpiryEvidence
+    from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
+    from cloud_network_benchmark.lifecycle_adapters import RemoteStages, azure_hooks
+
+    cap_start_utc = datetime.fromisoformat("2026-11-24T18:49:42.963086+00:00")
+    cap_start_mono = 1156605.752490595
+    origin_utc = datetime.fromisoformat("2026-11-24T18:49:45.827666+00:00")
+    origin_mono = 1156608.617074353
+    stop = datetime.fromisoformat("2026-11-24T19:57:00+00:00")
+    requested_stop = datetime.fromisoformat("2026-11-24T19:57:42.963086+00:00")
+    assert requested_stop.replace(second=0, microsecond=0) == stop
+    cap_end_utc = cap_start_utc + timedelta(seconds=4200)
+    cap_end_mono = cap_start_mono + 4200
+
+    d = deployment(repository_root, "exp-903-three-provider-smoke.yaml")
+    reservation = d.reservation.value.model_copy(update={
+        "reservation_id": Evidence(value="42be6b78059261493b9ce80fd058af55"),
+        "campaign_id": "20261124T174251Z-exp-903-4f979c09",
+        "cap_started_at": Evidence(value=cap_start_utc),
+        "expires_at": Evidence(value=cap_end_utc),
+        "source_sha256": "364813b5d08c0e16a286e196d9528085ce0e0941eee2c1dba232e91e19b019d4",
+        "workflow_profile": "all_cloud_acceptance_v1",
+    })
+    admission = d.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200,
+        "priority": "P0",
+    })
+    d = d.model_copy(update={
+        "campaign_id": "20261124T174251Z-exp-903-4f979c09",
+        "run_id": "20261124T174251Z-exp-903-4f979c09-azure",
+        "deployment_id": "20261124T174251Z-exp-903-4f979c09-azure-deployment",
+        "admission": admission, "reservation": Evidence(value=reservation),
+    })
+    value = options(tmp_path, "P0").model_dump(mode="python")
+    value.update(
+        complete_workflow_seconds=3535, post_registration_workflow_seconds=2635,
+        cap_deadline_monotonic=cap_end_mono, cap_started_monotonic=cap_start_mono,
+        retry_end_at=cap_end_utc, workflow_profile="all_cloud_acceptance_v1",
+        admission_evidence={**value["admission_evidence"],
+            "reservation_id": reservation.reservation_id.value,
+            "source_sha256": reservation.source_sha256},
+        cleanup_timing_path=tmp_path / "private" / "azure-clock.json",
+        profile_allowance={
+            "registration_seconds": 900, "provision_seconds": 900,
+            "readiness_seconds": 600, "stabilization_seconds": 60,
+            "measurement_seconds": 100, "measurement_shutdown_seconds": 15,
+            "retrieval_seconds": 300, "cleanup_seconds": 660,
+            "azure_provider_lead_seconds": 120,
+        },
+    )
+    o = AzureRuntimeOptions.model_validate(value)
+    clock_identity = {"value": "9b1cc84e4aaa6905061a6c10c49af2d277d8eb394364da05ec60206638994fd"}
+    monkeypatch.setattr(azure_provider, "_clock_identity", lambda: clock_identity["value"])
+    azure_provider._initialize_profile_timing(
+        d, o, clock=lambda: origin_mono, utc_now=lambda: origin_utc,
+        origin_monotonic=origin_mono, origin_utc=origin_utc)
+    name = _slug(d)
+    target_ids = [f"/subscriptions/{o.subscription_id}/resourceGroups/{name}/providers/Microsoft.Compute/virtualMachines/{name}-{role}"
+                  for role in ("a", "b")]
+    evidence = ExpiryEvidence(
+        schema_version=2, run_id=d.run_id, deployment_id=d.deployment_id,
+        provider="azure", action="deallocate", state="registered",
+        registration_id=Evidence(value="fake-v15-expiry-registration"),
+        registered_at=Evidence(value=cap_start_utc + timedelta(seconds=100)),
+        expires_at=Evidence(value=stop + timedelta(minutes=1) if case == "changed_stop" else stop),
+        target_selector=";".join(target_ids),
+        provider_metadata=StructuredEvidence(value={
+            "reservation_id": "foreign-reservation" if case == "changed_identity" else reservation.reservation_id.value,
+            "source_sha256": reservation.source_sha256,
+        }),
+    )
+
+    # The captured V15 mapping leaves 3.758 microseconds before the UTC cap.
+    # A controlled 100-microsecond interval between the production samples makes
+    # the old monotonic-then-UTC order project the deadline beyond that cap.
+    provision_utc = datetime.fromisoformat("2026-11-24T19:13:00+00:00")
+    if case == "expired":
+        provision_utc = cap_end_utc + timedelta(seconds=1)
+    elif case == "backwards_clock":
+        provision_utc = cap_start_utc - timedelta(seconds=1)
+    provision_elapsed = (provision_utc - origin_utc).total_seconds()
+    provision_mono = origin_mono + provision_elapsed
+    state = {"provision": False, "mono_calls": 0, "utc_calls": 0}
+
+    def fake_clock():
+        if not state["provision"]:
+            return origin_mono + 100
+        state["mono_calls"] += 1
+        return provision_mono + (0.0001 if state["utc_calls"] else 0.0)
+
+    def fake_utc_now():
+        if not state["provision"]:
+            return cap_start_utc + timedelta(seconds=100)
+        state["utc_calls"] += 1
+        offset = timedelta(seconds=5) if case == "changed_clock" else timedelta()
+        return provision_utc + offset + (timedelta(microseconds=100) if state["mono_calls"] else timedelta())
+
+    def fake_register(*args, **kwargs):
+        if case != "missing_stop":
+            azure_provider._bind_profile_stop(d, o, stop)
+        return evidence
+
+    monkeypatch.setattr(azure_provider, "register_expiry", fake_register)
+
+    def protected(_provider, _evidence):
+        state["provision"] = True
+        if case == "changed_clock_identity":
+            clock_identity["value"] = "f" * 64
+
+    stages = RemoteStages(*([lambda *_: None] * 6))
+    hooks = azure_hooks(d, expiry_request(d, o, requested_stop), options=o,
+        runner=AutomationRunner(d, o, cap_start_utc), stages=stages,
+        clock=fake_clock, utc_now=fake_utc_now, on_protected=protected)
+    assert hooks.protect() == evidence
+
+    def stop_before_external_terraform(*args, action, **kwargs):
+        assert action == "pair_init"
+        runtime_options = args[1]
+        assert runtime_options.cap_started_monotonic == cap_start_mono
+        assert runtime_options.cap_deadline_monotonic == cap_end_mono
+        assert runtime_options.retry_end_at == cap_end_utc
+        assert runtime_options.workflow_stage_deadline_monotonic == cap_start_mono + 1800
+        assert evidence.expires_at.value == stop
+        anchor = json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
+        assert anchor["provider_stop_at"] == stop.isoformat()
+        raise RuntimeError("offline test boundary before external command execution")
+
+    monkeypatch.setattr(azure_provider, "_tf", stop_before_external_terraform)
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            hooks.create()
+    else:
+        result = hooks.create()
+        assert any("offline test boundary before external command execution" in failure.message
+                   for failure in result.failures)
+        assert not any("original monotonic deadline extends beyond" in failure.message
+                       for failure in result.failures)
+
+
 @pytest.mark.parametrize("timezone_name", ["Europe/London", "GMT", "Etc/GMT", "etc/utc"])
 def test_registration_rejects_unexpected_schedule_timezone_aliases(repository_root: Path,tmp_path: Path,timezone_name):
     d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)

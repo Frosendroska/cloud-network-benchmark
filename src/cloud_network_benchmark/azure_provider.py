@@ -562,6 +562,8 @@ def _require_profile_timing_anchor(deployment: ProviderDeploymentInput, options:
                 or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
                 or state.get("config_sha256") != deployment.config_sha256):
             raise ValueError("Azure cleanup timing anchor identity mismatch")
+        if state.get("clock_identity") != _clock_identity():
+            raise ValueError("Azure cleanup timing anchor clock identity changed")
         if require_stop and state.get("provider_stop_at") != deployment.expiry.value.expires_at.value.isoformat():
             raise ValueError("actual registered STOP is absent from the original cleanup timing anchor")
         return state
@@ -2030,8 +2032,8 @@ def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root:
 def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
               clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureProviderResult:
     provision_stage_seconds = float(deployment.provisioning_timeout_seconds or options.command_timeout_seconds)
-    mono=clock()
-    provision_deadline_monotonic = mono + provision_stage_seconds
+    stage_started_monotonic = clock()
+    provision_deadline_monotonic = stage_started_monotonic + provision_stage_seconds
     if deployment.admission.workflow_profile:
         allowance = options.profile_allowance
         if allowance is None:
@@ -2050,7 +2052,12 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         # stage cutoff. Keep the source overall cap untouched for its bindings.
         options = options.model_copy(update={
             "workflow_stage_deadline_monotonic": provision_deadline_monotonic})
+    # Keep the stage cutoff anchored to its original first monotonic sample,
+    # then validate one conservative UTC/monotonic pair. Sampling UTC first
+    # and monotonic second prevents elapsed Python work from moving the
+    # projected UTC cap later than the reserved cap.
     now=utc_now().astimezone(UTC)
+    mono=clock()
     _require_profile_timing_anchor(deployment, options, require_stop=True)
     name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
