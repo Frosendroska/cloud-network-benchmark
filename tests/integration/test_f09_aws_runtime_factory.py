@@ -1020,7 +1020,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             archive_staging_root=restore_staging, materialization_root=materialized,
             repository_root=repository_root, maximum_part_bytes=2_000_000,
             evaluated_at=clock.utc_now() + timedelta(minutes=1), **quota_args)
-    if fault is None:
+    if fault in {None, "nested_stage", "nested_stage_prune"}:
         assert restored["status"] == "replayed", restored.get("validation")
         assert restored["validation"][provider]["status"]["data_validity"] == "valid"
         assert Path(restored["analysis"]["report_path"]).is_file()
