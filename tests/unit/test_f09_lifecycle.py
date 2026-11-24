@@ -176,6 +176,27 @@ def test_returned_provider_failure_and_unregistered_expiry_are_not_success():
     assert "registered expiry" in outcome.provider_results["aws"].primary_failure
     assert "claim" not in [stage for _, stage in trace.events]
 
+
+def test_claim_denial_reports_only_bounded_stage_decision_reason_codes():
+    from types import SimpleNamespace
+
+    denied = SimpleNamespace(eligible=False, creation_granted=False,
+        reason_codes=("financial_outstanding_liability", "controller_session_changed"))
+    ok, message = _typed_outcome("aws", "claim", denied)
+    assert not ok
+    assert message == ("F11 creation claim was not granted "
+        "(financial_outstanding_liability, controller_session_changed)")
+
+    malformed = SimpleNamespace(eligible=False, creation_granted=False,
+        reason_codes=("safe_code", "secret value", "x" * 65, 7))
+    ok, message = _typed_outcome("aws", "claim", malformed)
+    assert not ok
+    assert message == "F11 creation claim was not granted (safe_code)"
+
+    granted = SimpleNamespace(eligible=True, creation_granted=True,
+        reason_codes=("creation_granted",))
+    assert _typed_outcome("aws", "claim", granted) == (True, None)
+
     trace = Trace()
     base = hooks("aws", trace)
     bad_cleanup = ProviderHooks(**{**base.__dict__,

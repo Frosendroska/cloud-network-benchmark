@@ -548,8 +548,19 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
         return (isinstance(value, ExpiryEvidence) and value.state == "registered"
                 and actual_provider == provider, reason)
     if stage == "claim":
-        return (getattr(value, "eligible", None) is True and getattr(value, "creation_granted", None) is True,
-                "F11 creation claim was not granted")
+        granted = (getattr(value, "eligible", None) is True
+                   and getattr(value, "creation_granted", None) is True)
+        if granted:
+            return True, None
+        # StageDecision reason codes are internal, fixed identifiers. Keep the
+        # operational error useful while excluding arbitrary adapter payloads.
+        reasons = getattr(value, "reason_codes", ())
+        reasons = reasons if isinstance(reasons, (tuple, list)) else ()
+        safe_reasons = tuple(code for code in reasons[:8]
+            if isinstance(code, str) and code.isascii() and code.replace("_", "").isalnum()
+            and len(code) <= 64)
+        detail = f" ({', '.join(safe_reasons)})" if safe_reasons else ""
+        return False, f"F11 creation claim was not granted{detail}"
     if stage == "create":
         from .contracts.deployment import ProviderDeploymentOutput
         deployment = value if isinstance(value, ProviderDeploymentOutput) else getattr(value, "deployment", None)
