@@ -41,6 +41,34 @@ def _is_uuid_segment(value: str) -> bool:
         return str(uuid.UUID(value)) == value.lower()
     except (ValueError, AttributeError):
         return False
+
+
+def _azure_schedule_matches(props: Any, expected_trigger: datetime) -> bool:
+    """Validate Azure's exact one-time UTC schedule readback."""
+    if (not isinstance(props, dict) or props.get("isEnabled") is not True
+            or props.get("frequency") != "OneTime"
+            or not isinstance(props.get("timeZone"), str)
+            or props.get("timeZone") not in {"UTC", "Etc/UTC"}):
+        return False
+    if expected_trigger.tzinfo is None or expected_trigger.utcoffset() != timedelta(0):
+        return False
+    for key in ("startTime", "nextRun", "expiryTime"):
+        if key not in props or props[key] is None:
+            if key == "startTime":
+                return False
+            continue
+        value = props[key]
+        if not isinstance(value, str):
+            return False
+        try:
+            actual = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if actual.tzinfo is None or actual.utcoffset() != timedelta(0) or actual != expected_trigger:
+            return False
+    return True
+
+
 _EXPLICIT_UTC_NOW: ContextVar[Callable[[], datetime] | None] = ContextVar("azure_explicit_utc_now", default=None)
 _EXPLICIT_TIMING_IDENTITY: ContextVar[dict[str, str] | None] = ContextVar("azure_explicit_timing_identity", default=None)
 _TIMING_OBSERVATION_FAILURE: ContextVar[str | None] = ContextVar("azure_timing_observation_failure", default=None)
@@ -1672,8 +1700,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["schedule"]="created"; _atomic_private(journal,state)
     sched_read = json.loads(_command(runner, options, root, _azure_rest("GET", sched_url), "schedule_readback", clock).stdout or "{}")
     props = sched_read.get("properties", {})
-    if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
-            or datetime.fromisoformat(props["startTime"].replace("Z", "+00:00")).astimezone(UTC) != trigger):
+    if not _azure_schedule_matches(props, trigger):
         raise RuntimeError("schedule readback mismatch")
     if (trigger - utc_now().astimezone(UTC)).total_seconds() < 300:
         raise ValueError("Automation schedule no longer has 300 seconds lead")
@@ -1777,9 +1804,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     schedule_url = f"{account}/schedules/{m['schedule']}?api-version={AUTOMATION_API}"
     schedule = json.loads(_command(runner, options, root, _azure_rest("GET", schedule_url), "expiry_schedule_recheck", clock).stdout or "{}")
     props = schedule.get("properties", {})
-    if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
-            or props.get("runOn") not in (None, "")
-            or datetime.fromisoformat(props["startTime"].replace("Z", "+00:00")).astimezone(UTC) != expiry.expires_at.value):
+    if (not _azure_schedule_matches(props, expiry.expires_at.value)
+            or props.get("runOn") not in (None, "")):
         raise RuntimeError("registered expiry schedule is disabled or has changed")
     job_url = f"{account}/jobSchedules/{m['job_schedule_id']}?api-version={AUTOMATION_API}"
     job = json.loads(_command(runner, options, root, _azure_rest("GET", job_url), "expiry_binding_recheck", clock).stdout or "{}")

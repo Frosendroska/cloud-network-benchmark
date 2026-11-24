@@ -19,6 +19,29 @@ from tests.fixtures.f06 import RESPONSE_FIXTURES
 from tests.contract.test_azure_provider_contract import deployment, options
 
 
+@pytest.mark.parametrize("changes", [
+    {"timeZone":"Europe/London"},
+    {"timeZone":"GMT"},
+    {"timeZone":[]},
+    {"timeZone":{}},
+    {"startTime":None},
+    {"startTime":17},
+    {"startTime":"2026-11-24T14:29:00"},
+    {"startTime":"not-a-time"},
+    {"startTime":"2026-11-24T15:29:00+01:00"},
+    {"startTime":"2026-11-24T14:29:01+00:00"},
+    {"nextRun":"2026-11-24T14:30:00+00:00"},
+    {"expiryTime":"2026-11-24T14:30:00+00:00"},
+    {"isEnabled":False},
+    {"frequency":"Daily"},
+])
+def test_azure_schedule_validator_rejects_non_exact_readbacks(changes):
+    props={"isEnabled":True,"frequency":"OneTime","timeZone":"Etc/UTC",
+        "startTime":"2026-11-24T14:29:00+00:00"}
+    props.update(changes)
+    assert not azure_provider._azure_schedule_matches(props,datetime(2026,11,24,14,29,tzinfo=timezone.utc))
+
+
 def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_keys():
     from cloud_network_benchmark.azure_provider import _is_exact_missing_attempt_resource_group
     now=datetime.now(timezone.utc); group="cnb-attempt"
@@ -401,11 +424,12 @@ class AutomationRunner:
     def __init__(self, deployment_input, options_input, now, fail_at=None, publish_delay=0, bad_key_for=None, wrong_vm_id_for=None,
                  stale_nonce_for=None, image_architecture="x64", wrong_role_definition=False,
                  image_publisher="Canonical", image_offer=None, image_sku=None, vm_image_mismatch=False,
-                 image_os="Linux", module_recheck=None, marketplace_response=None):
+                 image_os="Linux", module_recheck=None, marketplace_response=None, schedule_timezone=None):
         self.d=deployment_input; self.o=options_input; self.now=now; self.fail_at=fail_at; self.publish_delay=publish_delay; self.bad_key_for=bad_key_for; self.wrong_vm_id_for=wrong_vm_id_for
         self.stale_nonce_for=stale_nonce_for; self.image_architecture=image_architecture; self.wrong_role_definition=wrong_role_definition
         self.image_publisher=image_publisher; self.image_offer=image_offer; self.image_sku=image_sku; self.vm_image_mismatch=vm_image_mismatch
         self.image_os=image_os; self.module_recheck=module_recheck; self.marketplace_response=marketplace_response
+        self.schedule_timezone=schedule_timezone
         self.publish_reads=0; self.requests=[]; self.script=""; self.schedule={}; self.binding={}; self.tamper_recheck=None
         self.name=_slug(deployment_input)
         self.account=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Automation/automationAccounts/{self.name}-auto"
@@ -453,7 +477,9 @@ class AutomationRunner:
             out=json.dumps(payload)
         elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script+"\n"
         elif request.action_type in {"schedule_readback","expiry_schedule_recheck"}:
-            p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True; out=json.dumps({"properties":p})
+            p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True
+            if self.schedule_timezone is not None: p["timeZone"]=self.schedule_timezone
+            out=json.dumps({"properties":p})
         elif request.action_type in {"job_binding_readback","expiry_binding_recheck"}:
             self.job_id=request.argv[request.argv.index("--url")+1].split("/jobSchedules/")[1].split("?")[0]
             binding=json.loads(json.dumps(self.binding["properties"]))
@@ -1202,6 +1228,36 @@ def test_registration_records_readbacks_and_narrow_rbac(repository_root: Path, t
     journal=json.loads((o.attempt_root/"recovery.json").read_text())
     assert journal["expiry_state"]=="registered"
     assert journal["expiry"]["automation_account_id"] and journal["expiry"]["job_schedule_id"]
+
+
+@pytest.mark.parametrize("timezone_name", ["UTC", "Etc/UTC"])
+def test_registration_accepts_only_supported_utc_schedule_names(repository_root: Path,tmp_path: Path,timezone_name):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone=timezone_name)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    assert expiry.state=="registered"
+
+
+def test_pre_vm_recheck_accepts_etc_utc_schedule_name(repository_root: Path,tmp_path: Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone="Etc/UTC")
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
+    assert not any("schedule" in failure.message for failure in result.failures)
+    assert "pair_apply" in [request.action_type for request in runner.requests]
+
+
+@pytest.mark.parametrize("timezone_name", ["Europe/London", "GMT", "Etc/GMT", "etc/utc"])
+def test_registration_rejects_unexpected_schedule_timezone_aliases(repository_root: Path,tmp_path: Path,timezone_name):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone=timezone_name)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    assert expiry.state=="failed" and expiry.failure is not None
+    assert not any(request.action_type=="pair_apply" for request in runner.requests)
 
 
 def test_registration_rejects_foreign_assigned_role_definition(repository_root: Path,tmp_path: Path):
