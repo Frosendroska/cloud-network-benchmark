@@ -31,6 +31,60 @@ def stamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def select_source_contract(directory: Path, provider: str) -> tuple[Path, dict]:
+    """Select exactly one recognizable saved request contract, failing closed."""
+    candidates: list[tuple[Path, dict]] = []
+    for path in sorted(directory.glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"non-regular evidence entry: {path.name}")
+        value = load(path)
+        if not isinstance(value, dict):
+            raise ValueError(f"evidence entry is not an object: {path.name}")
+        # Cleanup receipts are JSON too, but lack these original-contract keys.
+        if any(key in value for key in ("expiry_request", "snapshot_sha256", "settings")):
+            candidates.append((path, value))
+    if len(candidates) != 1:
+        raise ValueError(f"expected one source contract, found {len(candidates)}")
+    path, contract = candidates[0]
+    required = {"schema_version", "provider", "deployment", "expiry_request",
+        "provider_lead_seconds", "reservation", "settings", "snapshot_sha256"}
+    if (set(contract) != required or contract.get("schema_version") != 1
+            or contract.get("provider") != provider
+            or not isinstance(contract.get("deployment"), dict)
+            or not isinstance(contract.get("expiry_request"), dict)
+            or not isinstance(contract.get("reservation"), dict)):
+        raise ValueError("source contract shape or provider identity mismatch")
+    return path, contract
+
+
+def evidence_value(value: object) -> object:
+    """Unwrap the exact evidence envelope used by saved F11 contracts."""
+    if not isinstance(value, dict) or value.get("unavailable_reason") is not None:
+        return None
+    return value.get("value")
+
+
+def validate_source_request(contract: dict, *, provider: str, child_id: str,
+        namespace: str, reservation_id: str, cap_end: datetime, lead: float) -> tuple[bool, str]:
+    req = contract["expiry_request"]
+    deployment_id = contract["deployment"].get("deployment_id")
+    expected_trigger = cap_end - timedelta(seconds=float(lead))
+    checks = {
+        "provider": contract.get("provider") == provider == req.get("provider"),
+        "child": req.get("run_id") == child_id,
+        "deployment": bool(deployment_id) and req.get("deployment_id") == deployment_id,
+        "reservation": evidence_value(req.get("reservation_id")) == reservation_id
+            and evidence_value(contract["reservation"].get("reservation_id")) == reservation_id,
+        "namespace": req.get("resource_namespace") == namespace,
+        "action": req.get("action") == {"aws": "stop", "azure": "deallocate", "gcp": "stop"}[provider],
+        "target_selector": isinstance(req.get("target_selector"), str) and bool(req["target_selector"]),
+        "provider_lead": float(contract.get("provider_lead_seconds", -1)) == float(lead),
+        "trigger": evidence_value(req.get("expires_at")) is not None
+            and stamp(evidence_value(req["expires_at"])) == expected_trigger,
+    }
+    return all(checks.values()), ",".join(key for key, ok in checks.items() if not ok)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ledger", type=Path, required=True)
@@ -59,25 +113,19 @@ def main() -> int:
     cap_end = stamp(row["evidence"]["expires_at"]["value"])
     registration_times: list[datetime] = []
     for provider in sorted(row["plan"]["providers"]):
-        cleanup_files = list((args.evidence / "V-S3" / "f09-cleanup" / provider).glob("*.json"))
-        if len(cleanup_files) != 1:
-            print(f"  {provider}: FAIL expected one sealed cleanup contract, got {len(cleanup_files)}")
+        try:
+            _contract_path, contract = select_source_contract(
+                args.evidence / "V-S3" / "f09-cleanup" / provider, provider)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"  {provider}: FAIL source contract selection: {type(exc).__name__}: {exc}")
             continue
-        contract = load(cleanup_files[0])
         req = contract["expiry_request"]
-        expected = {
-            "provider": provider,
-            "run_id": child_ids[provider],
-            "deployment_id": contract["deployment"]["deployment_id"],
-            "reservation_id": RID,
-            "resource_namespace": row["plan"]["namespaces"][provider],
-            "expires_at": (cap_end - timedelta(seconds=float(leads[provider]))).isoformat(),
-        }
-        actual_req = {key: req.get(key) for key in expected if key != "expires_at"}
-        actual_req["expires_at"] = stamp(req["expires_at"]["value"]).isoformat()
-        expected["expires_at"] = stamp(expected["expires_at"]).isoformat()
-        request_ok = actual_req == expected
+        request_ok, request_mismatches = validate_source_request(contract,
+            provider=provider, child_id=child_ids[provider],
+            namespace=row["plan"]["namespaces"][provider], reservation_id=RID,
+            cap_end=cap_end, lead=leads[provider])
         print(f"  {provider}: source_request_identity={'PASS' if request_ok else 'FAIL'}; "
+              f"mismatches={request_mismatches or 'none'}; "
               f"action={req.get('action')}; target_selector_present={bool(req.get('target_selector'))}; "
               f"cap_lead_seconds={leads[provider]}")
 
