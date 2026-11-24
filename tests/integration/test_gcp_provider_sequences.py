@@ -1043,15 +1043,61 @@ def test_cleanup_runner_uses_only_remaining_original_deadline_and_keeps_other_li
     assert capture.requests[-1].timeout_seconds == 120
 
 
-@pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
-def test_gcp_cleanup_checks_routine_and_absence_at_their_own_boundaries(
-        tmp_path, monkeypatch, routine_finish, expected_status):
+def test_first_owned_cleanup_after_stop_is_bounded_but_timing_remains_late(tmp_path, monkeypatch):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    from cloud_network_benchmark.providers.gcp import GcpProviderDriver
+    from cloud_network_benchmark.validation_profiles import provider_lead_seconds
     deployment, driver = _cleanup_fixture(tmp_path)
     admission = deployment.admission.model_copy(update={
         "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
-    deployment = deployment.model_copy(update={"admission": admission})
+    deployment = deployment.model_copy(update={"admission": admission,
+        "cleanup_timeout_seconds": 660})
+    reservation_end = deployment.reservation.value.expires_at.value
+    late_now = reservation_end + timedelta(seconds=1)
+    lead = provider_lead_seconds(admission.workflow_profile, "gcp", gcp_provider.SAFETY_LEAD_SECONDS)
+    assert late_now >= reservation_end-timedelta(seconds=lead)
+    mono = [100.0]
+    driver.clock = lambda: late_now
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
+    attempt = driver._attempt_dir(deployment)
+    driver._save(attempt, {"run_id": deployment.run_id,
+        "deployment_id": deployment.deployment_id, "creation_may_have_started": True,
+        "registered": True})
+    driver = GcpProviderDriver(object(), driver.settings)
+    driver.clock = lambda: late_now
+    actions = []
+    def terraform(_attempt, root, action, _deployment, _extra):
+        driver._check_cleanup_deadline(f"gcp-{root}-{action}")
+        actions.append((root, action))
+        return {}
+    monkeypatch.setattr(driver, "_terraform", terraform)
+    monkeypatch.setattr(driver, "_inventory", lambda _deployment: {
+        "pages_complete": True, "instances": [], "resources": [], "known": []})
+
+    result = driver.cleanup(deployment)
+    journal = driver._load(attempt, deployment)
+
+    assert result.cleanup_state == "succeeded"
+    assert actions == [("pair", "destroy"), ("protection", "destroy")]
+    assert result.inventory.value["cleanup_timing"]["status"] == "late"
+    assert journal["cleanup_routine_deadline_utc"] == (late_now+timedelta(seconds=600)).isoformat()
+    assert journal["cleanup_deadline_utc"] == (late_now+timedelta(seconds=660)).isoformat()
+
+
+@pytest.mark.parametrize(("routine_finish", "expected_status"), [(599, "within_deadline"), (601, "late")])
+def test_gcp_cleanup_checks_routine_and_absence_at_their_own_boundaries(
+        tmp_path, monkeypatch, routine_finish, expected_status):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    deployment, driver = _cleanup_fixture(tmp_path)
+    admission = deployment.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200})
+    deployment = deployment.model_copy(update={"admission": admission,
+        "cleanup_timeout_seconds": 660})
     current = [deployment.reservation.value.cap_started_at.value + timedelta(seconds=1)]
+    initial_current = current[0]
+    mono = [100.0]
     driver.clock = lambda: current[0]
+    monkeypatch.setattr(gcp_provider.time, "monotonic", lambda: mono[0])
     attempt = driver._attempt_dir(deployment)
     driver._save(attempt, {"run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
         "creation_may_have_started": True, "registered": True})
@@ -1061,10 +1107,12 @@ def test_gcp_cleanup_checks_routine_and_absence_at_their_own_boundaries(
         calls[0] += 1
         current[0] = deployment.reservation.value.cap_started_at.value + timedelta(
             seconds=1 + (routine_finish if calls[0] == 1 else routine_finish+2))
+        mono[0] = 100.0 + (current[0]-initial_current).total_seconds()
         return {"pages_complete": True, "instances": [], "resources": [], "known": []}
     monkeypatch.setattr(driver, "_inventory", inventory)
     result = driver.cleanup(deployment)
-    assert result.cleanup_state == "succeeded"
+    journal = driver._load(attempt, deployment)
+    assert result.cleanup_state == "succeeded", result.cleanup_failure.model_dump() if result.cleanup_failure else None
     assert result.inventory.value["cleanup_timing"]["status"] == expected_status
 
 

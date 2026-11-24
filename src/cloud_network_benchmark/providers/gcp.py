@@ -489,8 +489,12 @@ class GcpProviderDriver:
             reservation_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)
             from ..validation_profiles import provider_lead_seconds
             lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
-            routine_end = min(started_utc + timedelta(seconds=600), reservation_end-timedelta(seconds=lead+60))
-            routine_mono = float(journal["cleanup_started_monotonic"]) + (routine_end-started_utc).total_seconds()
+            routine_acceptance_end = min(started_utc + timedelta(seconds=600), reservation_end-timedelta(seconds=lead+60))
+            # The reservation/STOP boundary classifies cleanup timeliness. It
+            # cannot consume the independent recovery allowance for deletion.
+            routine_end = min(started_utc + timedelta(seconds=600), cleanup_deadline)
+            routine_mono = min(float(journal["cleanup_started_monotonic"])+600.0,
+                float(journal["cleanup_deadline_monotonic"]))
             saved_routine_utc = journal.get("cleanup_routine_deadline_utc")
             saved_routine_mono = journal.get("cleanup_routine_deadline_monotonic")
             if saved_routine_utc is not None or saved_routine_mono is not None:
@@ -511,13 +515,19 @@ class GcpProviderDriver:
             if self._cleanup_absence_deadline_utc is None:
                 self._cleanup_routine_deadline_utc = routine_end
                 self._deadline = min(self._deadline, routine_mono)
-            self._cleanup_acceptance_deadlines = [routine_end]
+            self._cleanup_acceptance_deadlines = [routine_acceptance_end]
+            if self._cleanup_absence_deadline_utc is not None:
+                absence_started_utc = datetime.fromisoformat(
+                    journal["cleanup_absence_started_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                self._cleanup_acceptance_deadlines.append(min(
+                    absence_started_utc+timedelta(seconds=60),
+                    reservation_end-timedelta(seconds=lead)))
             previous_timing = journal.get("cleanup_acceptance_timing", {})
             timing_status = previous_timing.get("status")
             if timing_status not in {"late", "unknown"}:
-                timing_status = "late" if cleanup_now >= routine_end else "within_deadline"
+                timing_status = "late" if cleanup_now >= routine_acceptance_end else "within_deadline"
             journal["cleanup_acceptance_timing"] = {
-                "routine_deadline_utc": routine_end.isoformat(),
+                "routine_deadline_utc": routine_acceptance_end.isoformat(),
                 "status": timing_status,
             }
             self._save(attempt, journal)
@@ -537,9 +547,13 @@ class GcpProviderDriver:
                 if self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[0]:
                     journal["cleanup_acceptance_timing"]["status"] = "late"
                 absence_end = self._prepare_absence_deadline(attempt, journal, deployment, lead)
-                self._cleanup_acceptance_deadlines.append(absence_end)
+                absence_started_utc = datetime.fromisoformat(
+                    journal["cleanup_absence_started_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                absence_acceptance_end = min(absence_started_utc+timedelta(seconds=60),
+                    deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead))
+                self._cleanup_acceptance_deadlines.append(absence_acceptance_end)
                 self._cleanup_absence_deadline_utc = absence_end
-                if self.clock().astimezone(timezone.utc) >= absence_end:
+                if self.clock().astimezone(timezone.utc) >= absence_acceptance_end:
                     journal["cleanup_acceptance_timing"]["status"] = "late"
                 remaining_utc = (absence_end-self.clock().astimezone(timezone.utc)).total_seconds()
                 absence_mono = journal["cleanup_absence_deadline_monotonic"]
@@ -705,11 +719,16 @@ class GcpProviderDriver:
             elapsed_mono = now_mono-float(started_mono)
             if elapsed_utc < 0 or elapsed_mono < 0 or abs(elapsed_utc-elapsed_mono) > 2.0:
                 raise GcpProviderError("cleanup absence UTC and monotonic elapsed time disagree", category="cleanup_clock_changed")
-        reservation = deployment.reservation.value
-        if reservation is None or reservation.expires_at.value.tzinfo is None or reservation.expires_at.value.utcoffset() is None:
-            raise GcpProviderError("cleanup absence cap is unavailable", category="cleanup_deadline_unknown")
-        candidate = min(started_utc + timedelta(seconds=60),
-            reservation.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead))
+        raw_overall_end = journal.get("cleanup_deadline_utc")
+        if raw_overall_end is None:
+            raise GcpProviderError("original cumulative cleanup deadline is unavailable for absence verification", category="cleanup_deadline_unknown")
+        try:
+            overall_end = datetime.fromisoformat(str(raw_overall_end).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise GcpProviderError("original cumulative cleanup deadline is malformed", category="cleanup_deadline_unknown") from exc
+        if overall_end.tzinfo is None or overall_end.utcoffset() is None:
+            raise GcpProviderError("original cumulative cleanup deadline has no UTC offset", category="cleanup_deadline_unknown")
+        candidate = min(started_utc + timedelta(seconds=60), overall_end.astimezone(timezone.utc))
         raw_end = journal.get("cleanup_absence_deadline_utc")
         if raw_end is not None:
             try:
