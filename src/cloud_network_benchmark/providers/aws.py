@@ -1951,7 +1951,7 @@ def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, r
         if step_status == "Success":
             if not stop or stop_status not in {"Pending", "InProgress"} or execution.get("CurrentStepName") != "discoverAndStopOwnedInstances" or execution.get("CurrentAction") != "aws:executeScript":
                 raise AwsProviderError(f"active expiry stop-step evidence conflicts in {region}", category="expiry_terminal_step")
-        elif step_status != "InProgress" or (stop and not stop_unstarted_placeholder) or execution.get("CurrentStepName") != "waitUntilExpiry" or execution.get("CurrentAction") != "aws:sleep":
+        elif step_status != "InProgress" or (stop and not (stop_status == "Pending" and stop_unstarted_placeholder)) or execution.get("CurrentStepName") != "waitUntilExpiry" or execution.get("CurrentAction") != "aws:sleep":
             raise AwsProviderError(f"active expiry sleep-step evidence conflicts in {region}", category="expiry_terminal_step")
     elif status in {"Failed", "TimedOut"}:
         if not (step_status in {"Failed", "TimedOut"} or stop_status in {"Failed", "TimedOut"}):
@@ -1959,7 +1959,7 @@ def _validate_terminal_execution(execution: dict[str, Any], execution_id: str, r
     elif status == "Cancelled":
         if step_status == "Success" and (not stop or stop_status not in {"Pending", "Cancelled"}):
             raise AwsProviderError(f"cancelled expiry has conflicting stop-step evidence in {region}", category="expiry_terminal_step")
-        if step_status not in {"InProgress", "Success", "Cancelled"} or stop_status in {"Failed", "TimedOut", "Success", "InProgress"} or (stop and not stop_unstarted_placeholder):
+        if step_status in {"Failed", "TimedOut"} or stop_status in {"Failed", "TimedOut", "Success", "InProgress"}:
             raise AwsProviderError(f"cancelled expiry has conflicting terminal step evidence in {region}", category="expiry_terminal_step")
 
 

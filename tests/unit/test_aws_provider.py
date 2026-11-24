@@ -907,12 +907,28 @@ def _queued_expiry_execution(params, status="InProgress", stop_status="Pending")
     return execution
 
 
+def _bound_queued_stop_inputs(params):
+    return {"InputPayload": json.dumps({"run_id": params["RunId"][0],
+        "deployment_id": params["DeploymentId"][0], "region": params["Region"][0]})}
+
+
 def test_terminal_expiry_accepts_only_unstarted_pending_placeholder_during_wait():
     params = {"AutomationAssumeRole": ["role"], "ExpiryTriggerUtc": ["2026-10-22T12:14:00Z"],
         "RunId": ["r"], "DeploymentId": ["d"], "Region": ["eu-central-1"]}
     safety = {"document_name": "expiry", "document_version": "1"}
+    # During the original wait, only the exact empty Pending placeholder is valid.
     _validate_terminal_execution(_queued_expiry_execution(params), "exec", "eu-central-1", safety, params)
+    wrong_wait_state = _queued_expiry_execution(params, stop_status="Cancelled")
+    with pytest.raises(AwsProviderError, match="conflicts"):
+        _validate_terminal_execution(wrong_wait_state, "exec", "eu-central-1", safety, params)
+    # A genuine cancellation may retain an empty unstarted Pending or Cancelled row.
+    _validate_terminal_execution(_queued_expiry_execution(params, "Cancelled", "Pending"), "exec", "eu-central-1", safety, params)
     _validate_terminal_execution(_queued_expiry_execution(params, "Cancelled", "Cancelled"), "exec", "eu-central-1", safety, params)
+    # Previously valid resolved inputs remain valid for cancelled terminal readbacks.
+    for stop_status in ("Pending", "Cancelled"):
+        resolved = _queued_expiry_execution(params, "Cancelled", stop_status)
+        resolved["StepExecutions"][1]["Inputs"] = _bound_queued_stop_inputs(params)
+        _validate_terminal_execution(resolved, "exec", "eu-central-1", safety, params)
     for inputs in ({"InputPayload": "{}"}, {"InputPayload": json.dumps({"run_id": "wrong"})}):
         malformed = _queued_expiry_execution(params)
         malformed["StepExecutions"][1]["Inputs"] = inputs
