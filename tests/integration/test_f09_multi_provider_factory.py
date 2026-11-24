@@ -70,6 +70,21 @@ class Clock:
         self._sleep_for(threading.current_thread(), seconds)
 
 
+class _GcpTimeBridge:
+    """Bind GCP's absolute-monotonic reads to the same synthetic Clock."""
+    def __init__(self, clock):
+        self._clock = clock
+    def monotonic(self):
+        return self._clock.monotonic()
+
+
+def _bridge_gcp_monotonic(monkeypatch, clock):
+    import cloud_network_benchmark.providers.gcp as gcp_provider
+    # Replace only GCP's module-local time reference; never mutate the shared
+    # stdlib time module used by threading or the other provider drivers.
+    monkeypatch.setattr(gcp_provider, "time", _GcpTimeBridge(clock))
+
+
 def test_clock_phase_workers_inherit_highwater_without_serializing_parallel_workers():
     clock = Clock()
     day_seconds = 86_400
@@ -224,6 +239,7 @@ def test_default_gcp_factory_protects_provisions_and_cleans_up_with_source_shape
                 "support_cost_path": repository_root / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                 "primary_review_path": None}}}}
     clock, runner = Clock(), GcpSourceRunner()
+    _bridge_gcp_monotonic(monkeypatch, clock)
     runner.clock = clock
     original_gcp_hooks = adapters.gcp_hooks
     def observe_gcp_hooks(driver, deployment, expiry_request, **kwargs):
@@ -579,6 +595,7 @@ def test_default_three_provider_factory_reserves_and_enforces_global_claim_barri
                     "support_cost_path": ROOT / "tests/fixtures/gcp/zero-support-cost-2026-10-23.json",
                     "primary_review_path": None}}}}
     clock = Clock()
+    _bridge_gcp_monotonic(monkeypatch, clock)
     f03_status_started = threading.Event()
     provider_status_started = {provider: threading.Event() for provider in children}
     provider_cancel_called = {provider: threading.Event() for provider in children}

@@ -125,8 +125,9 @@ def test_pair_apply_review_rechecks_full_budget_and_preserves_total_stage_deadli
     clock=[2.0]
     calls=[]
     budget_checks=[]
-    def reviewed(request,execute,*,review_seconds,apply_timeout_seconds,before_apply,review_admission_path):
+    def reviewed(request,execute,*,review_seconds,command_timeout_seconds,apply_timeout_seconds,before_apply,review_admission_path):
         assert review_admission_path is None
+        assert command_timeout_seconds == 180
         calls.append((request.timeout_seconds,review_seconds,apply_timeout_seconds))
         clock[0]+=review_elapsed
         budget_checks.append("invoked")
