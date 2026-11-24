@@ -600,13 +600,7 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
         request=request, reservation=deployment.reservation.value, provider_lead_seconds=30.0,
         settings=driver.settings, private_root=tmp_path/"cleanup-settings")
     attempt = driver._attempt_dir(deployment)
-    driver._save(attempt, {"run_id": deployment.run_id,
-        "deployment_id": deployment.deployment_id,
-        "binding_sha256": driver._binding_fingerprint(deployment),
-        "reservation_id": deployment.reservation.value.reservation_id.value,
-        "registration_may_have_started": True,
-        "unused_protection_destroy_attempted": True,
-        "protection_cleanup_state": "succeeded"})
+    assert not (attempt/"attempt.json").exists()
     inventory = {"pages_complete": True,
         "completed_scopes": ["all_project_zones", deployment.vm_a.region, "global"],
         "regions_scanned": [deployment.vm_a.region], "zone_scope": "all_project_zones",
@@ -621,7 +615,12 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
     result, saved, absent_ids = cleanup_saved_provider(record, runner=object())
     assert result.cleanup_state == "succeeded" and result.expiry.value is None
     assert result.expiry.unavailable_reason == "no native expiry was registered"
-    assert absent_ids == [] and terraform_calls == [("protection", "destroy")]
+    assert absent_ids == [] and terraform_calls == []
+    cleanup_journal = json.loads((attempt/"attempt.json").read_text())
+    assert cleanup_journal["run_id"] == deployment.run_id
+    assert cleanup_journal["deployment_id"] == deployment.deployment_id
+    assert cleanup_journal["commands"] == []
+    assert "binding_sha256" not in cleanup_journal and "reservation_id" not in cleanup_journal
 
     reservation_id = deployment.reservation.value.reservation_id.value
     ledger_path = tmp_path/"ledger.json"
@@ -657,6 +656,27 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
         utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=["foreign-resource-id"])
     assert foreign["absence_proved"] is False
     assert foreign["ledger_event"].absent_resource_ids == ()
+
+    # A partial or changed identity journal must not fall through to the
+    # cleanup-created minimal-journal exception.
+    journal_path = Path(record.journal_reference)
+    journal_bytes = journal_path.read_bytes()
+    mutations = (
+        lambda row: row.update(reservation_id="foreign-reservation"),
+        lambda row: row.update(run_id="foreign-run"),
+        lambda row: row.update(unrecognized_identity="ambiguous"),
+        lambda row: row["inventory"].update(resources=[{"id": "foreign-resource"}]),
+        lambda row: row.update(commands=[{"action": "unknown"}]),
+    )
+    for mutate in mutations:
+        changed_journal = json.loads(journal_bytes)
+        mutate(changed_journal)
+        journal_path.write_text(json.dumps(changed_journal))
+        partial = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
+            utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=[])
+        assert partial["absence_proved"] is False
+    journal_path.write_bytes(journal_bytes)
+
     outcome = reconcile_saved_cleanup_result(record, result, recovery=recovery, ledger=ledger,
         utc_now=lambda: datetime.now(timezone.utc), provider_resource_ids=absent_ids)
     event = outcome["ledger_event"]
@@ -669,7 +689,7 @@ def test_gcp_precreation_cleanup_receipt_replays_source_bound_and_idempotently(t
     assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
     assert ledger.event_count() == 1
     assert replay_saved_cleanup_receipt(record, recovery=recovery, ledger=ledger)
-    assert ledger.event_count() == 1 and terraform_calls == [("protection", "destroy")]
+    assert ledger.event_count() == 1 and terraform_calls == []
 
 
 def test_cleanup_verifies_compute_absence_before_removing_protection_and_is_idempotent(tmp_path, monkeypatch):

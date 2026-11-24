@@ -336,17 +336,49 @@ def _gcp_precreation_selector(record: Any, saved: SavedProviderCleanupSettings,
         f"deployment_id={saved.deployment.deployment_id};roles=vm_a,vm_b")
     if (saved.expiry_request.resource_namespace != saved.deployment.run_id
             or saved.expiry_request.target_selector != expected_selector
-            or state.get("binding_sha256") != expected_binding
             or state.get("run_id") != saved.deployment.run_id
-            or state.get("deployment_id") != saved.deployment.deployment_id
-            or state.get("reservation_id") != recovery.reservation_id
-            or ("creation_may_have_started" in state and state.get("creation_may_have_started") is not False)
-            or state.get("deployment_output") is not None
-            or ("registered" in state and state.get("registered") is not False)
-            or state.get("expiry") is not None
-            or state.get("cleanup_state") != "succeeded"
-            or state.get("launch_blocked") is not False):
+            or state.get("deployment_id") != saved.deployment.deployment_id):
         return None
+    bound_state = "binding_sha256" in state or "reservation_id" in state
+    if bound_state:
+        if (state.get("binding_sha256") != expected_binding
+                or state.get("reservation_id") != recovery.reservation_id
+                or ("creation_may_have_started" in state and state.get("creation_may_have_started") is not False)
+                or state.get("deployment_output") is not None
+                or ("registered" in state and state.get("registered") is not False)
+                or state.get("expiry") is not None
+                or state.get("cleanup_state") != "succeeded"
+                or state.get("launch_blocked") is not False):
+            return None
+    else:
+        # A supervisor can stop before the provider creates its journal. The
+        # ordinary cleanup path then creates a minimal journal containing only
+        # deployment identity and its completed empty inventory. Accept that
+        # shape only when it exactly matches the returned cleanup result; any
+        # added or partial identity fields must use the fully bound path above.
+        allowed = {"run_id", "deployment_id", "commands", "cleanup_state", "launch_blocked",
+            "inventory", "cleanup_started_at", "cleanup_absence_started_at",
+            "cleanup_acceptance_timing"}
+        required = {"run_id", "deployment_id", "commands", "cleanup_state", "launch_blocked", "inventory"}
+        if (not required.issubset(state) or not set(state).issubset(allowed)
+                or state.get("commands") != []
+                or state.get("cleanup_state") != "succeeded"
+                or state.get("launch_blocked") is not False
+                or state.get("inventory") != getattr(getattr(result, "inventory", None), "value", None)):
+            return None
+        for key in ("cleanup_started_at", "cleanup_absence_started_at"):
+            if key in state:
+                try:
+                    value = datetime.fromisoformat(str(state[key]).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    return None
+                if value.tzinfo is None or value.utcoffset() is None:
+                    return None
+        timing = state.get("cleanup_acceptance_timing")
+        if timing is not None and (not isinstance(timing, dict)
+                or set(timing) != {"routine_deadline_utc", "status"}
+                or timing.get("status") not in {"within_deadline", "late", "unknown"}):
+            return None
     registration_started = state.get("registration_may_have_started")
     if registration_started is not None and registration_started is not False and registration_started is not True:
         return None
