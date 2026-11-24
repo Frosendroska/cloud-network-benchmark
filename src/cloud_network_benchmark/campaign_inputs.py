@@ -220,6 +220,29 @@ def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
     return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
 
 
+def _profile_dispatch_window(inputs: dict, stage: str, execution_window: dict[str, str]) -> dict[str, str]:
+    """Validate a split dispatch window, preserving the historical shared-window default."""
+    if "dispatch_window_utc" not in inputs:
+        # Older ready-profile settings used one interval for both dispatch and
+        # common measurement start. Preserve that exact, finite behavior.
+        return dict(execution_window)
+    window = inputs["dispatch_window_utc"]
+    if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
+        raise ValueError(f"{stage}.dispatch_window_utc requires not_before_utc and not_after_utc for ready-triggered validation")
+    start = _utc(window["not_before_utc"], f"{stage}.dispatch_window_utc.not_before_utc")
+    end = _utc(window["not_after_utc"], f"{stage}.dispatch_window_utc.not_after_utc")
+    common_end = _utc(execution_window["not_after_utc"], f"{stage}.execution_window_utc.not_after_utc")
+    if end <= start or end > common_end:
+        raise ValueError("validation dispatch window must be positive and end no later than the common measurement window")
+    return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
+
+
+def _ready_credential_horizon(inputs: dict, stage: str, cap_seconds: int) -> datetime:
+    execution_window = _profile_execution_window(inputs, stage)
+    dispatch_window = _profile_dispatch_window(inputs, stage, execution_window)
+    return _utc(dispatch_window["not_after_utc"], f"{stage}.dispatch_window_utc.not_after_utc") + timedelta(seconds=cap_seconds)
+
+
 def _acceptance_dispatch_policy(settings, approval_refs):
     declaration = {**settings.get("approvals", {}),
                    **settings.get("stage_inputs", {}).get("acceptance", {}).get("approvals", {})}["paired_acceptance"]
@@ -227,8 +250,10 @@ def _acceptance_dispatch_policy(settings, approval_refs):
     inputs = settings.get("stage_inputs", {}).get("acceptance", {})
     ready_triggered = inputs.get("workflow_profile") == ACCEPTANCE_PROFILE
     window = _profile_execution_window(inputs, "acceptance") if ready_triggered else None
+    dispatch_window = _profile_dispatch_window(inputs, "acceptance", window) if ready_triggered else None
     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
             or (ready_triggered and fields.get("execution_window_utc") != window)
+            or (ready_triggered and fields.get("dispatch_window_utc", window) != dispatch_window)
             or (not ready_triggered and _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc").isoformat()
                 != _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat())):
         raise ValueError("paired_acceptance must bind the pair and exact approved validation timing policy")
@@ -237,6 +262,7 @@ def _acceptance_dispatch_policy(settings, approval_refs):
         return {"policy_id": "acceptance-paired-s1-s3-ready-v1", "group_by": "acceptance_slot",
             "scenarios": ["S1", "S3"], "max_parallel_entries": 2,
             "start_policy": "all_ready", "execution_window": window,
+            "dispatch_window_utc": dispatch_window,
             "ready_window_seconds": 600, "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
     start_utc = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat()
     return {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
@@ -369,9 +395,11 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 inputs = settings["stage_inputs"][stage]
                 if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
                     window = _profile_execution_window(inputs, "acceptance")
+                    dispatch_window = _profile_dispatch_window(inputs, "acceptance", window)
                     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-                            or fields.get("execution_window_utc") != window):
-                        raise ValueError("paired_acceptance must bind the exact ready-triggered validation window")
+                            or fields.get("execution_window_utc") != window
+                            or fields.get("dispatch_window_utc", window) != dispatch_window):
+                        raise ValueError("paired_acceptance must bind both exact ready-triggered validation windows")
                 else:
                     start = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc")
                     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
@@ -388,7 +416,14 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             for window, time in windows.items():
                 _utc(f"{start}T{time}+00:00", f"windows_utc.{window}")
         elif stage == "calibration" and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") == CALIBRATION_PROFILE:
-            _profile_execution_window(settings["stage_inputs"][stage], "calibration")
+            inputs = settings["stage_inputs"][stage]
+            window = _profile_execution_window(inputs, "calibration")
+            dispatch_window = _profile_dispatch_window(inputs, "calibration", window)
+            fields = gates["calibration_authorized"].get("fields", {})
+            if not draft and "dispatch_window_utc" in inputs and (
+                    fields.get("execution_window_utc") != window
+                    or fields.get("dispatch_window_utc") != dispatch_window):
+                raise ValueError("calibration_authorized must bind both exact ready-triggered validation windows")
         elif stage != "acceptance":
             _utc(settings["stage_inputs"][stage].get("start_utc"), f"stage_inputs.{stage}.start_utc")
         elif entries and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") != ACCEPTANCE_PROFILE:
@@ -449,8 +484,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             last = max(_utc(f"{start + timedelta(days=6)}T{time}+00:00", "WEEK final slot") for time in windows.values())
             horizon = last + timedelta(seconds=1200)
         elif stage in {"acceptance", "calibration"} and selected_caps:
-            horizon = _utc(_profile_execution_window(settings["stage_inputs"][stage], stage)["not_after_utc"],
-                f"{stage}.execution_window_utc.not_after_utc") + timedelta(seconds=stage_horizon)
+            horizon = _ready_credential_horizon(settings["stage_inputs"][stage], stage, stage_horizon)
         elif stage in {"calibration", "day"}:
             horizon = _utc(settings["stage_inputs"][stage]["start_utc"], "start_utc") + timedelta(seconds=stage_horizon if selected_caps else 1800 if stage == "calibration" else 87600)
         if valid_through < horizon:
@@ -967,8 +1001,13 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             window = None
         launch_at = scheduled - timedelta(seconds=prep) if scheduled else now
         if profile == ACCEPTANCE_PROFILE and entry_id in {"V-S1", "V-S3"}:
-            launch_at = _utc(_profile_execution_window(inputs, "acceptance")["not_before_utc"],
-                             "acceptance.execution_window_utc.not_before_utc")
+            launch_at = _utc(_profile_dispatch_window(inputs, "acceptance",
+                _profile_execution_window(inputs, "acceptance"))["not_before_utc"],
+                "acceptance.dispatch_window_utc.not_before_utc")
+        elif profile == CALIBRATION_PROFILE:
+            launch_at = _utc(_profile_dispatch_window(inputs, "calibration",
+                _profile_execution_window(inputs, "calibration"))["not_before_utc"],
+                "calibration.dispatch_window_utc.not_before_utc")
         if scheduled and launch_at <= now:
             raise ValueError(f"{entry_id}: setup lead time is already missed; explicitly review new timing, no backfill")
         end = (scheduled or now) + timedelta(seconds=allowance["measurement_seconds"] + allowance["measurement_shutdown_seconds"] + allowance["retrieval_seconds"] + allowance["cleanup_seconds"])
@@ -1099,17 +1138,23 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "expected_participants": participants,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start")}
         if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
-            start_barrier.update(start_policy="all_ready",
-                execution_window=_profile_execution_window(inputs, "acceptance"), ready_window_seconds=600)
+            execution_window = _profile_execution_window(inputs, "acceptance")
+            start_barrier.update(start_policy="all_ready", execution_window=execution_window,
+                dispatch_window_utc=_profile_dispatch_window(inputs, "acceptance", execution_window),
+                ready_window_seconds=600)
         else:
             start_barrier["start_utc"] = _utc(inputs["start_utc"], "acceptance.start_utc").isoformat()
         stage_data["post_measurement_barrier"] = barrier
         stage_data["measurement_start_barrier"] = start_barrier
+        if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
+            stage_data["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         for entry in normal:
             runtime_path = Path(entry["runtime_config_path"])
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             runtime["post_measurement_barrier"] = barrier
             runtime["measurement_start_barrier"] = start_barrier
+            if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
+                runtime["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
             atomic_write_json(runtime_path, runtime)
             entry["runtime_config_sha256"] = _sha(runtime_path)
         for entry in entries:
@@ -1147,14 +1192,20 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "expected_participants": participants,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "calibration-start")}
         if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
-            start_barrier.update(start_policy="all_ready",
-                execution_window=_profile_execution_window(inputs, "calibration"), ready_window_seconds=600)
+            execution_window = _profile_execution_window(inputs, "calibration")
+            start_barrier.update(start_policy="all_ready", execution_window=execution_window,
+                dispatch_window_utc=_profile_dispatch_window(inputs, "calibration", execution_window),
+                ready_window_seconds=600)
         else:
             start_barrier["start_utc"] = _utc(inputs["start_utc"], "calibration.start_utc").isoformat()
         stage_data["measurement_start_barrier"] = start_barrier
+        if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
+            stage_data["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         runtime_path = Path(entry["runtime_config_path"])
         runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
         runtime["measurement_start_barrier"] = start_barrier
+        if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
+            runtime["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         atomic_write_json(runtime_path, runtime)
         entry["runtime_config_sha256"] = _sha(runtime_path)
     if stage == "acceptance":

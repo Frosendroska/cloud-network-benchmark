@@ -23,6 +23,10 @@ from .campaign_draft import (ACTIVATED_STATUS, create_draft_bundle,
     verify_activation)
 
 
+class _DispatchWindowExpired(RuntimeError):
+    """Raised before an external dispatch when the reviewed window has closed."""
+
+
 def _utc(value: Any) -> datetime:
     if isinstance(value, datetime):
         result = value
@@ -33,6 +37,50 @@ def _utc(value: Any) -> datetime:
     if result.tzinfo is None or result.utcoffset() is None:
         raise ValueError("campaign timestamps must include a UTC offset")
     return result.astimezone(timezone.utc)
+
+
+def _window_bounds(window: Any, label: str) -> tuple[datetime, datetime]:
+    if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
+        raise ValueError(f"{label} must contain exactly not_before_utc and not_after_utc")
+    lower, upper = _utc(window.get("not_before_utc")), _utc(window.get("not_after_utc"))
+    if upper <= lower:
+        raise ValueError(f"{label} must be a positive UTC interval")
+    return lower, upper
+
+
+def _stage_dispatch_window(stage: dict[str, Any]) -> tuple[datetime, datetime] | None:
+    """Resolve the frozen dispatch interval across stage, admission and start barrier."""
+    raw = stage.get("dispatch_window_utc")
+    barrier = stage.get("measurement_start_barrier")
+    if raw is None:
+        if isinstance(barrier, dict) and barrier.get("start_policy") == "all_ready":
+            policy = stage.get("dispatch_policy") if stage.get("stage") == "acceptance" else barrier
+            raw = policy.get("dispatch_window_utc", policy.get("execution_window")) if isinstance(policy, dict) else None
+            if raw is None:
+                raise ValueError("ready-triggered stage is missing its source-bound dispatch window")
+        else:
+            return None
+    bounds = _window_bounds(raw, "stage dispatch window")
+    barrier_window = barrier.get("dispatch_window_utc", barrier.get("execution_window")) if isinstance(barrier, dict) else None
+    if not isinstance(barrier, dict) or barrier_window != raw:
+        raise ValueError("stage dispatch window differs from the frozen measurement barrier")
+    policy = stage.get("dispatch_policy")
+    if stage.get("stage") == "acceptance":
+        policy_window = policy.get("dispatch_window_utc", policy.get("execution_window")) if isinstance(policy, dict) else None
+        if not isinstance(policy, dict) or policy_window != raw:
+            raise ValueError("stage dispatch window differs from paired acceptance admission")
+    return bounds
+
+
+def _retained_reservation_reconciliation(stage: dict[str, Any], reservation_ids: list[str]) -> dict[str, Any]:
+    """Describe reserved liabilities when admission succeeded but dispatch did not start."""
+    return {"cleanup_open": True, "provider_cleanup_required": False,
+        "resource_cleanup_status": "not_required_no_provider_call", "provider_calls": 0,
+        "reservation_status": "retained_reserved_unreconciled",
+        "ledger_reconciliation_required": True,
+        "ledger_path": stage.get("ledger_path"), "scope_id": stage.get("scope_id"),
+        "pre_admission_reservation_ids": list(reservation_ids),
+        "next_action": "Call BudgetLedger.inspect() read-only on the bound ledger and review only these reservation IDs; retain their holds. This record alone does not authorize cancellation, and no hold release or billing conclusion was made."}
 
 
 def _now(clock: Any) -> datetime:
@@ -85,7 +133,10 @@ def _validate_acceptance_dispatch_policy(policy: Any) -> None:
         raise ValueError("acceptance paired admission evidence must be an object")
     source = Path(admission.get("source_path", ""))
     source_hash = admission.get("source_sha256")
+    expected_dispatch = policy.get("dispatch_window_utc", policy.get("execution_window"))
+    admission_dispatch = admission.get("dispatch_window_utc", admission.get("execution_window_utc"))
     policy_bound = (admission.get("execution_window_utc") == policy.get("execution_window")
+        and admission_dispatch == expected_dispatch
         if ready else admission.get("start_utc") == policy.get("start_utc"))
     if (admission.get("mode") != "paired_acceptance_s1_s3" or admission.get("max_parallel_entries") != 2
             or not policy_bound
@@ -97,8 +148,14 @@ def _validate_acceptance_dispatch_policy(policy: Any) -> None:
     if ready and (policy.get("start_policy") != "all_ready"
             or type(policy.get("ready_window_seconds")) is not int
             or not 1 <= policy["ready_window_seconds"] <= 600
-            or not isinstance(policy.get("execution_window"), dict)):
+            or not isinstance(policy.get("execution_window"), dict)
+            or not isinstance(policy.get("dispatch_window_utc", policy.get("execution_window")), dict)):
         raise ValueError("ready-triggered acceptance requires a bounded all_ready policy and frozen execution window")
+    if ready:
+        _, common_end = _window_bounds(policy.get("execution_window"), "acceptance execution window")
+        dispatch_start, dispatch_end = _window_bounds(expected_dispatch, "acceptance dispatch window")
+        if dispatch_end > common_end:
+            raise ValueError("acceptance dispatch window must end no later than the common measurement window")
 
 
 def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -144,21 +201,25 @@ def _acceptance_pair(stage: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("paired acceptance requires a shared six-child readiness barrier")
     if stage["dispatch_policy"].get("start_policy") == "all_ready":
         window = stage["dispatch_policy"].get("execution_window")
+        dispatch_window = stage["dispatch_policy"].get("dispatch_window_utc", window)
         ready_window_seconds = stage["dispatch_policy"].get("ready_window_seconds")
         if (type(ready_window_seconds) is not int or not 1 <= ready_window_seconds <= 600
                 or not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}
                 or start_barrier.get("start_policy") != "all_ready"
                 or start_barrier.get("execution_window") != window
+                or start_barrier.get("dispatch_window_utc", window) != dispatch_window
+                or stage.get("dispatch_window_utc", window) != dispatch_window
                 or start_barrier.get("ready_window_seconds") != ready_window_seconds
-                or any(row.get("scheduled_start") is not None for row in pair)
-                or len(launches) != 1 or _utc(pair[0].get("launch_at")) != _utc(window.get("not_before_utc"))):
+                or any(row.get("scheduled_start") is not None for row in pair)):
             raise ValueError("ready-triggered acceptance requires null scheduled starts and the frozen all-ready window")
         try:
-            lower, upper = _utc(window.get("not_before_utc")), _utc(window.get("not_after_utc"))
+            lower, upper = _window_bounds(window, "acceptance execution window")
+            dispatch_lower, dispatch_upper = _window_bounds(dispatch_window, "acceptance dispatch window")
         except (TypeError, ValueError) as exc:
-            raise ValueError("ready-triggered acceptance window bounds must be UTC timestamps") from exc
-        if upper <= lower:
-            raise ValueError("ready-triggered acceptance execution window must be positive")
+            raise ValueError("ready-triggered acceptance windows must contain valid UTC bounds") from exc
+        if (dispatch_upper > upper
+                or len(launches) != 1 or _utc(pair[0].get("launch_at")) != dispatch_lower):
+            raise ValueError("ready-triggered acceptance dispatch window is inconsistent with the frozen pair")
     else:
         scheduled = {_utc(row.get("scheduled_start")) for row in pair}
         if (len(scheduled) != 1 or len(launches) != 1
@@ -583,6 +644,7 @@ class CampaignDriver:
         if stage.get("status") == "DRAFT_UNAPPROVED":
             raise ValueError("an unapproved draft cannot enter the campaign runner")
         state_root = Path(stage["state_root"]).resolve()
+        dispatch_window = _stage_dispatch_window(stage)
         weekly_slots = _week_slot_groups(stage) if stage.get("stage") == "week" else None
         acceptance_pair = None
         journal_path = state_root / stage["stage_id"] / "campaign-journal.json"
@@ -624,7 +686,7 @@ class CampaignDriver:
                     _write_json(journal_path, journal)
                     continue
                 now = _now(self.clock)
-                pending = self._exclude_expired_slots(pending, journal, journal_path, now)
+                pending = self._exclude_expired_slots(pending, journal, journal_path, now, dispatch_window)
                 if not pending:
                     if stage.get("stage") == "week":
                         blocked = True
@@ -639,9 +701,11 @@ class CampaignDriver:
                         _write_json(journal_path, journal)
                         blocked = True
                         continue
-                while any(entry.get("scheduled_start") is not None for entry in pending):
+                while (any(entry.get("scheduled_start") is not None for entry in pending)
+                        or (dispatch_window is not None and _now(self.clock) < dispatch_window[0])):
                     now = _now(self.clock)
-                    delay = (launch_at - now).total_seconds()
+                    target = max([launch_at] + ([dispatch_window[0]] if dispatch_window else []))
+                    delay = (target - now).total_seconds()
                     if delay <= 0:
                         break
                     chunk = min(delay, 60)
@@ -655,7 +719,7 @@ class CampaignDriver:
                     _write_json(journal_path, journal)
                     blocked = True
                     continue
-                pending = self._exclude_expired_slots(pending, journal, journal_path, _now(self.clock))
+                pending = self._exclude_expired_slots(pending, journal, journal_path, _now(self.clock), dispatch_window)
                 if not pending:
                     continue
                 if min_free:
@@ -711,6 +775,20 @@ class CampaignDriver:
                             _append_log(stage, message)
                             blocked = True
                             break
+                    # Admission may take long enough to cross the reviewed latest-dispatch instant.
+                    pending_after_admission = self._exclude_expired_slots(
+                        group, journal, journal_path, _now(self.clock), dispatch_window)
+                    if not pending_after_admission:
+                        if aggregate_reservation_ids:
+                            for entry in group:
+                                record = journal["entries"][entry["entry_id"]]
+                                record["aggregate_reservation_ids"] = aggregate_reservation_ids
+                                record["blocked_reason"] = "ledger_reconciliation_required"
+                                record["result"] = _retained_reservation_reconciliation(
+                                    stage, aggregate_reservation_ids)
+                            _write_json(journal_path, journal)
+                        blocked = True
+                        break
                     if any(entry.get("scheduled_start") is not None
                             and _utc(entry["scheduled_start"]) <= _now(self.clock) for entry in group):
                         for entry in group:
@@ -732,7 +810,12 @@ class CampaignDriver:
                         self._transition(journal, entry["entry_id"], "running")
                     _write_json(journal_path, journal)
                     with ThreadPoolExecutor(max_workers=max(1, len(group))) as pool:
-                        futures = {pool.submit(self.launch, entry, stage): entry for entry in group}
+                        def guarded_launch(entry):
+                            current = _now(self.clock)
+                            if dispatch_window is not None and not (dispatch_window[0] <= current <= dispatch_window[1]):
+                                raise _DispatchWindowExpired("dispatch window expired immediately before launch")
+                            return self.launch(entry, stage)
+                        futures = {pool.submit(guarded_launch, entry): entry for entry in group}
                         for future, entry in futures.items():
                             entry_id = entry["entry_id"]
                             try:
@@ -747,9 +830,18 @@ class CampaignDriver:
                                                  result=result_payload,
                                                  **({"error": "lifecycle did not report complete"} if status == "failed" else {}))
                             except Exception as exc:
-                                self._transition(journal, entry_id, "failed", finished_at=_now(self.clock).isoformat(),
-                                                 error=f"{type(exc).__name__}: {exc}",
-                                                 result={"cleanup_open": True, "launch_uncertain": True})
+                                if isinstance(exc, _DispatchWindowExpired):
+                                    self._transition(journal, entry_id, "missed", finished_at=_now(self.clock).isoformat(),
+                                        error=str(exc), result=(
+                                            _retained_reservation_reconciliation(stage, aggregate_reservation_ids)
+                                            if aggregate_reservation_ids else
+                                            {"cleanup_open": False, "provider_calls": 0}))
+                                    if aggregate_reservation_ids:
+                                        journal["entries"][entry_id]["blocked_reason"] = "ledger_reconciliation_required"
+                                else:
+                                    self._transition(journal, entry_id, "failed", finished_at=_now(self.clock).isoformat(),
+                                        error=f"{type(exc).__name__}: {exc}",
+                                        result={"cleanup_open": True, "launch_uncertain": True})
                             _write_json(journal_path, journal)
                             if journal["entries"][entry_id]["state"] in {"complete", "failed"}:
                                 self._archive_closed_entry(stage, entry, journal["entries"][entry_id])
@@ -1068,9 +1160,16 @@ class CampaignDriver:
                     "preserved_export": str(preserved), "dispatch_started": False}
 
     def _exclude_expired_slots(self, entries: list[dict[str, Any]], journal: dict[str, Any],
-                               journal_path: Path, now: datetime) -> list[dict[str, Any]]:
+                               journal_path: Path, now: datetime,
+                               dispatch_window: tuple[datetime, datetime] | None = None) -> list[dict[str, Any]]:
         active: list[dict[str, Any]] = []
         changed = False
+        if dispatch_window is not None and now > dispatch_window[1]:
+            for entry in entries:
+                self._transition(journal, entry["entry_id"], "missed", finished_at=now.isoformat(),
+                    error="latest dispatch instant passed; automatic backfill is disabled")
+            _write_json(journal_path, journal)
+            return active
         for entry in entries:
             scheduled_start = entry.get("scheduled_start")
             if scheduled_start is not None and _utc(scheduled_start) <= now:
@@ -1242,8 +1341,11 @@ class CampaignDriver:
                 pending_supervision = any(row.get("blocked_reason") in {"supervision_required", "cleanup_pending"}
                                           and row.get("state") == "scheduled"
                                           for row in value.get("entries", {}).values())
+                pending_reservation_reconciliation = any(
+                    row.get("blocked_reason") == "ledger_reconciliation_required"
+                    for row in value.get("entries", {}).values())
                 stage_status = ("active" if counts["starting"] + counts["running"] else
-                                "awaiting_operator" if pending_supervision else
+                                "awaiting_operator" if pending_supervision or pending_reservation_reconciliation else
                                 "archive_pending_validation" if counts["archive_pending_validation"] else
                                 "active" if counts["scheduled"] else
                                 "failed" if counts["failed"] else
@@ -1293,6 +1395,10 @@ class CampaignDriver:
                                "counts": counts, "free_disk_bytes": _free_bytes(prepared.get("results_root")),
                                "cleanup_liabilities": sum(bool((row.get("result") or {}).get("cleanup_open"))
                                                           for row in value.get("entries", {}).values()),
+                               "retained_reservation_reconciliations": [
+                                   {"entry_id": entry_id, **row["result"]}
+                                   for entry_id, row in value.get("entries", {}).items()
+                                   if (row.get("result") or {}).get("ledger_reconciliation_required")],
                                "exports": exports, "backups": backups, "notifications": notifications,
                                "stage_summary": summary,
                                "entries": value["entries"], "journal": str(path),
@@ -1528,6 +1634,14 @@ class CampaignDriver:
         free_samples = [free_start] if free_start is not None else []
         memory_peak = 0
         with run_log.open("ab") as output:
+            # The outer campaign guard can run before filesystem work. Recheck at
+            # the actual subprocess seam so that log setup cannot carry an
+            # otherwise valid dispatch past its frozen UTC upper bound.
+            dispatch_window = _stage_dispatch_window(stage)
+            if dispatch_window is not None:
+                now = datetime.now(timezone.utc)
+                if not (dispatch_window[0] <= now <= dispatch_window[1]):
+                    raise _DispatchWindowExpired("dispatch window expired immediately before lifecycle process start")
             process = subprocess.Popen(command, cwd=root, stdout=output, stderr=subprocess.STDOUT)
             while process.poll() is None:
                 try:
@@ -1777,8 +1891,9 @@ def _status_payload(stage: dict[str, Any], journal: dict[str, Any]) -> dict[str,
     counts["expected"] = len(journal["entries"])
     next_entry = next((entry for entry in stage["entries"]
                        if journal["entries"][entry["entry_id"]]["state"] == "scheduled"), None)
-    awaiting = any(item.get("blocked_reason") in {"supervision_required", "cleanup_pending"}
-                   and item["state"] == "scheduled"
+    awaiting = any((item.get("blocked_reason") in {"supervision_required", "cleanup_pending"}
+                    and item["state"] == "scheduled")
+                   or item.get("blocked_reason") == "ledger_reconciliation_required"
                    for item in journal["entries"].values())
     settled = counts["scheduled"] == 0 or awaiting
     outcome = ("archive_pending_validation" if counts["archive_pending_validation"] else
@@ -1789,6 +1904,10 @@ def _status_payload(stage: dict[str, Any], journal: dict[str, Any]) -> dict[str,
             "free_disk_bytes": _free_bytes(stage.get("results_root")),
             "cleanup_liabilities": sum(bool((item.get("result") or {}).get("cleanup_open"))
                                         for item in journal["entries"].values()),
+            "retained_reservation_reconciliations": [
+                {"entry_id": entry_id, **item["result"]}
+                for entry_id, item in journal["entries"].items()
+                if (item.get("result") or {}).get("ledger_reconciliation_required")],
             "journal": str(Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json")}
 
 

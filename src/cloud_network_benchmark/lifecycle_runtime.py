@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -116,7 +116,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
     optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
-        "measurement_start_barrier", "observer", "workflow_profile",
+        "measurement_start_barrier", "observer", "workflow_profile", "dispatch_window_utc",
         "provider_registration_timeout_seconds", "plan_review_admission_path") if isinstance(raw, dict) and key in raw}
     root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
@@ -203,6 +203,8 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         barrier_keys = {"schema_version", "barrier_id", "barrier_root", "expected_participants",
             "start_policy", "execution_window", "ready_window_seconds"} if ready_policy else {
             "schema_version", "barrier_id", "barrier_root", "expected_participants", "start_utc"}
+        if ready_policy and isinstance(raw_barrier, dict) and "dispatch_window_utc" in raw_barrier:
+            barrier_keys.add("dispatch_window_utc")
         barrier = _keys(raw_barrier, barrier_keys, "measurement start barrier")
         participants = barrier["expected_participants"]
         calibration_entry = (root.get("workflow_profile") == "all_cloud_calibration_v1"
@@ -238,6 +240,33 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
                     or window_end.utcoffset().total_seconds() != 0
                     or window_end <= window_start):
                 raise ValueError("ready-triggered barrier execution window is invalid")
+            has_runtime_dispatch = "dispatch_window_utc" in root
+            has_barrier_dispatch = "dispatch_window_utc" in barrier
+            if has_runtime_dispatch != has_barrier_dispatch:
+                raise ValueError("ready-triggered dispatch window must be bound in both runtime and barrier")
+            if has_runtime_dispatch:
+                dispatch = _keys(root["dispatch_window_utc"], {"not_before_utc", "not_after_utc"},
+                    "runtime dispatch window")
+                barrier_dispatch = _keys(barrier["dispatch_window_utc"], {"not_before_utc", "not_after_utc"},
+                    "measurement start dispatch window")
+                try:
+                    dispatch_bounds = [datetime.fromisoformat(dispatch[name].replace("Z", "+00:00"))
+                        for name in ("not_before_utc", "not_after_utc")]
+                    barrier_bounds = [datetime.fromisoformat(barrier_dispatch[name].replace("Z", "+00:00"))
+                        for name in ("not_before_utc", "not_after_utc")]
+                except (AttributeError, ValueError) as exc:
+                    raise ValueError("ready-triggered dispatch window bounds must use UTC timestamps") from exc
+                if (any(value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0
+                            for value in dispatch_bounds + barrier_bounds)
+                        or dispatch_bounds[1] <= dispatch_bounds[0]
+                        or dispatch_bounds[1] > window_end
+                        or dispatch_bounds != barrier_bounds):
+                    raise ValueError("ready-triggered dispatch window is malformed or mismatched")
+                root["dispatch_window_utc"] = {name: value.astimezone(timezone.utc).isoformat()
+                    for name, value in zip(("not_before_utc", "not_after_utc"), dispatch_bounds)}
+                barrier["dispatch_window_utc"] = dict(root["dispatch_window_utc"])
+        elif "dispatch_window_utc" in root or "dispatch_window_utc" in barrier:
+            raise ValueError("dispatch_window_utc is allowed only for ready-triggered validation profiles")
         expected_entries = {"CAL-S1"} if calibration_entry else {"V-S1", "V-S3"}
         expected_pairs = {(entry, provider) for entry in expected_entries for provider in {"aws", "azure", "gcp"}}
         identities = set()

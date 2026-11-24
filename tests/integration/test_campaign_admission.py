@@ -290,14 +290,16 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
     window = {"not_before_utc": lower, "not_after_utc": upper}
+    dispatch_window = dict(window)
     acceptance = settings["stage_inputs"]["acceptance"]
     acceptance.update(workflow_profile=ACCEPTANCE_PROFILE,
-        failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window)
+        failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     acceptance.pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, FAILURE_PROFILE]
     settings["approvals"]["paired_acceptance"]["fields"] = {
         "mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
-        "execution_window_utc": window}
+        "execution_window_utc": window, "dispatch_window_utc": dispatch_window}
 
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
@@ -308,6 +310,7 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     assert all(row["scheduled_start"] is None for row in pair)
     assert {row["launch_at"] for row in pair} == {lower}
     assert stage["dispatch_policy"]["execution_window"] == window
+    assert stage["dispatch_policy"]["dispatch_window_utc"] == dispatch_window
     assert stage["dispatch_policy"]["ready_window_seconds"] == 600
     assert stage["measurement_start_barrier"]["execution_window"] == window
     assert stage["measurement_start_barrier"]["ready_window_seconds"] == 600
@@ -442,11 +445,13 @@ def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
         workflow_profile=ACCEPTANCE_PROFILE, failure_workflow_profile=FAILURE_PROFILE)
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
-    settings["stage_inputs"]["acceptance"]["execution_window_utc"] = {
-        "not_before_utc": lower, "not_after_utc": upper}
+    window = {"not_before_utc": lower, "not_after_utc": upper}
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE)
-    settings["stage_inputs"]["calibration"]["execution_window_utc"] = {
-        "not_before_utc": lower, "not_after_utc": upper}
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [
@@ -545,11 +550,13 @@ def test_source_profile_allowance_reaches_materialized_azure_factory(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     settings["stage_inputs"]["acceptance"].update(workflow_profile="all_cloud_acceptance_v1",
-        failure_workflow_profile="all_cloud_failure_acceptance_v1", execution_window_utc=window)
+        failure_workflow_profile="all_cloud_failure_acceptance_v1", execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].update(workflow_profile="all_cloud_calibration_v1",
-        execution_window_utc=window)
+        execution_window_utc=window, dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = ["all_cloud_acceptance_v1",
         "all_cloud_failure_acceptance_v1", "all_cloud_calibration_v1"]
@@ -723,8 +730,9 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE,
-        execution_window_utc=window)
+        execution_window_utc=window, dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
     stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
@@ -733,6 +741,15 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
     entry = stage["entries"][0]
     runtime = load_runtime_config(Path(entry["runtime_config_path"]),
         allow_missing_approval_evidence=True)
+    assert runtime["dispatch_window_utc"] == runtime["measurement_start_barrier"]["dispatch_window_utc"]
+    runtime_path = Path(entry["runtime_config_path"])
+    original_runtime = json.loads(runtime_path.read_text())
+    changed_runtime = json.loads(json.dumps(original_runtime))
+    changed_runtime["dispatch_window_utc"]["not_after_utc"] = "2026-11-24T16:00:00+00:00"
+    runtime_path.write_text(json.dumps(changed_runtime))
+    with pytest.raises(ValueError, match="malformed or mismatched"):
+        load_runtime_config(runtime_path, allow_missing_approval_evidence=True)
+    runtime_path.write_text(json.dumps(original_runtime))
     parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
         repository_root=repository_root, config_path=Path(entry["config_path"]))
     campaign, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
@@ -745,6 +762,43 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
             recovery_path=tmp_path / f"calibration-{provider}-recovery.json",
             archive_sink={"archive_root": str(tmp_path / "calibration-archive")})
         assert callable(stages.measure)
+
+
+def test_calibration_approval_backcompat_and_explicit_split_binding(repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import validate_stage_inputs
+    from cloud_network_benchmark.validation_profiles import CALIBRATION_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    calibration = settings["stage_inputs"]["calibration"]
+    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window)
+    calibration.pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
+
+    # Legacy ready CAL approval did not bind execution-window fields.
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert not any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    dispatch = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=4)).isoformat()}
+    calibration["dispatch_window_utc"] = dispatch
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    settings["approvals"]["calibration_authorized"]["fields"] = {
+        "execution_window_utc": window, "dispatch_window_utc": dispatch}
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert not any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    settings["approvals"]["calibration_authorized"]["fields"]["dispatch_window_utc"] = window
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
 
 
 def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repository_root, tmp_path, monkeypatch, request):
@@ -782,8 +836,10 @@ def test_real_calibration_activation_without_acceptance_receipt_writes_no_approv
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     calibration = settings["stage_inputs"]["calibration"]
-    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window)
+    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     calibration.pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
     stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
@@ -1133,8 +1189,11 @@ def test_source_bound_waiver_uses_reduced_acceptance_and_calibration_profiles(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
-    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
-    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["stage_inputs"]["acceptance"]["failure_waiver"] = {
@@ -1175,8 +1234,11 @@ def test_supported_fixed_draft_binds_final_waiver_runtime_hashes_and_rejects_tam
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
-    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
-    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["stage_inputs"]["acceptance"]["failure_waiver"] = {

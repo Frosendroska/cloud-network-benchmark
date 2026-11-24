@@ -25,7 +25,7 @@ def test_expired_credential_refresh_evidence_cannot_pass_preflight(tmp_path, mon
     import cloud_network_benchmark.campaign_inputs as inputs
     # Isolate the credential-duration condition; unrelated price/approval/config
     # contracts are exercised separately by lifecycle/admission integration tests.
-    monkeypatch.setattr(inputs, "_selected", lambda _: [])
+    monkeypatch.setattr(inputs, "_selected", lambda *_: [])
     monkeypatch.setattr(inputs, "_gate_rows", lambda *_: {})
     monkeypatch.setattr(inputs, "_cost_payload", lambda *_: {})
     evidence = tmp_path / "refresh-review.txt"
@@ -37,10 +37,32 @@ def test_expired_credential_refresh_evidence_cannot_pass_preflight(tmp_path, mon
     assert blockers and any("credential" in value.lower() or "refresh" in value.lower() for value in blockers)
 
 
+def test_ready_profile_requires_finite_ordered_dispatch_window_and_uses_it_for_credential_horizon():
+    from cloud_network_benchmark.campaign_inputs import _profile_dispatch_window, _ready_credential_horizon
+
+    inputs = {"execution_window_utc": {"not_before_utc": "2026-11-24T15:25:00Z",
+            "not_after_utc": "2026-11-24T17:00:00Z"},
+        "dispatch_window_utc": {"not_before_utc": "2026-11-24T15:25:00Z",
+            "not_after_utc": "2026-11-24T16:15:00Z"}}
+    execution = inputs["execution_window_utc"]
+    assert _profile_dispatch_window(inputs, "acceptance", execution) == {
+        "not_before_utc": "2026-11-24T15:25:00+00:00", "not_after_utc": "2026-11-24T16:15:00+00:00"}
+    assert _ready_credential_horizon(inputs, "acceptance", 4200) == datetime(2026, 11, 24, 17, 25, tzinfo=timezone.utc)
+    for dispatch in (
+            None,
+            {"not_before_utc": "2026-11-24T16:15:00Z", "not_after_utc": "2026-11-24T15:25:00Z"},
+            {"not_before_utc": "2026-11-24T15:25:00Z", "not_after_utc": "2026-11-24T17:01:00Z"},
+            {"not_before_utc": "2026-11-24T15:25:00", "not_after_utc": "2026-11-24T16:15:00Z"},
+    ):
+        inputs["dispatch_window_utc"] = dispatch
+        with pytest.raises(ValueError):
+            _profile_dispatch_window(inputs, "acceptance", execution)
+
+
 def test_archive_paths_must_not_overlap_results_or_private_state(tmp_path, monkeypatch):
     import hashlib, json
     import cloud_network_benchmark.campaign_inputs as inputs
-    monkeypatch.setattr(inputs, "_selected", lambda _: [])
+    monkeypatch.setattr(inputs, "_selected", lambda *_: [])
     quota_path = tmp_path / "quota-evidence.json"
     quota_payload = json.dumps({"measured_free_bytes": 8192}, sort_keys=True).encode()
     quota_path.write_bytes(quota_payload)

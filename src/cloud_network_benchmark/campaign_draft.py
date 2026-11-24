@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -215,6 +216,24 @@ def _expected_acceptance_policy(stage: Mapping[str, Any]) -> dict[str, Any] | No
     policy = stage.get("dispatch_policy")
     if not isinstance(policy, dict):
         return None
+    if policy.get("policy_id") == "acceptance-paired-s1-s3-ready-v1":
+        dispatch = policy.get("dispatch_window_utc", policy.get("execution_window"))
+        barrier = stage.get("measurement_start_barrier")
+        if (not isinstance(dispatch, dict) or set(dispatch) != {"not_before_utc", "not_after_utc"}
+                or stage.get("dispatch_window_utc", dispatch) != dispatch
+                or not isinstance(barrier, dict)
+                or barrier.get("dispatch_window_utc", barrier.get("execution_window")) != dispatch):
+            raise ValueError("ready acceptance draft must bind the dispatch window across stage, policy and runtime barrier")
+        try:
+            lower = datetime.fromisoformat(str(dispatch["not_before_utc"]).replace("Z", "+00:00"))
+            upper = datetime.fromisoformat(str(dispatch["not_after_utc"]).replace("Z", "+00:00"))
+            common_upper = datetime.fromisoformat(str(policy["execution_window"]["not_after_utc"]).replace("Z", "+00:00"))
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("ready acceptance draft dispatch bounds must be timestamps") from exc
+        if (lower.tzinfo is None or upper.tzinfo is None or common_upper.tzinfo is None
+                or lower.utcoffset() is None or upper.utcoffset() is None or common_upper.utcoffset() is None
+                or upper <= lower or upper > common_upper):
+            raise ValueError("ready acceptance draft dispatch window is inverted or exceeds the common measurement window")
     return {key: value for key, value in policy.items() if key != "evidence_sha256"}
 
 
