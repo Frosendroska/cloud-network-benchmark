@@ -1749,7 +1749,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("post-registration workflow no longer fits actual trigger")
     metadata = {"mechanism":"azure_automation_once_deallocate","api_version":AUTOMATION_API,"resource_group":name,"location":deployment.vm_a.region,
         "reservation_id":reservation.reservation_id.value,"source_sha256":reservation.source_sha256,
-        "runbook":rb,"schedule":sched,"job_schedule_id":job_id,"trigger":trigger.isoformat(),"target_ids":ids,
+        "runbook":rb,"schedule":sched,"job_schedule_id":job_id,
+        "requested_trigger":requested_trigger.isoformat(),"trigger":trigger.isoformat(),"target_ids":ids,
         "published_content_sha256":digest,"runtime":"PowerShell 5.1","module":{"name":"Az.Accounts","version":module_props["version"]},
         "managed_identity_principal_id":expiry_ids["principal_id"],"role_assignment_id":expiry_ids["role_assignment_id"],
         "role_definition_id":expiry_ids["role_definition_id"],"resource_group_id":expiry_ids["resource_group_id"],

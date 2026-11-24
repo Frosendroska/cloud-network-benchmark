@@ -675,9 +675,12 @@ def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository
     azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:origin_utc,
         origin_monotonic=origin_mono,origin_utc=origin_utc)
     runner=AutomationRunner(d,o,now)
-    result=register_expiry(d,expiry_request(d,o,cap_expires_at-timedelta(seconds=120)),o,runner,
+    requested=cap_expires_at-timedelta(seconds=120)
+    result=register_expiry(d,expiry_request(d,o,requested),o,runner,
         clock=lambda:origin_mono+1.0,utc_now=lambda:now)
     assert result.state=="registered",result.failure
+    assert result.provider_metadata.value["requested_trigger"] == requested.isoformat()
+    assert result.provider_metadata.value["trigger"] == requested.replace(second=0,microsecond=0).isoformat()
     assert runner.requests
 
 

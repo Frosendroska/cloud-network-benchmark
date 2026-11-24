@@ -98,11 +98,13 @@ def main() -> int:
                 and meta.get("source_sha256") == row["evidence"]["source_sha256"]
                 and meta.get("resource_group") == req["resource_namespace"]
                 and meta.get("target_ids") == req["target_selector"].split(";")
+                and meta.get("requested_trigger") == requested.isoformat()
                 and meta.get("trigger") == floor.isoformat()
                 and readback.get("timeZone") in {"UTC", "Etc/UTC"}
                 and stamp(readback["startTime"]) == floor)
             print(f"    saved_registration_and_exact_minute_floor={'PASS' if checks else 'FAIL'}; "
                   f"requested={requested.isoformat()}; effective={floor.isoformat()}; "
+                  f"requested_metadata_present={meta.get('requested_trigger') == requested.isoformat()}; "
                   f"metadata_source_match={meta.get('source_sha256') == row['evidence']['source_sha256']}")
         else:
             attempts = list(provider_dir.glob("*/**/attempt.json"))

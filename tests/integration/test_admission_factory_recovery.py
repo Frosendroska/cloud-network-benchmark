@@ -439,7 +439,7 @@ def test_azure_factory_claim_binds_floored_schedule_and_keeps_original_request(t
         assert result.eligible and result.creation_granted, result.reason_codes
 
 
-@pytest.mark.parametrize("bad", ["late", "early", "ceil", "wrong_request_metadata", "wrong_reservation_metadata", "wrong_source_metadata", "wrong_timezone", "absent_metadata", "wrong_target"])
+@pytest.mark.parametrize("bad", ["late", "early", "ceil", "wrong_request_metadata", "missing_requested_metadata", "wrong_reservation_metadata", "wrong_source_metadata", "wrong_timezone", "absent_metadata", "wrong_target"])
 def test_azure_factory_claim_rejects_unproven_or_mismatched_expiry(tmp_path, monkeypatch, bad):
     fixture = prepared(tmp_path, "azure", support="0.04")
     fixture.clock = FixedClock(NOW.replace(second=4, microsecond=437261))
@@ -464,6 +464,10 @@ def test_azure_factory_claim_rejects_unproven_or_mismatched_expiry(tmp_path, mon
                 "provider_metadata":StructuredEvidence(value=metadata)})
         if bad == "wrong_request_metadata":
             metadata["requested_trigger"] = (request.expires_at.value+timedelta(seconds=1)).isoformat()
+            return evidence.model_copy(update={"expires_at":Evidence(value=when),
+                "provider_metadata":StructuredEvidence(value=metadata)})
+        if bad == "missing_requested_metadata":
+            metadata.pop("requested_trigger", None)
             return evidence.model_copy(update={"expires_at":Evidence(value=when),
                 "provider_metadata":StructuredEvidence(value=metadata)})
         if bad == "wrong_reservation_metadata":
