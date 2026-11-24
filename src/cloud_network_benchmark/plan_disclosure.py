@@ -20,7 +20,7 @@ from . import terraform_plan as tp
 
 
 # SHA-256 of terraform_plan.py after the registered GCP placement-name contract.
-PINNED_VALIDATOR_SHA256 = "0ab7b971dab60c8d4256553be21136d8305eea5f8c4941d1849b2c6ae43ccef1"
+PINNED_VALIDATOR_SHA256 = "4532a7198dff4d370d15b83e65c472db7af4276d23481d3a5f171e118f581758"
 
 
 def digest(data: bytes) -> str:
