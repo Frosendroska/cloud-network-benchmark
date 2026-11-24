@@ -730,7 +730,11 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     entry = {"entry_id": str(campaign_id),
         "run_ids": {provider: child.run_id for provider, child in children.items()},
         "parent_manifest_path": str(parent_path)}
-    selection_results_root = closed_export_results_root if prune_verified_scratch else repository_root / "results"
+    # The initialized stage may own results/<stage> rather than the legacy
+    # repository-wide results root. Derive the export root from the exact
+    # restored parent manifest so raw and manifest paths stay paired.
+    selection_results_root = (closed_export_results_root if prune_verified_scratch
+        else Path(parent_path).resolve(strict=True).parent.parent)
     selection = export_entry({"results_root": str(selection_results_root),
         "repository_root": str(repository_root), "stage_id": "archive-replay", "entries": []},
         entry, export_root)

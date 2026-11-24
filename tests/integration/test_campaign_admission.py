@@ -152,6 +152,45 @@ def test_generated_acceptance_does_not_manufacture_financial_authority(repositor
     assert len(namespaces) == len(set(namespaces)) == 9
 
 
+def test_prepared_stage_initializes_nested_manifests_and_raw_paths(repository_root, tmp_path, monkeypatch, request):
+    """Exercise the source-bound prepare_stage layout without invoking providers."""
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    results_root = repository_root / "results"
+    settings["results_root"] = str(results_root)
+    baseline = set(results_root.rglob("*")) if results_root.exists() else set()
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), results_root, Clock())
+    register_generated_cleanup(stage, request)
+
+    def cleanup_results():
+        for path in sorted(set(results_root.rglob("*")) - baseline,
+                key=lambda item: len(item.parts), reverse=True):
+            if path.is_dir() and not path.is_symlink():
+                path.rmdir()
+            else:
+                path.unlink(missing_ok=True)
+    request.addfinalizer(cleanup_results)
+
+    for entry in stage["entries"]:
+        parent_path = Path(entry["parent_manifest_path"])
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        assert parent_path.is_relative_to(results_root / stage["stage_id"] / "manifests")
+        for reference in parent["child_runs"]:
+            assert reference["manifest_path"].startswith(f"results/{stage['stage_id']}/manifests/")
+            assert reference["result_path"] == (
+                f"results/{stage['stage_id']}/raw/{reference['run_id']}")
+            assert (repository_root / reference["manifest_path"]).is_file()
+            assert (repository_root / reference["result_path"]).is_dir()
+            reference["manifest_path"] = str((repository_root / reference["manifest_path"]).resolve())
+        parent_path.write_text(json.dumps(parent), encoding="utf-8")
+        recomputed = recompute_parent_manifest(parent_path,
+            datetime.fromisoformat(parent["updated_at"]) + timedelta(seconds=1),
+            "offline nested-stage reference qualification")
+        assert recomputed.campaign_id == parent["campaign_id"]
+
+
 @pytest.mark.parametrize("fail_recovery_update", [False, True])
 def test_campaign_consumer_reconciles_terminal_factory_failure_without_resuming_entry(
         fail_recovery_update,

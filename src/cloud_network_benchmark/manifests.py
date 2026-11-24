@@ -539,14 +539,53 @@ def _resolve_reference_path(parent_manifest_path: Path, reference_path: str) -> 
     path = Path(reference_path)
     if path.is_absolute():
         return path
-    if path.parts[:2] != ("results", "manifests"):
-        raise PersistenceError("child manifest reference must be absolute or rooted at results/manifests")
-    results_root = parent_manifest_path.parent.parent
-    if results_root.name == "results":
-        repository_root = results_root.parent
+    # Determine the owner from the actual parent manifest directory first;
+    # the serialized reference must then name that same layout and directory.
+    parent_dir = parent_manifest_path.absolute().parent
+    if parent_dir.name != "manifests":
+        raise PersistenceError("parent manifest must be stored in a manifests directory")
+    if parent_dir.parent.name == "results":
+        repository_root = parent_dir.parent.parent
+        expected_prefix = ("results", "manifests")
+    elif parent_dir.parent.parent.name == "results":
+        repository_root = parent_dir.parent.parent.parent
+        expected_prefix = ("results", parent_dir.parent.name, "manifests")
     else:
-        repository_root = results_root
-    return repository_root.joinpath(*path.parts)
+        raise PersistenceError("parent manifest must use results/manifests or results/<stage>/manifests")
+    # Accept only the actual parent's exact relative directory, preserving
+    # legacy flat refs while preventing mixed-stage and foreign-root refs.
+    parts = path.parts
+    if (len(parts) != len(expected_prefix) + 1 or parts[:-1] != expected_prefix
+            or any(part in {"", ".", ".."} for part in parts)):
+        raise PersistenceError("child manifest reference must use results/manifests or results/<stage>/manifests")
+    # Resolve the root, but reject any symlink component in the serialized
+    # repository-relative path so a valid-looking reference cannot escape it.
+    repository_root = repository_root.absolute()
+    candidate = repository_root.joinpath(*parts)
+    if candidate.parent != parent_dir:
+        raise PersistenceError("child manifest reference does not belong to the parent manifest stage")
+    cursor = repository_root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise PersistenceError("child manifest reference cannot traverse symlink components")
+    try:
+        candidate.resolve(strict=False).relative_to(repository_root.resolve())
+    except ValueError as exc:
+        raise PersistenceError("child manifest reference escapes the owning repository") from exc
+    return candidate
+
+
+def _expected_relative_result_path(parent_manifest_path: Path, run_id: str) -> Path:
+    """Return the exact raw path paired with this parent's flat or stage layout."""
+    parent_dir = Path(parent_manifest_path).absolute().parent
+    if parent_dir.parent.name == "results":
+        results_relative = Path("results")
+    elif parent_dir.parent.parent.name == "results":
+        results_relative = Path("results") / parent_dir.parent.name
+    else:
+        raise PersistenceError("parent manifest must use results/manifests or results/<stage>/manifests")
+    return results_relative / "raw" / run_id
 
 
 def recompute_parent_manifest(
@@ -635,7 +674,8 @@ def _recompute_parent_manifest(
         if stored_result_path.is_absolute():
             matches_result = stored_result_path == expected_result_path
         else:
-            matches_result = stored_result_path == Path("results/raw") / reference.run_id
+            expected_relative = _expected_relative_result_path(parent_manifest_path, reference.run_id)
+            matches_result = stored_result_path == expected_relative
         if not matches_result:
             raise PersistenceError("referenced child result path does not match its run_id", {"run_id": reference.run_id})
         children.append((child.execution_state, child.cleanup_state))

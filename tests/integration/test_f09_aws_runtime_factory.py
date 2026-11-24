@@ -943,11 +943,31 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
         parent_manifest_path=parent_path, child_manifest_paths={provider: child_path},
         result_roots={provider: root}, provider_results={provider: provider_result},
         reservation=reservation, repository_root=repository_root, maximum_capsule_bytes=8_000_000)
+    if fault in {"nested_stage", "nested_stage_prune"}:
+        from cloud_network_benchmark.lifecycle_cli import _verified_replay_entry
+        stage_id, entry_id = "acceptance-nested-stage", "V-S1"
+        stage_root = root.parent.parent
+        stage_dir = tmp_path / "registered-stage"
+        stage_dir.mkdir()
+        prepared_path, journal_path = stage_dir / "prepared-stage.json", stage_dir / "campaign-journal.json"
+        stage = {"stage_id": stage_id, "repository_root": str(repository_root),
+            "results_root": str(stage_root), "entries": [{"entry_id": entry_id,
+                "parent_manifest_path": str(parent_path), "run_ids": {provider: child.run_id}}]}
+        record = {"state": "archive_pending_validation", "result": {"cleanup_open": False,
+            "replay_capsule": {"path": str(capsule_path), "sha256": capsule["sha256"]}}}
+        prepared_path.write_text(json.dumps(stage), encoding="utf-8")
+        journal_path.write_text(json.dumps({"stage_id": stage_id,
+            "entries": {entry_id: record}}), encoding="utf-8")
+        verified = _verified_replay_entry(capsule_path=capsule_path,
+            capsule_sha256=capsule["sha256"], observer={"stage_id": stage_id,
+                "entry_id": entry_id, "prepared_stage_path": str(prepared_path),
+                "journal_path": str(journal_path)}, repository_root=repository_root)
+        assert verified == (entry_id, stage_root)
     restore_staging, materialized = tmp_path / "capsule-restore-staging", tmp_path / "capsule-native"
     restore_staging.mkdir(); materialized.mkdir()
     integrity_faults = {"missing_part", "mutated_part", "wrong_generation"}
     quota_args = {}
-    if fault in {"prune_and_reconcile", "quota_underflow"}:
+    if fault in {"prune_and_reconcile", "quota_underflow", "nested_stage_prune"}:
         registered_entry_id = "V-S1"
         free_bytes = 10**9
         metadata_bytes = 1_000_000
@@ -961,7 +981,8 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             "measured_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
         quota_args = {"prune_verified_scratch": True,
             "closed_export_entry_id": registered_entry_id,
-            "closed_export_results_root": repository_root / "results",
+            "closed_export_results_root": (repository_root / "results" / "nested-stage"
+                if fault == "nested_stage_prune" else repository_root / "results"),
             "controller_quota_free_bytes": free_bytes,
             "controller_quota_evidence_path": quota_path,
             "controller_quota_evidence_sha256": hashlib.sha256(quota_path.read_bytes()).hexdigest(),
@@ -1004,14 +1025,16 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
         assert restored["validation"][provider]["status"]["data_validity"] == "valid"
         assert Path(restored["analysis"]["report_path"]).is_file()
         assert Path(restored["replay_receipt"]["path"]).is_file()
-    if fault == "prune_and_reconcile":
+    if fault in {"prune_and_reconcile", "nested_stage_prune"}:
         assert restored["scratch_prune"]["status"] == "complete"
         assert not Path(restored["native_roots"][provider]).exists()
         archive_scratch = restore_staging / provider / (
             f"{provider}-{receipt['manifest']['experiment_id']}-{receipt['run_id']}.guest-archive")
         assert not archive_scratch.exists()
         assert backend.objects == remote_objects_before
-        export_root = repository_root / "results" / "closed" / "V-S1" / "export"
+        closed_results = (repository_root / "results" / "nested-stage"
+            if fault == "nested_stage_prune" else repository_root / "results")
+        export_root = closed_results / "closed" / "V-S1" / "export"
         assert export_root.is_dir()
         for item in closed.items:
             target = root / item.destination_path
@@ -1077,6 +1100,8 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     ("failure_check", True, True, "valid", "eu-north-1", "missing_part"),
     ("failure_check", True, True, "valid", "eu-north-1", "mutated_part"),
     ("failure_check", True, True, "valid", "eu-north-1", "wrong_generation"),
+    ("failure_check", True, True, "valid", "eu-north-1", "nested_stage"),
+    ("failure_check", True, True, "valid", "eu-north-1", "nested_stage_prune"),
     ("failure_check", True, True, "valid", "eu-north-1", "reconcile_campaign"),
     ("failure_check", True, True, "valid", "eu-north-1", "prune_and_reconcile"),
     ("failure_check", True, True, "valid", "eu-north-1", "quota_underflow"),
@@ -1099,19 +1124,25 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     from cloud_network_benchmark.manifests import StaticGitProvenance
     archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
         and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
-            "mutated_part", "wrong_generation", "reconcile_campaign", "prune_and_reconcile",
+            "mutated_part", "wrong_generation", "nested_stage", "nested_stage_prune",
+            "reconcile_campaign", "prune_and_reconcile",
             "quota_underflow"})
     if archive_roundtrip:
         import shutil
-        results_root = repository_root / "results"
+        results_root = (repository_root / "results" / "nested-stage"
+            if archive_fault in {"nested_stage", "nested_stage_prune"} else repository_root / "results")
         existing_results = set(results_root.rglob("*")) if results_root.exists() else set()
+        analysis_root = repository_root / "results" / "analysis" / "archive-replays"
+        existing_analysis = set(analysis_root.rglob("*")) if analysis_root.exists() else set()
         def cleanup_test_results():
-            for path in sorted(set(results_root.rglob("*")) - existing_results,
-                    key=lambda item: len(item.parts), reverse=True):
-                if path.is_dir() and not path.is_symlink():
-                    path.rmdir()
-                else:
-                    path.unlink(missing_ok=True)
+            for target, baseline in ((results_root, existing_results),
+                    (analysis_root, existing_analysis)):
+                for path in sorted(set(target.rglob("*")) - baseline,
+                        key=lambda item: len(item.parts), reverse=True):
+                    if path.is_dir() and not path.is_symlink():
+                        path.rmdir()
+                    else:
+                        path.unlink(missing_ok=True)
         request.addfinalizer(cleanup_test_results)
     else:
         results_root = tmp_path / "results"
