@@ -1374,6 +1374,18 @@ def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_a
 
 @pytest.mark.parametrize(("stage_name", "activation_fault"), [
     ("acceptance", "none"),
+    ("acceptance", "v19_release_success"),
+    ("acceptance", "v19_missing_prior"),
+    ("acceptance", "v19_missing_prior_file"),
+    ("acceptance", "v19_wrong_prior_hash"),
+    ("acceptance", "v19_wrong_prior_caps"),
+    ("acceptance", "v19_expired_prior"),
+    ("acceptance", "v19_missing_current"),
+    ("acceptance", "v19_missing_current_file"),
+    ("acceptance", "v19_missing_current_hash"),
+    ("acceptance", "v19_wrong_current_hash"),
+    ("acceptance", "v19_wrong_current_caps"),
+    ("acceptance", "v19_expired_current"),
     ("acceptance", "expired_auxiliary_card"),
     ("acceptance", "future_auxiliary_card"),
     ("acceptance", "ordinary_pending_evidence"),
@@ -1388,6 +1400,17 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
     from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
 
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    v19_cases = {"v19_release_success", "v19_missing_prior", "v19_wrong_prior_hash",
+        "v19_missing_prior_file", "v19_wrong_prior_caps", "v19_expired_prior",
+        "v19_missing_current", "v19_missing_current_file", "v19_missing_current_hash",
+        "v19_wrong_current_hash", "v19_wrong_current_caps", "v19_expired_current"}
+    if activation_fault in v19_cases:
+        settings["pricing"]["funding"].update(primary="200.73562207733502645502645501",
+            uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+            replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+        settings["pricing"]["pending_eur_reserve_release"] = {
+            "status": "pending", "currency": "EUR", "prior_release_eur": "14",
+            "additional_release_eur": "15", "cumulative_release_eur": "29"}
     source = tmp_path / "DECISIONS.md"
     source.write_text("## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments\n")
     settings["providers"]["azure"]["subscription_id"] = "188a5848-76fb-4d57-8f2a-32c09284d486"
@@ -1425,6 +1448,12 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
     stage = prepare_stage({"stage": stage_name}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
     register_generated_cleanup(stage, request)
+    if activation_fault in v19_cases:
+        pending_payload = json.loads(Path(stage["cost_input_path"]).read_text())
+        assert pending_payload["normalization"]["reserve_release"] == settings["pricing"]["pending_eur_reserve_release"]
+        assert pending_payload["funding"]["total_limit"] == "300"
+        assert pending_payload["funding"]["working_limit"] == "250"
+        assert pending_payload["funding"]["protected_buffer"] == "50"
     calibration_stage = None
     batch_draft_path = None
     if stage_name == "acceptance":
@@ -1566,12 +1595,64 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
             source_path.write_text(json.dumps(source, sort_keys=True) + "\n")
             reference.update(sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
                 checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+        prior_card_path = auth_root / "SYNTHETIC-prior-v18-card.json"
+        prior_card_hash = None
+        if activation_fault in v19_cases:
+            import copy
+            prior_card = copy.deepcopy(paid_card)
+            prior_card["caps"].update(project_eur="300", working_eur="264", protected_eur="36",
+                personal_cash_eur="264", batch_eur="264", stage_eur="264")
+            if activation_fault == "v19_wrong_prior_caps":
+                prior_card["caps"]["working_eur"] = "263"
+            if activation_fault == "v19_expired_prior":
+                prior_card["valid_until"] = (now - timedelta(seconds=1)).isoformat()
+            prior_card_path.write_text(json.dumps(prior_card, sort_keys=True) + "\n")
+            prior_card_hash = hashlib.sha256(prior_card_path.read_bytes()).hexdigest()
+            import cloud_network_benchmark.campaign_inputs as campaign_inputs
+            monkeypatch.setattr(campaign_inputs, "_EUR14_AUTHORITY_SHA256", prior_card_hash)
+            settings["approvals"]["prior_paid_authorization"] = {
+                "confirmed": True, "source": str(prior_card_path), "sha256": prior_card_hash}
+            paid_card["caps"].update(project_eur="300", working_eur="279", protected_eur="21",
+                personal_cash_eur="279", batch_eur="279", stage_eur="279")
+            if activation_fault == "v19_wrong_current_caps":
+                paid_card["caps"].update(working_eur="264", protected_eur="36")
+            if activation_fault == "v19_expired_current":
+                paid_card["valid_until"] = (now - timedelta(seconds=1)).isoformat()
         paid_card_path.write_text(json.dumps(paid_card, sort_keys=True) + "\n")
-        settings["approvals"]["paid_authorization"].update(confirmed=True, source=str(paid_card_path))
+        current_card_hash = hashlib.sha256(paid_card_path.read_bytes()).hexdigest()
+        settings["approvals"]["paid_authorization"].update(confirmed=True, source=str(paid_card_path),
+            sha256=current_card_hash)
+        if activation_fault == "v19_missing_prior":
+            settings["approvals"].pop("prior_paid_authorization")
+        elif activation_fault == "v19_missing_prior_file":
+            settings["approvals"]["prior_paid_authorization"]["source"] = str(
+                auth_root / "missing-SYNTHETIC-prior-v18-card.json")
+        elif activation_fault == "v19_wrong_prior_hash":
+            settings["approvals"]["prior_paid_authorization"]["sha256"] = "0" * 64
+        elif activation_fault == "v19_missing_current":
+            settings["approvals"].pop("paid_authorization")
+        elif activation_fault == "v19_missing_current_file":
+            settings["approvals"]["paid_authorization"]["source"] = str(
+                auth_root / "missing-SYNTHETIC-current-v19-card.json")
+        elif activation_fault == "v19_missing_current_hash":
+            settings["approvals"]["paid_authorization"].pop("sha256")
+        elif activation_fault == "v19_wrong_current_hash":
+            settings["approvals"]["paid_authorization"]["sha256"] = "0" * 64
         settings_path = tmp_path / "operator-settings.yaml"; settings_path.write_text("synthetic offline fixture\n")
+        dispatched = []
         driver = CampaignDriver(settings_loader=lambda _path: settings, clock=Clock(),
-            dispatch=lambda _activated: {"supervisor": "synthetic-no-call"})
+            dispatch=lambda activated: dispatched.append(activated["stage_id"]) or
+                {"supervisor": "synthetic-no-call"})
         pending_fixture_bytes = {}
+        financial_preflight_calls = []
+        if activation_fault in v19_cases:
+            validate_finances = driver._validate_activated_stage_finances
+
+            def count_v19_preflight(*args, **kwargs):
+                financial_preflight_calls.append(True)
+                return validate_finances(*args, **kwargs)
+
+            driver._validate_activated_stage_finances = count_v19_preflight
         if activation_fault == "expired_auxiliary_card":
             changed = json.loads(card_path.read_text())
             changed["not_after_utc"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
@@ -1602,7 +1683,21 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
 
             driver._validate_activated_stage_finances = validate_then_mutate
 
-        if activation_fault != "none":
+        if activation_fault in v19_cases and activation_fault != "v19_release_success":
+            with pytest.raises((ValueError, PermissionError)):
+                driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                    settings_path=settings_path, execute=True, root=repository_root)
+            assert financial_preflight_calls == []
+            assert dispatched == []
+            assert all(not Path(value).exists() for key, value in stage["approval_refs"].items()
+                if key != "azure_shared_cleanup")
+            assert not (Path(settings["state_root"]) / stage["stage_id"] / "activated-stage.json").exists()
+            consumed_path = batch_draft_path.with_suffix(
+                batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+            assert not consumed_path.exists()
+            return
+
+        if activation_fault not in {"none", "v19_release_success"}:
             if activation_fault in {"expired_auxiliary_card", "future_auxiliary_card"}:
                 with pytest.raises(PermissionError, match="validity window"):
                     driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
@@ -1638,6 +1733,9 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         result = driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
             settings_path=settings_path, execute=True, root=repository_root)
         assert result["status"] == "dispatched"
+        if activation_fault == "v19_release_success":
+            assert financial_preflight_calls == [True]
+            assert dispatched == [stage["stage_id"]]
         consumed = batch_draft_path.with_suffix(batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
         assert json.loads(consumed.read_text())["status"] == "CONSUMED"
         with pytest.raises(ValueError, match="already activated or dispatched"):
