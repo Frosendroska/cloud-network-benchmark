@@ -279,6 +279,22 @@ def _week_slot_groups(stage: dict[str, Any]) -> dict[datetime, list[dict[str, An
     return groups
 
 
+def _week_dispatch_blocked(journal: dict[str, Any]) -> bool:
+    """Terminal outcomes remain evidence; only unsettled work blocks a later pair."""
+    for record in journal["entries"].values():
+        result = record.get("result") or {}
+        if (result.get("cleanup_open") or result.get("launch_uncertain")
+                or record["state"] == "archive_pending_validation"):
+            return True
+        # A missed entry that never started needs no resource cleanup. Every
+        # attempted entry needs explicit closure, including failed measurements.
+        attempted = (record["state"] in {"complete", "failed"}
+                     or record.get("started_at") is not None)
+        if attempted and result.get("cleanup_open") is not False:
+            return True
+    return False
+
+
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -728,8 +744,6 @@ class CampaignDriver:
                           for item in journal["entries"].values())
             if stage.get("stage") == "acceptance":
                 blocked |= any(item["state"] == "failed" for item in journal["entries"].values())
-            if stage.get("stage") == "week":
-                blocked |= any(item["state"] in {"failed", "missed"} for item in journal["entries"].values())
             entries_by_time: dict[datetime, list[dict[str, Any]]] = {}
             for entry in stage["entries"]:
                 state = journal["entries"][entry["entry_id"]]["state"]
@@ -738,6 +752,19 @@ class CampaignDriver:
                     bucket.append(entry)
             for launch_at in sorted(entries_by_time):
                 pending = entries_by_time[launch_at]
+                if stage.get("stage") == "week":
+                    blocked = _week_dispatch_blocked(journal)
+                    if blocked:
+                        # Do not consume future slots while cleanup/replay is
+                        # unresolved. An authorized continuation rechecks their
+                        # original UTC deadlines and never retries terminal work.
+                        for record in journal["entries"].values():
+                            if record["state"] == "scheduled":
+                                record["blocked_reason"] = "cleanup_pending"
+                        _write_json(journal_path, journal)
+                        break
+                    for entry in pending:
+                        journal["entries"][entry["entry_id"]]["blocked_reason"] = None
                 if blocked:
                     for entry in pending:
                         self._transition(journal, entry["entry_id"], "missed", finished_at=_now(self.clock).isoformat(),
@@ -747,8 +774,6 @@ class CampaignDriver:
                 now = _now(self.clock)
                 pending = self._exclude_expired_slots(pending, journal, journal_path, now, dispatch_window)
                 if not pending:
-                    if stage.get("stage") == "week":
-                        blocked = True
                     continue
                 min_free = int(stage.get("minimum_free_bytes", 0))
                 if min_free:
@@ -813,7 +838,6 @@ class CampaignDriver:
                                 finished_at=_now(self.clock).isoformat(),
                                 error="paired weekly slot is incomplete; no singleton dispatch is permitted")
                         _write_json(journal_path, journal)
-                        blocked = True
                         continue
                     groups = [admitted]
                 else:
@@ -912,7 +936,7 @@ class CampaignDriver:
                                     or (stage.get("stage") == "acceptance"
                                         and journal["entries"][entry_id]["state"] == "failed")
                                     or (stage.get("stage") == "week"
-                                        and journal["entries"][entry_id]["state"] == "failed")):
+                                        and _week_dispatch_blocked(journal))):
                                 blocked = True
                     if blocked:
                         unstarted_entries = stage["entries"] if stage.get("stage") == "acceptance" else pending
@@ -1541,6 +1565,8 @@ class CampaignDriver:
                         and recovered.get("reconciliation") == "cleanup_complete"):
                     record["result"] = {**prior_result, **recovered,
                         "cleanup_open": False, "execution": "not_resumed"}
+                    if stage.get("stage") == "week":
+                        record["result"]["launch_uncertain"] = False
                     record["cleanup_reconciled_at"] = _now(self.clock).isoformat()
                     self._archive_closed_entry(stage, by_id[entry_id], record)
                 continue

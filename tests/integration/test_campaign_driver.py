@@ -84,7 +84,8 @@ def journal(stage):
     return json.loads((Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json").read_text())
 
 
-def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budget(tmp_path):
+@pytest.mark.parametrize("first_failure", [False, True])
+def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budget(tmp_path, first_failure):
     from cloud_network_benchmark.admission import BudgetLedger, load_cost_inputs
     from cloud_network_benchmark.config import resolve_campaign
     from cloud_network_benchmark.contracts.common import Evidence, Provider
@@ -129,11 +130,13 @@ def test_full_week_runs_56_observations_with_two_calls_per_slot_and_shared_budge
         rid = decision.evidence.reservation_id.value
         for provider in (Provider.AWS, Provider.AZURE, Provider.GCP):
             record_absence(book, f"{entry['entry_id']}-{provider.value}", rid, provider, clock.utc_now())
-        return {"status": "complete", "cleanup_open": False}
+        return {"status": "failed" if first_failure and entry["entry_id"] == "P0-00" else "complete",
+                "cleanup_open": False}
 
     driver(clock, launch).run(stage)
     saved = journal(stage)
-    assert Counter(item["state"] for item in saved["entries"].values()) == {"complete": 56}
+    expected = {"complete": 55, "failed": 1} if first_failure else {"complete": 56}
+    assert Counter(item["state"] for item in saved["entries"].values()) == expected
     assert Counter(e.split("-")[0] for e in launched) == {"P0": 28, "P1": 28}
     assert len(launched) == len(set(launched)) == 56
     assert max(active_peaks) == 2
@@ -509,10 +512,10 @@ def test_missed_slots_are_recorded_and_never_backfilled(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock(START + timedelta(hours=1))
     launched = []
-    driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
+    driver(clock, lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete", "cleanup_open": False}).run(stage)
     states = {key: value["state"] for key, value in journal(stage)["entries"].items()}
-    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "missed", "P1-01": "missed"}
-    assert launched == []
+    assert states == {"P0-00": "missed", "P1-00": "missed", "P0-01": "complete", "P1-01": "complete"}
+    assert set(launched) == {"P0-01", "P1-01"}
 
 
 @pytest.mark.parametrize("uncertain_state", ["starting", "running"])
@@ -739,7 +742,7 @@ def test_lifecycle_records_sampled_disk_highwater_even_when_space_recovers_befor
     assert result["peak_process_rss_bytes"] == 50 * 1024
 
 
-def test_week_measurement_failure_with_verified_cleanup_blocks_later_slots(tmp_path):
+def test_week_measurement_failure_with_verified_cleanup_allows_later_slots(tmp_path):
     stage = stage_fixture(tmp_path, slots=2)
     clock = FakeClock()
     launched = []
@@ -750,10 +753,10 @@ def test_week_measurement_failure_with_verified_cleanup_blocks_later_slots(tmp_p
 
     driver(clock, launch).run(stage)
     saved = journal(stage)
-    assert set(launched) == {"P0-00", "P1-00"}
+    assert set(launched) == {"P0-00", "P1-00", "P0-01", "P1-01"}
     assert saved["entries"]["P0-00"]["state"] == "failed"
     assert saved["entries"]["P1-00"]["state"] == "complete"
-    assert all(saved["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
+    assert all(saved["entries"][name]["state"] == "complete" for name in ("P0-01", "P1-01"))
 
 
 def test_week_rejects_incomplete_or_duplicate_pair_before_launch(tmp_path):
@@ -781,14 +784,15 @@ def test_week_restart_does_not_launch_a_single_remaining_pair_member(tmp_path):
     path = Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json"
     saved = engine._load_or_create_journal(stage, path)
     saved["entries"]["P1-00"]["state"] = "complete"
+    saved["entries"]["P1-00"]["result"] = {"status": "complete", "cleanup_open": False}
     saved["entries"]["P1-00"]["finished_at"] = clock.utc_now().isoformat()
     path.write_text(json.dumps(saved))
     called = []
-    result = driver(clock, lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
-    assert called == []
+    result = driver(clock, lambda entry, _: called.append(entry["entry_id"]) or {"status": "complete", "cleanup_open": False}).run(stage)
+    assert set(called) == {"P0-01", "P1-01"}
     assert result["entries"]["P0-00"]["state"] == "missed"
     assert result["entries"]["P1-00"]["state"] == "complete"
-    assert all(result["entries"][name]["state"] == "missed" for name in ("P0-01", "P1-01"))
+    assert all(result["entries"][name]["state"] == "complete" for name in ("P0-01", "P1-01"))
 
 
 def test_sleeping_controller_that_wakes_after_the_slot_never_launches_backfill(tmp_path):
@@ -1048,7 +1052,8 @@ def test_restart_blocks_all_later_slots_while_archive_validation_is_pending(tmp_
 
     assert launched == []
     assert result["counts"]["archive_pending_validation"] == 1
-    assert result["counts"]["missed"] == 1
+    assert result["counts"]["scheduled"] == 1
+    assert result["status"] == "awaiting_operator"
 
 
 def test_archive_reconciliation_rejects_open_cleanup_and_handwritten_receipt(tmp_path):
