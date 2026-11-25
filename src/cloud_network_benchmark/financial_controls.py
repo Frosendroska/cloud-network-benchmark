@@ -361,6 +361,37 @@ def validate_paid_financial_plan(plan: Any, request: Any, *, scope_id: str, now:
         raise FinancialError('financial_authorization_invalid') from exc
 
 
+def has_explicit_eur_reserve_release(snapshot: Mapping[str, Any] | None, *, now: datetime) -> bool:
+    """Whether the source-bound, currently valid card changes the reserve split."""
+    if not isinstance(snapshot, Mapping):
+        return False
+    try:
+        # A snapshot's caps are not authority by themselves. Re-read the human-
+        # owned card and require exact scope and typed-cap agreement.
+        source = Source.model_validate(snapshot['authority'])
+        card = FinancialAuthorization.model_validate(source.json())
+        caps = Caps.model_validate(snapshot['caps'])
+        return (snapshot.get('scope_id') == card.ledger_scope_id
+                and caps == card.caps
+                and stamp(card.approved_at) <= stamp(now)
+                and stamp(card.valid_from) <= stamp(now) < stamp(card.valid_until)
+                and ceiling(caps.project_eur) <= Decimal('300')
+                and ceiling(caps.working_eur) + liability(caps.protected_eur)
+                <= ceiling(caps.project_eur)
+                and ceiling(caps.working_eur) > Decimal('250')
+                and liability(caps.protected_eur) < Decimal('50'))
+    except (FinancialError, ValueError, TypeError, KeyError):
+        return False
+
+
+def legacy_usd_budget_exceeded(commitment: Decimal, snapshot: Mapping[str, Any] | None,
+                               *, now: datetime) -> bool:
+    """Apply the historical USD split unless the current source card replaces it."""
+    if has_explicit_eur_reserve_release(snapshot, now=now):
+        return False
+    return commitment > Decimal('250') or commitment + Decimal('50') > Decimal('300')
+
+
 def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal) -> None:
     """Called under the SAME exclusive ledger lock as the USD reservation."""
     records = list(state['reservations'].values())
