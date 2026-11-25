@@ -1435,11 +1435,27 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
             "synthetic offline lifecycle rewrite")
         assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
 
+    def draft_admission(entry, runtime=None):
+        from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+        runtime = runtime or load_runtime_config(Path(entry["runtime_config_path"]),
+            selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+        parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+            repository_root=repository_root, config_path=Path(entry["config_path"]),
+            schedule_path=Path(entry["schedule_path"]) if entry["schedule_path"] else None)
+        base, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
+        campaign = base
+        costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
+        return build_admission_request(campaign=campaign, parent=parent, children=children,
+            costs=costs, runtime=runtime, controller_session_id=stage["controller_session_id"])
+
     pre_card_bindings = {}
     for entry in stage["entries"]:
-        runtime, _parent, _children, _paid_request, plan = load_entry(stage, entry, repository_root)
+        runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+            selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+        _paid_request, plan = draft_admission(entry, runtime)
         assert "authorization" not in runtime["azure_auxiliary_cleanup"]
-        pre_card_bindings[entry["entry_id"]] = plan.financial_binding
+        pre_card_bindings[entry["entry_id"]] = (plan.financial_binding,
+            _paid_request.model_dump(mode="json"))
 
     decision = tmp_path / "synthetic-cleanup-decision.txt"
     decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
@@ -1469,8 +1485,8 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         for entry in stage["entries"]:
             runtime = runtime_configs[entry["entry_id"]]
             assert runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
-            _runtime, _parent, _children, _paid_request, plan = load_entry(stage, entry, repository_root)
-            assert plan.financial_binding == pre_card_bindings[entry["entry_id"]]
+            _paid_request, plan = draft_admission(entry, runtime)
+            assert (plan.financial_binding, _paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
             assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
 
     runtime_bytes_by_entry = {entry["entry_id"]: Path(entry["runtime_config_path"]).read_bytes()
@@ -1478,3 +1494,51 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
     activated = activate_prepared_stage(stage, settings, repository_root, preflight=read_only_preflight)
     assert activated["status"] == "READY_FOR_ADMISSION"
     assert not Path(stage["ledger_path"]).exists()
+    for entry in stage["entries"]:
+        strict_runtime, _parent, _children, paid_request, plan = load_entry(stage, entry, repository_root)
+        assert strict_runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
+        assert (plan.financial_binding, paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
+        assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
+
+    runtime_path = Path(stage["entries"][0]["runtime_config_path"])
+    original_runtime = runtime_path.read_bytes()
+    original_card = card_path.read_bytes()
+    original_scope = scope_path.read_bytes()
+    member = scope["members"][0]
+    snapshot_path = Path(member["parent_manifest_path"])
+    original_snapshot = snapshot_path.read_bytes()
+    parent = json.loads(Path(stage["entries"][0]["parent_manifest_path"]).read_text())
+    child_ref = next(row for row in parent["child_runs"] if row["provider"] == "azure")
+    child_path = Path(child_ref["manifest_path"])
+    if not child_path.is_absolute():
+        child_path = repository_root / child_path
+    original_child = child_path.read_bytes()
+
+    def reject_runtime_source():
+        with pytest.raises((ValueError, PermissionError)):
+            load_runtime_config(runtime_path, allow_missing_approval_evidence=True)
+
+    runtime_path.write_bytes(original_runtime + b" ")
+    reject_runtime_source()
+    runtime_path.write_bytes(original_runtime)
+    snapshot_path.write_bytes(original_snapshot + b" ")
+    reject_runtime_source()
+    snapshot_path.write_bytes(original_snapshot)
+    scope_path.write_bytes(original_scope + b" ")
+    reject_runtime_source()
+    scope_path.write_bytes(original_scope)
+    pending_card = json.loads(original_card)
+    pending_card["approval_status"] = "pending"
+    card_path.write_text(json.dumps(pending_card, sort_keys=True) + "\n")
+    with pytest.raises((ValueError, PermissionError)):
+        load_runtime_config(runtime_path)
+    card_path.write_bytes(original_card)
+    child = json.loads(original_child)
+    child["config_provenance"]["sha256"] = "0" * 64
+    child_path.write_text(json.dumps(child, sort_keys=True) + "\n")
+    reject_runtime_source()
+    child_path.write_bytes(original_child)
+    card_path.unlink()
+    with pytest.raises((ValueError, PermissionError)):
+        load_runtime_config(runtime_path)
+    card_path.write_bytes(original_card)

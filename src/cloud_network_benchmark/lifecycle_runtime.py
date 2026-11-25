@@ -517,7 +517,8 @@ def _validate_azure_parent_snapshot(member: dict[str, Any], runtime: dict[str, A
     snapshot_value = member.get("parent_manifest_path")
     expected_hash = member.get("parent_manifest_sha256")
     live_value = runtime.get("initialized_campaign_manifest")
-    if not isinstance(snapshot_value, str) or not isinstance(expected_hash, str) or not isinstance(live_value, str):
+    if (not isinstance(snapshot_value, str) or not isinstance(expected_hash, str)
+            or not isinstance(live_value, (str, Path))):
         raise ValueError("Azure auxiliary cleanup requires initialized parent snapshot and live identity paths")
     snapshot = Path(snapshot_value)
     live = Path(live_value)

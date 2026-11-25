@@ -209,17 +209,37 @@ def _approval_paths(directory: Path, stage: str) -> dict[str, str]:
     return {key: str(directory / f"{key}.json") for key in sorted(_required_gate_keys(stage))}
 
 
-def _azure_auxiliary_owner(entry_id: str, child: Any) -> dict[str, Any]:
-    campaign_id, deployment_id = child.campaign_id, child.deployment_id
-    suffix = hashlib.sha256(f"{campaign_id}\0{deployment_id}".encode()).hexdigest()[:8]
-    stem = re.sub(r"[^a-z0-9-]", "-", f"cnb-{campaign_id}-{deployment_id}".lower()).strip("-")
-    slug = stem[:36].rstrip("-") + "-" + suffix
-    group = f"/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/{slug}"
-    return {"entry_id": entry_id, "run_id": child.run_id, "campaign_id": campaign_id,
-        "deployment_id": deployment_id, "config_sha256": child.config_provenance.sha256,
+def _azure_auxiliary_owner(entry_id: str, child: Any, deployment: Any, subscription_id: str) -> dict[str, Any]:
+    from .azure_provider import _slug
+
+    slug = _slug(deployment)
+    group = f"/subscriptions/{subscription_id}/resourceGroups/{slug}"
+    return {"entry_id": entry_id, "run_id": child.run_id, "campaign_id": child.campaign_id,
+        "deployment_id": child.deployment_id, "config_sha256": child.config_provenance.sha256,
         "resource_group_id": group,
         "vm_ids": [f"{group}/providers/Microsoft.Compute/virtualMachines/{slug}-{role}" for role in ("a", "b")],
         "nic_ids": [f"{group}/providers/Microsoft.Network/networkInterfaces/{slug}-{role}-nic" for role in ("a", "b")]}
+
+
+def _initialized_azure_child(reference: Any, campaign_id: str, root: Path):
+    from .manifests import ChildRunManifest
+
+    if str(getattr(reference.provider, "value", reference.provider)) != "azure":
+        raise ValueError("Azure auxiliary cleanup reference must identify the Azure child")
+    child_path = Path(reference.manifest_path)
+    if not child_path.is_absolute():
+        child_path = root / child_path
+    child_path = child_path.absolute()
+    if (any(part.is_symlink() for part in (child_path, *child_path.parents))
+            or not child_path.is_file()):
+        raise ValueError("Azure auxiliary cleanup initialized child manifest is unavailable")
+    child = ChildRunManifest.model_validate_json(child_path.read_bytes())
+    if (child.provider != "azure" or child.run_id != reference.run_id
+            or child.campaign_id != campaign_id or child.execution_state != "initialized"
+            or child.actual_started_at is not None or child.actual_finished_at is not None
+            or child.commands or child.timings or child.artifact_records):
+        raise ValueError("Azure auxiliary cleanup child manifest differs from the initialized parent reference")
+    return child
 
 
 def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
@@ -1070,11 +1090,28 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             selected_entry = load_schedule(schedule_path, config_paths={data["config_id"]: config_path}, repository_root=root)[0]
         initialized = initialize_campaign(config_path, root, result, schedule_entry=selected_entry)
         if auxiliary_opt_in:
-            azure_child = next((child for child in initialized.children
+            azure_reference = next((child for child in initialized.children
                 if str(getattr(child.provider, "value", child.provider)) == "azure"), None)
-            if azure_child is None:
+            if azure_reference is None:
                 raise ValueError("Azure auxiliary cleanup scope has no initialized Azure parent")
-            azure_cleanup_owners.append(_azure_auxiliary_owner(entry["entry_id"], azure_child))
+            azure_child = _initialized_azure_child(azure_reference, initialized.campaign_id, root)
+            resolved, _source = resolve_campaign(config_path, root, schedule_entry=selected_entry)
+            azure_observation = next((observation for observation in resolved.observations
+                if str(getattr(observation.provider, "value", observation.provider)) == "azure"), None)
+            if azure_observation is None:
+                raise ValueError("Azure auxiliary cleanup child has no resolved Azure deployment observation")
+            from .contracts.deployment import ProviderDeploymentInput
+            azure_deployment = ProviderDeploymentInput.from_observation(azure_observation,
+                campaign_id=azure_child.campaign_id, run_id=azure_child.run_id,
+                observation_id=azure_child.observation_id, deployment_id=azure_child.deployment_id,
+                bootstrap_template=str(bootstrap_path), terraform_directory=str(root / "terraform" / "azure"),
+                child_result_path=azure_reference.result_path,
+                config_sha256=azure_child.config_provenance.sha256,
+                resolved_sha256=azure_child.config_provenance.resolved_snapshot_sha256,
+                implementation_git_commit=azure_child.config_provenance.implementation_git_commit,
+                design_git_commit=azure_child.config_provenance.design_git_commit)
+            azure_cleanup_owners.append(_azure_auxiliary_owner(entry["entry_id"], azure_child,
+                azure_deployment, settings["providers"]["azure"]["subscription_id"]))
         parent_path = Path(initialized.parent_manifest_path)
         if not parent_path.is_absolute():
             parent_path = root / parent_path
