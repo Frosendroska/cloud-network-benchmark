@@ -1400,22 +1400,136 @@ def _watcher_baseline(groups: list[dict[str,Any]], resources: list[dict[str,Any]
 
 def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
                                       runner: CommandRunner, root: Path, journal: Path,
-                                      clock: Callable[[],float]) -> None:
-    if deployment.admission.timing_profile is None:
+                                      clock: Callable[[],float],
+                                      utc_now: Callable[[],datetime]) -> None:
+    if _profile_name(deployment) is None:
         return
-    resources,_=_read_arm_collection(runner,options,root,
-        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
-        "profile_watcher_baseline_resources",clock,("id","type"))
-    groups,_=_read_arm_collection(runner,options,root,
-        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
-        "profile_watcher_baseline_groups",clock,("id","name"))
-    baseline=_watcher_baseline(groups,resources)
     state=json.loads(journal.read_text(encoding="utf-8"))
     prior=state.get("profile_external_baseline")
+    if prior is not None:
+        if not _valid_watcher_baseline(prior, deployment, options, state.get("actions")):
+            raise RuntimeError("saved pre-creation Network Watcher baseline is invalid or belongs to another attempt")
+        return
+    if (state.get("creation_may_have_started")
+            or state.get("pair_state") in {"creating","created"}
+            or state.get("expiry_state") in {"preparing","registered"}
+            or any(action.get("request",{}).get("action_type") in {
+                "expiry_prerequisites","pair_apply","pair_destroy","expiry_destroy"}
+                for action in state.get("actions",[]) if isinstance(action,dict))):
+        raise RuntimeError("pre-creation Network Watcher baseline is missing after provider mutation may have started")
+    if any(action.get("request",{}).get("action_type") in {
+            "profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}
+            for action in state.get("actions", []) if isinstance(action,dict)):
+        raise RuntimeError("pre-creation Network Watcher baseline capture was interrupted; refusing a late replacement")
+    started_utc=utc_now().astimezone(UTC)
+    started_mono=clock()
+    resources,resource_evidence=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "profile_watcher_baseline_resources",clock,("id","type"))
+    groups,group_evidence=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "profile_watcher_baseline_groups",clock,("id","name"))
+    finished_utc=utc_now().astimezone(UTC)
+    finished_mono=clock()
+    resource_inventory=sorted(({"id":row["id"].lower(),"type":row["type"].lower()} for row in resources),
+        key=lambda row:(row["id"],row["type"]))
+    group_inventory=sorted(({"id":row["id"].lower(),"name":row["name"].lower()} for row in groups),
+        key=lambda row:(row["id"],row["name"]))
+    baseline=_watcher_baseline(groups,resources)
+    baseline.update({"schema_version":2,"subscription_id":options.subscription_id,
+        "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,
+        "config_sha256":deployment.config_sha256,"profile":_profile_name(deployment),
+        "capture_started_at_utc":started_utc.isoformat(),"capture_started_monotonic":started_mono,
+        "capture_finished_at_utc":finished_utc.isoformat(),"capture_finished_monotonic":finished_mono,
+        "resource_inventory":resource_inventory,"group_inventory":group_inventory,
+        "source_action_ids":[item["action_id"] for item in (*resource_evidence,*group_evidence)
+            if isinstance(item.get("action_id"),str) and item["action_id"]],
+        "inventory_sha256":hashlib.sha256(json.dumps({"resources":resource_inventory,"groups":group_inventory},
+            sort_keys=True,separators=(",",":")).encode()).hexdigest()})
+    baseline["sha256"]=_profile_timing_digest(baseline)
+    state=json.loads(journal.read_text(encoding="utf-8"))
+    if (state.get("run_id")!=deployment.run_id or state.get("deployment_id")!=deployment.deployment_id
+            or state.get("config_sha256")!=deployment.config_sha256):
+        raise RuntimeError("attempt journal identity changed during Network Watcher baseline capture")
+    prior=state.get("profile_external_baseline")
     if prior is not None and prior!=baseline:
-        raise RuntimeError("pre-creation Network Watcher baseline changed during registration recovery")
+        raise RuntimeError("pre-creation Network Watcher baseline changed during concurrent registration")
     state["profile_external_baseline"]=baseline
     _atomic_private(journal,state)
+
+
+def _valid_watcher_baseline(baseline: Any, deployment: ProviderDeploymentInput,
+                            options: AzureRuntimeOptions,
+                            journal_actions: Any = None) -> bool:
+    if not isinstance(baseline,dict) or baseline.get("schema_version")!=2:
+        return False
+    if (baseline.get("subscription_id")!=options.subscription_id
+            or baseline.get("run_id")!=deployment.run_id
+            or baseline.get("deployment_id")!=deployment.deployment_id
+            or baseline.get("config_sha256")!=deployment.config_sha256
+            or baseline.get("profile")!=_profile_name(deployment)):
+        return False
+    resources,groups=baseline.get("resource_inventory"),baseline.get("group_inventory")
+    source_ids=baseline.get("source_action_ids")
+    if (not isinstance(resources,list) or not isinstance(groups,list)
+            or not isinstance(source_ids,list) or len(source_ids)<2
+            or any(not isinstance(value,str) or not value for value in source_ids)
+            or len(set(source_ids))!=len(source_ids)):
+        return False
+    if journal_actions is not None:
+        if not isinstance(journal_actions,list):
+            return False
+        action_types={}
+        for action in journal_actions:
+            if not isinstance(action,dict):
+                continue
+            request=action.get("request")
+            if not isinstance(request,dict):
+                continue
+            action_id,action_type=request.get("action_id"),request.get("action_type")
+            if isinstance(action_id,str) and isinstance(action_type,str):
+                action_types[action_id]=action_type
+        bound_types=[action_types.get(action_id) for action_id in source_ids]
+        if (any(action_type is None for action_type in bound_types)
+                or not any(action_type.startswith("profile_watcher_baseline_resources") for action_type in bound_types)
+                or not any(action_type.startswith("profile_watcher_baseline_groups") for action_type in bound_types)
+                or any(not re.fullmatch(r"profile_watcher_baseline_(?:resources|groups)(?:_page_[1-9][0-9]*)?",action_type)
+                    for action_type in bound_types)):
+            return False
+    if any(not isinstance(row,dict) or set(row)!={"id","type"}
+            or not all(isinstance(row.get(key),str) and row[key] for key in ("id","type"))
+            or not row["id"].startswith(f"/subscriptions/{options.subscription_id}/".lower())
+            for row in resources):
+        return False
+    if any(not isinstance(row,dict) or set(row)!={"id","name"}
+            or not all(isinstance(row.get(key),str) and row[key] for key in ("id","name"))
+            or not row["id"].startswith(f"/subscriptions/{options.subscription_id}/".lower())
+            for row in groups):
+        return False
+    try:
+        start_utc=datetime.fromisoformat(baseline["capture_started_at_utc"])
+        finish_utc=datetime.fromisoformat(baseline["capture_finished_at_utc"])
+        start_mono=float(baseline["capture_started_monotonic"])
+        finish_mono=float(baseline["capture_finished_monotonic"])
+    except (KeyError,TypeError,ValueError):
+        return False
+    if (start_utc.tzinfo is None or finish_utc.tzinfo is None
+            or start_utc.utcoffset()!=timedelta(0) or finish_utc.utcoffset()!=timedelta(0)
+            or finish_utc<start_utc
+            or not isfinite(start_mono) or not isfinite(finish_mono) or finish_mono<start_mono):
+        return False
+    inventory_hash=hashlib.sha256(json.dumps({"resources":resources,"groups":groups},
+        sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    if baseline.get("inventory_sha256")!=inventory_hash:
+        return False
+    # The complete inventory is persisted above; these two projections are the
+    # only external resources whose ownership the cleanup verifier needs.
+    projected=_watcher_baseline(
+        [{"id":row["id"],"name":row["name"]} for row in groups],
+        [{"id":row["id"],"type":row["type"]} for row in resources])
+    if baseline.get("groups")!=projected["groups"] or baseline.get("watchers")!=projected["watchers"]:
+        return False
+    return baseline.get("sha256")==_profile_timing_digest(baseline)
 
 
 def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
@@ -1471,10 +1585,7 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
         raise RuntimeError("independent Azure group inventory found the attempt resource group: "
             + ", ".join(residual_attempt_groups))
     baseline=state.get("profile_external_baseline")
-    baseline_valid=(isinstance(baseline,dict) and baseline.get("sha256")==hashlib.sha256(
-            json.dumps({key:value for key,value in baseline.items() if key!="sha256"},
-                sort_keys=True,separators=(",",":")).encode()).hexdigest()
-            and isinstance(baseline.get("groups"),list) and isinstance(baseline.get("watchers"),list))
+    baseline_valid=_valid_watcher_baseline(baseline,deployment,options,state.get("actions"))
     current=_watcher_baseline(groups,resources)
     if not baseline_valid:
         if current["groups"] or current["watchers"]:
@@ -1628,7 +1739,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("expiry target selector must name exactly A and B")
     root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options, clock=clock,
         utc_now=utc_now, initialize_timing=False)
-    _capture_profile_watcher_baseline(deployment,options,runner,root,journal,clock)
+    _capture_profile_watcher_baseline(deployment,options,runner,root,journal,clock,utc_now)
     _validate_provider_registrations(runner, options, root, clock)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"

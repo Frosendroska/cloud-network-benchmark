@@ -271,7 +271,6 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
     "mixed_account", "duplicate_account", "authorization", "mixed", "duplicate", "wrong_target"])
 def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
     from cloud_network_benchmark.azure_provider import _verify_profile_absence
-    import hashlib
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
     account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
@@ -281,8 +280,7 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
     child_name=(_slug(d)+"-once" if collection=="schedules" else
         _slug(d)+"-deallocate" if collection=="runbooks" else job_id)
     child_url=f"{account}/{collection}/{child_name}?api-version={azure_provider.AUTOMATION_API}"
-    baseline={"groups":[],"watchers":[]}
-    baseline["sha256"]=hashlib.sha256(json.dumps(baseline,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    baseline=watcher_baseline(d,o)
     expiry_child=({"schedule":child_name} if collection=="schedules" else
         {"runbook":child_name} if collection=="runbooks" else {"job_schedule_id":job_id})
     state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,**expiry_child},
@@ -349,6 +347,31 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
     else:
         with pytest.raises(RuntimeError):
             _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+
+
+def test_final_profile_absence_accepts_watcher_proven_in_precreation_baseline(repository_root,tmp_path):
+    from cloud_network_benchmark.azure_provider import _verify_profile_absence
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    watcher_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/NetworkWatcherRG"
+        "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_germanywestcentral")
+    watcher_group=watcher_id.rsplit("/providers/",1)[0]
+    resources=[{"id":watcher_id,"type":"Microsoft.Network/networkWatchers"}]
+    groups=[{"id":watcher_group,"name":"NetworkWatcherRG"}]
+    state={"resource_group":_slug(d),"expiry":{},"profile_external_baseline":watcher_baseline(d,o,resources,groups)}
+    class Runner:
+        def run(self,request):
+            if request.action_type=="profile_absence_group": out="false"
+            elif request.action_type=="profile_absence_resources": out=json.dumps({"value":resources})
+            elif request.action_type=="profile_absence_groups": out=json.dumps({"value":groups})
+            elif request.action_type in {"profile_absence_role_assignments","profile_absence_role_definitions"}:
+                out=json.dumps({"value":[]})
+            else: raise AssertionError(f"unexpected cleanup inventory request: {request.action_type}")
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout=out,stderr="")
+    actions=[]
+    _verify_profile_absence(d,o,Runner(),tmp_path,lambda:1.0,state,actions)
+    assert len(actions)>=5
 
 
 
@@ -604,6 +627,26 @@ def expiry_request(d, o, trigger):
         expires_at={"value":trigger},reservation_id={"value":d.reservation.value.reservation_id.value},resource_namespace=slug,target_selector=";".join(ids))
 
 
+def watcher_baseline(d,o,resources=(),groups=()):
+    import hashlib
+    from cloud_network_benchmark.azure_provider import _profile_timing_digest, _watcher_baseline
+    resource_inventory=sorted(({"id":row["id"].lower(),"type":row["type"].lower()} for row in resources),
+        key=lambda row:(row["id"],row["type"]))
+    group_inventory=sorted(({"id":row["id"].lower(),"name":row["name"].lower()} for row in groups),
+        key=lambda row:(row["id"],row["name"]))
+    baseline=_watcher_baseline(list(groups),list(resources))
+    baseline.update({"schema_version":2,"subscription_id":o.subscription_id,"run_id":d.run_id,
+        "deployment_id":d.deployment_id,"config_sha256":d.config_sha256,
+        "profile":azure_provider._profile_name(d),"capture_started_at_utc":"2026-11-20T12:00:00+00:00",
+        "capture_started_monotonic":1000.0,"capture_finished_at_utc":"2026-11-20T12:00:01+00:00",
+        "capture_finished_monotonic":1001.0,"resource_inventory":resource_inventory,
+        "group_inventory":group_inventory,"source_action_ids":["baseline-resources","baseline-groups"],
+        "inventory_sha256":hashlib.sha256(json.dumps({"resources":resource_inventory,"groups":group_inventory},
+            sort_keys=True,separators=(",",":")).encode()).hexdigest()})
+    baseline["sha256"]=_profile_timing_digest(baseline)
+    return baseline
+
+
 def profile_attempt(repository_root: Path,attempt_root: Path,now: datetime):
     from cloud_network_benchmark.contracts.common import Evidence
     profile="azure_exp901_sweden_acceptance_v1"
@@ -632,6 +675,92 @@ def register_profile_expiry(d,o,start,now,runner,*,clock=1000.0):
     azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:start)
     return register_expiry(d,expiry_request(d,o,start+timedelta(seconds=1680)),o,runner,
         clock=lambda:clock,utc_now=lambda:now)
+
+
+def test_workflow_profile_captures_complete_bound_watcher_baseline_before_provider_mutation(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={
+        "workflow_profile":"all_cloud_acceptance_v1","timing_profile":None})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    watcher_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/NetworkWatcherRG"
+        "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_germanywestcentral")
+    resource_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/shared/providers/Microsoft.Network/virtualNetworks/shared")
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            if request.action_type=="profile_watcher_baseline_resources":
+                values=[{"id":watcher_id,"type":"Microsoft.Network/networkWatchers"},
+                    {"id":resource_id,"type":"Microsoft.Network/virtualNetworks"}]
+            else:
+                values=[{"id":watcher_id.rsplit("/providers/",1)[0],"name":"NetworkWatcherRG"},
+                    {"id":resource_id.rsplit("/providers/",1)[0],"name":"shared"}]
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":values}),stderr="")
+    runner=Runner()
+    azure_provider._capture_profile_watcher_baseline(d,o,runner,root,journal,lambda:1.0,lambda:now)
+    state=json.loads(journal.read_text()); baseline=state["profile_external_baseline"]
+    assert azure_provider._valid_watcher_baseline(baseline,d,o)
+    assert baseline["subscription_id"]==o.subscription_id and baseline["run_id"]==d.run_id
+    assert baseline["deployment_id"]==d.deployment_id and baseline["config_sha256"]==d.config_sha256
+    assert baseline["resource_inventory"]==[
+        {"id":watcher_id.lower(),"type":"microsoft.network/networkwatchers"},
+        {"id":resource_id.lower(),"type":"microsoft.network/virtualnetworks"}]
+    assert baseline["watchers"]==[watcher_id.lower()]
+    assert baseline["capture_finished_monotonic"]>=baseline["capture_started_monotonic"]
+    assert len(baseline["source_action_ids"])==2
+    assert {request.action_type for request in runner.requests}=={
+        "profile_watcher_baseline_resources","profile_watcher_baseline_groups"}
+    class NoReplay:
+        def run(self,request): raise AssertionError("saved complete baseline must be reused")
+    azure_provider._capture_profile_watcher_baseline(d,o,NoReplay(),root,journal,lambda:1.0,lambda:now)
+
+
+def test_workflow_profile_baseline_rejects_foreign_inventory_and_interrupted_recovery(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    class ForeignRunner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":[{"id":"/subscriptions/foreign/resourceGroups/shared/providers/Microsoft.Network/networkWatchers/shared",
+                    "type":"Microsoft.Network/networkWatchers"}]}),stderr="")
+    foreign=ForeignRunner()
+    with pytest.raises(RuntimeError,match="foreign subscription"):
+        azure_provider._capture_profile_watcher_baseline(d,o,foreign,root,journal,lambda:1.0,lambda:now)
+    assert not json.loads(journal.read_text()).get("profile_external_baseline")
+    class NoReplay:
+        def run(self,request): raise AssertionError("interrupted baseline must not be replaced")
+    with pytest.raises(RuntimeError,match="interrupted; refusing a late replacement"):
+        azure_provider._capture_profile_watcher_baseline(d,o,NoReplay(),root,journal,lambda:1.0,lambda:now)
+
+
+def test_workflow_profile_never_retrofits_missing_baseline_after_expiry_registration(
+        repository_root: Path,tmp_path: Path):
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    state=json.loads(journal.read_text()); state["expiry_state"]="registered"
+    journal.write_text(json.dumps(state))
+    class NoProviderCall:
+        def run(self,request): raise AssertionError("late baseline capture must not query after mutation")
+    with pytest.raises(RuntimeError,match="after provider mutation may have started"):
+        azure_provider._capture_profile_watcher_baseline(d,o,NoProviderCall(),root,journal,lambda:1.0,
+            lambda:datetime.now(timezone.utc))
 
 
 def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository_root,tmp_path,monkeypatch):
