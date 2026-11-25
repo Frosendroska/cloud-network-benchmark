@@ -57,11 +57,19 @@ class AuxiliaryCleanupCohort:
         if info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise PermissionError("Azure auxiliary cleanup state root must be privately owned by the current user")
         self.root = root.resolve(strict=True)
+        self.configured_root = root.absolute()
         self.digest = hashlib.sha256(canonical({k: v for k, v in self.spec.items() if k != "state_root"})).hexdigest()
         self.path = self.root / (self.spec["cohort_id"] + ".azure-cleanup.json")
         self.lock = self.root / (self.spec["cohort_id"] + ".azure-cleanup.lock")
 
     def _mutate(self, callback: Callable[[dict[str, Any]], Any]) -> Any:
+        if (self.configured_root.is_symlink()
+                or any(parent.is_symlink() for parent in self.configured_root.parents)
+                or self.configured_root.resolve(strict=True) != self.root):
+            raise ValueError("Azure auxiliary cleanup state root changed or traverses a symlink")
+        root_info = self.root.stat()
+        if root_info.st_uid != os.getuid() or root_info.st_mode & 0o077:
+            raise PermissionError("Azure auxiliary cleanup state root must remain private and current-user owned")
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(self.lock, flags, 0o600)
         try:
@@ -123,24 +131,7 @@ class AuxiliaryCleanupCohort:
         expected = {owner_key(item) for item in self.spec["owners"]}
         if key not in expected or not isinstance(baseline, dict):
             raise ValueError("Azure auxiliary cleanup baseline owner identity is invalid")
-        started = baseline.get("capture_started_at_utc")
-        finished = baseline.get("capture_finished_at_utc")
-        try:
-            from datetime import datetime
-            start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(finished.replace("Z", "+00:00"))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError("Azure auxiliary cleanup needs a complete pre-creation baseline window") from exc
-        if (start_dt.tzinfo is None or end_dt.tzinfo is None or end_dt < start_dt
-                or baseline.get("subscription_id") != self.spec["subscription_id"]
-                or baseline.get("run_id") != owner["run_id"]
-                or baseline.get("deployment_id") != owner["deployment_id"]
-                or baseline.get("config_sha256") != owner["config_sha256"]
-                or not is_sha256(baseline.get("sha256"))
-                or not is_sha256(baseline.get("inventory_sha256"))
-                or not isinstance(baseline.get("source_action_ids"), list)
-                or len(baseline["source_action_ids"]) < 2):
-            raise ValueError("Azure auxiliary cleanup cohort baseline is incomplete or foreign")
+        _validate_precreation_baseline(baseline, owner, self.spec)
         def apply(state: dict[str, Any]) -> None:
             prior = state.get("precreation_baseline")
             observed = {"owner_key": key, "captured_at_utc": start_dt.isoformat(),
@@ -148,6 +139,29 @@ class AuxiliaryCleanupCohort:
             if prior is None:
                 state["precreation_baseline"] = observed
         self._mutate(apply)
+
+    def precreation_baseline(self) -> dict[str, Any] | None:
+        state = self.snapshot()
+        row = state.get("precreation_baseline")
+        if row is None:
+            return None
+        if not isinstance(row, dict) or set(row) != {"owner_key", "captured_at_utc", "baseline", "baseline_sha256"}:
+            raise ValueError("Azure auxiliary cleanup stored cohort baseline is malformed")
+        if not isinstance(row.get("baseline"), dict):
+            raise ValueError("Azure auxiliary cleanup stored cohort baseline payload is malformed")
+        owner = next((item for item in self.spec["owners"] if owner_key(item) == row["owner_key"]), None)
+        if owner is None or row["baseline_sha256"] != row["baseline"].get("sha256"):
+            raise ValueError("Azure auxiliary cleanup stored cohort baseline owner or digest differs")
+        _validate_precreation_baseline(row["baseline"], owner, self.spec)
+        return row["baseline"]
+
+    def earliest_deadline(self) -> float:
+        state = self.snapshot()
+        expected = {owner_key(item) for item in self.spec["owners"]}
+        if set(state.get("owners", {})) != expected:
+            raise RuntimeError("Azure auxiliary cleanup cohort has not registered every original owner deadline")
+        return min(_finite_monotonic(state["owners"][key].get("deadline_monotonic"),
+            "original owner cleanup deadline") for key in expected)
 
     def snapshot(self) -> dict[str, Any]:
         def read(state: dict[str, Any]) -> dict[str, Any]:
@@ -181,6 +195,8 @@ class AuxiliaryCleanupCohort:
             if claim.get("state") == "leaf_absent":
                 if now_monotonic >= min(float(row["deadline_monotonic"]) for row in state["owners"].values()):
                     raise TimeoutError("Azure auxiliary cleanup reached the original peer cleanup deadline")
+                if now_monotonic < state["outcomes"][-1].get("recorded_at_monotonic", 0):
+                    raise ValueError("Azure auxiliary cleanup group claim clock moved backwards")
                 claim["state"] = "group_claimed"
                 claim["group_claimed_at_monotonic"] = now_monotonic
                 return True
@@ -254,11 +270,17 @@ class AuxiliaryCleanupCohort:
             expected_action = {"claimed": "leaf_delete", "group_claimed": "group_delete"}.get(claim.get("state"))
             if action != expected_action:
                 raise ValueError("Azure auxiliary cleanup action is out of order")
+            earliest_action_clock = (claim.get("claimed_at_monotonic") if action == "leaf_delete"
+                else max(claim.get("group_claimed_at_monotonic", 0),
+                    state["outcomes"][-1].get("recorded_at_monotonic", 0)) if state["outcomes"] else None)
+            if (isinstance(earliest_action_clock, bool) or not isinstance(earliest_action_clock, (int, float))
+                    or now_monotonic < earliest_action_clock):
+                raise ValueError("Azure auxiliary cleanup outcome clock moved backwards")
             earliest_deadline = min(float(row["deadline_monotonic"]) for row in state["owners"].values())
             if now_monotonic >= earliest_deadline:
                 raise TimeoutError("Azure auxiliary cleanup outcome exceeded the original peer cleanup deadline")
             row = {"action": action, "identity": identity, "outcome": outcome,
-                "evidence_sha256": evidence_sha256}
+                "evidence_sha256": evidence_sha256, "recorded_at_monotonic": now_monotonic}
             if typed_404_identity is not None:
                 row["typed_404_identity"] = typed_404_identity
             state["outcomes"].append(row)
@@ -304,9 +326,68 @@ def is_sha256(value: Any) -> bool:
 
 
 def _finite_monotonic(value: Any, label: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError(f"{label} must be finite monotonic seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be nonnegative finite monotonic seconds")
     return float(value)
+
+
+def _validate_precreation_baseline(baseline: dict[str, Any], owner: dict[str, Any], spec: dict[str, Any]) -> None:
+    from datetime import datetime, timezone
+    expected_profile = "all_cloud_acceptance_v1" if spec["profile"] == "normal_pair" else "all_cloud_calibration_v1"
+    try:
+        started = datetime.fromisoformat(baseline["capture_started_at_utc"].replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(baseline["capture_finished_at_utc"].replace("Z", "+00:00"))
+        start_mono = _finite_monotonic(baseline["capture_started_monotonic"], "baseline start clock")
+        finish_mono = _finite_monotonic(baseline["capture_finished_monotonic"], "baseline finish clock")
+    except (KeyError, AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Azure auxiliary cleanup needs complete valid baseline clock samples") from exc
+    if (type(baseline.get("schema_version")) is not int or baseline["schema_version"] != 2
+            or baseline.get("subscription_id") != spec["subscription_id"]
+            or baseline.get("run_id") != owner["run_id"]
+            or baseline.get("deployment_id") != owner["deployment_id"]
+            or baseline.get("config_sha256") != owner["config_sha256"]
+            or baseline.get("profile") != expected_profile
+            or started.tzinfo is None or finished.tzinfo is None
+            or started.utcoffset() != timezone.utc.utcoffset(started)
+            or finished.utcoffset() != timezone.utc.utcoffset(finished)
+            or finished < started or finish_mono < start_mono
+            or not isinstance(baseline.get("groups"), list)
+            or not isinstance(baseline.get("watchers"), list)
+            or not all(isinstance(item, str) for item in baseline["groups"] + baseline["watchers"])
+            or not isinstance(baseline.get("resource_inventory"), list)
+            or not isinstance(baseline.get("group_inventory"), list)
+            or not isinstance(baseline.get("source_action_ids"), list)
+            or len(baseline["source_action_ids"]) < 2
+            or not all(isinstance(item, str) and item for item in baseline["source_action_ids"])):
+        raise ValueError("Azure auxiliary cleanup cohort baseline is incomplete or foreign")
+    if len(set(baseline["source_action_ids"])) != len(baseline["source_action_ids"]):
+        raise ValueError("Azure auxiliary cleanup baseline source actions are duplicated")
+    if (any(not isinstance(item, dict) or set(item) != {"id", "type"}
+            or not isinstance(item.get("id"), str) or not item["id"]
+            or not isinstance(item.get("type"), str) or not item["type"]
+            for item in baseline["resource_inventory"])
+            or any(not isinstance(item, dict) or set(item) != {"id", "name"}
+                or not isinstance(item.get("id"), str) or not item["id"]
+                or not isinstance(item.get("name"), str) or not item["name"]
+                for item in baseline["group_inventory"])):
+        raise ValueError("Azure auxiliary cleanup baseline full inventories are malformed")
+    subscription_root = f"/subscriptions/{spec['subscription_id']}/".lower()
+    if any(not item["id"].lower().startswith(subscription_root)
+            for item in baseline["resource_inventory"] + baseline["group_inventory"]):
+        raise ValueError("Azure auxiliary cleanup baseline contains a foreign subscription resource")
+    expected_groups = sorted(item["id"].lower() for item in baseline["group_inventory"]
+        if item["name"].lower().startswith(("networkwatcher", "newnetworkwatcher")))
+    expected_watchers = sorted(item["id"].lower() for item in baseline["resource_inventory"]
+        if item["type"].lower() == "microsoft.network/networkwatchers")
+    if (baseline["groups"] != expected_groups or baseline["watchers"] != expected_watchers):
+        raise ValueError("Azure auxiliary cleanup baseline summary differs from its full inventories")
+    inventory = {"resources": baseline["resource_inventory"], "groups": baseline["group_inventory"]}
+    inventory_hash = hashlib.sha256(json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    baseline_payload = {key: value for key, value in baseline.items() if key != "sha256"}
+    baseline_hash = hashlib.sha256(json.dumps(baseline_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if (not is_sha256(baseline.get("inventory_sha256")) or baseline["inventory_sha256"] != inventory_hash
+            or not is_sha256(baseline.get("sha256")) or baseline["sha256"] != baseline_hash):
+        raise ValueError("Azure auxiliary cleanup cohort baseline inventory or source digest is invalid")
 
 
 def _regular_source(path: Path) -> bool:

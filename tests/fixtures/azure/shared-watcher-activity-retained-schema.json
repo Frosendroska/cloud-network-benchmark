@@ -1,0 +1,244 @@
+{
+  "events": [
+    {
+      "caller": "11111111-1111-1111-1111-111111111111",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "3ccede9d-076f-450f-b91b-7a7b1b7ae95b",
+      "eventTimestamp": "2026-11-25T10:19:21.1650783Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral/events/3ccede9d-076f-450f-b91b-7a7b1b7ae95b/ticks/639311987611650783",
+      "operationName": {
+        "localizedValue": "Create or Update Network Watcher",
+        "value": "Microsoft.Network/networkWatchers/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message",
+        "responseBody",
+        "statusCode"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Network/networkWatchers/write",
+        "statusCode": "Created"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral",
+      "status": {
+        "localizedValue": "Succeeded",
+        "value": "Succeeded"
+      },
+      "subStatus": {
+        "localizedValue": "Created (HTTP Status Code: 201)",
+        "value": "Created"
+      },
+      "submissionTimestamp": "2026-11-25T10:21:20Z"
+    },
+    {
+      "caller": "11111111-1111-1111-1111-111111111111",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "ee134275-31d4-4569-85fc-8455aed19ec0",
+      "eventTimestamp": "2026-11-25T10:19:20.7744542Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral/events/ee134275-31d4-4569-85fc-8455aed19ec0/ticks/639311987607744542",
+      "operationName": {
+        "localizedValue": "Create or Update Network Watcher",
+        "value": "Microsoft.Network/networkWatchers/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message",
+        "requestbody"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Network/networkWatchers/write"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral",
+      "status": {
+        "localizedValue": "Started",
+        "value": "Started"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:21:20Z"
+    },
+    {
+      "caller": "owner@example.invalid",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "4c84bb90-5619-423f-b38d-2e7bb5d0ed33",
+      "eventTimestamp": "2026-11-25T10:19:58.2295353Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b/events/4c84bb90-5619-423f-b38d-2e7bb5d0ed33/ticks/639311987982295353",
+      "operationName": {
+        "localizedValue": "Create or Update Virtual Machine",
+        "value": "Microsoft.Compute/virtualMachines/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Compute/virtualMachines/write"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b",
+      "status": {
+        "localizedValue": "Succeeded",
+        "value": "Succeeded"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:21:13Z"
+    },
+    {
+      "caller": "owner@example.invalid",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "9b27b293-7244-4556-aac1-31031efb556e",
+      "eventTimestamp": "2026-11-25T10:19:57.4490137Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a/events/9b27b293-7244-4556-aac1-31031efb556e/ticks/639311987974490137",
+      "operationName": {
+        "localizedValue": "Create or Update Virtual Machine",
+        "value": "Microsoft.Compute/virtualMachines/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Compute/virtualMachines/write"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Compute/virtualMachines/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a",
+      "status": {
+        "localizedValue": "Succeeded",
+        "value": "Succeeded"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:20:54Z"
+    },
+    {
+      "caller": null,
+      "correlationId": "0f7414ac-b154-4dfc-9a0b-794580e73f50",
+      "eventDataId": "fe498952-0dce-b901-45d8-82834c354ec8",
+      "eventTimestamp": "2026-11-25T10:19:44.637Z",
+      "id": "/SUBSCRIPTIONS/188A5848-76FB-4D57-8F2A-32C09284D486/RESOURCEGROUPS/CNB-20261125T092305Z-EXP-903-437C773-6B5BE70B/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/CNB-20261125T092305Z-EXP-903-437C773-6B5BE70B-A/events/fe498952-0dce-b901-45d8-82834c354ec8/ticks/639311987846370000",
+      "operationName": {
+        "localizedValue": "Health Event Resolved",
+        "value": "Microsoft.Resourcehealth/healthevent/Resolved/action"
+      },
+      "original_properties_keys": [
+        "cause",
+        "currentHealthStatus",
+        "details",
+        "previousHealthStatus",
+        "title",
+        "type"
+      ],
+      "properties": {},
+      "resourceId": "/SUBSCRIPTIONS/188A5848-76FB-4D57-8F2A-32C09284D486/RESOURCEGROUPS/CNB-20261125T092305Z-EXP-903-437C773-6B5BE70B/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/CNB-20261125T092305Z-EXP-903-437C773-6B5BE70B-A",
+      "status": {
+        "localizedValue": "Resolved",
+        "value": "Resolved"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:19:44.637Z"
+    },
+    {
+      "caller": "owner@example.invalid",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "2e1983e4-313b-42cc-b3d3-91478ae845a1",
+      "eventTimestamp": "2026-11-25T10:19:35.4127838Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a-nic/events/2e1983e4-313b-42cc-b3d3-91478ae845a1/ticks/639311987754127838",
+      "operationName": {
+        "localizedValue": "Create or Update Network Interface",
+        "value": "Microsoft.Network/networkInterfaces/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a-nic",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Network/networkInterfaces/write"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-a-nic",
+      "status": {
+        "localizedValue": "Succeeded",
+        "value": "Succeeded"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:21:33Z"
+    },
+    {
+      "caller": "owner@example.invalid",
+      "correlationId": "8ae6c03a-f4f9-f5e6-528b-15d81198e46b",
+      "eventDataId": "a190a8cf-7dd1-49d9-a03a-2aff24eff843",
+      "eventTimestamp": "2026-11-25T10:19:32.9551136Z",
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b-nic/events/a190a8cf-7dd1-49d9-a03a-2aff24eff843/ticks/639311987729551136",
+      "operationName": {
+        "localizedValue": "Create or Update Network Interface",
+        "value": "Microsoft.Network/networkInterfaces/write"
+      },
+      "original_properties_keys": [
+        "entity",
+        "eventCategory",
+        "hierarchy",
+        "message"
+      ],
+      "properties": {
+        "entity": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b-nic",
+        "eventCategory": "Administrative",
+        "message": "Microsoft.Network/networkInterfaces/write"
+      },
+      "resourceId": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourcegroups/cnb-20261125t092305z-exp-903-437c773-6b5be70b/providers/Microsoft.Network/networkInterfaces/cnb-20261125t092305z-exp-903-437c773-6b5be70b-b-nic",
+      "status": {
+        "localizedValue": "Succeeded",
+        "value": "Succeeded"
+      },
+      "subStatus": {
+        "localizedValue": "",
+        "value": ""
+      },
+      "submissionTimestamp": "2026-11-25T10:20:43Z"
+    }
+  ],
+  "group_get": {
+    "body": {
+      "id": "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG",
+      "location": "swedencentral",
+      "managedBy": null,
+      "name": "NetworkWatcherRG",
+      "properties": {
+        "provisioningState": "Succeeded"
+      },
+      "tags": null,
+      "type": "Microsoft.Resources/resourceGroups"
+    },
+    "exit_code": 0
+  }
+}

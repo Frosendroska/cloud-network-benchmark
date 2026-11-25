@@ -1133,6 +1133,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
              allow_missing_resource_group: str | None = None,
              expected_missing_automation_child_url: str | None = None,
              expected_missing_automation_account_id: str | None = None,
+             expected_missing_resource_id: str | None = None,
+             expected_missing_resource_url: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
     if options.cleanup_timing_active:
@@ -1263,7 +1265,14 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         and (_is_exact_missing_automation_account(result,expected_missing_automation_account_id)
             or (account_cli_request and account_parts is not None
                 and _is_exact_missing_attempt_resource_group(result,account_parts["group"]))))
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or exact_automation_account_absence or (
+    exact_resource_absence = (expected_missing_resource_id is not None
+        and expected_missing_resource_url is not None and action == "azure_auxiliary_watcher_absence"
+        and argv[:2] == ["az", "rest"] and method_values == ["GET"]
+        and url_values == [expected_missing_resource_url] and output_values == ["json"]
+        and subscription_values == [options.subscription_id]
+        and not any(flag in argv for flag in ("--body", "--headers", "--query", "--resource"))
+        and _is_exact_resource_404(result, expected_missing_resource_id))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_resource_absence or exact_automation_child_absence or exact_automation_account_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1738,10 +1747,9 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
         raise TimeoutError("original Azure cleanup deadline is unavailable")
     cohort = AuxiliaryCleanupCohort(spec)
     cohort_state = cohort.snapshot()
-    initial = cohort_state.get("precreation_baseline")
-    if not isinstance(initial, dict) or not isinstance(initial.get("baseline"), dict):
+    baseline = cohort.precreation_baseline()
+    if not isinstance(baseline, dict):
         raise RuntimeError("shared Azure cleanup cohort lacks its earliest pre-creation baseline")
-    baseline = initial["baseline"]
     if group_id in baseline["groups"] or watcher_id in baseline["watchers"]:
         # The earliest complete cohort baseline proves the shared resource was
         # pre-existing. Preserve it and let ordinary per-parent absence checks run.
@@ -1766,6 +1774,7 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
                 raise RuntimeError("saved shared cleanup owner evidence is missing")
             cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
                 activity_sha256=owner_state["activity_sha256"], deadline_monotonic=float(peer_deadline), clock=clock)
+            options = _bind_azure_cleanup_cohort_deadline(options, cohort)
             _finish_shared_watcher_group(spec, options, runner, root, clock, utc_now,
                 cohort, existing["claim_id"], float(peer_deadline), actions)
             return
@@ -1793,6 +1802,7 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
     activity_sha = hashlib.sha256(canonical(activity)).hexdigest()
     cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
         activity_sha256=activity_sha, deadline_monotonic=float(peer_deadline), clock=clock)
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
     claim_id = cohort.claim_leaf(now_monotonic=clock())
     if claim_id is None:
         cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
@@ -1835,7 +1845,9 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
             "azure_auxiliary_watcher_delete", clock)
         actions.append(_safe_cleanup_action(options, delete))
         absence = _command(runner, options, root, _azure_rest("GET", leaf_url),
-            "azure_auxiliary_watcher_absence", clock, allow_not_found=True)
+            "azure_auxiliary_watcher_absence", clock, allow_not_found=True,
+            expected_missing_resource_id=watcher_id,
+            expected_missing_resource_url=leaf_url)
         actions.append(_safe_cleanup_action(options, absence))
         if not _is_exact_resource_404(absence, watcher_id):
             cohort.record_outcome(claim_id, action="leaf_delete", identity=watcher_id,
@@ -1854,6 +1866,7 @@ def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOpti
         runner: CommandRunner, root: Path, clock: Callable[[], float], utc_now: Callable[[], datetime],
         cohort: Any, claim_id: str, peer_deadline: float, actions: list[dict[str, Any]]) -> None:
     from .azure_auxiliary_cleanup import authorization_payload, canonical
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
     group_id = spec["resource_group_id"].lower()
     if not cohort.claim_group(claim_id, now_monotonic=clock()):
         cohort.wait_complete(deadline_monotonic=peer_deadline, clock=clock)
@@ -1875,13 +1888,9 @@ def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOpti
     _require_cleanup_cohort_parents_absent(spec, global_groups, global_resources)
     if any(str(row.get("id", "")).lower().startswith(group_id + "/") for row in global_resources):
         raise RuntimeError("fresh full inventory found a child under NetworkWatcherRG")
-    for collection in ("flowLogs", "packetCaptures", "connectionMonitors"):
-        children, ev = _read_arm_collection(runner, options, root,
-            f"{spec['watcher_id']}/{collection}?api-version=2023-09-01",
-            f"azure_auxiliary_group_final_{collection}", clock, ("id",))
-        actions.extend(ev)
-        if children:
-            raise RuntimeError(f"Network Watcher {collection} collection became nonempty before parent deletion")
+    # The watcher is already absent, so its child collection endpoints may
+    # return typed 404. Full subscription and parent group inventories above
+    # prove there are no extant children before deleting the group.
     grouped, ev = _read_arm_collection(runner, options, root,
         f"{group_id}/resources?api-version=2021-04-01",
         "azure_auxiliary_group_immediate_children", clock, ("id", "type"))
@@ -1914,10 +1923,24 @@ def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOpti
         now_monotonic=clock())
 
 
+def _bind_azure_cleanup_cohort_deadline(options: AzureRuntimeOptions, cohort: Any) -> AzureRuntimeOptions:
+    deadline = cohort.earliest_deadline()
+    current = options.workflow_stage_deadline_monotonic
+    if current is not None:
+        deadline = min(deadline, float(current))
+    return options.model_copy(update={"workflow_stage_deadline_monotonic": deadline})
+
+
 def _require_cleanup_cohort_parents_absent(spec: dict[str, Any], groups: list[dict[str, Any]],
         resources: list[dict[str, Any]]) -> None:
     group_ids = {str(row.get("id", "")).lower() for row in groups}
     resource_ids = {str(row.get("id", "")).lower() for row in resources}
+    expected_vms = {item.lower() for owner in spec["owners"] for item in owner["vm_ids"]}
+    for row in resources:
+        resource_id = str(row.get("id", "")).lower()
+        if (str(row.get("type", "")).lower() == "microsoft.compute/virtualmachines"
+                and resource_id not in expected_vms):
+            raise RuntimeError("fresh all-subscription inventory found a foreign VM that may depend on the shared watcher")
     for owner in spec["owners"]:
         parent = owner["resource_group_id"].lower().rstrip("/")
         if parent in group_ids or any(item == parent or item.startswith(parent + "/") for item in resource_ids):
