@@ -1788,6 +1788,32 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
         "azure_auxiliary_inventory_groups", clock, ("id", "name"))
     actions.extend(ev)
     current = _watcher_baseline(groups, resources)
+    # A feature's complete pre-creation baseline and current subscription-wide
+    # inventories can prove that the exact shared auxiliary pair was never
+    # created (or is already absent). This is deliberately a no-op: do not
+    # synthesize activity, cohort-owner absence, a delete claim, or completion.
+    # The caller still has to pass the independent per-profile absence audit.
+    target_group_rows = [row for row in groups if row["id"].lower() == group_id]
+    target_group_resource_rows = [row for row in resources if row["id"].lower() == group_id]
+    target_watcher_rows = [row for row in resources if row["id"].lower() == watcher_id]
+    target_group_children = [row for row in resources
+        if row["id"].lower().startswith(group_id.rstrip("/") + "/")]
+    baseline_group_rows = [row for row in baseline["group_inventory"]
+        if row["id"].lower() == group_id]
+    baseline_group_resource_rows = [row for row in baseline["resource_inventory"]
+        if row["id"].lower() == group_id]
+    baseline_watcher_rows = [row for row in baseline["resource_inventory"]
+        if row["id"].lower() == watcher_id]
+    baseline_group_children = [row for row in baseline["resource_inventory"]
+        if row["id"].lower().startswith(group_id.rstrip("/") + "/")]
+    new_groups = sorted(set(current["groups"]) - set(baseline["groups"]))
+    new_watchers = sorted(set(current["watchers"]) - set(baseline["watchers"]))
+    if (not target_group_rows and not target_group_resource_rows and not target_watcher_rows
+            and not target_group_children and not baseline_group_rows and not baseline_group_resource_rows
+            and not baseline_watcher_rows and not baseline_group_children
+            and not new_groups and not new_watchers):
+        _require_cleanup_cohort_parents_absent(spec, groups, resources)
+        return
     if (sorted(set(current["watchers"]) - set(baseline["watchers"])) != [watcher_id]
             or sorted(set(current["groups"]) - set(baseline["groups"])) != [group_id]):
         raise RuntimeError("fresh inventory does not prove the exact newly created watcher and parent group")

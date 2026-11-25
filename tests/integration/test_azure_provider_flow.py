@@ -1029,8 +1029,9 @@ def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
 
 
 @pytest.mark.parametrize("cohort_profile", ["normal_pair", "calibration_self"])
+@pytest.mark.parametrize("auxiliary_state", ["created", "never_created"])
 def test_public_destroy_cleans_authorized_shared_watcher_cohort(
-        repository_root: Path, tmp_path: Path, cohort_profile):
+        repository_root: Path, tmp_path: Path, cohort_profile, auxiliary_state):
     """Exercise the public cleanup lifecycle with provider I/O replaced only at CommandRunner.run."""
     from concurrent.futures import ThreadPoolExecutor
     from urllib.parse import unquote
@@ -1171,14 +1172,14 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
                 return self._result(request, stdout=json.dumps({"value": [event] if event else []}))
             if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
                 rows = ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
-                    if not self.watcher_deleted else [])
+                    if auxiliary_state == "created" and not self.watcher_deleted else [])
             elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups",
                     "azure_auxiliary_group_final_groups"}:
                 rows = ([{"id": group_id, "name": "NetworkWatcherRG"}]
-                    if not self.group_deleted else [])
+                    if auxiliary_state == "created" and not self.group_deleted else [])
             elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
                 rows = ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
-                    if not self.watcher_deleted else [])
+                    if auxiliary_state == "created" and not self.watcher_deleted else [])
             elif action == "azure_auxiliary_watcher_etag":
                 return self._result(request, stdout=json.dumps({"id": watcher_id, "etag": 'W/"fresh"'}))
             elif action == "azure_auxiliary_watcher_delete":
@@ -1221,19 +1222,30 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
         assert any(request.action_type == "profile_absence_groups" for request in runner.requests)
         assert any(request.action_type == "azure_auxiliary_inventory_resources" for request in runner.requests)
     cohort = AuxiliaryCleanupCohort(spec)
-    assert cohort.snapshot()["claim"]["state"] == "complete"
-    assert sum(sum(request.action_type == "azure_auxiliary_watcher_delete" for request in runner.requests)
-        for runner in runners) == 1
-    assert sum(sum(request.action_type == "azure_auxiliary_group_delete" for request in runner.requests)
-        for runner in runners) == 1
+    state = cohort.snapshot()
+    if auxiliary_state == "never_created":
+        assert state["claim"] is None and state["outcomes"] == [] and state["owners"] == {}
+        assert not any(request.action_type in {"azure_auxiliary_watcher_delete", "azure_auxiliary_group_delete"}
+            for runner in runners for request in runner.requests)
+    else:
+        assert state["claim"]["state"] == "complete"
+        assert sum(sum(request.action_type == "azure_auxiliary_watcher_delete" for request in runner.requests)
+            for runner in runners) == 1
+        assert sum(sum(request.action_type == "azure_auxiliary_group_delete" for request in runner.requests)
+            for runner in runners) == 1
     all_actions = [request.action_type for runner in runners for request in runner.requests]
-    for required in ("azure_auxiliary_preleaf_group_children", "azure_auxiliary_watcher_absence",
-            "azure_auxiliary_group_final_inventory", "azure_auxiliary_group_final_subscription_inventory",
-            "azure_auxiliary_group_final_groups", "azure_auxiliary_group_immediate_children",
-            "azure_auxiliary_group_exact_readback", "azure_auxiliary_group_absence"):
-        assert required in all_actions
-    assert sum(runner.watcher_deleted for runner in runners) == 1
-    assert sum(runner.group_deleted for runner in runners) == 1
+    if auxiliary_state == "created":
+        for required in ("azure_auxiliary_preleaf_group_children", "azure_auxiliary_watcher_absence",
+                "azure_auxiliary_group_final_inventory", "azure_auxiliary_group_final_subscription_inventory",
+                "azure_auxiliary_group_final_groups", "azure_auxiliary_group_immediate_children",
+                "azure_auxiliary_group_exact_readback", "azure_auxiliary_group_absence"):
+            assert required in all_actions
+        assert sum(runner.watcher_deleted for runner in runners) == 1
+        assert sum(runner.group_deleted for runner in runners) == 1
+    else:
+        assert not any(action.startswith("azure_auxiliary_") and action not in {
+            "azure_auxiliary_inventory_resources", "azure_auxiliary_inventory_groups"} for action in all_actions)
+        assert not any(runner.watcher_deleted or runner.group_deleted for runner in runners)
     for (_d, o) in ready:
         timer = json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
         assert timer["absence_verified_at"] is not None
@@ -1742,9 +1754,13 @@ def test_authorized_shared_watcher_cleanup_deletes_one_leaf_then_one_empty_group
 
 
 @pytest.mark.parametrize("profile", ["normal_pair", "calibration_self"])
+@pytest.mark.parametrize("auxiliary_state", ["created", "never_created", "watcher_only",
+    "group_only", "foreign_child", "foreign_watcher", "unproved_parent", "wrong_type_target",
+    "wrong_type_group_resource",
+    "stale_baseline_watcher", "stale_baseline_group"])
 def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
-        repository_root: Path, tmp_path: Path, monkeypatch, profile):
-    """Invoke each real parent hook; only provider/network commands are faked."""
+        repository_root: Path, tmp_path: Path, monkeypatch, profile, auxiliary_state):
+    """Exercise each profile's shared cleanup decision with provider calls faked."""
     from concurrent.futures import ThreadPoolExecutor
     from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort, owner_key
 
@@ -1778,6 +1794,18 @@ def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
     baselines = [_provider_cleanup_baseline(deployment, subscription,
         profile="all_cloud_acceptance_v1" if profile == "normal_pair" else "all_cloud_calibration_v1")
         for deployment in deployments]
+    if auxiliary_state in {"stale_baseline_watcher", "stale_baseline_group"}:
+        if auxiliary_state == "stale_baseline_watcher":
+            baselines[0]["resource_inventory"] = [{"id": watcher_id.lower(),
+                "type": "microsoft.network/networkinterfaces"}]
+        else:
+            baselines[0]["group_inventory"] = [{"id": group_id.lower(), "name": "foreign-name"}]
+        inventory = {"resources": baselines[0]["resource_inventory"],
+            "groups": baselines[0]["group_inventory"]}
+        baselines[0]["inventory_sha256"] = hashlib.sha256(json.dumps(inventory,
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        baselines[0]["sha256"] = hashlib.sha256(json.dumps({key: value for key, value in baselines[0].items()
+            if key != "sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     cohort.record_precreation_baseline(spec["owners"][0], baselines[0])
     monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *_a, **_k: True)
     monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor", lambda *_a, **_k: {
@@ -1785,8 +1813,10 @@ def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
     activity = {"events": [{"id": "synthetic-owned-event"}], "correlation_id": "synthetic-correlation"}
     monkeypatch.setattr(azure_provider, "_azure_watcher_activity", lambda *_a, **_k: (activity, []))
     deleted = {"watcher": False, "group": False}
+    command_actions = []
 
     def fake_command(_runner, _options, _root, _argv, action, _clock, **_kwargs):
+        command_actions.append(action)
         output = ""
         error = ""
         outcome = CommandOutcome.SUCCEEDED
@@ -1813,11 +1843,27 @@ def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
         watcher = {"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}
         group = {"id": group_id, "name": "NetworkWatcherRG"}
         if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
-            rows = [watcher]
+            if auxiliary_state in {"created", "watcher_only"}:
+                rows = [watcher]
+            elif auxiliary_state == "wrong_type_target":
+                rows = [{"id": watcher_id, "type": "Microsoft.Network/networkInterfaces"}]
+            elif auxiliary_state == "wrong_type_group_resource":
+                rows = [{"id": group_id, "type": "Microsoft.Resources/resourceGroups"}]
+            elif auxiliary_state == "foreign_child":
+                rows = [{"id": group_id + "/providers/Microsoft.Network/routeTables/foreign",
+                    "type": "Microsoft.Network/routeTables"}]
+            elif auxiliary_state == "foreign_watcher":
+                rows = [{"id": f"/subscriptions/{subscription}/resourceGroups/Foreign/providers/"
+                    "Microsoft.Network/networkWatchers/foreign", "type": "Microsoft.Network/networkWatchers"}]
+            elif auxiliary_state == "unproved_parent":
+                rows = [{"id": spec["owners"][0]["vm_ids"][0],
+                    "type": "Microsoft.Compute/virtualMachines"}]
+            else:
+                rows = []
         elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups"}:
-            rows = [group]
+            rows = [group] if auxiliary_state in {"created", "group_only"} else []
         elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
-            rows = [] if deleted["watcher"] else [watcher]
+            rows = [] if deleted["watcher"] or auxiliary_state == "never_created" else [watcher]
         elif action == "azure_auxiliary_group_final_inventory":
             rows = []
         elif action == "azure_auxiliary_group_final_subscription_inventory":
@@ -1843,12 +1889,27 @@ def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
         return azure_provider._cleanup_shared_network_watcher(deployments[index], options, runner,
             tmp_path / f"parent-{index}", lambda: 1100.0, lambda: now,
             {"profile_external_baseline": baselines[index], "actions": []}, [])
+    rejected_states = {"watcher_only", "group_only", "foreign_child", "foreign_watcher",
+        "unproved_parent", "wrong_type_target", "wrong_type_group_resource",
+        "stale_baseline_watcher", "stale_baseline_group"}
+    if auxiliary_state in rejected_states:
+        with pytest.raises(RuntimeError):
+            invoke(0)
+        assert deleted == {"watcher": False, "group": False}
+        assert command_actions == []
+        return
     if profile == "normal_pair":
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(invoke, range(2)))
     else:
         results = [invoke(0)]
     assert results == [None] * len(deployments)
+    if auxiliary_state == "never_created":
+        assert deleted == {"watcher": False, "group": False}
+        assert command_actions == []
+        state = cohort.snapshot()
+        assert state["claim"] is None and state["outcomes"] == [] and state["owners"] == {}
+        return
     assert deleted == {"watcher": True, "group": True}
     state = cohort.snapshot()
     assert state["claim"]["state"] == "complete"
