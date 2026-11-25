@@ -191,6 +191,8 @@ def test_two_parent_barrier_grants_one_leaf_claim_and_orders_group_after_leaf(tm
     winner.record_outcome(claim_id, action="group_delete", identity=GROUP,
         outcome="succeeded", evidence_sha256=hashlib.sha256(b"group-absent").hexdigest(), now_monotonic=21.5)
     assert winner.wait_complete(deadline_monotonic=90, clock=lambda: 22.0)["claim"]["state"] == "complete"
+    with pytest.raises(ValueError, match="moved backwards after completion"):
+        winner.wait_complete(deadline_monotonic=90, clock=lambda: 21.0)
 
 
 def test_valid_precreation_baseline_is_persisted_with_its_original_capture_time(tmp_path):

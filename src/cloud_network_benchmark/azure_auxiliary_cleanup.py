@@ -237,6 +237,10 @@ class AuxiliaryCleanupCohort:
             if now >= min(deadline_monotonic, owner_deadline):
                 raise TimeoutError("Azure auxiliary cleanup completion exceeded the original peer cleanup deadline")
             if isinstance(claim, dict) and claim.get("state") == "complete":
+                completed = _finite_monotonic(claim.get("completed_at_monotonic"),
+                    "durable cleanup completion clock")
+                if now < completed:
+                    raise ValueError("Azure auxiliary cleanup observation clock moved backwards after completion")
                 return snapshot
             if isinstance(claim, dict) and claim.get("state") in {"failed", "unknown"}:
                 raise RuntimeError("Azure auxiliary cleanup action claim is terminal: " + claim["state"])
