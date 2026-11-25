@@ -1,4 +1,4 @@
-"""Characterize WEEK scheduler and archive-reconcile locking before the fix."""
+"""Characterize existing WEEK scheduler and archive-reconcile behavior."""
 from __future__ import annotations
 
 import json

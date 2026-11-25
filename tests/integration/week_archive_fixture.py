@@ -26,6 +26,12 @@ class WeekArchiveFixture:
     repository_root: Path
     restore: Any
     restore_kwargs: dict[str, Any]
+    runtime: dict[str, Any]
+    built: dict[str, Any]
+    lifecycle: Any
+    parent_path: Path
+    child_manifest_paths: dict[str, Path]
+    result_roots: dict[str, Path]
     cleanup: Any
 
 
@@ -53,6 +59,37 @@ def build_single_provider_week_archive_fixture(*, tmp_path: Path, monkeypatch: A
         raise CapturedBeforeReplay
 
     monkeypatch.setattr(archive_replay, "restore_and_finalize_batch_capsule", capture_restore)
+
+    # The existing scenario normally gets these explicit legacy-fixture
+    # boundaries from pytest's module-level usefixtures marker. A direct call
+    # from this factory must install the same test-only seams itself.
+    from cloud_network_benchmark import admission, financial_controls, terraform_plan
+
+    def original_apply(request, run, **_kwargs):
+        assert "apply" in request.argv
+        return run(request)
+
+    monkeypatch.setattr(terraform_plan, "reviewed_apply", original_apply)
+    monkeypatch.setattr(admission, "validate_paid_financial_plan", lambda *_a, **_k: None)
+    monkeypatch.setattr(financial_controls, "validate_paid_financial_plan", lambda *_a, **_k: None)
+    monkeypatch.setattr(admission, "revalidate_financial_record", lambda *_a, **_k: None)
+
+    real_build_runtime = f09.build_runtime
+    real_run_lifecycle = f09.run_lifecycle
+
+    def capture_build_runtime(**kwargs):
+        result = real_build_runtime(**kwargs)
+        captured["runtime"] = kwargs["runtime"]
+        captured["built"] = result
+        return result
+
+    def capture_run_lifecycle(**kwargs):
+        result = real_run_lifecycle(**kwargs)
+        captured["lifecycle"] = result
+        return result
+
+    monkeypatch.setattr(f09, "build_runtime", capture_build_runtime)
+    monkeypatch.setattr(f09, "run_lifecycle", capture_run_lifecycle)
 
     class Request:
         def __init__(self) -> None:
@@ -88,6 +125,12 @@ def build_single_provider_week_archive_fixture(*, tmp_path: Path, monkeypatch: A
     capsule_path = Path(kwargs["capsule_path"])
     capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
     receipt = capsule["archives"]["aws"]
+    repository_root = Path(kwargs["repository_root"])
+    parent_path = repository_root / capsule["parent_path"]
+    child_manifest_paths = {provider: repository_root / path
+                            for provider, path in capsule["child_paths"].items()}
+    result_roots = {provider: repository_root / path
+                    for provider, path in capsule["result_paths"].items()}
 
     return WeekArchiveFixture(
         capsule_path=capsule_path,
@@ -101,5 +144,11 @@ def build_single_provider_week_archive_fixture(*, tmp_path: Path, monkeypatch: A
         repository_root=Path(kwargs["repository_root"]),
         restore=restore,
         restore_kwargs=kwargs,
+        runtime=captured["runtime"],
+        built=captured["built"],
+        lifecycle=captured["lifecycle"],
+        parent_path=parent_path,
+        child_manifest_paths=child_manifest_paths,
+        result_roots=result_roots,
         cleanup=cleanup,
     )
