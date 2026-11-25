@@ -1,15 +1,15 @@
 # Paired-WEEK failure semantics: proposed continuation policy
 
-Status: REVIEW CANDIDATE ONLY. Author code/invariant review complete; user policy decision and integration review pending. No integration, publication, provider calls, spending, operational-ledger changes or launch.
+Status: The isolated candidate below was reviewed and its continuation policy was later authorized by the user. The change is integrated in commit `588daa6` of the isolated consolidation candidate; publication and any future run approval remain separate. No provider calls, spending, operational-ledger changes or launch occurred.
 
 ## Exact audited source
 
-The current detached-WEEK readiness handoff names:
+The original detached-WEEK review named:
 - Halle: /var/tmp/cnb-v19-financial-qualification-owejkuZA/R2/candidate
 - Commit: bed9b98893540e52a0433a3213f20e75b3dd0d1d
 - Tree: 15eaae842d9db6d0df3c142d1c2965d31d883a0c
 
-Both pins were verified live. This is the intended candidate named by that handoff, not a claim that a final approved WEEK source or launch record exists. The older published 1e87f31 source is not substituted. The independent WEEK observer repair is not included here.
+Both pins were verified live. This was the reviewed source, not a claim that a final approved WEEK source or launch record exists. It was later merged with published main and the independent WEEK observer repair; current integration pins are in [the WEEK integration report](week-integration.md).
 
 The candidate is isolated at /var/tmp/cnb-week-failure-review-20261125/candidate on Halle. The canonical Mac checkout was not edited. A temporary local code clone was removed after transferring its changes to this isolated native clone because local writes began failing with ENOSPC. No other workspace was removed.
 
@@ -81,17 +81,22 @@ No-call runner SHA-256: dc5ccd03f3df23c800b13d2ea6793974cbef462a9cbd82a819e2bcb2
 
 git diff --check passed. These are focused native Linux no-call tests, not a full suite, elapsed-week endurance, real cleanup proof, provider acceptance or research measurements.
 
-## Methodology impact and decision
+These 125 passing tests are the original isolated-branch result at the pins
+above. They are preserved as historical evidence and are not added to the
+combined integration count. The combined source was qualified separately; see
+[the WEEK integration report](week-integration.md).
 
-Proposed decision: permit later scheduled complete pairs once prior work is settled, while retaining every failed/missed observation and every existing safety/admission gate.
+## Methodology impact and adopted policy
+
+The user authorized later scheduled complete pairs after prior work has settled, while retaining every failed/missed observation and every existing safety/admission gate. This authorization applies to the implementation policy; it does not authorize a WEEK launch.
 
 This changes stopping/missingness policy, not workload, N, VM topology, seven-day duration, sampling windows, measurement criteria or the planned 28 pairs/56 entries. Fail-stop truncates the sample at the first failure; continuation can retain later times of day but does not make missingness random. Capacity, infrastructure and controller failures may correlate with provider, scenario and time.
 
 Report expected, attempted, failed, missed, valid and matched counts with reasons per scheduled slot/provider/scenario. A successful sibling remains evidence but cannot supply the missing side of a matched S1/S3 contrast. Apply existing validity and timing criteria to the actual matched intersection. Do not impute measurements, count packets as independent deployments, shift windows, fill gaps, or claim 28 successful pairs. A week with failures remains incomplete/failed in execution reporting even if later pairs succeed.
 
-The current V2 design/handoff require preserved failures, missed slots and cleanup closure. The narrower implementation FR-004 imposes stronger fail-stop semantics; changing it is a reviewable policy amendment and must be declared before research. Historical conditional replacement entries do not override this task's explicit no-retry/no-backfill constraint.
+The current V2 design/handoff require preserved failures, missed slots and cleanup closure. The narrower implementation FR-004 imposed stronger fail-stop semantics; the user-authorized implementation amendment is recorded in this candidate before research. Historical conditional replacement entries do not override the explicit no-retry/no-backfill constraint.
 
-Before any integration: accept or reject this policy amendment; review this exact delta; compose with the separately owned observer/final source changes and requalify affected integration; bind a fresh exact WEEK source and financial approval. No such decision, integration or launch is performed here.
+The change is integrated with the observer repair and published-main history. Existing prepared stages and cards were not edited. A future run still needs a fresh exact source and separate financial approval; open cleanup, launch uncertainty, and `archive_pending_validation` remain blockers. See the combined Linux qualification and its limits in [the WEEK integration report](week-integration.md).
 
 Sources consulted through current connected GitHub because local routed reads failed:
 - advisor/docs/design_document.md blob 04e400edf64076b010d2d0077f8576a93bbc9bad

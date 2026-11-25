@@ -6,6 +6,10 @@ observer configuration nor the prepared-stage campaign/receipt/binding paths.
 The fix adds WEEK to those two existing gates. It does not change scheduling,
 provider implementations, measurement protocols, financial admission or retries.
 
+This document preserves the original isolated-branch evidence. That change is
+now included in the combined integration candidate at `f13ff35`; the integrated
+Linux qualification is recorded in [the WEEK integration report](week-integration.md).
+
 The reproduced baseline is `bed9b98893540e52a0433a3213f20e75b3dd0d1d`, tree
 `15eaae842d9db6d0df3c142d1c2965d31d883a0c`, identified by the durable
 `WEEK_DETACHED_READINESS.md` copy on Halle. Keep this repair separate from existing
@@ -67,10 +71,11 @@ failures remain in the evidence directory; they are not counted as passes.
 
 ## Integration boundary
 
-Cherry-pick only this repair onto the integration candidate, then rerun the chain
-and affected checks on that combined tree. The change cannot retroactively supply
-bindings to a previously generated WEEK. Keep paired dispatch, no singleton
-restart, no retry/backfill, deadlines, cost caps and provider semantics intact.
+The repair is integrated with the published-main history and the reviewed
+paired-failure continuation change in the isolated candidate. It cannot
+retroactively supply bindings to a previously generated WEEK. Future stages must
+be generated and reviewed through the ordinary preparation path; existing
+prepared stages and cards were not changed.
 
 This qualifies the offline observer chain on native Linux. It does not establish
 cloud acceptance, real guest/SSH connectivity, credential renewal, notification
