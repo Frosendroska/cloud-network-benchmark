@@ -143,19 +143,19 @@ def test_authorization_card_byte_change_is_rejected(tmp_path):
 
 def test_authorization_source_parent_symlink_is_rejected(tmp_path):
     spec = _spec(tmp_path)
-    real = tmp_path / "source-real"
+    real = tmp_path / "decision-real"
     real.mkdir()
-    source = real / "input.yaml"
-    source.write_text("source: exact\n")
-    link = tmp_path / "source-link"
+    source = real / "decision.md"
+    source.write_text("Synthetic offline approval fixture only.\n")
+    link = tmp_path / "decision-link"
     link.symlink_to(real, target_is_directory=True)
     card_path = spec["authorization"]["card_path"]
     card = json.loads(open(card_path).read())
-    card["source_path"] = str(link / source.name)
-    card["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    card["decision_source_path"] = str(link / source.name)
+    card["decision_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
     open(card_path, "w").write(json.dumps(card))
     spec["authorization"]["card_sha256"] = hashlib.sha256(open(card_path, "rb").read()).hexdigest()
-    with pytest.raises(PermissionError, match="source is missing or changed"):
+    with pytest.raises(PermissionError, match="human decision source is missing or changed"):
         validate_spec(spec)
 
 

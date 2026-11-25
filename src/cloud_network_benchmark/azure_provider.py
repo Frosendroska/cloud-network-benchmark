@@ -1956,18 +1956,34 @@ def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
     if len(texts) != 1:
         return False
     text = texts[0]
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate error field")
+            value[key] = item
+        return value
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
+        payload = json.loads(text, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
         wrapped = re.fullmatch(r"ERROR: Not Found\((\{.*\})\)", text, flags=re.DOTALL)
         if wrapped is None:
             return False
         try:
-            payload = json.loads(wrapped.group(1))
-        except json.JSONDecodeError:
+            payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+        except (json.JSONDecodeError, ValueError):
             return False
-    error = payload.get("error") if isinstance(payload, dict) else None
-    if not isinstance(error, dict) or error.get("code") not in {"ResourceNotFound", "NotFound"}:
+    if not isinstance(payload, dict):
+        return False
+    if set(payload) == {"error"}:
+        error = payload["error"]
+    elif "error" not in payload:
+        error = payload
+    else:
+        return False
+    allowed_error_fields = {"code", "message", "target", "resourceId", "resourceUri", "details"}
+    if (not isinstance(error, dict) or not set(error).issubset(allowed_error_fields)
+            or error.get("code") not in {"ResourceNotFound", "NotFound"}):
         return False
     targets = []
     for key in ("target", "resourceId", "resourceUri"):
@@ -1980,7 +1996,7 @@ def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
     if not isinstance(details, list):
         return False
     for item in details:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not set(item).issubset(allowed_error_fields):
             return False
         for key in ("target", "resourceId", "resourceUri"):
             if key in item:
@@ -1993,8 +2009,7 @@ def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
     message = error.get("message")
     # A code-only 404 is ambiguous. Accept the known exact-message form only
     # when it names the exact resource requested by the caller.
-    return (isinstance(message, str) and bool(message.strip())
-        and resource_id.lower() in message.lower())
+    return isinstance(message, str) and message == f"Resource not found for exact {resource_id}"
 
 
 def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
