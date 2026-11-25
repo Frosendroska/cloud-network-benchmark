@@ -1477,6 +1477,23 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
         if cleanup_scope is not None and not runtime_configs[entry["entry_id"]].get(
                 "azure_auxiliary_cleanup", {}).get("authorization"):
             raise PermissionError("Azure auxiliary cleanup approval card is not genuinely approved and source-bound")
+    cleanup_source_hashes: dict[str, str] = {}
+    if cleanup_scope is not None:
+        from .azure_auxiliary_cleanup import authorization_payload
+        for runtime in runtime_configs.values():
+            spec = runtime["azure_auxiliary_cleanup"]
+            payload = authorization_payload(spec, datetime.now(timezone.utc))
+            manifest_path = Path(spec["authorization"]["cohort_manifest_path"])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            paths = [Path(spec["authorization"]["card_path"]), manifest_path,
+                Path(payload["decision_source_path"])]
+            for member in manifest["members"]:
+                paths.extend(Path(member[key]) for key in (
+                    "runtime_path", "parent_manifest_path", "config_path", "source_config_path"))
+            for path in paths:
+                if not path.is_file() or path.is_symlink():
+                    raise PermissionError("Azure auxiliary cleanup bound source is unavailable or unsafe")
+                cleanup_source_hashes[str(path)] = _sha(path)
     candidate = copy.deepcopy(prepared)
     candidate["status"] = "READY_FOR_ADMISSION"
     candidate["approval_files_created"] = True
@@ -1489,6 +1506,20 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
             path = _path(entry.get(path_key), f"prepared {path_key}", file=True)
             if _sha(path) != entry.get(digest_key):
                 raise ValueError(f"prepared frozen source changed during activation: {entry.get('entry_id')} {path_key}")
+    if cleanup_scope is not None:
+        from .azure_auxiliary_cleanup import authorization_payload
+        from .lifecycle_runtime import load_runtime_config
+        for entry in entries:
+            refreshed = load_runtime_config(Path(entry["runtime_config_path"]),
+                selected_providers=set(entry.get("run_ids", {})), allow_missing_approval_evidence=True)
+            spec = refreshed.get("azure_auxiliary_cleanup")
+            if not isinstance(spec, dict):
+                raise PermissionError("Azure auxiliary cleanup runtime binding disappeared during activation")
+            authorization_payload(spec, datetime.now(timezone.utc))
+        for source, digest in cleanup_source_hashes.items():
+            path = Path(source)
+            if not path.is_file() or path.is_symlink() or _sha(path) != digest:
+                raise PermissionError("Azure auxiliary cleanup approval or bound cohort source changed during activation")
     refs = _write_evidence(private / "approvals", _gate_rows(settings, stage),
         provider_scope(settings["providers"]), settings)
     if cleanup_scope is not None:

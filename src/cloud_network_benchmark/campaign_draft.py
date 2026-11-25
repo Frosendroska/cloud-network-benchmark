@@ -319,7 +319,24 @@ def create_draft_bundle(*, plan: Mapping[str, Any], stages: list[dict[str, Any]]
     return bundle
 
 
-def load_and_verify_draft(path: Path, *, allow_evidence_for: str | None = None) -> dict[str, Any]:
+def _frozen_auxiliary_cleanup_path(stage: Mapping[str, Any]) -> str | None:
+    """Return only the preallocated Azure cleanup card path for this frozen stage."""
+    scope = stage.get("azure_auxiliary_cleanup_scope")
+    refs = stage.get("approval_refs")
+    if scope is None:
+        return None
+    if not isinstance(scope, dict) or not isinstance(refs, dict):
+        raise ValueError("Azure auxiliary cleanup frozen scope is malformed")
+    card_path = scope.get("card_path")
+    if (not isinstance(card_path, str) or not Path(card_path).is_absolute()
+            or refs.get("azure_shared_cleanup") != card_path):
+        raise ValueError("Azure auxiliary cleanup card path differs from its frozen approval reference")
+    return card_path
+
+
+def load_and_verify_draft(path: Path, *, allow_evidence_for: str | None = None,
+                          allow_frozen_auxiliary_cleanup_for: str | None = None,
+                          require_frozen_auxiliary_cleanup: bool = True) -> dict[str, Any]:
     """Reject modified, symlinked, malformed, or already activated bundles."""
     source = _safe_file(str(Path(path).absolute()), "draft bundle")
     bundle = json.loads(source.read_text(encoding="utf-8"))
@@ -352,11 +369,19 @@ def load_and_verify_draft(path: Path, *, allow_evidence_for: str | None = None) 
             if (consumed.get("status") != "CONSUMED" or consumed.get("draft_sha256") != expected
                     or consumed.get("stage_id") != stage_id):
                 raise ValueError("campaign draft consumed-stage marker is invalid")
+        stage = next((row for row in stages if row.get("stage_id") == stage_id), None)
+        auxiliary_path = (_frozen_auxiliary_cleanup_path(stage)
+                          if stage is not None and stage_id == allow_frozen_auxiliary_cleanup_for else None)
+        if auxiliary_path is not None and paths.count(auxiliary_path) != 1:
+            raise ValueError("Azure auxiliary cleanup card is not a unique pending evidence path")
         for value in paths:
             path = Path(value)
             if consumed is None:
                 if stage_id == allow_evidence_for:
                     _safe_file(value, "activated approval evidence")
+                elif value == auxiliary_path:
+                    if require_frozen_auxiliary_cleanup or path.exists() or path.is_symlink():
+                        _safe_file(value, "frozen Azure auxiliary cleanup approval card")
                 elif path.exists() or path.is_symlink():
                     raise ValueError(f"draft approval evidence appeared before activation: {path}")
             else:

@@ -419,7 +419,9 @@ class CampaignDriver:
         approval evidence or READY state.
         """
         draft_path = Path(draft_path).absolute()
-        draft = load_and_verify_draft(draft_path)
+        draft = load_and_verify_draft(
+            draft_path, allow_frozen_auxiliary_cleanup_for=stage_id,
+            require_frozen_auxiliary_cleanup=execute)
         if any(Path(draft_path).with_suffix(Path(draft_path).suffix + f".{sid}.consumed.json").exists()
                for sid in [stage_id]):
             raise ValueError(f"campaign draft stage was already activated or dispatched: {stage_id}")
@@ -455,32 +457,89 @@ class CampaignDriver:
                 if previous["entries"] and any(row["state"] in {"scheduled", "starting", "running", "archive_pending_validation"}
                                                  for row in previous["entries"].values()):
                     raise RuntimeError("another campaign stage is still active or awaiting operator action")
-            draft = load_and_verify_draft(draft_path)
+            draft = load_and_verify_draft(
+                draft_path, allow_frozen_auxiliary_cleanup_for=stage_id,
+                require_frozen_auxiliary_cleanup=execute)
             if self.financial_preflight is None:
                 self._financial_card_source(draft, settings, stage)
             preflight_result: dict[str, Any] | None = None
             preflight_calls = 0
+            auxiliary_sources: dict[str, str] = {}
 
             def preflight(candidate: dict[str, Any], runtime_configs: dict[str, dict[str, Any]] | None = None):
                 nonlocal preflight_result, preflight_calls
                 preflight_calls += 1
                 if preflight_calls != 1:
                     raise ValueError("activation must run financial preflight exactly once before publishing evidence")
+                auxiliary_scope = stage.get("azure_auxiliary_cleanup_scope")
+                auxiliary_path = (auxiliary_scope.get("card_path")
+                                  if isinstance(auxiliary_scope, dict) else None)
                 for evidence_path in draft.get("pending_evidence_paths", {}).get(stage_id, []):
                     evidence = Path(evidence_path)
-                    if evidence.exists() or evidence.is_symlink():
+                    if (evidence.exists() or evidence.is_symlink()) and evidence_path != auxiliary_path:
                         raise ValueError("approval evidence was published before financial preflight")
                 if not isinstance(candidate, dict) or _stage_identity(candidate) != draft["stage_identities"][
                         next(i for i, row in enumerate(draft["stages"]) if row["stage_id"] == stage_id)]:
                     raise ValueError("activation preflight candidate changed the frozen draft identity")
+                if auxiliary_path is not None:
+                    expected_runtime_ids = {entry["entry_id"] for entry in stage.get("entries", [])}
+                    if (not isinstance(runtime_configs, dict)
+                            or set(runtime_configs) != expected_runtime_ids):
+                        raise ValueError("Azure auxiliary cleanup requires validated runtime DTOs before financial preflight")
+                    from .azure_auxiliary_cleanup import authorization_payload
+                    auxiliary_specs = []
+                    for runtime in runtime_configs.values():
+                        spec = runtime.get("azure_auxiliary_cleanup") if isinstance(runtime, dict) else None
+                        if not isinstance(spec, dict):
+                            raise ValueError("Azure auxiliary cleanup authorization is absent from a frozen runtime DTO")
+                        auxiliary_specs.append(spec)
+                    for spec in auxiliary_specs:
+                        authorization = spec.get("authorization", {})
+                        card = Path(authorization.get("card_path", ""))
+                        manifest = Path(authorization.get("cohort_manifest_path", ""))
+                        if (str(card) != auxiliary_path or not card.is_file() or card.is_symlink()
+                                or not manifest.is_file() or manifest.is_symlink()):
+                            raise ValueError("Azure auxiliary cleanup runtime source differs from the frozen card or cohort")
+                        # The DTO loader binds the runtime, owners, snapshots and hashes. Recheck the
+                        # explicit time window here, immediately before financial preflight.
+                        payload = authorization_payload(spec, _now(self.clock))
+                        sources = [card, manifest, Path(payload["decision_source_path"])]
+                        cohort = json.loads(manifest.read_text(encoding="utf-8"))
+                        for member in cohort["members"]:
+                            sources.extend(Path(member[key]) for key in (
+                                "runtime_path", "parent_manifest_path", "config_path", "source_config_path"))
+                        for source in sources:
+                            if not source.is_file() or source.is_symlink():
+                                raise ValueError("Azure auxiliary cleanup bound source is unavailable or unsafe")
+                            auxiliary_sources[str(source)] = _digest(source)
+                    if not auxiliary_sources:
+                        raise ValueError("Azure auxiliary cleanup source binding is incomplete")
+                    for source, digest in auxiliary_sources.items():
+                        path = Path(source)
+                        if not path.is_file() or path.is_symlink() or _digest(path) != digest:
+                            raise ValueError("Azure auxiliary cleanup approval or cohort source changed during financial preflight")
                 preflight_result = self._validate_activated_stage_finances(
                     candidate, draft, settings, root, runtime_configs=runtime_configs)
+                if auxiliary_path is not None:
+                    from .azure_auxiliary_cleanup import authorization_payload
+                    for spec in auxiliary_specs:
+                        authorization_payload(spec, _now(self.clock))
+                    for source, digest in auxiliary_sources.items():
+                        path = Path(source)
+                        if not path.is_file() or path.is_symlink() or _digest(path) != digest:
+                            raise ValueError("Azure auxiliary cleanup source changed during financial preflight")
                 return dict(preflight_result)
 
             activated = activate(prepared=stage, settings=settings, root=root, preflight=preflight)
             if preflight_calls != 1 or preflight_result is None:
                 raise ValueError("production activation did not complete financial preflight before evidence publication")
-            revalidated = load_and_verify_draft(draft_path, allow_evidence_for=stage_id)
+            revalidated = load_and_verify_draft(
+                draft_path, allow_evidence_for=stage_id,
+                allow_frozen_auxiliary_cleanup_for=stage_id)
+            for source, digest in auxiliary_sources.items():
+                path = Path(source)
+                if not path.is_file() or path.is_symlink() or _digest(path) != digest:
+                    raise ValueError("Azure auxiliary cleanup approval or cohort source changed during activation")
             if revalidated["draft_sha256"] != draft["draft_sha256"]:
                 raise ValueError("frozen draft changed while activation was being checked")
             if not isinstance(activated, dict):

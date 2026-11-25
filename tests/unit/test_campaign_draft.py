@@ -272,6 +272,63 @@ def test_draft_rejects_artifact_and_bundle_tampering(tmp_path):
         load_and_verify_draft(bundle_path)
 
 
+def test_draft_only_allows_selected_stage_frozen_azure_cleanup_card(tmp_path):
+    from cloud_network_benchmark.campaign_draft import create_draft_bundle
+
+    state = tmp_path / "state"; state.mkdir()
+    root = tmp_path / "src"; root.mkdir()
+    stages = []
+    cards = {}
+    for stage_id, stage_name, entry_id, profile in (
+            ("acceptance-1", "acceptance", "V-S1", "normal_pair"),
+            ("calibration-1", "calibration", "CAL-S1", "calibration_self")):
+        config = tmp_path / f"{stage_id}-config.yaml"; config.write_text("fixture\n")
+        runtime = tmp_path / f"{stage_id}-runtime.json"; runtime.write_text("{}\n")
+        cost = tmp_path / f"{stage_id}-cost.json"; cost.write_text("{}\n")
+        manifest = tmp_path / f"{stage_id}-manifest.json"; manifest.write_text("{}\n")
+        scope_path = state / f"{stage_id}-scope.json"; scope_path.write_text("{}\n")
+        card = state / f"{stage_id}-azure-cleanup-card.json"
+        ordinary = state / f"{stage_id}-paid-approval.json"
+        cards[stage_id] = (card, ordinary)
+        stage = {"stage_id": stage_id, "stage": stage_name, "status": DRAFT_STATUS,
+            "state_root": str(state), "repository_root": str(root),
+            "entries": [{"entry_id": entry_id, "config_path": str(config),
+                "runtime_config_path": str(runtime), "cost_inputs_path": str(cost),
+                "parent_manifest_path": str(manifest), "run_ids": {"azure": f"{entry_id}-azure"}}],
+            "approval_refs": {"azure_shared_cleanup": str(card)},
+            "azure_auxiliary_cleanup_scope": {"path": str(scope_path),
+                "sha256": hashlib.sha256(scope_path.read_bytes()).hexdigest(), "card_path": str(card)},
+            "draft_pending_evidence_paths": [str(card), str(ordinary)]}
+        stages.append(stage)
+    draft = state / "draft.json"
+    create_draft_bundle(plan={"batch_id": "synthetic-offline"}, stages=stages,
+        output_path=draft,
+        missing_prerequisites={"acceptance-1": ["paid_authorization"],
+            "calibration-1": ["paid_acceptance"]}, preparer=lambda: None)
+
+    # Only the exact auxiliary card for the selected, frozen stage may preexist;
+    # its genuine content/validity is checked by the production runtime loader.
+    acceptance_card = cards["acceptance-1"][0]
+    acceptance_card.write_text('{"fixture":"unapproved-placeholder"}\n')
+    load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft)
+
+    cards["calibration-1"][0].write_text('{"fixture":"foreign-stage-placeholder"}\n')
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    cards["calibration-1"][0].unlink()
+
+    cards["acceptance-1"][1].write_text('{"fixture":"ordinary-pending"}\n')
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    cards["acceptance-1"][1].unlink()
+    acceptance_card.unlink()
+    acceptance_card.symlink_to(state / "target.json")
+    with pytest.raises(ValueError, match="symlinks"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+
+
 def test_draft_blocks_activation_without_execute_and_rejects_identity_change(tmp_path):
     from cloud_network_benchmark.campaign_draft import create_draft_bundle
 
