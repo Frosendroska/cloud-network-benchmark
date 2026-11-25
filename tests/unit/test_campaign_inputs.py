@@ -225,6 +225,7 @@ def _synthetic_v19_authorities(tmp_path):
 def test_v19_release_request_is_pending_and_non_authorizing_in_draft(tmp_path):
     from cloud_network_benchmark.campaign_inputs import (_reserve_release_policy,
         _validate_funding_budget)
+    from tests.financial_helpers import NOW
 
     request = _v19_request()
     settings = {"pricing": {"pending_eur_reserve_release": request}}
