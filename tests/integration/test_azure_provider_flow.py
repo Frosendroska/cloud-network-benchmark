@@ -1494,11 +1494,11 @@ def test_authorized_shared_watcher_cleanup_deletes_one_leaf_then_one_empty_group
 
     runner = Runner()
     def inventory(_runner, _options, _root, endpoint, action, _clock, _fields):
-        if action == "azure_auxiliary_inventory_resources":
+        if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
             rows = [{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
-        elif action == "azure_auxiliary_inventory_groups":
+        elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups"}:
             rows = [{"id": group_id, "name": "NetworkWatcherRG"}]
-        elif action == "azure_auxiliary_group_inventory":
+        elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
             rows = [] if runner.watcher_deleted else [{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
         elif action.startswith("azure_auxiliary_") and action.endswith("_inventory") and any(
                 name in action for name in ("flowLogs", "packetCaptures", "connectionMonitors")):
@@ -1730,6 +1730,8 @@ def test_preexisting_watcher_and_parent_group_are_never_deleted(
     d = d.model_copy(update={"config_sha256": owner["config_sha256"]})
     options = options.model_copy(update={"subscription_id": subscription, "azure_auxiliary_cleanup": spec})
     monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *args: True)
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor", lambda *args, **kwargs: {
+        "routine_deadline_monotonic": 1500.0})
     class NoProviderCall:
         def run(self, _request):
             raise AssertionError("pre-existing watcher must cause zero provider calls")
