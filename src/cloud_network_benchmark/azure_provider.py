@@ -1421,7 +1421,12 @@ def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, optio
             "profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}
             for action in state.get("actions", []) if isinstance(action,dict)):
         raise RuntimeError("pre-creation Network Watcher baseline capture was interrupted; refusing a late replacement")
-    started_utc=utc_now().astimezone(UTC)
+    def capture_utc_sample() -> datetime:
+        value=utc_now()
+        if not isinstance(value,datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise RuntimeError("captured pre-creation Network Watcher baseline is invalid; provider mutation is blocked")
+        return value.astimezone(UTC)
+    started_utc=capture_utc_sample()
     started_mono=clock()
     resources,resource_evidence=_read_arm_collection(runner,options,root,
         f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
@@ -1429,7 +1434,7 @@ def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, optio
     groups,group_evidence=_read_arm_collection(runner,options,root,
         f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
         "profile_watcher_baseline_groups",clock,("id","name"))
-    finished_utc=utc_now().astimezone(UTC)
+    finished_utc=capture_utc_sample()
     finished_mono=clock()
     resource_inventory=sorted(({"id":row["id"].lower(),"type":row["type"].lower()} for row in resources),
         key=lambda row:(row["id"],row["type"]))
@@ -1454,6 +1459,12 @@ def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, optio
     prior=state.get("profile_external_baseline")
     if prior is not None and prior!=baseline:
         raise RuntimeError("pre-creation Network Watcher baseline changed during concurrent registration")
+    # Validate chronology, full identity, inventory digest, and the just-recorded
+    # source actions before publishing this baseline or allowing the caller to
+    # proceed to expiry/provider mutations. Keep the completed query actions in
+    # the journal when validation fails so recovery retains the evidence.
+    if not _valid_watcher_baseline(baseline, deployment, options, state.get("actions")):
+        raise RuntimeError("captured pre-creation Network Watcher baseline is invalid; provider mutation is blocked")
     state["profile_external_baseline"]=baseline
     _atomic_private(journal,state)
 

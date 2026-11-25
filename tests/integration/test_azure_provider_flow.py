@@ -721,6 +721,57 @@ def test_workflow_profile_captures_complete_bound_watcher_baseline_before_provid
     azure_provider._capture_profile_watcher_baseline(d,o,NoReplay(),root,journal,lambda:1.0,lambda:now)
 
 
+@pytest.mark.parametrize("clock_samples,utc_samples", [
+    ((1.0, 1.0), ("2026-11-25T10:00:00+00:00", "2026-11-25T09:59:59+00:00")),
+    ((2.0, 1.0), ("2026-11-25T10:00:00+00:00", "2026-11-25T10:00:01+00:00")),
+    ((float("nan"), float("nan")), ("2026-11-25T10:00:00+00:00", "2026-11-25T10:00:01+00:00")),
+    ((1.0, 1.0), ("2026-11-25T10:00:00", "2026-11-25T10:00:01+00:00")),
+])
+def test_workflow_profile_invalid_baseline_capture_blocks_before_expiry_mutation(
+        repository_root: Path,tmp_path: Path,clock_samples,utc_samples):
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            assert request.action_type in {"profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":[]}),stderr="")
+
+    runner=Runner()
+    clock_calls=0
+    def clock_sample():
+        nonlocal clock_calls
+        clock_calls+=1
+        if clock_calls==1: return clock_samples[0]
+        # _command samples the clock while bounding each read. Keep those
+        # intermediate values finite and let the final capture sample exercise
+        # the requested invalid chronology/value.
+        if clock_calls<6: return 1.0
+        return clock_samples[1]
+    utc_values=iter(datetime.fromisoformat(value) for value in utc_samples)
+    with pytest.raises(RuntimeError,match="captured pre-creation Network Watcher baseline is invalid"):
+        azure_provider._capture_profile_watcher_baseline(d,o,runner,root,journal,
+            clock_sample,lambda:next(utc_values))
+
+    state=json.loads(journal.read_text())
+    assert "profile_external_baseline" not in state
+    expected_queries=0 if datetime.fromisoformat(utc_samples[0]).tzinfo is None else 2
+    assert len(state["actions"])==expected_queries
+    if expected_queries:
+        assert {item["request"]["action_type"] for item in state["actions"]}=={
+            "profile_watcher_baseline_resources","profile_watcher_baseline_groups"}
+    assert not any("expiry" in item["request"]["action_type"] for item in state["actions"])
+    assert len(runner.requests)==expected_queries
+
+
 def test_workflow_profile_baseline_rejects_foreign_inventory_and_interrupted_recovery(
         repository_root: Path,tmp_path: Path):
     now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
