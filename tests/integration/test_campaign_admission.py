@@ -1370,3 +1370,111 @@ def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_a
     settings["stage_inputs"]["acceptance"]["failure_checks"]["V-A-FAIL"]["reuse"]["sha256"] = hashlib.sha256(old.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="identity changed|exact prepared config/runtime"):
         inputs._review_from_prepared(settings, stage)
+
+
+@pytest.mark.parametrize("stage_name", ["acceptance", "calibration"])
+def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_binding(
+        stage_name, repository_root, tmp_path, monkeypatch, request):
+    """Exercise real preparation and read-only paid preflight with synthetic sources only."""
+    from cloud_network_benchmark.campaign_inputs import activate_prepared_stage
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    source = tmp_path / "DECISIONS.md"
+    source.write_text("## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments\n")
+    settings["providers"]["azure"]["subscription_id"] = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    if stage_name == "acceptance":
+        profile = ACCEPTANCE_PROFILE
+        settings["stage_inputs"][stage_name].update(workflow_profile=profile,
+            failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window,
+            dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True,
+            failure_waiver={"confirmed": True, "source": str(source),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+        settings["stage_inputs"][stage_name].pop("allowance", None)
+        settings["approvals"]["paired_acceptance"]["fields"].update(
+            execution_window_utc=window, dispatch_window_utc=dict(window))
+        expected_ids = {"V-S1", "V-S3"}
+    else:
+        profile = CALIBRATION_PROFILE
+        settings["stage_inputs"][stage_name].update(workflow_profile=profile,
+            execution_window_utc=window, dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True)
+        settings["stage_inputs"][stage_name].pop("allowance", None)
+        settings["approvals"]["calibration_authorized"]["fields"] = {
+            "execution_window_utc": window, "dispatch_window_utc": dict(window)}
+        expected_ids = {"CAL-S1"}
+    settings["pricing"]["workflow_profiles"] = [profile]
+
+    stage = prepare_stage({"stage": stage_name}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+    scope_ref = stage["azure_auxiliary_cleanup_scope"]
+    scope_path = Path(scope_ref["path"])
+    scope = json.loads(scope_path.read_text())
+    assert {row["entry_id"] for row in scope["owners"]} == expected_ids
+    assert all(set(owner) == {"entry_id", "run_id", "campaign_id", "deployment_id", "config_sha256",
+        "resource_group_id", "vm_ids", "nic_ids"} for owner in scope["owners"])
+    assert "azure_shared_cleanup" in stage["approval_refs"]
+    assert not Path(stage["approval_refs"]["azure_shared_cleanup"]).exists()
+    assert all(not Path(value).exists() for key, value in stage["approval_refs"].items()
+        if key != "azure_shared_cleanup")
+
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+    for entry in stage["entries"]:
+        member = next(row for row in scope["members"] if row["entry_id"] == entry["entry_id"])
+        snapshot = Path(member["parent_manifest_path"])
+        live = Path(entry["parent_manifest_path"])
+        assert snapshot != live and snapshot.read_bytes() == live.read_bytes()
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
+        runtime_bytes = Path(entry["runtime_config_path"]).read_bytes()
+        assert hashlib.sha256(runtime_bytes).hexdigest() == entry["runtime_config_sha256"]
+        parent = json.loads(live.read_text())
+        recompute_parent_manifest(live, datetime.fromisoformat(parent["updated_at"]) + timedelta(seconds=1),
+            "synthetic offline lifecycle rewrite")
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
+
+    pre_card_bindings = {}
+    for entry in stage["entries"]:
+        runtime, _parent, _children, _paid_request, plan = load_entry(stage, entry, repository_root)
+        assert "authorization" not in runtime["azure_auxiliary_cleanup"]
+        pre_card_bindings[entry["entry_id"]] = plan.financial_binding
+
+    decision = tmp_path / "synthetic-cleanup-decision.txt"
+    decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+    card_path = Path(stage["approval_refs"]["azure_shared_cleanup"])
+    created = datetime.now(timezone.utc).replace(microsecond=0)
+    card = {"schema_version": 1, "approval_status": "approved",
+        "action": "delete_exact_auto_created_network_watcher_and_empty_parent",
+        "profile": scope["profile"], "cohort_id": scope["cohort_id"],
+        "subscription_id": scope["subscription_id"], "region": scope["region"],
+        "resource_group_id": scope["resource_group_id"], "watcher_id": scope["watcher_id"],
+        "cohort_manifest_path": str(scope_path), "cohort_manifest_sha256": scope_ref["sha256"],
+        "owners": scope["owners"],
+        "expected_watcher_create_caller": "00000000-0000-0000-0000-000000000001",
+        "expected_owned_write_caller": "00000000-0000-0000-0000-000000000002",
+        "maximum_leaf_deletes": 1, "maximum_group_deletes": 1,
+        "source_path": str(scope_path), "source_sha256": scope_ref["sha256"],
+        "decision_source_path": str(decision),
+        "decision_source_sha256": hashlib.sha256(decision.read_bytes()).hexdigest(),
+        "approved_by": "synthetic-offline-test", "approved_at_utc": created.isoformat(),
+        "not_before_utc": (created - timedelta(minutes=1)).isoformat(),
+        "not_after_utc": (created + timedelta(days=30)).isoformat()}
+    card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
+
+    def read_only_preflight(candidate, *, runtime_configs):
+        assert candidate["status"] == "READY_FOR_ADMISSION"
+        assert set(runtime_configs) == expected_ids
+        for entry in stage["entries"]:
+            runtime = runtime_configs[entry["entry_id"]]
+            assert runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
+            _runtime, _parent, _children, _paid_request, plan = load_entry(stage, entry, repository_root)
+            assert plan.financial_binding == pre_card_bindings[entry["entry_id"]]
+            assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
+
+    runtime_bytes_by_entry = {entry["entry_id"]: Path(entry["runtime_config_path"]).read_bytes()
+        for entry in stage["entries"]}
+    activated = activate_prepared_stage(stage, settings, repository_root, preflight=read_only_preflight)
+    assert activated["status"] == "READY_FOR_ADMISSION"
+    assert not Path(stage["ledger_path"]).exists()

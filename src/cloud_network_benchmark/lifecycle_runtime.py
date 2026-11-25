@@ -454,6 +454,7 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         if (member is None or member.get("runtime_sha256") != root["runtime_source"]["sha256"]
                 or member.get("entry_id") not in {owner["entry_id"] for owner in auxiliary["owners"]}):
             raise ValueError("Azure auxiliary cleanup cohort manifest does not bind this exact runtime source")
+        _validate_azure_parent_snapshot(member, root, path, auxiliary)
         if card is None or card.get("approval_status") != "approved":
             if not allow_missing_approval_evidence:
                 if card is None:
@@ -480,11 +481,11 @@ def _validate_azure_auxiliary_owners(auxiliary: dict[str, Any], runtime: dict[st
     if not isinstance(owners, list) or len(owners) != expected_count:
         raise ValueError("Azure auxiliary cleanup must identify exactly its registered Azure parent set")
     normalized = []
-    required = {"entry_id", "provider", "run_id", "campaign_id", "deployment_id", "config_sha256",
+    required = {"entry_id", "run_id", "campaign_id", "deployment_id", "config_sha256",
         "resource_group_id", "vm_ids", "nic_ids"}
     for row in owners:
         owner = _keys(row, required, "Azure auxiliary cleanup owner")
-        if (owner["provider"] != "azure" or not all(isinstance(owner[k], str) and owner[k]
+        if (not all(isinstance(owner[k], str) and owner[k]
                 for k in required - {"vm_ids", "nic_ids"})
                 or not re.fullmatch(r"[a-f0-9]{64}", owner["config_sha256"])
                 or not isinstance(owner["vm_ids"], list) or not isinstance(owner["nic_ids"], list)):
@@ -506,6 +507,57 @@ def _validate_azure_auxiliary_owners(auxiliary: dict[str, Any], runtime: dict[st
     if {(row["entry_id"], row["run_id"]) for row in normalized} != expected_runs:
         raise ValueError("Azure auxiliary cleanup owners differ from the source-bound runtime barrier identities")
     return normalized
+
+
+def _validate_azure_parent_snapshot(member: dict[str, Any], runtime: dict[str, Any],
+                                    runtime_path: Path, auxiliary: dict[str, Any]) -> None:
+    """Bind the cohort's immutable initialized-parent bytes to the live parent identity."""
+    from .manifests import CampaignManifest, ChildRunManifest
+
+    snapshot_value = member.get("parent_manifest_path")
+    expected_hash = member.get("parent_manifest_sha256")
+    live_value = runtime.get("initialized_campaign_manifest")
+    if not isinstance(snapshot_value, str) or not isinstance(expected_hash, str) or not isinstance(live_value, str):
+        raise ValueError("Azure auxiliary cleanup requires initialized parent snapshot and live identity paths")
+    snapshot = Path(snapshot_value)
+    live = Path(live_value)
+    if not snapshot.is_absolute():
+        snapshot = runtime_path.parent / snapshot
+    if not live.is_absolute():
+        live = runtime_path.parent / live
+    snapshot = snapshot.absolute()
+    live = live.absolute()
+    if (any(part.is_symlink() for path in (snapshot, live) for part in (path, *path.parents))
+            or snapshot == live
+            or not snapshot.is_file() or not live.is_file()
+            or snapshot.parent != runtime_path.parent.resolve()):
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot is outside its private stage or aliases the live manifest")
+    snapshot_bytes = snapshot.read_bytes()
+    if hashlib.sha256(snapshot_bytes).hexdigest() != expected_hash:
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot hash mismatch")
+    snapshot_parent = CampaignManifest.model_validate_json(snapshot_bytes)
+    live_parent = CampaignManifest.model_validate_json(live.read_bytes())
+    mutable = {"reservation", "aggregate_state", "updated_at", "lifecycle_events"}
+    if (snapshot_parent.model_dump(mode="json", exclude=mutable)
+            != live_parent.model_dump(mode="json", exclude=mutable)):
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot differs from live parent identity")
+    owner = next((item for item in auxiliary["owners"] if item["entry_id"] == member.get("entry_id")), None)
+    azure_reference = next((item for item in snapshot_parent.child_runs if str(item.provider) == "azure"), None)
+    if owner is None or azure_reference is None or azure_reference.run_id != owner["run_id"]:
+        raise ValueError("Azure auxiliary cleanup snapshot does not identify its source-bound Azure child")
+    repository_root = Path(__file__).resolve().parents[2]
+    child_path = Path(azure_reference.manifest_path)
+    if not child_path.is_absolute():
+        child_path = repository_root / child_path
+    child_path = child_path.absolute()
+    if (any(part.is_symlink() for part in (child_path, *child_path.parents))
+            or not child_path.is_file()):
+        raise ValueError("Azure auxiliary cleanup initialized child manifest is unavailable")
+    child = ChildRunManifest.model_validate_json(child_path.read_bytes())
+    if (child.provider != "azure" or child.run_id != owner["run_id"]
+            or child.campaign_id != owner["campaign_id"] or child.deployment_id != owner["deployment_id"]
+            or child.config_provenance.sha256 != owner["config_sha256"]):
+        raise ValueError("Azure auxiliary cleanup owner differs from initialized parent and child identities")
 
 
 def _azure_auxiliary_for_child(runtime: dict[str, Any], child: Any, deployment: Any) -> dict[str, Any] | None:

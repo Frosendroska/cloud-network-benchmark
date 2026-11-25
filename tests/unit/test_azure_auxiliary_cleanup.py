@@ -364,8 +364,7 @@ def test_state_root_symlink_is_rejected(tmp_path):
 
 
 def test_runtime_owner_set_is_bound_to_barrier_run_identities():
-    owners = [{**_owner("V-S1", "s1"), "provider": "azure"},
-        {**_owner("V-S3", "s3"), "provider": "azure"}]
+    owners = [_owner("V-S1", "s1"), _owner("V-S3", "s3")]
     runtime = {"post_measurement_barrier": {"expected_participants": [
         {"entry_id": entry, "provider": provider, "run_id": run_id}
         for entry, provider, run_id in (("V-S1", "azure", "campaign-s1-azure"),
@@ -379,13 +378,13 @@ def test_runtime_owner_set_is_bound_to_barrier_run_identities():
 
 
 def test_calibration_runtime_allows_only_the_single_registered_azure_parent():
-    owner = {**_owner("CAL-S1", "cal"), "provider": "azure"}
+    owner = _owner("CAL-S1", "cal")
     runtime = {"measurement_start_barrier": {"expected_participants": [
         {"entry_id": "CAL-S1", "provider": provider, "run_id": run}
         for provider, run in (("azure", owner["run_id"]), ("aws", "calibration-aws"),
             ("gcp", "calibration-gcp"))]}}
     auxiliary = {"profile": "calibration_self", "owners": [owner]}
     assert len(_validate_azure_auxiliary_owners(auxiliary, runtime)) == 1
-    auxiliary["owners"] = [_owner("V-S1", "foreign") | {"provider": "azure"}]
+    auxiliary["owners"] = [_owner("V-S1", "foreign")]
     with pytest.raises(ValueError, match="scope"):
         _validate_azure_auxiliary_owners(auxiliary, runtime)

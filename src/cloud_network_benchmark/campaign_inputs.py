@@ -28,7 +28,7 @@ from .admission import (COST_COMPONENTS, WorkflowAllowance, minimum_protocol_sec
 from .config import resolve_campaign
 from .contracts.common import ExperimentMode
 from .manifests import initialize_campaign
-from .paths import atomic_write_json
+from .paths import atomic_write_json, write_exclusive
 from .scheduling import load_schedule
 from .campaign_identity import check_provider_identities
 from .storage_admission import validate_storage_review
@@ -910,6 +910,20 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         raise ValueError("; ".join(errors))
     root = Path(root).resolve()
     stage = plan["stage"]
+    inputs = settings["stage_inputs"][stage]
+    auxiliary_opt_in = inputs.get("azure_auxiliary_cleanup", False)
+    if type(auxiliary_opt_in) is not bool:
+        raise ValueError("stage_inputs.azure_auxiliary_cleanup must be an explicit boolean")
+    selected = _selected(plan, settings)
+    selected_entry_ids = {entry_id for entry_id, _alias in selected}
+    if auxiliary_opt_in:
+        expected_profile = ACCEPTANCE_PROFILE if stage == "acceptance" else CALIBRATION_PROFILE if stage == "calibration" else None
+        expected_entries = {"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}
+        if (not draft or expected_profile is None or inputs.get("workflow_profile") != expected_profile
+                or settings.get("providers", {}).get("azure", {}).get("subscription_id")
+                    != "188a5848-76fb-4d57-8f2a-32c09284d486"
+                or selected_entry_ids != expected_entries):
+            raise ValueError("Azure auxiliary cleanup requires an unapproved supported-profile draft selecting exactly the normal pair or CAL-S1 in the reviewed subscription")
     now = _now(clock)
     stage_id = f"{stage}-{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     private = Path(state_root) / stage_id
@@ -918,16 +932,6 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     stage_private = private
     result = Path(results_root) / stage_id
     result.mkdir(parents=True)
-    inputs = settings["stage_inputs"][stage]
-    auxiliary_opt_in = inputs.get("azure_auxiliary_cleanup", False)
-    if type(auxiliary_opt_in) is not bool:
-        raise ValueError("stage_inputs.azure_auxiliary_cleanup must be an explicit boolean")
-    if auxiliary_opt_in:
-        expected_profile = ACCEPTANCE_PROFILE if stage == "acceptance" else CALIBRATION_PROFILE if stage == "calibration" else None
-        if (not draft or expected_profile is None or inputs.get("workflow_profile") != expected_profile
-                or settings.get("providers", {}).get("azure", {}).get("subscription_id")
-                    != "188a5848-76fb-4d57-8f2a-32c09284d486"):
-            raise ValueError("Azure auxiliary cleanup is limited to an unapproved supported-profile draft in the reviewed subscription")
     cost_path = Path(state_root) / "cost-inputs.json"
     cost_payload = _cost_payload(settings, root)
     serialized = json.dumps(cost_payload, indent=2, sort_keys=True) + "\n"
@@ -941,7 +945,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         raise ValueError("ledger.scope_id must identify one shared thesis budget")
     if draft:
         approvals = _approval_paths(private / "approvals", stage)
-        if auxiliary_opt_in and entry["entry_id"] in ({"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}):
+        if auxiliary_opt_in:
             approvals["azure_shared_cleanup"] = str(private / "approvals" / "azure_shared_cleanup.json")
     else:
         approvals = _write_evidence(private / "approvals", _gate_rows(settings, stage), provider_scope(settings["providers"]), settings)
@@ -966,7 +970,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     schedule_rows = []
     source_configs = {}
     azure_cleanup_owners = []
-    for index, (entry_id, alias) in enumerate(_selected(plan, settings)):
+    azure_parent_snapshots = {}
+    for index, (entry_id, alias) in enumerate(selected):
         template = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
         data = _frozen_config(yaml.safe_load(template.read_text()), alias, settings, entry_id)
         if stage == "acceptance" and entry_id.endswith("FAIL"):
@@ -1073,6 +1078,22 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         parent_path = Path(initialized.parent_manifest_path)
         if not parent_path.is_absolute():
             parent_path = root / parent_path
+        if auxiliary_opt_in:
+            # Keep the live parent path in runtime/entry identity. The cohort
+            # source hash binds a private byte-for-byte initialization snapshot,
+            # because normal lifecycle updates rewrite the live manifest.
+            snapshot_path = private / entry["entry_id"] / "initialized-parent-manifest.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            snapshot_path.parent.chmod(0o700)
+            if parent_path.is_symlink() or not parent_path.is_file() or any(parent.is_symlink() for parent in parent_path.parents):
+                raise ValueError("initialized campaign parent must be a regular non-symlink file before snapshot")
+            parent_bytes = parent_path.read_bytes()
+            write_exclusive(snapshot_path, parent_bytes)
+            snapshot_path.chmod(0o600)
+            snapshot_sha256 = hashlib.sha256(parent_bytes).hexdigest()
+            if _sha(snapshot_path) != snapshot_sha256:
+                raise ValueError("initialized campaign parent snapshot hash mismatch")
+            azure_parent_snapshots[entry["entry_id"]] = (snapshot_path, snapshot_sha256)
         providers = data["selected_providers"]
         allowance = _allowance(settings, stage, providers, entry_id=entry["entry_id"])
         provider_runtime = {}
@@ -1263,11 +1284,14 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             entry["runtime_config_sha256"] = _sha(runtime_path)
         members = []
         for entry, owner in zip(selected_entries, azure_cleanup_owners):
+            parent_snapshot_path, parent_snapshot_sha256 = azure_parent_snapshots[entry["entry_id"]]
             members.append({"entry_id": owner["entry_id"], "run_id": owner["run_id"],
                 "config_sha256": owner["config_sha256"],
                 "runtime_path": entry["runtime_config_path"], "runtime_sha256": entry["runtime_config_sha256"],
-                "parent_manifest_path": entry["parent_manifest_path"],
-                "parent_manifest_sha256": _sha(Path(entry["parent_manifest_path"])),
+                # Existing member fields bind the immutable initialized-parent
+                # snapshot. The mutable live path remains in runtime config.
+                "parent_manifest_path": str(parent_snapshot_path),
+                "parent_manifest_sha256": parent_snapshot_sha256,
                 "config_path": entry["config_path"], "source_config_path": entry["source_config_path"],
                 "source_config_sha256": entry["source_config_sha256"]})
         scope = {"schema_version": 1, "cohort_id": cohort_id, "profile": profile,
