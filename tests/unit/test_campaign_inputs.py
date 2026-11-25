@@ -1,5 +1,6 @@
 """Focused source/settings contract tests, without provider calls."""
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ def test_expired_credential_refresh_evidence_cannot_pass_preflight(tmp_path, mon
     # contracts are exercised separately by lifecycle/admission integration tests.
     monkeypatch.setattr(inputs, "_selected", lambda *_: [])
     monkeypatch.setattr(inputs, "_gate_rows", lambda *_: {})
-    monkeypatch.setattr(inputs, "_cost_payload", lambda *_: {})
+    monkeypatch.setattr(inputs, "_cost_payload", lambda *_, **__: {})
     evidence = tmp_path / "refresh-review.txt"
     evidence.write_text("offline test-only stale credential review")
     settings = {"state_root": str(tmp_path / "private"), "results_root": str(tmp_path / "results"),
@@ -106,3 +107,81 @@ def test_raw_calibration_results_are_not_accepted_as_a_locally_reviewed_recommen
     saved.write_text(json.dumps([{}, {}, {}]))
     with pytest.raises(ValueError, match="locally saved"):
         inputs._common_n({"common_n_recommendation": str(saved)})
+
+
+def _proposed_overrun_amounts():
+    return {"primary": Decimal("189.10562207733502645502645501"),
+        "uncertainty": Decimal("51.11454259936507936507936508"),
+        "tax": Decimal("11.16189295488931216931216931"),
+        "replacements": Decimal("0"), "total_limit": Decimal("300"),
+        "working_limit": Decimal("250"), "protected_buffer": Decimal("50")}
+
+
+def _pending_eur_release_settings(path, *, scope_id="SYNTHETIC-OFFLINE"):
+    import hashlib
+    from cloud_network_benchmark.campaign_inputs import _EUR_RESERVE_RELEASE_REQUEST
+    return {"ledger": {"scope_id": scope_id},
+        "pricing": {"pending_eur_reserve_release": dict(_EUR_RESERVE_RELEASE_REQUEST)},
+        "approvals": {"paid_authorization": {"confirmed": True, "source": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}}
+
+
+def test_over_250_usd_cost_draft_records_pending_eur_release_without_authority():
+    from cloud_network_benchmark.campaign_inputs import (_EUR_RESERVE_RELEASE_REQUEST,
+        _validate_funding_budget)
+    from cloud_network_benchmark.financial_controls import legacy_usd_budget_exceeded
+
+    now = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    amounts = _proposed_overrun_amounts()
+    commitment = sum((amounts[key] for key in ("primary", "uncertainty", "tax", "replacements")), Decimal(0))
+    assert commitment == Decimal("251.3820576315894179894179894")
+    assert legacy_usd_budget_exceeded(commitment, None, now=now)
+    _validate_funding_budget(amounts, dict(_EUR_RESERVE_RELEASE_REQUEST), None, draft=True, now=now)
+    with pytest.raises(ValueError, match="without an explicit EUR 14"):
+        _validate_funding_budget(amounts, None, None, draft=True, now=now)
+    with pytest.raises(ValueError, match="without current source-bound EUR 14 approval"):
+        _validate_funding_budget(amounts, dict(_EUR_RESERVE_RELEASE_REQUEST), None, draft=False, now=now)
+
+
+def test_non_draft_overrun_requires_current_source_bound_typed_eur_14_caps(tmp_path):
+    import hashlib
+    import json
+    from datetime import timedelta
+    from cloud_network_benchmark.campaign_inputs import (_EUR_RESERVE_RELEASE_REQUEST,
+        _reserve_release_policy, _validate_funding_budget)
+    from tests.financial_helpers import NOW, synthetic_finances
+
+    book, _plans, card, path = synthetic_finances(tmp_path, paid=True)
+    card["caps"].update(project_eur="300", working_eur="264", protected_eur="36",
+        personal_cash_eur="264", batch_eur="264", stage_eur="264")
+    path.write_text(json.dumps(card, sort_keys=True))
+    settings = _pending_eur_release_settings(path, scope_id=book.scope_id)
+    request, snapshot = _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+    assert request == _EUR_RESERVE_RELEASE_REQUEST
+    assert snapshot["scope_id"] == book.scope_id
+    _validate_funding_budget(_proposed_overrun_amounts(), request, snapshot, draft=False, now=NOW)
+
+    with pytest.raises(ValueError, match="current ledger scope"):
+        _reserve_release_policy(_pending_eur_release_settings(path, scope_id="SYNTHETIC-OTHER"),
+            "acceptance", draft=False, now=NOW)
+    with pytest.raises(ValueError, match="exact typed EUR 14"):
+        card["caps"].update(working_eur="266", protected_eur="34")
+        path.write_text(json.dumps(card, sort_keys=True))
+        settings["approvals"]["paid_authorization"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+
+    card["caps"].update(working_eur="264", protected_eur="36")
+    card["stage_id"] = "SYNTHETIC-TAMPERED-STAGE"
+    path.write_text(json.dumps(card, sort_keys=True))
+    with pytest.raises(ValueError, match="exact declared source sha256"):
+        _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+    card["stage_id"] = "SYNTHETIC-STAGE"
+    card["valid_until"] = (NOW - timedelta(seconds=1)).isoformat()
+    path.write_text(json.dumps(card, sort_keys=True))
+    settings["approvals"]["paid_authorization"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="stale"):
+        _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+
+    settings["approvals"]["paid_authorization"]["source"] = str(tmp_path / "missing-card.json")
+    with pytest.raises(ValueError, match="missing approvals.paid_authorization.source"):
+        _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)

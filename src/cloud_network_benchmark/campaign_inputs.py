@@ -438,7 +438,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
                             or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
                         raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
-        _cost_payload(settings, root)
+        _cost_payload(settings, root, stage=stage, draft=draft)
         if stage in {"day", "week"}:
             _common_n(settings)
         if stage == "week":
@@ -577,7 +577,72 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
     return errors
 
 
-def _cost_payload(settings, root):
+_EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release_eur": "14"}
+
+
+def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
+                            now: datetime) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Return non-authorizing draft metadata and, only after approval, the source-bound guard snapshot."""
+    request = settings.get("pricing", {}).get("pending_eur_reserve_release")
+    if request is None:
+        return None, None
+    if (stage not in {"acceptance", "calibration"} or not isinstance(request, dict)
+            or request != _EUR_RESERVE_RELEASE_REQUEST):
+        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 pending request for acceptance or calibration")
+    if draft:
+        return dict(_EUR_RESERVE_RELEASE_REQUEST), None
+
+    declarations = {**settings.get("approvals", {}),
+        **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
+    declaration = declarations.get("paid_authorization")
+    if not isinstance(declaration, dict) or declaration.get("confirmed") is not True:
+        raise ValueError("the EUR 14 reserve release requires confirmed paid_authorization")
+    from .financial_controls import (Caps, FinancialAuthorization, Source,
+        has_explicit_eur_reserve_release)
+    source_path = _path(declaration.get("source"), "approvals.paid_authorization.source", file=True)
+    expected_hash = declaration.get("sha256")
+    if (not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+            or hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash):
+        raise ValueError("paid_authorization requires its exact declared source sha256")
+    source = Source(path=str(source_path), sha256=expected_hash)
+    card = FinancialAuthorization.model_validate(source.json())
+    scope_id = settings.get("ledger", {}).get("scope_id")
+    caps = Caps.model_validate(card.caps.model_dump())
+    if (card.ledger_scope_id != scope_id
+            or Decimal(caps.project_eur) != Decimal("300")
+            or Decimal(caps.working_eur) != Decimal("264")
+            or Decimal(caps.protected_eur) != Decimal("36")
+            or Decimal("250") + Decimal(_EUR_RESERVE_RELEASE_REQUEST["release_eur"]) != Decimal(caps.working_eur)
+            or Decimal("50") - Decimal(caps.protected_eur) != Decimal(_EUR_RESERVE_RELEASE_REQUEST["release_eur"])
+            or Decimal(caps.working_eur) + Decimal(caps.protected_eur) != Decimal(caps.project_eur)):
+        raise ValueError("paid_authorization must bind the current ledger scope and exact typed EUR 14 reserve release")
+    snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
+    if not has_explicit_eur_reserve_release(snapshot, now=now):
+        raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the EUR 14 release")
+    return dict(_EUR_RESERVE_RELEASE_REQUEST), snapshot
+
+
+def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[str, str] | None,
+                             release_snapshot: dict[str, Any] | None, *, draft: bool,
+                             now: datetime) -> None:
+    commitment = sum((amounts.get(k, Decimal(0)) for k in
+        ("primary", "replacements", "tax", "uncertainty", "optional")), Decimal(0))
+    if (amounts.get("total_limit", Decimal(300)) != 300
+            or amounts.get("protected_buffer", Decimal(50)) != 50
+            or amounts.get("working_limit", Decimal(250)) != 250):
+        raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
+    if commitment > amounts.get("total_limit", Decimal(300)):
+        raise ValueError("pricing.funding commitment exceeds its unchanged $300 USD total limit")
+    if commitment > Decimal("250"):
+        if pending_release is None:
+            raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+        if not draft:
+            from .financial_controls import legacy_usd_budget_exceeded
+            if legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
+
+
+def _cost_payload(settings, root, *, stage: str | None = None, draft: bool = False):
     """One immutable source for every stage; amounts must be supplied from real prices."""
     pricing = settings.get("pricing")
     if not isinstance(pricing, dict) or pricing.get("reviewed") is not True:
@@ -591,11 +656,11 @@ def _cost_payload(settings, root):
     workflow_profiles = set()
     from .failure_waiver import source_waiver
     acceptance_waived = source_waiver(settings) is not None
-    for stage, inputs in settings.get("stage_inputs", {}).items():
-        if stage not in STAGES or not isinstance(inputs, dict):
+    for configured_stage, inputs in settings.get("stage_inputs", {}).items():
+        if configured_stage not in STAGES or not isinstance(inputs, dict):
             continue
         profile_names = ("workflow_profile", "failure_workflow_profile")
-        if stage == "acceptance" and acceptance_waived:
+        if configured_stage == "acceptance" and acceptance_waived:
             # The source-bound waiver selects only V-S1/V-S3, so the registered
             # failure profile is not part of this reduced campaign's priced scope.
             profile_names = ("workflow_profile",)
@@ -672,11 +737,11 @@ def _cost_payload(settings, root):
         raise ValueError("pricing.funding must name reviewed primary/replacements/tax/uncertainty amounts")
     from .admission import _decimal
     amounts = {k: _decimal(v, f"pricing.funding.{k}") for k, v in funding.items()}
-    if (sum((amounts.get(k, Decimal(0)) for k in ("primary", "replacements", "tax", "uncertainty", "optional")), Decimal(0)) > 250
-        or amounts.get("total_limit", Decimal(300)) != 300
-        or amounts.get("protected_buffer", Decimal(50)) != 50
-        or amounts.get("working_limit", Decimal(250)) != 250):
-        raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
+    financial_check_time = datetime.now(timezone.utc)
+    pending_release, release_snapshot = _reserve_release_policy(settings, stage, draft=draft,
+        now=financial_check_time)
+    _validate_funding_budget(amounts, pending_release, release_snapshot, draft=draft,
+        now=financial_check_time)
     support = _support_payloads(settings)
     aws_raw = (json.dumps(support["aws"], indent=2, sort_keys=True) + "\n").encode()
     profile_bindings = [{"profile_id": profile, "stage": PROFILE_SPECS[profile]["stage"],
@@ -690,6 +755,10 @@ def _cost_payload(settings, root):
         "provider_support": {"aws": {"sha256": hashlib.sha256(aws_raw).hexdigest(),
             "per_region_usd": str(support["aws"]["worst_planned_cost_per_region"])}},
         "provider_run_envelope_templates": templates}
+    if pending_release is not None:
+        # This declaration records a proposal only. FinancialAuthorization is
+        # re-read and validated before any non-draft activation or reservation.
+        result["normalization"] = {"reserve_release": pending_release}
     if workflow_profiles:
         result["workflow_profiles"] = profile_bindings
         result["refresh_required_before_paid_execution"] = False
@@ -953,7 +1022,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     result = Path(results_root) / stage_id
     result.mkdir(parents=True)
     cost_path = Path(state_root) / "cost-inputs.json"
-    cost_payload = _cost_payload(settings, root)
+    cost_payload = _cost_payload(settings, root, stage=stage, draft=draft)
     serialized = json.dumps(cost_payload, indent=2, sort_keys=True) + "\n"
     if cost_path.exists() and cost_path.read_text() != serialized:
         raise ValueError("reviewed prices changed: preserve the existing ledger and use its source reconciliation workflow before preparing another stage")

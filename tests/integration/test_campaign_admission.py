@@ -1546,3 +1546,24 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
     with pytest.raises((ValueError, PermissionError)):
         load_runtime_config(runtime_path)
     card_path.write_bytes(original_card)
+
+
+def test_over_250_cost_payload_is_pending_only_in_explicit_draft(repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import (
+        _EUR_RESERVE_RELEASE_REQUEST, _cost_payload,
+    )
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["pricing"]["funding"].update(primary="189.10562207733502645502645501",
+        uncertainty="51.11454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    settings["pricing"]["pending_eur_reserve_release"] = dict(_EUR_RESERVE_RELEASE_REQUEST)
+    payload = _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+    assert payload["funding"]["primary"] == "189.10562207733502645502645501"
+    assert payload["normalization"]["reserve_release"] == _EUR_RESERVE_RELEASE_REQUEST
+    with pytest.raises(ValueError, match="exact declared source sha256"):
+        _cost_payload(settings, repository_root, stage="acceptance", draft=False)
+
+    settings["pricing"].pop("pending_eur_reserve_release")
+    with pytest.raises(ValueError, match="without an explicit EUR 14"):
+        _cost_payload(settings, repository_root, stage="acceptance", draft=True)
