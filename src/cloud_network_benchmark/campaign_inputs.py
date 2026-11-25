@@ -581,6 +581,27 @@ _EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release
 _EUR15_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
     "prior_release_eur": "14", "additional_release_eur": "15", "cumulative_release_eur": "29"}
 _EUR14_AUTHORITY_SHA256 = "97deee1289455535dad654b6618ebd6f32e562175d55da4f5b4bfd612d0e0aa6"
+_EUR29_AUTHORITY_SHA256 = "f12175ff678980460894e91d489d9d408c95d6b644dc4dd5395cd4006d3552d0"
+
+
+def _cumulative_reserve_release_request(request: dict[str, Any]) -> tuple[Decimal, dict[str, str]] | None:
+    """Recognize a positive additional release against the pinned EUR 29 history."""
+    if (set(request) != {"status", "currency", "prior_release_eur", "additional_release_eur",
+            "cumulative_release_eur"} or request.get("status") != "pending"
+            or request.get("currency") != "EUR" or request.get("prior_release_eur") != "29"):
+        return None
+    try:
+        additional = Decimal(request["additional_release_eur"])
+        cumulative = Decimal(request["cumulative_release_eur"])
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (not additional.is_finite() or not cumulative.is_finite()
+            or additional <= 0 or additional > 21 or cumulative != 29 + additional
+            or additional != additional.quantize(Decimal("0.01"))
+            or str(additional) != request["additional_release_eur"]
+            or str(cumulative) != request["cumulative_release_eur"]):
+        return None
+    return additional, dict(request)
 
 
 def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
@@ -597,8 +618,11 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     elif request == _EUR15_RESERVE_RELEASE_REQUEST:
         working_eur, protected_eur = Decimal("279"), Decimal("21")
         requested_release = dict(_EUR15_RESERVE_RELEASE_REQUEST)
+    elif isinstance(request, dict) and (cumulative := _cumulative_reserve_release_request(request)):
+        additional, requested_release = cumulative
+        working_eur, protected_eur = Decimal("279") + additional, Decimal("21") - additional
     else:
-        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 legacy request or EUR 15 additional / EUR 29 cumulative request")
+        raise ValueError("pricing.pending_eur_reserve_release must be an exact supported cumulative EUR reserve-release request")
     if draft:
         return requested_release, None
 
@@ -629,26 +653,33 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
     if not has_explicit_eur_reserve_release(snapshot, now=now):
         raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the requested reserve release")
-    if request == _EUR15_RESERVE_RELEASE_REQUEST:
+    if request == _EUR15_RESERVE_RELEASE_REQUEST or _cumulative_reserve_release_request(request):
+        cumulative_request = _cumulative_reserve_release_request(request) is not None
         prior = declarations.get("prior_paid_authorization")
         if not isinstance(prior, dict) or prior.get("confirmed") is not True:
-            raise ValueError("the EUR 15 additional release requires the exact source-bound prior EUR 14 paid_authorization")
+            raise ValueError("the additional release requires its exact source-bound prior reserve-release authorization")
         prior_path = _path(prior.get("source"), "approvals.prior_paid_authorization.source", file=True)
         prior_hash = prior.get("sha256")
-        if (prior_hash != _EUR14_AUTHORITY_SHA256
+        expected_prior_hash = _EUR29_AUTHORITY_SHA256 if cumulative_request else _EUR14_AUTHORITY_SHA256
+        if (prior_hash != expected_prior_hash
                 or hashlib.sha256(prior_path.read_bytes()).hexdigest() != prior_hash):
-            raise ValueError("prior_paid_authorization must match the pinned, source-bound EUR 14 authority")
+            raise ValueError("prior_paid_authorization must match the pinned, source-bound cumulative reserve-release authority")
         prior_source = Source(path=str(prior_path), sha256=prior_hash)
         prior_card = FinancialAuthorization.model_validate(prior_source.json())
         prior_caps = Caps.model_validate(prior_card.caps.model_dump())
         prior_snapshot = {"authority": prior_source.model_dump(), "caps": prior_caps.model_dump(),
             "scope_id": scope_id}
-        if (prior_card.ledger_scope_id != scope_id
-                or Decimal(prior_caps.project_eur) != Decimal("300")
-                or Decimal(prior_caps.working_eur) != Decimal("264")
-                or Decimal(prior_caps.protected_eur) != Decimal("36")
-                or not has_explicit_eur_reserve_release(prior_snapshot, now=now)):
-            raise ValueError("prior_paid_authorization is expired, out of scope, or does not prove the exact EUR 14 release")
+        expected_working, expected_protected = ((Decimal("279"), Decimal("21")) if cumulative_request
+            else (Decimal("264"), Decimal("36")))
+        expected_scope_caps = (prior_snapshot["scope_id"] == prior_card.ledger_scope_id
+            and prior_caps == prior_card.caps
+            and Decimal(prior_caps.project_eur) == Decimal("300")
+            and Decimal(prior_caps.working_eur) == expected_working
+            and Decimal(prior_caps.protected_eur) == expected_protected)
+        prior_check_time = prior_card.approved_at if cumulative_request else now
+        if (prior_card.ledger_scope_id != scope_id or not expected_scope_caps
+                or not has_explicit_eur_reserve_release(prior_snapshot, now=prior_check_time)):
+            raise ValueError("prior_paid_authorization is invalid for its pinned historical reserve-release proof")
     return requested_release, snapshot
 
 
