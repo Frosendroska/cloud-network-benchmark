@@ -1372,9 +1372,17 @@ def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_a
         inputs._review_from_prepared(settings, stage)
 
 
-@pytest.mark.parametrize("stage_name", ["acceptance", "calibration"])
+@pytest.mark.parametrize(("stage_name", "activation_fault"), [
+    ("acceptance", "none"),
+    ("acceptance", "expired_auxiliary_card"),
+    ("acceptance", "future_auxiliary_card"),
+    ("acceptance", "ordinary_pending_evidence"),
+    ("acceptance", "other_stage_pending_evidence"),
+    ("acceptance", "financial_callback_source_mutation"),
+    ("calibration", "none"),
+])
 def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_binding(
-        stage_name, repository_root, tmp_path, monkeypatch, request):
+        stage_name, activation_fault, repository_root, tmp_path, monkeypatch, request):
     """Exercise real preparation and read-only paid preflight with synthetic sources only."""
     from cloud_network_benchmark.campaign_inputs import activate_prepared_stage
     from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
@@ -1405,11 +1413,25 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         settings["approvals"]["calibration_authorized"]["fields"] = {
             "execution_window_utc": window, "dispatch_window_utc": dict(window)}
         expected_ids = {"CAL-S1"}
-    settings["pricing"]["workflow_profiles"] = [profile]
+    if stage_name == "acceptance":
+        settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE,
+            execution_window_utc=window, dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True)
+        settings["stage_inputs"]["calibration"].pop("allowance", None)
+        settings["approvals"]["calibration_authorized"]["fields"] = {
+            "execution_window_utc": window, "dispatch_window_utc": dict(window)}
+    settings["pricing"]["workflow_profiles"] = ([ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
+        if stage_name == "acceptance" else [profile])
 
     stage = prepare_stage({"stage": stage_name}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
     register_generated_cleanup(stage, request)
+    calibration_stage = None
+    batch_draft_path = None
+    if stage_name == "acceptance":
+        calibration_stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
+            Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+        register_generated_cleanup(calibration_stage, request)
+        assert stage["cost_input_sha256"] == calibration_stage["cost_input_sha256"]
     scope_ref = stage["azure_auxiliary_cleanup_scope"]
     scope_path = Path(scope_ref["path"])
     scope = json.loads(scope_path.read_text())
@@ -1435,8 +1457,17 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
             "synthetic offline lifecycle rewrite")
         assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
 
-    def draft_admission(entry, runtime=None):
+    if calibration_stage is not None:
+        from cloud_network_benchmark.campaign_draft import create_draft_bundle
+        batch_draft_path = Path(settings["state_root"]) / "fixed-pre-day-driver-draft.json"
+        create_draft_bundle(plan={"batch_id": "fixed-pre-day-v1"},
+            stages=[stage, calibration_stage], output_path=batch_draft_path,
+            missing_prerequisites={stage["stage_id"]: ["paid_authorization"],
+                calibration_stage["stage_id"]: ["paid_authorization"]}, preparer=lambda: None)
+
+    def draft_admission(entry, runtime=None, owner_stage=None):
         from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+        owner_stage = owner_stage or stage
         runtime = runtime or load_runtime_config(Path(entry["runtime_config_path"]),
             selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
         parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
@@ -1446,7 +1477,7 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         campaign = base
         costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
         return build_admission_request(campaign=campaign, parent=parent, children=children,
-            costs=costs, runtime=runtime, controller_session_id=stage["controller_session_id"])
+            costs=costs, runtime=runtime, controller_session_id=owner_stage["controller_session_id"])
 
     from cloud_network_benchmark.financial_controls import financial_binding
 
@@ -1458,6 +1489,15 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         assert "authorization" not in runtime["azure_auxiliary_cleanup"]
         pre_card_bindings[entry["entry_id"]] = (plan.financial_binding,
             financial_binding(plan, _paid_request), _paid_request.model_dump(mode="json"))
+
+    batch_financial_entries = []
+    if calibration_stage is not None:
+        for prepared in (stage, calibration_stage):
+            for entry in prepared["entries"]:
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+                    selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+                request_obj, plan_obj = draft_admission(entry, runtime, owner_stage=prepared)
+                batch_financial_entries.append(financial_binding(plan_obj, request_obj))
 
     decision = tmp_path / "synthetic-cleanup-decision.txt"
     decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
@@ -1494,8 +1534,153 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
 
     runtime_bytes_by_entry = {entry["entry_id"]: Path(entry["runtime_config_path"]).read_bytes()
         for entry in stage["entries"]}
-    activated = activate_prepared_stage(stage, settings, repository_root, preflight=read_only_preflight)
-    assert activated["status"] == "READY_FOR_ADMISSION"
+    if calibration_stage is None:
+        activated = activate_prepared_stage(stage, settings, repository_root, preflight=read_only_preflight)
+        assert activated["status"] == "READY_FOR_ADMISSION"
+    else:
+        from cloud_network_benchmark.campaign import CampaignDriver
+        from tests.financial_helpers import synthetic_finances
+
+        auth_root = tmp_path / "synthetic-financial-card"; auth_root.mkdir()
+        _book, _plans, paid_card, paid_card_path = synthetic_finances(auth_root, count=3, paid=True)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        valid_until = now + timedelta(days=60)
+        paid_card.update(batch_id="fixed-pre-day-v1", stage_id="synthetic-fixed-batch",
+            ledger_scope_id=stage["scope_id"], approved_by="SYNTHETIC-OFFLINE-TEST",
+            approved_at=now.isoformat(), valid_from=(now - timedelta(minutes=1)).isoformat(),
+            valid_until=valid_until.isoformat(), approved_run_count=9,
+            entries=batch_financial_entries)
+        cost_path = Path(stage["cost_input_path"])
+        cost_sha256 = load_cost_inputs(cost_path).payload_sha256
+        paid_card["price"] = {"path": str(cost_path), "sha256": cost_sha256,
+            "official_urls": ["https://example.invalid/SYNTHETIC-OFFLINE"],
+            "checked_at": now.isoformat(), "valid_until": valid_until.isoformat()}
+        for key in ("fx", "external_liabilities"):
+            reference = paid_card[key]
+            source_path = Path(reference["path"])
+            source = json.loads(source_path.read_text())
+            source.update(checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+            if key == "external_liabilities":
+                source.update(ledger_scope_id=stage["scope_id"], currency="EUR", gross_eur="0",
+                    personal_cash_eur="0", excludes_this_ledger=True)
+            source_path.write_text(json.dumps(source, sort_keys=True) + "\n")
+            reference.update(sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+        paid_card_path.write_text(json.dumps(paid_card, sort_keys=True) + "\n")
+        settings["approvals"]["paid_authorization"].update(confirmed=True, source=str(paid_card_path))
+        settings_path = tmp_path / "operator-settings.yaml"; settings_path.write_text("synthetic offline fixture\n")
+        driver = CampaignDriver(settings_loader=lambda _path: settings, clock=Clock(),
+            dispatch=lambda _activated: {"supervisor": "synthetic-no-call"})
+        pending_fixture_bytes = {}
+        if activation_fault == "expired_auxiliary_card":
+            changed = json.loads(card_path.read_text())
+            changed["not_after_utc"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+            card_path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+        elif activation_fault == "future_auxiliary_card":
+            changed = json.loads(card_path.read_text())
+            changed["not_before_utc"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            card_path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+        elif activation_fault == "ordinary_pending_evidence":
+            ordinary_path = Path(next(value for key, value in stage["approval_refs"].items()
+                if key != "azure_shared_cleanup"))
+            ordinary_path.parent.mkdir(parents=True, exist_ok=True)
+            ordinary_path.write_text("SYNTHETIC PENDING ORDINARY EVIDENCE\n")
+            pending_fixture_bytes[str(ordinary_path)] = ordinary_path.read_bytes()
+        elif activation_fault == "other_stage_pending_evidence":
+            foreign_card_path = Path(calibration_stage["approval_refs"]["azure_shared_cleanup"])
+            foreign_card_path.write_text("SYNTHETIC PENDING CALIBRATION EVIDENCE\n")
+            pending_fixture_bytes[str(foreign_card_path)] = foreign_card_path.read_bytes()
+        elif activation_fault == "financial_callback_source_mutation":
+            validate_finances = driver._validate_activated_stage_finances
+            validated = {"called": False}
+
+            def validate_then_mutate(*args, **kwargs):
+                result = validate_finances(*args, **kwargs)
+                validated["called"] = True
+                decision.write_bytes(decision.read_bytes() + b"synthetic callback mutation\n")
+                return result
+
+            driver._validate_activated_stage_finances = validate_then_mutate
+
+        if activation_fault != "none":
+            if activation_fault in {"expired_auxiliary_card", "future_auxiliary_card"}:
+                with pytest.raises(PermissionError, match="validity window"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+            elif activation_fault in {"ordinary_pending_evidence", "other_stage_pending_evidence"}:
+                with pytest.raises(ValueError, match="approval evidence appeared before activation"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+            else:
+                with pytest.raises((ValueError, PermissionError),
+                                   match="decision source is missing or changed"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+                assert validated["called"]
+            for key, value in stage["approval_refs"].items():
+                if key == "azure_shared_cleanup":
+                    continue
+                ordinary_path = Path(value)
+                expected_bytes = pending_fixture_bytes.get(str(ordinary_path))
+                assert ordinary_path.exists() == (expected_bytes is not None)
+                if expected_bytes is not None:
+                    assert ordinary_path.read_bytes() == expected_bytes
+            for pending_path, expected_bytes in pending_fixture_bytes.items():
+                assert Path(pending_path).read_bytes() == expected_bytes
+            assert not (Path(settings["state_root"]) / stage["stage_id"] / "activated-stage.json").exists()
+            consumed_path = batch_draft_path.with_suffix(
+                batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+            assert not consumed_path.exists()
+            if activation_fault == "financial_callback_source_mutation":
+                decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+            return
+
+        result = driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+            settings_path=settings_path, execute=True, root=repository_root)
+        assert result["status"] == "dispatched"
+        consumed = batch_draft_path.with_suffix(batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+        assert json.loads(consumed.read_text())["status"] == "CONSUMED"
+        with pytest.raises(ValueError, match="already activated or dispatched"):
+            driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                settings_path=settings_path, execute=True, root=repository_root)
+
+        # Explicitly terminalize only this pytest-temp journal so the fixture
+        # can probe CAL activation sequencing. The synthetic dispatch above
+        # performed no provider calls and produced no normal-run evidence.
+        journal_path = Path(result["journal"])
+        journal = json.loads(journal_path.read_text())
+        fixture_terminal_at = datetime.now(timezone.utc).isoformat()
+        for entry_id, record in journal["entries"].items():
+            record.update(state="complete", finished_at=fixture_terminal_at,
+                result={"fixture_scope": "SYNTHETIC_TEST_ONLY_NO_PROVIDER_CALLS",
+                    "provider_acceptance": False, "valid_normals": 0})
+        journal["updated_at"] = fixture_terminal_at
+        journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n")
+
+        calibration_scope_ref = calibration_stage["azure_auxiliary_cleanup_scope"]
+        calibration_scope_path = Path(calibration_scope_ref["path"])
+        calibration_scope = json.loads(calibration_scope_path.read_text())
+        calibration_decision = tmp_path / "synthetic-calibration-cleanup-decision.txt"
+        calibration_decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+        calibration_card_path = Path(calibration_stage["approval_refs"]["azure_shared_cleanup"])
+        calibration_card = {**card, "profile": calibration_scope["profile"],
+            "cohort_id": calibration_scope["cohort_id"], "subscription_id": calibration_scope["subscription_id"],
+            "region": calibration_scope["region"], "resource_group_id": calibration_scope["resource_group_id"],
+            "watcher_id": calibration_scope["watcher_id"],
+            "cohort_manifest_path": str(calibration_scope_path),
+            "cohort_manifest_sha256": calibration_scope_ref["sha256"], "owners": calibration_scope["owners"],
+            "source_path": str(calibration_scope_path), "source_sha256": calibration_scope_ref["sha256"],
+            "decision_source_path": str(calibration_decision),
+            "decision_source_sha256": hashlib.sha256(calibration_decision.read_bytes()).hexdigest()}
+        calibration_card_path.write_text(json.dumps(calibration_card, sort_keys=True) + "\n")
+        calibration_result = driver.activate_frozen_draft(batch_draft_path,
+            stage_id=calibration_stage["stage_id"], settings_path=settings_path,
+            execute=True, root=repository_root)
+        assert calibration_result["status"] == "dispatched"
+        calibration_consumed = batch_draft_path.with_suffix(
+            batch_draft_path.suffix + f".{calibration_stage['stage_id']}.consumed.json")
+        assert json.loads(calibration_consumed.read_text())["status"] == "CONSUMED"
+        activated = {"status": "READY_FOR_ADMISSION"}
     assert not Path(stage["ledger_path"]).exists()
     for entry in stage["entries"]:
         strict_runtime, _parent, _children, paid_request, plan = load_entry(stage, entry, repository_root)
