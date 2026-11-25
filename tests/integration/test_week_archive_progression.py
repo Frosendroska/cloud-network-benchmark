@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -118,7 +117,7 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         settings = operator_settings(settings_root, Path.cwd(), monkeypatch)
         settings["state_root"] = str(tmp_path / "driver-state")
         settings["minimum_free_bytes"] = 5_000_000
-        settings["results_root"] = str(fixture.result_roots["aws"].parent.parent)
+        settings["results_root"] = str(tmp_path / "generated-week-results")
         settings["ledger"] = {"path": str(fixture.built["ledger"].path),
             "scope_id": fixture.built["ledger"].scope_id}
         archive_root, staging_root, restore_root = (tmp_path / "driver-archive-root",
@@ -155,14 +154,6 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
             "staging_directory": str(staging_root)}
         stage = prepare_stage({"stage": "week"}, settings, Path.cwd(),
             Path(settings["state_root"]), Path(settings["results_root"]), clock)
-        generated_results_root = Path(stage["results_root"]).resolve()
-        try:
-            generated_results_root.relative_to(tmp_path.resolve())
-        except ValueError:
-            pass
-        else:
-            if generated_results_root != Path(fixture.result_roots["aws"]).parent.parent.resolve():
-                request.addfinalizer(lambda: shutil.rmtree(generated_results_root, ignore_errors=True))
         register_generated_cleanup(stage, request)
         # Keep two original scheduled pairs: the first carries genuine pending
         # archive evidence and the second proves dispatch resumes after replay.
