@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,10 +97,10 @@ def test_second_parallel_replay_counts_retained_first_replay_payload(tmp_path, m
 
 
 def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_owned_lock(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, request):
     from cloud_network_benchmark import archive_replay, gcs_archive
     from cloud_network_benchmark.campaign_inputs import prepare_stage
-    from tests.integration.test_campaign_admission import operator_settings
+    from tests.integration.test_campaign_admission import operator_settings, register_generated_cleanup
     fixture = build_single_provider_week_archive_fixture(tmp_path=tmp_path,
         monkeypatch=monkeypatch, repository_root=Path.cwd())
     try:
@@ -154,6 +155,15 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
             "staging_directory": str(staging_root)}
         stage = prepare_stage({"stage": "week"}, settings, Path.cwd(),
             Path(settings["state_root"]), Path(settings["results_root"]), clock)
+        generated_results_root = Path(stage["results_root"]).resolve()
+        try:
+            generated_results_root.relative_to(tmp_path.resolve())
+        except ValueError:
+            pass
+        else:
+            if generated_results_root != Path(fixture.result_roots["aws"]).parent.parent.resolve():
+                request.addfinalizer(lambda: shutil.rmtree(generated_results_root, ignore_errors=True))
+        register_generated_cleanup(stage, request)
         # Keep two original scheduled pairs: the first carries genuine pending
         # archive evidence and the second proves dispatch resumes after replay.
         launch_times = list(dict.fromkeys(item["launch_at"] for item in stage["entries"]))[:2]
