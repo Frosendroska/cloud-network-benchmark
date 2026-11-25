@@ -5,11 +5,13 @@ import json
 import hashlib
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -279,12 +281,14 @@ def _week_slot_groups(stage: dict[str, Any]) -> dict[datetime, list[dict[str, An
     return groups
 
 
-def _week_dispatch_blocked(journal: dict[str, Any]) -> bool:
+def _week_dispatch_blocked(journal: dict[str, Any], *, allow_archive_pending: bool = False) -> bool:
     """Terminal outcomes remain evidence; only unsettled work blocks a later pair."""
     for record in journal["entries"].values():
         result = record.get("result") or {}
         if (result.get("cleanup_open") or result.get("launch_uncertain")
-                or record["state"] == "archive_pending_validation"):
+                or result.get("ledger_reconciliation_required")
+                or record.get("blocked_reason") == "ledger_reconciliation_required"
+                or (record["state"] == "archive_pending_validation" and not allow_archive_pending)):
             return True
         # A missed entry that never started needs no resource cleanup. Every
         # attempted entry needs explicit closure, including failed measurements.
@@ -293,6 +297,95 @@ def _week_dispatch_blocked(journal: dict[str, Any]) -> bool:
         if attempted and result.get("cleanup_open") is not False:
             return True
     return False
+
+
+def _week_ledger_settled(runtime: dict[str, Any], capsule_ref: dict[str, Any] | None,
+                         entry: dict[str, Any], stage: dict[str, Any], *,
+                         reservation_id: str | None = None) -> bool:
+    """Read-only proof that the original reservation's cleanup is durable."""
+    try:
+        from .contracts.admission import ReservationEvidence
+        capsule = {}
+        expected_reservation = None
+        if capsule_ref is not None:
+            capsule_path = Path(capsule_ref["path"])
+            if capsule_path.is_symlink() or not capsule_path.is_file() or _digest(capsule_path) != capsule_ref.get("sha256"):
+                return False
+            capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
+            expected_reservation = ReservationEvidence.model_validate(capsule.get("reservation", {}))
+            reservation_id = expected_reservation.reservation_id.value
+            if expected_reservation.state != "reserved":
+                return False
+        if not isinstance(reservation_id, str) or not reservation_id:
+            return False
+        from .admission import BudgetLedger
+        ledger_ref = runtime["ledger"]
+        if (Path(ledger_ref["path"]).resolve(strict=True)
+                != Path(stage["ledger_path"]).resolve(strict=True)
+                or ledger_ref["scope_id"] != stage["scope_id"]):
+            return False
+        state = BudgetLedger(ledger_ref["path"], scope_id=ledger_ref["scope_id"],
+            utc_now=lambda: datetime.now(timezone.utc), monotonic_now=time.monotonic,
+            controller_session_id="week-archive-readback").inspect()
+        item = state.get("reservations", {}).get(reservation_id)
+        if not isinstance(item, dict):
+            return False
+        parent_path = Path(entry["parent_manifest_path"])
+        if parent_path.is_symlink() or not parent_path.is_file():
+            return False
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        run_ids = entry.get("run_ids", {})
+        observed_reservation = ReservationEvidence.model_validate(item.get("evidence", {}))
+        if (observed_reservation.state != "reserved"
+                or (expected_reservation is not None and observed_reservation != expected_reservation)
+                or item.get("request", {}).get("campaign_id") != parent.get("campaign_id")
+                or item.get("child_identities") != run_ids):
+            return False
+        from .orchestration import SavedLifecycleRecovery
+        recovery_path = Path(entry["private_root"]) / "lifecycle-recovery.json"
+        if recovery_path.is_symlink() or not recovery_path.is_file():
+            return False
+        recovery = SavedLifecycleRecovery.validate_unique(
+            json.loads(recovery_path.read_text(encoding="utf-8")))
+        recovery_rows = {str(row.provider): row for row in recovery.providers}
+        if (recovery.attempt_id != parent.get("campaign_id")
+                or recovery.reservation_id != reservation_id
+                or recovery.controller_session_id != stage.get("controller_session_id")
+                or item.get("session") != recovery.controller_session_id
+                or set(recovery_rows) != set(run_ids)
+                or any(row.cleanup_open or row.deployment_id != f"{run_ids[provider]}-deployment"
+                    for provider, row in recovery_rows.items())):
+            return False
+        providers = set(item.get("plan", {}).get("providers", ()))
+        return (providers == set(run_ids)
+            and (not capsule or providers == set(capsule.get("archives", {})))
+            and item.get("lifecycle_terminal") is True
+            and item.get("cleanup_open") is False
+            and item.get("provider_cleanup") == {name: True for name in providers}
+            and reservation_id not in state.get("cleanup_open", ())
+            and reservation_id not in state.get("cleanup_blocked", ())
+            and reservation_id not in state.get("budget_blocked", ()))
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return False
+
+
+def _replay_payload_from_receipt(path: Path, expected_sha256: str) -> int:
+    """Read previously allocated replay payload only from its bound successful receipt."""
+    if path.is_symlink() or not path.is_file() or _digest(path) != expected_sha256:
+        raise ValueError("previous WEEK replay receipt is missing or changed")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    projection = payload.get("storage_projection")
+    if payload.get("status") != "replayed" or not isinstance(projection, dict):
+        raise ValueError("previous WEEK replay lacks successful quota projection evidence")
+    raw = projection.get("raw_bytes")
+    compressed = projection.get("compressed_archive_bytes")
+    copies = projection.get("raw_copy_count_at_peak")
+    amount = projection.get("payload_bytes")
+    if (type(raw) is not int or raw < 0 or type(compressed) is not int or compressed < 0
+            or type(copies) is not int or copies != 4 or type(amount) is not int
+            or amount != compressed + copies * raw):
+        raise ValueError("previous WEEK replay quota projection is malformed")
+    return amount
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -348,6 +441,7 @@ class CampaignDriver:
                  launch: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
                  dispatch: Callable[[dict[str, Any]], Any] | None = None,
                  pre_admit: Callable[[list[dict[str, Any]], dict[str, Any]], Any] | None = None,
+                 archive_replay: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], Path] | None = None,
                  reconcile: Callable[[dict[str, Any], dict[str, Any]], str | None] | None = None,
                  clock: Any = None, sleep: Callable[[float], None] = time.sleep):
         self.prepare = prepare
@@ -358,6 +452,7 @@ class CampaignDriver:
         self.launch = launch or self._launch_lifecycle
         self.pre_admit = pre_admit if pre_admit is not None else (self._pre_admit_acceptance_pair if launch is None else None)
         self.dispatch = dispatch or self._dispatch_user_space
+        self.archive_replay = archive_replay or self._restore_week_archive
         self.reconcile = reconcile if reconcile is not None else (self._reconcile_lifecycle if launch is None else None)
         self.clock = clock or _SystemClock()
         self.sleep = sleep
@@ -738,6 +833,9 @@ class CampaignDriver:
                 if any(journal["entries"].get(entry_id, {}).get("state") == "scheduled" for entry_id in normal_ids):
                     acceptance_pair = _acceptance_pair(stage)
             self._reconcile_ambiguous(stage, journal, journal_path)
+            if stage.get("stage") == "week":
+                self._refresh_week_financial_state(stage, journal, journal_path)
+                self._reconcile_week_archives(stage, journal, journal_path)
             blocked = any((item.get("result") or {}).get("cleanup_open")
                           or (item.get("result") or {}).get("launch_uncertain")
                           or item.get("state") == "archive_pending_validation"
@@ -932,12 +1030,23 @@ class CampaignDriver:
                             _append_log(stage, f"{entry_id}: {journal['entries'][entry_id]['state']}")
                             if ((journal["entries"][entry_id].get("result") or {}).get("cleanup_open")
                                     or (journal["entries"][entry_id].get("result") or {}).get("launch_uncertain")
-                                    or journal["entries"][entry_id]["state"] == "archive_pending_validation"
+                                    or (journal["entries"][entry_id]["state"] == "archive_pending_validation"
+                                        and stage.get("stage") != "week")
                                     or (stage.get("stage") == "acceptance"
                                         and journal["entries"][entry_id]["state"] == "failed")
                                     or (stage.get("stage") == "week"
-                                        and _week_dispatch_blocked(journal))):
+                                        and _week_dispatch_blocked(journal, allow_archive_pending=True))):
                                 blocked = True
+                    # Archive replay and its canonical reconciliation are post-measurement
+                    # work. Wait until both parallel lifecycle calls have returned before
+                    # reading the source-bound archive store or changing either journal row.
+                    if stage.get("stage") == "week" and not _week_dispatch_blocked(
+                            journal, allow_archive_pending=True):
+                        self._reconcile_week_archives(stage, journal, journal_path,
+                            entry_ids={item["entry_id"] for item in group})
+                        self._refresh_week_financial_state(stage, journal, journal_path,
+                            entry_ids={item["entry_id"] for item in group})
+                        blocked = _week_dispatch_blocked(journal)
                     if blocked:
                         unstarted_entries = stage["entries"] if stage.get("stage") == "acceptance" else pending
                         for unstarted in unstarted_entries:
@@ -955,18 +1064,31 @@ class CampaignDriver:
             return result
 
     def reconcile_archive(self, state_root: Path, stage_id: str, entry_id: str, receipt_path: Path) -> dict[str, Any]:
+        """Public, exclusively locked archive reconciliation command."""
+        return self._reconcile_archive(state_root, stage_id, entry_id, receipt_path, lock_held=False)
+
+    def _reconcile_archive(self, state_root: Path, stage_id: str, entry_id: str,
+                           receipt_path: Path, *, lock_held: bool) -> dict[str, Any]:
         """Close an archive-pending entry only after replay artifacts and cleanup revalidate."""
         root = Path(state_root); folder = root / stage_id
-        with _file_lock(root / ".campaign-driver.lock", blocking=False):
+        with (nullcontext() if lock_held else _file_lock(root / ".campaign-driver.lock", blocking=False)):
             stage = json.loads((folder / "prepared-stage.json").read_text(encoding="utf-8"))
             journal_path = folder / "campaign-journal.json"
             journal = self._load_or_create_journal(stage, journal_path)
             record = journal["entries"].get(entry_id)
             if not record or record.get("state") != "archive_pending_validation":
                 raise ValueError("entry is not awaiting archive validation")
+            entry = next((item for item in stage["entries"] if item["entry_id"] == entry_id), None)
+            if entry is None:
+                raise ValueError("prepared stage no longer contains the pending entry")
             prior = record.get("result") or {}; capsule_ref = prior.get("replay_capsule")
             if prior.get("cleanup_open") is not False or not isinstance(capsule_ref, dict):
                 raise ValueError("archive-pending entry lacks closed cleanup or a source-bound capsule")
+            if stage.get("stage") == "week":
+                from .lifecycle_runtime import load_runtime_config
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+                if not _week_ledger_settled(runtime, capsule_ref, entry, stage):
+                    raise ValueError("WEEK archive replay lacks exact durable reservation cleanup reconciliation")
             capsule_file = Path(capsule_ref.get("path", ""))
             receipt = Path(receipt_path)
             if (capsule_file.is_symlink() or not capsule_file.is_file()
@@ -975,9 +1097,6 @@ class CampaignDriver:
                 raise ValueError("capsule or replay receipt is missing, unsafe, or changed")
             capsule_doc = json.loads(capsule_file.read_text(encoding="utf-8"))
             payload = json.loads(receipt.read_text(encoding="utf-8"))
-            entry = next((item for item in stage["entries"] if item["entry_id"] == entry_id), None)
-            if entry is None:
-                raise ValueError("prepared stage no longer contains the pending entry")
             run_ids = entry.get("run_ids", {})
             repository = Path(stage["repository_root"]).resolve(strict=True)
             from .manifests import CampaignManifest, ChildRunManifest
@@ -1166,12 +1285,290 @@ class CampaignDriver:
             report_payload = json.loads(Path(analysis["report_path"]).read_text(encoding="utf-8"))
             if report_payload != analysis_result.payload:
                 raise ValueError("analysis report differs from deterministic analysis of the bound selection")
-            record["result"] = {**prior, "archive_replay_receipt": str(receipt.resolve()),
+            if stage.get("stage") == "week":
+                from .lifecycle_runtime import load_runtime_config
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+                if not _week_ledger_settled(runtime, capsule_ref, entry, stage):
+                    raise ValueError("WEEK financial cleanup evidence changed during archive reconciliation")
+            reconciled_result = {**prior, "archive_replay_receipt": str(receipt.resolve()),
                 "archive_replay_receipt_sha256": _digest(receipt), "archive_validation": "valid"}
+            reconciled_result.pop("ledger_reconciliation_required", None)
+            record["result"] = reconciled_result
             record.update(state="complete", finished_at=_now(self.clock).isoformat(), error=None)
+            if record.get("blocked_reason") == "ledger_reconciliation_required":
+                record.pop("blocked_reason", None)
             _write_json(journal_path, journal)
             self._archive_closed_entry(stage, entry, record); _write_json(journal_path, journal)
             return _status_payload(stage, journal)
+
+    def _reconcile_week_archives(self, stage: dict[str, Any], journal: dict[str, Any],
+                                 journal_path: Path, *, entry_ids: set[str] | None = None) -> None:
+        """Replay and reconcile only WEEK capsules, under CampaignDriver.run's lock."""
+        replay_payload_used = 0
+        prior_capacity_unknown = False
+        attempted_prior: dict[str, int] = {}
+        attempted_payloads: dict[str, int] = {}
+        for saved in journal["entries"].values():
+            saved_result = saved.get("result") or {}
+            if saved.get("state") != "complete" or saved_result.get("archive_validation") != "valid":
+                continue
+            try:
+                replay_payload_used += _replay_payload_from_receipt(
+                    Path(saved_result["archive_replay_receipt"]),
+                    saved_result["archive_replay_receipt_sha256"])
+            except (OSError, ValueError, KeyError, TypeError):
+                prior_capacity_unknown = True
+                break
+        if not prior_capacity_unknown:
+            for saved_id, saved in journal["entries"].items():
+                saved_result = saved.get("result") or {}
+                if (saved.get("state") != "archive_pending_validation"
+                        or not saved_result.get("archive_replay_attempted")):
+                    continue
+                capsule_ref = saved_result.get("replay_capsule")
+                try:
+                    entry = next(row for row in stage["entries"] if row["entry_id"] == saved_id)
+                    from .lifecycle_runtime import load_runtime_config
+                    runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+                    digest = capsule_ref["sha256"]
+                    work_id = f"{saved_id}-{digest[:16]}"
+                    receipt = Path(runtime["archive_sink"]["staging_directory"]) / "week-replay" / work_id / "replay-receipts" / f"{digest}.json"
+                    payload_bytes = _replay_payload_from_receipt(receipt, _digest(receipt))
+                    if saved_result.get("prior_replay_payload_bytes") != replay_payload_used:
+                        raise ValueError("attempted replay quota allocation differs from earlier committed rows")
+                    if (saved_result.get("cleanup_open") is not False
+                            or saved_result.get("launch_uncertain")
+                            or not _week_ledger_settled(runtime, capsule_ref, entry, stage)):
+                        raise ValueError("attempted replay has unresolved cleanup or financial ownership")
+                    attempted_prior[saved_id] = replay_payload_used
+                    attempted_payloads[saved_id] = payload_bytes
+                    replay_payload_used += payload_bytes
+                except (OSError, ValueError, RuntimeError, KeyError, TypeError, StopIteration):
+                    prior_capacity_unknown = True
+                    break
+        attempted_entries = [entry for entry in stage.get("entries", [])
+            if journal["entries"][entry["entry_id"]].get("state") == "archive_pending_validation"
+            and (journal["entries"][entry["entry_id"]].get("result") or {}).get("archive_replay_attempted")]
+        fresh_entries = [entry for entry in stage.get("entries", [])
+            if entry not in attempted_entries and (entry_ids is None or entry["entry_id"] in entry_ids)]
+        for entry in [*attempted_entries, *fresh_entries]:
+            entry_id = entry["entry_id"]
+            if entry not in attempted_entries and entry_ids is not None and entry_id not in entry_ids:
+                continue
+            record = journal["entries"][entry_id]
+            if record.get("state") != "archive_pending_validation":
+                continue
+            result = record.get("result") or {}
+            # An unresolved financial hold or ambiguous ownership/launch state is
+            # never cleared by a data replay receipt.
+            if (record.get("blocked_reason") == "ledger_reconciliation_required"
+                    or result.get("launch_uncertain") or result.get("cleanup_open") is not False):
+                continue
+            capsule_ref = result.get("replay_capsule")
+            if not isinstance(capsule_ref, dict):
+                continue
+            if prior_capacity_unknown:
+                record["result"] = {**result,
+                    "archive_replay_error": "retained prior replay quota allocation is unavailable; automatic replay is blocked"}
+                _write_json(journal_path, journal)
+                continue
+            try:
+                runtime_path = Path(entry["runtime_config_path"])
+                from .lifecycle_runtime import load_runtime_config
+                runtime = load_runtime_config(runtime_path)
+                sink = runtime.get("archive_sink")
+                if not isinstance(sink, dict):
+                    raise ValueError("archive replay requires the entry's frozen archive sink")
+                capsule_path = Path(capsule_ref.get("path", ""))
+                capsule_digest = capsule_ref.get("sha256")
+                if (capsule_path.is_symlink() or not capsule_path.is_file()
+                        or _digest(capsule_path) != capsule_digest):
+                    raise ValueError("source-bound archive replay capsule is missing or changed")
+                if not _week_ledger_settled(runtime, capsule_ref, entry, stage):
+                    record["result"] = {**result, "ledger_reconciliation_required": True}
+                    _write_json(journal_path, journal)
+                    continue
+                if result.get("ledger_reconciliation_required"):
+                    result.pop("ledger_reconciliation_required", None)
+                    record["result"] = result
+                    _write_json(journal_path, journal)
+                work_id = f"{entry_id}-{capsule_digest[:16]}"
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", work_id):
+                    raise ValueError("prepared entry identity is unsafe for an isolated replay workspace")
+                receipt_path = (Path(sink["staging_directory"]) / "week-replay" / work_id
+                    / "replay-receipts" / f"{capsule_digest}.json")
+                if receipt_path.exists():
+                    # A successful replay may have committed its receipt just before
+                    # controller loss. Reconcile that exact immutable receipt; never
+                    # run restore/finalize a second time or overwrite its outputs.
+                    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    if payload.get("status") != "replayed":
+                        raise ValueError("existing archive replay receipt is not successful")
+                    expected_prior = attempted_prior.get(entry_id, replay_payload_used)
+                    if result.get("prior_replay_payload_bytes") != expected_prior:
+                        raise ValueError("existing replay receipt was attempted against a different shared quota allocation")
+                else:
+                    if result.get("archive_replay_attempted"):
+                        raise ValueError("prior replay attempt has no successful receipt; automatic retry is disabled")
+                    record["result"] = {**result, "archive_replay_attempted": True,
+                        "prior_replay_payload_bytes": replay_payload_used}
+                    _write_json(journal_path, journal)
+                    receipt_path = self.archive_replay(entry, stage, record)
+                    if not Path(receipt_path).is_file() or Path(receipt_path).is_symlink():
+                        raise ValueError("archive replay did not produce its exclusive receipt")
+                    payload = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+                    if payload.get("status") != "replayed":
+                        raise ValueError("archive replay did not complete native validation and analysis")
+                current_payload_bytes = _replay_payload_from_receipt(
+                    Path(receipt_path), _digest(Path(receipt_path)))
+                self._reconcile_archive(stage["state_root"], stage["stage_id"], entry_id,
+                    receipt_path, lock_held=True)
+                if entry_id not in attempted_payloads:
+                    replay_payload_used += current_payload_bytes
+                journal.clear()
+                journal.update(self._load_or_create_journal(stage, journal_path))
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+                # Keep the original archive-pending state and immutable capsule.
+                # A diagnostic does not turn transport into validation or cleanup.
+                latest = self._load_or_create_journal(stage, journal_path)
+                journal.clear(); journal.update(latest)
+                record = journal["entries"][entry_id]
+                if record.get("state") != "archive_pending_validation":
+                    continue
+                record["result"] = {**(record.get("result") or result),
+                    "archive_replay_error": f"{type(exc).__name__}: {exc}"}
+                _write_json(journal_path, journal)
+                if record["result"].get("archive_replay_attempted"):
+                    prior_capacity_unknown = True
+
+    def _refresh_week_financial_state(self, stage: dict[str, Any], journal: dict[str, Any],
+                                      journal_path: Path, *, entry_ids: set[str] | None = None) -> None:
+        """Recheck durable F11 cleanup for every attempted WEEK terminal record."""
+        entries = {entry["entry_id"]: entry for entry in stage.get("entries", [])}
+        for entry_id, record in journal["entries"].items():
+            if entry_ids is not None and entry_id not in entry_ids:
+                continue
+            if record.get("state") not in {"complete", "failed", "archive_pending_validation"}:
+                continue
+            result = record.get("result") or {}
+            reservation_id = result.get("reservation_id")
+            capsule_ref = result.get("replay_capsule")
+            if reservation_id is None and not isinstance(capsule_ref, dict):
+                continue
+            entry = entries.get(entry_id)
+            settled = False
+            try:
+                from .lifecycle_runtime import load_runtime_config
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+                settled = _week_ledger_settled(runtime,
+                    capsule_ref if isinstance(capsule_ref, dict) else None,
+                    entry, stage, reservation_id=reservation_id)
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                settled = False
+            if settled and result.get("ledger_reconciliation_required"):
+                result.pop("ledger_reconciliation_required", None)
+                record["result"] = result
+                if record.get("blocked_reason") == "ledger_reconciliation_required":
+                    record.pop("blocked_reason", None)
+                _write_json(journal_path, journal)
+            elif settled and record.get("blocked_reason") == "ledger_reconciliation_required":
+                record.pop("blocked_reason", None)
+                _write_json(journal_path, journal)
+            elif not settled and not result.get("ledger_reconciliation_required"):
+                record["result"] = {**result, "ledger_reconciliation_required": True}
+                _write_json(journal_path, journal)
+
+    @staticmethod
+    def _restore_week_archive(entry: dict[str, Any], stage: dict[str, Any],
+                              record: dict[str, Any]) -> Path:
+        """Use the existing bounded archive restore, validator, and analysis path."""
+        capsule_ref = (record.get("result") or {}).get("replay_capsule") or {}
+        capsule_path, capsule_sha256 = Path(capsule_ref["path"]), capsule_ref["sha256"]
+        repository = Path(stage["repository_root"]).resolve(strict=True)
+        capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
+        # Bind every write target to this exact prepared entry before the archive
+        # backend is constructed or contacted.
+        parent_rel = Path(capsule.get("parent_path", ""))
+        if parent_rel.is_absolute() or ".." in parent_rel.parts:
+            raise ValueError("capsule parent path is unsafe")
+        parent_path = repository / parent_rel
+        if parent_path.resolve(strict=True) != Path(entry["parent_manifest_path"]).resolve(strict=True):
+            raise ValueError("capsule parent differs from the prepared entry")
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+        runs = entry.get("run_ids", {})
+        if set(runs) != set(capsule.get("archives", {})) or set(runs) != set(capsule.get("child_paths", {})):
+            raise ValueError("capsule provider/run set differs from the prepared entry")
+        child_refs = parent.get("child_runs", [])
+        expected_children = {str(child.get("provider")): child
+            for child in child_refs if isinstance(child, dict)}
+        if (len(expected_children) != len(child_refs) or set(expected_children) != set(runs)
+                or len({str(child.get("run_id")) for child in child_refs}) != len(child_refs)):
+            raise ValueError("prepared parent does not uniquely bind its provider/run result references")
+        for provider, run_id in runs.items():
+            child_rel = Path(capsule["child_paths"][provider])
+            result_rel = Path(capsule["result_paths"][provider])
+            ref = expected_children[provider]
+            if (child_rel.is_absolute() or ".." in child_rel.parts
+                    or result_rel.is_absolute() or ".." in result_rel.parts
+                    or str(ref.get("run_id")) != str(run_id)
+                    or child_rel.as_posix() != str(ref.get("manifest_path"))
+                    or result_rel.as_posix() != str(ref.get("result_path"))
+                    or result_rel != (Path(stage["results_root"]) / "raw" / str(run_id)).resolve().relative_to(repository)):
+                raise ValueError("capsule child or result path differs from its exact prepared run")
+        from .lifecycle_runtime import load_runtime_config
+        runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+        sink = runtime.get("archive_sink")
+        observer = runtime.get("observer")
+        if not isinstance(sink, dict) or not isinstance(observer, dict):
+            raise ValueError("entry runtime lacks its registered archive sink or observer identity")
+        if (Path(runtime["initialized_campaign_manifest"]).resolve(strict=True)
+                != Path(entry["parent_manifest_path"]).resolve(strict=True)
+                or set(runtime.get("providers", {})) != set(runs)):
+            raise ValueError("entry runtime campaign/provider binding differs from its prepared run set")
+        work_id = f"{entry['entry_id']}-{capsule_sha256[:16]}"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", work_id):
+            raise ValueError("prepared entry identity is unsafe for an isolated replay workspace")
+        staging_root = Path(sink["staging_directory"]) / "week-replay" / work_id
+        restore_base = Path(sink.get("restore_path") or Path(sink["staging_directory"]).parent)
+        materialization_root = restore_base / "week-replay-native" / work_id
+        from .lifecycle_cli import _verified_replay_entry
+        bound_entry, _ = _verified_replay_entry(capsule_path=capsule_path,
+            capsule_sha256=capsule_sha256, observer=observer, repository_root=repository)
+        if bound_entry != entry["entry_id"]:
+            raise ValueError("runtime observer does not bind this prepared entry")
+        from .gcs_archive import google_cloud_storage_backend
+        from .archive_replay import restore_and_finalize_batch_capsule
+        quota_path = Path(sink["controller_quota_evidence_path"])
+        if quota_path.is_symlink() or not quota_path.is_file():
+            raise ValueError("fresh user quota evidence is required before archive backend access")
+        quota_doc = json.loads(quota_path.read_text(encoding="utf-8"))
+        quota_free = sink["controller_quota_free_bytes"]
+        metadata_headroom = quota_doc.get("metadata_headroom_bytes")
+        other_growth = quota_doc.get("projected_other_growth_bytes")
+        reserve = quota_doc.get("reserve_bytes")
+        if any(type(value) is not int or value <= 0 for value in
+                (metadata_headroom, other_growth, reserve)):
+            raise ValueError("fresh replay quota evidence lacks positive metadata, growth, and reserve bounds")
+        if reserve < sink["minimum_controller_free_bytes"]:
+            raise ValueError("fresh replay reserve is below the frozen runtime controller minimum")
+        output = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
+            expected_capsule_sha256=capsule_sha256, backend=None,
+            backend_factory=lambda: google_cloud_storage_backend(sink), bucket=sink["bucket"],
+            archive_staging_root=staging_root,
+            materialization_root=materialization_root,
+            repository_root=repository, maximum_part_bytes=sink["maximum_staging_bytes"],
+            minimum_free_bytes=reserve, admit_replay_storage=True,
+            prepare_replay_roots=True,
+            additional_raw_copies_at_peak=1,
+            prior_replay_payload_bytes=(record.get("result") or {}).get("prior_replay_payload_bytes", 0),
+            controller_quota_free_bytes=quota_free,
+            controller_quota_evidence_path=quota_path,
+            controller_quota_evidence_sha256=sink["controller_quota_evidence_sha256"],
+            metadata_headroom_bytes=metadata_headroom,
+            projected_other_growth_bytes=other_growth)
+        if output.get("status") != "replayed":
+            raise ValueError("archive replay failed canonical validation or analysis")
+        return Path(output["replay_receipt"]["path"])
 
     def reconcile_export(self, state_root: Path, stage_id: str, entry_id: str,
                          preserve_to: Path) -> dict[str, Any]:
@@ -1760,19 +2157,47 @@ class CampaignDriver:
             except (OSError, ValueError, TypeError):
                 valid_outputs = False
         report = _last_json_object(run_log)
+        if not isinstance(report, dict):
+            return {"status": "failed", "returncode": return_code,
+                "cleanup_open": True, "launch_uncertain": True,
+                "log": str(run_log), "lifecycle_status_complete": False,
+                "validated_outputs_present": False}
         providers = report.get("providers", {}) if isinstance(report, dict) else {}
         cleanup_open = not providers or any(
             item.get("cleanup_state") not in {"succeeded", "not_required"} for item in providers.values())
+        replay_capsule = report.get("replay_capsule")
+        replay_pending = (stage.get("stage") == "week" and return_code == 0
+            and report.get("status") == "archive_pending_validation"
+            and cleanup_open is False and isinstance(replay_capsule, dict)
+            and replay_capsule.get("status") == "archive_pending_replay"
+            and isinstance(replay_capsule.get("path"), str)
+            and isinstance(replay_capsule.get("sha256"), str)
+            and bool(re.fullmatch(r"[a-f0-9]{64}", replay_capsule["sha256"]))
+            and report.get("run_ids") == entry.get("run_ids"))
         lifecycle_complete = return_code == 0 and report.get("status") == "complete"
         success = return_code == 0 and valid_outputs and lifecycle_complete
-        return {"status": "complete" if success else "failed", "returncode": return_code,
+        result = {"status": "complete" if success else
+                    "archive_pending_validation" if replay_pending else "failed", "returncode": return_code,
                 "validated_outputs_present": valid_outputs, "lifecycle_status_complete": lifecycle_complete,
                 "cleanup_open": cleanup_open, "provider_results": providers,
+                "reservation_id": report.get("reservation_id"),
+                "admission_status": report.get("admission_status"),
+                "reason_codes": report.get("reason_codes", []),
                 "log": str(run_log), "peak_process_rss_bytes": memory_peak,
                 "free_disk_bytes_start": free_start, "free_disk_bytes_end": free_end,
                 "minimum_free_disk_bytes_during_run": minimum_free,
                 "peak_observed_shared_filesystem_usage_delta_bytes": usage_delta,
                 "disk_sample_scope": "shared_results_filesystem"}
+        if stage.get("stage") == "week" and (report.get("reservation_id")
+                or report.get("admission_status") == "reserved" or report.get("external_calls", 0)):
+            from .lifecycle_runtime import load_runtime_config
+            runtime = load_runtime_config(Path(entry["runtime_config_path"]))
+            if replay_pending:
+                result["replay_capsule"] = replay_capsule
+            result["ledger_reconciliation_required"] = not _week_ledger_settled(
+                runtime, replay_capsule if replay_pending else None, entry, stage,
+                reservation_id=report.get("reservation_id"))
+        return result
 
     @staticmethod
     def _reconcile_lifecycle(entry: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
@@ -1979,6 +2404,7 @@ def _status_payload(stage: dict[str, Any], journal: dict[str, Any]) -> dict[str,
     awaiting = any((item.get("blocked_reason") in {"supervision_required", "cleanup_pending"}
                     and item["state"] == "scheduled")
                    or item.get("blocked_reason") == "ledger_reconciliation_required"
+                   or (item.get("result") or {}).get("ledger_reconciliation_required")
                    for item in journal["entries"].values())
     settled = counts["scheduled"] == 0 or awaiting
     outcome = ("archive_pending_validation" if counts["archive_pending_validation"] else

@@ -509,6 +509,10 @@ def finalize_restored_capsule(*, capsule_path: Path, native_root: Path,
 def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_sha256: str,
         backend: Any | None, bucket: str, archive_staging_root: Path, materialization_root: Path,
         repository_root: Path, maximum_part_bytes: int, minimum_free_bytes: int = 0,
+        admit_replay_storage: bool = False,
+        prepare_replay_roots: bool = False,
+        additional_raw_copies_at_peak: int = 0,
+        prior_replay_payload_bytes: int = 0,
         evaluated_at: datetime | None = None, prune_verified_scratch: bool = False,
         backend_factory: Any | None = None, closed_export_entry_id: str | None = None,
         closed_export_results_root: Path | None = None,
@@ -547,28 +551,31 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     replay_storage_projection = None
     if type(prune_verified_scratch) is not bool:
         raise ValueError("prune_verified_scratch must be an explicit boolean")
-    if prune_verified_scratch:
+    if type(admit_replay_storage) is not bool:
+        raise ValueError("admit_replay_storage must be an explicit boolean")
+    if type(prepare_replay_roots) is not bool:
+        raise ValueError("prepare_replay_roots must be an explicit boolean")
+    if type(additional_raw_copies_at_peak) is not int or additional_raw_copies_at_peak < 0:
+        raise ValueError("additional_raw_copies_at_peak must be a nonnegative integer")
+    if type(prior_replay_payload_bytes) is not int or prior_replay_payload_bytes < 0:
+        raise ValueError("prior_replay_payload_bytes must be a nonnegative integer")
+    if prune_verified_scratch or admit_replay_storage:
         if (type(controller_quota_free_bytes) is not int or controller_quota_free_bytes < 0
                 or controller_quota_evidence_path is None or controller_quota_evidence_sha256 is None
                 or type(metadata_headroom_bytes) is not int or metadata_headroom_bytes <= 0
                 or type(projected_other_growth_bytes) is not int or projected_other_growth_bytes <= 0
                 or type(minimum_free_bytes) is not int or minimum_free_bytes <= 0):
-            raise ValueError("opt-in replay pruning requires fresh quota evidence, positive metadata, workspace-growth, and reserve bounds")
-        if (not isinstance(closed_export_entry_id, str)
+            raise ValueError("replay storage admission requires fresh quota evidence, positive metadata, workspace-growth, and reserve bounds")
+        if prune_verified_scratch and (not isinstance(closed_export_entry_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", closed_export_entry_id)):
             raise ValueError("opt-in replay pruning requires the registered closed-export entry id")
-        if closed_export_results_root is None:
+        if prune_verified_scratch and closed_export_results_root is None:
             raise ValueError("opt-in replay pruning requires the verified stage results root")
-        closed_export_results_root = Path(closed_export_results_root)
-        if (closed_export_results_root.is_symlink() or not closed_export_results_root.is_dir()
-                or closed_export_results_root.resolve(strict=True) != closed_export_results_root.absolute()):
-            raise ValueError("verified stage results root must be an existing real directory")
-        _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
-            evidence_path=Path(controller_quota_evidence_path),
-            evidence_sha256=controller_quota_evidence_sha256,
-            metadata_headroom_bytes=metadata_headroom_bytes,
-            projected_other_growth_bytes=projected_other_growth_bytes,
-            reserve_bytes=minimum_free_bytes, now=datetime.now(timezone.utc))
+        if prune_verified_scratch:
+            closed_export_results_root = Path(closed_export_results_root)
+            if (closed_export_results_root.is_symlink() or not closed_export_results_root.is_dir()
+                    or closed_export_results_root.resolve(strict=True) != closed_export_results_root.absolute()):
+                raise ValueError("verified stage results root must be an existing real directory")
         raw_bytes = compressed_bytes = 0
         for receipt in archives.values():
             manifest = receipt.get("manifest")
@@ -581,19 +588,42 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
             if not isinstance(roles, list) or {row.get("role") for row in roles if isinstance(row, dict)} != {"vm_a", "vm_b"}:
                 raise ValueError("replay archive does not contain both complete role inventories")
             compressed_bytes += sum(row.get("archive_bytes", 0) for row in roles)
-        # Peak new payload is downloaded role archives plus three raw copies:
-        # restored scratch, canonical results and the closed F12 export.
-        peak = compressed_bytes + 3 * raw_bytes + metadata_headroom_bytes + projected_other_growth_bytes
+        # Base peak includes restored scratch, canonical results and the closed
+        # F12 export. A campaign-owned closed export may add one more raw copy.
+        raw_copy_count = 3 + additional_raw_copies_at_peak
+        payload_bytes = compressed_bytes + raw_copy_count * raw_bytes
+        peak = (prior_replay_payload_bytes + payload_bytes
+            + metadata_headroom_bytes + projected_other_growth_bytes)
         required = peak + minimum_free_bytes
+        _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
+            evidence_path=Path(controller_quota_evidence_path),
+            evidence_sha256=controller_quota_evidence_sha256,
+            metadata_headroom_bytes=metadata_headroom_bytes,
+            projected_other_growth_bytes=projected_other_growth_bytes,
+            reserve_bytes=minimum_free_bytes, now=datetime.now(timezone.utc))
         if controller_quota_free_bytes < required:
             raise OSError(f"user quota cannot cover bounded replay peak: need {required} bytes, have {controller_quota_free_bytes}")
         replay_storage_projection = {"raw_bytes": raw_bytes, "compressed_archive_bytes": compressed_bytes,
-            "raw_copy_count_at_peak": 3, "metadata_headroom_bytes": metadata_headroom_bytes,
+            "raw_copy_count_at_peak": raw_copy_count, "metadata_headroom_bytes": metadata_headroom_bytes,
             "projected_other_growth_bytes": projected_other_growth_bytes,
+            "prior_replay_payload_bytes": prior_replay_payload_bytes,
+            "payload_bytes": payload_bytes,
             "reserve_bytes": minimum_free_bytes, "required_free_bytes": required,
             "observed_user_quota_free_bytes": controller_quota_free_bytes}
     repository_root = Path(repository_root).resolve(strict=True)
     archive_staging_root, materialization_root = Path(archive_staging_root), Path(materialization_root)
+    if prepare_replay_roots:
+        # Create the exclusive per-entry work roots only after quota admission.
+        for path, label in ((archive_staging_root, "archive staging root"),
+                            (materialization_root, "materialization root")):
+            if path.exists() or path.is_symlink():
+                raise FileExistsError(f"{label} must be a new per-capsule directory")
+            if any(parent.is_symlink() for parent in (path.parent, *path.parent.parents)):
+                raise ValueError(f"{label} has a symlink ancestor")
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if path.parent.is_symlink() or not path.parent.is_dir():
+                raise ValueError(f"{label} parent is not a real directory")
+            path.mkdir(mode=0o700)
     for path, label in ((archive_staging_root, "archive staging root"),
                         (materialization_root, "materialization root")):
         if path.is_symlink() or not path.is_dir() or path.resolve(strict=True) != path.absolute():
@@ -746,11 +776,16 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
     first_child = next(iter(children.values()))
     report = analyze_selection(selection,
         analysis_git=first_child.config_provenance.implementation_git)
-    report_path = export_root / "analysis-report.json"
+    # The native selection export is sealed by its exact transport inventory.
+    # Keep the derived report beside that immutable export and bind it separately
+    # in the replay receipt instead of silently extending or resealing the export.
+    report_path = export_root.with_name(export_root.name + "-analysis-report.json")
     fd = os.open(report_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "wb") as stream:
         stream.write((json.dumps(report.payload, sort_keys=True, indent=2) + "\n").encode())
         stream.flush(); os.fsync(stream.fileno())
+    if not verify_export(export_root):
+        raise ValueError("analysis report generation changed the sealed native export")
     output["analysis"] = {"status": "completed", "selection_path": str(selection),
         "selection_sha256": hashlib.sha256(selection.read_bytes()).hexdigest(),
         "report_path": str(report_path), "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest()}
