@@ -1448,6 +1448,8 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         return build_admission_request(campaign=campaign, parent=parent, children=children,
             costs=costs, runtime=runtime, controller_session_id=stage["controller_session_id"])
 
+    from cloud_network_benchmark.financial_controls import financial_binding
+
     pre_card_bindings = {}
     for entry in stage["entries"]:
         runtime = load_runtime_config(Path(entry["runtime_config_path"]),
@@ -1455,7 +1457,7 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
         _paid_request, plan = draft_admission(entry, runtime)
         assert "authorization" not in runtime["azure_auxiliary_cleanup"]
         pre_card_bindings[entry["entry_id"]] = (plan.financial_binding,
-            _paid_request.model_dump(mode="json"))
+            financial_binding(plan, _paid_request), _paid_request.model_dump(mode="json"))
 
     decision = tmp_path / "synthetic-cleanup-decision.txt"
     decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
@@ -1486,7 +1488,8 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
             runtime = runtime_configs[entry["entry_id"]]
             assert runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
             _paid_request, plan = draft_admission(entry, runtime)
-            assert (plan.financial_binding, _paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
+            assert (plan.financial_binding, financial_binding(plan, _paid_request),
+                _paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
             assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
 
     runtime_bytes_by_entry = {entry["entry_id"]: Path(entry["runtime_config_path"]).read_bytes()
@@ -1497,7 +1500,8 @@ def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_bin
     for entry in stage["entries"]:
         strict_runtime, _parent, _children, paid_request, plan = load_entry(stage, entry, repository_root)
         assert strict_runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
-        assert (plan.financial_binding, paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
+        assert (plan.financial_binding, financial_binding(plan, paid_request),
+            paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
         assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
 
     runtime_path = Path(stage["entries"][0]["runtime_config_path"])
