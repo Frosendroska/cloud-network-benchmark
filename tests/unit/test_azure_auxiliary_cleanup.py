@@ -193,6 +193,25 @@ def test_two_parent_barrier_grants_one_leaf_claim_and_orders_group_after_leaf(tm
     assert winner.wait_complete(deadline_monotonic=90, clock=lambda: 22.0)["claim"]["state"] == "complete"
 
 
+def test_valid_precreation_baseline_is_persisted_with_its_original_capture_time(tmp_path):
+    spec = _spec(tmp_path)
+    owner = spec["owners"][0]
+    baseline = {"schema_version": 2, "subscription_id": SUBSCRIPTION,
+        "run_id": owner["run_id"], "deployment_id": owner["deployment_id"],
+        "config_sha256": owner["config_sha256"], "profile": "all_cloud_acceptance_v1",
+        "capture_started_at_utc": "2026-11-25T11:59:00+00:00", "capture_started_monotonic": 900.0,
+        "capture_finished_at_utc": "2026-11-25T11:59:01+00:00", "capture_finished_monotonic": 901.0,
+        "groups": [], "watchers": [], "resource_inventory": [], "group_inventory": [],
+        "source_action_ids": ["baseline-resources", "baseline-groups"],
+        "inventory_sha256": hashlib.sha256(b'{"groups":[],"resources":[]}').hexdigest()}
+    baseline["sha256"] = hashlib.sha256(json.dumps(baseline, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    cohort = AuxiliaryCleanupCohort(spec)
+    cohort.record_precreation_baseline(owner, baseline)
+    assert cohort.precreation_baseline() == baseline
+    assert cohort.snapshot()["precreation_baseline"]["captured_at_utc"] == baseline["capture_started_at_utc"]
+
+
 def test_missing_peer_and_deadline_never_claim_leaf_or_extend_deadline(tmp_path):
     spec = _spec(tmp_path)
     coordinator = AuxiliaryCleanupCohort(spec)

@@ -134,7 +134,7 @@ class AuxiliaryCleanupCohort:
         _validate_precreation_baseline(baseline, owner, self.spec)
         def apply(state: dict[str, Any]) -> None:
             prior = state.get("precreation_baseline")
-            observed = {"owner_key": key, "captured_at_utc": start_dt.isoformat(),
+            observed = {"owner_key": key, "captured_at_utc": baseline["capture_started_at_utc"],
                 "baseline": baseline, "baseline_sha256": baseline["sha256"]}
             if prior is None:
                 state["precreation_baseline"] = observed
