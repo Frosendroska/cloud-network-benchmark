@@ -9,7 +9,10 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
+import re
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -50,17 +53,22 @@ class AuxiliaryCleanupCohort:
         if root.is_symlink() or any(parent.is_symlink() for parent in root.parents):
             raise ValueError("Azure auxiliary cleanup state root cannot traverse symlinks")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(root, 0o700)
+        info = root.stat()
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise PermissionError("Azure auxiliary cleanup state root must be privately owned by the current user")
         self.root = root.resolve(strict=True)
         self.digest = hashlib.sha256(canonical({k: v for k, v in self.spec.items() if k != "state_root"})).hexdigest()
         self.path = self.root / (self.spec["cohort_id"] + ".azure-cleanup.json")
         self.lock = self.root / (self.spec["cohort_id"] + ".azure-cleanup.lock")
 
     def _mutate(self, callback: Callable[[dict[str, Any]], Any]) -> Any:
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(self.lock, flags, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            lock_info = os.fstat(fd)
+            if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
+                    or lock_info.st_mode & 0o077):
+                raise PermissionError("Azure auxiliary cleanup lock must be a private regular file owned by the current user")
             lock_deadline = time.monotonic() + 1.0
             while True:
                 try:
@@ -74,8 +82,10 @@ class AuxiliaryCleanupCohort:
             if self.path.is_symlink():
                 raise ValueError("Azure auxiliary cleanup state cannot be a symlink")
             if self.path.exists():
-                if self.path.stat().st_mode & 0o077:
-                    raise PermissionError("Azure auxiliary cleanup state must remain private")
+                state_info = self.path.stat()
+                if (not self.path.is_file() or state_info.st_uid != os.getuid()
+                        or state_info.st_mode & 0o077):
+                    raise PermissionError("Azure auxiliary cleanup state must be private and owned by the current user")
                 state = json.loads(self.path.read_text(encoding="utf-8"))
                 if (state.get("schema_version") != 1 or state.get("spec_sha256") != self.digest
                         or state.get("spec") != {k: v for k, v in self.spec.items() if k != "state_root"}):
@@ -96,7 +106,8 @@ class AuxiliaryCleanupCohort:
         key = owner_key(owner)
         expected = {owner_key(item) for item in self.spec["owners"]}
         if (key not in expected or not is_sha256(baseline_sha256) or not is_sha256(activity_sha256)
-                or deadline_monotonic <= 0):
+                or isinstance(deadline_monotonic, bool) or not isinstance(deadline_monotonic, (int, float))
+                or not math.isfinite(deadline_monotonic) or deadline_monotonic <= 0):
             raise ValueError("Azure auxiliary cleanup parent identity or deadline is invalid")
         def apply(state: dict[str, Any]) -> None:
             prior = state["owners"].get(key)
@@ -107,12 +118,44 @@ class AuxiliaryCleanupCohort:
             state["owners"][key] = value
         self._mutate(apply)
 
+    def record_precreation_baseline(self, owner: dict[str, str], baseline: dict[str, Any]) -> None:
+        key = owner_key(owner)
+        expected = {owner_key(item) for item in self.spec["owners"]}
+        if key not in expected or not isinstance(baseline, dict):
+            raise ValueError("Azure auxiliary cleanup baseline owner identity is invalid")
+        started = baseline.get("capture_started_at_utc")
+        finished = baseline.get("capture_finished_at_utc")
+        try:
+            from datetime import datetime
+            start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(finished.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Azure auxiliary cleanup needs a complete pre-creation baseline window") from exc
+        if (start_dt.tzinfo is None or end_dt.tzinfo is None or end_dt < start_dt
+                or baseline.get("subscription_id") != self.spec["subscription_id"]
+                or baseline.get("run_id") != owner["run_id"]
+                or baseline.get("deployment_id") != owner["deployment_id"]
+                or baseline.get("config_sha256") != owner["config_sha256"]
+                or not is_sha256(baseline.get("sha256"))
+                or not is_sha256(baseline.get("inventory_sha256"))
+                or not isinstance(baseline.get("source_action_ids"), list)
+                or len(baseline["source_action_ids"]) < 2):
+            raise ValueError("Azure auxiliary cleanup cohort baseline is incomplete or foreign")
+        def apply(state: dict[str, Any]) -> None:
+            prior = state.get("precreation_baseline")
+            observed = {"owner_key": key, "captured_at_utc": start_dt.isoformat(),
+                "baseline": baseline, "baseline_sha256": baseline["sha256"]}
+            if prior is None:
+                state["precreation_baseline"] = observed
+        self._mutate(apply)
+
     def snapshot(self) -> dict[str, Any]:
         def read(state: dict[str, Any]) -> dict[str, Any]:
             return json.loads(json.dumps(state))
         return self._mutate(read)
 
     def claim_leaf(self, *, now_monotonic: float) -> str | None:
+        _finite_monotonic(now_monotonic, "cleanup claim clock")
         expected = {owner_key(item) for item in self.spec["owners"]}
         def apply(state: dict[str, Any]) -> str | None:
             if state["claim"] is not None:
@@ -130,6 +173,7 @@ class AuxiliaryCleanupCohort:
         return self._mutate(apply)
 
     def claim_group(self, claim_id: str, *, now_monotonic: float) -> bool:
+        _finite_monotonic(now_monotonic, "cleanup claim clock")
         def apply(state: dict[str, Any]) -> bool:
             claim = state.get("claim")
             if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
@@ -147,43 +191,56 @@ class AuxiliaryCleanupCohort:
                         activity_sha256: str,
                         deadline_monotonic: float, clock: Callable[[], float] = time.monotonic,
                         sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+        _finite_monotonic(deadline_monotonic, "cleanup deadline")
         self.register_absent(owner, baseline_sha256=baseline_sha256,
             activity_sha256=activity_sha256, deadline_monotonic=deadline_monotonic)
         expected = {owner_key(item) for item in self.spec["owners"]}
         while True:
             snapshot = self.snapshot()
+            now = _finite_monotonic(clock(), "cleanup barrier clock")
             if snapshot.get("claim") is not None:
                 return snapshot
             if set(snapshot["owners"]) == expected:
                 return snapshot
-            remaining = min(deadline_monotonic - clock(),
-                min((float(row["deadline_monotonic"]) - clock()
-                     for row in snapshot["owners"].values()), default=deadline_monotonic-clock()))
+            remaining = min(deadline_monotonic - now,
+                min((float(row["deadline_monotonic"]) - now
+                     for row in snapshot["owners"].values()), default=deadline_monotonic-now))
             if remaining <= 0:
                 raise TimeoutError("Azure auxiliary cleanup peer absence barrier reached the original cleanup deadline")
             sleep(min(0.1, remaining))
 
     def wait_complete(self, *, deadline_monotonic: float, clock: Callable[[], float] = time.monotonic,
                       sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+        _finite_monotonic(deadline_monotonic, "cleanup deadline")
         while True:
             snapshot = self.snapshot()
             claim = snapshot.get("claim")
+            now = _finite_monotonic(clock(), "cleanup completion clock")
+            owner_deadline = min((float(row["deadline_monotonic"])
+                for row in snapshot.get("owners", {}).values()), default=deadline_monotonic)
+            if now >= min(deadline_monotonic, owner_deadline):
+                raise TimeoutError("Azure auxiliary cleanup completion exceeded the original peer cleanup deadline")
             if isinstance(claim, dict) and claim.get("state") == "complete":
                 return snapshot
             if isinstance(claim, dict) and claim.get("state") in {"failed", "unknown"}:
                 raise RuntimeError("Azure auxiliary cleanup action claim is terminal: " + claim["state"])
-            remaining = deadline_monotonic - clock()
+            remaining = min(deadline_monotonic, owner_deadline) - now
             if remaining <= 0:
                 raise TimeoutError("Azure auxiliary cleanup action did not complete within the original deadline")
             sleep(min(0.1, remaining))
 
     def record_outcome(self, claim_id: str, *, action: str, identity: str,
                        outcome: str, evidence_sha256: str,
+                       now_monotonic: float,
                        typed_404_identity: str | None = None) -> None:
+        now_monotonic = _finite_monotonic(now_monotonic, "cleanup outcome clock")
         if action not in {"leaf_delete", "group_delete"} or outcome not in {"succeeded", "failed", "unknown"}:
             raise ValueError("Azure auxiliary cleanup action outcome is invalid")
         if not is_sha256(claim_id) or not is_sha256(evidence_sha256) or not isinstance(identity, str) or not identity:
             raise ValueError("Azure auxiliary cleanup action evidence is malformed")
+        expected_identity = self.spec["watcher_id"] if action == "leaf_delete" else self.spec["resource_group_id"]
+        if identity.lower() != expected_identity.lower():
+            raise ValueError("Azure auxiliary cleanup outcome identity differs from its exact target")
         if action == "leaf_delete" and outcome == "succeeded" and (
                 not isinstance(typed_404_identity, str)
                 or typed_404_identity.lower() != self.spec["watcher_id"].lower()):
@@ -194,9 +251,12 @@ class AuxiliaryCleanupCohort:
                 raise ValueError("Azure auxiliary cleanup action does not own the durable claim")
             if claim.get("state") in {"failed", "unknown", "complete"}:
                 raise RuntimeError("Azure auxiliary cleanup claim is terminal and cannot be retried")
-            expected_action = "leaf_delete" if claim.get("state") == "claimed" else "group_delete"
+            expected_action = {"claimed": "leaf_delete", "group_claimed": "group_delete"}.get(claim.get("state"))
             if action != expected_action:
                 raise ValueError("Azure auxiliary cleanup action is out of order")
+            earliest_deadline = min(float(row["deadline_monotonic"]) for row in state["owners"].values())
+            if now_monotonic >= earliest_deadline:
+                raise TimeoutError("Azure auxiliary cleanup outcome exceeded the original peer cleanup deadline")
             row = {"action": action, "identity": identity, "outcome": outcome,
                 "evidence_sha256": evidence_sha256}
             if typed_404_identity is not None:
@@ -208,6 +268,7 @@ class AuxiliaryCleanupCohort:
                 claim["state"] = "leaf_absent"
             else:
                 claim["state"] = "complete"
+                claim["completed_at_monotonic"] = now_monotonic
         self._mutate(apply)
 
 
@@ -242,6 +303,12 @@ def is_sha256(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
+def _finite_monotonic(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{label} must be finite monotonic seconds")
+    return float(value)
+
+
 def _regular_source(path: Path) -> bool:
     return (path.is_absolute() and path.is_file()
         and not any(item.is_symlink() for item in (path, *path.parents)))
@@ -256,8 +323,10 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Azure auxiliary cleanup schema is unsupported")
     if spec["profile"] not in {"normal_pair", "calibration_self"}:
         raise ValueError("Azure auxiliary cleanup profile is unsupported")
-    if not isinstance(spec["cohort_id"], str) or not spec["cohort_id"]:
-        raise ValueError("Azure auxiliary cleanup cohort identity is required")
+    if (not isinstance(spec["cohort_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", spec["cohort_id"])
+            or spec["cohort_id"] in {".", ".."}):
+        raise ValueError("Azure auxiliary cleanup cohort identity must be one safe filename component")
     if not isinstance(spec["state_root"], str) or not Path(spec["state_root"]).is_absolute():
         raise ValueError("Azure auxiliary cleanup state root must be absolute")
     subscription = spec["subscription_id"]
@@ -268,38 +337,96 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
             or spec["watcher_id"].lower() != watcher.lower()):
         raise ValueError("Azure auxiliary cleanup target differs from the exact reviewed Sweden Central identity")
     authorization = spec["authorization"]
-    if not isinstance(authorization, dict) or set(authorization) != {"card_path", "card_sha256", "runtime_path", "runtime_sha256"}:
+    if not isinstance(authorization, dict) or set(authorization) != {
+            "card_path", "card_sha256", "cohort_manifest_path", "cohort_manifest_sha256"}:
         raise ValueError("Azure auxiliary cleanup authorization binding is malformed")
-    if (not isinstance(authorization["card_path"], str)
-            or not Path(authorization["card_path"]).is_absolute()
-            or not isinstance(authorization["runtime_path"], str) or not Path(authorization["runtime_path"]).is_absolute()
-            or not is_sha256(authorization["card_sha256"]) or not is_sha256(authorization["runtime_sha256"])):
+    if (any(not isinstance(authorization[key], str) or not Path(authorization[key]).is_absolute()
+            for key in ("card_path", "cohort_manifest_path"))
+            or not is_sha256(authorization["card_sha256"])
+            or not is_sha256(authorization["cohort_manifest_sha256"])):
         raise PermissionError("Azure auxiliary cleanup requires a valid explicit source-bound authorization")
     card = Path(authorization["card_path"])
     if not _regular_source(card) or hashlib.sha256(card.read_bytes()).hexdigest() != authorization["card_sha256"]:
         raise PermissionError("Azure auxiliary cleanup authorization card is missing, changed, or unsafe")
     payload = json.loads(card.read_text(encoding="utf-8"))
-    runtime_path = Path(authorization["runtime_path"])
-    if (not _regular_source(runtime_path)
-            or hashlib.sha256(runtime_path.read_bytes()).hexdigest() != authorization["runtime_sha256"]):
-        raise PermissionError("Azure auxiliary cleanup runtime source is missing or changed")
-    if (not isinstance(payload, dict) or payload.get("schema_version") != 1
+    manifest_path = Path(authorization["cohort_manifest_path"])
+    manifest_hash = authorization["cohort_manifest_sha256"]
+    if not _regular_source(manifest_path) or hashlib.sha256(manifest_path.read_bytes()).hexdigest() != manifest_hash:
+        raise PermissionError("Azure auxiliary cleanup cohort manifest is missing, changed, or unsafe")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or set(manifest) != {
+            "schema_version", "cohort_id", "profile", "subscription_id", "region",
+            "resource_group_id", "watcher_id", "owners", "members"}:
+        raise ValueError("Azure auxiliary cleanup cohort manifest is malformed")
+    if (manifest["schema_version"] != 1 or manifest["cohort_id"] != spec["cohort_id"]
+            or manifest["profile"] != spec["profile"] or manifest["subscription_id"] != subscription
+            or manifest["region"] != spec["region"]
+            or manifest["resource_group_id"].lower() != group.lower()
+            or manifest["watcher_id"].lower() != watcher.lower() or manifest["owners"] != spec["owners"]):
+        raise PermissionError("Azure auxiliary cleanup cohort manifest differs from the exact authorized scope")
+    members = manifest["members"]
+    if not isinstance(members, list) or len(members) != len(spec["owners"]):
+        raise ValueError("Azure auxiliary cleanup cohort manifest must bind every owner runtime")
+    member_entries = set()
+    for member in members:
+        required_member = {"entry_id", "run_id", "config_sha256", "runtime_path", "runtime_sha256", "parent_manifest_path",
+            "parent_manifest_sha256", "config_path", "source_config_path", "source_config_sha256"}
+        if not isinstance(member, dict) or set(member) != required_member:
+            raise ValueError("Azure auxiliary cleanup cohort member is malformed")
+        owner = next((item for item in spec["owners"] if item["entry_id"] == member["entry_id"]
+            and item["run_id"] == member["run_id"]), None)
+        if owner is None or member["entry_id"] in member_entries:
+            raise ValueError("Azure auxiliary cleanup cohort member is foreign or duplicated")
+        if member["config_sha256"] != owner["config_sha256"]:
+            raise PermissionError("Azure auxiliary cleanup cohort config hash differs from its owner")
+        member_entries.add(member["entry_id"])
+        for path_key, hash_key in (("runtime_path", "runtime_sha256"),
+                ("parent_manifest_path", "parent_manifest_sha256"),
+                ("config_path", "config_sha256"), ("source_config_path", "source_config_sha256")):
+            path = Path(member[path_key])
+            if not _regular_source(path):
+                raise PermissionError("Azure auxiliary cleanup cohort member source is unavailable")
+            if hash_key is not None and (not is_sha256(member[hash_key])
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != member[hash_key]):
+                raise PermissionError("Azure auxiliary cleanup cohort member source hash differs")
+    if not isinstance(payload, dict) or set(payload) != {
+            "schema_version", "approval_status", "action", "profile", "cohort_id", "subscription_id", "region",
+            "resource_group_id", "watcher_id", "cohort_manifest_path", "cohort_manifest_sha256", "owners",
+            "expected_watcher_create_caller", "expected_owned_write_caller", "maximum_leaf_deletes",
+            "maximum_group_deletes", "source_path", "source_sha256", "decision_source_path",
+            "decision_source_sha256", "approved_by", "approved_at_utc", "not_before_utc", "not_after_utc"}:
+        raise PermissionError("Azure auxiliary cleanup approval card has an unknown or missing field")
+    if (type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1
             or payload.get("approval_status") != "approved"
             or payload.get("action") != "delete_exact_auto_created_network_watcher_and_empty_parent"
-            or payload.get("profile") != spec["profile"]
-            or payload.get("runtime_sha256") != authorization["runtime_sha256"]
+            or payload.get("profile") != spec["profile"] or payload.get("cohort_id") != spec["cohort_id"]
             or payload.get("subscription_id") != subscription or payload.get("region") != spec["region"]
-            or payload.get("resource_group_id", "").lower() != group.lower()
-            or payload.get("watcher_id", "").lower() != watcher.lower()
-            or payload.get("maximum_leaf_deletes") != 1 or payload.get("maximum_group_deletes") != 1):
+            or not isinstance(payload.get("resource_group_id"), str)
+            or payload["resource_group_id"].lower() != group.lower()
+            or not isinstance(payload.get("watcher_id"), str)
+            or payload["watcher_id"].lower() != watcher.lower()
+            or payload.get("cohort_manifest_path") != str(manifest_path)
+            or payload.get("cohort_manifest_sha256") != manifest_hash
+            or type(payload.get("maximum_leaf_deletes")) is not int or payload.get("maximum_leaf_deletes") != 1
+            or type(payload.get("maximum_group_deletes")) is not int or payload.get("maximum_group_deletes") != 1):
         raise PermissionError("Azure auxiliary cleanup approval card does not bind the exact target, source, and delete cap")
-    if not is_sha256(payload.get("source_sha256")) or not isinstance(payload.get("source_path"), str):
-        raise PermissionError("Azure auxiliary cleanup approval card lacks source identity")
+    if (payload.get("owners") != spec["owners"] or payload.get("source_path") != str(manifest_path)
+            or payload.get("source_sha256") != manifest_hash or not is_sha256(payload.get("decision_source_sha256"))
+            or not isinstance(payload.get("decision_source_path"), str)
+            or not isinstance(payload.get("approved_by"), str) or not payload["approved_by"].strip()):
+        raise PermissionError("Azure auxiliary cleanup approval card does not bind exact owner and decision sources")
     source = Path(payload["source_path"])
     if not _regular_source(source) or hashlib.sha256(source.read_bytes()).hexdigest() != payload["source_sha256"]:
         raise PermissionError("Azure auxiliary cleanup approval source is missing or changed")
-    if not isinstance(payload.get("expected_caller"), str) or not payload["expected_caller"].strip():
-        raise PermissionError("Azure auxiliary cleanup approval does not identify the expected Activity Log caller")
+    decision_source = Path(payload["decision_source_path"])
+    if (not _regular_source(decision_source)
+            or hashlib.sha256(decision_source.read_bytes()).hexdigest() != payload["decision_source_sha256"]):
+        raise PermissionError("Azure auxiliary cleanup human decision source is missing or changed")
+    if (not isinstance(payload.get("expected_watcher_create_caller"), str)
+            or not payload["expected_watcher_create_caller"].strip()
+            or not isinstance(payload.get("expected_owned_write_caller"), str)
+            or not payload["expected_owned_write_caller"].strip()):
+        raise PermissionError("Azure auxiliary cleanup approval must identify exact watcher and owned-write callers")
     for key in ("not_before_utc", "not_after_utc"):
         if not isinstance(payload.get(key), str):
             raise PermissionError("Azure auxiliary cleanup approval validity window is missing")
@@ -312,7 +439,9 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
             raise PermissionError("Azure auxiliary cleanup approval validity must use UTC")
     starts = datetime.fromisoformat(payload["not_before_utc"].replace("Z", "+00:00"))
     ends = datetime.fromisoformat(payload["not_after_utc"].replace("Z", "+00:00"))
-    if ends <= starts:
+    approved = datetime.fromisoformat(payload["approved_at_utc"].replace("Z", "+00:00"))
+    if (approved.tzinfo is None or approved.utcoffset() != timezone.utc.utcoffset(approved)
+            or starts.tzinfo is None or ends.tzinfo is None or ends <= starts):
         raise PermissionError("Azure auxiliary cleanup approval validity window must be positive and finite")
     owners = spec["owners"]
     expected_count = 2 if spec["profile"] == "normal_pair" else 1
@@ -332,8 +461,8 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     expected_entries = {"V-S1", "V-S3"} if spec["profile"] == "normal_pair" else {"CAL-S1"}
     if {owner["entry_id"] for owner in owners} != expected_entries:
         raise ValueError("Azure auxiliary cleanup owner set is outside the exact normal or CAL scope")
-    if payload.get("owners") != owners:
-        raise PermissionError("Azure auxiliary cleanup approval card does not bind the exact parent identities")
+    if member_entries != expected_entries:
+        raise PermissionError("Azure auxiliary cleanup cohort manifest omits a frozen owner runtime")
     return dict(spec)
 
 
@@ -344,9 +473,14 @@ def authorization_payload(spec: dict[str, Any], now_utc: Any) -> dict[str, Any]:
     from datetime import datetime, timezone
     start = datetime.fromisoformat(card["not_before_utc"].replace("Z", "+00:00"))
     end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00"))
+    approved_at = datetime.fromisoformat(card["approved_at_utc"].replace("Z", "+00:00"))
     if now_utc.tzinfo is None or now_utc.utcoffset() is None:
         raise PermissionError("Azure auxiliary cleanup authorization check needs an aware UTC clock")
     now = now_utc.astimezone(timezone.utc)
+    if approved_at.tzinfo is None or approved_at.utcoffset() != timezone.utc.utcoffset(approved_at):
+        raise PermissionError("Azure auxiliary cleanup decision timestamp must use UTC")
+    if approved_at.astimezone(timezone.utc) > now:
+        raise PermissionError("Azure auxiliary cleanup card approval timestamp is in the future")
     if now < start.astimezone(timezone.utc) or now > end.astimezone(timezone.utc):
         raise PermissionError("Azure auxiliary cleanup authorization is outside its finite validity window")
     return card

@@ -209,6 +209,19 @@ def _approval_paths(directory: Path, stage: str) -> dict[str, str]:
     return {key: str(directory / f"{key}.json") for key in sorted(_required_gate_keys(stage))}
 
 
+def _azure_auxiliary_owner(entry_id: str, child: Any) -> dict[str, Any]:
+    campaign_id, deployment_id = child.campaign_id, child.deployment_id
+    suffix = hashlib.sha256(f"{campaign_id}\0{deployment_id}".encode()).hexdigest()[:8]
+    stem = re.sub(r"[^a-z0-9-]", "-", f"cnb-{campaign_id}-{deployment_id}".lower()).strip("-")
+    slug = stem[:36].rstrip("-") + "-" + suffix
+    group = f"/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/{slug}"
+    return {"entry_id": entry_id, "run_id": child.run_id, "campaign_id": campaign_id,
+        "deployment_id": deployment_id, "config_sha256": child.config_provenance.sha256,
+        "resource_group_id": group,
+        "vm_ids": [f"{group}/providers/Microsoft.Compute/virtualMachines/{slug}-{role}" for role in ("a", "b")],
+        "nic_ids": [f"{group}/providers/Microsoft.Network/networkInterfaces/{slug}-{role}-nic" for role in ("a", "b")]}
+
+
 def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
     window = inputs.get("execution_window_utc")
     if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
@@ -906,6 +919,15 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     result = Path(results_root) / stage_id
     result.mkdir(parents=True)
     inputs = settings["stage_inputs"][stage]
+    auxiliary_opt_in = inputs.get("azure_auxiliary_cleanup", False)
+    if type(auxiliary_opt_in) is not bool:
+        raise ValueError("stage_inputs.azure_auxiliary_cleanup must be an explicit boolean")
+    if auxiliary_opt_in:
+        expected_profile = ACCEPTANCE_PROFILE if stage == "acceptance" else CALIBRATION_PROFILE if stage == "calibration" else None
+        if (not draft or expected_profile is None or inputs.get("workflow_profile") != expected_profile
+                or settings.get("providers", {}).get("azure", {}).get("subscription_id")
+                    != "188a5848-76fb-4d57-8f2a-32c09284d486"):
+            raise ValueError("Azure auxiliary cleanup is limited to an unapproved supported-profile draft in the reviewed subscription")
     cost_path = Path(state_root) / "cost-inputs.json"
     cost_payload = _cost_payload(settings, root)
     serialized = json.dumps(cost_payload, indent=2, sort_keys=True) + "\n"
@@ -919,6 +941,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         raise ValueError("ledger.scope_id must identify one shared thesis budget")
     if draft:
         approvals = _approval_paths(private / "approvals", stage)
+        if auxiliary_opt_in and entry["entry_id"] in ({"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}):
+            approvals["azure_shared_cleanup"] = str(private / "approvals" / "azure_shared_cleanup.json")
     else:
         approvals = _write_evidence(private / "approvals", _gate_rows(settings, stage), provider_scope(settings["providers"]), settings)
     support_dir = Path(state_root) / "support-inputs"
@@ -941,6 +965,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     config_paths = {}
     schedule_rows = []
     source_configs = {}
+    azure_cleanup_owners = []
     for index, (entry_id, alias) in enumerate(_selected(plan, settings)):
         template = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
         data = _frozen_config(yaml.safe_load(template.read_text()), alias, settings, entry_id)
@@ -1039,6 +1064,12 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             schedule_path.write_text(buffer.getvalue())
             selected_entry = load_schedule(schedule_path, config_paths={data["config_id"]: config_path}, repository_root=root)[0]
         initialized = initialize_campaign(config_path, root, result, schedule_entry=selected_entry)
+        if auxiliary_opt_in:
+            azure_child = next((child for child in initialized.children
+                if str(getattr(child.provider, "value", child.provider)) == "azure"), None)
+            if azure_child is None:
+                raise ValueError("Azure auxiliary cleanup scope has no initialized Azure parent")
+            azure_cleanup_owners.append(_azure_auxiliary_owner(entry["entry_id"], azure_child))
         parent_path = Path(initialized.parent_manifest_path)
         if not parent_path.is_absolute():
             parent_path = root / parent_path
@@ -1208,6 +1239,44 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             runtime["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         atomic_write_json(runtime_path, runtime)
         entry["runtime_config_sha256"] = _sha(runtime_path)
+    if auxiliary_opt_in:
+        expected_entries = {"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}
+        if {owner["entry_id"] for owner in azure_cleanup_owners} != expected_entries:
+            raise ValueError("Azure auxiliary cleanup draft must bind exactly the supported S1/S3 or CAL-S1 owner set")
+        cohort_id = f"{stage_id}-azure-shared-cleanup"
+        cohort_root = private / "azure-shared-cleanup-state"
+        manifest_path = private / "azure-auxiliary-cleanup-scope.json"
+        card_path = Path(approvals["azure_shared_cleanup"])
+        profile = "normal_pair" if stage == "acceptance" else "calibration_self"
+        watcher_group = "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG"
+        watcher_id = watcher_group + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+        selected_entries = [entry for entry in entries if entry["entry_id"] in expected_entries]
+        for entry in selected_entries:
+            runtime_path = Path(entry["runtime_config_path"])
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            runtime["azure_auxiliary_cleanup"] = {"schema_version": 1, "cohort_id": cohort_id,
+                "state_root": str(cohort_root), "subscription_id": "188a5848-76fb-4d57-8f2a-32c09284d486",
+                "region": "swedencentral", "resource_group_id": watcher_group, "watcher_id": watcher_id,
+                "profile": profile, "owners": azure_cleanup_owners, "card_path": str(card_path),
+                "cohort_manifest_path": str(manifest_path)}
+            atomic_write_json(runtime_path, runtime)
+            entry["runtime_config_sha256"] = _sha(runtime_path)
+        members = []
+        for entry, owner in zip(selected_entries, azure_cleanup_owners):
+            members.append({"entry_id": owner["entry_id"], "run_id": owner["run_id"],
+                "config_sha256": owner["config_sha256"],
+                "runtime_path": entry["runtime_config_path"], "runtime_sha256": entry["runtime_config_sha256"],
+                "parent_manifest_path": entry["parent_manifest_path"],
+                "parent_manifest_sha256": _sha(Path(entry["parent_manifest_path"])),
+                "config_path": entry["config_path"], "source_config_path": entry["source_config_path"],
+                "source_config_sha256": entry["source_config_sha256"]})
+        scope = {"schema_version": 1, "cohort_id": cohort_id, "profile": profile,
+            "subscription_id": "188a5848-76fb-4d57-8f2a-32c09284d486", "region": "swedencentral",
+            "resource_group_id": watcher_group, "watcher_id": watcher_id,
+            "owners": azure_cleanup_owners, "members": members}
+        atomic_write_json(manifest_path, scope)
+        stage_data["azure_auxiliary_cleanup_scope"] = {"path": str(manifest_path),
+            "sha256": _sha(manifest_path), "card_path": str(card_path)}
     if stage == "acceptance":
         from .failure_waiver import bind_prepared_acceptance, source_waiver
         waiver = source_waiver(settings)
@@ -1250,8 +1319,21 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
         raise ValueError("draft prerequisites remain incomplete: " + "; ".join(errors))
     private = _path(prepared.get("state_root"), "prepared state root") / stage_id
     refs = prepared.get("approval_refs")
-    if not isinstance(refs, dict) or any(Path(path).exists() for path in refs.values()):
-        raise ValueError("draft approval destinations must remain absent until financial preflight succeeds")
+    if not isinstance(refs, dict):
+        raise ValueError("draft approval destinations are malformed")
+    cleanup_scope = prepared.get("azure_auxiliary_cleanup_scope")
+    cleanup_path = refs.get("azure_shared_cleanup")
+    present = {key for key, value in refs.items() if Path(value).exists() or Path(value).is_symlink()}
+    if present - {"azure_shared_cleanup"}:
+        raise ValueError("ordinary approval destinations must remain absent until financial preflight succeeds")
+    if cleanup_scope is not None:
+        scope_path = _path(cleanup_scope.get("path"), "Azure auxiliary cleanup frozen scope", file=True)
+        if _sha(scope_path) != cleanup_scope.get("sha256") or cleanup_path != cleanup_scope.get("card_path"):
+            raise ValueError("Azure auxiliary cleanup frozen scope or card path changed")
+        if "azure_shared_cleanup" not in present:
+            raise ValueError("Azure auxiliary cleanup draft needs its separately reviewed approval card before activation")
+    elif "azure_shared_cleanup" in refs:
+        raise ValueError("Azure auxiliary cleanup approval reference has no frozen cohort scope")
     if not callable(preflight):
         raise ValueError("activation requires a read-only financial preflight callback")
     runtime_configs = {}
@@ -1262,6 +1344,9 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
         from .lifecycle_runtime import load_runtime_config
         runtime_configs[entry["entry_id"]] = load_runtime_config(runtime_path,
             selected_providers=set(entry.get("run_ids", {})), allow_missing_approval_evidence=True)
+        if cleanup_scope is not None and not runtime_configs[entry["entry_id"]].get(
+                "azure_auxiliary_cleanup", {}).get("authorization"):
+            raise PermissionError("Azure auxiliary cleanup approval card is not genuinely approved and source-bound")
     candidate = copy.deepcopy(prepared)
     candidate["status"] = "READY_FOR_ADMISSION"
     candidate["approval_files_created"] = True
@@ -1276,6 +1361,8 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
                 raise ValueError(f"prepared frozen source changed during activation: {entry.get('entry_id')} {path_key}")
     refs = _write_evidence(private / "approvals", _gate_rows(settings, stage),
         provider_scope(settings["providers"]), settings)
+    if cleanup_scope is not None:
+        refs["azure_shared_cleanup"] = cleanup_path
     if refs != prepared.get("approval_refs"):
         raise ValueError("activated approval paths differ from preallocated draft references")
     activated = copy.deepcopy(prepared)

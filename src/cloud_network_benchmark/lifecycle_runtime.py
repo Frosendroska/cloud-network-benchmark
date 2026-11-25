@@ -200,18 +200,22 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
             raise ValueError("post-measurement barrier must cover every provider child of both registered entries")
     if "azure_auxiliary_cleanup" in root:
         auxiliary = _keys(root["azure_auxiliary_cleanup"], {"schema_version", "cohort_id", "state_root",
-            "subscription_id", "region", "resource_group_id", "watcher_id", "profile", "owners", "card_path"},
+            "subscription_id", "region", "resource_group_id", "watcher_id", "profile", "owners",
+            "card_path", "cohort_manifest_path"},
             "Azure auxiliary cleanup")
         if (type(auxiliary["schema_version"]) is not int or auxiliary["schema_version"] != 1
                 or not isinstance(auxiliary["cohort_id"], str) or not auxiliary["cohort_id"]
                 or not isinstance(auxiliary["state_root"], str) or not Path(auxiliary["state_root"]).is_absolute()
                 or auxiliary["profile"] not in {"normal_pair", "calibration_self"}
-                or not isinstance(auxiliary["card_path"], str)):
+                or not isinstance(auxiliary["card_path"], str)
+                or not isinstance(auxiliary["cohort_manifest_path"], str)):
             raise ValueError("Azure auxiliary cleanup runtime binding is malformed")
         auxiliary["state_root"] = str(_source_path(path.parent, auxiliary["state_root"],
             "azure_auxiliary_cleanup.state_root", must_exist=False))
         auxiliary["card_path"] = _source_path(path.parent, auxiliary["card_path"],
-            "azure_auxiliary_cleanup.card_path")
+            "azure_auxiliary_cleanup.card_path", must_exist=not allow_missing_approval_evidence)
+        auxiliary["cohort_manifest_path"] = _source_path(path.parent, auxiliary["cohort_manifest_path"],
+            "azure_auxiliary_cleanup.cohort_manifest_path")
     if "measurement_start_barrier" in root:
         raw_barrier = root["measurement_start_barrier"]
         ready_policy = isinstance(raw_barrier, dict) and raw_barrier.get("start_policy") == "all_ready"
@@ -440,17 +444,33 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     if "azure_auxiliary_cleanup" in root:
         auxiliary = root["azure_auxiliary_cleanup"]
         card = root["approval_evidence"].get("azure_shared_cleanup")
-        if card is None:
-            raise ValueError("Azure auxiliary cleanup approval card is unavailable")
-        if card.get("approval_status") != "approved":
-            raise PermissionError("Azure auxiliary cleanup approval card is not explicitly approved")
-        auxiliary["authorization"] = {"card_path": str(auxiliary["card_path"]),
-            "card_sha256": hashlib.sha256(auxiliary["card_path"].read_bytes()).hexdigest(),
-            "runtime_path": root["runtime_source"]["path"],
-            "runtime_sha256": root["runtime_source"]["sha256"]}
         auxiliary["owners"] = _validate_azure_auxiliary_owners(auxiliary, root)
-        from .azure_auxiliary_cleanup import validate_spec
-        validate_spec(auxiliary)
+        manifest = json.loads(auxiliary["cohort_manifest_path"].read_text(encoding="utf-8"))
+        if (manifest.get("cohort_id") != auxiliary["cohort_id"]
+                or manifest.get("owners") != auxiliary["owners"]):
+            raise ValueError("Azure auxiliary cleanup cohort manifest differs from the frozen runtime scope")
+        member = next((item for item in manifest.get("members", [])
+            if item.get("runtime_path") == str(path)), None)
+        if (member is None or member.get("runtime_sha256") != root["runtime_source"]["sha256"]
+                or member.get("entry_id") not in {owner["entry_id"] for owner in auxiliary["owners"]}):
+            raise ValueError("Azure auxiliary cleanup cohort manifest does not bind this exact runtime source")
+        if card is None or card.get("approval_status") != "approved":
+            if not allow_missing_approval_evidence:
+                if card is None:
+                    raise ValueError("Azure auxiliary cleanup approval card is unavailable")
+                raise PermissionError("Azure auxiliary cleanup approval card is not explicitly approved")
+            # Draft preflight has no destructive authority. Leave the frozen
+            # scope visible for source hashing, but omit the coordinator binding.
+            auxiliary.pop("authorization", None)
+        else:
+            auxiliary["authorization"] = {"card_path": str(auxiliary["card_path"]),
+                "card_sha256": hashlib.sha256(auxiliary["card_path"].read_bytes()).hexdigest(),
+                "cohort_manifest_path": str(auxiliary["cohort_manifest_path"]),
+                "cohort_manifest_sha256": hashlib.sha256(auxiliary["cohort_manifest_path"].read_bytes()).hexdigest()}
+            auxiliary.pop("card_path")
+            auxiliary.pop("cohort_manifest_path")
+            from .azure_auxiliary_cleanup import validate_spec
+            validate_spec(auxiliary)
     return root
 
 
@@ -490,7 +510,7 @@ def _validate_azure_auxiliary_owners(auxiliary: dict[str, Any], runtime: dict[st
 
 def _azure_auxiliary_for_child(runtime: dict[str, Any], child: Any, deployment: Any) -> dict[str, Any] | None:
     auxiliary = runtime.get("azure_auxiliary_cleanup")
-    if auxiliary is None:
+    if auxiliary is None or "authorization" not in auxiliary:
         return None
     matches = [owner for owner in auxiliary["owners"] if owner["run_id"] == child.run_id
         and owner["deployment_id"] == child.deployment_id and owner["config_sha256"] == deployment.config_sha256]
@@ -720,14 +740,17 @@ def _financial_runtime_binding(runtime, children):
     source = runtime.get("runtime_source")
     if source:
         sources[source["path"]] = source["sha256"]
-    cleanup_card = runtime.get("approval_refs", {}).get("azure_shared_cleanup")
-    if cleanup_card is not None:
-        if (cleanup_card.is_symlink() or not cleanup_card.is_file()
-                or not runtime.get("azure_auxiliary_cleanup")
-                or hashlib.sha256(cleanup_card.read_bytes()).hexdigest()
-                    != runtime["azure_auxiliary_cleanup"]["authorization"]["card_sha256"]):
-            raise ValueError("Azure auxiliary cleanup approval card changed after runtime validation")
-        sources[str(cleanup_card)] = runtime["azure_auxiliary_cleanup"]["authorization"]["card_sha256"]
+    auxiliary = runtime.get("azure_auxiliary_cleanup")
+    if auxiliary is not None:
+        authorization = auxiliary.get("authorization", {})
+        manifest_path = Path(authorization.get("cohort_manifest_path")
+            or auxiliary.get("cohort_manifest_path", ""))
+        if (not manifest_path.is_absolute() or manifest_path.is_symlink() or not manifest_path.is_file()):
+            raise ValueError("Azure auxiliary cleanup cohort scope manifest is unavailable")
+        manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if authorization.get("cohort_manifest_sha256", manifest_hash) != manifest_hash:
+            raise ValueError("Azure auxiliary cleanup cohort scope manifest changed after runtime validation")
+        sources[str(manifest_path)] = manifest_hash
     bundle = getattr(runtime.get("access", {}).get("bootstrap"), "prebuilt_bundle", None)
     if bundle is not None:
         bundle_path = Path(bundle.path)
@@ -735,12 +758,20 @@ def _financial_runtime_binding(runtime, children):
                 or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.sha256):
             raise ValueError("prebuilt tool bundle changed after runtime admission validation")
         sources[str(bundle_path)] = bundle.sha256
+    effective_runtime = {k: v for k, v in runtime.items()
+        if k not in {"approval_evidence", "runtime_source", "sleep"}}
+    effective_auxiliary = effective_runtime.get("azure_auxiliary_cleanup")
+    if isinstance(effective_auxiliary, dict):
+        effective_auxiliary = dict(effective_auxiliary)
+        authorization = effective_auxiliary.pop("authorization", {})
+        effective_auxiliary.setdefault("card_path", authorization.get("card_path"))
+        effective_auxiliary.setdefault("cohort_manifest_path", authorization.get("cohort_manifest_path"))
+        effective_runtime["azure_auxiliary_cleanup"] = effective_auxiliary
     return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
         "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
                                          for c in children.values()}),
         "runtime_source": source,
-        "effective_runtime_sha256": digest({k: v for k, v in runtime.items()
-            if k not in {"approval_evidence", "runtime_source", "sleep"}}),
+        "effective_runtime_sha256": digest(effective_runtime),
         "sources": [{"path": p, "sha256": h} for p, h in sorted(sources.items())]}
 
 
