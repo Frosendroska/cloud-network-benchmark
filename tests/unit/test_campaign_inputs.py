@@ -236,7 +236,7 @@ def test_v19_release_request_is_pending_and_non_authorizing_in_draft(tmp_path):
     pending, snapshot = _reserve_release_policy(settings, "acceptance", draft=True, now=NOW)
     assert pending == request and snapshot is None
     _validate_funding_budget(amounts, pending, snapshot, draft=True, now=NOW)
-    with pytest.raises(ValueError, match="without an explicit EUR reserve-release request"):
+    with pytest.raises(ValueError, match="without an explicit EUR 14 reserve-release request"):
         _validate_funding_budget(amounts, None, None, draft=True, now=NOW)
 
 
