@@ -207,5 +207,32 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         assert fixture.backend.deleted == []
         assert outcome["counts"]["complete"] == 4
         assert set(outcome["entries"]) == {item["entry_id"] for item in stage["entries"]}
+
+        # Emulate controller loss after the immutable successful receipt was
+        # committed but before the journal marked this entry complete. Restart
+        # must validate and consume that receipt without a second restore.
+        journal_path = Path(stage["state_root"]) / stage["stage_id"] / "campaign-journal.json"
+        saved_journal = journal(stage)
+        saved_entry = saved_journal["entries"][entry["entry_id"]]
+        receipt_path = Path(saved_entry["result"]["archive_replay_receipt"])
+        receipt_bytes = receipt_path.read_bytes()
+        pending_result = dict(saved_entry["result"])
+        for key in ("archive_validation", "archive_replay_receipt", "archive_replay_receipt_sha256"):
+            pending_result.pop(key, None)
+        saved_entry.update(state="archive_pending_validation", result=pending_result)
+        journal_path.write_text(json.dumps(saved_journal, sort_keys=True) + "\n", encoding="utf-8")
+        receipt_path.write_bytes(b"corrupt receipt\n")
+        monkeypatch.setattr(archive_replay, "restore_and_finalize_batch_capsule",
+            lambda **_kwargs: pytest.fail("restart retried archive restore"))
+        monkeypatch.setattr(gcs_archive, "google_cloud_storage_backend",
+            lambda _sink: pytest.fail("restart opened archive backend"))
+        driver(clock, lambda *_: pytest.fail("restart relaunched a WEEK entry")).run(stage)
+        assert journal(stage)["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+        receipt_path.write_bytes(receipt_bytes)
+        driver(clock, lambda *_: pytest.fail("receipt recovery relaunched a WEEK entry")).run(stage)
+        recovered = journal(stage)["entries"][entry["entry_id"]]
+        assert recovered["state"] == "complete"
+        assert recovered["result"]["archive_validation"] == "valid"
+        assert verify_export(Path(stage["results_root"]) / "closed" / entry["entry_id"] / "export")
     finally:
         fixture.cleanup()
