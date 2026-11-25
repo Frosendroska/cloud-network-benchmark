@@ -1080,6 +1080,7 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
         value.update(subscription_id=subscription, complete_workflow_seconds=complete_seconds,
             post_registration_workflow_seconds=post_registration_seconds,
             cap_deadline_monotonic=880.0 + cap_seconds, retry_end_at=cap_end,
+            cap_started_monotonic=880.0,
             workflow_profile=workflow, timing_profile=None,
             admission_evidence={**value["admission_evidence"],
                 "reservation_id": reservation.reservation_id.value,
@@ -1112,6 +1113,11 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
             utc_now=lambda: start, origin_monotonic=origin_monotonic, origin_utc=start)
         expiry = register_expiry(d, expiry_request(d, o, trigger), o, registration,
             clock=lambda: 1000.0, utc_now=lambda: now)
+        assert expiry.state == "registered", expiry.failure
+        journal = o.attempt_root / "recovery.json"
+        assert journal.is_file()
+        registered_state = json.loads(journal.read_text(encoding="utf-8"))
+        assert registered_state.get("profile_external_baseline") is not None
         d = d.model_copy(update={"expiry": Evidence(value=expiry)})
         ready.append((d, o))
 
