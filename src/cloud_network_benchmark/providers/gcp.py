@@ -1513,6 +1513,10 @@ class GcpProviderDriver:
             "network_ip_a": addresses[scenario][0], "network_ip_b": addresses[scenario][1],
             "nic_type_a": "GVNIC", "nic_type_b": "GVNIC",
             "public_management_a": True, "public_management_b": True,
+            # Terraform includes declared defaults in plan JSON variables.
+            # Supply the production value so strict review compares the same
+            # complete input map that produced the saved plan.
+            "cleanup_mode": False,
         }
 
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:

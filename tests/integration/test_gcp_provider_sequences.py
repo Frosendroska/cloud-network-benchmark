@@ -1314,6 +1314,7 @@ def test_pair_apply_records_exact_template_binding_input_hash(tmp_path,monkeypat
     assert json.loads(variables)["nic_type_a"] == json.loads(variables)["nic_type_b"] == "GVNIC"
     assert json.loads(variables)["public_management_a"] is True
     assert json.loads(variables)["public_management_b"] is True
+    assert json.loads(variables)["cleanup_mode"] is False
 
 
 @pytest.mark.parametrize(("scenario", "region_b", "zone_b", "expected_b", "subnet_b"), [
@@ -1341,6 +1342,7 @@ def test_pair_factory_binds_selected_role_network_overrides(tmp_path, scenario, 
     assert variables["network_ip_b"] == expected_b
     assert variables["nic_type_a"] == variables["nic_type_b"] == "GVNIC"
     assert variables["public_management_a"] is variables["public_management_b"] is True
+    assert variables["cleanup_mode"] is False
 
 
 @pytest.mark.parametrize(("scenario", "role", "wrong_ip"), [
