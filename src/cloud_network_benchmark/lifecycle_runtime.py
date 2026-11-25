@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import hashlib
 import math
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -116,8 +117,8 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     root_keys = {"schema_version", "initialized_campaign_manifest", "ledger", "allowance",
         "copy_retry_seconds", "access", "providers", "approval_refs"}
     optional_runtime_keys = {key for key in ("archive_sink", "post_measurement_barrier",
-        "measurement_start_barrier", "observer", "workflow_profile",
-        "provider_registration_timeout_seconds", "plan_review_admission_path") if isinstance(raw, dict) and key in raw}
+        "measurement_start_barrier", "observer", "workflow_profile", "dispatch_window_utc",
+        "provider_registration_timeout_seconds", "plan_review_admission_path", "azure_auxiliary_cleanup") if isinstance(raw, dict) and key in raw}
     root = _keys(raw, root_keys | optional_runtime_keys, "runtime config")
     if type(root["schema_version"]) is not int or root["schema_version"] != 1:
         raise ValueError("runtime configuration schema_version must be integer 1")
@@ -197,12 +198,32 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         if ({(entry, provider) for entry, provider, _ in normalized}
                 != {(entry, provider) for entry in ("V-S1", "V-S3") for provider in ("aws", "azure", "gcp")}):
             raise ValueError("post-measurement barrier must cover every provider child of both registered entries")
+    if "azure_auxiliary_cleanup" in root:
+        auxiliary = _keys(root["azure_auxiliary_cleanup"], {"schema_version", "cohort_id", "state_root",
+            "subscription_id", "region", "resource_group_id", "watcher_id", "profile", "owners",
+            "card_path", "cohort_manifest_path"},
+            "Azure auxiliary cleanup")
+        if (type(auxiliary["schema_version"]) is not int or auxiliary["schema_version"] != 1
+                or not isinstance(auxiliary["cohort_id"], str) or not auxiliary["cohort_id"]
+                or not isinstance(auxiliary["state_root"], str) or not Path(auxiliary["state_root"]).is_absolute()
+                or auxiliary["profile"] not in {"normal_pair", "calibration_self"}
+                or not isinstance(auxiliary["card_path"], str)
+                or not isinstance(auxiliary["cohort_manifest_path"], str)):
+            raise ValueError("Azure auxiliary cleanup runtime binding is malformed")
+        auxiliary["state_root"] = str(_source_path(path.parent, auxiliary["state_root"],
+            "azure_auxiliary_cleanup.state_root", must_exist=False))
+        auxiliary["card_path"] = _source_path(path.parent, auxiliary["card_path"],
+            "azure_auxiliary_cleanup.card_path", must_exist=not allow_missing_approval_evidence)
+        auxiliary["cohort_manifest_path"] = _source_path(path.parent, auxiliary["cohort_manifest_path"],
+            "azure_auxiliary_cleanup.cohort_manifest_path")
     if "measurement_start_barrier" in root:
         raw_barrier = root["measurement_start_barrier"]
         ready_policy = isinstance(raw_barrier, dict) and raw_barrier.get("start_policy") == "all_ready"
         barrier_keys = {"schema_version", "barrier_id", "barrier_root", "expected_participants",
             "start_policy", "execution_window", "ready_window_seconds"} if ready_policy else {
             "schema_version", "barrier_id", "barrier_root", "expected_participants", "start_utc"}
+        if ready_policy and isinstance(raw_barrier, dict) and "dispatch_window_utc" in raw_barrier:
+            barrier_keys.add("dispatch_window_utc")
         barrier = _keys(raw_barrier, barrier_keys, "measurement start barrier")
         participants = barrier["expected_participants"]
         calibration_entry = (root.get("workflow_profile") == "all_cloud_calibration_v1"
@@ -238,6 +259,33 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
                     or window_end.utcoffset().total_seconds() != 0
                     or window_end <= window_start):
                 raise ValueError("ready-triggered barrier execution window is invalid")
+            has_runtime_dispatch = "dispatch_window_utc" in root
+            has_barrier_dispatch = "dispatch_window_utc" in barrier
+            if has_runtime_dispatch != has_barrier_dispatch:
+                raise ValueError("ready-triggered dispatch window must be bound in both runtime and barrier")
+            if has_runtime_dispatch:
+                dispatch = _keys(root["dispatch_window_utc"], {"not_before_utc", "not_after_utc"},
+                    "runtime dispatch window")
+                barrier_dispatch = _keys(barrier["dispatch_window_utc"], {"not_before_utc", "not_after_utc"},
+                    "measurement start dispatch window")
+                try:
+                    dispatch_bounds = [datetime.fromisoformat(dispatch[name].replace("Z", "+00:00"))
+                        for name in ("not_before_utc", "not_after_utc")]
+                    barrier_bounds = [datetime.fromisoformat(barrier_dispatch[name].replace("Z", "+00:00"))
+                        for name in ("not_before_utc", "not_after_utc")]
+                except (AttributeError, ValueError) as exc:
+                    raise ValueError("ready-triggered dispatch window bounds must use UTC timestamps") from exc
+                if (any(value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0
+                            for value in dispatch_bounds + barrier_bounds)
+                        or dispatch_bounds[1] <= dispatch_bounds[0]
+                        or dispatch_bounds[1] > window_end
+                        or dispatch_bounds != barrier_bounds):
+                    raise ValueError("ready-triggered dispatch window is malformed or mismatched")
+                root["dispatch_window_utc"] = {name: value.astimezone(timezone.utc).isoformat()
+                    for name, value in zip(("not_before_utc", "not_after_utc"), dispatch_bounds)}
+                barrier["dispatch_window_utc"] = dict(root["dispatch_window_utc"])
+        elif "dispatch_window_utc" in root or "dispatch_window_utc" in barrier:
+            raise ValueError("dispatch_window_utc is allowed only for ready-triggered validation profiles")
         expected_entries = {"CAL-S1"} if calibration_entry else {"V-S1", "V-S3"}
         expected_pairs = {(entry, provider) for entry in expected_entries for provider in {"aws", "azure", "gcp"}}
         identities = set()
@@ -289,6 +337,17 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     except (TypeError, ValueError) as exc:
         raise ValueError("allowance does not match the strict F11 workflow contract") from exc
     workflow_profile = root.get("workflow_profile")
+    auxiliary = root.get("azure_auxiliary_cleanup")
+    if auxiliary is not None:
+        if "azure" not in providers or workflow_profile not in {"all_cloud_acceptance_v1", "all_cloud_calibration_v1"}:
+            raise ValueError("Azure auxiliary cleanup is restricted to the registered normal or calibration profile")
+        expected_aux_profile = ("normal_pair" if workflow_profile == "all_cloud_acceptance_v1"
+            else "calibration_self")
+        if auxiliary["profile"] != expected_aux_profile:
+            raise ValueError("Azure auxiliary cleanup scope differs from the selected workflow profile")
+        if (expected_aux_profile == "normal_pair" and "post_measurement_barrier" not in root
+                or expected_aux_profile == "calibration_self" and "measurement_start_barrier" not in root):
+            raise ValueError("Azure auxiliary cleanup requires the exact source-bound cohort barrier")
     from .validation_profiles import PROFILE_SPECS, validate_profile_allowance
     if workflow_profile is not None:
         if workflow_profile not in PROFILE_SPECS:
@@ -351,12 +410,15 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         raise ValueError("approval_refs must be a map of existing F11 gate names to evidence files")
     allowed_gates = {"f10_offline", "paid_authorization", "quota_review", "paid_acceptance", "common_n",
         "study_window", "calibration_authorized", "diagnostic_day_authorized", "size_export_review",
-        "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance"}
+        "optional_review", "original_failure", "weekly_concurrency", "paired_acceptance", "azure_shared_cleanup"}
     if set(root["approval_refs"]) - allowed_gates:
         raise ValueError("approval_refs names an unknown F11 gate")
     root["approval_refs"] = {key: _source_path(path.parent, value, f"approval_refs.{key}",
                                 must_exist=not allow_missing_approval_evidence)
                               for key, value in root["approval_refs"].items()}
+    if "azure_auxiliary_cleanup" in root and (
+            root["approval_refs"].get("azure_shared_cleanup") != root["azure_auxiliary_cleanup"]["card_path"]):
+        raise ValueError("Azure auxiliary cleanup requires its exact source-bound approval_refs card")
     root["approval_evidence"] = {}
     for key, reference in root["approval_refs"].items():
         if (allow_missing_approval_evidence and not reference.exists()
@@ -379,7 +441,135 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         root["approval_evidence"][key] = {**evidence, "source_path": str(source)}
     root["runtime_source"] = {"path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    if "azure_auxiliary_cleanup" in root:
+        auxiliary = root["azure_auxiliary_cleanup"]
+        card = root["approval_evidence"].get("azure_shared_cleanup")
+        auxiliary["owners"] = _validate_azure_auxiliary_owners(auxiliary, root)
+        manifest = json.loads(auxiliary["cohort_manifest_path"].read_text(encoding="utf-8"))
+        if (manifest.get("cohort_id") != auxiliary["cohort_id"]
+                or manifest.get("owners") != auxiliary["owners"]):
+            raise ValueError("Azure auxiliary cleanup cohort manifest differs from the frozen runtime scope")
+        member = next((item for item in manifest.get("members", [])
+            if item.get("runtime_path") == str(path)), None)
+        if (member is None or member.get("runtime_sha256") != root["runtime_source"]["sha256"]
+                or member.get("entry_id") not in {owner["entry_id"] for owner in auxiliary["owners"]}):
+            raise ValueError("Azure auxiliary cleanup cohort manifest does not bind this exact runtime source")
+        _validate_azure_parent_snapshot(member, root, path, auxiliary)
+        if card is None or card.get("approval_status") != "approved":
+            if not allow_missing_approval_evidence:
+                if card is None:
+                    raise ValueError("Azure auxiliary cleanup approval card is unavailable")
+                raise PermissionError("Azure auxiliary cleanup approval card is not explicitly approved")
+            # Draft preflight has no destructive authority. Leave the frozen
+            # scope visible for source hashing, but omit the coordinator binding.
+            auxiliary.pop("authorization", None)
+        else:
+            auxiliary["authorization"] = {"card_path": str(auxiliary["card_path"]),
+                "card_sha256": hashlib.sha256(auxiliary["card_path"].read_bytes()).hexdigest(),
+                "cohort_manifest_path": str(auxiliary["cohort_manifest_path"]),
+                "cohort_manifest_sha256": hashlib.sha256(auxiliary["cohort_manifest_path"].read_bytes()).hexdigest()}
+            auxiliary.pop("card_path")
+            auxiliary.pop("cohort_manifest_path")
+            from .azure_auxiliary_cleanup import validate_spec
+            validate_spec(auxiliary)
     return root
+
+
+def _validate_azure_auxiliary_owners(auxiliary: dict[str, Any], runtime: dict[str, Any]) -> list[dict[str, str]]:
+    owners = auxiliary.get("owners")
+    expected_count = 2 if auxiliary["profile"] == "normal_pair" else 1
+    if not isinstance(owners, list) or len(owners) != expected_count:
+        raise ValueError("Azure auxiliary cleanup must identify exactly its registered Azure parent set")
+    normalized = []
+    required = {"entry_id", "run_id", "campaign_id", "deployment_id", "config_sha256",
+        "resource_group_id", "vm_ids", "nic_ids"}
+    for row in owners:
+        owner = _keys(row, required, "Azure auxiliary cleanup owner")
+        if (not all(isinstance(owner[k], str) and owner[k]
+                for k in required - {"vm_ids", "nic_ids"})
+                or not re.fullmatch(r"[a-f0-9]{64}", owner["config_sha256"])
+                or not isinstance(owner["vm_ids"], list) or not isinstance(owner["nic_ids"], list)):
+            raise ValueError("Azure auxiliary cleanup owner identity is invalid")
+        normalized.append({key: owner[key] for key in ("entry_id", "run_id", "campaign_id", "deployment_id", "config_sha256",
+            "resource_group_id", "vm_ids", "nic_ids")})
+    from .azure_auxiliary_cleanup import owner_key
+    for owner in normalized:
+        owner_key(owner)
+    if len({(row["entry_id"], row["run_id"], row["deployment_id"]) for row in normalized}) != expected_count:
+        raise ValueError("Azure auxiliary cleanup owners must be unique")
+    expected_entries = {"V-S1", "V-S3"} if auxiliary["profile"] == "normal_pair" else {"CAL-S1"}
+    if {row["entry_id"] for row in normalized} != expected_entries:
+        raise ValueError("Azure auxiliary cleanup owners are outside normal pair or calibration scope")
+    participants = (runtime.get("post_measurement_barrier", {}).get("expected_participants", [])
+        if auxiliary["profile"] == "normal_pair" else runtime.get("measurement_start_barrier", {}).get("expected_participants", []))
+    expected_runs = {(row.get("entry_id"), row.get("run_id")) for row in participants
+        if row.get("provider") == "azure"}
+    if {(row["entry_id"], row["run_id"]) for row in normalized} != expected_runs:
+        raise ValueError("Azure auxiliary cleanup owners differ from the source-bound runtime barrier identities")
+    return normalized
+
+
+def _validate_azure_parent_snapshot(member: dict[str, Any], runtime: dict[str, Any],
+                                    runtime_path: Path, auxiliary: dict[str, Any]) -> None:
+    """Bind the cohort's immutable initialized-parent bytes to the live parent identity."""
+    from .manifests import CampaignManifest, ChildRunManifest
+
+    snapshot_value = member.get("parent_manifest_path")
+    expected_hash = member.get("parent_manifest_sha256")
+    live_value = runtime.get("initialized_campaign_manifest")
+    if (not isinstance(snapshot_value, str) or not isinstance(expected_hash, str)
+            or not isinstance(live_value, (str, Path))):
+        raise ValueError("Azure auxiliary cleanup requires initialized parent snapshot and live identity paths")
+    snapshot = Path(snapshot_value)
+    live = Path(live_value)
+    if not snapshot.is_absolute():
+        snapshot = runtime_path.parent / snapshot
+    if not live.is_absolute():
+        live = runtime_path.parent / live
+    snapshot = snapshot.absolute()
+    live = live.absolute()
+    if (any(part.is_symlink() for path in (snapshot, live) for part in (path, *path.parents))
+            or snapshot == live
+            or not snapshot.is_file() or not live.is_file()
+            or snapshot.parent != runtime_path.parent.resolve()):
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot is outside its private stage or aliases the live manifest")
+    snapshot_bytes = snapshot.read_bytes()
+    if hashlib.sha256(snapshot_bytes).hexdigest() != expected_hash:
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot hash mismatch")
+    snapshot_parent = CampaignManifest.model_validate_json(snapshot_bytes)
+    live_parent = CampaignManifest.model_validate_json(live.read_bytes())
+    mutable = {"reservation", "aggregate_state", "updated_at", "lifecycle_events"}
+    if (snapshot_parent.model_dump(mode="json", exclude=mutable)
+            != live_parent.model_dump(mode="json", exclude=mutable)):
+        raise ValueError("Azure auxiliary cleanup initialized parent snapshot differs from live parent identity")
+    owner = next((item for item in auxiliary["owners"] if item["entry_id"] == member.get("entry_id")), None)
+    azure_reference = next((item for item in snapshot_parent.child_runs if str(item.provider) == "azure"), None)
+    if owner is None or azure_reference is None or azure_reference.run_id != owner["run_id"]:
+        raise ValueError("Azure auxiliary cleanup snapshot does not identify its source-bound Azure child")
+    repository_root = Path(__file__).resolve().parents[2]
+    child_path = Path(azure_reference.manifest_path)
+    if not child_path.is_absolute():
+        child_path = repository_root / child_path
+    child_path = child_path.absolute()
+    if (any(part.is_symlink() for part in (child_path, *child_path.parents))
+            or not child_path.is_file()):
+        raise ValueError("Azure auxiliary cleanup initialized child manifest is unavailable")
+    child = ChildRunManifest.model_validate_json(child_path.read_bytes())
+    if (child.provider != "azure" or child.run_id != owner["run_id"]
+            or child.campaign_id != owner["campaign_id"] or child.deployment_id != owner["deployment_id"]
+            or child.config_provenance.sha256 != owner["config_sha256"]):
+        raise ValueError("Azure auxiliary cleanup owner differs from initialized parent and child identities")
+
+
+def _azure_auxiliary_for_child(runtime: dict[str, Any], child: Any, deployment: Any) -> dict[str, Any] | None:
+    auxiliary = runtime.get("azure_auxiliary_cleanup")
+    if auxiliary is None or "authorization" not in auxiliary:
+        return None
+    matches = [owner for owner in auxiliary["owners"] if owner["run_id"] == child.run_id
+        and owner["deployment_id"] == child.deployment_id and owner["config_sha256"] == deployment.config_sha256]
+    if len(matches) != 1:
+        raise ValueError("Azure auxiliary cleanup card does not bind this exact initialized deployment")
+    return auxiliary
 
 
 def load_initialized_campaign(parent_path: Path, *, repository_root: Path,
@@ -603,6 +793,17 @@ def _financial_runtime_binding(runtime, children):
     source = runtime.get("runtime_source")
     if source:
         sources[source["path"]] = source["sha256"]
+    auxiliary = runtime.get("azure_auxiliary_cleanup")
+    if auxiliary is not None:
+        authorization = auxiliary.get("authorization", {})
+        manifest_path = Path(authorization.get("cohort_manifest_path")
+            or auxiliary.get("cohort_manifest_path", ""))
+        if (not manifest_path.is_absolute() or manifest_path.is_symlink() or not manifest_path.is_file()):
+            raise ValueError("Azure auxiliary cleanup cohort scope manifest is unavailable")
+        manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if authorization.get("cohort_manifest_sha256", manifest_hash) != manifest_hash:
+            raise ValueError("Azure auxiliary cleanup cohort scope manifest changed after runtime validation")
+        sources[str(manifest_path)] = manifest_hash
     bundle = getattr(runtime.get("access", {}).get("bootstrap"), "prebuilt_bundle", None)
     if bundle is not None:
         bundle_path = Path(bundle.path)
@@ -610,12 +811,20 @@ def _financial_runtime_binding(runtime, children):
                 or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.sha256):
             raise ValueError("prebuilt tool bundle changed after runtime admission validation")
         sources[str(bundle_path)] = bundle.sha256
+    effective_runtime = {k: v for k, v in runtime.items()
+        if k not in {"approval_evidence", "runtime_source", "sleep"}}
+    effective_auxiliary = effective_runtime.get("azure_auxiliary_cleanup")
+    if isinstance(effective_auxiliary, dict):
+        effective_auxiliary = dict(effective_auxiliary)
+        authorization = effective_auxiliary.pop("authorization", {})
+        effective_auxiliary.setdefault("card_path", authorization.get("card_path"))
+        effective_auxiliary.setdefault("cohort_manifest_path", authorization.get("cohort_manifest_path"))
+        effective_runtime["azure_auxiliary_cleanup"] = effective_auxiliary
     return {"implementation_revision": RepositoryGitProvenance().commit(root).value,
         "initialized_revisions": sorted({c.config_provenance.implementation_git_commit.value or ""
                                          for c in children.values()}),
         "runtime_source": source,
-        "effective_runtime_sha256": digest({k: v for k, v in runtime.items()
-            if k not in {"approval_evidence", "runtime_source", "sleep"}}),
+        "effective_runtime_sha256": digest(effective_runtime),
         "sources": [{"path": p, "sha256": h} for p, h in sorted(sources.items())]}
 
 
@@ -1082,7 +1291,8 @@ def build_provider_workflows(*, campaign: Any, parent: Any, children: dict[str, 
                 retry_end_at=reservation.expires_at.value, poll_seconds=config["poll_seconds"],
                 command_timeout_seconds=config["command_timeout_seconds"], expiry_cost_input=price,
                 plan_review_timeout_seconds=_plan_review_timeout_seconds(config, runtime.get("workflow_profile")),
-                plan_review_admission_path=runtime.get("plan_review_admission_path"))
+                plan_review_admission_path=runtime.get("plan_review_admission_path"),
+                azure_auxiliary_cleanup=_azure_auxiliary_for_child(runtime, child, deployment))
             name, ids = azure_provider._validate_request(deployment, options,
                 reservation.cap_started_at.value, None, check_live_clock=False)
             requests[provider] = ExpiryRequest(schema_version=2, run_id=child.run_id,

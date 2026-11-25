@@ -38,7 +38,9 @@ CAPTURED_AWS_CLI_REJECT = '\naws: [ERROR]: ' + REJECT + '\n'
 
 def aws_driver(runner):
     return AwsProviderDriver(runner, SimpleNamespace(aws_cli='aws',registration_timeout_seconds=90,
-        authentication_reference='secret-reference',public_key='public-key-sentinel'),clock=lambda:NOW)
+        authentication_reference='secret-reference',public_key='public-key-sentinel',
+        workflow_profile=None,workflow_cap_started_monotonic=None,
+        plan_review_timeout_seconds=0,command_timeout_seconds=120),clock=lambda:NOW)
 
 
 @pytest.mark.parametrize('mismatch', [None,'document','version','role','deadline','run','deployment','region'])

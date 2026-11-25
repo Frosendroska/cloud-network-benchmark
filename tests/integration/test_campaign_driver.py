@@ -182,6 +182,38 @@ def acceptance_stage_fixture(tmp_path):
     return stage
 
 
+def ready_acceptance_stage_fixture(tmp_path):
+    stage = acceptance_stage_fixture(tmp_path)
+    pair = stage["entries"][:2]
+    lower = START
+    dispatch = {"not_before_utc": lower.isoformat(),
+        "not_after_utc": (lower + timedelta(minutes=15)).isoformat()}
+    execution = {"not_before_utc": lower.isoformat(),
+        "not_after_utc": (lower + timedelta(hours=1)).isoformat()}
+    source = tmp_path / "ready-admission-source.json"
+    source.write_text('{"fixture":"SYNTHETIC OFFLINE TEST ONLY"}\n')
+    evidence = Path(stage["dispatch_policy"]["evidence_path"])
+    evidence.write_text(json.dumps({"mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
+        "execution_window_utc": execution, "dispatch_window_utc": dispatch,
+        "source_path": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}) + "\n")
+    stage["dispatch_policy"] = {"policy_id": "acceptance-paired-s1-s3-ready-v1",
+        "group_by": "acceptance_slot", "scenarios": ["S1", "S3"], "max_parallel_entries": 2,
+        "start_policy": "all_ready", "execution_window": execution, "dispatch_window_utc": dispatch,
+        "ready_window_seconds": 600, "evidence_path": str(evidence),
+        "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}
+    for entry in pair:
+        entry["scheduled_start"] = None
+        entry["launch_at"] = lower.isoformat()
+    participants = stage["post_measurement_barrier"]["expected_participants"]
+    stage["dispatch_window_utc"] = dispatch
+    stage["measurement_start_barrier"] = {"schema_version": 1,
+        "barrier_id": f"{stage['stage_id']}-normal-measurement-start",
+        "barrier_root": str(Path(stage["state_root"]) / stage["stage_id"] / "measurement-barriers" / "normal-start"),
+        "expected_participants": participants, "start_policy": "all_ready",
+        "execution_window": execution, "dispatch_window_utc": dispatch, "ready_window_seconds": 600}
+    return stage
+
+
 def test_acceptance_s1_s3_entries_run_as_one_bounded_parallel_slot(tmp_path):
     stage = acceptance_stage_fixture(tmp_path)
     active = 0
@@ -222,6 +254,53 @@ def test_acceptance_rejects_changed_pair_admission_before_launch(tmp_path):
     with pytest.raises(ValueError, match="evidence is missing or changed"):
         driver(FakeClock(), lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}).run(stage)
     assert launched == []
+
+
+def test_expired_ready_dispatch_window_blocks_admission_and_provider_launch(tmp_path):
+    stage = ready_acceptance_stage_fixture(tmp_path)
+    dispatch_calls = []
+    admission_calls = []
+    clock = FakeClock(START + timedelta(minutes=15, seconds=1))
+    result = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+        launch=lambda entry, _: dispatch_calls.append(entry["entry_id"]) or {"status": "complete"},
+        pre_admit=lambda *_: admission_calls.append("admit"), clock=clock, sleep=clock.sleep).run(stage)
+    assert dispatch_calls == [] and admission_calls == []
+    assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+
+
+def test_production_launch_rechecks_dispatch_after_log_open_before_popen(tmp_path, monkeypatch):
+    import cloud_network_benchmark.campaign as campaign_module
+
+    stage = ready_acceptance_stage_fixture(tmp_path)
+    lower, upper = campaign_module._stage_dispatch_window(stage)
+    now = [lower + timedelta(seconds=1)]
+    popen_calls = []
+    opened_logs = []
+    real_open = Path.open
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0].astimezone(tz) if tz else now[0].replace(tzinfo=None)
+
+    def crossing_open(path, *args, **kwargs):
+        result = real_open(path, *args, **kwargs)
+        if path.name == "V-S1.log":
+            opened_logs.append(result)
+            now[0] = upper + timedelta(seconds=1)
+        return result
+
+    monkeypatch.setattr(campaign_module, "datetime", ControlledDateTime)
+    monkeypatch.setattr(Path, "open", crossing_open)
+    monkeypatch.setattr(campaign_module.subprocess, "Popen",
+        lambda *args, **kwargs: popen_calls.append(args) or None)
+
+    with pytest.raises(campaign_module._DispatchWindowExpired, match="immediately before lifecycle process start"):
+        campaign_module.CampaignDriver._launch_lifecycle(stage["entries"][0], stage)
+
+    assert popen_calls == []
+    assert len(opened_logs) == 1 and opened_logs[0].closed
+    assert Path(stage["state_root"], stage["stage_id"], "V-S1.log").stat().st_size == 0
 
 
 def test_acceptance_does_not_shift_fixed_start_after_aggregate_admission(tmp_path):
@@ -305,8 +384,8 @@ def test_completed_acceptance_pair_restarts_without_remeasurement(tmp_path):
     restarted.run(stage)
 
 
-@pytest.mark.parametrize("one_cent_under", [False, True])
-def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_root, tmp_path, monkeypatch, one_cent_under):
+@pytest.mark.parametrize("admission_case", ["within_window", "one_cent_under", "dispatch_expired_after_reserve"])
+def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_root, tmp_path, monkeypatch, admission_case):
     import copy
     from datetime import datetime, timezone
     from types import SimpleNamespace
@@ -315,7 +394,7 @@ def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_ro
     from cloud_network_benchmark.contracts.common import Evidence, Provider
     from tests.integration.test_f11_ledger import scheduled_request_and_plan
 
-    stage = acceptance_stage_fixture(tmp_path)
+    stage = ready_acceptance_stage_fixture(tmp_path)
     stage["repository_root"] = str(repository_root)
     stage["scope_id"] = "offline-acceptance-pair"
     stage["controller_session_id"] = "offline-acceptance-controller"
@@ -362,7 +441,7 @@ def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_ro
     book = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
         utc_now=clock.utc_now, monotonic_now=clock.monotonic, controller_session_id=stage["controller_session_id"])
     book.initialize(costs)
-    if one_cent_under:
+    if admission_case == "one_cent_under":
         request, plan = scheduled_request_and_plan(campaign, costs, campaign_id="prior-one-cent",
             providers=providers, child_prefix="prior-one-cent", namespace_prefix="prior-one-cent",
             funding={"primary": "0.01"}, measurement_seconds=76)
@@ -372,15 +451,49 @@ def test_acceptance_pre_admits_both_full_ledgers_before_any_launch(repository_ro
         assert book.reserve(request, plan=plan).status == "reserved"
 
     launched = []
+    import cloud_network_benchmark.campaign as campaign_module
+    popen_calls = []
+    monkeypatch.setattr(campaign_module.subprocess, "Popen",
+        lambda *args, **kwargs: popen_calls.append(args) or None)
     engine = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
-        launch=lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}, clock=clock,
+        launch=(campaign_module.CampaignDriver._launch_lifecycle if admission_case == "dispatch_expired_after_reserve"
+            else lambda entry, _: launched.append(entry["entry_id"]) or {"status": "complete"}), clock=clock,
         sleep=clock.sleep)
     engine.pre_admit = engine._pre_admit_acceptance_pair
-    if one_cent_under:
+    if admission_case == "dispatch_expired_after_reserve":
+        actual_pre_admit = engine.pre_admit
+        def cross_dispatch_after_reserve(entries, prepared_stage):
+            reservation_ids = actual_pre_admit(entries, prepared_stage)
+            clock.current = datetime.fromisoformat(prepared_stage["dispatch_window_utc"]["not_after_utc"]) + timedelta(seconds=1)
+            return reservation_ids
+        engine.pre_admit = cross_dispatch_after_reserve
+    if admission_case == "one_cent_under":
         result = engine.run(stage)
         assert launched == []
         assert len(book.inspect()["reservations"]) == 2  # prior + first paired liability; no VM call occurred
         assert all(result["entries"][entry_id]["state"] == "missed" for entry_id in ("V-S1", "V-S3"))
+    elif admission_case == "dispatch_expired_after_reserve":
+        result = engine.run(stage)
+        ledger = book.inspect()
+        assert launched == [] and popen_calls == []
+        assert len(ledger["reservations"]) == 2
+        assert not any(event_id.startswith("cancel-unused:") for event_id in ledger["events"])
+        assert result["status"] == "awaiting_operator"
+        assert result["cleanup_liabilities"] == 2
+        assert len(result["retained_reservation_reconciliations"]) == 2
+        status = engine.status(Path(stage["state_root"]), stage["stage_id"])[0]
+        assert status["status"] == "awaiting_operator"
+        assert status["cleanup_liabilities"] == 2
+        assert len(status["retained_reservation_reconciliations"]) == 2
+        for entry_id in ("V-S1", "V-S3"):
+            record = result["entries"][entry_id]
+            assert record["state"] == "missed"
+            assert record["result"]["provider_calls"] == 0
+            assert record["result"]["cleanup_open"] is True
+            assert record["result"]["provider_cleanup_required"] is False
+            assert record["result"]["reservation_status"] == "retained_reserved_unreconciled"
+            assert set(record["result"]["pre_admission_reservation_ids"]) == set(ledger["reservations"])
+            assert "retain their holds" in record["result"]["next_action"]
     else:
         result = engine.run(stage)
         reservations = book.inspect()["reservations"]

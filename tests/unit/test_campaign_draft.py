@@ -13,7 +13,7 @@ from cloud_network_benchmark.campaign import CampaignDriver
 from cloud_network_benchmark.campaign import _acceptance_pair
 from cloud_network_benchmark.campaign_draft import (
     DRAFT_STATUS, load_and_verify_draft, mark_consumed,
-    verify_activation, _stage_identity,
+    verify_activation, _stage_identity, _expected_acceptance_policy,
 )
 
 
@@ -24,14 +24,17 @@ def _ready_acceptance_stage(tmp_path):
     source = tmp_path / "approval-source.yaml"; source.write_text("synthetic-offline-fixture\n")
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     lower, upper = "2026-11-23T00:00:00+00:00", "2026-11-23T06:00:00+00:00"
+    dispatch = {"not_before_utc": lower, "not_after_utc": "2026-11-23T03:00:00+00:00"}
     admission = {"mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
         "execution_window_utc": {"not_before_utc": lower, "not_after_utc": upper},
+        "dispatch_window_utc": dispatch,
         "source_path": str(source), "source_sha256": source_hash}
     admission_path = tmp_path / "paired-acceptance.json"
     admission_path.write_text(json.dumps(admission))
     policy = {"policy_id": "acceptance-paired-s1-s3-ready-v1", "group_by": "acceptance_slot",
         "scenarios": ["S1", "S3"], "max_parallel_entries": 2, "start_policy": "all_ready",
-        "execution_window": admission["execution_window_utc"], "ready_window_seconds": 90,
+        "execution_window": admission["execution_window_utc"], "dispatch_window_utc": dispatch,
+        "ready_window_seconds": 90,
         "evidence_path": str(admission_path), "evidence_sha256": hashlib.sha256(admission_path.read_bytes()).hexdigest()}
     entries = []
     participants = []
@@ -47,7 +50,7 @@ def _ready_acceptance_stage(tmp_path):
     state_root = tmp_path / "state"
     barrier_root = state_root / stage_id / "measurement-barriers"
     return {"stage_id": stage_id, "stage": "acceptance", "state_root": str(state_root),
-        "entries": entries, "dispatch_policy": policy,
+        "entries": entries, "dispatch_policy": policy, "dispatch_window_utc": dispatch,
         "post_measurement_barrier": {"schema_version": 1,
             "barrier_id": f"{stage_id}-normal-measurement-terminal",
             "barrier_root": str(barrier_root / "normal-terminal"), "expected_participants": participants},
@@ -55,6 +58,7 @@ def _ready_acceptance_stage(tmp_path):
             "barrier_id": f"{stage_id}-normal-measurement-start",
             "barrier_root": str(barrier_root / "normal-start"), "expected_participants": participants,
             "start_policy": "all_ready", "execution_window": policy["execution_window"],
+            "dispatch_window_utc": dispatch,
             "ready_window_seconds": policy["ready_window_seconds"]}}
 
 
@@ -77,11 +81,61 @@ def test_ready_acceptance_pair_freezes_window_and_all_six_participants(tmp_path)
         _acceptance_pair(legacy_null)
 
 
+def test_legacy_ready_profile_defaults_dispatch_to_the_original_execution_window(tmp_path):
+    stage = _ready_acceptance_stage(tmp_path)
+    admission_path = Path(stage["dispatch_policy"]["evidence_path"])
+    admission = json.loads(admission_path.read_text())
+    admission.pop("dispatch_window_utc")
+    admission_path.write_text(json.dumps(admission))
+    policy = stage["dispatch_policy"]
+    policy.pop("dispatch_window_utc")
+    policy["evidence_sha256"] = hashlib.sha256(admission_path.read_bytes()).hexdigest()
+    stage.pop("dispatch_window_utc")
+    stage["measurement_start_barrier"].pop("dispatch_window_utc")
+    assert _acceptance_pair(stage) == stage["entries"][:2]
+    assert _expected_acceptance_policy(stage)["execution_window"] == admission["execution_window_utc"]
+
+
 def test_ready_acceptance_rejects_inconsistent_barrier_policy_and_non_null_schedule(tmp_path):
     stage = _ready_acceptance_stage(tmp_path)
     stage["entries"][0]["scheduled_start"] = "2026-11-23T00:00:00+00:00"
     with pytest.raises(ValueError, match="null scheduled starts"):
         _acceptance_pair(stage)
+
+
+def test_ready_acceptance_rejects_changed_dispatch_window_binding(tmp_path):
+    stage = _ready_acceptance_stage(tmp_path)
+    stage["measurement_start_barrier"]["dispatch_window_utc"]["not_after_utc"] = "2026-11-23T05:00:00+00:00"
+    with pytest.raises(ValueError, match="acceptance admission evidence"):
+        _acceptance_pair(stage)
+
+
+def test_ready_acceptance_draft_freezes_dispatch_window_across_stage_and_barrier(tmp_path):
+    stage = _ready_acceptance_stage(tmp_path)
+    expected = _expected_acceptance_policy(stage)
+    assert expected["dispatch_window_utc"] == stage["dispatch_window_utc"]
+    changed = json.loads(json.dumps(stage))
+    changed["dispatch_policy"]["dispatch_window_utc"]["not_after_utc"] = "2026-11-23T05:00:00+00:00"
+    with pytest.raises(ValueError, match="across stage, policy and runtime barrier"):
+        _expected_acceptance_policy(changed)
+
+
+def test_campaign_driver_excludes_expired_ready_dispatch_rows(tmp_path):
+    from datetime import datetime, timezone
+
+    runner = CampaignDriver.__new__(CampaignDriver)
+    class Clock:
+        def utc_now(self):
+            return datetime(2026, 11, 23, 3, 0, 1, tzinfo=timezone.utc)
+    runner.clock = Clock()
+    entry = {"entry_id": "V-S1", "scheduled_start": None,
+        "launch_at": "2026-11-23T00:00:00+00:00"}
+    journal = {"entries": {"V-S1": {"state": "scheduled"}}}
+    kept = runner._exclude_expired_slots([entry], journal, tmp_path / "journal.json",
+        datetime(2026, 11, 23, 3, 0, 1, tzinfo=timezone.utc),
+        (datetime(2026, 11, 23, 0, tzinfo=timezone.utc), datetime(2026, 11, 23, 3, tzinfo=timezone.utc)))
+    assert kept == []
+    assert journal["entries"]["V-S1"]["state"] == "missed"
 
 
 def test_draft_driver_uses_initializer_outputs_and_freezes_two_stages(tmp_path, monkeypatch):
@@ -216,6 +270,63 @@ def test_draft_rejects_artifact_and_bundle_tampering(tmp_path):
     bundle_path.write_text(json.dumps(bundle))
     with pytest.raises(ValueError, match="bundle digest changed"):
         load_and_verify_draft(bundle_path)
+
+
+def test_draft_only_allows_selected_stage_frozen_azure_cleanup_card(tmp_path):
+    from cloud_network_benchmark.campaign_draft import create_draft_bundle
+
+    state = tmp_path / "state"; state.mkdir()
+    root = tmp_path / "src"; root.mkdir()
+    stages = []
+    cards = {}
+    for stage_id, stage_name, entry_id, profile in (
+            ("acceptance-1", "acceptance", "V-S1", "normal_pair"),
+            ("calibration-1", "calibration", "CAL-S1", "calibration_self")):
+        config = tmp_path / f"{stage_id}-config.yaml"; config.write_text("fixture\n")
+        runtime = tmp_path / f"{stage_id}-runtime.json"; runtime.write_text("{}\n")
+        cost = tmp_path / f"{stage_id}-cost.json"; cost.write_text("{}\n")
+        manifest = tmp_path / f"{stage_id}-manifest.json"; manifest.write_text("{}\n")
+        scope_path = state / f"{stage_id}-scope.json"; scope_path.write_text("{}\n")
+        card = state / f"{stage_id}-azure-cleanup-card.json"
+        ordinary = state / f"{stage_id}-paid-approval.json"
+        cards[stage_id] = (card, ordinary)
+        stage = {"stage_id": stage_id, "stage": stage_name, "status": DRAFT_STATUS,
+            "state_root": str(state), "repository_root": str(root),
+            "entries": [{"entry_id": entry_id, "config_path": str(config),
+                "runtime_config_path": str(runtime), "cost_inputs_path": str(cost),
+                "parent_manifest_path": str(manifest), "run_ids": {"azure": f"{entry_id}-azure"}}],
+            "approval_refs": {"azure_shared_cleanup": str(card)},
+            "azure_auxiliary_cleanup_scope": {"path": str(scope_path),
+                "sha256": hashlib.sha256(scope_path.read_bytes()).hexdigest(), "card_path": str(card)},
+            "draft_pending_evidence_paths": [str(card), str(ordinary)]}
+        stages.append(stage)
+    draft = state / "draft.json"
+    create_draft_bundle(plan={"batch_id": "synthetic-offline"}, stages=stages,
+        output_path=draft,
+        missing_prerequisites={"acceptance-1": ["paid_authorization"],
+            "calibration-1": ["paid_acceptance"]}, preparer=lambda: None)
+
+    # Only the exact auxiliary card for the selected, frozen stage may preexist;
+    # its genuine content/validity is checked by the production runtime loader.
+    acceptance_card = cards["acceptance-1"][0]
+    acceptance_card.write_text('{"fixture":"unapproved-placeholder"}\n')
+    load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft)
+
+    cards["calibration-1"][0].write_text('{"fixture":"foreign-stage-placeholder"}\n')
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    cards["calibration-1"][0].unlink()
+
+    cards["acceptance-1"][1].write_text('{"fixture":"ordinary-pending"}\n')
+    with pytest.raises(ValueError, match="appeared before activation"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
+    cards["acceptance-1"][1].unlink()
+    acceptance_card.unlink()
+    acceptance_card.symlink_to(state / "target.json")
+    with pytest.raises(ValueError, match="symlinks"):
+        load_and_verify_draft(draft, allow_frozen_auxiliary_cleanup_for="acceptance-1")
 
 
 def test_draft_blocks_activation_without_execute_and_rejects_identity_change(tmp_path):

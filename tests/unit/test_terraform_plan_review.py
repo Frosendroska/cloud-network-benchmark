@@ -25,7 +25,7 @@ def scope(provider, root, scenario="same_zone"):
     if provider == "gcp":
         v = dict(project_id="review-project", zone_a="europe-north1-c", zone_b="europe-north1-c")
         if root == "pair":
-            v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102")
+            v.update(name_a="scope-a", name_b="scope-b", template_a="projects/review-project/global/instanceTemplates/a?uniqueId=101", template_b="projects/review-project/global/instanceTemplates/b?uniqueId=102", cleanup_mode=False)
             r = {"terraform_data.scope_guard": {"input": v["project_id"]}}
             for role in ("a", "b"):
                 r["google_compute_instance_from_template.vm_" + role] = {"project": v["project_id"], "zone": v["zone_" + role], "name": v["name_" + role], "source_instance_template": v["template_" + role]}
@@ -85,6 +85,17 @@ def test_gcp_s3_plan_requires_registered_policy_name():
     policy["change"]["after"]["name"] = v["namespace"] + "-compact"
     with pytest.raises(tp.PlanReviewError, match="GCP compact policy"):
         tp.validate_scope(wrong, "gcp", ROOT/"terraform/gcp/protection", v)
+
+
+def test_gcp_pair_review_binds_cleanup_mode_default_and_rejects_cleanup_plan():
+    variables, resources = scope("gcp", "pair")
+    approved = plan_document(variables, resources, "gcp")
+    assert len(tp.validate_scope(approved, "gcp", ROOT/"terraform/gcp/pair", variables)) == 3
+
+    cleanup_plan = deepcopy(approved)
+    cleanup_plan["variables"]["cleanup_mode"]["value"] = True
+    with pytest.raises(tp.PlanReviewError, match="saved plan differs from approved input variables"):
+        tp.validate_scope(cleanup_plan, "gcp", ROOT/"terraform/gcp/pair", variables)
 
 
 def test_aws_expiry_scope_binds_optional_permissions_boundary_to_configured_account():

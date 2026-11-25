@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from urllib.parse import quote
 from contextvars import ContextVar
 from datetime import date
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,34 @@ def _is_uuid_segment(value: str) -> bool:
         return str(uuid.UUID(value)) == value.lower()
     except (ValueError, AttributeError):
         return False
+
+
+def _azure_schedule_matches(props: Any, expected_trigger: datetime) -> bool:
+    """Validate Azure's exact one-time UTC schedule readback."""
+    if (not isinstance(props, dict) or props.get("isEnabled") is not True
+            or props.get("frequency") != "OneTime"
+            or not isinstance(props.get("timeZone"), str)
+            or props.get("timeZone") not in {"UTC", "Etc/UTC"}):
+        return False
+    if expected_trigger.tzinfo is None or expected_trigger.utcoffset() != timedelta(0):
+        return False
+    for key in ("startTime", "nextRun", "expiryTime"):
+        if key not in props or props[key] is None:
+            if key == "startTime":
+                return False
+            continue
+        value = props[key]
+        if not isinstance(value, str):
+            return False
+        try:
+            actual = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if actual.tzinfo is None or actual.utcoffset() != timedelta(0) or actual != expected_trigger:
+            return False
+    return True
+
+
 _EXPLICIT_UTC_NOW: ContextVar[Callable[[], datetime] | None] = ContextVar("azure_explicit_utc_now", default=None)
 _EXPLICIT_TIMING_IDENTITY: ContextVar[dict[str, str] | None] = ContextVar("azure_explicit_timing_identity", default=None)
 _TIMING_OBSERVATION_FAILURE: ContextVar[str | None] = ContextVar("azure_timing_observation_failure", default=None)
@@ -84,6 +113,7 @@ class AzureRuntimeOptions(StrictModel):
     cleanup_timing_active: bool = Field(default=False, exclude_if=lambda value: value is False)
     cleanup_timing_phase: Optional[Literal["routine", "absence", "emergency"]] = Field(default=None, exclude_if=lambda value: value is None)
     profile_allowance: Optional[dict[str, float]] = Field(default=None, exclude_if=lambda value: value is None)
+    azure_auxiliary_cleanup: Optional[dict[str, Any]] = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("subscription_id", "tenant_id")
     @classmethod
@@ -148,6 +178,9 @@ class AzureRuntimeOptions(StrictModel):
             raise ValueError("P2/P3 requires explicit priority review evidence")
         if self.admission_evidence.get("outstanding_cleanup") is not False:
             raise ValueError("outstanding cleanup must be explicitly false")
+        if self.azure_auxiliary_cleanup is not None:
+            from .azure_auxiliary_cleanup import validate_spec
+            validate_spec(self.azure_auxiliary_cleanup)
         price = self.expiry_cost_input
         if not all(price.get(k) is not None for k in ("source_id", "date", "sha256", "automation_rate_per_job_minute", "job_minutes_bound")):
             raise ValueError("dated expiry cost input and bounded job minutes are required")
@@ -534,6 +567,8 @@ def _require_profile_timing_anchor(deployment: ProviderDeploymentInput, options:
                 or state.get("reservation_id") != deployment.reservation.value.reservation_id.value
                 or state.get("config_sha256") != deployment.config_sha256):
             raise ValueError("Azure cleanup timing anchor identity mismatch")
+        if state.get("clock_identity") != _clock_identity():
+            raise ValueError("Azure cleanup timing anchor clock identity changed")
         if require_stop and state.get("provider_stop_at") != deployment.expiry.value.expires_at.value.isoformat():
             raise ValueError("actual registered STOP is absent from the original cleanup timing anchor")
         return state
@@ -1098,6 +1133,8 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
              allow_missing_resource_group: str | None = None,
              expected_missing_automation_child_url: str | None = None,
              expected_missing_automation_account_id: str | None = None,
+             expected_missing_resource_id: str | None = None,
+             expected_missing_resource_url: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
     if options.cleanup_timing_active:
@@ -1146,8 +1183,11 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
     environment["TF_DATA_DIR"] = str(root / ("terraform-data-" + Path(tf_root).name))
     reviewed_apply = ("apply" in argv and any(arg.startswith("-chdir=") for arg in argv)
         and options.plan_review_timeout_seconds > 0)
+    bounded_terraform_destroy = ("terraform" in argv[:1] and "destroy" in argv
+        and action.endswith("_destroy") and options.cleanup_timing_active
+        and options.cleanup_timing_phase in {"routine", "emergency"})
     req = CommandRequest(action_id=f"azure-{uuid.uuid4()}", action_type=action, argv=argv,
-        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=(remaining if reviewed_apply else min(
+        cwd=str(Path(__file__).resolve().parents[2]), timeout_seconds=(remaining if reviewed_apply or bounded_terraform_destroy else min(
             options.command_timeout_seconds, 180.0 if options.timing_profile else options.command_timeout_seconds, remaining)),
         environment=environment, environment_classification="contains_secret_references", redactions=[options.authentication_reference, options.ssh_public_key, str(options.attempt_root)])
     def execute(req: CommandRequest) -> CommandResult:
@@ -1225,7 +1265,14 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
         and (_is_exact_missing_automation_account(result,expected_missing_automation_account_id)
             or (account_cli_request and account_parts is not None
                 and _is_exact_missing_attempt_resource_group(result,account_parts["group"]))))
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_automation_child_absence or exact_automation_account_absence or (
+    exact_resource_absence = (expected_missing_resource_id is not None
+        and expected_missing_resource_url is not None and action == "azure_auxiliary_watcher_absence"
+        and argv[:2] == ["az", "rest"] and method_values == ["GET"]
+        and url_values == [expected_missing_resource_url] and output_values == ["json"]
+        and subscription_values == [options.subscription_id]
+        and not any(flag in argv for flag in ("--body", "--headers", "--query", "--resource"))
+        and _is_exact_resource_404(result, expected_missing_resource_id))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_resource_absence or exact_automation_child_absence or exact_automation_account_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1367,22 +1414,163 @@ def _watcher_baseline(groups: list[dict[str,Any]], resources: list[dict[str,Any]
 
 def _capture_profile_watcher_baseline(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
                                       runner: CommandRunner, root: Path, journal: Path,
-                                      clock: Callable[[],float]) -> None:
-    if deployment.admission.timing_profile is None:
+                                      clock: Callable[[],float],
+                                      utc_now: Callable[[],datetime]) -> None:
+    if _profile_name(deployment) is None:
         return
-    resources,_=_read_arm_collection(runner,options,root,
-        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
-        "profile_watcher_baseline_resources",clock,("id","type"))
-    groups,_=_read_arm_collection(runner,options,root,
-        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
-        "profile_watcher_baseline_groups",clock,("id","name"))
-    baseline=_watcher_baseline(groups,resources)
     state=json.loads(journal.read_text(encoding="utf-8"))
     prior=state.get("profile_external_baseline")
+    if prior is not None:
+        if not _valid_watcher_baseline(prior, deployment, options, state.get("actions")):
+            raise RuntimeError("saved pre-creation Network Watcher baseline is invalid or belongs to another attempt")
+        if options.azure_auxiliary_cleanup is not None:
+            from .azure_auxiliary_cleanup import AuxiliaryCleanupCohort
+            owner = next((row for row in options.azure_auxiliary_cleanup["owners"]
+                if row["run_id"] == deployment.run_id and row["deployment_id"] == deployment.deployment_id
+                and row["config_sha256"] == deployment.config_sha256), None)
+            if owner is None:
+                raise PermissionError("Azure pre-creation cohort baseline does not bind this exact parent")
+            AuxiliaryCleanupCohort(options.azure_auxiliary_cleanup).record_precreation_baseline(owner, prior)
+        return
+    if (state.get("creation_may_have_started")
+            or state.get("pair_state") in {"creating","created"}
+            or state.get("expiry_state") in {"preparing","registered"}
+            or any(action.get("request",{}).get("action_type") in {
+                "expiry_prerequisites","pair_apply","pair_destroy","expiry_destroy"}
+                for action in state.get("actions",[]) if isinstance(action,dict))):
+        raise RuntimeError("pre-creation Network Watcher baseline is missing after provider mutation may have started")
+    if any(action.get("request",{}).get("action_type") in {
+            "profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}
+            for action in state.get("actions", []) if isinstance(action,dict)):
+        raise RuntimeError("pre-creation Network Watcher baseline capture was interrupted; refusing a late replacement")
+    def capture_utc_sample() -> datetime:
+        value=utc_now()
+        if not isinstance(value,datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise RuntimeError("captured pre-creation Network Watcher baseline is invalid; provider mutation is blocked")
+        return value.astimezone(UTC)
+    started_utc=capture_utc_sample()
+    started_mono=clock()
+    resources,resource_evidence=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "profile_watcher_baseline_resources",clock,("id","type"))
+    groups,group_evidence=_read_arm_collection(runner,options,root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "profile_watcher_baseline_groups",clock,("id","name"))
+    finished_utc=capture_utc_sample()
+    finished_mono=clock()
+    resource_inventory=sorted(({"id":row["id"].lower(),"type":row["type"].lower()} for row in resources),
+        key=lambda row:(row["id"],row["type"]))
+    group_inventory=sorted(({"id":row["id"].lower(),"name":row["name"].lower()} for row in groups),
+        key=lambda row:(row["id"],row["name"]))
+    baseline=_watcher_baseline(groups,resources)
+    baseline.update({"schema_version":2,"subscription_id":options.subscription_id,
+        "run_id":deployment.run_id,"deployment_id":deployment.deployment_id,
+        "config_sha256":deployment.config_sha256,"profile":_profile_name(deployment),
+        "capture_started_at_utc":started_utc.isoformat(),"capture_started_monotonic":started_mono,
+        "capture_finished_at_utc":finished_utc.isoformat(),"capture_finished_monotonic":finished_mono,
+        "resource_inventory":resource_inventory,"group_inventory":group_inventory,
+        "source_action_ids":[item["action_id"] for item in (*resource_evidence,*group_evidence)
+            if isinstance(item.get("action_id"),str) and item["action_id"]],
+        "inventory_sha256":hashlib.sha256(json.dumps({"resources":resource_inventory,"groups":group_inventory},
+            sort_keys=True,separators=(",",":")).encode()).hexdigest()})
+    baseline["sha256"]=_profile_timing_digest(baseline)
+    state=json.loads(journal.read_text(encoding="utf-8"))
+    if (state.get("run_id")!=deployment.run_id or state.get("deployment_id")!=deployment.deployment_id
+            or state.get("config_sha256")!=deployment.config_sha256):
+        raise RuntimeError("attempt journal identity changed during Network Watcher baseline capture")
+    prior=state.get("profile_external_baseline")
     if prior is not None and prior!=baseline:
-        raise RuntimeError("pre-creation Network Watcher baseline changed during registration recovery")
+        raise RuntimeError("pre-creation Network Watcher baseline changed during concurrent registration")
+    # Validate chronology, full identity, inventory digest, and the just-recorded
+    # source actions before publishing this baseline or allowing the caller to
+    # proceed to expiry/provider mutations. Keep the completed query actions in
+    # the journal when validation fails so recovery retains the evidence.
+    if not _valid_watcher_baseline(baseline, deployment, options, state.get("actions")):
+        raise RuntimeError("captured pre-creation Network Watcher baseline is invalid; provider mutation is blocked")
     state["profile_external_baseline"]=baseline
     _atomic_private(journal,state)
+    if options.azure_auxiliary_cleanup is not None:
+        from .azure_auxiliary_cleanup import AuxiliaryCleanupCohort
+        owner = next((row for row in options.azure_auxiliary_cleanup["owners"]
+            if row["run_id"] == deployment.run_id and row["deployment_id"] == deployment.deployment_id
+            and row["config_sha256"] == deployment.config_sha256), None)
+        if owner is None:
+            raise PermissionError("Azure pre-creation cohort baseline does not bind this exact parent")
+        AuxiliaryCleanupCohort(options.azure_auxiliary_cleanup).record_precreation_baseline(owner, baseline)
+
+
+def _valid_watcher_baseline(baseline: Any, deployment: ProviderDeploymentInput,
+                            options: AzureRuntimeOptions,
+                            journal_actions: Any = None) -> bool:
+    if not isinstance(baseline,dict) or baseline.get("schema_version")!=2:
+        return False
+    if (baseline.get("subscription_id")!=options.subscription_id
+            or baseline.get("run_id")!=deployment.run_id
+            or baseline.get("deployment_id")!=deployment.deployment_id
+            or baseline.get("config_sha256")!=deployment.config_sha256
+            or baseline.get("profile")!=_profile_name(deployment)):
+        return False
+    resources,groups=baseline.get("resource_inventory"),baseline.get("group_inventory")
+    source_ids=baseline.get("source_action_ids")
+    if (not isinstance(resources,list) or not isinstance(groups,list)
+            or not isinstance(source_ids,list) or len(source_ids)<2
+            or any(not isinstance(value,str) or not value for value in source_ids)
+            or len(set(source_ids))!=len(source_ids)):
+        return False
+    if journal_actions is not None:
+        if not isinstance(journal_actions,list):
+            return False
+        action_types={}
+        for action in journal_actions:
+            if not isinstance(action,dict):
+                continue
+            request=action.get("request")
+            if not isinstance(request,dict):
+                continue
+            action_id,action_type=request.get("action_id"),request.get("action_type")
+            if isinstance(action_id,str) and isinstance(action_type,str):
+                action_types[action_id]=action_type
+        bound_types=[action_types.get(action_id) for action_id in source_ids]
+        if (any(action_type is None for action_type in bound_types)
+                or not any(action_type.startswith("profile_watcher_baseline_resources") for action_type in bound_types)
+                or not any(action_type.startswith("profile_watcher_baseline_groups") for action_type in bound_types)
+                or any(not re.fullmatch(r"profile_watcher_baseline_(?:resources|groups)(?:_page_[1-9][0-9]*)?",action_type)
+                    for action_type in bound_types)):
+            return False
+    if any(not isinstance(row,dict) or set(row)!={"id","type"}
+            or not all(isinstance(row.get(key),str) and row[key] for key in ("id","type"))
+            or not row["id"].startswith(f"/subscriptions/{options.subscription_id}/".lower())
+            for row in resources):
+        return False
+    if any(not isinstance(row,dict) or set(row)!={"id","name"}
+            or not all(isinstance(row.get(key),str) and row[key] for key in ("id","name"))
+            or not row["id"].startswith(f"/subscriptions/{options.subscription_id}/".lower())
+            for row in groups):
+        return False
+    try:
+        start_utc=datetime.fromisoformat(baseline["capture_started_at_utc"])
+        finish_utc=datetime.fromisoformat(baseline["capture_finished_at_utc"])
+        start_mono=float(baseline["capture_started_monotonic"])
+        finish_mono=float(baseline["capture_finished_monotonic"])
+    except (KeyError,TypeError,ValueError):
+        return False
+    if (start_utc.tzinfo is None or finish_utc.tzinfo is None
+            or start_utc.utcoffset()!=timedelta(0) or finish_utc.utcoffset()!=timedelta(0)
+            or finish_utc<start_utc
+            or not isfinite(start_mono) or not isfinite(finish_mono) or finish_mono<start_mono):
+        return False
+    inventory_hash=hashlib.sha256(json.dumps({"resources":resources,"groups":groups},
+        sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    if baseline.get("inventory_sha256")!=inventory_hash:
+        return False
+    # The complete inventory is persisted above; these two projections are the
+    # only external resources whose ownership the cleanup verifier needs.
+    projected=_watcher_baseline(
+        [{"id":row["id"],"name":row["name"]} for row in groups],
+        [{"id":row["id"],"type":row["type"]} for row in resources])
+    if baseline.get("groups")!=projected["groups"] or baseline.get("watchers")!=projected["watchers"]:
+        return False
+    return baseline.get("sha256")==_profile_timing_digest(baseline)
 
 
 def _delete_owned_arm_child(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
@@ -1438,10 +1626,7 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
         raise RuntimeError("independent Azure group inventory found the attempt resource group: "
             + ", ".join(residual_attempt_groups))
     baseline=state.get("profile_external_baseline")
-    baseline_valid=(isinstance(baseline,dict) and baseline.get("sha256")==hashlib.sha256(
-            json.dumps({key:value for key,value in baseline.items() if key!="sha256"},
-                sort_keys=True,separators=(",",":")).encode()).hexdigest()
-            and isinstance(baseline.get("groups"),list) and isinstance(baseline.get("watchers"),list))
+    baseline_valid=_valid_watcher_baseline(baseline,deployment,options,state.get("actions"))
     current=_watcher_baseline(groups,resources)
     if not baseline_valid:
         if current["groups"] or current["watchers"]:
@@ -1525,9 +1710,447 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
                 raise RuntimeError(f"independent Azure {label} absence is not proved by typed NotFound")
 
 
-def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None) -> list[str]:
+def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+        runner: CommandRunner, root: Path, clock: Callable[[], float], utc_now: Callable[[], datetime],
+        state: dict[str, Any], actions: list[dict[str, Any]]) -> None:
+    """Delete one auto-created watcher only after exact parent and activity proof."""
+    spec = options.azure_auxiliary_cleanup
+    if spec is None:
+        return
+    from .azure_auxiliary_cleanup import AuxiliaryCleanupCohort, authorization_payload, canonical, owner_key
+    card = authorization_payload(spec, utc_now().astimezone(UTC))
+    if (options.subscription_id != spec["subscription_id"] or deployment.vm_a.region != spec["region"]
+            or deployment.vm_b.region != spec["region"]):
+        raise PermissionError("Azure auxiliary cleanup binding differs from the exact subscription or region")
+    baseline = state.get("profile_external_baseline")
+    if not _valid_watcher_baseline(baseline, deployment, options, state.get("actions")):
+        raise RuntimeError("Azure auxiliary cleanup lacks the complete pre-mutation watcher baseline")
+    group_id, watcher_id = spec["resource_group_id"].lower(), spec["watcher_id"].lower()
+    owner = next((row for row in spec["owners"] if row["run_id"] == deployment.run_id
+        and row["deployment_id"] == deployment.deployment_id
+        and row["config_sha256"] == deployment.config_sha256), None)
+    if owner is None:
+        raise PermissionError("Azure auxiliary cleanup does not bind this exact parent deployment")
+    expected_group = f"/subscriptions/{options.subscription_id}/resourceGroups/{_slug(deployment)}".lower()
+    if owner["resource_group_id"].lower() != expected_group:
+        raise PermissionError("Azure auxiliary cleanup owner resource group differs from deployment")
+    vm_ids = [f"{expected_group}/providers/Microsoft.Compute/virtualMachines/{_slug(deployment)}-{r}".lower()
+        for r in ("a", "b")]
+    nic_ids = [f"{expected_group}/providers/Microsoft.Network/networkInterfaces/{_slug(deployment)}-{r}-nic".lower()
+        for r in ("a", "b")]
+    if sorted(x.lower() for x in owner["vm_ids"]) != sorted(vm_ids) or sorted(
+            x.lower() for x in owner["nic_ids"]) != sorted(nic_ids):
+        raise PermissionError("Azure auxiliary cleanup VM/NIC identities differ from deployment")
+    timing = _require_profile_timing_anchor(deployment, options, require_stop=False)
+    peer_deadline = timing.get("routine_deadline_monotonic") if timing else None
+    if isinstance(peer_deadline, bool) or not isinstance(peer_deadline, (int, float)) or not isfinite(float(peer_deadline)):
+        raise TimeoutError("original Azure cleanup deadline is unavailable")
+    cohort = AuxiliaryCleanupCohort(spec)
+    cohort_state = cohort.snapshot()
+    baseline = cohort.precreation_baseline()
+    if not isinstance(baseline, dict):
+        raise RuntimeError("shared Azure cleanup cohort lacks its earliest pre-creation baseline")
+    if group_id in baseline["groups"] or watcher_id in baseline["watchers"]:
+        # The earliest complete cohort baseline proves the shared resource was
+        # pre-existing. Preserve it and let ordinary per-parent absence checks run.
+        return
+    existing = cohort_state.get("claim")
+    if isinstance(existing, dict):
+        if existing.get("state") == "complete":
+            cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+            return
+        if existing.get("state") in {"claimed", "group_claimed"}:
+            cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+            return
+        if existing.get("state") == "leaf_absent":
+            outcomes = cohort.snapshot().get("outcomes", [])
+            leaf = [row for row in outcomes if row.get("action") == "leaf_delete"]
+            if (not leaf or leaf[-1].get("outcome") != "succeeded"
+                    or leaf[-1].get("identity", "").lower() != watcher_id
+                    or leaf[-1].get("typed_404_identity", "").lower() != watcher_id):
+                raise RuntimeError("saved leaf completion lacks exact typed absence identity")
+            owner_state = cohort.snapshot().get("owners", {}).get(owner_key(owner))
+            if not isinstance(owner_state, dict):
+                raise RuntimeError("saved shared cleanup owner evidence is missing")
+            cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
+                activity_sha256=owner_state["activity_sha256"], deadline_monotonic=float(peer_deadline), clock=clock)
+            options = _bind_azure_cleanup_cohort_deadline(options, cohort)
+            _finish_shared_watcher_group(spec, options, runner, root, clock, utc_now,
+                cohort, existing["claim_id"], float(peer_deadline), actions)
+            return
+        raise RuntimeError("Azure auxiliary cleanup has a terminal or uncertain prior action")
+    resources, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "azure_auxiliary_inventory_resources", clock, ("id", "type"))
+    actions.extend(ev)
+    groups, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "azure_auxiliary_inventory_groups", clock, ("id", "name"))
+    actions.extend(ev)
+    current = _watcher_baseline(groups, resources)
+    # A feature's complete pre-creation baseline and current subscription-wide
+    # inventories can prove that the exact shared auxiliary pair was never
+    # created (or is already absent). This is deliberately a no-op: do not
+    # synthesize activity, cohort-owner absence, a delete claim, or completion.
+    # The caller still has to pass the independent per-profile absence audit.
+    target_group_rows = [row for row in groups if row["id"].lower() == group_id]
+    target_group_resource_rows = [row for row in resources if row["id"].lower() == group_id]
+    target_watcher_rows = [row for row in resources if row["id"].lower() == watcher_id]
+    target_group_children = [row for row in resources
+        if row["id"].lower().startswith(group_id.rstrip("/") + "/")]
+    baseline_group_rows = [row for row in baseline["group_inventory"]
+        if row["id"].lower() == group_id]
+    baseline_group_resource_rows = [row for row in baseline["resource_inventory"]
+        if row["id"].lower() == group_id]
+    baseline_watcher_rows = [row for row in baseline["resource_inventory"]
+        if row["id"].lower() == watcher_id]
+    baseline_group_children = [row for row in baseline["resource_inventory"]
+        if row["id"].lower().startswith(group_id.rstrip("/") + "/")]
+    new_groups = sorted(set(current["groups"]) - set(baseline["groups"]))
+    new_watchers = sorted(set(current["watchers"]) - set(baseline["watchers"]))
+    if (not target_group_rows and not target_group_resource_rows and not target_watcher_rows
+            and not target_group_children and not baseline_group_rows and not baseline_group_resource_rows
+            and not baseline_watcher_rows and not baseline_group_children
+            and not new_groups and not new_watchers):
+        _require_cleanup_cohort_parents_absent(spec, groups, resources)
+        return
+    if (sorted(set(current["watchers"]) - set(baseline["watchers"])) != [watcher_id]
+            or sorted(set(current["groups"]) - set(baseline["groups"])) != [group_id]):
+        raise RuntimeError("fresh inventory does not prove the exact newly created watcher and parent group")
+    grouped, ev = _read_arm_collection(runner, options, root,
+        f"{group_id}/resources?api-version=2021-04-01", "azure_auxiliary_group_inventory", clock, ("id", "type"))
+    actions.extend(ev)
+    if len(grouped) != 1 or grouped[0]["id"].lower() != watcher_id:
+        raise RuntimeError("NetworkWatcherRG has foreign or additional child resources")
+    activity, ev = _azure_watcher_activity(deployment, options, runner, root, baseline, watcher_id,
+        card["expected_watcher_create_caller"], card["expected_owned_write_caller"], clock, utc_now)
+    actions.extend(ev)
+    activity_sha = hashlib.sha256(canonical(activity)).hexdigest()
+    cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
+        activity_sha256=activity_sha, deadline_monotonic=float(peer_deadline), clock=clock)
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
+    claim_id = cohort.claim_leaf(now_monotonic=clock())
+    if claim_id is None:
+        cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+        return
+    for collection in ("flowLogs", "packetCaptures", "connectionMonitors"):
+        children, ev = _read_arm_collection(runner, options, root,
+            f"{watcher_id}/{collection}?api-version=2023-09-01",
+            f"azure_auxiliary_{collection}_inventory", clock, ("id",))
+        actions.extend(ev)
+        if children:
+            raise RuntimeError(f"Network Watcher {collection} collection is nonempty")
+    fresh_resources, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "azure_auxiliary_preleaf_resources", clock, ("id", "type"))
+    actions.extend(ev)
+    fresh_groups, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "azure_auxiliary_preleaf_groups", clock, ("id", "name"))
+    actions.extend(ev)
+    _require_cleanup_cohort_parents_absent(spec, fresh_groups, fresh_resources)
+    fresh_grouped, ev = _read_arm_collection(runner, options, root,
+        f"{group_id}/resources?api-version=2021-04-01", "azure_auxiliary_preleaf_group_children", clock, ("id", "type"))
+    actions.extend(ev)
+    if len(fresh_grouped) != 1 or fresh_grouped[0].get("id", "").lower() != watcher_id:
+        raise RuntimeError("immediate pre-delete NetworkWatcherRG inventory is not exact")
+    leaf_url = watcher_id + "?api-version=2023-09-01"
+    claim = cohort.snapshot().get("claim")
+    if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
+        raise RuntimeError("Network Watcher delete claim is no longer owned")
+    if claim.get("state") == "claimed":
+        authorization_payload(spec, utc_now().astimezone(UTC))
+        before = _command(runner, options, root, _azure_rest("GET", leaf_url),
+            "azure_auxiliary_watcher_etag", clock)
+        actions.append(_safe_cleanup_action(options, before))
+        observed = json.loads(before.stdout)
+        if str(observed.get("id", "")).lower() != watcher_id or not isinstance(observed.get("etag"), str):
+            raise RuntimeError("Network Watcher exact ETag identity is unavailable")
+        delete = _command(runner, options, root,
+            _azure_rest("DELETE", leaf_url, headers={"If-Match": observed["etag"]}),
+            "azure_auxiliary_watcher_delete", clock)
+        actions.append(_safe_cleanup_action(options, delete))
+        absence = _command(runner, options, root, _azure_rest("GET", leaf_url),
+            "azure_auxiliary_watcher_absence", clock, allow_not_found=True,
+            expected_missing_resource_id=watcher_id,
+            expected_missing_resource_url=leaf_url)
+        actions.append(_safe_cleanup_action(options, absence))
+        if not _is_exact_resource_404(absence, watcher_id):
+            cohort.record_outcome(claim_id, action="leaf_delete", identity=watcher_id,
+                outcome="unknown", evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absence))).hexdigest(),
+                now_monotonic=clock())
+            raise RuntimeError("Network Watcher deletion lacks an exact typed 404 identity")
+        cohort.record_outcome(claim_id, action="leaf_delete", identity=watcher_id,
+            outcome="succeeded", evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absence))).hexdigest(),
+            now_monotonic=clock(),
+            typed_404_identity=watcher_id)
+    _finish_shared_watcher_group(spec, options, runner, root, clock, utc_now,
+        cohort, claim_id, float(peer_deadline), actions)
+
+
+def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOptions,
+        runner: CommandRunner, root: Path, clock: Callable[[], float], utc_now: Callable[[], datetime],
+        cohort: Any, claim_id: str, peer_deadline: float, actions: list[dict[str, Any]]) -> None:
+    from .azure_auxiliary_cleanup import authorization_payload, canonical
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
+    group_id = spec["resource_group_id"].lower()
+    if not cohort.claim_group(claim_id, now_monotonic=clock()):
+        cohort.wait_complete(deadline_monotonic=peer_deadline, clock=clock)
+        return
+    authorization_payload(spec, utc_now().astimezone(UTC))
+    grouped, ev = _read_arm_collection(runner, options, root,
+        f"{group_id}/resources?api-version=2021-04-01", "azure_auxiliary_group_final_inventory", clock, ("id", "type"))
+    actions.extend(ev)
+    if grouped:
+        raise RuntimeError("NetworkWatcherRG is not empty after exact watcher absence")
+    global_resources, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+        "azure_auxiliary_group_final_subscription_inventory", clock, ("id", "type"))
+    actions.extend(ev)
+    global_groups, ev = _read_arm_collection(runner, options, root,
+        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+        "azure_auxiliary_group_final_groups", clock, ("id", "name"))
+    actions.extend(ev)
+    _require_cleanup_cohort_parents_absent(spec, global_groups, global_resources)
+    if any(str(row.get("id", "")).lower().startswith(group_id + "/") for row in global_resources):
+        raise RuntimeError("fresh full inventory found a child under NetworkWatcherRG")
+    # The watcher is already absent, so its child collection endpoints may
+    # return typed 404. Full subscription and parent group inventories above
+    # prove there are no extant children before deleting the group.
+    grouped, ev = _read_arm_collection(runner, options, root,
+        f"{group_id}/resources?api-version=2021-04-01",
+        "azure_auxiliary_group_immediate_children", clock, ("id", "type"))
+    actions.extend(ev)
+    if grouped:
+        raise RuntimeError("NetworkWatcherRG acquired a child before parent deletion")
+    group_url = f"/subscriptions/{options.subscription_id}/resourcegroups/NetworkWatcherRG?api-version=2021-04-01"
+    read = _command(runner, options, root, _azure_rest("GET", group_url),
+        "azure_auxiliary_group_exact_readback", clock)
+    actions.append(_safe_cleanup_action(options, read))
+    observed = json.loads(read.stdout)
+    if str(observed.get("id", "")).lower() != group_id:
+        raise RuntimeError("NetworkWatcherRG exact identity is not confirmed before deletion")
+    authorization_payload(spec, utc_now().astimezone(UTC))
+    deleted = _command(runner, options, root,
+        _azure_rest("DELETE", group_url),
+        "azure_auxiliary_group_delete", clock)
+    actions.append(_safe_cleanup_action(options, deleted))
+    absent = _command(runner, options, root,
+        ["az", "group", "exists", "--name", "NetworkWatcherRG", "--output", "json"],
+        "azure_auxiliary_group_absence", clock)
+    actions.append(_safe_cleanup_action(options, absent))
+    if absent.stderr.strip() or absent.stdout.strip().lower() != "false":
+        cohort.record_outcome(claim_id, action="group_delete", identity=group_id, outcome="unknown",
+            evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absent))).hexdigest(),
+            now_monotonic=clock())
+        raise RuntimeError("NetworkWatcherRG deletion is not confirmed absent")
+    cohort.record_outcome(claim_id, action="group_delete", identity=group_id, outcome="succeeded",
+        evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absent))).hexdigest(),
+        now_monotonic=clock())
+
+
+def _bind_azure_cleanup_cohort_deadline(options: AzureRuntimeOptions, cohort: Any) -> AzureRuntimeOptions:
+    deadline = cohort.earliest_deadline()
+    current = options.workflow_stage_deadline_monotonic
+    if current is not None:
+        deadline = min(deadline, float(current))
+    return options.model_copy(update={"workflow_stage_deadline_monotonic": deadline})
+
+
+def _require_cleanup_cohort_parents_absent(spec: dict[str, Any], groups: list[dict[str, Any]],
+        resources: list[dict[str, Any]]) -> None:
+    group_ids = {str(row.get("id", "")).lower() for row in groups}
+    resource_ids = {str(row.get("id", "")).lower() for row in resources}
+    expected_vms = {item.lower() for owner in spec["owners"] for item in owner["vm_ids"]}
+    for row in resources:
+        resource_id = str(row.get("id", "")).lower()
+        if (str(row.get("type", "")).lower() == "microsoft.compute/virtualmachines"
+                and resource_id not in expected_vms):
+            raise RuntimeError("fresh all-subscription inventory found a foreign VM that may depend on the shared watcher")
+    for owner in spec["owners"]:
+        parent = owner["resource_group_id"].lower().rstrip("/")
+        if parent in group_ids or any(item == parent or item.startswith(parent + "/") for item in resource_ids):
+            raise RuntimeError("fresh all-subscription inventory found a live or unknown owned parent resource")
+        if any(item.lower() in resource_ids for item in owner["vm_ids"] + owner["nic_ids"]):
+            raise RuntimeError("fresh all-subscription inventory found an owned VM or NIC before shared deletion")
+
+
+def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
+    if result.outcome != "failed":
+        return False
+    texts = [value for value in (result.stdout, result.stderr) if value.strip()]
+    if len(texts) != 1:
+        return False
+    text = texts[0]
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate error field")
+            value[key] = item
+        return value
+    try:
+        payload = json.loads(text, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
+        wrapped = re.fullmatch(r"ERROR: Not Found\((\{.*\})\)", text, flags=re.DOTALL)
+        if wrapped is None:
+            return False
+        try:
+            payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+        except (json.JSONDecodeError, ValueError):
+            return False
+    if not isinstance(payload, dict):
+        return False
+    if set(payload) == {"error"}:
+        error = payload["error"]
+    elif "error" not in payload:
+        error = payload
+    else:
+        return False
+    allowed_error_fields = {"code", "message", "target", "resourceId", "resourceUri", "details"}
+    if (not isinstance(error, dict) or not set(error).issubset(allowed_error_fields)
+            or error.get("code") not in {"ResourceNotFound", "NotFound"}):
+        return False
+    targets = []
+    for key in ("target", "resourceId", "resourceUri"):
+        if key in error:
+            value = error[key]
+            if not isinstance(value, str) or not value:
+                return False
+            targets.append(value)
+    details = error.get("details", [])
+    if not isinstance(details, list):
+        return False
+    for item in details:
+        if not isinstance(item, dict) or not set(item).issubset(allowed_error_fields):
+            return False
+        for key in ("target", "resourceId", "resourceUri"):
+            if key in item:
+                value = item[key]
+                if not isinstance(value, str) or not value:
+                    return False
+                targets.append(value)
+    if targets:
+        return all(value.lower() == resource_id.lower() for value in targets)
+    message = error.get("message")
+    # A code-only 404 is ambiguous. Accept the known exact-message form only
+    # when it names the exact resource requested by the caller.
+    return isinstance(message, str) and message == f"Resource not found for exact {resource_id}"
+
+
+def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
+        runner: CommandRunner, root: Path, baseline: dict[str, Any], watcher_id: str,
+        expected_create_caller: str, expected_owned_caller: str,
+        clock: Callable[[], float], utc_now: Callable[[], datetime]):
+    start_text = baseline.get("capture_finished_at_utc")
+    if not isinstance(start_text, str):
+        raise RuntimeError("Azure Activity Log proof requires the complete cohort baseline end time")
+    start = datetime.fromisoformat(start_text).astimezone(UTC)
+    end = utc_now().astimezone(UTC)
+    if end < start:
+        raise RuntimeError("Azure Activity Log query window precedes the watcher baseline")
+    owners = options.azure_auxiliary_cleanup["owners"]
+    resource_owner = {resource_id.lower(): owner for owner in owners
+        for resource_id in owner["vm_ids"] + owner["nic_ids"]}
+    events, evidence = [], []
+    targets = [watcher_id, *sorted(resource_owner)]
+    for index, target in enumerate(targets):
+        filt = f"eventTimestamp ge '{start.isoformat()}' and eventTimestamp le '{end.isoformat()}' and resourceUri eq '{target}'"
+        encoded_filter = quote(filt, safe="'() ")
+        endpoint = (f"/subscriptions/{options.subscription_id}/providers/Microsoft.Insights/eventtypes/management/values"
+            f"?api-version=2015-04-01&$filter={encoded_filter}")
+        rows, page_evidence = _read_arm_collection(runner, options, root, endpoint,
+            f"azure_auxiliary_activity_{index + 1}", clock, ("id", "resourceId"))
+        events.extend(rows)
+        evidence.extend(page_evidence)
+    watcher_create = []
+    peer_writes = {}
+    for row in events:
+        details = row.get("properties", {})
+        if not isinstance(details, dict):
+            raise RuntimeError("Azure Activity Log event properties are malformed")
+        resource = row.get("resourceId")
+        caller, corr = row.get("caller"), row.get("correlationId")
+        status, operation = row.get("status", {}), row.get("operationName", {})
+        status = status.get("value") if isinstance(status, dict) else status
+        operation = operation.get("value") if isinstance(operation, dict) else operation
+        if not isinstance(resource, str) or not resource:
+            raise RuntimeError("Azure Activity Log event lacks a resource identity")
+        if not isinstance(operation, str) or not operation:
+            if resource.lower() == watcher_id.lower() or resource.lower() in resource_owner:
+                raise RuntimeError("Azure Activity Log event for an owned target lacks its operation identity")
+            continue
+        owner_target = resource.lower() in resource_owner
+        expected_owned_operation = None
+        if owner_target and "/providers/microsoft.network/networkinterfaces/" in resource.lower():
+            expected_owned_operation = "microsoft.network/networkinterfaces/write"
+        elif owner_target and "/providers/microsoft.compute/virtualmachines/" in resource.lower():
+            expected_owned_operation = "microsoft.compute/virtualmachines/write"
+        watcher_write = (resource.lower() == watcher_id.lower()
+            and operation.lower() == "microsoft.network/networkwatchers/write")
+        is_owned_write = owner_target and operation.lower() == expected_owned_operation
+        # Actual Activity Log exports include non-write health events for VM
+        # targets, sometimes without a caller. They do not prove ownership.
+        if not watcher_write and not is_owned_write:
+            continue
+        if not all(isinstance(value, str) and value for value in (caller, corr, status)):
+            raise RuntimeError("Azure Activity Log target write lacks caller, correlation, or status")
+        if status.lower() != "succeeded":
+            continue
+        raw_substatus = row.get("subStatus", {})
+        if not isinstance(raw_substatus, dict):
+            raise RuntimeError("Azure Activity Log subStatus field is malformed")
+        substatus = raw_substatus.get("value")
+        is_watcher_create = (watcher_write and status.lower() == "succeeded"
+            and isinstance(substatus, str) and substatus.lower() == "created"
+            and str(details.get("statusCode", "")).lower() == "created"
+            and str(raw_substatus.get("localizedValue", "")).lower() == "created (http status code: 201)")
+        is_owned_write = is_owned_write and status.lower() == "succeeded"
+        if watcher_write and not is_watcher_create:
+            raise RuntimeError("successful Network Watcher write is not an exact HTTP 201 creation")
+        if (is_watcher_create and caller != expected_create_caller) or (is_owned_write and caller != expected_owned_caller):
+            raise RuntimeError("Azure Activity Log caller differs from the exact authorized principal")
+        if is_watcher_create:
+            timestamp = row.get("eventTimestamp")
+            try:
+                observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as exc:
+                raise RuntimeError("Network Watcher Activity Log timestamp is malformed") from exc
+            if observed.tzinfo is None or not start < observed.astimezone(UTC) <= end:
+                raise RuntimeError("Network Watcher creation event is outside the cohort baseline and cleanup window")
+            watcher_create.append(corr)
+        if is_owned_write:
+            timestamp = row.get("eventTimestamp")
+            try:
+                observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as exc:
+                raise RuntimeError("owned parent Activity Log timestamp is malformed") from exc
+            if observed.tzinfo is None or not start < observed.astimezone(UTC) <= end:
+                raise RuntimeError("owned parent write is outside the original cohort mutation window")
+            owner = resource_owner[resource.lower()]
+            peer_writes.setdefault((owner["run_id"], corr), set()).add(resource.lower())
+    if len(watcher_create) != 1:
+        raise RuntimeError("Activity Log does not prove one exact successful Network Watcher creation")
+    correlation = watcher_create[0]
+    matches = [(run_id, writes) for (run_id, corr), writes in peer_writes.items() if corr == correlation]
+    if len(matches) != 1:
+        raise RuntimeError("Network Watcher creation correlation does not uniquely match owned NIC and VM writes")
+    owner = next(item for item in owners if item["run_id"] == matches[0][0])
+    if not (set(x.lower() for x in owner["nic_ids"]) & matches[0][1]
+            and set(x.lower() for x in owner["vm_ids"]) & matches[0][1]):
+        raise RuntimeError("Network Watcher creation correlation lacks both an owned NIC and VM write")
+    return {"events": events, "correlation_id": correlation}, evidence
+
+
+def _azure_rest(method: str, url: str, body: Optional[dict[str, Any]] = None,
+                headers: Optional[dict[str, str]] = None) -> list[str]:
     args = ["az", "rest", "--method", method, "--url", url, "--output", "json"]
-    if body is not None: args += ["--headers", "Content-Type=application/json", "--body", json.dumps(body, separators=(",", ":"))]
+    header_values = dict(headers or {})
+    if body is not None:
+        header_values.setdefault("Content-Type", "application/json")
+        args += ["--body", json.dumps(body, separators=(",", ":"))]
+    if header_values:
+        args += ["--headers", *[f"{key}={value}" for key, value in sorted(header_values.items())]]
     return args
 
 
@@ -1595,7 +2218,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("expiry target selector must name exactly A and B")
     root, journal, pair_vars, expiry_vars = prepare_recovery(deployment, options, clock=clock,
         utc_now=utc_now, initialize_timing=False)
-    _capture_profile_watcher_baseline(deployment,options,runner,root,journal,clock)
+    _capture_profile_watcher_baseline(deployment,options,runner,root,journal,clock,utc_now)
     _validate_provider_registrations(runner, options, root, clock)
     account = f"/subscriptions/{options.subscription_id}/resourceGroups/{name}/providers/Microsoft.Automation/automationAccounts/{name}-auto"
     rb = name + "-deallocate"
@@ -1672,8 +2295,7 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
     state=json.loads(journal.read_text(encoding="utf-8")); state["expiry"]["children"]["schedule"]="created"; _atomic_private(journal,state)
     sched_read = json.loads(_command(runner, options, root, _azure_rest("GET", sched_url), "schedule_readback", clock).stdout or "{}")
     props = sched_read.get("properties", {})
-    if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
-            or datetime.fromisoformat(props["startTime"].replace("Z", "+00:00")).astimezone(UTC) != trigger):
+    if not _azure_schedule_matches(props, trigger):
         raise RuntimeError("schedule readback mismatch")
     if (trigger - utc_now().astimezone(UTC)).total_seconds() < 300:
         raise ValueError("Automation schedule no longer has 300 seconds lead")
@@ -1719,7 +2341,8 @@ def _register_expiry_impl(deployment: ProviderDeploymentInput, request: ExpiryRe
         raise ValueError("post-registration workflow no longer fits actual trigger")
     metadata = {"mechanism":"azure_automation_once_deallocate","api_version":AUTOMATION_API,"resource_group":name,"location":deployment.vm_a.region,
         "reservation_id":reservation.reservation_id.value,"source_sha256":reservation.source_sha256,
-        "runbook":rb,"schedule":sched,"job_schedule_id":job_id,"trigger":trigger.isoformat(),"target_ids":ids,
+        "runbook":rb,"schedule":sched,"job_schedule_id":job_id,
+        "requested_trigger":requested_trigger.isoformat(),"trigger":trigger.isoformat(),"target_ids":ids,
         "published_content_sha256":digest,"runtime":"PowerShell 5.1","module":{"name":"Az.Accounts","version":module_props["version"]},
         "managed_identity_principal_id":expiry_ids["principal_id"],"role_assignment_id":expiry_ids["role_assignment_id"],
         "role_definition_id":expiry_ids["role_definition_id"],"resource_group_id":expiry_ids["resource_group_id"],
@@ -1777,9 +2400,8 @@ def _verify_registered_expiry(deployment: ProviderDeploymentInput, options: Azur
     schedule_url = f"{account}/schedules/{m['schedule']}?api-version={AUTOMATION_API}"
     schedule = json.loads(_command(runner, options, root, _azure_rest("GET", schedule_url), "expiry_schedule_recheck", clock).stdout or "{}")
     props = schedule.get("properties", {})
-    if (not props.get("isEnabled") or props.get("frequency") != "OneTime" or props.get("timeZone") != "UTC"
-            or props.get("runOn") not in (None, "")
-            or datetime.fromisoformat(props["startTime"].replace("Z", "+00:00")).astimezone(UTC) != expiry.expires_at.value):
+    if (not _azure_schedule_matches(props, expiry.expires_at.value)
+            or props.get("runOn") not in (None, "")):
         raise RuntimeError("registered expiry schedule is disabled or has changed")
     job_url = f"{account}/jobSchedules/{m['job_schedule_id']}?api-version={AUTOMATION_API}"
     job = json.loads(_command(runner, options, root, _azure_rest("GET", job_url), "expiry_binding_recheck", clock).stdout or "{}")
@@ -2000,8 +2622,8 @@ def _observe_vm_image(options: AzureRuntimeOptions, runner: CommandRunner, root:
 def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions, runner: CommandRunner, *,
               clock: Callable[[],float], utc_now: Callable[[],datetime]) -> AzureProviderResult:
     provision_stage_seconds = float(deployment.provisioning_timeout_seconds or options.command_timeout_seconds)
-    mono=clock()
-    provision_deadline_monotonic = mono + provision_stage_seconds
+    stage_started_monotonic = clock()
+    provision_deadline_monotonic = stage_started_monotonic + provision_stage_seconds
     if deployment.admission.workflow_profile:
         allowance = options.profile_allowance
         if allowance is None:
@@ -2020,7 +2642,12 @@ def provision(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         # stage cutoff. Keep the source overall cap untouched for its bindings.
         options = options.model_copy(update={
             "workflow_stage_deadline_monotonic": provision_deadline_monotonic})
+    # Keep the stage cutoff anchored to its original first monotonic sample,
+    # then validate one conservative UTC/monotonic pair. Sampling UTC first
+    # and monotonic second prevents elapsed Python work from moving the
+    # projected UTC cap later than the reserved cap.
     now=utc_now().astimezone(UTC)
+    mono=clock()
     _require_profile_timing_anchor(deployment, options, require_stop=True)
     name,ids=_validate_request(deployment,options,now,mono,require_registered=True)
     if date.fromisoformat(str(options.expiry_cost_input["date"])) > now.date():
@@ -2462,6 +3089,10 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
             raise RuntimeError("custom role definition inventory contains an unexpected identity")
         actions.append(_safe_cleanup_action(options,residual_defs))
         if _profile_name(deployment):
+            routine_options = options.model_copy(update={"cleanup_timing_phase": "routine"})
+            if timing_state is not None and timing_state.get("timing_status") == "within_deadline":
+                _cleanup_shared_network_watcher(deployment, routine_options, runner, root, clock, utc_now,
+                    state, actions)
             phase="emergency"
             if timing_state is not None:
                 try:

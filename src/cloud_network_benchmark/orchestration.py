@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
+import re
 import signal
 import stat
 import threading
@@ -75,6 +76,10 @@ class ProviderHooks:
     stage_admission: Callable[[str], Any] | None = None
     cleanup_reconcile: Callable[[Any], Any] | None = None
     cleanup_resource_ids: Callable[[], list[str]] | None = None
+    # AWS-only source-bound cleanup identity captured by the production hook.
+    # This remains available when expiry registration partially succeeds or
+    # returns a failed outcome, so cleanup never has to trust its own payload.
+    aws_cleanup_identity: Callable[[], Mapping[str, Any] | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -529,7 +534,37 @@ def cleanup_lifecycle(recovery_path: Path, *, current_session_id: str,
                                   current_session_id, outcomes, complete)
 
 
-def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | None]:
+def _expected_aws_cleanup_identity(result: ProviderLifecycleResult) -> Mapping[str, Any] | None:
+    """Bind AWS cleanup to the exact successful protection evidence for this workflow."""
+    from .contracts.admission import ExpiryEvidence
+
+    protected = result.values.get("protect")
+    if (not isinstance(protected, ExpiryEvidence) or protected.state != "registered"
+            or getattr(protected.provider, "value", protected.provider) != "aws"
+            or protected.registration_id.value != f"aws-ssm:{protected.deployment_id}"):
+        return None
+    match = re.fullmatch(
+        r"account=([0-9]{12});regions=([a-z]{2}-[a-z]+-[0-9](?:,[a-z]{2}-[a-z]+-[0-9])*)"
+        r";tags=cnb_run_id:([^;&,]+)&cnb_deployment_id:([^;&,]+)",
+        protected.target_selector,
+    )
+    if match is None:
+        return None
+    account_id, region_list, selector_run_id, selector_deployment_id = match.groups()
+    regions = region_list.split(",")
+    if len(regions) != len(set(regions)):
+        return None
+    if (protected.run_id != selector_run_id
+            or protected.deployment_id != selector_deployment_id
+            or protected.deployment_id != f"{protected.run_id}-deployment"):
+        return None
+    return {"account_id": account_id, "regions": regions,
+            "run_id": protected.run_id, "deployment_id": protected.deployment_id}
+
+
+def _typed_outcome(provider: str, stage: str, value: Any, *,
+                   expected_cleanup_identity: Mapping[str, Any] | None = None,
+                   cleanup_window: tuple[datetime, datetime] | None = None) -> tuple[bool, str | None]:
     """Interpret provider contract results and explicit adapter outcomes."""
     if stage == "cancel":
         return True, None
@@ -548,8 +583,19 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
         return (isinstance(value, ExpiryEvidence) and value.state == "registered"
                 and actual_provider == provider, reason)
     if stage == "claim":
-        return (getattr(value, "eligible", None) is True and getattr(value, "creation_granted", None) is True,
-                "F11 creation claim was not granted")
+        granted = (getattr(value, "eligible", None) is True
+                   and getattr(value, "creation_granted", None) is True)
+        if granted:
+            return True, None
+        # StageDecision reason codes are internal, fixed identifiers. Keep the
+        # operational error useful while excluding arbitrary adapter payloads.
+        reasons = getattr(value, "reason_codes", ())
+        reasons = reasons if isinstance(reasons, (tuple, list)) else ()
+        safe_reasons = tuple(code for code in reasons[:8]
+            if isinstance(code, str) and code.isascii() and code.replace("_", "").isalnum()
+            and len(code) <= 64)
+        detail = f" ({', '.join(safe_reasons)})" if safe_reasons else ""
+        return False, f"F11 creation claim was not granted{detail}"
     if stage == "create":
         from .contracts.deployment import ProviderDeploymentOutput
         deployment = value if isinstance(value, ProviderDeploymentOutput) else getattr(value, "deployment", None)
@@ -601,20 +647,91 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
         if isinstance(value, Mapping):
             inventory = value.get("inventory", inventory)
         inventory_proves_absence = False
-        def empty_inventory(value: Any) -> bool:
-            if isinstance(value, Mapping):
-                return all(empty_inventory(item) for item in value.values())
-            if isinstance(value, (list, tuple, set)):
-                return len(value) == 0
-            return value in (None, False, {}, [])
+        def aws_region_proves_absence(region: str, item: Any) -> bool:
+            resource_types = {
+                "addresses", "instances", "internet_gateways", "key_pairs",
+                "network_interfaces", "peerings", "placement_groups", "route_tables",
+                "security_groups", "subnets", "volumes", "vpcs",
+            }
+            if not isinstance(item, Mapping) or item.get("complete") is not True:
+                return False
+            scope = item.get("scope")
+            if (not isinstance(scope, Mapping) or scope.get("region") != region
+                    or expected_cleanup_identity is None
+                    or scope.get("run_id") != expected_cleanup_identity.get("run_id")
+                    or scope.get("deployment_id") != expected_cleanup_identity.get("deployment_id")
+                    or scope.get("account_id") != expected_cleanup_identity.get("account_id")):
+                return False
+            run_id, deployment_id = scope.get("run_id"), scope.get("deployment_id")
+            if not isinstance(run_id, str) or not run_id.strip() or not isinstance(deployment_id, str) or not deployment_id.strip():
+                return False
+            if item.get("remaining") != {}:
+                return False
+            if cleanup_window is None or len(cleanup_window) != 2:
+                return False
+            observed_at = item.get("observed_at_utc")
+            try:
+                observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError):
+                return False
+            started, finished = cleanup_window
+            if (observed.tzinfo is None or observed.utcoffset() is None
+                    or started.tzinfo is None or started.utcoffset() is None
+                    or finished.tzinfo is None or finished.utcoffset() is None
+                    or observed.astimezone(timezone.utc) < started.astimezone(timezone.utc)
+                    or observed.astimezone(timezone.utc) > finished.astimezone(timezone.utc)):
+                return False
+            resources = item.get("resources")
+            if not isinstance(resources, Mapping) or set(resources) != resource_types:
+                return False
+            seen_instances: set[str] = set()
+            for name, rows in resources.items():
+                if not isinstance(rows, list):
+                    return False
+                if name not in {"instances", "peerings"} and rows:
+                    return False
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        return False
+                    tags = row.get("Tags")
+                    if not isinstance(tags, list) or any(not isinstance(tag, Mapping) for tag in tags):
+                        return False
+                    tag_map = {tag.get("Key"): tag.get("Value") for tag in tags}
+                    if len(tag_map) != len(tags):
+                        return False
+                    if (tag_map.get("cnb_run_id") != run_id
+                            or tag_map.get("cnb_deployment_id") != deployment_id):
+                        return False
+                    if name == "instances":
+                        instance_id = row.get("InstanceId")
+                        state = row.get("State")
+                        if (not isinstance(instance_id, str) or not instance_id.strip()
+                                or instance_id in seen_instances
+                                or tag_map.get("cnb_role") not in {"vm_a", "vm_b"}
+                                or not isinstance(state, Mapping) or state.get("Name") != "terminated"):
+                            return False
+                        seen_instances.add(instance_id)
+                        if len(seen_instances) > 2:
+                            return False
+                    elif name == "peerings":
+                        peering_id = row.get("VpcPeeringConnectionId")
+                        status = row.get("Status")
+                        if (not isinstance(peering_id, str) or not peering_id.strip()
+                                or not isinstance(status, Mapping) or status.get("Code") != "deleted"):
+                            return False
+            return True
         if provider == "aws" and isinstance(inventory, Mapping):
             safety = inventory.get("safety_absent")
             regions = inventory.get("regions")
+            expected_regions = (expected_cleanup_identity.get("regions")
+                if isinstance(expected_cleanup_identity, Mapping) else None)
             inventory_proves_absence = (inventory.get("complete") is True
                 and isinstance(safety, Mapping) and bool(safety) and all(item is True for item in safety.values())
                 and isinstance(regions, Mapping) and bool(regions)
-                and all(isinstance(item, Mapping) and item.get("complete") is True
-                        and empty_inventory(item.get("resources")) for item in regions.values()))
+                and isinstance(expected_regions, (list, tuple)) and bool(expected_regions)
+                and set(regions) == set(expected_regions)
+                and set(safety) == set(regions)
+                and all(aws_region_proves_absence(region, item) for region, item in regions.items()))
         elif provider == "gcp" and isinstance(inventory, Mapping):
             inventory_proves_absence = (inventory.get("pages_complete") is True
                 and inventory.get("zone_scope") == "all_project_zones"
@@ -633,7 +750,9 @@ def _typed_outcome(provider: str, stage: str, value: Any) -> tuple[bool, str | N
 def _call(provider: str, stage: str, action: Callable[[], Any], result: ProviderLifecycleResult,
           *, before: Callable[[], None] | None = None,
           after: Callable[[Any, bool], None] | None = None,
-          verify: Callable[[Any], None] | None = None) -> bool:
+          verify: Callable[[Any], None] | None = None,
+          aws_cleanup_identity: Callable[[], Mapping[str, Any] | None] | None = None,
+          cleanup_window: list[datetime] | None = None) -> bool:
     try:
         if before is not None:
             try:
@@ -645,7 +764,15 @@ def _call(provider: str, stage: str, action: Callable[[], Any], result: Provider
             result.creation_may_have_started = True
         value = action()
         result.values[stage] = value
-        succeeded, reason = _typed_outcome(provider, stage, value)
+        outcome_window = (cleanup_window[0], cleanup_window[1]) if cleanup_window is not None and len(cleanup_window) == 2 else None
+        if provider == "aws" and stage == "cleanup":
+            expected_identity = (aws_cleanup_identity() if aws_cleanup_identity is not None
+                else _expected_aws_cleanup_identity(result))
+        else:
+            expected_identity = None
+        succeeded, reason = _typed_outcome(provider, stage, value,
+            expected_cleanup_identity=expected_identity,
+            cleanup_window=outcome_window)
         if succeeded and verify is not None:
             verify(value)
         if succeeded and stage == "create" and not isinstance(value, ProviderStageOutcome):
@@ -790,6 +917,7 @@ def execute_provider_workflows(
     def call(provider: str, stage: str, action: Callable[[], Any], *, verify=None) -> bool:
         nonlocal interrupted
         started_at = utc_now()
+        cleanup_times: list[datetime] = [started_at]
         try:
             before = None if stage == "cancel" else lambda: _before_stage(context, clock, provider, stage, workflows[provider])
             if recovery_path is not None and stage != "cancel":
@@ -831,8 +959,17 @@ def execute_provider_workflows(
                             update_archive_recovery(recovery_path, provider, archive_status)
             else:
                 after = None
+            if stage == "cleanup":
+                original_action = action
+                def action():
+                    value = original_action()
+                    cleanup_times.append(utc_now())
+                    return value
             succeeded = _call(provider, stage, action, results[provider], before=before,
-                              after=after, verify=verify)
+                              after=after, verify=verify,
+                              aws_cleanup_identity=(workflows[provider].aws_cleanup_identity
+                                  if provider == "aws" and stage == "cleanup" else None),
+                              cleanup_window=cleanup_times)
         except BaseException as exc:
             results[provider].stage_times[stage] = {
                 "started_at": started_at, "finished_at": utc_now()}

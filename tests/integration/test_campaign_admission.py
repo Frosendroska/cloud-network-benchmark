@@ -290,14 +290,16 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
     window = {"not_before_utc": lower, "not_after_utc": upper}
+    dispatch_window = dict(window)
     acceptance = settings["stage_inputs"]["acceptance"]
     acceptance.update(workflow_profile=ACCEPTANCE_PROFILE,
-        failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window)
+        failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     acceptance.pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, FAILURE_PROFILE]
     settings["approvals"]["paired_acceptance"]["fields"] = {
         "mode": "paired_acceptance_s1_s3", "max_parallel_entries": 2,
-        "execution_window_utc": window}
+        "execution_window_utc": window, "dispatch_window_utc": dispatch_window}
 
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock())
@@ -308,6 +310,7 @@ def test_production_ready_acceptance_stage_composes_with_driver_pair_validation(
     assert all(row["scheduled_start"] is None for row in pair)
     assert {row["launch_at"] for row in pair} == {lower}
     assert stage["dispatch_policy"]["execution_window"] == window
+    assert stage["dispatch_policy"]["dispatch_window_utc"] == dispatch_window
     assert stage["dispatch_policy"]["ready_window_seconds"] == 600
     assert stage["measurement_start_barrier"]["execution_window"] == window
     assert stage["measurement_start_barrier"]["ready_window_seconds"] == 600
@@ -442,11 +445,13 @@ def test_fixed_acceptance_draft_prices_the_northern_failure_configs(
         workflow_profile=ACCEPTANCE_PROFILE, failure_workflow_profile=FAILURE_PROFILE)
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     upper = (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()
-    settings["stage_inputs"]["acceptance"]["execution_window_utc"] = {
-        "not_before_utc": lower, "not_after_utc": upper}
+    window = {"not_before_utc": lower, "not_after_utc": upper}
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE)
-    settings["stage_inputs"]["calibration"]["execution_window_utc"] = {
-        "not_before_utc": lower, "not_after_utc": upper}
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [
@@ -545,11 +550,13 @@ def test_source_profile_allowance_reaches_materialized_azure_factory(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     settings["stage_inputs"]["acceptance"].update(workflow_profile="all_cloud_acceptance_v1",
-        failure_workflow_profile="all_cloud_failure_acceptance_v1", execution_window_utc=window)
+        failure_workflow_profile="all_cloud_failure_acceptance_v1", execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].update(workflow_profile="all_cloud_calibration_v1",
-        execution_window_utc=window)
+        execution_window_utc=window, dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = ["all_cloud_acceptance_v1",
         "all_cloud_failure_acceptance_v1", "all_cloud_calibration_v1"]
@@ -723,8 +730,9 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE,
-        execution_window_utc=window)
+        execution_window_utc=window, dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
     stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
@@ -733,6 +741,15 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
     entry = stage["entries"][0]
     runtime = load_runtime_config(Path(entry["runtime_config_path"]),
         allow_missing_approval_evidence=True)
+    assert runtime["dispatch_window_utc"] == runtime["measurement_start_barrier"]["dispatch_window_utc"]
+    runtime_path = Path(entry["runtime_config_path"])
+    original_runtime = json.loads(runtime_path.read_text())
+    changed_runtime = json.loads(json.dumps(original_runtime))
+    changed_runtime["dispatch_window_utc"]["not_after_utc"] = "2026-11-24T16:00:00+00:00"
+    runtime_path.write_text(json.dumps(changed_runtime))
+    with pytest.raises(ValueError, match="malformed or mismatched"):
+        load_runtime_config(runtime_path, allow_missing_approval_evidence=True)
+    runtime_path.write_text(json.dumps(original_runtime))
     parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
         repository_root=repository_root, config_path=Path(entry["config_path"]))
     campaign, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
@@ -745,6 +762,43 @@ def test_ready_triggered_calibration_runtime_binds_all_factory_stages(repository
             recovery_path=tmp_path / f"calibration-{provider}-recovery.json",
             archive_sink={"archive_root": str(tmp_path / "calibration-archive")})
         assert callable(stages.measure)
+
+
+def test_calibration_approval_backcompat_and_explicit_split_binding(repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import validate_stage_inputs
+    from cloud_network_benchmark.validation_profiles import CALIBRATION_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    calibration = settings["stage_inputs"]["calibration"]
+    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window)
+    calibration.pop("allowance", None)
+    settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
+
+    # Legacy ready CAL approval did not bind execution-window fields.
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert not any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    dispatch = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=4)).isoformat()}
+    calibration["dispatch_window_utc"] = dispatch
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    settings["approvals"]["calibration_authorized"]["fields"] = {
+        "execution_window_utc": window, "dispatch_window_utc": dispatch}
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert not any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
+
+    settings["approvals"]["calibration_authorized"]["fields"]["dispatch_window_utc"] = window
+    errors = validate_stage_inputs({"stage": "calibration"}, settings, repository_root)
+    assert any("calibration_authorized must bind both exact ready-triggered validation windows" in item
+        for item in errors)
 
 
 def test_draft_activation_parses_runtime_and_runs_preflight_before_evidence(repository_root, tmp_path, monkeypatch, request):
@@ -782,8 +836,10 @@ def test_real_calibration_activation_without_acceptance_receipt_writes_no_approv
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    dispatch_window = dict(window)
     calibration = settings["stage_inputs"]["calibration"]
-    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window)
+    calibration.update(workflow_profile=CALIBRATION_PROFILE, execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     calibration.pop("allowance", None)
     settings["pricing"]["workflow_profiles"] = [CALIBRATION_PROFILE]
     stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
@@ -1133,8 +1189,11 @@ def test_source_bound_waiver_uses_reduced_acceptance_and_calibration_profiles(
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
-    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
-    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["stage_inputs"]["acceptance"]["failure_waiver"] = {
@@ -1175,8 +1234,11 @@ def test_supported_fixed_draft_binds_final_waiver_runtime_hashes_and_rejects_tam
     lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
-    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window)
-    settings["stage_inputs"]["calibration"].update(execution_window_utc=window)
+    dispatch_window = dict(window)
+    settings["stage_inputs"]["acceptance"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
+    settings["stage_inputs"]["calibration"].update(execution_window_utc=window,
+        dispatch_window_utc=dispatch_window)
     settings["stage_inputs"]["acceptance"].pop("allowance", None)
     settings["stage_inputs"]["calibration"].pop("allowance", None)
     settings["stage_inputs"]["acceptance"]["failure_waiver"] = {
@@ -1308,3 +1370,527 @@ def test_exact_registered_failure_receipt_can_be_reused_without_recreating_its_a
     settings["stage_inputs"]["acceptance"]["failure_checks"]["V-A-FAIL"]["reuse"]["sha256"] = hashlib.sha256(old.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="identity changed|exact prepared config/runtime"):
         inputs._review_from_prepared(settings, stage)
+
+
+@pytest.mark.parametrize(("stage_name", "activation_fault"), [
+    ("acceptance", "none"),
+    ("acceptance", "v19_release_success"),
+    ("acceptance", "v19_missing_prior"),
+    ("acceptance", "v19_missing_prior_file"),
+    ("acceptance", "v19_wrong_prior_hash"),
+    ("acceptance", "v19_wrong_prior_caps"),
+    ("acceptance", "v19_expired_prior"),
+    ("acceptance", "v19_missing_current"),
+    ("acceptance", "v19_missing_current_file"),
+    ("acceptance", "v19_missing_current_hash"),
+    ("acceptance", "v19_wrong_current_hash"),
+    ("acceptance", "v19_wrong_current_caps"),
+    ("acceptance", "v19_expired_current"),
+    ("acceptance", "expired_auxiliary_card"),
+    ("acceptance", "future_auxiliary_card"),
+    ("acceptance", "ordinary_pending_evidence"),
+    ("acceptance", "other_stage_pending_evidence"),
+    ("acceptance", "financial_callback_source_mutation"),
+    ("calibration", "none"),
+])
+def test_azure_auxiliary_production_draft_freezes_parent_scope_and_financial_binding(
+        stage_name, activation_fault, repository_root, tmp_path, monkeypatch, request):
+    """Exercise real preparation and read-only paid preflight with synthetic sources only."""
+    from cloud_network_benchmark.campaign_inputs import activate_prepared_stage
+    from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, CALIBRATION_PROFILE, FAILURE_PROFILE
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    v19_cases = {"v19_release_success", "v19_missing_prior", "v19_wrong_prior_hash",
+        "v19_missing_prior_file", "v19_wrong_prior_caps", "v19_expired_prior",
+        "v19_missing_current", "v19_missing_current_file", "v19_missing_current_hash",
+        "v19_wrong_current_hash", "v19_wrong_current_caps", "v19_expired_current"}
+    if activation_fault in v19_cases:
+        settings["pricing"]["funding"].update(primary="200.73562207733502645502645501",
+            uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+            replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+        settings["pricing"]["pending_eur_reserve_release"] = {
+            "status": "pending", "currency": "EUR", "prior_release_eur": "14",
+            "additional_release_eur": "15", "cumulative_release_eur": "29"}
+    source = tmp_path / "DECISIONS.md"
+    source.write_text("## 2026-11-23 Waive deliberate pre-DAY fault, expiry and recovery experiments\n")
+    settings["providers"]["azure"]["subscription_id"] = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    lower = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)).isoformat()
+    window = {"not_before_utc": lower,
+        "not_after_utc": (datetime.fromisoformat(lower) + timedelta(hours=5)).isoformat()}
+    if stage_name == "acceptance":
+        profile = ACCEPTANCE_PROFILE
+        settings["stage_inputs"][stage_name].update(workflow_profile=profile,
+            failure_workflow_profile=FAILURE_PROFILE, execution_window_utc=window,
+            dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True,
+            failure_waiver={"confirmed": True, "source": str(source),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+        settings["stage_inputs"][stage_name].pop("allowance", None)
+        settings["approvals"]["paired_acceptance"]["fields"].update(
+            execution_window_utc=window, dispatch_window_utc=dict(window))
+        expected_ids = {"V-S1", "V-S3"}
+    else:
+        profile = CALIBRATION_PROFILE
+        settings["stage_inputs"][stage_name].update(workflow_profile=profile,
+            execution_window_utc=window, dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True)
+        settings["stage_inputs"][stage_name].pop("allowance", None)
+        settings["approvals"]["calibration_authorized"]["fields"] = {
+            "execution_window_utc": window, "dispatch_window_utc": dict(window)}
+        expected_ids = {"CAL-S1"}
+    if stage_name == "acceptance":
+        settings["stage_inputs"]["calibration"].update(workflow_profile=CALIBRATION_PROFILE,
+            execution_window_utc=window, dispatch_window_utc=dict(window), azure_auxiliary_cleanup=True)
+        settings["stage_inputs"]["calibration"].pop("allowance", None)
+        settings["approvals"]["calibration_authorized"]["fields"] = {
+            "execution_window_utc": window, "dispatch_window_utc": dict(window)}
+    settings["pricing"]["workflow_profiles"] = ([ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
+        if stage_name == "acceptance" else [profile])
+
+    stage = prepare_stage({"stage": stage_name}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+    if activation_fault in v19_cases:
+        pending_payload = json.loads(Path(stage["cost_input_path"]).read_text())
+        assert pending_payload["normalization"]["reserve_release"] == settings["pricing"]["pending_eur_reserve_release"]
+        assert pending_payload["funding"]["total_limit"] == "300"
+        assert pending_payload["funding"]["working_limit"] == "250"
+        assert pending_payload["funding"]["protected_buffer"] == "50"
+    calibration_stage = None
+    batch_draft_path = None
+    if stage_name == "acceptance":
+        calibration_stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
+            Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+        register_generated_cleanup(calibration_stage, request)
+        assert stage["cost_input_sha256"] == calibration_stage["cost_input_sha256"]
+    scope_ref = stage["azure_auxiliary_cleanup_scope"]
+    scope_path = Path(scope_ref["path"])
+    scope = json.loads(scope_path.read_text())
+    assert {row["entry_id"] for row in scope["owners"]} == expected_ids
+    assert all(set(owner) == {"entry_id", "run_id", "campaign_id", "deployment_id", "config_sha256",
+        "resource_group_id", "vm_ids", "nic_ids"} for owner in scope["owners"])
+    assert "azure_shared_cleanup" in stage["approval_refs"]
+    assert not Path(stage["approval_refs"]["azure_shared_cleanup"]).exists()
+    assert all(not Path(value).exists() for key, value in stage["approval_refs"].items()
+        if key != "azure_shared_cleanup")
+
+    from cloud_network_benchmark.manifests import recompute_parent_manifest
+    for entry in stage["entries"]:
+        member = next(row for row in scope["members"] if row["entry_id"] == entry["entry_id"])
+        snapshot = Path(member["parent_manifest_path"])
+        live = Path(entry["parent_manifest_path"])
+        assert snapshot != live and snapshot.read_bytes() == live.read_bytes()
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
+        runtime_bytes = Path(entry["runtime_config_path"]).read_bytes()
+        assert hashlib.sha256(runtime_bytes).hexdigest() == entry["runtime_config_sha256"]
+        parent = json.loads(live.read_text())
+        recompute_parent_manifest(live, datetime.fromisoformat(parent["updated_at"]) + timedelta(seconds=1),
+            "synthetic offline lifecycle rewrite")
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == member["parent_manifest_sha256"]
+
+    if calibration_stage is not None:
+        from cloud_network_benchmark.campaign_draft import create_draft_bundle
+        batch_draft_path = Path(settings["state_root"]) / "fixed-pre-day-driver-draft.json"
+        create_draft_bundle(plan={"batch_id": "fixed-pre-day-v1"},
+            stages=[stage, calibration_stage], output_path=batch_draft_path,
+            missing_prerequisites={stage["stage_id"]: ["paid_authorization"],
+                calibration_stage["stage_id"]: ["paid_authorization"]}, preparer=lambda: None)
+
+    def draft_admission(entry, runtime=None, owner_stage=None):
+        from cloud_network_benchmark.lifecycle_runtime import load_initialized_campaign
+        owner_stage = owner_stage or stage
+        runtime = runtime or load_runtime_config(Path(entry["runtime_config_path"]),
+            selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+        parent, children = load_initialized_campaign(Path(entry["parent_manifest_path"]),
+            repository_root=repository_root, config_path=Path(entry["config_path"]),
+            schedule_path=Path(entry["schedule_path"]) if entry["schedule_path"] else None)
+        base, _ = resolve_campaign(Path(entry["config_path"]), repository_root)
+        campaign = base
+        costs = load_cost_inputs(Path(entry["cost_inputs_path"]))
+        return build_admission_request(campaign=campaign, parent=parent, children=children,
+            costs=costs, runtime=runtime, controller_session_id=owner_stage["controller_session_id"])
+
+    from cloud_network_benchmark.financial_controls import financial_binding
+
+    pre_card_bindings = {}
+    for entry in stage["entries"]:
+        runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+            selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+        _paid_request, plan = draft_admission(entry, runtime)
+        assert "authorization" not in runtime["azure_auxiliary_cleanup"]
+        pre_card_bindings[entry["entry_id"]] = (plan.financial_binding,
+            financial_binding(plan, _paid_request), _paid_request.model_dump(mode="json"))
+
+    batch_financial_entries = []
+    if calibration_stage is not None:
+        for prepared in (stage, calibration_stage):
+            for entry in prepared["entries"]:
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+                    selected_providers=set(entry["run_ids"]), allow_missing_approval_evidence=True)
+                request_obj, plan_obj = draft_admission(entry, runtime, owner_stage=prepared)
+                batch_financial_entries.append(financial_binding(plan_obj, request_obj))
+
+    decision = tmp_path / "synthetic-cleanup-decision.txt"
+    decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+    card_path = Path(stage["approval_refs"]["azure_shared_cleanup"])
+    created = datetime.now(timezone.utc).replace(microsecond=0)
+    card = {"schema_version": 1, "approval_status": "approved",
+        "action": "delete_exact_auto_created_network_watcher_and_empty_parent",
+        "profile": scope["profile"], "cohort_id": scope["cohort_id"],
+        "subscription_id": scope["subscription_id"], "region": scope["region"],
+        "resource_group_id": scope["resource_group_id"], "watcher_id": scope["watcher_id"],
+        "cohort_manifest_path": str(scope_path), "cohort_manifest_sha256": scope_ref["sha256"],
+        "owners": scope["owners"],
+        "expected_watcher_create_caller": "00000000-0000-0000-0000-000000000001",
+        "expected_owned_write_caller": "00000000-0000-0000-0000-000000000002",
+        "maximum_leaf_deletes": 1, "maximum_group_deletes": 1,
+        "source_path": str(scope_path), "source_sha256": scope_ref["sha256"],
+        "decision_source_path": str(decision),
+        "decision_source_sha256": hashlib.sha256(decision.read_bytes()).hexdigest(),
+        "approved_by": "synthetic-offline-test", "approved_at_utc": created.isoformat(),
+        "not_before_utc": (created - timedelta(minutes=1)).isoformat(),
+        "not_after_utc": (created + timedelta(days=30)).isoformat()}
+    card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
+
+    def read_only_preflight(candidate, *, runtime_configs):
+        assert candidate["status"] == "READY_FOR_ADMISSION"
+        assert set(runtime_configs) == expected_ids
+        for entry in stage["entries"]:
+            runtime = runtime_configs[entry["entry_id"]]
+            assert runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
+            _paid_request, plan = draft_admission(entry, runtime)
+            assert (plan.financial_binding, financial_binding(plan, _paid_request),
+                _paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
+            assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
+
+    runtime_bytes_by_entry = {entry["entry_id"]: Path(entry["runtime_config_path"]).read_bytes()
+        for entry in stage["entries"]}
+    if calibration_stage is None:
+        activated = activate_prepared_stage(stage, settings, repository_root, preflight=read_only_preflight)
+        assert activated["status"] == "READY_FOR_ADMISSION"
+    else:
+        from cloud_network_benchmark.campaign import CampaignDriver
+        from tests.financial_helpers import synthetic_finances
+
+        auth_root = tmp_path / "synthetic-financial-card"; auth_root.mkdir()
+        _book, _plans, paid_card, paid_card_path = synthetic_finances(auth_root, count=3, paid=True)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        valid_until = now + timedelta(days=60)
+        paid_card.update(batch_id="fixed-pre-day-v1", stage_id="synthetic-fixed-batch",
+            ledger_scope_id=stage["scope_id"], approved_by="SYNTHETIC-OFFLINE-TEST",
+            approved_at=now.isoformat(), valid_from=(now - timedelta(minutes=1)).isoformat(),
+            valid_until=valid_until.isoformat(), approved_run_count=9,
+            entries=batch_financial_entries)
+        cost_path = Path(stage["cost_input_path"])
+        cost_sha256 = load_cost_inputs(cost_path).payload_sha256
+        paid_card["price"] = {"path": str(cost_path), "sha256": cost_sha256,
+            "official_urls": ["https://example.invalid/SYNTHETIC-OFFLINE"],
+            "checked_at": now.isoformat(), "valid_until": valid_until.isoformat()}
+        for key in ("fx", "external_liabilities"):
+            reference = paid_card[key]
+            source_path = Path(reference["path"])
+            source = json.loads(source_path.read_text())
+            source.update(checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+            if key == "external_liabilities":
+                source.update(ledger_scope_id=stage["scope_id"], currency="EUR", gross_eur="0",
+                    personal_cash_eur="0", excludes_this_ledger=True)
+            source_path.write_text(json.dumps(source, sort_keys=True) + "\n")
+            reference.update(sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+        prior_card_path = auth_root / "SYNTHETIC-prior-v18-card.json"
+        prior_card_hash = None
+        if activation_fault in v19_cases:
+            import copy
+            prior_card = copy.deepcopy(paid_card)
+            prior_card["caps"].update(project_eur="300", working_eur="264", protected_eur="36",
+                personal_cash_eur="264", batch_eur="264", stage_eur="264")
+            if activation_fault == "v19_wrong_prior_caps":
+                prior_card["caps"]["working_eur"] = "263"
+            if activation_fault == "v19_expired_prior":
+                prior_card["valid_until"] = (now - timedelta(seconds=1)).isoformat()
+            prior_card_path.write_text(json.dumps(prior_card, sort_keys=True) + "\n")
+            prior_card_hash = hashlib.sha256(prior_card_path.read_bytes()).hexdigest()
+            import cloud_network_benchmark.campaign_inputs as campaign_inputs
+            monkeypatch.setattr(campaign_inputs, "_EUR14_AUTHORITY_SHA256", prior_card_hash)
+            settings["approvals"]["prior_paid_authorization"] = {
+                "confirmed": True, "source": str(prior_card_path), "sha256": prior_card_hash}
+            paid_card["caps"].update(project_eur="300", working_eur="279", protected_eur="21",
+                personal_cash_eur="279", batch_eur="279", stage_eur="279")
+            if activation_fault == "v19_wrong_current_caps":
+                paid_card["caps"].update(working_eur="264", protected_eur="36")
+            if activation_fault == "v19_expired_current":
+                paid_card["valid_until"] = (now - timedelta(seconds=1)).isoformat()
+        paid_card_path.write_text(json.dumps(paid_card, sort_keys=True) + "\n")
+        current_card_hash = hashlib.sha256(paid_card_path.read_bytes()).hexdigest()
+        settings["approvals"]["paid_authorization"].update(confirmed=True, source=str(paid_card_path),
+            sha256=current_card_hash)
+        if activation_fault == "v19_missing_prior":
+            settings["approvals"].pop("prior_paid_authorization")
+        elif activation_fault == "v19_missing_prior_file":
+            settings["approvals"]["prior_paid_authorization"]["source"] = str(
+                auth_root / "missing-SYNTHETIC-prior-v18-card.json")
+        elif activation_fault == "v19_wrong_prior_hash":
+            settings["approvals"]["prior_paid_authorization"]["sha256"] = "0" * 64
+        elif activation_fault == "v19_missing_current":
+            settings["approvals"].pop("paid_authorization")
+        elif activation_fault == "v19_missing_current_file":
+            settings["approvals"]["paid_authorization"]["source"] = str(
+                auth_root / "missing-SYNTHETIC-current-v19-card.json")
+        elif activation_fault == "v19_missing_current_hash":
+            settings["approvals"]["paid_authorization"].pop("sha256")
+        elif activation_fault == "v19_wrong_current_hash":
+            settings["approvals"]["paid_authorization"]["sha256"] = "0" * 64
+        settings_path = tmp_path / "operator-settings.yaml"; settings_path.write_text("synthetic offline fixture\n")
+        dispatched = []
+        driver = CampaignDriver(settings_loader=lambda _path: settings, clock=Clock(),
+            dispatch=lambda activated: dispatched.append(activated["stage_id"]) or
+                {"supervisor": "synthetic-no-call"})
+        pending_fixture_bytes = {}
+        financial_preflight_calls = []
+        if activation_fault in v19_cases:
+            validate_finances = driver._validate_activated_stage_finances
+
+            def count_v19_preflight(*args, **kwargs):
+                financial_preflight_calls.append(True)
+                return validate_finances(*args, **kwargs)
+
+            driver._validate_activated_stage_finances = count_v19_preflight
+        if activation_fault == "expired_auxiliary_card":
+            changed = json.loads(card_path.read_text())
+            changed["not_after_utc"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+            card_path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+        elif activation_fault == "future_auxiliary_card":
+            changed = json.loads(card_path.read_text())
+            changed["not_before_utc"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            card_path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+        elif activation_fault == "ordinary_pending_evidence":
+            ordinary_path = Path(next(value for key, value in stage["approval_refs"].items()
+                if key != "azure_shared_cleanup"))
+            ordinary_path.parent.mkdir(parents=True, exist_ok=True)
+            ordinary_path.write_text("SYNTHETIC PENDING ORDINARY EVIDENCE\n")
+            pending_fixture_bytes[str(ordinary_path)] = ordinary_path.read_bytes()
+        elif activation_fault == "other_stage_pending_evidence":
+            foreign_card_path = Path(calibration_stage["approval_refs"]["azure_shared_cleanup"])
+            foreign_card_path.write_text("SYNTHETIC PENDING CALIBRATION EVIDENCE\n")
+            pending_fixture_bytes[str(foreign_card_path)] = foreign_card_path.read_bytes()
+        elif activation_fault == "financial_callback_source_mutation":
+            validate_finances = driver._validate_activated_stage_finances
+            validated = {"called": False}
+
+            def validate_then_mutate(*args, **kwargs):
+                result = validate_finances(*args, **kwargs)
+                validated["called"] = True
+                decision.write_bytes(decision.read_bytes() + b"synthetic callback mutation\n")
+                return result
+
+            driver._validate_activated_stage_finances = validate_then_mutate
+
+        if activation_fault in v19_cases and activation_fault != "v19_release_success":
+            with pytest.raises((ValueError, PermissionError)):
+                driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                    settings_path=settings_path, execute=True, root=repository_root)
+            assert financial_preflight_calls == []
+            assert dispatched == []
+            assert all(not Path(value).exists() for key, value in stage["approval_refs"].items()
+                if key != "azure_shared_cleanup")
+            assert not (Path(settings["state_root"]) / stage["stage_id"] / "activated-stage.json").exists()
+            consumed_path = batch_draft_path.with_suffix(
+                batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+            assert not consumed_path.exists()
+            return
+
+        if activation_fault not in {"none", "v19_release_success"}:
+            if activation_fault in {"expired_auxiliary_card", "future_auxiliary_card"}:
+                with pytest.raises(PermissionError, match="validity window"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+            elif activation_fault in {"ordinary_pending_evidence", "other_stage_pending_evidence"}:
+                with pytest.raises(ValueError, match="approval evidence appeared before activation"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+            else:
+                with pytest.raises((ValueError, PermissionError),
+                                   match="decision source is missing or changed"):
+                    driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                        settings_path=settings_path, execute=True, root=repository_root)
+                assert validated["called"]
+            for key, value in stage["approval_refs"].items():
+                if key == "azure_shared_cleanup":
+                    continue
+                ordinary_path = Path(value)
+                expected_bytes = pending_fixture_bytes.get(str(ordinary_path))
+                assert ordinary_path.exists() == (expected_bytes is not None)
+                if expected_bytes is not None:
+                    assert ordinary_path.read_bytes() == expected_bytes
+            for pending_path, expected_bytes in pending_fixture_bytes.items():
+                assert Path(pending_path).read_bytes() == expected_bytes
+            assert not (Path(settings["state_root"]) / stage["stage_id"] / "activated-stage.json").exists()
+            consumed_path = batch_draft_path.with_suffix(
+                batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+            assert not consumed_path.exists()
+            if activation_fault == "financial_callback_source_mutation":
+                decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+            return
+
+        result = driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+            settings_path=settings_path, execute=True, root=repository_root)
+        assert result["status"] == "dispatched"
+        if activation_fault == "v19_release_success":
+            assert financial_preflight_calls == [True]
+            assert dispatched == [stage["stage_id"]]
+        consumed = batch_draft_path.with_suffix(batch_draft_path.suffix + f".{stage['stage_id']}.consumed.json")
+        assert json.loads(consumed.read_text())["status"] == "CONSUMED"
+        with pytest.raises(ValueError, match="already activated or dispatched"):
+            driver.activate_frozen_draft(batch_draft_path, stage_id=stage["stage_id"],
+                settings_path=settings_path, execute=True, root=repository_root)
+
+        # Explicitly terminalize only this pytest-temp journal so the fixture
+        # can probe CAL activation sequencing. The synthetic dispatch above
+        # performed no provider calls and produced no normal-run evidence.
+        journal_path = Path(result["journal"])
+        journal = json.loads(journal_path.read_text())
+        fixture_terminal_at = datetime.now(timezone.utc).isoformat()
+        for entry_id, record in journal["entries"].items():
+            record.update(state="complete", finished_at=fixture_terminal_at,
+                result={"fixture_scope": "SYNTHETIC_TEST_ONLY_NO_PROVIDER_CALLS",
+                    "provider_acceptance": False, "valid_normals": 0})
+        journal["updated_at"] = fixture_terminal_at
+        journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n")
+
+        calibration_scope_ref = calibration_stage["azure_auxiliary_cleanup_scope"]
+        calibration_scope_path = Path(calibration_scope_ref["path"])
+        calibration_scope = json.loads(calibration_scope_path.read_text())
+        calibration_decision = tmp_path / "synthetic-calibration-cleanup-decision.txt"
+        calibration_decision.write_text("SYNTHETIC OFFLINE TEST ONLY: no Azure cleanup authority\n")
+        calibration_card_path = Path(calibration_stage["approval_refs"]["azure_shared_cleanup"])
+        calibration_card = {**card, "profile": calibration_scope["profile"],
+            "cohort_id": calibration_scope["cohort_id"], "subscription_id": calibration_scope["subscription_id"],
+            "region": calibration_scope["region"], "resource_group_id": calibration_scope["resource_group_id"],
+            "watcher_id": calibration_scope["watcher_id"],
+            "cohort_manifest_path": str(calibration_scope_path),
+            "cohort_manifest_sha256": calibration_scope_ref["sha256"], "owners": calibration_scope["owners"],
+            "source_path": str(calibration_scope_path), "source_sha256": calibration_scope_ref["sha256"],
+            "decision_source_path": str(calibration_decision),
+            "decision_source_sha256": hashlib.sha256(calibration_decision.read_bytes()).hexdigest()}
+        calibration_card_path.write_text(json.dumps(calibration_card, sort_keys=True) + "\n")
+        calibration_result = driver.activate_frozen_draft(batch_draft_path,
+            stage_id=calibration_stage["stage_id"], settings_path=settings_path,
+            execute=True, root=repository_root)
+        assert calibration_result["status"] == "dispatched"
+        calibration_consumed = batch_draft_path.with_suffix(
+            batch_draft_path.suffix + f".{calibration_stage['stage_id']}.consumed.json")
+        assert json.loads(calibration_consumed.read_text())["status"] == "CONSUMED"
+        activated = {"status": "READY_FOR_ADMISSION"}
+    assert not Path(stage["ledger_path"]).exists()
+    for entry in stage["entries"]:
+        strict_runtime, _parent, _children, paid_request, plan = load_entry(stage, entry, repository_root)
+        assert strict_runtime["azure_auxiliary_cleanup"]["authorization"]["card_path"] == str(card_path)
+        assert (plan.financial_binding, financial_binding(plan, paid_request),
+            paid_request.model_dump(mode="json")) == pre_card_bindings[entry["entry_id"]]
+        assert Path(entry["runtime_config_path"]).read_bytes() == runtime_bytes_by_entry[entry["entry_id"]]
+
+    runtime_path = Path(stage["entries"][0]["runtime_config_path"])
+    original_runtime = runtime_path.read_bytes()
+    original_card = card_path.read_bytes()
+    original_scope = scope_path.read_bytes()
+    member = scope["members"][0]
+    snapshot_path = Path(member["parent_manifest_path"])
+    original_snapshot = snapshot_path.read_bytes()
+    parent = json.loads(Path(stage["entries"][0]["parent_manifest_path"]).read_text())
+    child_ref = next(row for row in parent["child_runs"] if row["provider"] == "azure")
+    child_path = Path(child_ref["manifest_path"])
+    if not child_path.is_absolute():
+        child_path = repository_root / child_path
+    original_child = child_path.read_bytes()
+
+    def reject_runtime_source():
+        with pytest.raises((ValueError, PermissionError)):
+            load_runtime_config(runtime_path, allow_missing_approval_evidence=True)
+
+    runtime_path.write_bytes(original_runtime + b" ")
+    reject_runtime_source()
+    runtime_path.write_bytes(original_runtime)
+    snapshot_path.write_bytes(original_snapshot + b" ")
+    reject_runtime_source()
+    snapshot_path.write_bytes(original_snapshot)
+    scope_path.write_bytes(original_scope + b" ")
+    reject_runtime_source()
+    scope_path.write_bytes(original_scope)
+    pending_card = json.loads(original_card)
+    pending_card["approval_status"] = "pending"
+    card_path.write_text(json.dumps(pending_card, sort_keys=True) + "\n")
+    with pytest.raises((ValueError, PermissionError)):
+        load_runtime_config(runtime_path)
+    card_path.write_bytes(original_card)
+    child = json.loads(original_child)
+    child["config_provenance"]["sha256"] = "0" * 64
+    child_path.write_text(json.dumps(child, sort_keys=True) + "\n")
+    reject_runtime_source()
+    child_path.write_bytes(original_child)
+    card_path.unlink()
+    with pytest.raises((ValueError, PermissionError)):
+        load_runtime_config(runtime_path)
+    card_path.write_bytes(original_card)
+
+
+def test_over_250_cost_payload_is_pending_only_in_explicit_draft(repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import (
+        _EUR_RESERVE_RELEASE_REQUEST, _cost_payload,
+    )
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["pricing"]["funding"].update(primary="189.10562207733502645502645501",
+        uncertainty="51.11454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    settings["pricing"]["pending_eur_reserve_release"] = dict(_EUR_RESERVE_RELEASE_REQUEST)
+    payload = _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+    assert payload["funding"]["primary"] == "189.10562207733502645502645501"
+    assert payload["normalization"]["reserve_release"] == _EUR_RESERVE_RELEASE_REQUEST
+    with pytest.raises(ValueError, match="exact declared source sha256"):
+        _cost_payload(settings, repository_root, stage="acceptance", draft=False)
+
+    settings["pricing"].pop("pending_eur_reserve_release")
+    with pytest.raises(ValueError, match="without an explicit EUR 14"):
+        _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+
+
+def test_v19_cost_payload_keeps_legacy_usd_split_and_records_exact_pending_eur_metadata(
+        repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import _cost_payload
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    funding = settings["pricing"]["funding"]
+    funding.update(primary="200.73562207733502645502645501",
+        uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    request = {"status": "pending", "currency": "EUR", "prior_release_eur": "14",
+        "additional_release_eur": "15", "cumulative_release_eur": "29"}
+    settings["pricing"]["pending_eur_reserve_release"] = request
+
+    payload = _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+
+    assert payload["normalization"]["reserve_release"] == request
+    assert payload["funding"]["total_limit"] == "300"
+    assert payload["funding"]["working_limit"] == "250"
+    assert payload["funding"]["protected_buffer"] == "50"
+    assert payload["funding"]["primary"] == funding["primary"]
+
+
+def test_unsigned_v19_prepare_stage_preserves_pending_release_as_draft_only(
+        repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.campaign_inputs import prepare_stage
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["pricing"]["funding"].update(primary="200.73562207733502645502645501",
+        uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    pending = {"status": "pending", "currency": "EUR", "prior_release_eur": "14",
+        "additional_release_eur": "15", "cumulative_release_eur": "29"}
+    settings["pricing"]["pending_eur_reserve_release"] = pending
+
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+
+    cost_payload = json.loads(Path(stage["entries"][0]["cost_inputs_path"]).read_text())
+    assert cost_payload["normalization"]["reserve_release"] == pending
+    assert cost_payload["funding"]["working_limit"] == "250"
+    assert cost_payload["funding"]["protected_buffer"] == "50"

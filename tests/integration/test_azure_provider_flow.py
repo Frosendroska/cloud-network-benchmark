@@ -1,7 +1,9 @@
 """Offline protocol tests for Azure's registered-expiry gate."""
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -17,6 +19,29 @@ pytestmark = pytest.mark.usefixtures("isolated_legacy_saved_plan_boundary")
 
 from tests.fixtures.f06 import RESPONSE_FIXTURES
 from tests.contract.test_azure_provider_contract import deployment, options
+
+
+@pytest.mark.parametrize("changes", [
+    {"timeZone":"Europe/London"},
+    {"timeZone":"GMT"},
+    {"timeZone":[]},
+    {"timeZone":{}},
+    {"startTime":None},
+    {"startTime":17},
+    {"startTime":"2026-11-24T14:29:00"},
+    {"startTime":"not-a-time"},
+    {"startTime":"2026-11-24T15:29:00+01:00"},
+    {"startTime":"2026-11-24T14:29:01+00:00"},
+    {"nextRun":"2026-11-24T14:30:00+00:00"},
+    {"expiryTime":"2026-11-24T14:30:00+00:00"},
+    {"isEnabled":False},
+    {"frequency":"Daily"},
+])
+def test_azure_schedule_validator_rejects_non_exact_readbacks(changes):
+    props={"isEnabled":True,"frequency":"OneTime","timeZone":"Etc/UTC",
+        "startTime":"2026-11-24T14:29:00+00:00"}
+    props.update(changes)
+    assert not azure_provider._azure_schedule_matches(props,datetime(2026,11,24,14,29,tzinfo=timezone.utc))
 
 
 def test_missing_parent_wrapper_requires_exact_resource_group_and_unique_json_keys():
@@ -248,7 +273,6 @@ def test_job_schedule_absence_command_requires_one_exact_owned_url(repository_ro
     "mixed_account", "duplicate_account", "authorization", "mixed", "duplicate", "wrong_target"])
 def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_found(repository_root,tmp_path,case):
     from cloud_network_benchmark.azure_provider import _verify_profile_absence
-    import hashlib
     now=datetime.now(timezone.utc); d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
     account=(f"/subscriptions/{o.subscription_id}/resourceGroups/{_slug(d)}"
         f"/providers/Microsoft.Automation/automationAccounts/{_slug(d)}-auto")
@@ -258,8 +282,7 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
     child_name=(_slug(d)+"-once" if collection=="schedules" else
         _slug(d)+"-deallocate" if collection=="runbooks" else job_id)
     child_url=f"{account}/{collection}/{child_name}?api-version={azure_provider.AUTOMATION_API}"
-    baseline={"groups":[],"watchers":[]}
-    baseline["sha256"]=hashlib.sha256(json.dumps(baseline,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    baseline=watcher_baseline(d,o)
     expiry_child=({"schedule":child_name} if collection=="schedules" else
         {"runbook":child_name} if collection=="runbooks" else {"job_schedule_id":job_id})
     state={"resource_group":_slug(d),"expiry":{"automation_account_id":account,**expiry_child},
@@ -326,6 +349,31 @@ def test_final_profile_absence_accepts_only_exact_owned_automation_child_not_fou
     else:
         with pytest.raises(RuntimeError):
             _verify_profile_absence(d,o,runner,tmp_path,lambda:1.0,state,actions)
+
+
+def test_final_profile_absence_accepts_watcher_proven_in_precreation_baseline(repository_root,tmp_path):
+    from cloud_network_benchmark.azure_provider import _verify_profile_absence
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root); o=options(tmp_path,d.admission.priority)
+    watcher_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/NetworkWatcherRG"
+        "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_germanywestcentral")
+    watcher_group=watcher_id.rsplit("/providers/",1)[0]
+    resources=[{"id":watcher_id,"type":"Microsoft.Network/networkWatchers"}]
+    groups=[{"id":watcher_group,"name":"NetworkWatcherRG"}]
+    state={"resource_group":_slug(d),"expiry":{},"profile_external_baseline":watcher_baseline(d,o,resources,groups)}
+    class Runner:
+        def run(self,request):
+            if request.action_type=="profile_absence_group": out="false"
+            elif request.action_type=="profile_absence_resources": out=json.dumps({"value":resources})
+            elif request.action_type=="profile_absence_groups": out=json.dumps({"value":groups})
+            elif request.action_type in {"profile_absence_role_assignments","profile_absence_role_definitions"}:
+                out=json.dumps({"value":[]})
+            else: raise AssertionError(f"unexpected cleanup inventory request: {request.action_type}")
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,stdout=out,stderr="")
+    actions=[]
+    _verify_profile_absence(d,o,Runner(),tmp_path,lambda:1.0,state,actions)
+    assert len(actions)>=5
 
 
 
@@ -401,11 +449,12 @@ class AutomationRunner:
     def __init__(self, deployment_input, options_input, now, fail_at=None, publish_delay=0, bad_key_for=None, wrong_vm_id_for=None,
                  stale_nonce_for=None, image_architecture="x64", wrong_role_definition=False,
                  image_publisher="Canonical", image_offer=None, image_sku=None, vm_image_mismatch=False,
-                 image_os="Linux", module_recheck=None, marketplace_response=None):
+                 image_os="Linux", module_recheck=None, marketplace_response=None, schedule_timezone=None):
         self.d=deployment_input; self.o=options_input; self.now=now; self.fail_at=fail_at; self.publish_delay=publish_delay; self.bad_key_for=bad_key_for; self.wrong_vm_id_for=wrong_vm_id_for
         self.stale_nonce_for=stale_nonce_for; self.image_architecture=image_architecture; self.wrong_role_definition=wrong_role_definition
         self.image_publisher=image_publisher; self.image_offer=image_offer; self.image_sku=image_sku; self.vm_image_mismatch=vm_image_mismatch
         self.image_os=image_os; self.module_recheck=module_recheck; self.marketplace_response=marketplace_response
+        self.schedule_timezone=schedule_timezone
         self.publish_reads=0; self.requests=[]; self.script=""; self.schedule={}; self.binding={}; self.tamper_recheck=None
         self.name=_slug(deployment_input)
         self.account=f"/subscriptions/{options_input.subscription_id}/resourceGroups/{self.name}/providers/Microsoft.Automation/automationAccounts/{self.name}-auto"
@@ -453,7 +502,9 @@ class AutomationRunner:
             out=json.dumps(payload)
         elif request.action_type in {"published_content_readback","expiry_content_recheck"}: out=self.script+"\n"
         elif request.action_type in {"schedule_readback","expiry_schedule_recheck"}:
-            p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True; out=json.dumps({"properties":p})
+            p=dict(self.schedule["properties"]); p["isEnabled"]=self.tamper_recheck!="schedule" if request.action_type=="expiry_schedule_recheck" else True
+            if self.schedule_timezone is not None: p["timeZone"]=self.schedule_timezone
+            out=json.dumps({"properties":p})
         elif request.action_type in {"job_binding_readback","expiry_binding_recheck"}:
             self.job_id=request.argv[request.argv.index("--url")+1].split("/jobSchedules/")[1].split("?")[0]
             binding=json.loads(json.dumps(self.binding["properties"]))
@@ -578,6 +629,26 @@ def expiry_request(d, o, trigger):
         expires_at={"value":trigger},reservation_id={"value":d.reservation.value.reservation_id.value},resource_namespace=slug,target_selector=";".join(ids))
 
 
+def watcher_baseline(d,o,resources=(),groups=()):
+    import hashlib
+    from cloud_network_benchmark.azure_provider import _profile_timing_digest, _watcher_baseline
+    resource_inventory=sorted(({"id":row["id"].lower(),"type":row["type"].lower()} for row in resources),
+        key=lambda row:(row["id"],row["type"]))
+    group_inventory=sorted(({"id":row["id"].lower(),"name":row["name"].lower()} for row in groups),
+        key=lambda row:(row["id"],row["name"]))
+    baseline=_watcher_baseline(list(groups),list(resources))
+    baseline.update({"schema_version":2,"subscription_id":o.subscription_id,"run_id":d.run_id,
+        "deployment_id":d.deployment_id,"config_sha256":d.config_sha256,
+        "profile":azure_provider._profile_name(d),"capture_started_at_utc":"2026-11-20T12:00:00+00:00",
+        "capture_started_monotonic":1000.0,"capture_finished_at_utc":"2026-11-20T12:00:01+00:00",
+        "capture_finished_monotonic":1001.0,"resource_inventory":resource_inventory,
+        "group_inventory":group_inventory,"source_action_ids":["baseline-resources","baseline-groups"],
+        "inventory_sha256":hashlib.sha256(json.dumps({"resources":resource_inventory,"groups":group_inventory},
+            sort_keys=True,separators=(",",":")).encode()).hexdigest()})
+    baseline["sha256"]=_profile_timing_digest(baseline)
+    return baseline
+
+
 def profile_attempt(repository_root: Path,attempt_root: Path,now: datetime):
     from cloud_network_benchmark.contracts.common import Evidence
     profile="azure_exp901_sweden_acceptance_v1"
@@ -606,6 +677,143 @@ def register_profile_expiry(d,o,start,now,runner,*,clock=1000.0):
     azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:start)
     return register_expiry(d,expiry_request(d,o,start+timedelta(seconds=1680)),o,runner,
         clock=lambda:clock,utc_now=lambda:now)
+
+
+def test_workflow_profile_captures_complete_bound_watcher_baseline_before_provider_mutation(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={
+        "workflow_profile":"all_cloud_acceptance_v1","timing_profile":None})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    watcher_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/NetworkWatcherRG"
+        "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_germanywestcentral")
+    resource_id=(f"/subscriptions/{o.subscription_id}/resourceGroups/shared/providers/Microsoft.Network/virtualNetworks/shared")
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            if request.action_type=="profile_watcher_baseline_resources":
+                values=[{"id":watcher_id,"type":"Microsoft.Network/networkWatchers"},
+                    {"id":resource_id,"type":"Microsoft.Network/virtualNetworks"}]
+            else:
+                values=[{"id":watcher_id.rsplit("/providers/",1)[0],"name":"NetworkWatcherRG"},
+                    {"id":resource_id.rsplit("/providers/",1)[0],"name":"shared"}]
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":values}),stderr="")
+    runner=Runner()
+    azure_provider._capture_profile_watcher_baseline(d,o,runner,root,journal,lambda:1.0,lambda:now)
+    state=json.loads(journal.read_text()); baseline=state["profile_external_baseline"]
+    assert azure_provider._valid_watcher_baseline(baseline,d,o)
+    assert baseline["subscription_id"]==o.subscription_id and baseline["run_id"]==d.run_id
+    assert baseline["deployment_id"]==d.deployment_id and baseline["config_sha256"]==d.config_sha256
+    assert baseline["resource_inventory"]==[
+        {"id":watcher_id.lower(),"type":"microsoft.network/networkwatchers"},
+        {"id":resource_id.lower(),"type":"microsoft.network/virtualnetworks"}]
+    assert baseline["watchers"]==[watcher_id.lower()]
+    assert baseline["capture_finished_monotonic"]>=baseline["capture_started_monotonic"]
+    assert len(baseline["source_action_ids"])==2
+    assert {request.action_type for request in runner.requests}=={
+        "profile_watcher_baseline_resources","profile_watcher_baseline_groups"}
+    class NoReplay:
+        def run(self,request): raise AssertionError("saved complete baseline must be reused")
+    azure_provider._capture_profile_watcher_baseline(d,o,NoReplay(),root,journal,lambda:1.0,lambda:now)
+
+
+@pytest.mark.parametrize("clock_samples,utc_samples", [
+    ((1.0, 1.0), ("2026-11-25T10:00:00+00:00", "2026-11-25T09:59:59+00:00")),
+    ((2.0, 1.0), ("2026-11-25T10:00:00+00:00", "2026-11-25T10:00:01+00:00")),
+    ((float("nan"), float("nan")), ("2026-11-25T10:00:00+00:00", "2026-11-25T10:00:01+00:00")),
+    ((1.0, 1.0), ("2026-11-25T10:00:00", "2026-11-25T10:00:01+00:00")),
+])
+def test_workflow_profile_invalid_baseline_capture_blocks_before_expiry_mutation(
+        repository_root: Path,tmp_path: Path,clock_samples,utc_samples):
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+
+    class Runner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            assert request.action_type in {"profile_watcher_baseline_resources", "profile_watcher_baseline_groups"}
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":[]}),stderr="")
+
+    runner=Runner()
+    clock_calls=0
+    def clock_sample():
+        nonlocal clock_calls
+        clock_calls+=1
+        if clock_calls==1: return clock_samples[0]
+        # _command samples the clock while bounding each read. Keep those
+        # intermediate values finite and let the final capture sample exercise
+        # the requested invalid chronology/value.
+        if clock_calls<6: return 1.0
+        return clock_samples[1]
+    utc_values=iter(datetime.fromisoformat(value) for value in utc_samples)
+    with pytest.raises(RuntimeError,match="captured pre-creation Network Watcher baseline is invalid"):
+        azure_provider._capture_profile_watcher_baseline(d,o,runner,root,journal,
+            clock_sample,lambda:next(utc_values))
+
+    state=json.loads(journal.read_text())
+    assert "profile_external_baseline" not in state
+    expected_queries=0 if datetime.fromisoformat(utc_samples[0]).tzinfo is None else 2
+    assert len(state["actions"])==expected_queries
+    if expected_queries:
+        assert {item["request"]["action_type"] for item in state["actions"]}=={
+            "profile_watcher_baseline_resources","profile_watcher_baseline_groups"}
+    assert not any("expiry" in item["request"]["action_type"] for item in state["actions"])
+    assert len(runner.requests)==expected_queries
+
+
+def test_workflow_profile_baseline_rejects_foreign_inventory_and_interrupted_recovery(
+        repository_root: Path,tmp_path: Path):
+    now=datetime(2026,11,25,10,0,tzinfo=timezone.utc)
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    class ForeignRunner:
+        def __init__(self): self.requests=[]
+        def run(self,request):
+            self.requests.append(request)
+            return CommandResult(action_id=request.action_id,outcome=CommandOutcome.SUCCEEDED,
+                started_at=now,finished_at=now,duration_seconds=0,exit_code=0,
+                stdout=json.dumps({"value":[{"id":"/subscriptions/foreign/resourceGroups/shared/providers/Microsoft.Network/networkWatchers/shared",
+                    "type":"Microsoft.Network/networkWatchers"}]}),stderr="")
+    foreign=ForeignRunner()
+    with pytest.raises(RuntimeError,match="foreign subscription"):
+        azure_provider._capture_profile_watcher_baseline(d,o,foreign,root,journal,lambda:1.0,lambda:now)
+    assert not json.loads(journal.read_text()).get("profile_external_baseline")
+    class NoReplay:
+        def run(self,request): raise AssertionError("interrupted baseline must not be replaced")
+    with pytest.raises(RuntimeError,match="interrupted; refusing a late replacement"):
+        azure_provider._capture_profile_watcher_baseline(d,o,NoReplay(),root,journal,lambda:1.0,lambda:now)
+
+
+def test_workflow_profile_never_retrofits_missing_baseline_after_expiry_registration(
+        repository_root: Path,tmp_path: Path):
+    d=deployment(repository_root,"exp-003-placement-optimization.yaml")
+    d=d.model_copy(update={"admission":d.admission.model_copy(update={"workflow_profile":"all_cloud_acceptance_v1"})})
+    o=options(tmp_path,d.admission.priority).model_copy(update={"workflow_profile":"all_cloud_acceptance_v1",
+        "cleanup_timing_path":tmp_path/"cleanup-timing.json"})
+    root,journal=azure_provider._workspace(o,d)
+    state=json.loads(journal.read_text()); state["expiry_state"]="registered"
+    journal.write_text(json.dumps(state))
+    class NoProviderCall:
+        def run(self,request): raise AssertionError("late baseline capture must not query after mutation")
+    with pytest.raises(RuntimeError,match="after provider mutation may have started"):
+        azure_provider._capture_profile_watcher_baseline(d,o,NoProviderCall(),root,journal,lambda:1.0,
+            lambda:datetime.now(timezone.utc))
 
 
 def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository_root,tmp_path,monkeypatch):
@@ -649,9 +857,12 @@ def test_saved_s3_clock_mapping_registers_against_original_cap_sample(repository
     azure_provider._initialize_profile_timing(d,o,clock=lambda:origin_mono,utc_now=lambda:origin_utc,
         origin_monotonic=origin_mono,origin_utc=origin_utc)
     runner=AutomationRunner(d,o,now)
-    result=register_expiry(d,expiry_request(d,o,cap_expires_at-timedelta(seconds=120)),o,runner,
+    requested=cap_expires_at-timedelta(seconds=120)
+    result=register_expiry(d,expiry_request(d,o,requested),o,runner,
         clock=lambda:origin_mono+1.0,utc_now=lambda:now)
     assert result.state=="registered",result.failure
+    assert result.provider_metadata.value["requested_trigger"] == requested.isoformat()
+    assert result.provider_metadata.value["trigger"] == requested.replace(second=0,microsecond=0).isoformat()
     assert runner.requests
 
 
@@ -815,6 +1026,229 @@ def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
     assert any(r.action_type=="profile_absence_role_definitions" for r in runner.requests)
     assert any(r.action_type=="profile_absence_role_definitions_page_2" for r in runner.requests)
     assert any(r.action_type=="profile_absence_automation" for r in runner.requests)
+
+
+@pytest.mark.parametrize("cohort_profile", ["normal_pair", "calibration_self"])
+@pytest.mark.parametrize("auxiliary_state", ["created", "never_created"])
+def test_public_destroy_cleans_authorized_shared_watcher_cohort(
+        repository_root: Path, tmp_path: Path, cohort_profile, auxiliary_state):
+    """Exercise the public cleanup lifecycle with provider I/O replaced only at CommandRunner.run."""
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import unquote
+    from cloud_network_benchmark.validation_profiles import PROFILE_SPECS
+    from cloud_network_benchmark.contracts.admission import AdmissionRequirements
+    from cloud_network_benchmark.contracts.common import Evidence
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort
+
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    workflow = ("all_cloud_acceptance_v1" if cohort_profile == "normal_pair"
+        else "all_cloud_calibration_v1")
+    fixture_name = ("exp-903-three-provider-smoke.yaml" if cohort_profile == "normal_pair"
+        else "exp-001-calibration.yaml")
+    profile_spec = PROFILE_SPECS[workflow]
+    profile_allowance = profile_spec["allowance"]
+    allowance = {key: float(profile_allowance[key]) for key in (
+        "registration_seconds", "provision_seconds", "readiness_seconds", "stabilization_seconds",
+        "measurement_seconds", "measurement_shutdown_seconds", "retrieval_seconds", "cleanup_seconds")}
+    allowance["azure_provider_lead_seconds"] = float(profile_allowance["provider_leads_seconds"]["azure"])
+    complete_seconds = sum(allowance.values()) - allowance["azure_provider_lead_seconds"]
+    post_registration_seconds = complete_seconds - allowance["registration_seconds"]
+    cap_seconds = int(profile_spec["cap_seconds"])
+    cap_start = now - timedelta(seconds=120)
+    cap_end = cap_start + timedelta(seconds=cap_seconds)
+    trigger = cap_start + timedelta(seconds=cap_seconds - 600)
+    owners = []
+    attempts = []
+    count = 2 if cohort_profile == "normal_pair" else 1
+    for index in range(count):
+        attempt_root = tmp_path / f"parent-{index}"
+        d = deployment(repository_root, fixture_name)
+        start = cap_start
+        entry_id = ("V-S1" if index == 0 else "V-S3") if count == 2 else "CAL-S1"
+        if index == 1:
+            d = d.model_copy(update={"campaign_id": "peer-campaign", "run_id": "peer-campaign-azure",
+                "deployment_id": "peer-campaign-azure-deployment"})
+        admission_fields = AdmissionRequirements.expected_for(d.mode, d.scenario, None, workflow)
+        admission = d.admission.model_copy(update=admission_fields)
+        reservation = d.reservation.value.model_copy(update={"campaign_id": d.campaign_id,
+            "reservation_id": Evidence(value=f"public-{cohort_profile}-reservation-{index}"),
+            "timing_profile": None, "workflow_profile": workflow,
+            "cap_started_at": Evidence(value=cap_start), "expires_at": Evidence(value=cap_end)})
+        d = d.model_copy(update={"admission": admission, "reservation": Evidence(value=reservation)})
+        d = type(d).model_validate(d.model_dump(mode="python"))
+        value = options(attempt_root, d.admission.priority).model_dump(mode="python")
+        value.update(subscription_id=subscription, complete_workflow_seconds=complete_seconds,
+            post_registration_workflow_seconds=post_registration_seconds,
+            cap_deadline_monotonic=880.0 + cap_seconds, retry_end_at=cap_end,
+            cap_started_monotonic=880.0,
+            workflow_profile=workflow, timing_profile=None,
+            admission_evidence={**value["admission_evidence"],
+                "reservation_id": reservation.reservation_id.value,
+                "source_sha256": reservation.source_sha256},
+            cleanup_timing_path=attempt_root / "private" / "azure-cleanup-timing.json",
+            profile_allowance=allowance, command_timeout_seconds=60)
+        o = AzureRuntimeOptions.model_validate(value)
+        parent = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+        owners.append({"entry_id": entry_id, "run_id": d.run_id, "campaign_id": d.campaign_id,
+            "deployment_id": d.deployment_id, "config_sha256": d.config_sha256,
+            "resource_group_id": parent,
+            "vm_ids": [f"{parent}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{role}"
+                for role in ("a", "b")],
+            "nic_ids": [f"{parent}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{role}-nic"
+                for role in ("a", "b")]})
+        attempts.append((d, o, start, entry_id))
+
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    spec = _provider_cleanup_spec(tmp_path, owners, subscription, group_id, watcher_id,
+        f"public-{cohort_profile}", profile=cohort_profile)
+    ready = []
+    for (d, o, start, _entry), owner in zip(attempts, spec["owners"]):
+        d = d.model_copy(update={"config_sha256": owner["config_sha256"]})
+        o = o.model_copy(update={"azure_auxiliary_cleanup": spec})
+        d = type(d).model_validate(d.model_dump(mode="python"))
+        registration = AutomationRunner(d, o, now)
+        origin_monotonic = 1000.0 - (now - start).total_seconds()
+        azure_provider._initialize_profile_timing(d, o, clock=lambda: origin_monotonic,
+            utc_now=lambda: start, origin_monotonic=origin_monotonic, origin_utc=start)
+        expiry = register_expiry(d, expiry_request(d, o, trigger), o, registration,
+            clock=lambda: 1000.0, utc_now=lambda: now)
+        assert expiry.state == "registered", expiry.failure
+        journal = o.attempt_root / "recovery.json"
+        assert journal.is_file()
+        registered_state = json.loads(journal.read_text(encoding="utf-8"))
+        assert registered_state.get("profile_external_baseline") is not None
+        d = d.model_copy(update={"expiry": Evidence(value=expiry)})
+        ready.append((d, o))
+
+    event_owner = spec["owners"][0]
+    fixture = json.loads((Path(__file__).parents[1] /
+        "fixtures/azure/shared-watcher-activity-retained-schema.json").read_text(encoding="utf-8"))
+
+    class PublicCleanupRunner(ProfileCleanupRunner):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, role_pages=True, **kwargs)
+            self.watcher_deleted = False
+            self.group_deleted = False
+
+        def _result(self, request, *, outcome=CommandOutcome.SUCCEEDED, stdout="", stderr=""):
+            return CommandResult(action_id=request.action_id, outcome=outcome, started_at=now,
+                finished_at=now, duration_seconds=0, exit_code=0 if outcome == CommandOutcome.SUCCEEDED else 1,
+                stdout=stdout, stderr=stderr)
+
+        def run(self, request):
+            if not request.action_type.startswith("azure_auxiliary_"):
+                return super().run(request)
+            self.requests.append(request)
+            action = request.action_type
+            if action.startswith("azure_auxiliary_activity_"):
+                url = request.argv[request.argv.index("--url") + 1]
+                decoded = unquote(url)
+                match = re.search(r"resourceUri eq '([^']+)'", decoded)
+                target = match.group(1) if match else ""
+                event = None
+                if target.lower() == watcher_id.lower():
+                    event = {"id": f"/subscriptions/{subscription}/providers/Microsoft.Insights/eventtypes/management/values/watcher-create",
+                        "resourceId": watcher_id,
+                        "caller": "synthetic-watcher-caller", "correlationId": "public-cohort-correlation",
+                        "eventTimestamp": (now + timedelta(seconds=1)).isoformat(),
+                        "status": {"value": "Succeeded"}, "subStatus": {"value": "Created",
+                            "localizedValue": "Created (HTTP Status Code: 201)"},
+                        "operationName": {"value": "Microsoft.Network/networkWatchers/write"},
+                        "properties": {"statusCode": "Created"}}
+                else:
+                    for resource_id in event_owner["vm_ids"] + event_owner["nic_ids"]:
+                        if target.lower() == resource_id.lower():
+                            operation = ("Microsoft.Compute/virtualMachines/write" if "/virtualmachines/" in
+                                resource_id.lower() else "Microsoft.Network/networkInterfaces/write")
+                            event = {"id": f"/subscriptions/{subscription}/providers/Microsoft.Insights/eventtypes/management/values/owner-write-" +
+                                hashlib.sha256(resource_id.encode()).hexdigest()[:8], "resourceId": resource_id,
+                                "caller": "synthetic-owner-caller", "correlationId": "public-cohort-correlation",
+                                "eventTimestamp": (now + timedelta(seconds=1)).isoformat(),
+                                "status": {"value": "Succeeded"}, "subStatus": {"value": "OK"},
+                                "operationName": {"value": operation}, "properties": {}}
+                            break
+                return self._result(request, stdout=json.dumps({"value": [event] if event else []}))
+            if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
+                rows = ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
+                    if auxiliary_state == "created" and not self.watcher_deleted else [])
+            elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups",
+                    "azure_auxiliary_group_final_groups"}:
+                rows = ([{"id": group_id, "name": "NetworkWatcherRG"}]
+                    if auxiliary_state == "created" and not self.group_deleted else [])
+            elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
+                rows = ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
+                    if auxiliary_state == "created" and not self.watcher_deleted else [])
+            elif action == "azure_auxiliary_watcher_etag":
+                return self._result(request, stdout=json.dumps({"id": watcher_id, "etag": 'W/"fresh"'}))
+            elif action == "azure_auxiliary_watcher_delete":
+                assert any(f"If-Match=W/\"fresh\"" in arg for arg in request.argv)
+                self.watcher_deleted = True
+                return self._result(request)
+            elif action == "azure_auxiliary_watcher_absence":
+                error = {"error": {"code": "ResourceNotFound", "target": watcher_id}}
+                return self._result(request, outcome=CommandOutcome.FAILED,
+                    stderr="ERROR: Not Found(" + json.dumps(error) + ")")
+            elif action == "azure_auxiliary_group_exact_readback":
+                return self._result(request, stdout=json.dumps(fixture["group_get"]["body"]))
+            elif action == "azure_auxiliary_group_delete":
+                assert not any("If-Match=" in arg for arg in request.argv)
+                self.group_deleted = True
+                return self._result(request)
+            elif action == "azure_auxiliary_group_absence":
+                return self._result(request, stdout="false")
+            else:
+                # Watcher child collections and post-leaf group inventories must be empty.
+                rows = []
+            return self._result(request, stdout=json.dumps({"value": rows}))
+
+    runners = [PublicCleanupRunner(d, o, now) for d, o in ready]
+    cleanup_utc = now + timedelta(seconds=100)
+    def invoke(index):
+        d, o = ready[index]
+        return destroy(d, o, runners[index], clock=lambda: 1100.0,
+            utc_now=lambda: cleanup_utc)
+    if count == 2:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(invoke, range(count)))
+    else:
+        results = [invoke(0)]
+
+    for result, runner in zip(results, runners):
+        assert result.cleanup_state == "succeeded" and not result.launch_blocked, result.failures
+        assert result.timing_status == "within_deadline" and result.timing_failure is None
+        assert any(request.action_type == "profile_absence_resources" for request in runner.requests)
+        assert any(request.action_type == "profile_absence_groups" for request in runner.requests)
+        assert any(request.action_type == "azure_auxiliary_inventory_resources" for request in runner.requests)
+    cohort = AuxiliaryCleanupCohort(spec)
+    state = cohort.snapshot()
+    if auxiliary_state == "never_created":
+        assert state["claim"] is None and state["outcomes"] == [] and state["owners"] == {}
+        assert not any(request.action_type in {"azure_auxiliary_watcher_delete", "azure_auxiliary_group_delete"}
+            for runner in runners for request in runner.requests)
+    else:
+        assert state["claim"]["state"] == "complete"
+        assert sum(sum(request.action_type == "azure_auxiliary_watcher_delete" for request in runner.requests)
+            for runner in runners) == 1
+        assert sum(sum(request.action_type == "azure_auxiliary_group_delete" for request in runner.requests)
+            for runner in runners) == 1
+    all_actions = [request.action_type for runner in runners for request in runner.requests]
+    if auxiliary_state == "created":
+        for required in ("azure_auxiliary_preleaf_group_children", "azure_auxiliary_watcher_absence",
+                "azure_auxiliary_group_final_inventory", "azure_auxiliary_group_final_subscription_inventory",
+                "azure_auxiliary_group_final_groups", "azure_auxiliary_group_immediate_children",
+                "azure_auxiliary_group_exact_readback", "azure_auxiliary_group_absence"):
+            assert required in all_actions
+        assert sum(runner.watcher_deleted for runner in runners) == 1
+        assert sum(runner.group_deleted for runner in runners) == 1
+    else:
+        assert not any(action.startswith("azure_auxiliary_") and action not in {
+            "azure_auxiliary_inventory_resources", "azure_auxiliary_inventory_groups"} for action in all_actions)
+        assert not any(runner.watcher_deleted or runner.group_deleted for runner in runners)
+    for (_d, o) in ready:
+        timer = json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
+        assert timer["absence_verified_at"] is not None
 
 
 def test_cleanup_resume_accepts_exact_missing_automation_account_for_all_owned_children(
@@ -1141,6 +1575,676 @@ def test_missing_watcher_baseline_allows_empty_fresh_inventory_to_close_with_unk
         for item in runner.requests)
 
 
+def _provider_cleanup_spec(tmp_path, owners, subscription, group_id, watcher_id, cohort_id,
+        profile="normal_pair"):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import canonical
+    owners = [dict(owner) for owner in owners]
+    members = []
+    for owner in owners:
+        stem = owner["entry_id"]
+        config = tmp_path / f"{cohort_id}-{stem}.yaml"; config.write_text(f"config: {stem}\n")
+        source = tmp_path / f"{cohort_id}-{stem}-source.yaml"; source.write_text(f"source: {stem}\n")
+        runtime = tmp_path / f"{cohort_id}-{stem}-runtime.json"; runtime.write_text(json.dumps({"entry_id": stem}) + "\n")
+        parent = tmp_path / f"{cohort_id}-{stem}-parent.json"; parent.write_text(json.dumps({"run_id": owner["run_id"]}) + "\n")
+        owner["config_sha256"] = hashlib.sha256(config.read_bytes()).hexdigest()
+        members.append({"entry_id": owner["entry_id"], "run_id": owner["run_id"],
+            "config_sha256": owner["config_sha256"], "runtime_path": str(runtime),
+            "runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
+            "parent_manifest_path": str(parent), "parent_manifest_sha256": hashlib.sha256(parent.read_bytes()).hexdigest(),
+            "config_path": str(config), "source_config_path": str(source),
+            "source_config_sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+    manifest_path = tmp_path / f"{cohort_id}-manifest.json"
+    manifest = {"schema_version": 1, "cohort_id": cohort_id, "profile": profile,
+        "subscription_id": subscription, "region": "swedencentral", "resource_group_id": group_id,
+        "watcher_id": watcher_id, "owners": owners, "members": members}
+    manifest_path.write_bytes(canonical(manifest) + b"\n")
+    manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    decision = tmp_path / f"{cohort_id}-decision.md"; decision.write_text("Synthetic offline approval only.\n")
+    card = {"schema_version": 1, "approval_status": "approved",
+        "action": "delete_exact_auto_created_network_watcher_and_empty_parent", "profile": profile,
+        "cohort_id": cohort_id, "subscription_id": subscription, "region": "swedencentral",
+        "resource_group_id": group_id, "watcher_id": watcher_id,
+        "cohort_manifest_path": str(manifest_path), "cohort_manifest_sha256": manifest_hash,
+        "owners": owners, "maximum_leaf_deletes": 1, "maximum_group_deletes": 1,
+        "source_path": str(manifest_path), "source_sha256": manifest_hash,
+        "decision_source_path": str(decision), "decision_source_sha256": hashlib.sha256(decision.read_bytes()).hexdigest(),
+        "approved_by": "synthetic-offline-test", "approved_at_utc": "2026-11-25T12:00:00Z",
+        "not_before_utc": "2026-11-25T00:00:00Z", "not_after_utc": "2026-11-26T00:00:00Z",
+        "expected_watcher_create_caller": "synthetic-watcher-caller",
+        "expected_owned_write_caller": "synthetic-owner-caller"}
+    card_path = tmp_path / f"{cohort_id}-approval.json"; card_path.write_text(json.dumps(card))
+    spec = {"schema_version": 1, "cohort_id": cohort_id,
+        "state_root": str(tmp_path / f"{cohort_id}-cohort-state"), "subscription_id": subscription,
+        "region": "swedencentral", "resource_group_id": group_id, "watcher_id": watcher_id,
+        "profile": profile, "owners": owners,
+        "authorization": {"card_path": str(card_path),
+            "card_sha256": hashlib.sha256(card_path.read_bytes()).hexdigest(),
+            "cohort_manifest_path": str(manifest_path), "cohort_manifest_sha256": manifest_hash}}
+    return spec
+
+
+def _provider_cleanup_baseline(deployment, subscription, *, profile="all_cloud_acceptance_v1"):
+    baseline = {"schema_version": 2, "subscription_id": subscription,
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+        "config_sha256": deployment.config_sha256, "profile": profile,
+        "capture_started_at_utc": "2026-11-25T11:59:00+00:00",
+        "capture_started_monotonic": 900.0, "capture_finished_at_utc": "2026-11-25T11:59:01+00:00",
+        "capture_finished_monotonic": 901.0,
+        "groups": [], "watchers": [], "source_action_ids": ["baseline-resources", "baseline-groups"],
+        "resource_inventory": [], "group_inventory": [],
+        "inventory_sha256": hashlib.sha256(b'{"groups":[],"resources":[]}').hexdigest()}
+    baseline["sha256"] = hashlib.sha256(json.dumps(baseline, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return baseline
+
+
+def test_authorized_shared_watcher_cleanup_deletes_one_leaf_then_one_empty_group(
+        repository_root: Path, tmp_path: Path, monkeypatch):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort, canonical
+
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    options = options.model_copy(update={"subscription_id": subscription})
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "deployment_id": d.deployment_id,
+        "campaign_id": d.campaign_id, "config_sha256": d.config_sha256, "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    peer_campaign, peer_deployment = "peer-campaign", "peer-campaign-azure-deployment"
+    peer_run = "peer-campaign-azure"
+    peer_slug = f"cnb-{peer_campaign}-{peer_deployment}"
+    peer_suffix = hashlib.sha256(f"{peer_campaign}\0{peer_deployment}".encode()).hexdigest()[:8]
+    peer_slug = peer_slug[:36].rstrip("-") + "-" + peer_suffix
+    peer_group = f"/subscriptions/{subscription}/resourceGroups/{peer_slug}"
+    peer = {"entry_id": "V-S3", "run_id": peer_run, "campaign_id": peer_campaign,
+        "deployment_id": peer_deployment,
+        "config_sha256": hashlib.sha256(b"peer config").hexdigest(),
+        "resource_group_id": peer_group,
+        "vm_ids": [f"{peer_group}/providers/Microsoft.Compute/virtualMachines/{peer_slug}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{peer_group}/providers/Microsoft.Network/networkInterfaces/{peer_slug}-{r}-nic" for r in ("a", "b")]}
+    spec = _provider_cleanup_spec(tmp_path, [owner, peer], subscription, group_id, watcher_id, "provider-path")
+    owner, peer = spec["owners"]
+    d = d.model_copy(update={"config_sha256": owner["config_sha256"]})
+    options = options.model_copy(update={"azure_auxiliary_cleanup": spec})
+    baseline = _provider_cleanup_baseline(d, subscription)
+    monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *args: True)
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor",
+        lambda *args, **kwargs: {"routine_deadline_monotonic": 1500.0})
+    event_source = {"events": [{"id": "event-source"}], "correlation_id": "corr-owned"}
+    monkeypatch.setattr(azure_provider, "_azure_watcher_activity",
+        lambda *args, **kwargs: (event_source, []))
+    cohort = AuxiliaryCleanupCohort(spec)
+    cohort.record_precreation_baseline(owner, baseline)
+    cohort.register_absent(peer, baseline_sha256=baseline["sha256"],
+        activity_sha256=hashlib.sha256(canonical(event_source)).hexdigest(), deadline_monotonic=1500.0)
+
+    class Runner:
+        def __init__(self):
+            self.calls = []
+            self.watcher_deleted = False
+            self.group_deleted = False
+        def run(self, request):
+            self.calls.append(request)
+            action = request.action_type
+            def result(outcome=CommandOutcome.SUCCEEDED, stdout="", stderr=""):
+                return CommandResult(action_id=request.action_id, outcome=outcome,
+                    started_at=now, finished_at=now, duration_seconds=0.0,
+                    exit_code=0 if outcome == CommandOutcome.SUCCEEDED else 1,
+                    stdout=stdout, stderr=stderr)
+            if action == "azure_auxiliary_watcher_etag":
+                output = json.dumps({"id": watcher_id, "etag": "W/\"fresh\""})
+                return result(stdout=output)
+            if action == "azure_auxiliary_watcher_delete":
+                assert "If-Match=W/\"fresh\"" in request.argv
+                self.watcher_deleted = True
+                return result()
+            if action == "azure_auxiliary_watcher_absence":
+                assert self.watcher_deleted
+                error = {"error": {"code": "ResourceNotFound", "target": watcher_id}}
+                return result(CommandOutcome.FAILED, stderr="ERROR: Not Found(" + json.dumps(error) + ")")
+            if action == "azure_auxiliary_group_delete":
+                assert self.watcher_deleted
+                assert not any("If-Match=" in arg for arg in request.argv)
+                self.group_deleted = True
+                return result()
+            if action == "azure_auxiliary_group_exact_readback":
+                retained = json.loads((Path(__file__).parents[1] / "fixtures/azure/shared-watcher-activity-retained-schema.json").read_text())
+                return result(stdout=json.dumps(retained["group_get"]["body"]))
+            if action == "azure_auxiliary_group_absence":
+                return result(stdout="false")
+            return result()
+
+    runner = Runner()
+    def inventory(_runner, _options, _root, endpoint, action, _clock, _fields):
+        if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
+            rows = [{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
+        elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups"}:
+            rows = [{"id": group_id, "name": "NetworkWatcherRG"}]
+        elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
+            rows = [] if runner.watcher_deleted else [{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
+        elif action.startswith("azure_auxiliary_") and action.endswith("_inventory") and any(
+                name in action for name in ("flowLogs", "packetCaptures", "connectionMonitors")):
+            rows = []
+        elif action == "azure_auxiliary_group_final_inventory":
+            rows = []
+        else:
+            rows = []
+        return rows, []
+    monkeypatch.setattr(azure_provider, "_read_arm_collection", inventory)
+    monkeypatch.setattr(azure_provider, "_safe_cleanup_action", lambda _options, result: {
+        "action_id": result.action_id, "outcome": result.outcome, "stdout": result.stdout, "stderr": result.stderr})
+    state = {"profile_external_baseline": baseline, "actions": []}
+    actions = []
+    finish_group = azure_provider._finish_shared_watcher_group
+    monkeypatch.setattr(azure_provider, "_finish_shared_watcher_group",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected interruption after exact leaf absence")))
+    with pytest.raises(RuntimeError, match="injected interruption"):
+        azure_provider._cleanup_shared_network_watcher(d, options, runner, tmp_path,
+            lambda: 1100.0, lambda: now, state, actions)
+    assert runner.watcher_deleted and not runner.group_deleted
+    monkeypatch.setattr(azure_provider, "_finish_shared_watcher_group", finish_group)
+    azure_provider._cleanup_shared_network_watcher(d, options, runner, tmp_path,
+        lambda: 1100.0, lambda: now, state, actions)
+    assert runner.watcher_deleted and runner.group_deleted
+    assert [r.action_type for r in runner.calls].count("azure_auxiliary_watcher_delete") == 1
+    assert [r.action_type for r in runner.calls].count("azure_auxiliary_group_delete") == 1
+    assert cohort.snapshot()["claim"]["state"] == "complete"
+
+
+@pytest.mark.parametrize("profile", ["normal_pair", "calibration_self"])
+@pytest.mark.parametrize("auxiliary_state", ["created", "never_created", "watcher_only",
+    "group_only", "foreign_child", "foreign_watcher", "unproved_parent", "wrong_type_target",
+    "wrong_type_group_resource",
+    "stale_baseline_watcher", "stale_baseline_group"])
+def test_private_parent_cleanup_hooks_reach_shared_terminal_absence(
+        repository_root: Path, tmp_path: Path, monkeypatch, profile, auxiliary_state):
+    """Exercise each profile's shared cleanup decision with provider calls faked."""
+    from concurrent.futures import ThreadPoolExecutor
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort, owner_key
+
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    first, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    if profile == "normal_pair":
+        second = first.model_copy(update={"campaign_id": "peer-campaign", "run_id": "peer-campaign-azure",
+            "deployment_id": "peer-campaign-azure-deployment", "config_sha256": hashlib.sha256(b"peer-config").hexdigest()})
+        deployments = [first, second]
+        entries = ["V-S1", "V-S3"]
+    else:
+        deployments = [first]
+        entries = ["CAL-S1"]
+    owners = []
+    for deployment, entry_id in zip(deployments, entries):
+        parent = f"/subscriptions/{subscription}/resourceGroups/{_slug(deployment)}"
+        owners.append({"entry_id": entry_id, "run_id": deployment.run_id,
+            "campaign_id": deployment.campaign_id, "deployment_id": deployment.deployment_id,
+            "config_sha256": deployment.config_sha256, "resource_group_id": parent,
+            "vm_ids": [f"{parent}/providers/Microsoft.Compute/virtualMachines/{_slug(deployment)}-{r}" for r in ("a", "b")],
+            "nic_ids": [f"{parent}/providers/Microsoft.Network/networkInterfaces/{_slug(deployment)}-{r}-nic" for r in ("a", "b")]})
+    spec = _provider_cleanup_spec(tmp_path, owners, subscription, group_id, watcher_id,
+        f"hook-{profile}", profile=profile)
+    deployments = [deployment.model_copy(update={"config_sha256": owner["config_sha256"]})
+        for deployment, owner in zip(deployments, spec["owners"])]
+    options = options.model_copy(update={"subscription_id": subscription, "azure_auxiliary_cleanup": spec})
+    cohort = AuxiliaryCleanupCohort(spec)
+    baselines = [_provider_cleanup_baseline(deployment, subscription,
+        profile="all_cloud_acceptance_v1" if profile == "normal_pair" else "all_cloud_calibration_v1")
+        for deployment in deployments]
+    if auxiliary_state in {"stale_baseline_watcher", "stale_baseline_group"}:
+        if auxiliary_state == "stale_baseline_watcher":
+            baselines[0]["resource_inventory"] = [{"id": watcher_id.lower(),
+                "type": "microsoft.network/networkinterfaces"}]
+        else:
+            baselines[0]["group_inventory"] = [{"id": group_id.lower(), "name": "foreign-name"}]
+        inventory = {"resources": baselines[0]["resource_inventory"],
+            "groups": baselines[0]["group_inventory"]}
+        baselines[0]["inventory_sha256"] = hashlib.sha256(json.dumps(inventory,
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        baselines[0]["sha256"] = hashlib.sha256(json.dumps({key: value for key, value in baselines[0].items()
+            if key != "sha256"}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    cohort.record_precreation_baseline(spec["owners"][0], baselines[0])
+    monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *_a, **_k: True)
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor", lambda *_a, **_k: {
+        "routine_deadline_monotonic": 1500.0})
+    activity = {"events": [{"id": "synthetic-owned-event"}], "correlation_id": "synthetic-correlation"}
+    monkeypatch.setattr(azure_provider, "_azure_watcher_activity", lambda *_a, **_k: (activity, []))
+    deleted = {"watcher": False, "group": False}
+    command_actions = []
+
+    def fake_command(_runner, _options, _root, _argv, action, _clock, **_kwargs):
+        command_actions.append(action)
+        output = ""
+        error = ""
+        outcome = CommandOutcome.SUCCEEDED
+        if action == "azure_auxiliary_watcher_etag":
+            output = json.dumps({"id": watcher_id, "etag": 'W/"fresh"'})
+        elif action == "azure_auxiliary_watcher_delete":
+            deleted["watcher"] = True
+        elif action == "azure_auxiliary_watcher_absence":
+            outcome = CommandOutcome.FAILED
+            error = "ERROR: Not Found(" + json.dumps({"error": {"code": "ResourceNotFound", "target": watcher_id}}) + ")"
+        elif action == "azure_auxiliary_group_exact_readback":
+            fixture = json.loads((Path(__file__).parents[1] / "fixtures/azure/shared-watcher-activity-retained-schema.json").read_text())
+            output = json.dumps(fixture["group_get"]["body"])
+        elif action == "azure_auxiliary_group_delete":
+            deleted["group"] = True
+        elif action == "azure_auxiliary_group_absence":
+            output = "false"
+        return CommandResult(action_id=f"synthetic-{action}", outcome=outcome,
+            started_at=now, finished_at=now, duration_seconds=0.0,
+            exit_code=0 if outcome == CommandOutcome.SUCCEEDED else 1,
+            stdout=output, stderr=error)
+
+    def inventory(_runner, _options, _root, _endpoint, action, _clock, _fields):
+        watcher = {"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}
+        group = {"id": group_id, "name": "NetworkWatcherRG"}
+        if action in {"azure_auxiliary_inventory_resources", "azure_auxiliary_preleaf_resources"}:
+            if auxiliary_state in {"created", "watcher_only"}:
+                rows = [watcher]
+            elif auxiliary_state == "wrong_type_target":
+                rows = [{"id": watcher_id, "type": "Microsoft.Network/networkInterfaces"}]
+            elif auxiliary_state == "wrong_type_group_resource":
+                rows = [{"id": group_id, "type": "Microsoft.Resources/resourceGroups"}]
+            elif auxiliary_state == "foreign_child":
+                rows = [{"id": group_id + "/providers/Microsoft.Network/routeTables/foreign",
+                    "type": "Microsoft.Network/routeTables"}]
+            elif auxiliary_state == "foreign_watcher":
+                rows = [{"id": f"/subscriptions/{subscription}/resourceGroups/Foreign/providers/"
+                    "Microsoft.Network/networkWatchers/foreign", "type": "Microsoft.Network/networkWatchers"}]
+            elif auxiliary_state == "unproved_parent":
+                rows = [{"id": spec["owners"][0]["vm_ids"][0],
+                    "type": "Microsoft.Compute/virtualMachines"}]
+            else:
+                rows = []
+        elif action in {"azure_auxiliary_inventory_groups", "azure_auxiliary_preleaf_groups"}:
+            rows = [group] if auxiliary_state in {"created", "group_only"} else []
+        elif action in {"azure_auxiliary_group_inventory", "azure_auxiliary_preleaf_group_children"}:
+            rows = [] if deleted["watcher"] or auxiliary_state == "never_created" else [watcher]
+        elif action == "azure_auxiliary_group_final_inventory":
+            rows = []
+        elif action == "azure_auxiliary_group_final_subscription_inventory":
+            rows = []
+        elif action == "azure_auxiliary_group_final_groups":
+            rows = []
+        elif action == "azure_auxiliary_group_immediate_children":
+            rows = []
+        elif action.startswith("azure_auxiliary_") and any(name in action for name in
+                ("flowLogs", "packetCaptures", "connectionMonitors")):
+            rows = []
+        else:
+            rows = []
+        return rows, []
+
+    monkeypatch.setattr(azure_provider, "_command", fake_command)
+    monkeypatch.setattr(azure_provider, "_read_arm_collection", inventory)
+    monkeypatch.setattr(azure_provider, "_safe_cleanup_action", lambda _options, result: {
+        "action_id": result.action_id, "outcome": result.outcome,
+        "stdout": result.stdout, "stderr": result.stderr})
+    runner = object()
+    def invoke(index):
+        return azure_provider._cleanup_shared_network_watcher(deployments[index], options, runner,
+            tmp_path / f"parent-{index}", lambda: 1100.0, lambda: now,
+            {"profile_external_baseline": baselines[index], "actions": []}, [])
+    rejected_states = {"watcher_only", "group_only", "foreign_child", "foreign_watcher",
+        "unproved_parent", "wrong_type_target", "wrong_type_group_resource",
+        "stale_baseline_watcher", "stale_baseline_group"}
+    if auxiliary_state in rejected_states:
+        with pytest.raises(RuntimeError):
+            invoke(0)
+        assert deleted == {"watcher": False, "group": False}
+        assert command_actions == []
+        return
+    if profile == "normal_pair":
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(invoke, range(2)))
+    else:
+        results = [invoke(0)]
+    assert results == [None] * len(deployments)
+    if auxiliary_state == "never_created":
+        assert deleted == {"watcher": False, "group": False}
+        assert command_actions == []
+        state = cohort.snapshot()
+        assert state["claim"] is None and state["outcomes"] == [] and state["owners"] == {}
+        return
+    assert deleted == {"watcher": True, "group": True}
+    state = cohort.snapshot()
+    assert state["claim"]["state"] == "complete"
+    assert set(state["owners"]) == {owner_key(owner) for owner in spec["owners"]}
+    assert len(state["outcomes"]) == 2
+
+
+def test_shared_watcher_cleanup_refuses_nonempty_child_collection_before_any_delete(
+        repository_root: Path, tmp_path: Path, monkeypatch):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort, canonical
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    options = options.model_copy(update={"subscription_id": subscription})
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "deployment_id": d.deployment_id,
+        "campaign_id": d.campaign_id, "config_sha256": d.config_sha256, "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    peer_campaign, peer_deployment = "peer-campaign", "peer-campaign-azure-deployment"
+    peer_run = "peer-campaign-azure"
+    peer_slug = f"cnb-{peer_campaign}-{peer_deployment}"
+    peer_suffix = hashlib.sha256(f"{peer_campaign}\0{peer_deployment}".encode()).hexdigest()[:8]
+    peer_slug = peer_slug[:36].rstrip("-") + "-" + peer_suffix
+    peer_group = f"/subscriptions/{subscription}/resourceGroups/{peer_slug}"
+    peer = {"entry_id": "V-S3", "run_id": peer_run, "campaign_id": peer_campaign,
+        "deployment_id": peer_deployment,
+        "config_sha256": hashlib.sha256(b"peer config").hexdigest(),
+        "resource_group_id": peer_group,
+        "vm_ids": [f"{peer_group}/providers/Microsoft.Compute/virtualMachines/{peer_slug}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{peer_group}/providers/Microsoft.Network/networkInterfaces/{peer_slug}-{r}-nic" for r in ("a", "b")]}
+    spec = _provider_cleanup_spec(tmp_path, [owner, peer], subscription, group_id, watcher_id, "nonempty-child")
+    owner, peer = spec["owners"]
+    d = d.model_copy(update={"config_sha256": owner["config_sha256"]})
+    options = options.model_copy(update={"azure_auxiliary_cleanup": spec})
+    baseline = _provider_cleanup_baseline(d, subscription)
+    monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *args: True)
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor", lambda *args, **kwargs: {
+        "routine_deadline_monotonic": 1500.0})
+    event_source = {"events": [{"id": "event-source"}], "correlation_id": "corr-owned"}
+    monkeypatch.setattr(azure_provider, "_azure_watcher_activity", lambda *args, **kwargs: (event_source, []))
+    cohort = AuxiliaryCleanupCohort(spec)
+    cohort.record_precreation_baseline(owner, baseline)
+    cohort.register_absent(peer, baseline_sha256=baseline["sha256"],
+        activity_sha256=hashlib.sha256(canonical(event_source)).hexdigest(), deadline_monotonic=1500.0)
+    monkeypatch.setattr(azure_provider, "_read_arm_collection", lambda _r, _o, _root, _endpoint, action, _clock, _fields:
+        ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}] if action in {
+            "azure_auxiliary_inventory_resources", "azure_auxiliary_group_inventory"} else
+         [{"id": group_id, "name": "NetworkWatcherRG"}] if action == "azure_auxiliary_inventory_groups" else
+         [{"id": watcher_id + "/flowLogs/foreign", "name": "foreign"}] if action == "azure_auxiliary_flowLogs_inventory" else [], []))
+    class NoDelete:
+        def __init__(self): self.calls = []
+        def run(self, request):
+            self.calls.append(request)
+            raise AssertionError("provider delete must not occur")
+    runner = NoDelete()
+    monkeypatch.setattr(azure_provider, "_safe_cleanup_action", lambda _o, result: {"action_id": result.action_id})
+    with pytest.raises(RuntimeError, match="flowLogs collection is nonempty"):
+        azure_provider._cleanup_shared_network_watcher(d, options, runner, tmp_path,
+            lambda: 1100.0, lambda: now, {"profile_external_baseline": baseline, "actions": []}, [])
+    assert not any("delete" in request.action_type for request in runner.calls)
+
+
+def test_preexisting_watcher_and_parent_group_are_never_deleted(
+        repository_root: Path, tmp_path: Path, monkeypatch):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "deployment_id": d.deployment_id,
+        "campaign_id": d.campaign_id, "config_sha256": d.config_sha256, "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    peer_campaign, peer_deployment = "peer-campaign", "peer-campaign-azure-deployment"
+    peer_slug = f"cnb-{peer_campaign}-{peer_deployment}"
+    peer_suffix = hashlib.sha256(f"{peer_campaign}\0{peer_deployment}".encode()).hexdigest()[:8]
+    peer_slug = peer_slug[:36].rstrip("-") + "-" + peer_suffix
+    peer_group = f"/subscriptions/{subscription}/resourceGroups/{peer_slug}"
+    peer = {"entry_id": "V-S3", "run_id": "peer-campaign-azure", "campaign_id": peer_campaign,
+        "deployment_id": peer_deployment, "config_sha256": hashlib.sha256(b"peer config").hexdigest(),
+        "resource_group_id": peer_group,
+        "vm_ids": [f"{peer_group}/providers/Microsoft.Compute/virtualMachines/{peer_slug}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{peer_group}/providers/Microsoft.Network/networkInterfaces/{peer_slug}-{r}-nic" for r in ("a", "b")]}
+    spec = _provider_cleanup_spec(tmp_path, [owner, peer], subscription, group_id, watcher_id, "preexisting")
+    owner, _peer = spec["owners"]
+    d = d.model_copy(update={"config_sha256": owner["config_sha256"]})
+    options = options.model_copy(update={"subscription_id": subscription, "azure_auxiliary_cleanup": spec})
+    monkeypatch.setattr(azure_provider, "_valid_watcher_baseline", lambda *args: True)
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor", lambda *args, **kwargs: {
+        "routine_deadline_monotonic": 1500.0})
+    class NoProviderCall:
+        def run(self, _request):
+            raise AssertionError("pre-existing watcher must cause zero provider calls")
+    baseline = _provider_cleanup_baseline(d, subscription)
+    baseline["groups"] = [group_id.lower()]
+    baseline["watchers"] = [watcher_id.lower()]
+    baseline["resource_inventory"] = [{"id": watcher_id.lower(), "type": "microsoft.network/networkwatchers"}]
+    baseline["group_inventory"] = [{"id": group_id.lower(), "name": "networkwatcherrg"}]
+    baseline["inventory_sha256"] = hashlib.sha256(json.dumps({"resources": baseline["resource_inventory"],
+        "groups": baseline["group_inventory"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    baseline["sha256"] = hashlib.sha256(json.dumps({key: value for key, value in baseline.items() if key != "sha256"},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    cohort = AuxiliaryCleanupCohort(spec)
+    cohort.record_precreation_baseline(owner, baseline)
+    azure_provider._cleanup_shared_network_watcher(d, options, NoProviderCall(), tmp_path,
+        lambda: 1100.0, lambda: now, {"profile_external_baseline": baseline, "actions": []}, [])
+
+
+def test_shared_watcher_cleanup_inventories_block_foreign_active_vm(repository_root, tmp_path):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, _options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "deployment_id": d.deployment_id,
+        "campaign_id": d.campaign_id, "config_sha256": d.config_sha256, "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    peer_campaign, peer_deployment = "peer-campaign", "peer-campaign-azure-deployment"
+    peer_slug = f"cnb-{peer_campaign}-{peer_deployment}"
+    peer_suffix = hashlib.sha256(f"{peer_campaign}\0{peer_deployment}".encode()).hexdigest()[:8]
+    peer_slug = peer_slug[:36].rstrip("-") + "-" + peer_suffix
+    peer_group = f"/subscriptions/{subscription}/resourceGroups/{peer_slug}"
+    peer = {"entry_id": "V-S3", "run_id": "peer-campaign-azure", "campaign_id": peer_campaign,
+        "deployment_id": peer_deployment, "config_sha256": hashlib.sha256(b"peer config").hexdigest(),
+        "resource_group_id": peer_group,
+        "vm_ids": [f"{peer_group}/providers/Microsoft.Compute/virtualMachines/{peer_slug}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{peer_group}/providers/Microsoft.Network/networkInterfaces/{peer_slug}-{r}-nic" for r in ("a", "b")]}
+    spec = _provider_cleanup_spec(tmp_path, [owner, peer], subscription, group_id, watcher_id, "foreign-vm")
+    unrelated_vm = f"/subscriptions/{subscription}/resourceGroups/unregistered/providers/Microsoft.Compute/virtualMachines/live"
+    with pytest.raises(RuntimeError, match="foreign VM"):
+        azure_provider._require_cleanup_cohort_parents_absent(spec, [], [
+            {"id": unrelated_vm, "type": "Microsoft.Compute/virtualMachines"}])
+
+
+def test_cleanup_provider_commands_bind_the_earliest_registered_parent_deadline(repository_root, tmp_path):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    _deployment, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    group_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG"
+    watcher_id = group_id + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    peer_campaign, peer_deployment = "peer-campaign", "peer-campaign-azure-deployment"
+    peer_slug = f"cnb-{peer_campaign}-{peer_deployment}"
+    peer_suffix = hashlib.sha256(f"{peer_campaign}\0{peer_deployment}".encode()).hexdigest()[:8]
+    peer_slug = peer_slug[:36].rstrip("-") + "-" + peer_suffix
+    peer_group = f"/subscriptions/{subscription}/resourceGroups/{peer_slug}"
+    owners = [{"entry_id": "V-S1", "run_id": "local-campaign-azure",
+        "deployment_id": "local-campaign-azure-deployment",
+        "campaign_id": "local-campaign", "config_sha256": hashlib.sha256(b"local").hexdigest(),
+        "resource_group_id": f"/subscriptions/{subscription}/resourceGroups/cnb-local-campaign-local-deployment-00000000",
+        "vm_ids": [], "nic_ids": []},
+        {"entry_id": "V-S3", "run_id": "peer-campaign-azure", "deployment_id": peer_deployment,
+        "campaign_id": peer_campaign, "config_sha256": hashlib.sha256(b"peer").hexdigest(),
+        "resource_group_id": peer_group, "vm_ids": [], "nic_ids": []}]
+    # Derive resource IDs from the same campaign/deployment slug contract.
+    for owner in owners:
+        suffix = hashlib.sha256(f"{owner['campaign_id']}\0{owner['deployment_id']}".encode()).hexdigest()[:8]
+        stem = "-".join(("cnb", owner["campaign_id"], owner["deployment_id"]))
+        import re
+        stem = re.sub(r"[^a-z0-9-]", "-", stem.lower()).strip("-")[:36].rstrip("-")
+        owner["resource_group_id"] = f"/subscriptions/{subscription}/resourceGroups/{stem}-{suffix}"
+        owner["vm_ids"] = [owner["resource_group_id"] + f"/providers/Microsoft.Compute/virtualMachines/{stem}-{suffix}-{r}" for r in ("a", "b")]
+        owner["nic_ids"] = [owner["resource_group_id"] + f"/providers/Microsoft.Network/networkInterfaces/{stem}-{suffix}-{r}-nic" for r in ("a", "b")]
+    spec = _provider_cleanup_spec(tmp_path, owners, subscription, group_id, watcher_id, "deadline-binding")
+    cohort = AuxiliaryCleanupCohort(spec)
+    for owner, deadline in zip(spec["owners"], (900.0, 700.0)):
+        cohort.register_absent(owner, baseline_sha256=hashlib.sha256(owner["run_id"].encode()).hexdigest(),
+            activity_sha256=hashlib.sha256((owner["run_id"] + "activity").encode()).hexdigest(),
+            deadline_monotonic=deadline)
+    options = options.model_copy(update={"workflow_stage_deadline_monotonic": 950.0})
+    bound = azure_provider._bind_azure_cleanup_cohort_deadline(options, cohort)
+    assert bound.workflow_stage_deadline_monotonic == 700.0
+
+
+@pytest.mark.parametrize("corruption", ["wrong_caller", "ambiguous_create", "missing_nic_write"])
+def test_watcher_activity_ownership_requires_exact_caller_and_unique_correlated_vm_nic_writes(
+        repository_root: Path, tmp_path: Path, monkeypatch, corruption):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    watcher_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "campaign_id": d.campaign_id,
+        "deployment_id": d.deployment_id, "config_sha256": d.config_sha256,
+        "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    options = options.model_copy(update={"subscription_id": subscription,
+        "azure_auxiliary_cleanup": {"owners": [owner]}})
+    baseline = {"capture_started_at_utc": "2026-11-25T11:00:00+00:00",
+        "capture_finished_at_utc": "2026-11-25T11:00:01+00:00"}
+    caller = "00000000-0000-0000-0000-000000000001"
+    corr = "exact-owned-correlation"
+    def event(resource, operation, event_id, *, event_caller=caller, created=False):
+        return {"id": f"/subscriptions/{subscription}/providers/Microsoft.Insights/eventtypes/management/values/{event_id}",
+            "resourceId": resource,
+            "caller": event_caller, "correlationId": corr,
+            "eventTimestamp": "2026-11-25T11:30:00Z", "status": {"value": "Succeeded"},
+            "subStatus": {"value": "Created" if created else "",
+                "localizedValue": "Created (HTTP Status Code: 201)" if created else ""},
+            "operationName": {"value": operation},
+            "properties": {"statusCode": "Created"} if created else {}}
+    watcher_event = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher", created=True,
+        event_caller="foreign-caller" if corruption == "wrong_caller" else caller)
+    vm_event = event(owner["vm_ids"][0], "Microsoft.Compute/virtualMachines/write", "vm")
+    nic_event = event(owner["nic_ids"][0], "Microsoft.Network/networkInterfaces/write", "nic")
+    target_map = {watcher_id.lower(): [watcher_event],
+        owner["vm_ids"][0].lower(): [vm_event], owner["vm_ids"][1].lower(): [],
+        owner["nic_ids"][0].lower(): [nic_event], owner["nic_ids"][1].lower(): []}
+    if corruption == "ambiguous_create":
+        target_map[watcher_id.lower()].append(event(watcher_id,
+            "Microsoft.Network/networkWatchers/write", "watcher-two", created=True))
+    if corruption == "missing_nic_write":
+        target_map[owner["nic_ids"][0].lower()] = []
+    targets = [watcher_id, *sorted(target_map.keys() - {watcher_id.lower()})]
+    monkeypatch.setattr(azure_provider, "_read_arm_collection",
+        lambda _runner, _options, _root, endpoint, action, _clock, _fields:
+            (target_map.get(targets[int(action.rsplit("_", 1)[1]) - 1].lower(), []), []))
+    with pytest.raises(RuntimeError):
+        azure_provider._azure_watcher_activity(d, options, object(), tmp_path, baseline,
+            watcher_id, caller, caller, lambda: 1100.0, lambda: now)
+
+
+def test_watcher_activity_accepts_one_exact_successful_correlated_create(
+        repository_root: Path, tmp_path: Path, monkeypatch):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    watcher_id = f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "campaign_id": d.campaign_id,
+        "deployment_id": d.deployment_id, "config_sha256": d.config_sha256,
+        "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    options = options.model_copy(update={"subscription_id": subscription,
+        "azure_auxiliary_cleanup": {"owners": [owner]}})
+    baseline = {"capture_started_at_utc": "2026-11-25T11:00:00+00:00",
+        "capture_finished_at_utc": "2026-11-25T11:00:01+00:00"}
+    caller, corr = "00000000-0000-0000-0000-000000000001", "exact-owned-correlation"
+    def event(resource, operation, event_id, created=False):
+        return {"id": f"/subscriptions/{subscription}/providers/Microsoft.Insights/eventtypes/management/values/{event_id}",
+            "resourceId": resource, "caller": caller, "correlationId": corr,
+            "eventTimestamp": "2026-11-25T11:30:00Z", "status": {"value": "Succeeded"},
+            "subStatus": {"value": "Created" if created else "",
+                "localizedValue": "Created (HTTP Status Code: 201)" if created else ""},
+            "operationName": {"value": operation},
+            "properties": {"statusCode": "Created"} if created else {}}
+    watcher = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher", created=True)
+    vm = event(owner["vm_ids"][0], "Microsoft.Compute/virtualMachines/write", "vm")
+    nic = event(owner["nic_ids"][0], "Microsoft.Network/networkInterfaces/write", "nic")
+    data = {watcher_id.lower(): [watcher], owner["vm_ids"][0].lower(): [vm],
+        owner["vm_ids"][1].lower(): [], owner["nic_ids"][0].lower(): [nic],
+        owner["nic_ids"][1].lower(): []}
+    targets = [watcher_id, *sorted(data.keys() - {watcher_id.lower()})]
+    monkeypatch.setattr(azure_provider, "_read_arm_collection",
+        lambda _runner, _options, _root, endpoint, action, _clock, _fields:
+            (data.get(targets[int(action.rsplit("_", 1)[1]) - 1].lower(), []), []))
+    evidence, pages = azure_provider._azure_watcher_activity(d, options, object(), tmp_path,
+        baseline, watcher_id, caller, caller, lambda: 1100.0, lambda: now)
+    assert evidence["correlation_id"] == corr
+    assert len(evidence["events"]) == 3
+    assert pages == []
+
+
+def test_retained_azure_activity_schema_allows_split_callers_and_nonwrite_null_caller(
+        repository_root: Path, tmp_path: Path, monkeypatch):
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/azure/shared-watcher-activity-retained-schema.json").read_text())
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    d, options, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    watcher_id = (f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG/providers/"
+        "Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral")
+    owner_group = f"/subscriptions/{subscription}/resourceGroups/{_slug(d)}"
+    owner = {"entry_id": "V-S1", "run_id": d.run_id, "campaign_id": d.campaign_id,
+        "deployment_id": d.deployment_id, "config_sha256": d.config_sha256,
+        "resource_group_id": owner_group,
+        "vm_ids": [f"{owner_group}/providers/Microsoft.Compute/virtualMachines/{_slug(d)}-{r}" for r in ("a", "b")],
+        "nic_ids": [f"{owner_group}/providers/Microsoft.Network/networkInterfaces/{_slug(d)}-{r}-nic" for r in ("a", "b")]}
+    options = options.model_copy(update={"subscription_id": subscription,
+        "azure_auxiliary_cleanup": {"owners": [owner]}})
+    mapping = {}
+    for row in fixture["events"]:
+        resource = row["resourceId"]
+        if "/networkwatchers/" in resource.lower():
+            row["resourceId"] = watcher_id
+        elif "/virtualmachines/" in resource.lower():
+            role = "a" if resource.lower().rsplit("/", 1)[-1].endswith("-a") else "b"
+            row["resourceId"] = owner["vm_ids"][0 if role == "a" else 1]
+        elif "/networkinterfaces/" in resource.lower():
+            role = "a" if resource.lower().rsplit("/", 1)[-1].endswith("-a-nic") else "b"
+            row["resourceId"] = owner["nic_ids"][0 if role == "a" else 1]
+        mapping.setdefault(row["resourceId"].lower(), []).append(row)
+    targets = [watcher_id, *sorted(set(mapping) - {watcher_id.lower()})]
+    monkeypatch.setattr(azure_provider, "_read_arm_collection",
+        lambda _runner, _options, _root, _endpoint, action, _clock, _fields:
+            (mapping.get(targets[int(action.rsplit("_", 1)[1]) - 1].lower(), []), []))
+    evidence, _ = azure_provider._azure_watcher_activity(d, options, object(), tmp_path,
+        {"capture_started_at_utc": "2026-11-25T10:00:00+00:00",
+            "capture_finished_at_utc": "2026-11-25T10:00:01+00:00"}, watcher_id,
+        "11111111-1111-1111-1111-111111111111", "owner@example.invalid",
+        lambda: 1100.0, lambda: now)
+    assert evidence["correlation_id"] == "8ae6c03a-f4f9-f5e6-528b-15d81198e46b"
+    assert len(evidence["events"]) == 7
+    assert fixture["group_get"]["body"]["id"].lower() == (
+        f"/subscriptions/{subscription}/resourcegroups/networkwatcherrg")
+    assert "etag" not in fixture["group_get"]["body"]
+
+
+@pytest.mark.parametrize("body,accepted", [
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","message":"Resource not found for exact /watcher"}})', True),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","target":"/watcher","message":"absent"}})', True),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound"}})', False),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","target":"/watcher","details":[{"target":"/foreign"}]}})', False),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","target":"/watcher-foreign"}})', False),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","target":"/foreign","target":"/watcher"}})', False),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","message":"Resource not found for exact /watcher-foreign"}})', False),
+    ('ERROR: Not Found({"error":{"code":"AuthorizationFailed","target":"/watcher"}})', False),
+    ('ERROR: Not Found({"error":{"code":"ResourceNotFound","target":"/watcher"}}) extra', False),
+])
+def test_watcher_absence_requires_complete_exact_resource_404(body, accepted):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    result = CommandResult(action_id="watcher-404", outcome=CommandOutcome.FAILED,
+        started_at=now, finished_at=now, duration_seconds=0.0, exit_code=1,
+        stdout="", stderr=body)
+    assert azure_provider._is_exact_resource_404(result, "/watcher") is accepted
+
+
 def test_profile_cleanup_rejects_attempt_group_listed_after_exists_false(
         repository_root: Path,tmp_path: Path):
     now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
@@ -1202,6 +2306,204 @@ def test_registration_records_readbacks_and_narrow_rbac(repository_root: Path, t
     journal=json.loads((o.attempt_root/"recovery.json").read_text())
     assert journal["expiry_state"]=="registered"
     assert journal["expiry"]["automation_account_id"] and journal["expiry"]["job_schedule_id"]
+
+
+@pytest.mark.parametrize("timezone_name", ["UTC", "Etc/UTC"])
+def test_registration_accepts_only_supported_utc_schedule_names(repository_root: Path,tmp_path: Path,timezone_name):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone=timezone_name)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    assert expiry.state=="registered"
+
+
+def test_pre_vm_recheck_accepts_etc_utc_schedule_name(repository_root: Path,tmp_path: Path):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone="Etc/UTC")
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    registered=d.model_copy(update={"expiry":type(d.expiry)(value=expiry)})
+    result=provision(registered,o,runner,clock=lambda:2.0,utc_now=lambda:now+timedelta(seconds=1))
+    assert not any("schedule" in failure.message for failure in result.failures)
+    assert "pair_apply" in [request.action_type for request in runner.requests]
+
+
+@pytest.mark.parametrize("case,expected_error", [
+    ("expired", "reservation/deadline has expired"),
+    ("changed_identity", "registered expiry metadata is not bound to this reservation source"),
+    ("missing_stop", "actual registered STOP is absent from the original cleanup timing anchor"),
+    ("changed_stop", "actual registered STOP is absent from the original cleanup timing anchor"),
+    ("backwards_clock", "reservation chronology or original mode lifetime ceiling is invalid"),
+    ("changed_clock", "original monotonic deadline extends beyond the reserved UTC cap"),
+    ("changed_clock_identity", "Azure cleanup timing anchor clock identity changed"),
+    ("valid", None),
+])
+def test_v15_original_clock_mapping_preserves_deadlines_and_fails_closed(
+        repository_root: Path, tmp_path: Path, monkeypatch, case, expected_error):
+    """Exercise V15 UTC/monotonic bounds through Azure hooks and provision."""
+    from cloud_network_benchmark.contracts.admission import ExpiryEvidence
+    from cloud_network_benchmark.contracts.common import Evidence, StructuredEvidence
+    from cloud_network_benchmark.lifecycle_adapters import RemoteStages, azure_hooks
+
+    cap_start_utc = datetime.fromisoformat("2026-11-24T18:49:42.963086+00:00")
+    cap_start_mono = 1156605.752490595
+    origin_utc = datetime.fromisoformat("2026-11-24T18:49:45.827666+00:00")
+    origin_mono = 1156608.617074353
+    stop = datetime.fromisoformat("2026-11-24T19:57:00+00:00")
+    requested_stop = datetime.fromisoformat("2026-11-24T19:57:42.963086+00:00")
+    assert requested_stop.replace(second=0, microsecond=0) == stop
+    cap_end_utc = cap_start_utc + timedelta(seconds=4200)
+    cap_end_mono = cap_start_mono + 4200
+
+    d = deployment(repository_root, "exp-903-three-provider-smoke.yaml")
+    reservation = d.reservation.value.model_copy(update={
+        "reservation_id": Evidence(value="42be6b78059261493b9ce80fd058af55"),
+        "campaign_id": "20261124T174251Z-exp-903-4f979c09",
+        "cap_started_at": Evidence(value=cap_start_utc),
+        "expires_at": Evidence(value=cap_end_utc),
+        "source_sha256": "364813b5d08c0e16a286e196d9528085ce0e0941eee2c1dba232e91e19b019d4",
+        "workflow_profile": "all_cloud_acceptance_v1",
+    })
+    admission = d.admission.model_copy(update={
+        "workflow_profile": "all_cloud_acceptance_v1", "lifetime_cap_seconds": 4200,
+        "priority": "P0",
+    })
+    d = d.model_copy(update={
+        "campaign_id": "20261124T174251Z-exp-903-4f979c09",
+        "run_id": "20261124T174251Z-exp-903-4f979c09-azure",
+        "deployment_id": "20261124T174251Z-exp-903-4f979c09-azure-deployment",
+        "admission": admission, "reservation": Evidence(value=reservation),
+    })
+    value = options(tmp_path, "P0").model_dump(mode="python")
+    value.update(
+        complete_workflow_seconds=3535, post_registration_workflow_seconds=2635,
+        cap_deadline_monotonic=cap_end_mono, cap_started_monotonic=cap_start_mono,
+        retry_end_at=cap_end_utc, workflow_profile="all_cloud_acceptance_v1",
+        admission_evidence={**value["admission_evidence"],
+            "reservation_id": reservation.reservation_id.value,
+            "source_sha256": reservation.source_sha256},
+        cleanup_timing_path=tmp_path / "private" / "azure-clock.json",
+        profile_allowance={
+            "registration_seconds": 900, "provision_seconds": 900,
+            "readiness_seconds": 600, "stabilization_seconds": 60,
+            "measurement_seconds": 100, "measurement_shutdown_seconds": 15,
+            "retrieval_seconds": 300, "cleanup_seconds": 660,
+            "azure_provider_lead_seconds": 120,
+        },
+    )
+    o = AzureRuntimeOptions.model_validate(value)
+    clock_identity = {"value": "9b1cc84e4aaa6905061a6c10c49af2d277d8eb394364da05ec60206638994fd"}
+    monkeypatch.setattr(azure_provider, "_clock_identity", lambda: clock_identity["value"])
+    azure_provider._initialize_profile_timing(
+        d, o, clock=lambda: origin_mono, utc_now=lambda: origin_utc,
+        origin_monotonic=origin_mono, origin_utc=origin_utc)
+    name = _slug(d)
+    target_ids = [f"/subscriptions/{o.subscription_id}/resourceGroups/{name}/providers/Microsoft.Compute/virtualMachines/{name}-{role}"
+                  for role in ("a", "b")]
+    evidence = ExpiryEvidence(
+        schema_version=2, run_id=d.run_id, deployment_id=d.deployment_id,
+        provider="azure", action="deallocate", state="registered",
+        registration_id=Evidence(value="fake-v15-expiry-registration"),
+        registered_at=Evidence(value=cap_start_utc + timedelta(seconds=100)),
+        expires_at=Evidence(value=stop + timedelta(minutes=1) if case == "changed_stop" else stop),
+        target_selector=";".join(target_ids),
+        provider_metadata=StructuredEvidence(value={
+            "reservation_id": "foreign-reservation" if case == "changed_identity" else reservation.reservation_id.value,
+            "source_sha256": reservation.source_sha256,
+        }),
+    )
+
+    # The captured V15 mapping leaves 3.758 microseconds before the UTC cap.
+    # A controlled 100-microsecond interval between the production samples makes
+    # the old monotonic-then-UTC order project the deadline beyond that cap.
+    provision_utc = datetime.fromisoformat("2026-11-24T19:13:00+00:00")
+    if case == "expired":
+        provision_utc = cap_end_utc + timedelta(seconds=1)
+    elif case == "backwards_clock":
+        provision_utc = cap_start_utc - timedelta(seconds=1)
+    provision_elapsed = (provision_utc - origin_utc).total_seconds()
+    provision_mono = origin_mono + provision_elapsed
+    state = {"provision": False, "mono_calls": 0, "utc_calls": 0,
+        "stage_started_monotonic": None, "validation_monotonic": None}
+
+    def fake_clock():
+        if not state["provision"]:
+            return origin_mono + 100
+        state["mono_calls"] += 1
+        value = provision_mono + (0.0001 if state["utc_calls"] else 0.0)
+        if state["mono_calls"] == 1:
+            state["stage_started_monotonic"] = value
+        elif state["mono_calls"] == 2:
+            state["validation_monotonic"] = value
+        return value
+
+    def fake_utc_now():
+        if not state["provision"]:
+            return cap_start_utc + timedelta(seconds=100)
+        state["utc_calls"] += 1
+        offset = timedelta(seconds=5) if case == "changed_clock" else timedelta()
+        return provision_utc + offset + (timedelta(microseconds=100) if state["mono_calls"] else timedelta())
+
+    def fake_register(*args, **kwargs):
+        if case != "missing_stop":
+            azure_provider._bind_profile_stop(d, o, stop)
+        return evidence
+
+    monkeypatch.setattr(azure_provider, "register_expiry", fake_register)
+
+    def protected(_provider, _evidence):
+        state["provision"] = True
+        if case == "changed_clock_identity":
+            clock_identity["value"] = "f" * 64
+
+    stages = RemoteStages(*([lambda *_: None] * 6))
+    hooks = azure_hooks(d, expiry_request(d, o, requested_stop), options=o,
+        runner=AutomationRunner(d, o, cap_start_utc), stages=stages,
+        clock=fake_clock, utc_now=fake_utc_now, on_protected=protected)
+    assert hooks.protect() == evidence
+
+    def stop_before_external_terraform(*args, action, **kwargs):
+        assert action == "pair_init"
+        runtime_options = args[1]
+        assert runtime_options.cap_started_monotonic == cap_start_mono
+        assert runtime_options.cap_deadline_monotonic == cap_end_mono
+        assert runtime_options.retry_end_at == cap_end_utc
+        provision_stage_seconds = float(d.provisioning_timeout_seconds or o.command_timeout_seconds)
+        profile_stage_deadline = cap_start_mono + 900 + 900
+        effective_stop_deadline = cap_start_mono + (stop - cap_start_utc).total_seconds()
+        expected_stage_deadline = min(
+            state["stage_started_monotonic"] + provision_stage_seconds,
+            profile_stage_deadline, cap_end_mono, effective_stop_deadline)
+        second_sample_deadline = min(
+            state["validation_monotonic"] + provision_stage_seconds,
+            profile_stage_deadline, cap_end_mono, effective_stop_deadline)
+        assert runtime_options.workflow_stage_deadline_monotonic == expected_stage_deadline
+        assert runtime_options.workflow_stage_deadline_monotonic != second_sample_deadline
+        assert evidence.expires_at.value == stop
+        anchor = json.loads(o.cleanup_timing_path.read_text(encoding="utf-8"))
+        assert anchor["provider_stop_at"] == stop.isoformat()
+        raise RuntimeError("offline test boundary before external command execution")
+
+    monkeypatch.setattr(azure_provider, "_tf", stop_before_external_terraform)
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            hooks.create()
+    else:
+        result = hooks.create()
+        assert any("offline test boundary before external command execution" in failure.message
+                   for failure in result.failures)
+        assert not any("original monotonic deadline extends beyond" in failure.message
+                       for failure in result.failures)
+
+
+@pytest.mark.parametrize("timezone_name", ["Europe/London", "GMT", "Etc/GMT", "etc/utc"])
+def test_registration_rejects_unexpected_schedule_timezone_aliases(repository_root: Path,tmp_path: Path,timezone_name):
+    d=deployment(repository_root); now=datetime.now(timezone.utc); o=options(tmp_path,d.admission.priority)
+    o=AzureRuntimeOptions.model_validate({**o.model_dump(),"retry_end_at":now+timedelta(minutes=17)})
+    runner=AutomationRunner(d,o,now,schedule_timezone=timezone_name)
+    expiry=register_expiry(d,expiry_request(d,o,now+timedelta(minutes=16)),o,runner,clock=lambda:1.0,utc_now=lambda:now)
+    assert expiry.state=="failed" and expiry.failure is not None
+    assert not any(request.action_type=="pair_apply" for request in runner.requests)
 
 
 def test_registration_rejects_foreign_assigned_role_definition(repository_root: Path,tmp_path: Path):

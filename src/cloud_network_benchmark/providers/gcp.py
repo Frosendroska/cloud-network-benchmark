@@ -46,6 +46,8 @@ GCP_CLEANUP_INVENTORY_COMMANDS = (
     ("gcp-routes-inventory-all-scopes", ("compute", "routes", "list")),
     ("gcp-policy-inventory-all-scopes", ("compute", "resource-policies", "list")),
 )
+GCP_CLEANUP_COMMAND_IDS = frozenset({"gcp-pair-destroy", "gcp-protection-destroy",
+    *(action for action, _ in GCP_CLEANUP_INVENTORY_COMMANDS)})
 
 
 def validate_ubuntu_image_identities(images: dict[str, str], *, selected_regions: set[str] | None = None) -> None:
@@ -189,6 +191,38 @@ class GcpProviderDriver:
     @_deadline.setter
     def _deadline(self, value: float | None) -> None:
         self._command_context.deadline = value
+
+    @property
+    def _cleanup_deadline_utc(self) -> datetime | None:
+        return getattr(self._command_context, "cleanup_deadline_utc", None)
+
+    @_cleanup_deadline_utc.setter
+    def _cleanup_deadline_utc(self, value: datetime | None) -> None:
+        self._command_context.cleanup_deadline_utc = value
+
+    @property
+    def _cleanup_clock_binding(self) -> float | None:
+        return getattr(self._command_context, "cleanup_clock_binding", None)
+
+    @_cleanup_clock_binding.setter
+    def _cleanup_clock_binding(self, value: float | None) -> None:
+        self._command_context.cleanup_clock_binding = value
+
+    @property
+    def _cleanup_absence_deadline_utc(self) -> datetime | None:
+        return getattr(self._command_context, "cleanup_absence_deadline_utc", None)
+
+    @_cleanup_absence_deadline_utc.setter
+    def _cleanup_absence_deadline_utc(self, value: datetime | None) -> None:
+        self._command_context.cleanup_absence_deadline_utc = value
+
+    @property
+    def _cleanup_routine_deadline_utc(self) -> datetime | None:
+        return getattr(self._command_context, "cleanup_routine_deadline_utc", None)
+
+    @_cleanup_routine_deadline_utc.setter
+    def _cleanup_routine_deadline_utc(self, value: datetime | None) -> None:
+        self._command_context.cleanup_routine_deadline_utc = value
 
     @property
     def _active_attempt(self) -> Path | None:
@@ -394,44 +428,112 @@ class GcpProviderDriver:
 
     def cleanup(self, deployment: ProviderDeploymentInput) -> GcpCleanupResult:
         self._deadline = None
+        self._cleanup_deadline_utc = None
+        self._cleanup_absence_deadline_utc = None
+        self._cleanup_routine_deadline_utc = None
+        self._cleanup_clock_binding = None
         self._cleanup_acceptance_deadlines = []
         attempt = self._attempt_dir(deployment)
         self._active_attempt = attempt
         journal = self._load(attempt, deployment)
-        cleanup_now = self.clock().astimezone(timezone.utc)
-        if deployment.admission.workflow_profile:
-            started_at = journal.get("cleanup_started_at")
-            if started_at is None:
-                started_at = cleanup_now.isoformat()
-                journal["cleanup_started_at"] = started_at
+        if journal.get("binding_sha256") and journal["binding_sha256"] != self._binding_fingerprint(deployment):
+            failure = self._failure(GcpProviderError(
+                "cleanup caller differs from the immutable registered project/source/cap/settings",
+                category="state_identity_mismatch"))
+            return GcpCleanupResult(cleanup_state=CleanupState.FAILED,
+                cleanup_failure=failure,
+                primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None,
+                inventory=StructuredEvidence(value={"known": [], "pages_complete": False}),
+                expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"]))
+                    if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+        if journal.get("cleanup_state") == "succeeded":
+            return GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=journal["inventory"]), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])) if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"), primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None)
+        cleanup_now = self.clock()
+        deadline_required = bool(journal.get("creation_may_have_started")
+            or journal.get("registered") or journal.get("registration_may_have_started"))
+        try:
+            if cleanup_now.tzinfo is None or cleanup_now.utcoffset() is None:
+                raise GcpProviderError("cleanup UTC clock must be timezone-aware", category="cleanup_deadline_unknown")
+            cleanup_now = cleanup_now.astimezone(timezone.utc)
+            cleanup_deadline = (self._prepare_cleanup_deadline(attempt, journal, deployment, cleanup_now)
+                if deadline_required else None)
+            absence_fields = ("cleanup_absence_started_at", "cleanup_absence_deadline_utc",
+                "cleanup_absence_started_monotonic", "cleanup_absence_deadline_monotonic")
+            if any(field in journal for field in absence_fields):
+                if not deployment.admission.workflow_profile:
+                    raise GcpProviderError("saved cleanup absence phase has no profile identity", category="cleanup_deadline_unknown")
+                from ..validation_profiles import provider_lead_seconds
+                lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
+                absence_end = self._prepare_absence_deadline(attempt, journal, deployment, lead)
+                self._cleanup_absence_deadline_utc = absence_end
+                absence_remaining = (absence_end-cleanup_now).total_seconds()
+                overall_remaining = (cleanup_deadline-cleanup_now).total_seconds()
+                self._deadline = min(float(journal["cleanup_deadline_monotonic"]),
+                    time.monotonic()+overall_remaining,
+                    float(journal["cleanup_absence_deadline_monotonic"]),
+                    time.monotonic()+max(0.0, absence_remaining))
                 self._save(attempt, journal)
-            started_utc = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception as exc:
+            failure = self._failure(exc)
+            inventory = {"known": [], "pages_complete": False}
+            journal.update({"cleanup_state": "failed", "launch_blocked": True,
+                "cleanup_failure": failure.model_dump(mode="json"), "inventory": inventory})
+            self._save(attempt, journal)
+            expiry = journal.get("expiry")
+            return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure,
+                primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None,
+                inventory=StructuredEvidence(value=inventory),
+                expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+        if deployment.admission.workflow_profile and cleanup_deadline is not None:
+            started_utc = datetime.fromisoformat(journal["cleanup_started_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+            reservation_end = deployment.reservation.value.expires_at.value.astimezone(timezone.utc)
             from ..validation_profiles import provider_lead_seconds
             lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
-            # Keep the registered acceptance deadline immutable; allow bounded
-            # owned-resource recovery after it has elapsed.
-            routine_end = min(started_utc+timedelta(seconds=600),
-                deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead+60))
-            self._cleanup_acceptance_deadlines = [routine_end]
+            routine_acceptance_end = min(started_utc + timedelta(seconds=600), reservation_end-timedelta(seconds=lead+60))
+            # The reservation/STOP boundary classifies cleanup timeliness. It
+            # cannot consume the independent recovery allowance for deletion.
+            routine_end = min(started_utc + timedelta(seconds=600), cleanup_deadline)
+            routine_mono = min(float(journal["cleanup_started_monotonic"])+600.0,
+                float(journal["cleanup_deadline_monotonic"]))
+            saved_routine_utc = journal.get("cleanup_routine_deadline_utc")
+            saved_routine_mono = journal.get("cleanup_routine_deadline_monotonic")
+            if saved_routine_utc is not None or saved_routine_mono is not None:
+                if saved_routine_utc is None or saved_routine_mono is None:
+                    raise GcpProviderError("original cleanup routine deadline is incomplete", category="cleanup_deadline_unknown")
+                try:
+                    parsed_routine_utc = datetime.fromisoformat(str(saved_routine_utc).replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise GcpProviderError("original cleanup routine deadline is malformed", category="cleanup_deadline_unknown") from exc
+                if (parsed_routine_utc.tzinfo is None or parsed_routine_utc.utcoffset() is None
+                        or parsed_routine_utc.astimezone(timezone.utc) != routine_end
+                        or isinstance(saved_routine_mono, bool) or not isinstance(saved_routine_mono, (int, float))
+                        or not isfinite(float(saved_routine_mono)) or abs(float(saved_routine_mono)-routine_mono) > 0.01):
+                    raise GcpProviderError("original cleanup routine deadline changed", category="cleanup_deadline_invalid")
+            else:
+                journal["cleanup_routine_deadline_utc"] = routine_end.isoformat()
+                journal["cleanup_routine_deadline_monotonic"] = routine_mono
+            if self._cleanup_absence_deadline_utc is None:
+                self._cleanup_routine_deadline_utc = routine_end
+                self._deadline = min(self._deadline, routine_mono)
+            self._cleanup_acceptance_deadlines = [routine_acceptance_end]
+            if self._cleanup_absence_deadline_utc is not None:
+                absence_started_utc = datetime.fromisoformat(
+                    journal["cleanup_absence_started_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                self._cleanup_acceptance_deadlines.append(min(
+                    absence_started_utc+timedelta(seconds=60),
+                    reservation_end-timedelta(seconds=lead)))
             previous_timing = journal.get("cleanup_acceptance_timing", {})
             timing_status = previous_timing.get("status")
             if timing_status not in {"late", "unknown"}:
-                timing_status = "late" if cleanup_now >= routine_end else "within_deadline"
+                timing_status = "late" if cleanup_now >= routine_acceptance_end else "within_deadline"
             journal["cleanup_acceptance_timing"] = {
-                "routine_deadline_utc": routine_end.isoformat(),
+                "routine_deadline_utc": routine_acceptance_end.isoformat(),
                 "status": timing_status,
             }
-            # Execution gets a separate per-invocation recovery window.
-            self._deadline = time.monotonic()+600.0
-        else:
-            self._deadline = time.monotonic() + (deployment.cleanup_timeout_seconds or self.settings.registration_timeout_seconds)
-        if journal.get("cleanup_state") == "succeeded":
-            return GcpCleanupResult(cleanup_state=CleanupState.SUCCEEDED, inventory=StructuredEvidence(value=journal["inventory"]), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(journal["expiry"])) if journal.get("expiry") else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"), primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None)
+            self._save(attempt, journal)
         failure = None
         inventory: dict[str, Any] = {"known": [], "pages_complete": False}
         try:
-            if journal.get("binding_sha256") and journal["binding_sha256"] != self._binding_fingerprint(deployment):
-                raise GcpProviderError("cleanup caller differs from the immutable registered project/source/cap/settings", category="state_identity_mismatch")
             if journal.get("creation_may_have_started"):
                 self._terraform(attempt, "pair", "destroy", deployment, {})
             inventory = self._inventory(deployment)
@@ -439,21 +541,28 @@ class GcpProviderDriver:
                 raise GcpProviderError("owned compute remains; protection must stay installed", category="residual_compute")
             if journal.get("registered") or journal.get("registration_may_have_started"):
                 self._terraform(attempt, "protection", "destroy", deployment, {})
-            if deployment.admission.workflow_profile:
+            if deployment.admission.workflow_profile and (journal.get("registered") or journal.get("registration_may_have_started")):
+                from ..validation_profiles import provider_lead_seconds
+                lead = provider_lead_seconds(deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS)
                 if self.clock().astimezone(timezone.utc) >= self._cleanup_acceptance_deadlines[0]:
                     journal["cleanup_acceptance_timing"]["status"] = "late"
-                absence_started = journal.get("cleanup_absence_started_at")
-                if absence_started is None:
-                    absence_started = self.clock().astimezone(timezone.utc).isoformat()
-                    journal["cleanup_absence_started_at"] = absence_started
-                    self._save(attempt, journal)
-                absence_utc = datetime.fromisoformat(absence_started.replace("Z", "+00:00")).astimezone(timezone.utc)
-                absence_end = min(absence_utc+timedelta(seconds=60),
+                absence_end = self._prepare_absence_deadline(attempt, journal, deployment, lead)
+                absence_started_utc = datetime.fromisoformat(
+                    journal["cleanup_absence_started_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                absence_acceptance_end = min(absence_started_utc+timedelta(seconds=60),
                     deployment.reservation.value.expires_at.value.astimezone(timezone.utc)-timedelta(seconds=lead))
-                self._cleanup_acceptance_deadlines.append(absence_end)
-                if self.clock().astimezone(timezone.utc) >= absence_end:
+                self._cleanup_acceptance_deadlines.append(absence_acceptance_end)
+                self._cleanup_absence_deadline_utc = absence_end
+                if self.clock().astimezone(timezone.utc) >= absence_acceptance_end:
                     journal["cleanup_acceptance_timing"]["status"] = "late"
-                self._deadline = time.monotonic()+60.0
+                remaining_utc = (absence_end-self.clock().astimezone(timezone.utc)).total_seconds()
+                absence_mono = journal["cleanup_absence_deadline_monotonic"]
+                overall_deadline_utc = datetime.fromisoformat(journal["cleanup_deadline_utc"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                overall_remaining = (overall_deadline_utc-self.clock().astimezone(timezone.utc)).total_seconds()
+                self._deadline = min(float(journal["cleanup_deadline_monotonic"]),
+                    time.monotonic()+overall_remaining, float(absence_mono),
+                    time.monotonic()+max(0.0, remaining_utc))
+                self._save(attempt, journal)
             inventory = self._inventory(deployment)
             if not inventory["pages_complete"] or inventory["resources"]:
                 raise GcpProviderError("owned or unknown resources remain after cleanup", category="cleanup_incomplete")
@@ -490,6 +599,186 @@ class GcpProviderDriver:
             self._save(attempt, journal)
             expiry = journal.get("expiry")
             return GcpCleanupResult(cleanup_state=CleanupState.FAILED, cleanup_failure=failure, primary_failure=FailureEvidence.model_validate(journal["primary_failure"]) if journal.get("primary_failure") else None, inventory=StructuredEvidence(value=inventory), expiry=Evidence[ExpiryEvidence](value=ExpiryEvidence.model_validate(expiry)) if expiry else Evidence[ExpiryEvidence](unavailable_reason="no native expiry was registered"))
+
+    def _prepare_cleanup_deadline(self, attempt: Path, journal: dict[str, Any],
+                                  deployment: ProviderDeploymentInput, now_utc: datetime) -> datetime:
+        """Bind cleanup commands to one durable UTC and monotonic deadline."""
+        if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+            raise GcpProviderError("cleanup UTC clock must be timezone-aware", category="cleanup_deadline_unknown")
+        now_utc = now_utc.astimezone(timezone.utc)
+        now_mono = time.monotonic()
+        if not isfinite(now_mono) or now_mono < 0:
+            raise GcpProviderError("cleanup monotonic clock is unavailable", category="cleanup_deadline_unknown")
+        clock_binding = round(now_utc.timestamp()-now_mono, 3)
+        started_raw = journal.get("cleanup_started_at")
+        if started_raw is None:
+            started_utc = now_utc
+            journal["cleanup_started_at"] = started_utc.isoformat()
+            journal["cleanup_started_monotonic"] = now_mono
+            journal["cleanup_clock_binding"] = clock_binding
+        else:
+            try:
+                started_utc = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GcpProviderError("original cleanup start time is malformed", category="cleanup_deadline_unknown") from exc
+            if started_utc.tzinfo is None or started_utc.utcoffset() is None:
+                raise GcpProviderError("original cleanup start time has no UTC offset", category="cleanup_deadline_unknown")
+            started_utc = started_utc.astimezone(timezone.utc)
+            if started_utc > now_utc:
+                raise GcpProviderError("original cleanup start is in the future; UTC may have moved backward", category="cleanup_clock_changed")
+            started_mono = journal.get("cleanup_started_monotonic")
+            saved_binding = journal.get("cleanup_clock_binding")
+            if (isinstance(started_mono, bool) or not isinstance(started_mono, (int, float))
+                    or not isfinite(float(started_mono)) or not isinstance(saved_binding, (int, float))
+                    or not isfinite(float(saved_binding))):
+                raise GcpProviderError("original cleanup monotonic and clock identity anchors are unavailable", category="cleanup_deadline_unknown")
+            if abs(clock_binding-float(saved_binding)) > 2.0:
+                raise GcpProviderError("cleanup UTC/monotonic clock identity changed", category="cleanup_clock_changed")
+            elapsed_utc = (now_utc-started_utc).total_seconds()
+            elapsed_mono = now_mono-float(started_mono)
+            if elapsed_utc < 0 or elapsed_mono < 0 or abs(elapsed_utc-elapsed_mono) > 2.0:
+                raise GcpProviderError("cleanup UTC and monotonic elapsed time disagree", category="cleanup_clock_changed")
+        timeout_seconds = deployment.cleanup_timeout_seconds or (
+            660 if deployment.admission.workflow_profile else self.settings.registration_timeout_seconds)
+        if not isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+            raise GcpProviderError("original cleanup allowance is unavailable", category="cleanup_deadline_unknown")
+        original_end = started_utc + timedelta(seconds=float(timeout_seconds))
+        existing_end = journal.get("cleanup_deadline_utc")
+        if existing_end is not None:
+            try:
+                deadline_utc = datetime.fromisoformat(str(existing_end).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GcpProviderError("original cleanup deadline is malformed", category="cleanup_deadline_unknown") from exc
+            if deadline_utc.tzinfo is None or deadline_utc.utcoffset() is None:
+                raise GcpProviderError("original cleanup deadline has no UTC offset", category="cleanup_deadline_unknown")
+            deadline_utc = deadline_utc.astimezone(timezone.utc)
+            if deadline_utc > original_end:
+                raise GcpProviderError("saved cleanup deadline exceeds its original cap", category="cleanup_deadline_invalid")
+        else:
+            deadline_utc = original_end
+            journal["cleanup_deadline_utc"] = deadline_utc.isoformat()
+        owner_binding = journal.get("binding_sha256")
+        if "cleanup_deadline_binding_sha256" in journal and journal["cleanup_deadline_binding_sha256"] != owner_binding:
+            raise GcpProviderError("cleanup deadline is bound to another attempt identity", category="state_identity_mismatch")
+        journal["cleanup_deadline_binding_sha256"] = owner_binding
+        remaining_utc = (deadline_utc-now_utc).total_seconds()
+        if not isfinite(remaining_utc) or remaining_utc <= 0:
+            raise GcpProviderError("original cumulative cleanup deadline elapsed", category="command_timeout")
+        saved_mono = journal.get("cleanup_deadline_monotonic")
+        if saved_mono is None:
+            if started_raw is not None:
+                raise GcpProviderError("original cleanup monotonic deadline was not persisted", category="cleanup_deadline_unknown")
+            saved_mono = now_mono + remaining_utc
+            journal["cleanup_deadline_monotonic"] = saved_mono
+        if isinstance(saved_mono, bool) or not isinstance(saved_mono, (int, float)) or not isfinite(float(saved_mono)) or float(saved_mono) <= now_mono:
+            raise GcpProviderError("original cumulative monotonic cleanup deadline elapsed or is unknown", category="command_timeout")
+        # Recheck UTC on every resume and never extend the first monotonic cap.
+        self._deadline = min(float(saved_mono), now_mono + remaining_utc)
+        self._cleanup_deadline_utc = deadline_utc
+        self._cleanup_clock_binding = float(journal["cleanup_clock_binding"])
+        if self._deadline <= now_mono:
+            raise GcpProviderError("original cumulative cleanup deadline elapsed", category="command_timeout")
+        self._save(attempt, journal)
+        return deadline_utc
+
+    def _prepare_absence_deadline(self, attempt: Path, journal: dict[str, Any],
+                                  deployment: ProviderDeploymentInput, lead: float) -> datetime:
+        now_utc = self.clock()
+        if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+            raise GcpProviderError("cleanup UTC clock must be timezone-aware", category="cleanup_deadline_unknown")
+        now_utc = now_utc.astimezone(timezone.utc)
+        now_mono = time.monotonic()
+        if not isfinite(now_mono) or now_mono < 0:
+            raise GcpProviderError("cleanup absence monotonic clock is unavailable", category="cleanup_deadline_unknown")
+        clock_binding = round(now_utc.timestamp()-now_mono, 3)
+        started_raw = journal.get("cleanup_absence_started_at")
+        if started_raw is None:
+            started_utc = now_utc
+            journal["cleanup_absence_started_at"] = started_utc.isoformat()
+            journal["cleanup_absence_started_monotonic"] = now_mono
+            journal["cleanup_absence_clock_binding"] = clock_binding
+        else:
+            try:
+                started_utc = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GcpProviderError("original cleanup absence time is malformed", category="cleanup_deadline_unknown") from exc
+            if started_utc.tzinfo is None or started_utc.utcoffset() is None:
+                raise GcpProviderError("original cleanup absence time has no UTC offset", category="cleanup_deadline_unknown") from None
+            started_utc = started_utc.astimezone(timezone.utc)
+            if started_utc > now_utc:
+                raise GcpProviderError("cleanup absence start is in the future; UTC may have moved backward", category="cleanup_clock_changed")
+            started_mono = journal.get("cleanup_absence_started_monotonic")
+            saved_binding = journal.get("cleanup_absence_clock_binding")
+            if (isinstance(started_mono, bool) or not isinstance(started_mono, (int, float))
+                    or not isfinite(float(started_mono)) or not isinstance(saved_binding, (int, float))
+                    or not isfinite(float(saved_binding))):
+                raise GcpProviderError("cleanup absence monotonic and clock identity anchors are unavailable", category="cleanup_deadline_unknown")
+            if abs(clock_binding-float(saved_binding)) > 2.0:
+                raise GcpProviderError("cleanup absence clock identity changed", category="cleanup_clock_changed")
+            elapsed_utc = (now_utc-started_utc).total_seconds()
+            elapsed_mono = now_mono-float(started_mono)
+            if elapsed_utc < 0 or elapsed_mono < 0 or abs(elapsed_utc-elapsed_mono) > 2.0:
+                raise GcpProviderError("cleanup absence UTC and monotonic elapsed time disagree", category="cleanup_clock_changed")
+        raw_overall_end = journal.get("cleanup_deadline_utc")
+        if raw_overall_end is None:
+            raise GcpProviderError("original cumulative cleanup deadline is unavailable for absence verification", category="cleanup_deadline_unknown")
+        try:
+            overall_end = datetime.fromisoformat(str(raw_overall_end).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise GcpProviderError("original cumulative cleanup deadline is malformed", category="cleanup_deadline_unknown") from exc
+        if overall_end.tzinfo is None or overall_end.utcoffset() is None:
+            raise GcpProviderError("original cumulative cleanup deadline has no UTC offset", category="cleanup_deadline_unknown")
+        candidate = min(started_utc + timedelta(seconds=60), overall_end.astimezone(timezone.utc))
+        raw_end = journal.get("cleanup_absence_deadline_utc")
+        if raw_end is not None:
+            try:
+                end = datetime.fromisoformat(str(raw_end).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GcpProviderError("original cleanup absence deadline is malformed", category="cleanup_deadline_unknown") from exc
+            if end.tzinfo is None or end.utcoffset() is None or end.astimezone(timezone.utc) > candidate:
+                raise GcpProviderError("saved cleanup absence deadline exceeds its original cap", category="cleanup_deadline_invalid")
+            end = end.astimezone(timezone.utc)
+        else:
+            end = candidate
+            journal["cleanup_absence_deadline_utc"] = end.isoformat()
+        remaining_utc = (end-now_utc).total_seconds()
+        saved_mono = journal.get("cleanup_absence_deadline_monotonic")
+        if saved_mono is None:
+            if started_raw is not None:
+                raise GcpProviderError("original cleanup absence monotonic deadline was not persisted", category="cleanup_deadline_unknown")
+            saved_mono = now_mono + max(0.0, remaining_utc)
+            journal["cleanup_absence_deadline_monotonic"] = saved_mono
+        if isinstance(saved_mono, bool) or not isinstance(saved_mono, (int, float)) or not isfinite(float(saved_mono)):
+            raise GcpProviderError("original cleanup absence monotonic deadline is unknown", category="cleanup_deadline_unknown")
+        if remaining_utc <= 0 or float(saved_mono) <= now_mono:
+            raise GcpProviderError("original cleanup absence deadline elapsed", category="command_timeout")
+        return end
+
+    def _check_cleanup_deadline(self, action: str) -> None:
+        deadline_utc = self._cleanup_deadline_utc
+        if action not in GCP_CLEANUP_COMMAND_IDS or deadline_utc is None:
+            return
+        now_utc = self.clock()
+        now_mono = time.monotonic()
+        if (now_utc.tzinfo is None or now_utc.utcoffset() is None or not isfinite(now_mono)
+                or now_mono < 0 or self._deadline is None or not isfinite(self._deadline)):
+            raise GcpProviderError("cleanup UTC/monotonic deadline anchor is unavailable",
+                category="cleanup_deadline_unknown", action_id=action)
+        now_utc = now_utc.astimezone(timezone.utc)
+        binding = self._cleanup_clock_binding
+        if binding is None or abs(round(now_utc.timestamp()-now_mono, 3)-binding) > 2.0:
+            raise GcpProviderError("cleanup UTC/monotonic clock identity changed",
+                category="cleanup_clock_changed", action_id=action)
+        deadlines = [deadline_utc]
+        if self._cleanup_absence_deadline_utc is not None:
+            deadlines.append(self._cleanup_absence_deadline_utc)
+        elif self._cleanup_routine_deadline_utc is not None:
+            deadlines.append(self._cleanup_routine_deadline_utc)
+        remaining = min((deadline-now_utc).total_seconds() for deadline in deadlines)
+        if not isfinite(remaining) or remaining <= 0 or self._deadline <= now_mono:
+            raise GcpProviderError("original cumulative cleanup deadline elapsed",
+                category="command_timeout", action_id=action)
+        self._deadline = min(self._deadline, now_mono+remaining)
 
     def verify_unstarted_absence(self, deployment: ProviderDeploymentInput) -> dict[str, Any]:
         """Read-only all-scope inventory for a source-proved pre-registration failure."""
@@ -673,8 +962,24 @@ class GcpProviderDriver:
         expected_labels = {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}
         expected_policy = self._selected_policy_path(deployment)
         raw_policies = props.get("resourcePolicies", [])
-        policy_paths = [self._compute_path(policy) for policy in raw_policies] if isinstance(raw_policies, list) else None
-        policy_matches = policy_paths == ([expected_policy] if expected_policy else [])
+        item_policy_matches = (
+            self._compute_path(item.get("expected_policy")) == expected_policy
+            if expected_policy else not item.get("expected_policy")
+        )
+        if expected_policy:
+            # Compute's InstanceProperties contract returns policy names for
+            # templates, while Terraform's selected policy output is a full
+            # project/region path. Bind that one short name to the already
+            # validated selected path; retain exact path checks for URL forms.
+            policy_matches = (
+                isinstance(raw_policies, list) and len(raw_policies) == 1
+                and (
+                    self._compute_path(raw_policies[0]) == expected_policy
+                    or (raw_policies[0] == deployment.placement.name and item_policy_matches)
+                )
+            )
+        else:
+            policy_matches = raw_policies == []
         # Named predicates keep mismatch evidence precise without persisting raw
         # metadata (which includes SSH keys and bootstrap input contents).
         checks = {
@@ -707,7 +1012,7 @@ class GcpProviderDriver:
                 and metadata.get("cnb-network-intent") == json.dumps(deployment.vm_a.network.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
                 and metadata.get("ssh-keys") == f"benchmark:{self.settings.public_key}"),
             "reservationAffinity": props.get("reservationAffinity", {}).get("consumeReservationType") == "NO_RESERVATION",
-            "resourcePolicies": bool(policy_matches and (not item.get("expected_policy") or self._compute_path(item["expected_policy"]) == expected_policy)),
+            "resourcePolicies": bool(policy_matches and item_policy_matches),
             "labels": labels in (expected_labels, {**expected_labels, "goog-terraform-provisioned": "true"}),
             "maxRunDuration": "maxRunDuration" not in props,
             "guestAccelerators": not props.get("guestAccelerators"),
@@ -723,6 +1028,19 @@ class GcpProviderDriver:
                            mismatches: list[str], fields: dict[str, Any]) -> None:
         diagnostic = {"role": role, "mismatched_fields": mismatches,
             "observed_field_sha256": {key: hashlib.sha256(json.dumps(fields[key], sort_keys=True).encode()).hexdigest() for key in mismatches}}
+        if "resourcePolicies" in mismatches:
+            policies = fields.get("resourcePolicies")
+            policy_readback = {
+                "observed_type": type(policies).__name__,
+                "observed_sha256": diagnostic["observed_field_sha256"]["resourcePolicies"],
+            }
+            # Provider policy identifiers are safe to retain in the private
+            # attempt journal. Bound the diagnostic so malformed responses
+            # cannot turn it into an unbounded provider payload archive.
+            if (isinstance(policies, list) and len(policies) <= 16
+                    and all(isinstance(value, str) and len(value) <= 512 for value in policies)):
+                policy_readback["observed_values"] = policies
+            diagnostic["resourcePolicies_readback"] = policy_readback
         if self._active_attempt is not None:
             journal = self._load(self._active_attempt, deployment)
             journal.setdefault("template_validation_diagnostics", []).append(diagnostic)
@@ -866,7 +1184,7 @@ class GcpProviderDriver:
             current = json.loads(target.read_text(encoding="utf-8"))
             if (current.get("run_id"), current.get("deployment_id")) != (journal.get("run_id"), journal.get("deployment_id")):
                 raise GcpProviderError("journal identity changed during update", category="state_identity_mismatch")
-            immutable = ("run_id", "deployment_id", "binding_sha256", "reservation_id", "cap_started_at", "cap_expires_at", "trigger", "controller_session_id")
+            immutable = ("run_id", "deployment_id", "binding_sha256", "reservation_id", "cap_started_at", "cap_expires_at", "trigger", "controller_session_id", "cleanup_started_at", "cleanup_started_monotonic", "cleanup_clock_binding", "cleanup_deadline_utc", "cleanup_deadline_monotonic", "cleanup_deadline_binding_sha256", "cleanup_routine_deadline_utc", "cleanup_routine_deadline_monotonic", "cleanup_absence_started_at", "cleanup_absence_started_monotonic", "cleanup_absence_clock_binding", "cleanup_absence_deadline_utc", "cleanup_absence_deadline_monotonic")
             for key in immutable:
                 if key in current and key in journal and current[key] != journal[key]:
                     raise GcpProviderError(f"journal immutable ownership field {key} changed", category="state_identity_mismatch")
@@ -982,11 +1300,18 @@ class GcpProviderDriver:
             if os.path.exists(name): os.unlink(name)
 
     def _run(self, action: str, argv: list[str], cwd: Path, timeout: int | None = None) -> CommandResult:
-        command_limit = min(timeout or self.settings.command_timeout_seconds,
-            self.settings.command_timeout_seconds)
+        terraform_root = next((Path(arg.split("=", 1)[1]).name for arg in argv if arg.startswith("-chdir=")), None)
+        cleanup_destroy = (action in {"gcp-pair-destroy", "gcp-protection-destroy"}
+            and terraform_root in {"pair", "protection"}
+            and len(argv) > 2 and argv[2] == "destroy")
+        requested_limit = self.settings.command_timeout_seconds if timeout is None else timeout
+        command_limit = min(requested_limit, 1800 if cleanup_destroy else self.settings.command_timeout_seconds)
         reviewed_apply = "apply" in argv and any(a.startswith("-chdir=") for a in argv)
         started = time.monotonic()
+        self._check_cleanup_deadline(action)
         hard_deadline = self._deadline if self._deadline is not None else float("inf")
+        if cleanup_destroy and self._deadline is None:
+            raise GcpProviderError("original cumulative cleanup deadline is unavailable", category="cleanup_deadline_unknown", action_id=action)
         if reviewed_apply and self.settings.workflow_cap_started_monotonic is not None:
             cap_start = self.settings.workflow_cap_started_monotonic
             elapsed = started - cap_start
@@ -1026,7 +1351,11 @@ class GcpProviderDriver:
         if not hasattr(self, "_initialized_terraform"):
             self._initialized_terraform = set()
         initialize_terraform(self.runner, request, self._initialized_terraform)
-        remaining_after_init = command_deadline - time.monotonic()
+        self._check_cleanup_deadline(action)
+        now_after_init = time.monotonic()
+        remaining_after_init = command_deadline - now_after_init
+        if self._deadline is not None:
+            remaining_after_init = min(remaining_after_init, self._deadline-now_after_init)
         if remaining_after_init <= 0:
             raise GcpProviderError("original command deadline elapsed during private Terraform initialization", category="command_timeout", action_id=action)
         request_budget = (total_deadline - time.monotonic()) if reviewed_apply else min(
@@ -1072,6 +1401,9 @@ class GcpProviderDriver:
             raise GcpProviderError("Terraform work directory must remain inside its private attempt", category="state_path_unsafe")
         work.mkdir(mode=0o700, exist_ok=True)
         vars_path = work / "vars.json"
+        legacy_pair_cleanup = False
+        if root == "pair" and action == "destroy" and not vars_path.exists():
+            raise GcpProviderError("original pair Terraform inputs are unavailable for scoped cleanup", category="state_identity_mismatch")
         if action == "destroy" and vars_path.exists():
             if vars_path.is_symlink(): raise GcpProviderError("Terraform input cannot be a symlink", category="state_path_unsafe")
             variables = json.loads(vars_path.read_text(encoding="utf-8"))
@@ -1091,6 +1423,34 @@ class GcpProviderDriver:
                 expected = {"name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b"}
             if any(variables.get(key) != value for key, value in expected.items()):
                 raise GcpProviderError("Terraform inputs changed the original attempt scope", category="state_identity_mismatch")
+            if root == "pair":
+                expected_pair = self._pair_variables(deployment, {
+                    "template_a": variables.get("template_a"),
+                    "template_b": variables.get("template_b"),
+                })
+                pair_fields = set(expected_pair) - {"project_id", "name_a", "name_b", "zone_a", "zone_b", "template_a", "template_b"}
+                present_pair_fields = pair_fields.intersection(variables)
+                if present_pair_fields and present_pair_fields != pair_fields:
+                    raise GcpProviderError("pair Terraform NIC inputs are incomplete", category="state_identity_mismatch")
+                if present_pair_fields:
+                    if any(variables.get(key) != value for key, value in expected_pair.items()):
+                        raise GcpProviderError("pair Terraform NIC inputs changed the selected topology", category="state_identity_mismatch")
+                else:
+                    legacy_pair_cleanup = True
+                journal = self._load(attempt, deployment)
+                pair_binding = journal.get("pair_binding", {})
+                if pair_binding and any(pair_binding.get(key) != variables.get(key)
+                        for key in ("template_a", "template_b", "project_id", "zone_a", "zone_b")):
+                    raise GcpProviderError("saved pair template binding differs from cleanup inputs", category="state_identity_mismatch")
+                registered_templates = journal.get("templates", {})
+                if set(registered_templates) != {"vm_a", "vm_b"}:
+                    raise GcpProviderError("registered role template identities are unavailable for cleanup", category="state_identity_mismatch")
+                for role, key in (("vm_a", "template_a"), ("vm_b", "template_b")):
+                    registered_link = registered_templates[role].get("self_link_unique")
+                    registered_id = str(registered_templates[role].get("id", ""))
+                    if (not registered_id or not registered_link or variables.get(key) != registered_link
+                            or f"uniqueId={registered_id}" not in str(registered_link)):
+                        raise GcpProviderError("cleanup template link differs from its registered immutable identity", category="state_identity_mismatch")
         else:
             variables = None
         common = {"project_id": self.settings.project_id}
@@ -1098,14 +1458,17 @@ class GcpProviderDriver:
             template = variables
         elif root == "protection":
             template = {**common, "namespace": self._namespace(deployment), "scenario": deployment.scenario.value if hasattr(deployment.scenario, "value") else deployment.scenario, "placement_policy_name": deployment.placement.name or "", "expiry_time": "", "image_a": self.settings.images[deployment.vm_a.region], "image_b": self.settings.images[deployment.vm_b.region], "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone, "controller_cidr": self.settings.controller_cidr, "public_key": self.settings.public_key, "labels": {"cnb-run": hashlib.sha256(deployment.run_id.encode()).hexdigest()[:20], "cnb-deploy": hashlib.sha256(deployment.deployment_id.encode()).hexdigest()[:20]}, "bootstrap_template": deployment.bootstrap_template, "bootstrap_inputs": deployment.bootstrap_inputs, "network_intent": deployment.vm_a.network.model_dump(mode="json")}
+        elif root == "pair" and action == "apply":
+            template = self._pair_variables(deployment, extra)
         else:
             template = {**common, "name_a": self._namespace(deployment) + "-a", "name_b": self._namespace(deployment) + "-b", "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
-        template.update(extra)
+        if not (root == "pair" and action == "apply"):
+            template.update(extra)
         serialized_vars = json.dumps(template, sort_keys=True).encode("utf-8")
         self._write_private(vars_path, serialized_vars)
         if root == "pair" and action == "apply":
             journal = self._load(attempt, deployment)
-            journal["pair_binding"] = {"config_sha256": hashlib.sha256(serialized_vars).hexdigest(), "template_a": template["template_a"], "template_b": template["template_b"], "project_id": self.settings.project_id, "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone}
+            journal["pair_binding"] = {"config_sha256": hashlib.sha256(serialized_vars).hexdigest(), **{key: template[key] for key in ("template_a", "template_b", "project_id", "zone_a", "zone_b", "network_a", "network_b", "subnetwork_a", "subnetwork_b", "network_ip_a", "network_ip_b", "nic_type_a", "nic_type_b", "public_management_a", "public_management_b")}}
             self._save(attempt, journal)
         root_path = Path(__file__).resolve().parents[3] / "terraform" / "gcp" / root
         if root == "pair" and action == "apply":
@@ -1113,13 +1476,48 @@ class GcpProviderDriver:
                 deployment.admission.workflow_profile, "gcp", SAFETY_LEAD_SECONDS))
             slack = (trigger - self.clock()).total_seconds() - self._remaining_after_provision_seconds(deployment)
             self._deadline = min(self._deadline or float("inf"), time.monotonic() + max(0, slack))
-        rc = self._run(f"gcp-{root}-{action}", [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"], work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
+        argv = [self.settings.terraform, f"-chdir={root_path}", action, "-input=false", "-auto-approve", f"-state={work / 'terraform.tfstate'}", f"-var-file={vars_path}"]
+        if legacy_pair_cleanup:
+            argv.append("-var=cleanup_mode=true")
+        rc = self._run(f"gcp-{root}-{action}", argv, work, timeout=deployment.provisioning_timeout_seconds if action == "apply" else deployment.cleanup_timeout_seconds)
         if rc.outcome != "succeeded" or rc.exit_code != 0:
             raise GcpProviderError(f"GCP Terraform {root} {action} failed", category="terraform_failed", action_id=rc.action_id)
         if action == "destroy": return {}
         result = self._run(f"gcp-{root}-outputs", [self.settings.terraform, f"-chdir={root_path}", "output", "-json", f"-state={work / 'terraform.tfstate'}"], work)
         if result.outcome != "succeeded": raise GcpProviderError("Terraform output read failed", category="terraform_output")
         return json.loads(result.stdout)
+
+    def _pair_variables(self, deployment: ProviderDeploymentInput, templates: dict[str, Any]) -> dict[str, Any]:
+        scenario = deployment.scenario.value if hasattr(deployment.scenario, "value") else str(deployment.scenario)
+        addresses = {
+            "same_zone": ("10.80.1.10", "10.80.1.11"),
+            "cross_zone": ("10.80.1.10", "10.80.1.11"),
+            "placement_optimization": ("10.80.1.10", "10.80.1.11"),
+            "inter_region": ("10.80.1.10", "10.81.1.11"),
+        }
+        if scenario not in addresses or set(templates) != {"template_a", "template_b"}:
+            raise GcpProviderError("pair input factory received an unknown topology or template binding", category="state_identity_mismatch")
+        namespace = self._namespace(deployment)
+        network = f"projects/{self.settings.project_id}/global/networks/{namespace}-net"
+        subnet_b = "b" if scenario == "inter_region" else "a"
+        return {
+            "project_id": self.settings.project_id,
+            "name_a": namespace + "-a", "name_b": namespace + "-b",
+            "zone_a": deployment.vm_a.zone, "zone_b": deployment.vm_b.zone,
+            "template_a": templates["template_a"], "template_b": templates["template_b"],
+            "scenario": scenario,
+            "region_a": deployment.vm_a.region, "region_b": deployment.vm_b.region,
+            "network_a": network, "network_b": network,
+            "subnetwork_a": f"projects/{self.settings.project_id}/regions/{deployment.vm_a.region}/subnetworks/{namespace}-a",
+            "subnetwork_b": f"projects/{self.settings.project_id}/regions/{deployment.vm_b.region}/subnetworks/{namespace}-{subnet_b}",
+            "network_ip_a": addresses[scenario][0], "network_ip_b": addresses[scenario][1],
+            "nic_type_a": "GVNIC", "nic_type_b": "GVNIC",
+            "public_management_a": True, "public_management_b": True,
+            # Terraform includes declared defaults in plan JSON variables.
+            # Supply the production value so strict review compares the same
+            # complete input map that produced the saved plan.
+            "cleanup_mode": False,
+        }
 
     def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)

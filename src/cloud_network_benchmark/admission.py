@@ -29,8 +29,9 @@ from .contracts.admission import (ExpiryEvidence, ExpiryRequest, ReservationEvid
                                   ReservationRequest)
 from .contracts.common import Evidence, ExperimentMode, Provider, StringEvidence
 from .scheduling import assess_provider_skew, inspect_schedule, load_schedule
-from .financial_controls import (FinancialError, validate_paid_financial_plan,
-    check_shared_finances, revalidate_financial_record, validate_stored_commitment, transfer_terms)
+from .financial_controls import (FinancialError, legacy_usd_budget_exceeded,
+    validate_paid_financial_plan, check_shared_finances, revalidate_financial_record,
+    validate_stored_commitment, transfer_terms)
 from .validation_profiles import PROFILE_SPECS, validate_profile_allowance
 
 
@@ -1703,7 +1704,7 @@ class BudgetLedger:
             spent = sum((_decimal(v.get("incurred_usd", "0")) for v in state["reservations"].values()), Decimal("0"))
             remaining = sum((_decimal(v) for v in state["funding_remaining"].values()), Decimal("0"))
             commitment = active + spent + remaining
-            if commitment > Decimal("250") or commitment + Decimal("50") > Decimal("300"):
+            if legacy_usd_budget_exceeded(commitment, financial, now=self.utc_now()):
                 return AdmissionDecision("rejected", False, None, ("budget_exhausted",), state["revision"])
             if financial is not None:
                 try:

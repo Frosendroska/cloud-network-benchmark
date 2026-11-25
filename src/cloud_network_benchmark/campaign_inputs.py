@@ -28,7 +28,7 @@ from .admission import (COST_COMPONENTS, WorkflowAllowance, minimum_protocol_sec
 from .config import resolve_campaign
 from .contracts.common import ExperimentMode
 from .manifests import initialize_campaign
-from .paths import atomic_write_json
+from .paths import atomic_write_json, write_exclusive
 from .scheduling import load_schedule
 from .campaign_identity import check_provider_identities
 from .storage_admission import validate_storage_review
@@ -209,6 +209,39 @@ def _approval_paths(directory: Path, stage: str) -> dict[str, str]:
     return {key: str(directory / f"{key}.json") for key in sorted(_required_gate_keys(stage))}
 
 
+def _azure_auxiliary_owner(entry_id: str, child: Any, deployment: Any, subscription_id: str) -> dict[str, Any]:
+    from .azure_provider import _slug
+
+    slug = _slug(deployment)
+    group = f"/subscriptions/{subscription_id}/resourceGroups/{slug}"
+    return {"entry_id": entry_id, "run_id": child.run_id, "campaign_id": child.campaign_id,
+        "deployment_id": child.deployment_id, "config_sha256": child.config_provenance.sha256,
+        "resource_group_id": group,
+        "vm_ids": [f"{group}/providers/Microsoft.Compute/virtualMachines/{slug}-{role}" for role in ("a", "b")],
+        "nic_ids": [f"{group}/providers/Microsoft.Network/networkInterfaces/{slug}-{role}-nic" for role in ("a", "b")]}
+
+
+def _initialized_azure_child(reference: Any, campaign_id: str, root: Path):
+    from .manifests import ChildRunManifest
+
+    if str(getattr(reference.provider, "value", reference.provider)) != "azure":
+        raise ValueError("Azure auxiliary cleanup reference must identify the Azure child")
+    child_path = Path(reference.manifest_path)
+    if not child_path.is_absolute():
+        child_path = root / child_path
+    child_path = child_path.absolute()
+    if (any(part.is_symlink() for part in (child_path, *child_path.parents))
+            or not child_path.is_file()):
+        raise ValueError("Azure auxiliary cleanup initialized child manifest is unavailable")
+    child = ChildRunManifest.model_validate_json(child_path.read_bytes())
+    if (child.provider != "azure" or child.run_id != reference.run_id
+            or child.campaign_id != campaign_id or child.execution_state != "initialized"
+            or child.actual_started_at is not None or child.actual_finished_at is not None
+            or child.commands or child.timings or child.artifact_records):
+        raise ValueError("Azure auxiliary cleanup child manifest differs from the initialized parent reference")
+    return child
+
+
 def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
     window = inputs.get("execution_window_utc")
     if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
@@ -220,6 +253,29 @@ def _profile_execution_window(inputs: dict, stage: str) -> dict[str, str]:
     return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
 
 
+def _profile_dispatch_window(inputs: dict, stage: str, execution_window: dict[str, str]) -> dict[str, str]:
+    """Validate a split dispatch window, preserving the historical shared-window default."""
+    if "dispatch_window_utc" not in inputs:
+        # Older ready-profile settings used one interval for both dispatch and
+        # common measurement start. Preserve that exact, finite behavior.
+        return dict(execution_window)
+    window = inputs["dispatch_window_utc"]
+    if not isinstance(window, dict) or set(window) != {"not_before_utc", "not_after_utc"}:
+        raise ValueError(f"{stage}.dispatch_window_utc requires not_before_utc and not_after_utc for ready-triggered validation")
+    start = _utc(window["not_before_utc"], f"{stage}.dispatch_window_utc.not_before_utc")
+    end = _utc(window["not_after_utc"], f"{stage}.dispatch_window_utc.not_after_utc")
+    common_end = _utc(execution_window["not_after_utc"], f"{stage}.execution_window_utc.not_after_utc")
+    if end <= start or end > common_end:
+        raise ValueError("validation dispatch window must be positive and end no later than the common measurement window")
+    return {"not_before_utc": start.isoformat(), "not_after_utc": end.isoformat()}
+
+
+def _ready_credential_horizon(inputs: dict, stage: str, cap_seconds: int) -> datetime:
+    execution_window = _profile_execution_window(inputs, stage)
+    dispatch_window = _profile_dispatch_window(inputs, stage, execution_window)
+    return _utc(dispatch_window["not_after_utc"], f"{stage}.dispatch_window_utc.not_after_utc") + timedelta(seconds=cap_seconds)
+
+
 def _acceptance_dispatch_policy(settings, approval_refs):
     declaration = {**settings.get("approvals", {}),
                    **settings.get("stage_inputs", {}).get("acceptance", {}).get("approvals", {})}["paired_acceptance"]
@@ -227,8 +283,10 @@ def _acceptance_dispatch_policy(settings, approval_refs):
     inputs = settings.get("stage_inputs", {}).get("acceptance", {})
     ready_triggered = inputs.get("workflow_profile") == ACCEPTANCE_PROFILE
     window = _profile_execution_window(inputs, "acceptance") if ready_triggered else None
+    dispatch_window = _profile_dispatch_window(inputs, "acceptance", window) if ready_triggered else None
     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
             or (ready_triggered and fields.get("execution_window_utc") != window)
+            or (ready_triggered and fields.get("dispatch_window_utc", window) != dispatch_window)
             or (not ready_triggered and _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc").isoformat()
                 != _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat())):
         raise ValueError("paired_acceptance must bind the pair and exact approved validation timing policy")
@@ -237,6 +295,7 @@ def _acceptance_dispatch_policy(settings, approval_refs):
         return {"policy_id": "acceptance-paired-s1-s3-ready-v1", "group_by": "acceptance_slot",
             "scenarios": ["S1", "S3"], "max_parallel_entries": 2,
             "start_policy": "all_ready", "execution_window": window,
+            "dispatch_window_utc": dispatch_window,
             "ready_window_seconds": 600, "evidence_path": str(evidence_path), "evidence_sha256": _sha(evidence_path)}
     start_utc = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc").isoformat()
     return {"policy_id": "acceptance-paired-s1-s3-v1", "group_by": "acceptance_slot",
@@ -369,15 +428,17 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                 inputs = settings["stage_inputs"][stage]
                 if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
                     window = _profile_execution_window(inputs, "acceptance")
+                    dispatch_window = _profile_dispatch_window(inputs, "acceptance", window)
                     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
-                            or fields.get("execution_window_utc") != window):
-                        raise ValueError("paired_acceptance must bind the exact ready-triggered validation window")
+                            or fields.get("execution_window_utc") != window
+                            or fields.get("dispatch_window_utc", window) != dispatch_window):
+                        raise ValueError("paired_acceptance must bind both exact ready-triggered validation windows")
                 else:
                     start = _utc(inputs.get("start_utc"), "stage_inputs.acceptance.start_utc")
                     if (fields.get("mode") != "paired_acceptance_s1_s3" or fields.get("max_parallel_entries") != 2
                             or _utc(fields.get("start_utc"), "approvals.paired_acceptance.fields.start_utc") != start):
                         raise ValueError("paired_acceptance must bind paired_acceptance_s1_s3, two entries and the exact fixed UTC start")
-        _cost_payload(settings, root)
+        _cost_payload(settings, root, stage=stage, draft=draft)
         if stage in {"day", "week"}:
             _common_n(settings)
         if stage == "week":
@@ -388,7 +449,14 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             for window, time in windows.items():
                 _utc(f"{start}T{time}+00:00", f"windows_utc.{window}")
         elif stage == "calibration" and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") == CALIBRATION_PROFILE:
-            _profile_execution_window(settings["stage_inputs"][stage], "calibration")
+            inputs = settings["stage_inputs"][stage]
+            window = _profile_execution_window(inputs, "calibration")
+            dispatch_window = _profile_dispatch_window(inputs, "calibration", window)
+            fields = gates["calibration_authorized"].get("fields", {})
+            if not draft and "dispatch_window_utc" in inputs and (
+                    fields.get("execution_window_utc") != window
+                    or fields.get("dispatch_window_utc") != dispatch_window):
+                raise ValueError("calibration_authorized must bind both exact ready-triggered validation windows")
         elif stage != "acceptance":
             _utc(settings["stage_inputs"][stage].get("start_utc"), f"stage_inputs.{stage}.start_utc")
         elif entries and settings.get("stage_inputs", {}).get(stage, {}).get("workflow_profile") != ACCEPTANCE_PROFILE:
@@ -449,8 +517,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             last = max(_utc(f"{start + timedelta(days=6)}T{time}+00:00", "WEEK final slot") for time in windows.values())
             horizon = last + timedelta(seconds=1200)
         elif stage in {"acceptance", "calibration"} and selected_caps:
-            horizon = _utc(_profile_execution_window(settings["stage_inputs"][stage], stage)["not_after_utc"],
-                f"{stage}.execution_window_utc.not_after_utc") + timedelta(seconds=stage_horizon)
+            horizon = _ready_credential_horizon(settings["stage_inputs"][stage], stage, stage_horizon)
         elif stage in {"calibration", "day"}:
             horizon = _utc(settings["stage_inputs"][stage]["start_utc"], "start_utc") + timedelta(seconds=stage_horizon if selected_caps else 1800 if stage == "calibration" else 87600)
         if valid_through < horizon:
@@ -510,7 +577,104 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
     return errors
 
 
-def _cost_payload(settings, root):
+_EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release_eur": "14"}
+_EUR15_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
+    "prior_release_eur": "14", "additional_release_eur": "15", "cumulative_release_eur": "29"}
+_EUR14_AUTHORITY_SHA256 = "97deee1289455535dad654b6618ebd6f32e562175d55da4f5b4bfd612d0e0aa6"
+
+
+def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
+                            now: datetime) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+    """Return non-authorizing draft metadata and, only after approval, the source-bound guard snapshot."""
+    request = settings.get("pricing", {}).get("pending_eur_reserve_release")
+    if request is None:
+        return None, None
+    if stage not in {"acceptance", "calibration"} or not isinstance(request, dict):
+        raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")
+    if request == _EUR_RESERVE_RELEASE_REQUEST:
+        working_eur, protected_eur = Decimal("264"), Decimal("36")
+        requested_release = dict(_EUR_RESERVE_RELEASE_REQUEST)
+    elif request == _EUR15_RESERVE_RELEASE_REQUEST:
+        working_eur, protected_eur = Decimal("279"), Decimal("21")
+        requested_release = dict(_EUR15_RESERVE_RELEASE_REQUEST)
+    else:
+        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 legacy request or EUR 15 additional / EUR 29 cumulative request")
+    if draft:
+        return requested_release, None
+
+    declarations = {**settings.get("approvals", {}),
+        **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
+    declaration = declarations.get("paid_authorization")
+    if not isinstance(declaration, dict) or declaration.get("confirmed") is not True:
+        raise ValueError("the pending EUR reserve release requires confirmed paid_authorization")
+    from .financial_controls import (Caps, FinancialAuthorization, Source,
+        has_explicit_eur_reserve_release)
+    source_path = _path(declaration.get("source"), "approvals.paid_authorization.source", file=True)
+    expected_hash = declaration.get("sha256")
+    if (not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+            or hashlib.sha256(source_path.read_bytes()).hexdigest() != expected_hash):
+        raise ValueError("paid_authorization requires its exact declared source sha256")
+    source = Source(path=str(source_path), sha256=expected_hash)
+    card = FinancialAuthorization.model_validate(source.json())
+    scope_id = settings.get("ledger", {}).get("scope_id")
+    caps = Caps.model_validate(card.caps.model_dump())
+    if (card.ledger_scope_id != scope_id
+            or Decimal(caps.project_eur) != Decimal("300")
+            or Decimal(caps.working_eur) != working_eur
+            or Decimal(caps.protected_eur) != protected_eur
+            or Decimal(caps.working_eur) + Decimal(caps.protected_eur) != Decimal(caps.project_eur)):
+        if request == _EUR_RESERVE_RELEASE_REQUEST:
+            raise ValueError("paid_authorization must bind the current ledger scope and exact typed EUR 14 reserve release")
+        raise ValueError("paid_authorization must bind the current ledger scope and exact typed reserve-release caps")
+    snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
+    if not has_explicit_eur_reserve_release(snapshot, now=now):
+        raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the requested reserve release")
+    if request == _EUR15_RESERVE_RELEASE_REQUEST:
+        prior = declarations.get("prior_paid_authorization")
+        if not isinstance(prior, dict) or prior.get("confirmed") is not True:
+            raise ValueError("the EUR 15 additional release requires the exact source-bound prior EUR 14 paid_authorization")
+        prior_path = _path(prior.get("source"), "approvals.prior_paid_authorization.source", file=True)
+        prior_hash = prior.get("sha256")
+        if (prior_hash != _EUR14_AUTHORITY_SHA256
+                or hashlib.sha256(prior_path.read_bytes()).hexdigest() != prior_hash):
+            raise ValueError("prior_paid_authorization must match the pinned, source-bound EUR 14 authority")
+        prior_source = Source(path=str(prior_path), sha256=prior_hash)
+        prior_card = FinancialAuthorization.model_validate(prior_source.json())
+        prior_caps = Caps.model_validate(prior_card.caps.model_dump())
+        prior_snapshot = {"authority": prior_source.model_dump(), "caps": prior_caps.model_dump(),
+            "scope_id": scope_id}
+        if (prior_card.ledger_scope_id != scope_id
+                or Decimal(prior_caps.project_eur) != Decimal("300")
+                or Decimal(prior_caps.working_eur) != Decimal("264")
+                or Decimal(prior_caps.protected_eur) != Decimal("36")
+                or not has_explicit_eur_reserve_release(prior_snapshot, now=now)):
+            raise ValueError("prior_paid_authorization is expired, out of scope, or does not prove the exact EUR 14 release")
+    return requested_release, snapshot
+
+
+def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[str, str] | None,
+                             release_snapshot: dict[str, Any] | None, *, draft: bool,
+                             now: datetime) -> None:
+    commitment = sum((amounts.get(k, Decimal(0)) for k in
+        ("primary", "replacements", "tax", "uncertainty", "optional")), Decimal(0))
+    if (amounts.get("total_limit", Decimal(300)) != 300
+            or amounts.get("protected_buffer", Decimal(50)) != 50
+            or amounts.get("working_limit", Decimal(250)) != 250):
+        raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
+    if commitment > amounts.get("total_limit", Decimal(300)):
+        raise ValueError("pricing.funding commitment exceeds its unchanged $300 USD total limit")
+    if commitment > Decimal("250"):
+        if pending_release is None:
+            raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+        if not draft:
+            from .financial_controls import legacy_usd_budget_exceeded
+            if legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+                if pending_release == _EUR_RESERVE_RELEASE_REQUEST:
+                    raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound reserve-release approval")
+
+
+def _cost_payload(settings, root, *, stage: str | None = None, draft: bool = False):
     """One immutable source for every stage; amounts must be supplied from real prices."""
     pricing = settings.get("pricing")
     if not isinstance(pricing, dict) or pricing.get("reviewed") is not True:
@@ -524,11 +688,11 @@ def _cost_payload(settings, root):
     workflow_profiles = set()
     from .failure_waiver import source_waiver
     acceptance_waived = source_waiver(settings) is not None
-    for stage, inputs in settings.get("stage_inputs", {}).items():
-        if stage not in STAGES or not isinstance(inputs, dict):
+    for configured_stage, inputs in settings.get("stage_inputs", {}).items():
+        if configured_stage not in STAGES or not isinstance(inputs, dict):
             continue
         profile_names = ("workflow_profile", "failure_workflow_profile")
-        if stage == "acceptance" and acceptance_waived:
+        if configured_stage == "acceptance" and acceptance_waived:
             # The source-bound waiver selects only V-S1/V-S3, so the registered
             # failure profile is not part of this reduced campaign's priced scope.
             profile_names = ("workflow_profile",)
@@ -605,11 +769,11 @@ def _cost_payload(settings, root):
         raise ValueError("pricing.funding must name reviewed primary/replacements/tax/uncertainty amounts")
     from .admission import _decimal
     amounts = {k: _decimal(v, f"pricing.funding.{k}") for k, v in funding.items()}
-    if (sum((amounts.get(k, Decimal(0)) for k in ("primary", "replacements", "tax", "uncertainty", "optional")), Decimal(0)) > 250
-        or amounts.get("total_limit", Decimal(300)) != 300
-        or amounts.get("protected_buffer", Decimal(50)) != 50
-        or amounts.get("working_limit", Decimal(250)) != 250):
-        raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
+    financial_check_time = datetime.now(timezone.utc)
+    pending_release, release_snapshot = _reserve_release_policy(settings, stage, draft=draft,
+        now=financial_check_time)
+    _validate_funding_budget(amounts, pending_release, release_snapshot, draft=draft,
+        now=financial_check_time)
     support = _support_payloads(settings)
     aws_raw = (json.dumps(support["aws"], indent=2, sort_keys=True) + "\n").encode()
     profile_bindings = [{"profile_id": profile, "stage": PROFILE_SPECS[profile]["stage"],
@@ -623,6 +787,10 @@ def _cost_payload(settings, root):
         "provider_support": {"aws": {"sha256": hashlib.sha256(aws_raw).hexdigest(),
             "per_region_usd": str(support["aws"]["worst_planned_cost_per_region"])}},
         "provider_run_envelope_templates": templates}
+    if pending_release is not None:
+        # This declaration records a proposal only. FinancialAuthorization is
+        # re-read and validated before any non-draft activation or reservation.
+        result["normalization"] = {"reserve_release": pending_release}
     if workflow_profiles:
         result["workflow_profiles"] = profile_bindings
         result["refresh_required_before_paid_execution"] = False
@@ -863,6 +1031,20 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         raise ValueError("; ".join(errors))
     root = Path(root).resolve()
     stage = plan["stage"]
+    inputs = settings["stage_inputs"][stage]
+    auxiliary_opt_in = inputs.get("azure_auxiliary_cleanup", False)
+    if type(auxiliary_opt_in) is not bool:
+        raise ValueError("stage_inputs.azure_auxiliary_cleanup must be an explicit boolean")
+    selected = _selected(plan, settings)
+    selected_entry_ids = {entry_id for entry_id, _alias in selected}
+    if auxiliary_opt_in:
+        expected_profile = ACCEPTANCE_PROFILE if stage == "acceptance" else CALIBRATION_PROFILE if stage == "calibration" else None
+        expected_entries = {"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}
+        if (not draft or expected_profile is None or inputs.get("workflow_profile") != expected_profile
+                or settings.get("providers", {}).get("azure", {}).get("subscription_id")
+                    != "188a5848-76fb-4d57-8f2a-32c09284d486"
+                or selected_entry_ids != expected_entries):
+            raise ValueError("Azure auxiliary cleanup requires an unapproved supported-profile draft selecting exactly the normal pair or CAL-S1 in the reviewed subscription")
     now = _now(clock)
     stage_id = f"{stage}-{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     private = Path(state_root) / stage_id
@@ -871,9 +1053,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     stage_private = private
     result = Path(results_root) / stage_id
     result.mkdir(parents=True)
-    inputs = settings["stage_inputs"][stage]
     cost_path = Path(state_root) / "cost-inputs.json"
-    cost_payload = _cost_payload(settings, root)
+    cost_payload = _cost_payload(settings, root, stage=stage, draft=draft)
     serialized = json.dumps(cost_payload, indent=2, sort_keys=True) + "\n"
     if cost_path.exists() and cost_path.read_text() != serialized:
         raise ValueError("reviewed prices changed: preserve the existing ledger and use its source reconciliation workflow before preparing another stage")
@@ -885,6 +1066,8 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         raise ValueError("ledger.scope_id must identify one shared thesis budget")
     if draft:
         approvals = _approval_paths(private / "approvals", stage)
+        if auxiliary_opt_in:
+            approvals["azure_shared_cleanup"] = str(private / "approvals" / "azure_shared_cleanup.json")
     else:
         approvals = _write_evidence(private / "approvals", _gate_rows(settings, stage), provider_scope(settings["providers"]), settings)
     support_dir = Path(state_root) / "support-inputs"
@@ -907,7 +1090,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
     config_paths = {}
     schedule_rows = []
     source_configs = {}
-    for index, (entry_id, alias) in enumerate(_selected(plan, settings)):
+    azure_cleanup_owners = []
+    azure_parent_snapshots = {}
+    for index, (entry_id, alias) in enumerate(selected):
         template = root / plan.get("configs", {}).get(alias, CONFIGS[alias])
         data = _frozen_config(yaml.safe_load(template.read_text()), alias, settings, entry_id)
         if stage == "acceptance" and entry_id.endswith("FAIL"):
@@ -967,8 +1152,13 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             window = None
         launch_at = scheduled - timedelta(seconds=prep) if scheduled else now
         if profile == ACCEPTANCE_PROFILE and entry_id in {"V-S1", "V-S3"}:
-            launch_at = _utc(_profile_execution_window(inputs, "acceptance")["not_before_utc"],
-                             "acceptance.execution_window_utc.not_before_utc")
+            launch_at = _utc(_profile_dispatch_window(inputs, "acceptance",
+                _profile_execution_window(inputs, "acceptance"))["not_before_utc"],
+                "acceptance.dispatch_window_utc.not_before_utc")
+        elif profile == CALIBRATION_PROFILE:
+            launch_at = _utc(_profile_dispatch_window(inputs, "calibration",
+                _profile_execution_window(inputs, "calibration"))["not_before_utc"],
+                "calibration.dispatch_window_utc.not_before_utc")
         if scheduled and launch_at <= now:
             raise ValueError(f"{entry_id}: setup lead time is already missed; explicitly review new timing, no backfill")
         end = (scheduled or now) + timedelta(seconds=allowance["measurement_seconds"] + allowance["measurement_shutdown_seconds"] + allowance["retrieval_seconds"] + allowance["cleanup_seconds"])
@@ -1000,9 +1190,48 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             schedule_path.write_text(buffer.getvalue())
             selected_entry = load_schedule(schedule_path, config_paths={data["config_id"]: config_path}, repository_root=root)[0]
         initialized = initialize_campaign(config_path, root, result, schedule_entry=selected_entry)
+        if auxiliary_opt_in:
+            azure_reference = next((child for child in initialized.children
+                if str(getattr(child.provider, "value", child.provider)) == "azure"), None)
+            if azure_reference is None:
+                raise ValueError("Azure auxiliary cleanup scope has no initialized Azure parent")
+            azure_child = _initialized_azure_child(azure_reference, initialized.campaign_id, root)
+            resolved, _source = resolve_campaign(config_path, root, schedule_entry=selected_entry)
+            azure_observation = next((observation for observation in resolved.observations
+                if str(getattr(observation.provider, "value", observation.provider)) == "azure"), None)
+            if azure_observation is None:
+                raise ValueError("Azure auxiliary cleanup child has no resolved Azure deployment observation")
+            from .contracts.deployment import ProviderDeploymentInput
+            azure_deployment = ProviderDeploymentInput.from_observation(azure_observation,
+                campaign_id=azure_child.campaign_id, run_id=azure_child.run_id,
+                observation_id=azure_child.observation_id, deployment_id=azure_child.deployment_id,
+                bootstrap_template=str(bootstrap_path), terraform_directory=str(root / "terraform" / "azure"),
+                child_result_path=azure_reference.result_path,
+                config_sha256=azure_child.config_provenance.sha256,
+                resolved_sha256=azure_child.config_provenance.resolved_snapshot_sha256,
+                implementation_git_commit=azure_child.config_provenance.implementation_git_commit,
+                design_git_commit=azure_child.config_provenance.design_git_commit)
+            azure_cleanup_owners.append(_azure_auxiliary_owner(entry["entry_id"], azure_child,
+                azure_deployment, settings["providers"]["azure"]["subscription_id"]))
         parent_path = Path(initialized.parent_manifest_path)
         if not parent_path.is_absolute():
             parent_path = root / parent_path
+        if auxiliary_opt_in:
+            # Keep the live parent path in runtime/entry identity. The cohort
+            # source hash binds a private byte-for-byte initialization snapshot,
+            # because normal lifecycle updates rewrite the live manifest.
+            snapshot_path = private / entry["entry_id"] / "initialized-parent-manifest.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            snapshot_path.parent.chmod(0o700)
+            if parent_path.is_symlink() or not parent_path.is_file() or any(parent.is_symlink() for parent in parent_path.parents):
+                raise ValueError("initialized campaign parent must be a regular non-symlink file before snapshot")
+            parent_bytes = parent_path.read_bytes()
+            write_exclusive(snapshot_path, parent_bytes)
+            snapshot_path.chmod(0o600)
+            snapshot_sha256 = hashlib.sha256(parent_bytes).hexdigest()
+            if _sha(snapshot_path) != snapshot_sha256:
+                raise ValueError("initialized campaign parent snapshot hash mismatch")
+            azure_parent_snapshots[entry["entry_id"]] = (snapshot_path, snapshot_sha256)
         providers = data["selected_providers"]
         allowance = _allowance(settings, stage, providers, entry_id=entry["entry_id"])
         provider_runtime = {}
@@ -1099,17 +1328,23 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "expected_participants": participants,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "normal-start")}
         if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
-            start_barrier.update(start_policy="all_ready",
-                execution_window=_profile_execution_window(inputs, "acceptance"), ready_window_seconds=600)
+            execution_window = _profile_execution_window(inputs, "acceptance")
+            start_barrier.update(start_policy="all_ready", execution_window=execution_window,
+                dispatch_window_utc=_profile_dispatch_window(inputs, "acceptance", execution_window),
+                ready_window_seconds=600)
         else:
             start_barrier["start_utc"] = _utc(inputs["start_utc"], "acceptance.start_utc").isoformat()
         stage_data["post_measurement_barrier"] = barrier
         stage_data["measurement_start_barrier"] = start_barrier
+        if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
+            stage_data["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         for entry in normal:
             runtime_path = Path(entry["runtime_config_path"])
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
             runtime["post_measurement_barrier"] = barrier
             runtime["measurement_start_barrier"] = start_barrier
+            if inputs.get("workflow_profile") == ACCEPTANCE_PROFILE:
+                runtime["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
             atomic_write_json(runtime_path, runtime)
             entry["runtime_config_sha256"] = _sha(runtime_path)
         for entry in entries:
@@ -1147,16 +1382,63 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             "expected_participants": participants,
             "barrier_root": str(Path(state_root) / stage_id / "measurement-barriers" / "calibration-start")}
         if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
-            start_barrier.update(start_policy="all_ready",
-                execution_window=_profile_execution_window(inputs, "calibration"), ready_window_seconds=600)
+            execution_window = _profile_execution_window(inputs, "calibration")
+            start_barrier.update(start_policy="all_ready", execution_window=execution_window,
+                dispatch_window_utc=_profile_dispatch_window(inputs, "calibration", execution_window),
+                ready_window_seconds=600)
         else:
             start_barrier["start_utc"] = _utc(inputs["start_utc"], "calibration.start_utc").isoformat()
         stage_data["measurement_start_barrier"] = start_barrier
+        if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
+            stage_data["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         runtime_path = Path(entry["runtime_config_path"])
         runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
         runtime["measurement_start_barrier"] = start_barrier
+        if runtime.get("workflow_profile") == CALIBRATION_PROFILE:
+            runtime["dispatch_window_utc"] = start_barrier["dispatch_window_utc"]
         atomic_write_json(runtime_path, runtime)
         entry["runtime_config_sha256"] = _sha(runtime_path)
+    if auxiliary_opt_in:
+        expected_entries = {"V-S1", "V-S3"} if stage == "acceptance" else {"CAL-S1"}
+        if {owner["entry_id"] for owner in azure_cleanup_owners} != expected_entries:
+            raise ValueError("Azure auxiliary cleanup draft must bind exactly the supported S1/S3 or CAL-S1 owner set")
+        cohort_id = f"{stage_id}-azure-shared-cleanup"
+        cohort_root = private / "azure-shared-cleanup-state"
+        manifest_path = private / "azure-auxiliary-cleanup-scope.json"
+        card_path = Path(approvals["azure_shared_cleanup"])
+        profile = "normal_pair" if stage == "acceptance" else "calibration_self"
+        watcher_group = "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG"
+        watcher_id = watcher_group + "/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+        selected_entries = [entry for entry in entries if entry["entry_id"] in expected_entries]
+        for entry in selected_entries:
+            runtime_path = Path(entry["runtime_config_path"])
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            runtime["azure_auxiliary_cleanup"] = {"schema_version": 1, "cohort_id": cohort_id,
+                "state_root": str(cohort_root), "subscription_id": "188a5848-76fb-4d57-8f2a-32c09284d486",
+                "region": "swedencentral", "resource_group_id": watcher_group, "watcher_id": watcher_id,
+                "profile": profile, "owners": azure_cleanup_owners, "card_path": str(card_path),
+                "cohort_manifest_path": str(manifest_path)}
+            atomic_write_json(runtime_path, runtime)
+            entry["runtime_config_sha256"] = _sha(runtime_path)
+        members = []
+        for entry, owner in zip(selected_entries, azure_cleanup_owners):
+            parent_snapshot_path, parent_snapshot_sha256 = azure_parent_snapshots[entry["entry_id"]]
+            members.append({"entry_id": owner["entry_id"], "run_id": owner["run_id"],
+                "config_sha256": owner["config_sha256"],
+                "runtime_path": entry["runtime_config_path"], "runtime_sha256": entry["runtime_config_sha256"],
+                # Existing member fields bind the immutable initialized-parent
+                # snapshot. The mutable live path remains in runtime config.
+                "parent_manifest_path": str(parent_snapshot_path),
+                "parent_manifest_sha256": parent_snapshot_sha256,
+                "config_path": entry["config_path"], "source_config_path": entry["source_config_path"],
+                "source_config_sha256": entry["source_config_sha256"]})
+        scope = {"schema_version": 1, "cohort_id": cohort_id, "profile": profile,
+            "subscription_id": "188a5848-76fb-4d57-8f2a-32c09284d486", "region": "swedencentral",
+            "resource_group_id": watcher_group, "watcher_id": watcher_id,
+            "owners": azure_cleanup_owners, "members": members}
+        atomic_write_json(manifest_path, scope)
+        stage_data["azure_auxiliary_cleanup_scope"] = {"path": str(manifest_path),
+            "sha256": _sha(manifest_path), "card_path": str(card_path)}
     if stage == "acceptance":
         from .failure_waiver import bind_prepared_acceptance, source_waiver
         waiver = source_waiver(settings)
@@ -1199,8 +1481,21 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
         raise ValueError("draft prerequisites remain incomplete: " + "; ".join(errors))
     private = _path(prepared.get("state_root"), "prepared state root") / stage_id
     refs = prepared.get("approval_refs")
-    if not isinstance(refs, dict) or any(Path(path).exists() for path in refs.values()):
-        raise ValueError("draft approval destinations must remain absent until financial preflight succeeds")
+    if not isinstance(refs, dict):
+        raise ValueError("draft approval destinations are malformed")
+    cleanup_scope = prepared.get("azure_auxiliary_cleanup_scope")
+    cleanup_path = refs.get("azure_shared_cleanup")
+    present = {key for key, value in refs.items() if Path(value).exists() or Path(value).is_symlink()}
+    if present - {"azure_shared_cleanup"}:
+        raise ValueError("ordinary approval destinations must remain absent until financial preflight succeeds")
+    if cleanup_scope is not None:
+        scope_path = _path(cleanup_scope.get("path"), "Azure auxiliary cleanup frozen scope", file=True)
+        if _sha(scope_path) != cleanup_scope.get("sha256") or cleanup_path != cleanup_scope.get("card_path"):
+            raise ValueError("Azure auxiliary cleanup frozen scope or card path changed")
+        if "azure_shared_cleanup" not in present:
+            raise ValueError("Azure auxiliary cleanup draft needs its separately reviewed approval card before activation")
+    elif "azure_shared_cleanup" in refs:
+        raise ValueError("Azure auxiliary cleanup approval reference has no frozen cohort scope")
     if not callable(preflight):
         raise ValueError("activation requires a read-only financial preflight callback")
     runtime_configs = {}
@@ -1211,6 +1506,26 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
         from .lifecycle_runtime import load_runtime_config
         runtime_configs[entry["entry_id"]] = load_runtime_config(runtime_path,
             selected_providers=set(entry.get("run_ids", {})), allow_missing_approval_evidence=True)
+        if cleanup_scope is not None and not runtime_configs[entry["entry_id"]].get(
+                "azure_auxiliary_cleanup", {}).get("authorization"):
+            raise PermissionError("Azure auxiliary cleanup approval card is not genuinely approved and source-bound")
+    cleanup_source_hashes: dict[str, str] = {}
+    if cleanup_scope is not None:
+        from .azure_auxiliary_cleanup import authorization_payload
+        for runtime in runtime_configs.values():
+            spec = runtime["azure_auxiliary_cleanup"]
+            payload = authorization_payload(spec, datetime.now(timezone.utc))
+            manifest_path = Path(spec["authorization"]["cohort_manifest_path"])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            paths = [Path(spec["authorization"]["card_path"]), manifest_path,
+                Path(payload["decision_source_path"])]
+            for member in manifest["members"]:
+                paths.extend(Path(member[key]) for key in (
+                    "runtime_path", "parent_manifest_path", "config_path", "source_config_path"))
+            for path in paths:
+                if not path.is_file() or path.is_symlink():
+                    raise PermissionError("Azure auxiliary cleanup bound source is unavailable or unsafe")
+                cleanup_source_hashes[str(path)] = _sha(path)
     candidate = copy.deepcopy(prepared)
     candidate["status"] = "READY_FOR_ADMISSION"
     candidate["approval_files_created"] = True
@@ -1223,8 +1538,24 @@ def activate_prepared_stage(prepared: dict, settings: dict, root: Path, *, prefl
             path = _path(entry.get(path_key), f"prepared {path_key}", file=True)
             if _sha(path) != entry.get(digest_key):
                 raise ValueError(f"prepared frozen source changed during activation: {entry.get('entry_id')} {path_key}")
+    if cleanup_scope is not None:
+        from .azure_auxiliary_cleanup import authorization_payload
+        from .lifecycle_runtime import load_runtime_config
+        for entry in entries:
+            refreshed = load_runtime_config(Path(entry["runtime_config_path"]),
+                selected_providers=set(entry.get("run_ids", {})), allow_missing_approval_evidence=True)
+            spec = refreshed.get("azure_auxiliary_cleanup")
+            if not isinstance(spec, dict):
+                raise PermissionError("Azure auxiliary cleanup runtime binding disappeared during activation")
+            authorization_payload(spec, datetime.now(timezone.utc))
+        for source, digest in cleanup_source_hashes.items():
+            path = Path(source)
+            if not path.is_file() or path.is_symlink() or _sha(path) != digest:
+                raise PermissionError("Azure auxiliary cleanup approval or bound cohort source changed during activation")
     refs = _write_evidence(private / "approvals", _gate_rows(settings, stage),
         provider_scope(settings["providers"]), settings)
+    if cleanup_scope is not None:
+        refs["azure_shared_cleanup"] = cleanup_path
     if refs != prepared.get("approval_refs"):
         raise ValueError("activated approval paths differ from preallocated draft references")
     activated = copy.deepcopy(prepared)

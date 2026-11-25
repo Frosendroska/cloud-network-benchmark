@@ -205,6 +205,64 @@ class FakeAwsRunner:
         return result
 
 
+def test_actual_aws_hooks_cleanup_after_partial_protection_failure_fake_only(tmp_path):
+    """An owned safety output failure still leaves a trusted cleanup scope."""
+    from tests.unit.test_aws_provider import make_deployment, make_request, make_settings
+    from cloud_network_benchmark.lifecycle_adapters import RemoteStages, aws_hooks
+    from cloud_network_benchmark.orchestration import LifecycleContext, _typed_outcome, execute_provider_workflows
+    from cloud_network_benchmark.providers.aws import AwsProviderDriver
+
+    class PartialSupportRunner(FakeAwsRunner):
+        def run(self, request):
+            if request.action_id.startswith("aws-safety-output-"):
+                self.actions.append(request.action_id)
+                self.requests.append(request)
+                return CommandResult(action_id=request.action_id, outcome="failed", started_at=NOW,
+                    finished_at=NOW, duration_seconds=0, exit_code=1, stdout="",
+                    stderr="synthetic output failure after owned support apply")
+            return super().run(request)
+
+    deployment = make_deployment()
+    clock, runner = FakeClock(), PartialSupportRunner()
+    runner.complete_cleanup = True
+    runner.run_id, runner.deployment_id = deployment.run_id, deployment.deployment_id
+    driver = AwsProviderDriver(runner, make_settings(tmp_path, deployment), clock=clock.utc_now)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("claim, creation, and measurement must not run")
+
+    stages = RemoteStages(prepare=forbidden, stabilize=forbidden, measure=forbidden,
+        close=forbidden, retrieve=forbidden, claim=forbidden)
+    hooks = aws_hooks(driver, deployment, make_request(driver, deployment), stages=stages)
+    expected = {"account_id": "123456789012", "regions": ["eu-central-1"],
+        "run_id": deployment.run_id, "deployment_id": deployment.deployment_id}
+    # Before protection runs, the immutable hook inputs already bind the scope.
+    assert hooks.aws_cleanup_identity() == expected
+
+    result = execute_provider_workflows({"aws": hooks},
+        context=LifecycleContext("offline-partial-protection", 100, 1300, 1200), clock=clock)
+    provider = result.provider_results["aws"]
+    cleanup = provider.values["cleanup"]
+    assert provider.values["protect"].state == "failed"
+    assert getattr(cleanup.cleanup_state, "value", cleanup.cleanup_state) == "succeeded"
+    assert provider.cleanup_state == "succeeded"
+    assert provider.primary_failure and "protect" in provider.primary_failure
+    assert "aws-pair-apply" not in runner.actions
+    assert not any(action.startswith(("f02r-", "aws-host-key")) for action in runner.actions)
+
+    # The hook refuses an expected identity if the original request is foreign;
+    # neither failed nor absent protection evidence can supply that identity.
+    foreign_request = make_request(driver, deployment).model_copy(update={
+        "target_selector": "account=999999999999;regions=eu-central-1;tags=cnb_run_id:foreign&cnb_deployment_id:foreign-deployment"})
+    foreign_hooks = aws_hooks(driver, deployment, foreign_request, stages=stages)
+    assert foreign_hooks.aws_cleanup_identity() is None
+    assert not _typed_outcome("aws", "cleanup", cleanup,
+        expected_cleanup_identity=foreign_hooks.aws_cleanup_identity(),
+        cleanup_window=(NOW, NOW))[0]
+    assert not _typed_outcome("aws", "cleanup", cleanup,
+        expected_cleanup_identity=None, cleanup_window=(NOW, NOW))[0]
+
+
 class FakePreparedAwsRunner(FakeAwsRunner):
     """The real F02/F09 adapters run over source-shaped fake command responses."""
     def __init__(self):
