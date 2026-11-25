@@ -578,6 +578,9 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
 
 
 _EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release_eur": "14"}
+_EUR15_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
+    "prior_release_eur": "14", "additional_release_eur": "15", "cumulative_release_eur": "29"}
+_EUR14_AUTHORITY_SHA256 = "97deee1289455535dad654b6618ebd6f32e562175d55da4f5b4bfd612d0e0aa6"
 
 
 def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
@@ -586,17 +589,24 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     request = settings.get("pricing", {}).get("pending_eur_reserve_release")
     if request is None:
         return None, None
-    if (stage not in {"acceptance", "calibration"} or not isinstance(request, dict)
-            or request != _EUR_RESERVE_RELEASE_REQUEST):
-        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 pending request for acceptance or calibration")
+    if stage not in {"acceptance", "calibration"} or not isinstance(request, dict):
+        raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")
+    if request == _EUR_RESERVE_RELEASE_REQUEST:
+        working_eur, protected_eur = Decimal("264"), Decimal("36")
+        requested_release = dict(_EUR_RESERVE_RELEASE_REQUEST)
+    elif request == _EUR15_RESERVE_RELEASE_REQUEST:
+        working_eur, protected_eur = Decimal("279"), Decimal("21")
+        requested_release = dict(_EUR15_RESERVE_RELEASE_REQUEST)
+    else:
+        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 legacy request or EUR 15 additional / EUR 29 cumulative request")
     if draft:
-        return dict(_EUR_RESERVE_RELEASE_REQUEST), None
+        return requested_release, None
 
     declarations = {**settings.get("approvals", {}),
         **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
     declaration = declarations.get("paid_authorization")
     if not isinstance(declaration, dict) or declaration.get("confirmed") is not True:
-        raise ValueError("the EUR 14 reserve release requires confirmed paid_authorization")
+        raise ValueError("the pending EUR reserve release requires confirmed paid_authorization")
     from .financial_controls import (Caps, FinancialAuthorization, Source,
         has_explicit_eur_reserve_release)
     source_path = _path(declaration.get("source"), "approvals.paid_authorization.source", file=True)
@@ -610,16 +620,36 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     caps = Caps.model_validate(card.caps.model_dump())
     if (card.ledger_scope_id != scope_id
             or Decimal(caps.project_eur) != Decimal("300")
-            or Decimal(caps.working_eur) != Decimal("264")
-            or Decimal(caps.protected_eur) != Decimal("36")
-            or Decimal("250") + Decimal(_EUR_RESERVE_RELEASE_REQUEST["release_eur"]) != Decimal(caps.working_eur)
-            or Decimal("50") - Decimal(caps.protected_eur) != Decimal(_EUR_RESERVE_RELEASE_REQUEST["release_eur"])
+            or Decimal(caps.working_eur) != working_eur
+            or Decimal(caps.protected_eur) != protected_eur
             or Decimal(caps.working_eur) + Decimal(caps.protected_eur) != Decimal(caps.project_eur)):
-        raise ValueError("paid_authorization must bind the current ledger scope and exact typed EUR 14 reserve release")
+        if request == _EUR_RESERVE_RELEASE_REQUEST:
+            raise ValueError("paid_authorization must bind the current ledger scope and exact typed EUR 14 reserve release")
+        raise ValueError("paid_authorization must bind the current ledger scope and exact typed reserve-release caps")
     snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
     if not has_explicit_eur_reserve_release(snapshot, now=now):
-        raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the EUR 14 release")
-    return dict(_EUR_RESERVE_RELEASE_REQUEST), snapshot
+        raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the requested reserve release")
+    if request == _EUR15_RESERVE_RELEASE_REQUEST:
+        prior = declarations.get("prior_paid_authorization")
+        if not isinstance(prior, dict) or prior.get("confirmed") is not True:
+            raise ValueError("the EUR 15 additional release requires the exact source-bound prior EUR 14 paid_authorization")
+        prior_path = _path(prior.get("source"), "approvals.prior_paid_authorization.source", file=True)
+        prior_hash = prior.get("sha256")
+        if (prior_hash != _EUR14_AUTHORITY_SHA256
+                or hashlib.sha256(prior_path.read_bytes()).hexdigest() != prior_hash):
+            raise ValueError("prior_paid_authorization must match the pinned, source-bound EUR 14 authority")
+        prior_source = Source(path=str(prior_path), sha256=prior_hash)
+        prior_card = FinancialAuthorization.model_validate(prior_source.json())
+        prior_caps = Caps.model_validate(prior_card.caps.model_dump())
+        prior_snapshot = {"authority": prior_source.model_dump(), "caps": prior_caps.model_dump(),
+            "scope_id": scope_id}
+        if (prior_card.ledger_scope_id != scope_id
+                or Decimal(prior_caps.project_eur) != Decimal("300")
+                or Decimal(prior_caps.working_eur) != Decimal("264")
+                or Decimal(prior_caps.protected_eur) != Decimal("36")
+                or not has_explicit_eur_reserve_release(prior_snapshot, now=now)):
+            raise ValueError("prior_paid_authorization is expired, out of scope, or does not prove the exact EUR 14 release")
+    return requested_release, snapshot
 
 
 def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[str, str] | None,
@@ -639,7 +669,9 @@ def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[
         if not draft:
             from .financial_controls import legacy_usd_budget_exceeded
             if legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
-                raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
+                if pending_release == _EUR_RESERVE_RELEASE_REQUEST:
+                    raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound reserve-release approval")
 
 
 def _cost_payload(settings, root, *, stage: str | None = None, draft: bool = False):

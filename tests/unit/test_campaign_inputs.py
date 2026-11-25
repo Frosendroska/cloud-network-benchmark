@@ -185,3 +185,131 @@ def test_non_draft_overrun_requires_current_source_bound_typed_eur_14_caps(tmp_p
     settings["approvals"]["paid_authorization"]["source"] = str(tmp_path / "missing-card.json")
     with pytest.raises(ValueError, match="missing approvals.paid_authorization.source"):
         _reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+
+
+def _v19_request():
+    return {"status": "pending", "currency": "EUR", "prior_release_eur": "14",
+        "additional_release_eur": "15", "cumulative_release_eur": "29"}
+
+
+def _write_synthetic_authority(path, card):
+    import hashlib
+    import json
+    path.write_text(json.dumps(card, sort_keys=True))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _synthetic_v19_authorities(tmp_path):
+    import copy
+    from tests.financial_helpers import synthetic_finances
+
+    book, _plans, card, _path = synthetic_finances(tmp_path, paid=True)
+    prior = copy.deepcopy(card)
+    prior["caps"].update(project_eur="300", working_eur="264", protected_eur="36",
+        personal_cash_eur="264", batch_eur="264", stage_eur="264")
+    prior_path = tmp_path / "SYNTHETIC-prior-v18-card.json"
+    prior_hash = _write_synthetic_authority(prior_path, prior)
+    current = copy.deepcopy(card)
+    current["caps"].update(project_eur="300", working_eur="279", protected_eur="21",
+        personal_cash_eur="279", batch_eur="279", stage_eur="279")
+    current_path = tmp_path / "SYNTHETIC-new-v19-card.json"
+    current_hash = _write_synthetic_authority(current_path, current)
+    settings = {"ledger": {"scope_id": book.scope_id},
+        "pricing": {"pending_eur_reserve_release": _v19_request()},
+        "approvals": {
+            "prior_paid_authorization": {"confirmed": True, "source": str(prior_path), "sha256": prior_hash},
+            "paid_authorization": {"confirmed": True, "source": str(current_path), "sha256": current_hash}}}
+    return book, settings, prior, prior_path, current, current_path
+
+
+def test_v19_release_request_is_pending_and_non_authorizing_in_draft(tmp_path):
+    from cloud_network_benchmark.campaign_inputs import (_reserve_release_policy,
+        _validate_funding_budget)
+
+    request = _v19_request()
+    settings = {"pricing": {"pending_eur_reserve_release": request}}
+    amounts = {"primary": Decimal("200.73562207733502645502645501"),
+        "uncertainty": Decimal("54.60454259936507936507936508"),
+        "tax": Decimal("11.16189295488931216931216931"), "replacements": Decimal("0"),
+        "total_limit": Decimal("300"), "working_limit": Decimal("250"),
+        "protected_buffer": Decimal("50")}
+    pending, snapshot = _reserve_release_policy(settings, "acceptance", draft=True, now=NOW)
+    assert pending == request and snapshot is None
+    _validate_funding_budget(amounts, pending, snapshot, draft=True, now=NOW)
+    with pytest.raises(ValueError, match="without an explicit EUR reserve-release request"):
+        _validate_funding_budget(amounts, None, None, draft=True, now=NOW)
+
+
+def test_v19_overrun_requires_prior_14_and_current_15_source_bound_authorities(tmp_path, monkeypatch):
+    import hashlib
+    import cloud_network_benchmark.campaign_inputs as inputs
+    from tests.financial_helpers import NOW
+
+    book, settings, _prior, prior_path, _current, _current_path = _synthetic_v19_authorities(tmp_path)
+    prior_hash = hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(inputs, "_EUR14_AUTHORITY_SHA256", prior_hash)
+    request, snapshot = inputs._reserve_release_policy(settings, "acceptance", draft=False, now=NOW)
+    assert request == _v19_request()
+    assert snapshot["scope_id"] == book.scope_id
+    assert snapshot["caps"]["project_eur"] == "300"
+    assert snapshot["caps"]["working_eur"] == "279"
+    assert snapshot["caps"]["protected_eur"] == "21"
+    amounts = {"primary": Decimal("200.73562207733502645502645501"),
+        "uncertainty": Decimal("54.60454259936507936507936508"),
+        "tax": Decimal("11.16189295488931216931216931"), "replacements": Decimal("0"),
+        "total_limit": Decimal("300"), "working_limit": Decimal("250"),
+        "protected_buffer": Decimal("50")}
+    inputs._validate_funding_budget(amounts, request, snapshot, draft=False, now=NOW)
+
+
+@pytest.mark.parametrize("case", ["missing_prior", "wrong_prior_hash", "wrong_prior_scope",
+    "wrong_prior_caps", "expired_prior", "missing_current", "wrong_current_hash",
+    "wrong_current_scope", "wrong_current_caps", "expired_current", "changed_current_source"])
+def test_v19_release_authority_failures_close_paid_path(tmp_path, monkeypatch, case):
+    import hashlib
+    import cloud_network_benchmark.campaign_inputs as inputs
+    from datetime import timedelta
+    from tests.financial_helpers import NOW
+
+    _book, settings, prior, prior_path, current, current_path = _synthetic_v19_authorities(tmp_path)
+    prior_hash = hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(inputs, "_EUR14_AUTHORITY_SHA256", prior_hash)
+    if case == "missing_prior":
+        settings["approvals"].pop("prior_paid_authorization")
+    elif case == "wrong_prior_hash":
+        settings["approvals"]["prior_paid_authorization"]["sha256"] = "0" * 64
+    elif case == "wrong_prior_scope":
+        prior["ledger_scope_id"] = "SYNTHETIC-WRONG-SCOPE"
+        prior_hash = _write_synthetic_authority(prior_path, prior)
+        settings["approvals"]["prior_paid_authorization"]["sha256"] = prior_hash
+        monkeypatch.setattr(inputs, "_EUR14_AUTHORITY_SHA256", prior_hash)
+    elif case == "wrong_prior_caps":
+        prior["caps"]["working_eur"] = "263"
+        prior_hash = _write_synthetic_authority(prior_path, prior)
+        settings["approvals"]["prior_paid_authorization"]["sha256"] = prior_hash
+        monkeypatch.setattr(inputs, "_EUR14_AUTHORITY_SHA256", prior_hash)
+    elif case == "expired_prior":
+        prior["valid_until"] = (NOW - timedelta(seconds=1)).isoformat()
+        prior_hash = _write_synthetic_authority(prior_path, prior)
+        settings["approvals"]["prior_paid_authorization"]["sha256"] = prior_hash
+        monkeypatch.setattr(inputs, "_EUR14_AUTHORITY_SHA256", prior_hash)
+    elif case == "missing_current":
+        settings["approvals"].pop("paid_authorization")
+    elif case == "wrong_current_hash":
+        settings["approvals"]["paid_authorization"]["sha256"] = "0" * 64
+    elif case == "wrong_current_scope":
+        current["ledger_scope_id"] = "SYNTHETIC-WRONG-SCOPE"
+        current_hash = _write_synthetic_authority(current_path, current)
+        settings["approvals"]["paid_authorization"]["sha256"] = current_hash
+    elif case == "wrong_current_caps":
+        current["caps"].update(working_eur="264", protected_eur="36")
+        current_hash = _write_synthetic_authority(current_path, current)
+        settings["approvals"]["paid_authorization"]["sha256"] = current_hash
+    elif case == "expired_current":
+        current["valid_until"] = (NOW - timedelta(seconds=1)).isoformat()
+        current_hash = _write_synthetic_authority(current_path, current)
+        settings["approvals"]["paid_authorization"]["sha256"] = current_hash
+    elif case == "changed_current_source":
+        current_path.write_text("changed after approval")
+    with pytest.raises(ValueError):
+        inputs._reserve_release_policy(settings, "acceptance", draft=False, now=NOW)

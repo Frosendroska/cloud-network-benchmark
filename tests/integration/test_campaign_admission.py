@@ -1752,3 +1752,47 @@ def test_over_250_cost_payload_is_pending_only_in_explicit_draft(repository_root
     settings["pricing"].pop("pending_eur_reserve_release")
     with pytest.raises(ValueError, match="without an explicit EUR 14"):
         _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+
+
+def test_v19_cost_payload_keeps_legacy_usd_split_and_records_exact_pending_eur_metadata(
+        repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.campaign_inputs import _cost_payload
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    funding = settings["pricing"]["funding"]
+    funding.update(primary="200.73562207733502645502645501",
+        uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    request = {"status": "pending", "currency": "EUR", "prior_release_eur": "14",
+        "additional_release_eur": "15", "cumulative_release_eur": "29"}
+    settings["pricing"]["pending_eur_reserve_release"] = request
+
+    payload = _cost_payload(settings, repository_root, stage="acceptance", draft=True)
+
+    assert payload["normalization"]["reserve_release"] == request
+    assert payload["funding"]["total_limit"] == "300"
+    assert payload["funding"]["working_limit"] == "250"
+    assert payload["funding"]["protected_buffer"] == "50"
+    assert payload["funding"]["primary"] == funding["primary"]
+
+
+def test_unsigned_v19_prepare_stage_preserves_pending_release_as_draft_only(
+        repository_root, tmp_path, monkeypatch, request):
+    from cloud_network_benchmark.campaign_inputs import prepare_stage
+
+    settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    settings["pricing"]["funding"].update(primary="200.73562207733502645502645501",
+        uncertainty="54.60454259936507936507936508", tax="11.16189295488931216931216931",
+        replacements="0", total_limit="300", working_limit="250", protected_buffer="50")
+    pending = {"status": "pending", "currency": "EUR", "prior_release_eur": "14",
+        "additional_release_eur": "15", "cumulative_release_eur": "29"}
+    settings["pricing"]["pending_eur_reserve_release"] = pending
+
+    stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
+        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    register_generated_cleanup(stage, request)
+
+    cost_payload = json.loads(Path(stage["entries"][0]["cost_inputs_path"]).read_text())
+    assert cost_payload["normalization"]["reserve_release"] == pending
+    assert cost_payload["funding"]["working_limit"] == "250"
+    assert cost_payload["funding"]["protected_buffer"] == "50"
