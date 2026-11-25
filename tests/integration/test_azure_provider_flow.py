@@ -1186,6 +1186,7 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
             elif action == "azure_auxiliary_group_exact_readback":
                 return self._result(request, stdout=json.dumps(fixture["group_get"]["body"]))
             elif action == "azure_auxiliary_group_delete":
+                assert not any("If-Match=" in arg for arg in request.argv)
                 self.group_deleted = True
                 return self._result(request)
             elif action == "azure_auxiliary_group_absence":
@@ -1219,6 +1220,12 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
         for runner in runners) == 1
     assert sum(sum(request.action_type == "azure_auxiliary_group_delete" for request in runner.requests)
         for runner in runners) == 1
+    all_actions = [request.action_type for runner in runners for request in runner.requests]
+    for required in ("azure_auxiliary_preleaf_group_children", "azure_auxiliary_watcher_absence",
+            "azure_auxiliary_group_final_inventory", "azure_auxiliary_group_final_subscription_inventory",
+            "azure_auxiliary_group_final_groups", "azure_auxiliary_group_immediate_children",
+            "azure_auxiliary_group_exact_readback", "azure_auxiliary_group_absence"):
+        assert required in all_actions
     assert sum(runner.watcher_deleted for runner in runners) == 1
     assert sum(runner.group_deleted for runner in runners) == 1
     for (_d, o) in ready:
