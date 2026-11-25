@@ -1270,7 +1270,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
             runtime.update(workflow_profile=data["admission"]["workflow_profile"],
                 provider_registration_timeout_seconds=provider_registration,
                 plan_review_admission_path=str(stage_private / "plan-review-admission.lock"))
-        if stage in {"day", "acceptance", "calibration"}:
+        if stage in {"day", "acceptance", "calibration", "week"}:
             stage_private = Path(state_root) / stage_id
             runtime["observer"] = {"stage_id": stage_id, "campaign_id": stage_id,
                 "entry_id": entry["entry_id"],
@@ -1307,7 +1307,7 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "approval_refs": approvals, "cost_input_path": str(cost_path),
         "cost_input_sha256": _sha(cost_path),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
-    if stage in {"day", "acceptance", "calibration"}:
+    if stage in {"day", "acceptance", "calibration", "week"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),
             observer_launch_receipt_root=str(private / "observer-launch-receipts"))
