@@ -9,7 +9,7 @@ from typing import Callable, List
 from pydantic import Field, model_validator
 
 from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute, _identity_references_available, _request, _request_failure, _scrub
-from .bootstrap import BootstrapResult, _acl_matches, _process_identity_command, _process_identity_matches, _unit_log_destinations_match, _unit_environment_matches
+from .bootstrap import BootstrapResult, _acl_matches, _process_identity_command, _process_identity_matches, _unit_log_destinations_match, _unit_environment_matches, _unit_environment_value_matches
 from .contracts.common import CommandOutcome, StrictModel
 from .contracts.execution import CommandRunner
 
@@ -64,7 +64,8 @@ def _systemd_healthy(stdout: str, connection: ConnectionOutput, prepared: Bootst
     expected += ["server", "-i", connection.private_ipv4_b, "-p", "11111"] if tool == "sockperf" else ["-s", "-B", connection.private_ipv4_b, "-p", "5201", "--json-stream", "--forceflush"]
     build = next((item for item in prepared.builds if item.role == "vm_b" and item.tool == tool), None)
     environment_ok = (tool != "iperf3" or build is None or build.observation_capability is None
-                      or "CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3" in fields.get("Environment", ""))
+                      or _unit_environment_value_matches(fields.get("Environment", ""),
+                          "CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3"))
     return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
             and fields.get("Restart") == "no" and observed == expected
             and environment_ok

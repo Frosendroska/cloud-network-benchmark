@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import re
 import shlex
 import subprocess
 import sys
@@ -223,6 +224,170 @@ def test_pinned_bootstrap_records_observed_patch_and_capability_identity(tmp_pat
     rejected = run_bootstrap(connection(tmp_path), config, MalformedSockperfBanner(),
         deadline=deadline(), clock=lambda: 100)
     assert not rejected.succeeded and rejected.failure.category == "binary_version_missing"
+
+
+def test_listener_failure_projection_retains_cat_response_and_first_failed_predicate(tmp_path):
+    import base64
+    from cloud_network_benchmark.lifecycle_adapters import prepare_remote_pair
+    from cloud_network_benchmark.lifecycle_cli import _prepare_failure_projection, _safe_diagnostic_payload
+    from cloud_network_benchmark.readiness import _predicate as readiness_predicate
+    from tests.fixtures.f02r.support import nft_listing
+
+    iperf_commit = "2acfcfe94e928e74542c9f107e02aa6dd4748a79"
+    patch_path = Path(__file__).parents[2] / "src/cloud_network_benchmark/tool_patches/iperf-3.17.1-acquisition.patch"
+    patch_sha = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+    base = bootstrap_config()
+    iperf = SourceBuild(tool="iperf3", source_url=f"https://github.com/esnet/iperf/archive/{iperf_commit}.tar.gz",
+        source_reference=f"iperf-{iperf_commit}", upstream_commit=iperf_commit, archive_name="iperf3.tar.gz",
+        source_sha256="d6b4d2c7b20157c5b7fbd2de66f22bd3428958b5f2e28899151b6e22745886fe",
+        observation_patch_path="tool_patches/iperf-3.17.1-acquisition.patch", observation_patch_sha256=patch_sha)
+    config = base.model_copy(update={"sources": [base.sources[0], iperf]})
+    connected = connection(tmp_path).model_copy(update={"private_ipv4_a": "10.80.1.10", "private_ipv4_b": "10.80.1.11"})
+
+    class SourceGeneratedUnitRunner(BootstrapRunner):
+        def __init__(self, *, include_cat_environment, include_sensitive_output=False,
+                     cat_environment_value=None, extra_cat_environment=None):
+            super().__init__()
+            self.include_cat_environment = include_cat_environment
+            self.include_sensitive_output = include_sensitive_output
+            self.cat_environment_value = cat_environment_value
+            self.extra_cat_environment = extra_cat_environment
+            self.listener_launches = {}
+            self.last_iperf_cat = None
+
+        def run(self, request):
+            aid = request.action_id
+            tool = "sockperf" if "sockperf" in aid else "iperf3"
+            source = next(item for item in config.sources if item.tool == tool)
+            if "CNB_BUILD_V1" in request.argv[-1]:
+                version = "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0" if tool == "iperf3" else "sockperf, version 3.10\nBuild options: acquisition"
+                compiler = "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc."
+                build_configuration = f"CC=${{CC:-cc}}; compiler={compiler}; ./configure --prefix=/var/lib/cnb/install; make -j2"
+                semantics = "iperf-3.17.1-stats-v1" if tool == "iperf3" else "sockperf-3.10-enabled-v1"
+                fields = ["CNB_BUILD_V1", f"tool={tool}", f"source_reference={source.source_reference}",
+                    f"source_sha256={source.source_sha256}", f"upstream_commit={source.upstream_commit or ''}",
+                    f"patch_path={source.observation_patch_path or ''}", f"patch_sha256={source.observation_patch_sha256 or ''}",
+                    "compiler_version_b64=" + base64.b64encode(compiler.encode()).decode(),
+                    "build_configuration_b64=" + base64.b64encode(build_configuration.encode()).decode(),
+                    f"binary_path=/var/lib/cnb/install/bin/{tool}", "binary_version_b64=" + base64.b64encode(version.encode()).decode(),
+                    "binary_sha256=" + "c" * 64, "observation_capability=CNB_ACQ_V1",
+                    f"observation_semantics={semantics}", "capabilities=" + ",".join(_required_capabilities(tool))]
+                return result(aid, "\n".join(fields))
+            if aid.endswith("iperf3-2"):
+                return result(aid, f"{source.source_sha256} /var/lib/cnb/work/{source.archive_name}")
+            if aid.endswith("iperf3-5"):
+                return result(aid, "gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\nCopyright (C) 2024 Free Software Foundation, Inc.")
+            if aid.endswith("iperf3-6"):
+                return result(aid, "iperf 3.17.1\nLinux synthetic-host 6.8.0\nCompiler: gcc 13.3.0")
+            if aid.endswith("iperf3-9"):
+                return result(aid, "CNB_ACQ_V1")
+            if aid in {"f02r-vm_b-listener-sockperf", "f02r-vm_b-listener-iperf3"}:
+                tokens = shlex.split(request.argv[-1])
+                start = tokens.index("systemd-run")
+                self.listener_launches[tool] = tokens[start:]
+                return result(aid)
+            if "listener-verify-" in aid and aid.endswith(("sockperf", "iperf3")):
+                launch = self.listener_launches[tool]
+                binary_index = next(index for index, token in enumerate(launch) if token.endswith(f"/bin/{tool}"))
+                unit = launch[launch.index("--unit") + 1]
+                pid = 5345 if tool == "sockperf" else 5346
+                properties = [token.removeprefix("--property=") for token in launch if token.startswith("--property=")]
+                property_map = dict(item.split("=", 1) for item in properties)
+                argv_text = shlex.join(launch[binary_index:])
+                output = (f"Restart={property_map['Restart']}\nMainPID={pid}\nExecStart={{ path={launch[binary_index]} ; "
+                    f"argv[]={argv_text} ; ignore_errors=no ; start_time=[Thu 2026-11-26 20:07:24 UTC] ; "
+                    f"stop_time=[n/a] ; pid={pid} ; code=(null) ; status=0/0 }}\n")
+                if "Environment" in property_map:
+                    output += f"Environment={property_map['Environment']}\n"
+                output += ("StandardOutput=append\nStandardError=append\nLoadState=loaded\nActiveState=active\n")
+                return result(aid, output)
+            if "listener-config-" in aid and aid.endswith(("sockperf", "iperf3")):
+                assert tool in self.listener_launches
+                launch = self.listener_launches[tool]
+                unit = launch[launch.index("--unit") + 1]
+                properties = [token.removeprefix("--property=") for token in launch if token.startswith("--property=")]
+                property_map = dict(item.split("=", 1) for item in properties)
+                lines = [f"# /run/systemd/transient/{unit}.service", "[Service]"]
+                lines.extend(f"{key}={value}" for key, value in property_map.items()
+                    if key in {"StandardOutput", "StandardError"})
+                if self.include_cat_environment and "Environment" in property_map:
+                    environment = self.cat_environment_value or property_map["Environment"]
+                    lines.append(f'Environment="{environment}"')
+                if self.extra_cat_environment is not None:
+                    lines.append(f'Environment="{self.extra_cat_environment}"')
+                if tool == "iperf3" and self.include_sensitive_output:
+                    lines.extend([f"# auth-reference={connected.vm_b.authentication_reference}",
+                        'Environment="AWS_SESSION_TOKEN=SESSION_VALUE WITH SPACES"',
+                        'Environment="PASSWORD=PASSWORD_VALUE WITH SPACES"',
+                        "Environment=AWS_SECRET_ACCESS_KEY=AKIA_SYNTHETIC_VALUE"])
+                # This is the source-generated transient unit projection. The negative
+                # variant models a successful cat response missing one required field.
+                output = "\n".join(lines) + "\n"
+                if tool == "iperf3":
+                    self.last_iperf_cat = output
+                return result(aid, output)
+            if "listener-process-" in aid and aid.endswith(("sockperf", "iperf3")):
+                pid = 5345 if tool == "sockperf" else 5346
+                return result(aid, f"/var/lib/cnb/install/bin/{tool}\n" + "c" * 64 + f" /proc/{pid}/exe")
+            if aid == "f02r-vm_b-acl-inspect":
+                listing = nft_listing(connected.deployment_id).replace("10.0.0.1", connected.private_ipv4_a).replace(
+                    "10.0.0.2", connected.private_ipv4_b)
+                return result(aid, listing)
+            return super().run(request)
+
+    failed_runner = SourceGeneratedUnitRunner(include_cat_environment=False, include_sensitive_output=True)
+    failed = prepare_remote_pair(connected, bootstrap_config=config, readiness_config=None,
+        runner=failed_runner, deadline=deadline(),
+        source_root=Path(__file__).parents[2], source_revision="synthetic-source-revision",
+        remote_root="/var/lib/cnb", clock=lambda: 100)
+    assert failed.stage == "prepare" and failed.succeeded is False
+    assert failed.evidence["bootstrap"].failure.category == "listener_identity_unverified"
+    projection = _prepare_failure_projection("synthetic-gcp-run", "gcp", failed)
+    identity = projection["failures"][0]["listener_identity"]
+    assert identity["first_failed_predicate"] == "systemctl_cat.acquisition_environment"
+    cat = identity["systemctl_cat"]
+    assert "# auth-reference=[REDACTED]" in cat["diagnostic"]
+    assert cat["diagnostic"].count("Environment=[REDACTED]") == 3
+    assert "SESSION_VALUE" not in cat["diagnostic"] and "WITH SPACES" not in cat["diagnostic"]
+    assert "PASSWORD_VALUE" not in cat["diagnostic"]
+    assert connected.vm_b.authentication_reference not in cat["diagnostic"]
+    assert "AKIA_SYNTHETIC_VALUE" not in cat["diagnostic"]
+    assert cat["source_bytes"] == len(failed_runner.last_iperf_cat.encode())
+    assert cat["retained_diagnostic_sha256"] == hashlib.sha256(cat["diagnostic"].encode()).hexdigest()
+    assert not cat["diagnostic_truncated"] and not cat["source_scan_truncated"]
+    assert identity["systemctl_show_outcome"] == identity["systemctl_cat_outcome"] == "succeeded"
+    assert identity["systemctl_show_exit_code"] == identity["systemctl_cat_exit_code"] == 0
+    direct_sensitive = _safe_diagnostic_payload(
+        'Environment="CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3" "AWS_SESSION_TOKEN=SESSION VALUE"')
+    assert direct_sensitive["diagnostic"] == "Environment=[REDACTED]"
+    direct_password = _safe_diagnostic_payload('Environment="PASSWORD=PASSWORD VALUE"')
+    assert direct_password["diagnostic"] == "Environment=[REDACTED]"
+
+    # The same production launch command, with all generated unit properties
+    # present in `systemctl cat`, must satisfy the unchanged strict consumer.
+    accepted_runner = SourceGeneratedUnitRunner(include_cat_environment=True)
+    accepted = run_bootstrap(connected, config, accepted_runner,
+        deadline=deadline(), clock=lambda: 100)
+    assert accepted.succeeded, accepted.failure
+    assert accepted_runner.listener_launches["iperf3"][-8:] == [
+        "/var/lib/cnb/install/bin/iperf3", "-s", "-B", "10.80.1.11", "-p", "5201", "--json-stream", "--forceflush"]
+    expected_environment = "CNB_ACQUISITION_ID=f02r-vm_b-listener-iperf3"
+    assert readiness_predicate("unit-config-iperf3", accepted_runner.last_iperf_cat, connected, accepted)
+    wrong_environment = accepted_runner.last_iperf_cat.replace(expected_environment, expected_environment + "-wrong")
+    assert not readiness_predicate("unit-config-iperf3", wrong_environment, connected, accepted)
+    duplicate_environment = accepted_runner.last_iperf_cat + f'Environment="{expected_environment}"\n'
+    assert not readiness_predicate("unit-config-iperf3", duplicate_environment, connected, accepted)
+
+    for rejected_runner in (
+        SourceGeneratedUnitRunner(include_cat_environment=True,
+            cat_environment_value=expected_environment + "-wrong"),
+        SourceGeneratedUnitRunner(include_cat_environment=True,
+            extra_cat_environment="CNB_ACQUISITION_ID=wrong"),
+    ):
+        rejected = run_bootstrap(connected, config, rejected_runner,
+            deadline=deadline(), clock=lambda: 100)
+        assert not rejected.succeeded and rejected.failure.category == "listener_identity_unverified"
+        assert rejected.failure.details["listener_identity"]["first_failed_predicate"] == "systemctl_cat.acquisition_environment"
 
 
 def test_empty_compiler_and_runner_exception_return_accumulated_failure_evidence(tmp_path):

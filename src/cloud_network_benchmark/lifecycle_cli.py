@@ -37,11 +37,25 @@ def _redact_diagnostic(value: Any) -> str | None:
     value = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[REDACTED_KEY]", value, flags=re.S)
     value = re.sub(r"-----BEGIN [^-]+-----.*\Z", "[REDACTED_KEY]", value, flags=re.S)
     value = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", value)
+    sensitive_env = r"(?:password|token|secret|private[_-]?key|authorization|api[_-]?key|access[_-]?key|client[_-]?secret|sig)"
+    def redact_systemd_environment(match: re.Match[str]) -> str:
+        line = match.group(0)
+        keys = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", match.group(2))
+        if any(re.search(sensitive_env, key, re.I) for key in keys):
+            ending = "\n" if line.endswith("\n") else ""
+            return match.group(1) + "[REDACTED]" + ending
+        return match.group(0)
+    value = re.sub(r"(?im)(\bEnvironment\s*=)(.*?)(?=(?:\s+Environment\s*=)|[\r\n]|$)",
+                   redact_systemd_environment, value)
     sensitive = r"password|token|secret|private[_ -]?key|authorization|api[_ -]?key|access[_ -]?key|client[_ -]?secret|sig"
     value = re.sub(rf"(?i)([\"']?\b(?:{sensitive})\b[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,}}]+)",
                    r"\1[REDACTED]", value)
     value = re.sub(rf"(?i)(\b(?:{sensitive})\b\s*:\s*)(?:Bearer\s+)?[^\s,;}}]+",
                    r"\1[REDACTED]", value)
+    environment_secret = (r"(?i)(\b[A-Za-z_][A-Za-z0-9_]*(?:password|token|secret|private[_-]?key|"
+        r"authorization|api[_-]?key|access[_-]?key|client[_-]?secret|sig)[A-Za-z0-9_]*\s*=\s*)"
+        r"(\"[^\"]*\"|'[^']*'|[^\s,;}}]+)")
+    value = re.sub(environment_secret, r"\1[REDACTED]", value)
     value = re.sub(r"[\r\n\t]+", " ", value)
     return value
 
@@ -96,6 +110,23 @@ def _prepare_failure_projection(run_id: str, provider: str, outcome: Any) -> dic
                 "action_id": _bounded_diagnostic(getattr(failure, "action_id", None), 120),
                 "occurred_at": occurred.isoformat() if occurred is not None else None,
                 **diagnostic}
+            listener_identity = details.get("listener_identity")
+            if isinstance(listener_identity, dict):
+                cat_diagnostic = _safe_diagnostic_payload(listener_identity.get("systemctl_cat_stdout"))
+                source_bytes = listener_identity.get("systemctl_cat_source_bytes")
+                if type(source_bytes) is int and source_bytes >= 0:
+                    cat_diagnostic["source_bytes"] = source_bytes
+                failure_row["listener_identity"] = {
+                    "first_failed_predicate": _bounded_diagnostic(
+                        listener_identity.get("first_failed_predicate"), 120),
+                    "systemctl_show_outcome": _bounded_diagnostic(
+                        listener_identity.get("systemctl_show_outcome"), 40),
+                    "systemctl_show_exit_code": listener_identity.get("systemctl_show_exit_code"),
+                    "systemctl_cat_outcome": _bounded_diagnostic(
+                        listener_identity.get("systemctl_cat_outcome"), 40),
+                    "systemctl_cat_exit_code": listener_identity.get("systemctl_cat_exit_code"),
+                    "systemctl_cat": cat_diagnostic,
+                }
             if isinstance(last, dict):
                 failure_row["last_observation"] = {
                     "predicate": _bounded_diagnostic(last.get("predicate"), 120),
