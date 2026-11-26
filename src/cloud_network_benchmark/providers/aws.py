@@ -1325,7 +1325,7 @@ class AwsProviderDriver:
         if any(network.get("InterfaceType") == "efa" for network in networks):
             raise AwsProviderError("EFA network interfaces are not part of the selected protocol", category="acceleration_mismatch")
         zone = self._aws_json("ec2", "describe-instance-topology", "--instance-ids", expected["instance_id"], "--region", region, "--output", "json")
-        topology = zone.get("Instances") or []
+        topology = zone.get("Instances")
         self._record_topology_diagnostic(expected, zone, topology)
         if not isinstance(topology, list):
             raise AwsProviderError("physical AWS zone ID differs from observed instance topology", category="zone_identity_mismatch")
