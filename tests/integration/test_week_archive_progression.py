@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -118,6 +118,9 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         settings["state_root"] = str(tmp_path / "driver-state")
         settings["minimum_free_bytes"] = 5_000_000
         settings["results_root"] = str(tmp_path / "generated-week-results")
+        future_day = (now + timedelta(days=2)).date().isoformat()
+        settings["stage_inputs"]["week"]["first_day_utc"] = future_day
+        settings["stage_inputs"]["week"]["start_utc"] = f"{future_day}T06:00:00+00:00"
         settings["ledger"] = {"path": str(fixture.built["ledger"].path),
             "scope_id": fixture.built["ledger"].scope_id}
         archive_root, staging_root, restore_root = (tmp_path / "driver-archive-root",
