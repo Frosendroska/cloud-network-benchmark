@@ -84,7 +84,8 @@ def install_fake_gcs_backend(runtime: dict, backend) -> None:
 def replay_and_reconcile_actual_capsule(*, capsule_path: Path, expected_capsule_sha256: str,
         backend, bucket: str, archive_staging_root: Path, materialization_root: Path,
         repository_root: Path, maximum_part_bytes: int, evaluated_at,
-        campaign_driver, state_root: Path, stage_id: str, entry_id: str) -> dict:
+        campaign_driver, state_root: Path, stage_id: str, entry_id: str,
+        assert_first_provider_identity_rejected: bool = False) -> dict:
     """Consume the exact CLI-written capsule, then reconcile its campaign entry.
 
     Capsule path and digest must come from the actual archive-pending journal
@@ -113,6 +114,39 @@ def replay_and_reconcile_actual_capsule(*, capsule_path: Path, expected_capsule_
     receipt_path = Path(replay.get("replay_receipt", {}).get("path", ""))
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise ValueError("production batch restore did not persist a replay receipt")
+    if assert_first_provider_identity_rejected:
+        capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
+        providers = list(capsule.get("child_paths", {}))
+        if len(providers) < 2 or providers[0] != "aws":
+            raise ValueError("multi-provider fixture must put AWS first for the source-child negative")
+        provider = providers[0]
+        child_path = Path(repository_root) / capsule["child_paths"][provider]
+        if child_path.is_symlink() or not child_path.is_file():
+            raise ValueError("first provider source child manifest is unavailable")
+        original_child = child_path.read_bytes()
+        original_receipt = receipt_path.read_bytes()
+        try:
+            child_doc = json.loads(original_child)
+            child_doc["run_id"] = "tampered-first-provider-run"
+            child_path.write_text(json.dumps(child_doc, sort_keys=True) + "\n", encoding="utf-8")
+            payload = json.loads(original_receipt)
+            payload["replayed_manifests"]["children"][provider]["sha256"] = hashlib.sha256(
+                child_path.read_bytes()).hexdigest()
+            receipt_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            try:
+                campaign_driver.reconcile_archive(state_root, stage_id, entry_id, receipt_path)
+            except ValueError as exc:
+                if "capsule identity fields" not in str(exc):
+                    raise
+            else:
+                raise ValueError("tampered first-provider child identity was accepted")
+            journal_path = Path(state_root) / stage_id / "campaign-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            if journal["entries"][entry_id].get("state") != "archive_pending_validation":
+                raise ValueError("tampered first-provider child changed the pending journal")
+        finally:
+            child_path.write_bytes(original_child)
+            receipt_path.write_bytes(original_receipt)
     try:
         reconciled = campaign_driver.reconcile_archive(state_root, stage_id,
             entry_id, receipt_path)

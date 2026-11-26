@@ -1134,9 +1134,10 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
             entry["entry_id"], Path(restored["replay_receipt"]["path"]))
         assert reconciled["counts"]["complete"] == 1
         assert reconciled["entries"][entry["entry_id"]]["result"]["archive_validation"] == "valid"
-    elif fault == "invalid_native":
+    elif fault in {"invalid_native", "partial_native"}:
         assert restored["status"] == "replayed_invalid", restored.get("validation")
-        assert restored["validation"][provider]["status"]["data_validity"] == "invalid"
+        expected_data_status = "invalid" if fault == "invalid_native" else "partial"
+        assert restored["validation"][provider]["status"]["data_validity"] == expected_data_status
         # The real restore path still materializes and analyzes the genuine
         # archived native bytes. The driver currently cannot settle this
         # cleanup-closed archive-pending attempt because it treats any invalid
@@ -1173,14 +1174,26 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
                 "replay_capsule": {"status": "archive_pending_replay", "path": str(capsule_path),
                     "sha256": hashlib.sha256(capsule_bytes).hexdigest()}})
         journal_path.write_text(json.dumps(saved), encoding="utf-8")
-        replay_result = tmp_path / "invalid-native-replay-result.json"
-        replay_result.write_text(json.dumps(restored, sort_keys=True), encoding="utf-8")
-        with pytest.raises(ValueError, match="lacks successful cleanup and validation"):
+        receipt_path = Path(restored["replay_receipt"]["path"])
+        tampered_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        tampered_payload["validation"][provider]["result"]["validation_status"]["data_validity"] = "valid"
+        tampered_receipt = tmp_path / "tampered-invalid-native-replay-receipt.json"
+        tampered_receipt.write_text(json.dumps(tampered_payload, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="receipt validation differs from canonical replay"):
             driver.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
-                entry["entry_id"], replay_result)
+                entry["entry_id"], tampered_receipt)
         still_pending = json.loads(journal_path.read_text(encoding="utf-8"))
         assert still_pending["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
         assert _week_dispatch_blocked(still_pending)
+        reconciled = driver.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+            entry["entry_id"], receipt_path)
+        terminal = reconciled["entries"][entry["entry_id"]]
+        assert terminal["state"] == "failed"
+        assert terminal["result"]["archive_validation"] == "invalid"
+        assert terminal["result"]["archive_validation_results"][provider]["data_validity"] == expected_data_status
+        assert terminal["result"]["archive_replay_receipt_sha256"] == hashlib.sha256(
+            receipt_path.read_bytes()).hexdigest()
+        assert not _week_dispatch_blocked(reconciled)
     for path in root.rglob("*"):
         if path.is_file() and not path.is_symlink() and path.relative_to(root) not in original_context:
             path.unlink()
@@ -1196,6 +1209,7 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
 @pytest.mark.parametrize(("context_name", "full_native", "late_tail", "expected_validity", "region", "archive_fault"), [
     ("failure_check", False, False, "partial", "eu-central-1", None),
     ("failure_check", True, False, "partial", "eu-central-1", None),
+    ("failure_check", True, False, "partial", "eu-north-1", "partial_native"),
     ("failure_check", True, True, "valid", "eu-central-1", None),
     ("failure_check", True, True, "valid", "eu-north-1", None),
     ("failure_check", True, True, "valid", "eu-north-1", "invalid_native"),
@@ -1224,11 +1238,12 @@ def test_actual_f11_reserve_then_aws_protect_claim_provision_and_cleanup_fake_on
     # Keep real implementation identity for the staged-source guard. Only the
     # design identity belongs to this explicitly synthetic, cloud-free fixture.
     from cloud_network_benchmark.manifests import StaticGitProvenance
-    archive_roundtrip = (full_native and late_tail and expected_validity == "valid"
-        and region == "eu-north-1" and archive_fault in {None, "invalid_native", "missing_part",
-            "mutated_part", "wrong_generation", "nested_stage", "nested_stage_prune",
-            "reconcile_campaign", "prune_and_reconcile",
-            "quota_underflow"})
+    archive_roundtrip = (full_native and region == "eu-north-1" and (
+        (not late_tail and expected_validity == "partial" and archive_fault == "partial_native")
+        or (late_tail and expected_validity == "valid" and archive_fault in {
+            None, "invalid_native", "missing_part", "mutated_part", "wrong_generation",
+            "nested_stage", "nested_stage_prune", "reconcile_campaign", "prune_and_reconcile",
+            "quota_underflow"})))
     if archive_roundtrip:
         import shutil
         results_root = (repository_root / "results" / "nested-stage"

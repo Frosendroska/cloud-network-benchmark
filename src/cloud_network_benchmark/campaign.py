@@ -407,13 +407,13 @@ def _week_replay_quota_paths(runtime: dict[str, Any], stage: dict[str, Any],
 
 
 def _replay_payload_from_receipt(path: Path, expected_sha256: str) -> int:
-    """Read previously allocated replay payload only from its bound successful receipt."""
+    """Read allocated replay payload only from a bound terminal replay receipt."""
     if path.is_symlink() or not path.is_file() or _digest(path) != expected_sha256:
         raise ValueError("previous WEEK replay receipt is missing or changed")
     payload = json.loads(path.read_text(encoding="utf-8"))
     projection = payload.get("storage_projection")
-    if payload.get("status") != "replayed" or not isinstance(projection, dict):
-        raise ValueError("previous WEEK replay lacks successful quota projection evidence")
+    if payload.get("status") not in {"replayed", "replayed_invalid"} or not isinstance(projection, dict):
+        raise ValueError("previous WEEK replay lacks terminal quota projection evidence")
     raw = projection.get("raw_bytes")
     compressed = projection.get("compressed_archive_bytes")
     copies = projection.get("raw_copy_count_at_peak")
@@ -1286,8 +1286,8 @@ class CampaignDriver:
                 if child.reservation.value != reservation:
                     raise ValueError("replayed child manifest reservation differs from the capsule")
                 if (child.execution_state != "succeeded" or child.cleanup_state != "succeeded"
-                        or child.validation_status.data_validity != "valid"):
-                    raise ValueError("replayed child manifest lacks successful cleanup and validation")
+                        or str(child.validation_status.data_validity) not in {"valid", "partial", "invalid"}):
+                    raise ValueError("replayed child manifest lacks successful execution, cleanup, or a terminal data validation")
                 archive = capsule_doc["archives"][provider]
                 if child.run_id != run_id or archive.get("run_id") != run_id or str(child.provider) != provider:
                     raise ValueError("capsule run/provider identity differs from the prepared campaign")
@@ -1312,10 +1312,11 @@ class CampaignDriver:
             observed_archives = {provider: {"manifest_sha256": item.get("manifest_sha256"),
                 "completion_generation": item.get("completion_generation")}
                 for provider, item in payload.get("archives", {}).items()}
-            if (payload.get("status") != "replayed" or payload.get("capsule_sha256") != capsule_ref.get("sha256")
+            if (payload.get("status") not in {"replayed", "replayed_invalid"}
+                    or payload.get("capsule_sha256") != capsule_ref.get("sha256")
                     or observed_archives != expected_archives or set(validations) != set(run_ids)
                     or payload.get("analysis", {}).get("status") != "completed"):
-                raise ValueError("receipt does not bind successful replay and analysis to this capsule")
+                raise ValueError("receipt does not bind terminal replay and analysis to this capsule")
             # Re-run the canonical validator over its saved typed inputs and compare the
             # exact persisted/receipt result. Status strings alone never close a journal entry.
             from .contracts.validation import ValidatorInput, ValidationResult
@@ -1340,7 +1341,9 @@ class CampaignDriver:
                         or validator_input.config_sha256 != child.config_provenance.sha256
                         or validator_input.execution_state != "succeeded"
                         or validator_input.cleanup_state != "succeeded"
-                        or saved.run_id != run_id or saved.validation_status.data_validity != "valid"):
+                        or saved.run_id != run_id
+                        or str(saved.validation_status.data_validity) not in {"valid", "partial", "invalid"}
+                        or child.validation_status != saved.validation_status):
                     raise ValueError("saved validator input/result identity or validity differs from the source child")
                 closed_inventory = RetrievalManifest.model_validate(
                     capsule_doc["archives"][provider]["manifest"]["closed_inventory"])
@@ -1390,6 +1393,11 @@ class CampaignDriver:
                 if differences:
                     raise ValueError("receipt validation differs from canonical replay of saved native evidence: "
                         + ", ".join(differences))
+            invalid_providers = {provider for provider, value in saved_results.items()
+                if str(value.validation_status.data_validity) != "valid"}
+            expected_replay_status = "replayed_invalid" if invalid_providers else "replayed"
+            if payload.get("status") != expected_replay_status:
+                raise ValueError("receipt terminal status differs from canonical native validation")
             analysis = payload["analysis"]
             for path_key, hash_key in (("selection_path", "selection_sha256"), ("report_path", "report_sha256")):
                 artifact = Path(analysis.get(path_key, ""))
@@ -1406,11 +1414,21 @@ class CampaignDriver:
                 runtime = load_runtime_config(Path(entry["runtime_config_path"]))
                 if not _week_ledger_settled(runtime, capsule_ref, entry, stage):
                     raise ValueError("WEEK financial cleanup evidence changed during archive reconciliation")
+            validation_rows = {provider: value.validation_status.model_dump(mode="json")
+                for provider, value in saved_results.items()}
             reconciled_result = {**prior, "archive_replay_receipt": str(receipt.resolve()),
-                "archive_replay_receipt_sha256": _digest(receipt), "archive_validation": "valid"}
+                "archive_replay_receipt_sha256": _digest(receipt),
+                "archive_validation": "invalid" if invalid_providers else "valid",
+                "archive_validation_results": validation_rows}
             reconciled_result.pop("ledger_reconciliation_required", None)
             record["result"] = reconciled_result
-            record.update(state="complete", finished_at=_now(self.clock).isoformat(), error=None)
+            if invalid_providers:
+                descriptions = [f"{provider}={saved_results[provider].validation_status.data_validity}"
+                    for provider in sorted(invalid_providers)]
+                record.update(state="failed", finished_at=_now(self.clock).isoformat(),
+                    error="native archive validation is non-valid: " + ", ".join(descriptions))
+            else:
+                record.update(state="complete", finished_at=_now(self.clock).isoformat(), error=None)
             if record.get("blocked_reason") == "ledger_reconciliation_required":
                 record.pop("blocked_reason", None)
             _write_json(journal_path, journal)
@@ -1426,7 +1444,8 @@ class CampaignDriver:
         attempted_payloads: dict[str, int] = {}
         for saved in journal["entries"].values():
             saved_result = saved.get("result") or {}
-            if saved.get("state") != "complete" or saved_result.get("archive_validation") != "valid":
+            if (saved.get("state") not in {"complete", "failed"}
+                    or saved_result.get("archive_validation") not in {"valid", "invalid"}):
                 continue
             try:
                 replay_payload_used += _replay_payload_from_receipt(
@@ -1514,12 +1533,12 @@ class CampaignDriver:
                 receipt_path = (Path(sink["staging_directory"]) / "week-replay" / work_id
                     / "replay-receipts" / f"{capsule_digest}.json")
                 if receipt_path.exists():
-                    # A successful replay may have committed its receipt just before
+                    # A terminal replay may have committed its receipt just before
                     # controller loss. Reconcile that exact immutable receipt; never
                     # run restore/finalize a second time or overwrite its outputs.
                     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-                    if payload.get("status") != "replayed":
-                        raise ValueError("existing archive replay receipt is not successful")
+                    if payload.get("status") not in {"replayed", "replayed_invalid"}:
+                        raise ValueError("existing archive replay receipt has no terminal native validation")
                     expected_prior = attempted_prior.get(entry_id, replay_payload_used)
                     if result.get("prior_replay_payload_bytes") != expected_prior:
                         raise ValueError("existing replay receipt was attempted against a different shared quota allocation")
@@ -1560,8 +1579,8 @@ class CampaignDriver:
                     if not Path(receipt_path).is_file() or Path(receipt_path).is_symlink():
                         raise ValueError("archive replay did not produce its exclusive receipt")
                     payload = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
-                    if payload.get("status") != "replayed":
-                        raise ValueError("archive replay did not complete native validation and analysis")
+                    if payload.get("status") not in {"replayed", "replayed_invalid"}:
+                        raise ValueError("archive replay did not complete terminal native validation and analysis")
                 current_payload_bytes = _replay_payload_from_receipt(
                     Path(receipt_path), _digest(Path(receipt_path)))
                 self._reconcile_archive(stage["state_root"], stage["stage_id"], entry_id,

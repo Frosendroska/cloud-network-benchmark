@@ -164,6 +164,18 @@ def test_factory_generated_week_fresh_low_user_quota_stops_before_paid_launch(
         and saved["entries"][entry["entry_id"]]["result"]["provider_calls"] == 0
         for entry in stage["entries"])
     assert outcome["counts"]["missed"] == 4
+def test_terminal_invalid_replay_receipt_keeps_its_shared_quota_allocation(tmp_path):
+    from cloud_network_benchmark.campaign import _replay_payload_from_receipt
+
+    receipt = tmp_path / "invalid-replay-receipt.json"
+    receipt.write_text(json.dumps({"status": "replayed_invalid", "storage_projection": {
+        "raw_bytes": 10, "compressed_archive_bytes": 5,
+        "raw_copy_count_at_peak": 4, "payload_bytes": 45}}), encoding="utf-8")
+    assert _replay_payload_from_receipt(receipt, hashlib.sha256(receipt.read_bytes()).hexdigest()) == 45
+
+    receipt.write_text(json.dumps({"status": "replayed_invalid"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="terminal quota projection"):
+        _replay_payload_from_receipt(receipt, hashlib.sha256(receipt.read_bytes()).hexdigest())
 
 
 def test_replay_admission_precedes_backend_and_sealed_export_stays_verified(tmp_path, monkeypatch):

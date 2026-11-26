@@ -1021,7 +1021,8 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
                 maximum_part_bytes=archive_sink["maximum_staging_bytes"],
                 evaluated_at=lifecycle_clock.utc_now(), campaign_driver=driver,
                 state_root=Path(stage["state_root"]), stage_id=stage["stage_id"],
-                entry_id=entry["entry_id"])
+                entry_id=entry["entry_id"],
+                assert_first_provider_identity_rejected=(entry is stage["entries"][0]))
         except BaseException:
             evidence = tmp_path / f"replay-failure-results-{entry['entry_id']}"
             shutil.copytree(stage_results, evidence)
