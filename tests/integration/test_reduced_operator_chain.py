@@ -5,6 +5,8 @@ exists only below pytest's temporary directory. It cannot authorize live use.
 """
 from __future__ import annotations
 
+import pytest
+
 import hashlib
 import json
 import shutil
