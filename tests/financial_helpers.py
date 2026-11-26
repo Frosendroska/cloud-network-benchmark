@@ -19,6 +19,54 @@ def save(path, value):
     return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def synthetic_o2_amendment(path):
+    """Write a non-authorizing fixture for the O2 schema; never real approval."""
+    from cloud_network_benchmark import financial_controls as controls
+    return save(path, {
+        'schema_version': 1,
+        'kind': 'genuine-human-o2-budget-amendment',
+        'evidence_id': controls._O2_EVIDENCE_ID,
+        'approved_by': 'Katya',
+        'first_observed_at_utc': controls._O2_FIRST_OBSERVED,
+        'approved_pending_card': {
+            'path': 'tracking/approvals/PRE_DAY_APPROVAL_CARD_O2_FINANCIAL_UNBLOCK.md',
+            'sha256': controls._O2_PENDING_CARD_SHA256,
+        },
+        'limits': dict(controls._O2_LIMITS),
+        'scope': dict(controls._O2_SCOPE),
+        'supersedes_policy_source': {
+            'path': '/u/halle/brek/home_at/cnb/private/pre-day-release-20261122/fixed-batch-KoPvIO/protected-compact/overnight-acceptance-O2-20261126/genuine-human-budget-amendment-O2-01.json',
+            'sha256': controls._O2_SUPERSEDED_AMENDMENT_SHA256,
+        },
+        'change': {
+            'increase_from_interim_302_eur': '98',
+            'increase_from_original_chair_300_eur': '100',
+            'new_attempts_authorized_by_this_update': 0,
+            'new_reserve_release_authorized_eur': '0',
+            'new_whole_thesis_and_cash_ceiling_eur': '400',
+            'not_an_instruction_to_launch': True,
+            'prior_whole_thesis_and_cash_ceiling_eur': '302',
+        },
+        'source_message': {
+            'raw_message_sha256': 'b111f2c0c080aeda30a021833f4802916ddd20c4a2245e5c86562ded06050813',
+            'thread_id': '01a20d07-cdde-7dd0-bbc2-314c1c37dc1f',
+            'turn_id': '01a21754-0e00-72c3-b96e-878d1119e8a8',
+            'verification': 'Direct human userMessage read with Codex read_thread, not another agent assertion',
+        },
+        'dispatch_authorized_now': False,
+        'financial_authorization_materialized': False,
+        'funding_applied': False,
+        'ledger_mutated': False,
+        'reserve_applied': False,
+        'raw_user_message': 'SYNTHETIC TEST FIXTURE ONLY',
+        'interpretation': 'SYNTHETIC TEST FIXTURE ONLY',
+        'user_reported_billing': {
+            'overnight_dashboard_spend_report': 'SYNTHETIC',
+            'status': 'user_observation_not_final_invoice_or_VM_absence_proof',
+        },
+    })
+
+
 def synthetic_finances(tmp_path, count=1, *, paid=False):
     campaign, _ = resolve_campaign(ROOT/'configs/tests/exp-903-three-provider-smoke.yaml', ROOT)
     base = load_cost_inputs(ROOT/'tests/fixtures/f11/cost-inputs.json')

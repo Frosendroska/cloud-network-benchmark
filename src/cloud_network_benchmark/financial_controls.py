@@ -163,12 +163,136 @@ class FinancialAuthorization(StrictModel):
     price: CheckedSource
     fx: FxQuote
     external_liabilities: CheckedSource
+    # Optional so historical EUR 300 cards and stored snapshots keep their
+    # original shape and meaning. Elevated ceilings require this exact source.
+    financial_policy_amendment: Source | None = None
     # No defaults, credit/receipt offsets, or recommendation-derived permission.
     other_gross_eur: str
     other_personal_cash_eur: str
     fx_card_fee_rate: str
     fixed_fees_eur: str
     funding_treatment: Literal['full-personal-cash-no-offsets']
+
+
+_O2_AMENDMENT_SHA256 = '6c2253bfc2e92714289a6932d1e9061f785931b5328e922027122965f58cf0e1'
+_O2_SUPERSEDED_AMENDMENT_SHA256 = '5749cf6af58af9182e2a0df56b6cfe222b8b34d3cd9b099afab95c34e350d807'
+_O2_EVIDENCE_ID = 'user-cross-chat-message-01a21754-0e00-72c3-b96e-878d1119e8a8'
+_O2_FIRST_OBSERVED = '2026-11-26T10:08:34Z'
+_O2_PENDING_CARD_SHA256 = 'a61b9bc0fdedb526459218aab3ada6c0d5974611aec46a84847c1cb6120fc6a4'
+_O2_POLICY_END = datetime(2026, 11, 27, 7, 0, tzinfo=timezone.utc)
+_O2_LATEST_DISPATCH = datetime(2026, 11, 27, 5, 45, tzinfo=timezone.utc)
+_O2_FIXED_FAMILY_BATCH_ID = 'fixed-pre-day-v1'
+_O2_LIMITS = {
+    'whole_thesis_ceiling_eur': '400', 'cumulative_personal_cash_ceiling_eur': '400',
+    'new_batch_ceiling_eur': '16', 'fixed_family_combined_ceiling_eur': '233',
+    'overall_new_exposure_ceiling_eur': '48',
+    'remaining_additional_reserve_release_ceiling_eur': '13',
+    'maximum_cumulative_reserve_release_eur': '50',
+    'protected_after_maximum_release_eur': '0', 'additional_attempt_count': 1,
+    'policy_valid_until_utc': '2026-11-27T07:00:00Z',
+    'latest_dispatch_utc': '2026-11-27T05:45:00Z',
+    'chair_allowance_eur': '300', 'additional_personal_exposure_eur': '100',
+    'reimbursement_assumed': False,
+}
+_O2_SCOPE = {
+    'cases': ['S1', 'S3'], 'clouds': ['aws', 'azure', 'gcp'],
+    'later_exact_source_bound_card_required': True,
+    'new_guard_and_complete_operator_qualification_required': True,
+    'no_day_week': True, 'no_deliberate_failure_tests': True,
+    'no_paid_cal': True, 'no_pilots': True,
+    'original_caps_receipts_cleanup_native_and_gcs_preserved': True,
+    'simultaneous': True,
+}
+
+
+def _validate_o2_amendment(card: FinancialAuthorization, *, now: datetime,
+                           end: datetime, existing_authorization: bool = False) -> Source:
+    ref = card.financial_policy_amendment
+    if ref is None:
+        raise FinancialError('financial_ceiling_exceeded')
+    if ref.sha256 != _O2_AMENDMENT_SHA256:
+        raise FinancialError('financial_amendment_invalid')
+    payload = ref.json()
+    if (payload.get('schema_version') != 1
+            or payload.get('kind') != 'genuine-human-o2-budget-amendment'
+            or payload.get('evidence_id') != _O2_EVIDENCE_ID
+            or payload.get('approved_by') != 'Katya'
+            or payload.get('approved_pending_card') != {
+                'path': 'tracking/approvals/PRE_DAY_APPROVAL_CARD_O2_FINANCIAL_UNBLOCK.md',
+                'sha256': _O2_PENDING_CARD_SHA256}
+            or payload.get('limits') != _O2_LIMITS
+            or payload.get('scope') != _O2_SCOPE
+            or payload.get('supersedes_policy_source') != {
+                'path': '/u/halle/brek/home_at/cnb/private/pre-day-release-20261122/fixed-batch-KoPvIO/protected-compact/overnight-acceptance-O2-20261126/genuine-human-budget-amendment-O2-01.json',
+                'sha256': _O2_SUPERSEDED_AMENDMENT_SHA256}
+            or payload.get('change') != {
+                'increase_from_interim_302_eur': '98',
+                'increase_from_original_chair_300_eur': '100',
+                'new_attempts_authorized_by_this_update': 0,
+                'new_reserve_release_authorized_eur': '0',
+                'new_whole_thesis_and_cash_ceiling_eur': '400',
+                'not_an_instruction_to_launch': True,
+                'prior_whole_thesis_and_cash_ceiling_eur': '302'}
+            or payload.get('source_message') != {
+                'raw_message_sha256': 'b111f2c0c080aeda30a021833f4802916ddd20c4a2245e5c86562ded06050813',
+                'thread_id': '01a20d07-cdde-7dd0-bbc2-314c1c37dc1f',
+                'turn_id': '01a21754-0e00-72c3-b96e-878d1119e8a8',
+                'verification': 'Direct human userMessage read with Codex read_thread, not another agent assertion'}
+            or payload.get('dispatch_authorized_now') is not False
+            or payload.get('financial_authorization_materialized') is not False
+            or payload.get('funding_applied') is not False
+            or payload.get('ledger_mutated') is not False
+            or payload.get('reserve_applied') is not False
+            or payload.get('user_reported_billing', {}).get('status')
+                != 'user_observation_not_final_invoice_or_VM_absence_proof'):
+        raise FinancialError('financial_amendment_invalid')
+    first_observed = stamp(datetime.fromisoformat(payload['first_observed_at_utc'].replace('Z', '+00:00')))
+    now, end = stamp(now), stamp(end)
+    if (first_observed != stamp(datetime.fromisoformat(_O2_FIRST_OBSERVED.replace('Z', '+00:00')))
+            or first_observed > now
+            or (not existing_authorization and now > _O2_LATEST_DISPATCH)
+            or now > _O2_POLICY_END or end > _O2_POLICY_END
+            or stamp(card.valid_until) > _O2_POLICY_END):
+        raise FinancialError('financial_authorization_expired')
+    if (card.approved_at < first_observed
+            or ceiling(card.caps.project_eur) > Decimal('400')
+            or ceiling(card.caps.personal_cash_eur) > Decimal('400')
+            or ceiling(card.caps.working_eur) > Decimal('302')
+            or ceiling(card.caps.run_eur) > Decimal('8')
+            or ceiling(card.caps.batch_eur) > Decimal('233')
+            or ceiling(card.caps.stage_eur) > Decimal('16')):
+        raise FinancialError('financial_ceiling_exceeded')
+    entries = card.entries
+    starts = {row.get('scheduled_start') for row in entries}
+    if (card.batch_id != _O2_FIXED_FAMILY_BATCH_ID
+            or len(entries) != 2 or card.approved_run_count != 6
+            or {row.get('priority') for row in entries} != {'P0', 'P1'}
+            or {row.get('mode') for row in entries} != {'acceptance'}
+            or len(starts) != 1
+            or len({row.get('campaign_id') for row in entries}) != 2
+            or any(row.get('lifetime_cap_seconds') != 4200
+                   or set(row.get('run_ids', {})) != {'aws', 'azure', 'gcp'}
+                   or len(set(row.get('run_ids', {}).values())) != 3
+                   for row in entries)
+            or len({run for row in entries for run in row['run_ids'].values()}) != 6):
+        raise FinancialError('financial_scope_mismatch')
+    return ref
+
+
+def _validate_o2_batch_identity(prior_financials: list[Mapping[str, Any]],
+                                snapshot: Mapping[str, Any]) -> None:
+    amendment = snapshot.get('financial_policy_amendment')
+    if amendment is None:
+        return
+    current_authority = snapshot.get('authority', {}).get('sha256')
+    for prior in prior_financials:
+        previous_amendment = prior.get('financial_policy_amendment')
+        if (isinstance(previous_amendment, Mapping)
+                and previous_amendment.get('sha256') == amendment.get('sha256')
+                and (prior.get('authority', {}).get('sha256') != current_authority
+                     or prior.get('batch_id') != snapshot.get('batch_id')
+                     or prior.get('stage_id') != snapshot.get('stage_id'))):
+            raise FinancialError('financial_amendment_batch_consumed')
 
 
 def transfer_terms(envelope: Mapping[str, Any]) -> tuple[int, int]:
@@ -253,7 +377,8 @@ def _read_authority(reference: Mapping[str, Any]) -> tuple[Source, FinancialAuth
 
 def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, Any],
                        scope_id: str, now: datetime, end: datetime,
-                       quote_freshness_at: datetime | None = None) -> tuple[Source, FinancialAuthorization]:
+                       quote_freshness_at: datetime | None = None,
+                       existing_authorization: bool = False) -> tuple[Source, FinancialAuthorization]:
     source, card = _read_authority(reference)
     now, end = stamp(now), stamp(end)
     if quote_freshness_at is not None and not (stamp(card.valid_from) <= stamp(quote_freshness_at) <= now):
@@ -285,8 +410,12 @@ def validate_authority(reference: Mapping[str, Any], *, binding: Mapping[str, An
     if not providers <= set(card.caps.providers_eur):
         raise FinancialError('financial_scope_mismatch')
     caps = card.caps
-    if (ceiling(caps.project_eur) > 300
-            or ceiling(caps.working_eur) + liability(caps.protected_eur) > ceiling(caps.project_eur)):
+    if card.financial_policy_amendment is not None:
+        _validate_o2_amendment(card, now=now, end=end,
+                               existing_authorization=existing_authorization)
+    elif ceiling(caps.project_eur) > 300:
+        raise FinancialError('financial_ceiling_exceeded')
+    if ceiling(caps.working_eur) + liability(caps.protected_eur) > ceiling(caps.project_eur):
         raise FinancialError('financial_ceiling_exceeded')
     for value in caps.providers_eur.values():
         ceiling(value)
@@ -352,6 +481,8 @@ def validate_paid_financial_plan(plan: Any, request: Any, *, scope_id: str, now:
             'gross_eur': str(gross), 'cash_eur': str(gross), 'providers_eur': by_provider,
             'external_gross_eur': str(liability(card.other_gross_eur)),
             'external_cash_eur': str(liability(card.other_personal_cash_eur)), 'scope_id': scope_id}
+        if card.financial_policy_amendment is not None:
+            snapshot['financial_policy_amendment'] = card.financial_policy_amendment.model_dump()
         if plan.execution_scope == 'paid_request':
             require_transfer_capability(plan.cost_envelopes)
         return snapshot
@@ -371,11 +502,15 @@ def has_explicit_eur_reserve_release(snapshot: Mapping[str, Any] | None, *, now:
         source = Source.model_validate(snapshot['authority'])
         card = FinancialAuthorization.model_validate(source.json())
         caps = Caps.model_validate(snapshot['caps'])
+        if card.financial_policy_amendment is not None:
+            _validate_o2_amendment(card, now=now, end=now)
+        elif ceiling(caps.project_eur) > Decimal('300'):
+            return False
         return (snapshot.get('scope_id') == card.ledger_scope_id
                 and caps == card.caps
                 and stamp(card.approved_at) <= stamp(now)
                 and stamp(card.valid_from) <= stamp(now) < stamp(card.valid_until)
-                and ceiling(caps.project_eur) <= Decimal('300')
+                and ceiling(caps.project_eur) <= Decimal('400')
                 and ceiling(caps.working_eur) + liability(caps.protected_eur)
                 <= ceiling(caps.project_eur)
                 and ceiling(caps.working_eur) > Decimal('250')
@@ -400,6 +535,7 @@ def check_shared_finances(state: dict, snapshot: dict, *, remaining_usd: Decimal
     for record in records:
         validate_stored_commitment(record, scope_id=state['scope_id'])
     all_prior = [r['financial'] for r in records]
+    _validate_o2_batch_identity(all_prior, snapshot)
     prior_records = [r for r in records if r.get('financial_terminal_state') != 'cancelled_unused']
     prior = [r['financial'] for r in prior_records]
     records = [r for r in records if r.get('financial_terminal_state') != 'cancelled_unused']
@@ -538,7 +674,7 @@ def revalidate_financial_record(record: dict, *, state: dict, now: datetime, end
                 default=stamp(datetime.fromisoformat(record['evidence']['cap_started_at']['value']))))
         validate_authority({'source_path': source['path'], 'source_sha256': source['sha256']},
             binding=financial['binding'], scope_id=financial['scope_id'], now=now, end=end,
-            quote_freshness_at=launch_at)
+            quote_freshness_at=launch_at, existing_authorization=True)
         if (state.get('cleanup_blocked') and not existing_retrieval) or state.get('budget_blocked'):
             raise FinancialError('financial_outstanding_liability')
         # Existing records already include this reservation: add no new exposure.

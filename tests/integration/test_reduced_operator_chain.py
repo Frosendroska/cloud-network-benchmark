@@ -97,7 +97,37 @@ class _ActualCliPopenBoundary:
                     process.returncode = lifecycle_main(arguments[1:], run_clock=self.run_clock)
                 else:
                     from cloud_network_benchmark.campaign_supervisor import main as supervisor_main
-                    process.returncode = supervisor_main(arguments)
+                    from cloud_network_benchmark import campaign as campaign_module
+                    production_driver = campaign_module.CampaignDriver
+                    production_datetime = campaign_module.datetime
+                    run_clock = self.run_clock
+
+                    class ClockBoundCampaignDriver(production_driver):
+                        def __init__(self, *driver_args, **driver_kwargs):
+                            driver_kwargs.setdefault("clock", run_clock)
+                            driver_kwargs.setdefault("sleep", run_clock.sleep)
+                            super().__init__(*driver_args, **driver_kwargs)
+
+                    class ClockBoundDateTimeMeta(type):
+                        def __instancecheck__(cls, instance):
+                            return isinstance(instance, production_datetime)
+
+                    class ClockBoundDateTime(production_datetime, metaclass=ClockBoundDateTimeMeta):
+                        @classmethod
+                        def now(cls, tz=None):
+                            value = run_clock.utc_now()
+                            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+                    # The real detached CLI uses the same synthetic clock as
+                    # the intercepted lifecycle CLI; production defaults stay
+                    # untouched and both execute the production driver logic.
+                    campaign_module.CampaignDriver = ClockBoundCampaignDriver
+                    campaign_module.datetime = ClockBoundDateTime
+                    try:
+                        process.returncode = supervisor_main(arguments)
+                    finally:
+                        campaign_module.CampaignDriver = production_driver
+                        campaign_module.datetime = production_datetime
             except BaseException:
                 captured.write(traceback.format_exc())
                 process.returncode = 1
@@ -349,7 +379,8 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     from cloud_network_benchmark.admission import load_cost_inputs
     from cloud_network_benchmark.validation_profiles import ACCEPTANCE_PROFILE, FAILURE_PROFILE
     from tests.integration.test_campaign_admission import Clock, operator_settings
-    from tests.financial_helpers import synthetic_finances
+    from tests.financial_helpers import synthetic_finances, synthetic_o2_amendment
+    from cloud_network_benchmark import financial_controls
 
     production_common_n = campaign_inputs._common_n
     production_binary_lookup = shutil.which
@@ -392,7 +423,16 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
                 "diagnostic_day_authorized", "study_window"):
         settings["approvals"].pop(key, None)
 
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    # Keep the synthetic authorization inside O2's historical dispatch window;
+    # no wall-clock time is used as a live readiness or dispatch claim.
+    now = datetime(2026, 11, 26, 22, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(Clock, "__init__", lambda self: setattr(self, "now", now))
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = now if tz is not None else now.replace(tzinfo=None)
+            return value.astimezone(tz) if tz is not None else value
+    monkeypatch.setattr(campaign_inputs, "datetime", FrozenDateTime)
     lower = (now - timedelta(minutes=1)).isoformat()
     window = {"not_before_utc": lower,
         "not_after_utc": (now + timedelta(hours=5)).isoformat()}
@@ -420,8 +460,8 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         execution_window_utc=window, dispatch_window_utc=dict(window))
     settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
     reserve_request = {"status": "pending", "currency": "EUR",
-        "prior_release_eur": "29", "additional_release_eur": "8",
-        "cumulative_release_eur": "37"}
+        "prior_release_eur": "37", "additional_release_eur": "13",
+        "cumulative_release_eur": "50"}
     settings["pricing"]["pending_eur_reserve_release"] = reserve_request
     settings["pricing"]["funding"].update(primary="230", replacements="0", tax="20",
         uncertainty="25", total_limit="300", working_limit="250", protected_buffer="50")
@@ -470,15 +510,15 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     auth_root = tmp_path / "synthetic-authority"
     auth_root.mkdir()
     _ledger, _plans, card, card_path = synthetic_finances(auth_root, count=2, paid=True)
-    valid_until = now + timedelta(days=30)
-    card.update(batch_id="reduced-acceptance-offline-v1", stage_id=stage["stage_id"],
+    valid_until = datetime(2026, 11, 27, 7, 0, tzinfo=timezone.utc)
+    card.update(batch_id="fixed-pre-day-v1", stage_id=stage["stage_id"],
         ledger_scope_id=stage["scope_id"], approved_by="SYNTHETIC-OFFLINE-TEST",
         approved_at=now.isoformat(), valid_from=(now - timedelta(minutes=1)).isoformat(),
         valid_until=valid_until.isoformat(), approved_run_count=6,
         entries=[value for _entry, value in bindings])
-    card["caps"].update(project_eur="300", working_eur="287", protected_eur="13",
-        personal_cash_eur="287", run_eur="8", batch_eur="16", stage_eur="16",
-        providers_eur={provider: "8" for provider in ("aws", "azure", "gcp")})
+    card["caps"].update(project_eur="400", working_eur="302", protected_eur="0",
+        personal_cash_eur="400", run_eur="8", batch_eur="233", stage_eur="16",
+        providers_eur={provider: "16" for provider in ("aws", "azure", "gcp")})
     cost_file = Path(stage["cost_input_path"])
     from cloud_network_benchmark.admission import load_cost_inputs
     costs_hash = load_cost_inputs(cost_file).payload_sha256
@@ -495,29 +535,48 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         source_path.write_text(json.dumps(source, sort_keys=True) + "\n")
         reference.update(sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
             checked_at=now.isoformat(), valid_until=valid_until.isoformat())
+    private_policy_path = os.environ.get("CNB_O2_PRIVATE_POLICY_PATH")
+    if private_policy_path:
+        private_policy = Path(private_policy_path)
+        if (not private_policy.is_absolute() or private_policy.is_symlink()
+                or not private_policy.is_file()):
+            raise AssertionError("configured O2 policy source must be an existing absolute non-symlink file")
+        amendment_ref = {"path": str(private_policy),
+            "sha256": hashlib.sha256(private_policy.read_bytes()).hexdigest()}
+        if amendment_ref["sha256"] != financial_controls._O2_AMENDMENT_SHA256:
+            raise AssertionError("configured O2 policy source does not match the production pin")
+    else:
+        amendment_ref = synthetic_o2_amendment(auth_root / "SYNTHETIC-O2-policy.json")
+        # Public offline fixture mode remains explicitly synthetic; private
+        # native qualification sets CNB_O2_PRIVATE_POLICY_PATH and keeps the
+        # production SHA pin unchanged.
+        monkeypatch.setattr(financial_controls, "_O2_AMENDMENT_SHA256", amendment_ref["sha256"])
+    card["financial_policy_amendment"] = amendment_ref
+    # Exercise the production financial validator against the genuine native
+    # EUR400 source as a negative boundary: the overall cap rose, but existing
+    # working headroom did not. The normal card below uses the approved EUR302.
+    over_working = copy.deepcopy(card)
+    over_working["caps"]["working_eur"] = "303"
+    over_working_path = auth_root / "SYNTHETIC-O2-over-working-cap.json"
+    over_working_path.write_text(json.dumps(over_working, sort_keys=True) + "\n")
+    over_working_ref = {"source_path": str(over_working_path),
+        "source_sha256": hashlib.sha256(over_working_path.read_bytes()).hexdigest()}
+    try:
+        financial_controls.validate_authority(over_working_ref, binding=bindings[0][1],
+            scope_id=stage["scope_id"], now=now, end=now + timedelta(seconds=4200))
+    except financial_controls.FinancialError as exc:
+        assert exc.reason == "financial_ceiling_exceeded"
+    else:
+        raise AssertionError("EUR400 policy must reject working headroom above the retained EUR302 allocation")
     card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
-    prior_card = copy.deepcopy(card)
-    prior_card["caps"].update(project_eur="300", working_eur="279", protected_eur="21",
-        personal_cash_eur="279", batch_eur="279", stage_eur="279")
-    prior_card["approved_at"] = (now - timedelta(days=10)).isoformat()
-    prior_card["valid_from"] = (now - timedelta(days=10)).isoformat()
-    prior_card["valid_until"] = (now - timedelta(days=1)).isoformat()
-    prior_card_path = auth_root / "SYNTHETIC-pinned-prior-EUR29.json"
-    prior_card_path.write_text(json.dumps(prior_card, sort_keys=True) + "\n")
-    prior_hash = hashlib.sha256(prior_card_path.read_bytes()).hexdigest()
-    # The exact pinned historical card is represented by an explicit test-only
-    # typed fixture. Production still requires its compiled SHA-256 pin.
-    monkeypatch.setattr(campaign_inputs, "_EUR29_AUTHORITY_SHA256", prior_hash)
-    settings["approvals"]["prior_paid_authorization"] = {"confirmed": True,
-        "source": str(prior_card_path), "sha256": prior_hash}
     settings["approvals"]["paid_authorization"] = {"confirmed": True,
         "source": str(card_path), "sha256": hashlib.sha256(card_path.read_bytes()).hexdigest()}
 
     # Preserve the canonical $300/$250/$50 raw USD labels while using the
-    # source-bound synthetic EUR 37 cumulative card only for offline admission.
+    # source-bound synthetic EUR 400 O2 card only for offline admission.
     # Launch readiness and live financial authority remain out of scope.
     bundle_path = Path(settings["state_root"]) / "operator-chain-draft.json"
-    create_draft_bundle(plan={"batch_id": "reduced-acceptance-offline-v1"},
+    create_draft_bundle(plan={"batch_id": "fixed-pre-day-v1"},
         stages=[stage], output_path=bundle_path,
         missing_prerequisites={stage["stage_id"]: ["paid_authorization"]},
         preparer=prepare_stage)
@@ -537,7 +596,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     aux_decision = tmp_path / "SYNTHETIC-AZURE-CLEANUP-DECISION.md"
     aux_decision.write_text("SYNTHETIC OFFLINE ONLY; no Azure cleanup authority.\n")
     aux_card_path = Path(stage["approval_refs"]["azure_shared_cleanup"])
-    synthetic_now = datetime.now(timezone.utc).replace(microsecond=0)
+    synthetic_now = now
     aux_card = {"schema_version": 1, "approval_status": "approved",
         "action": "delete_exact_auto_created_network_watcher_and_empty_parent",
         "profile": aux_scope["profile"], "cohort_id": aux_scope["cohort_id"],
@@ -594,12 +653,12 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
 
     # The two provider fixtures share one bounded high-water clock based on
     # the current instant. Provider/module-local clock adapters stay local.
-    bounded_now = datetime.now(timezone.utc).replace(microsecond=0)
+    bounded_now = now
     monkeypatch.setattr(lifecycle_fixture, "NOW", bounded_now)
     monkeypatch.setattr(aws_fixture, "NOW", bounded_now)
     lifecycle_clock = lifecycle_fixture.Clock()
     real_monotonic = time.monotonic
-    lifecycle_clock.utc_now = lambda: datetime.now(timezone.utc) + timedelta(seconds=lifecycle_clock._offset())
+    lifecycle_clock.utc_now = lambda: now + timedelta(seconds=lifecycle_clock._offset())
     lifecycle_clock.monotonic = lambda: real_monotonic() + lifecycle_clock._offset()
     original_clock_sleep = lifecycle_clock.sleep
 
@@ -841,6 +900,26 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         raise AssertionError("production replay/reconciliation did not close both acceptance entries: "
             + json.dumps(final_journal, sort_keys=True, default=str))
 
+    # Reuse the real synthetic ledger state after both parent reservations to
+    # prove a newly minted card cannot spend this amendment on another batch.
+    financial_ledger_path = Path(settings["ledger"]["path"])
+    financial_ledger_bytes = financial_ledger_path.read_bytes()
+    ledger_state = json.loads(financial_ledger_bytes)
+    authorized_record = next(row for row in ledger_state["reservations"].values()
+        if row.get("financial", {}).get("financial_policy_amendment", {}).get("sha256")
+            == amendment_ref["sha256"])
+    second_batch_snapshot = copy.deepcopy(authorized_record["financial"])
+    second_batch_snapshot["authority"]["sha256"] = "0" * 64
+    second_batch_snapshot["stage_id"] = "SYNTHETIC-SECOND-O2-STAGE"
+    second_batch_snapshot["gross_eur"] = "0"
+    second_batch_snapshot["cash_eur"] = "0"
+    second_batch_snapshot["providers_eur"] = dict.fromkeys(
+        second_batch_snapshot["providers_eur"], "0")
+    from cloud_network_benchmark.financial_controls import FinancialError, check_shared_finances
+    with pytest.raises(FinancialError, match="financial_amendment_batch_consumed"):
+        check_shared_finances(ledger_state, second_batch_snapshot, remaining_usd=Decimal("0"))
+    assert financial_ledger_path.read_bytes() == financial_ledger_bytes
+
     # Build the conditional CAL admission request only from the closed,
     # replayed normal acceptance stage and its real source-bound outputs.
     acceptance_prepared_path = Path(stage["state_root"]) / stage["stage_id"] / "prepared-stage.json"
@@ -852,6 +931,10 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     for key in ("f10_offline", "quota_review"):
         settings["approvals"][key] = {"confirmed": True,
             "source": activated_stage["approval_refs"][key], "fields": {}}
+    # The one-time O2 reserve policy is acceptance-only. Prepare the offline
+    # CAL request without that input, then verify its financial binding is
+    # rejected by the same real guard before any admission or provider boundary.
+    settings["pricing"].pop("pending_eur_reserve_release", None)
     calibration_stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
     generated_calibration = Path(calibration_stage["entries"][0]["config_path"]).parent
@@ -866,6 +949,10 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     cal_admission, cal_plan = build_admission_request(campaign=cal_campaign,
         parent=cal_parent, children=cal_children, costs=cal_costs, runtime=cal_runtime,
         controller_session_id=calibration_stage["controller_session_id"])
+    from cloud_network_benchmark.financial_controls import FinancialError, validate_paid_financial_plan
+    with pytest.raises(FinancialError, match="financial_scope_mismatch"):
+        validate_paid_financial_plan(cal_plan, cal_admission, scope_id=stage["scope_id"],
+            now=Clock().utc_now())
     cal_evidence = cal_plan.prerequisites["paid_acceptance"]
     from tests.support.reduced_cal_gate import check_actual_calibration_acceptance_prerequisite
     cal_gate = check_actual_calibration_acceptance_prerequisite(evidence=cal_evidence,

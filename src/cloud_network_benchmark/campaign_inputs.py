@@ -580,6 +580,8 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
 _EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release_eur": "14"}
 _EUR15_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
     "prior_release_eur": "14", "additional_release_eur": "15", "cumulative_release_eur": "29"}
+_O2_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
+    "prior_release_eur": "37", "additional_release_eur": "13", "cumulative_release_eur": "50"}
 _EUR14_AUTHORITY_SHA256 = "97deee1289455535dad654b6618ebd6f32e562175d55da4f5b4bfd612d0e0aa6"
 _EUR29_AUTHORITY_SHA256 = "f12175ff678980460894e91d489d9d408c95d6b644dc4dd5395cd4006d3552d0"
 
@@ -610,15 +612,21 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     request = settings.get("pricing", {}).get("pending_eur_reserve_release")
     if request is None:
         return None, None
-    if stage not in {"acceptance", "calibration"} or not isinstance(request, dict):
+    if not isinstance(request, dict):
         raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")
-    if request == _EUR_RESERVE_RELEASE_REQUEST:
+    o2_request = request == _O2_RESERVE_RELEASE_REQUEST
+    if o2_request:
+        if stage != "acceptance":
+            raise ValueError("the O2 reserve-release authority is limited to the one normal acceptance batch")
+        working_eur, protected_eur = Decimal("302"), Decimal("0")
+        requested_release = dict(_O2_RESERVE_RELEASE_REQUEST)
+    elif stage in {"acceptance", "calibration"} and request == _EUR_RESERVE_RELEASE_REQUEST:
         working_eur, protected_eur = Decimal("264"), Decimal("36")
         requested_release = dict(_EUR_RESERVE_RELEASE_REQUEST)
-    elif request == _EUR15_RESERVE_RELEASE_REQUEST:
+    elif stage in {"acceptance", "calibration"} and request == _EUR15_RESERVE_RELEASE_REQUEST:
         working_eur, protected_eur = Decimal("279"), Decimal("21")
         requested_release = dict(_EUR15_RESERVE_RELEASE_REQUEST)
-    elif isinstance(request, dict) and (cumulative := _cumulative_reserve_release_request(request)):
+    elif stage in {"acceptance", "calibration"} and (cumulative := _cumulative_reserve_release_request(request)):
         additional, requested_release = cumulative
         working_eur, protected_eur = Decimal("279") + additional, Decimal("21") - additional
     else:
@@ -642,6 +650,20 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     card = FinancialAuthorization.model_validate(source.json())
     scope_id = settings.get("ledger", {}).get("scope_id")
     caps = Caps.model_validate(card.caps.model_dump())
+    if o2_request:
+        from .financial_controls import _validate_o2_amendment
+        if (card.ledger_scope_id != scope_id
+                or Decimal(caps.project_eur) != Decimal("400")
+                or Decimal(caps.working_eur) != Decimal("302")
+                or Decimal(caps.protected_eur) != Decimal("0")
+                or Decimal(caps.personal_cash_eur) != Decimal("400")):
+            raise ValueError("paid_authorization must bind the exact O2 policy, ledger scope, EUR 13 previously approved release and EUR 400 whole/cash ceilings")
+        try:
+            _validate_o2_amendment(card, now=now, end=now)
+        except ValueError as exc:
+            raise ValueError("paid_authorization is missing, changed, stale or outside the O2 amendment scope") from exc
+        snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
+        return requested_release, snapshot
     if (card.ledger_scope_id != scope_id
             or Decimal(caps.project_eur) != Decimal("300")
             or Decimal(caps.working_eur) != working_eur
