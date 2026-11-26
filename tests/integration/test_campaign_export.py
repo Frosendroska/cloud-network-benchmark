@@ -73,6 +73,80 @@ def test_export_can_move_and_analyze_without_original_runner_files(repository_ro
     assert verify_export(selection_root) is False
 
 
+def test_closed_failed_provider_export_keeps_valid_sibling_native_runs(
+        repository_root, tmp_path, frozen_clock, deterministic_token, fake_git_commits, request):
+    """A failed/ineligible provider remains inspectable beside valid native siblings."""
+    import shutil
+    from tests.f12_support import materialize_f08_pair
+    from cloud_network_benchmark.analysis import analyze_selection
+    from cloud_network_benchmark.campaign_export import (
+        aggregate_closed_exports, export_selection, verify_export)
+    from cloud_network_benchmark.lifecycle_bundle import seal_bundle
+    from cloud_network_benchmark.validation import validate_bundle
+
+    materialized = {}
+    for provider in ("aws", "azure", "gcp"):
+        complete, result, _ = materialize_f08_pair(repository_root, tmp_path / provider,
+            frozen_clock, deterministic_token, fake_git_commits, request,
+            mode="short_study", provider=provider, shared_slot=True)
+        root = Path(complete.child_result_root)
+        if provider == "azure":
+            record = next(item for item in complete.artifact_records if item.kind == "sockperf-csv")
+            native_path = root / record.path
+            native_path.write_bytes(native_path.read_bytes() + b"\n")
+            result = validate_bundle(complete, evaluated_at=result.evaluated_at)
+            assert result.validation_status.data_validity == "invalid"
+        else:
+            assert result.validation_status.data_validity == "valid"
+        validation = root / "validation"
+        validation.mkdir(exist_ok=True)
+        (validation / "input.json").write_text(complete.model_dump_json(), encoding="utf-8")
+        (validation / "result.json").write_text(result.model_dump_json(), encoding="utf-8")
+        seal_bundle(root)
+        materialized[provider] = (complete, result, root)
+
+    campaign_ids = {bundle.identity.campaign_id for bundle, _, _ in materialized.values()}
+    assert len(campaign_ids) == 1
+    parent_path = Path(materialized["aws"][0].campaign_manifest_path)
+    parent_doc = json.loads(parent_path.read_text(encoding="utf-8"))
+    parent_runs = {row["provider"]: row["run_id"] for row in parent_doc["child_runs"]}
+    assert parent_runs == {provider: bundle.identity.run_id
+        for provider, (bundle, _, _) in materialized.items()}
+
+    common_results = tmp_path / "campaign-results"
+    (common_results / "raw").mkdir(parents=True)
+    entries = []
+    for provider, (bundle, _, root) in materialized.items():
+        shutil.copytree(root, common_results / "raw" / bundle.identity.run_id)
+        provider_parent = Path(bundle.campaign_manifest_path)
+        provider_parent_doc = json.loads(provider_parent.read_text(encoding="utf-8"))
+        child_ref = next(row for row in provider_parent_doc["child_runs"] if row["provider"] == provider)
+        entries.append({"entry_id": f"slot-{provider}", "parent_manifest_path": str(provider_parent),
+            "run_ids": {provider: bundle.identity.run_id}})
+        # Preserve the source manifest path expected by export_selection.
+        assert Path(repository_root / child_ref["manifest_path"]).is_file()
+    stage = {"stage_id": "mixed-native-slot", "stage": "week",
+        "repository_root": str(repository_root), "results_root": str(common_results),
+        "entries": entries}
+    journal = {"entries": {entry["entry_id"]: {
+        "state": "failed" if entry["entry_id"] == "slot-azure" else "complete",
+        "result": {"cleanup_open": False}} for entry in entries}}
+    for entry in entries:
+        destination = common_results / "closed" / entry["entry_id"] / "export"
+        assert export_selection({**stage, "entries": [entry]}, destination) is not None
+    selection = aggregate_closed_exports(stage, journal, common_results / "export")
+    assert selection is not None and verify_export(selection.parent)
+    report = analyze_selection(selection, analysis_git=materialized["aws"][0].implementation_git)
+    run_rows = report.payload["runs"]
+    by_provider = {row["provider"]: row for row in run_rows}
+    assert set(by_provider) == {"aws", "azure", "gcp"}
+    assert by_provider["azure"]["current_data_validity"] == "invalid"
+    assert by_provider["aws"]["current_data_validity"] == "valid"
+    assert by_provider["gcp"]["current_data_validity"] == "valid", json.dumps(
+        [item for item in report.payload["findings"] if item["run_id"] == materialized["gcp"][0].identity.run_id],
+        indent=2)
+
+
 def test_corrupted_export_copy_is_rejected_and_original_bytes_remain(tmp_path, monkeypatch):
     import cloud_network_benchmark.campaign_export as exporting
 

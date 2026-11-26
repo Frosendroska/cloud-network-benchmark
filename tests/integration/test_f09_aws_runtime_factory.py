@@ -1137,6 +1137,50 @@ def _roundtrip_f09_archive_capsule(*, tmp_path, repository_root, parent_path, ch
     elif fault == "invalid_native":
         assert restored["status"] == "replayed_invalid", restored.get("validation")
         assert restored["validation"][provider]["status"]["data_validity"] == "invalid"
+        # The real restore path still materializes and analyzes the genuine
+        # archived native bytes. The driver currently cannot settle this
+        # cleanup-closed archive-pending attempt because it treats any invalid
+        # child as a failed replay instead of preserving it as an ineligible run.
+        selection = Path(restored["analysis"]["selection_path"])
+        selected = json.loads(selection.read_text(encoding="utf-8"))
+        assert len(selected["runs"]) == 1
+        assert Path(restored["native_roots"][provider]).is_dir()
+        from cloud_network_benchmark.campaign import CampaignDriver, _week_dispatch_blocked
+        from tests.integration.test_campaign_driver import FakeClock as CampaignClock, stage_fixture
+        campaign_clock = CampaignClock()
+        stage = stage_fixture(tmp_path, slots=2)
+        stage.update(stage_id="invalid-archive-reconciliation", stage="calibration",
+            repository_root=str(repository_root), results_root=str(repository_root / "results"),
+            controller_session_id="fake-session")
+        entry = stage["entries"][0]
+        entry.update(run_ids={provider: child.run_id}, parent_manifest_path=str(parent_path),
+            private_root=str(Path(recovery_path).parent),
+            result_path=str(repository_root / child_ref.result_path))
+        stage["entries"] = [entry]
+        stage_dir = Path(stage["state_root"]) / stage["stage_id"]
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        prepared_path = stage_dir / "prepared-stage.json"
+        prepared_path.write_text(json.dumps(stage), encoding="utf-8")
+        driver = CampaignDriver(prepare=lambda *a, **k: None, validate=lambda *a, **k: [],
+            launch=lambda *_: pytest.fail("archive reconciliation must not launch"),
+            clock=campaign_clock, sleep=campaign_clock.sleep)
+        journal_path = stage_dir / "campaign-journal.json"
+        saved = driver._load_or_create_journal(stage, journal_path)
+        capsule_bytes = capsule_path.read_bytes()
+        saved["entries"][entry["entry_id"]].update(state="archive_pending_validation",
+            finished_at=campaign_clock.utc_now().isoformat(), result={
+                "cleanup_open": False, "run_ids": entry["run_ids"],
+                "replay_capsule": {"status": "archive_pending_replay", "path": str(capsule_path),
+                    "sha256": hashlib.sha256(capsule_bytes).hexdigest()}})
+        journal_path.write_text(json.dumps(saved), encoding="utf-8")
+        replay_result = tmp_path / "invalid-native-replay-result.json"
+        replay_result.write_text(json.dumps(restored, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="lacks successful cleanup and validation"):
+            driver.reconcile_archive(Path(stage["state_root"]), stage["stage_id"],
+                entry["entry_id"], replay_result)
+        still_pending = json.loads(journal_path.read_text(encoding="utf-8"))
+        assert still_pending["entries"][entry["entry_id"]]["state"] == "archive_pending_validation"
+        assert _week_dispatch_blocked(still_pending)
     for path in root.rglob("*"):
         if path.is_file() and not path.is_symlink() and path.relative_to(root) not in original_context:
             path.unlink()
