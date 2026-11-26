@@ -645,7 +645,8 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
                 FinancialError, revalidate_financial_record)
             try:
                 revalidate_financial_record(record, state=state, now=ledger.utc_now(),
-                    end=datetime.fromisoformat(record["evidence"]["expires_at"]["value"]))
+                    end=datetime.fromisoformat(record["evidence"]["expires_at"]["value"]),
+                    existing_retrieval=True)
                 financial_recheck = {"status": "accepted"}
             except FinancialError as exc:
                 financial_recheck = {"status": "rejected", "reason": exc.reason}

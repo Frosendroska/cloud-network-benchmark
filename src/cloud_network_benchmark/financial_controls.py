@@ -522,7 +522,8 @@ def validate_stored_commitment(record: dict, *, scope_id: str) -> None:
 
 
 def revalidate_financial_record(record: dict, *, state: dict, now: datetime, end: datetime,
-                                quote_freshness_at: datetime | None = None) -> None:
+                                quote_freshness_at: datetime | None = None,
+                                existing_retrieval: bool = False) -> None:
     if record.get('execution_scope') == 'offline_simulation':
         return
     try:
@@ -538,7 +539,7 @@ def revalidate_financial_record(record: dict, *, state: dict, now: datetime, end
         validate_authority({'source_path': source['path'], 'source_sha256': source['sha256']},
             binding=financial['binding'], scope_id=financial['scope_id'], now=now, end=end,
             quote_freshness_at=launch_at)
-        if state.get('cleanup_blocked') or state.get('budget_blocked'):
+        if (state.get('cleanup_blocked') and not existing_retrieval) or state.get('budget_blocked'):
             raise FinancialError('financial_outstanding_liability')
         # Existing records already include this reservation: add no new exposure.
         check_shared_finances(state, {**financial, 'gross_eur':'0', 'cash_eur':'0',
