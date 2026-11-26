@@ -945,6 +945,8 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     cal_settings = copy.deepcopy(settings)
     cal_settings["pricing"].pop("pending_eur_reserve_release", None)
     cal_settings["pricing"]["funding"]["uncertainty"] = "0"
+    cal_settings["state_root"] = str(tmp_path / "calibration-private")
+    cal_settings["ledger"]["path"] = str(Path(cal_settings["state_root"]) / "ledger.json")
     calibration_stage = prepare_stage({"stage": "calibration"}, cal_settings,
         repository_root, Path(cal_settings["state_root"]), Path(cal_settings["results_root"]),
         Clock(), draft=False)
@@ -974,6 +976,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     assert cal_gate["accepted_campaign_count"] == 2
     assert set(cal_gate["rejected_cases"]) >= {"missing", "pending_incomplete",
         "source_mismatch", "accepted_manifest_source_mismatch"}
+    assert financial_ledger_path.read_bytes() == financial_ledger_bytes
     assert len(router.runtime_roots["aws"]) == 2
     assert len(router.runtime_roots["azure"]) == 2
     assert len(router.runtime_roots["gcp"]) == 2
