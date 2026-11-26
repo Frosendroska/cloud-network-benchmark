@@ -305,7 +305,10 @@ def cleanup_saved_provider(record: Any, *, runner: Any, utc_now=None, monotonic_
         prereq = state.get("expiry", {})
         absent_ids.extend(value for key, value in prereq.items()
             if key.endswith("_id") and isinstance(value, str) and value.startswith("/subscriptions/"))
-        result = azure_provider.destroy(d, options, runner, clock=monotonic_now, utc_now=utc_now)
+        result = azure_provider.recover_shared_watcher_group_only(d, options, runner,
+            options.attempt_root, clock=monotonic_now, utc_now=utc_now)
+        if result is None:
+            result = azure_provider.destroy(d, options, runner, clock=monotonic_now, utc_now=utc_now)
     return result, saved, list(dict.fromkeys(item for item in absent_ids if isinstance(item, str) and item.strip()))
 
 

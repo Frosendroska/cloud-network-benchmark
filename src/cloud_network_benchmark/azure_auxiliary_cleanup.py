@@ -15,6 +15,7 @@ import re
 import stat
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +110,19 @@ class AuxiliaryCleanupCohort:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def _pin_bounded_recovery_deadline(self, candidate: float | None) -> float | None:
+        if candidate is not None:
+            _finite_monotonic(candidate, "bounded auxiliary recovery deadline")
+        def pin(state: dict[str, Any]) -> float | None:
+            prior = state.get("bounded_recovery_deadline_monotonic")
+            if prior is not None:
+                prior = _finite_monotonic(prior, "saved bounded auxiliary recovery deadline")
+            if candidate is not None:
+                state["bounded_recovery_deadline_monotonic"] = (candidate if prior is None
+                    else min(prior, candidate))
+            return state.get("bounded_recovery_deadline_monotonic")
+        return self._mutate(pin)
+
     def register_absent(self, owner: dict[str, str], *, baseline_sha256: str,
                         activity_sha256: str, deadline_monotonic: float) -> None:
         key = owner_key(owner)
@@ -168,32 +182,129 @@ class AuxiliaryCleanupCohort:
             return json.loads(json.dumps(state))
         return self._mutate(read)
 
-    def claim_leaf(self, *, now_monotonic: float) -> str | None:
+    def record_group_only_recovery_receipt(self, receipt: dict[str, Any]) -> None:
+        """Persist group-only completion without rewriting the old leaf claim or deadline."""
+        required = {"schema_version", "spec_sha256", "claim_id", "source_entry_id", "leaf_receipt_sha256",
+            "group_id", "group_delete_action_id", "group_absence_action_id", "group_absent",
+            "occurred_at_utc", "operation_deadline_utc", "receipt_sha256"}
+        if (not isinstance(receipt, dict) or set(receipt) != required
+                or receipt.get("schema_version") != 1 or receipt.get("spec_sha256") != self.digest
+                or not is_sha256(receipt.get("claim_id"))
+                or not is_sha256(receipt.get("leaf_receipt_sha256"))
+                or not isinstance(receipt.get("source_entry_id"), str) or not receipt["source_entry_id"]
+                or not isinstance(receipt.get("group_id"), str)
+                or receipt["group_id"].lower() != self.spec["resource_group_id"].lower()
+                or not all(isinstance(receipt.get(key), str) and receipt[key]
+                    for key in ("group_delete_action_id", "group_absence_action_id"))
+                or receipt.get("group_absent") is not True
+                or receipt.get("source_entry_id") not in {owner["entry_id"] for owner in self.spec["owners"]}
+                or not isinstance(receipt.get("occurred_at_utc"), str)
+                or not isinstance(receipt.get("operation_deadline_utc"), str)
+                or receipt.get("receipt_sha256") != hashlib.sha256(canonical(
+                    {key: value for key, value in receipt.items() if key != "receipt_sha256"})).hexdigest()):
+            raise ValueError("Azure auxiliary group-only receipt is malformed or foreign")
+        occurred = datetime.fromisoformat(receipt["occurred_at_utc"].replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(receipt["operation_deadline_utc"].replace("Z", "+00:00"))
+        if (occurred.tzinfo is None or occurred.utcoffset() is None or deadline.tzinfo is None
+                or deadline.utcoffset() is None or occurred > deadline):
+            raise ValueError("Azure auxiliary group-only receipt timestamps are invalid or late")
+        def apply(state: dict[str, Any]) -> None:
+            claim = state.get("claim")
+            if (not isinstance(claim, dict) or claim.get("claim_id") != receipt["claim_id"]
+                    or claim.get("state") != "claimed" or state.get("outcomes") != []):
+                raise ValueError("Azure auxiliary group-only receipt does not match the untouched leaf claim")
+            intent = state.get("group_only_recovery_intent")
+            if (not isinstance(intent, dict) or intent.get("group_delete_action_id") != receipt["group_delete_action_id"]
+                    or intent.get("source_entry_id") != receipt["source_entry_id"]
+                    or intent.get("leaf_receipt_sha256") != receipt["leaf_receipt_sha256"]
+                    or intent.get("group_id", "").lower() != receipt["group_id"].lower()
+                    or intent.get("operation_deadline_utc") != receipt["operation_deadline_utc"]):
+                raise ValueError("Azure auxiliary group-only receipt lacks its durable delete intent")
+            prior = state.get("group_only_recovery_receipt")
+            if prior is not None and prior != receipt:
+                raise ValueError("Azure auxiliary group-only receipt conflicts with its first completion")
+            state["group_only_recovery_receipt"] = receipt
+        self._mutate(apply)
+
+    def record_group_only_recovery_intent(self, intent: dict[str, Any]) -> None:
+        required = {"schema_version", "spec_sha256", "claim_id", "source_entry_id",
+            "leaf_receipt_sha256", "group_id", "group_delete_action_id", "started_at_utc",
+            "operation_deadline_utc", "intent_sha256"}
+        if (not isinstance(intent, dict) or set(intent) != required
+                or intent.get("schema_version") != 1 or intent.get("spec_sha256") != self.digest
+                or not is_sha256(intent.get("claim_id")) or not is_sha256(intent.get("leaf_receipt_sha256"))
+                or not isinstance(intent.get("source_entry_id"), str) or not intent["source_entry_id"]
+                or intent["source_entry_id"] not in {owner["entry_id"] for owner in self.spec["owners"]}
+                or not isinstance(intent.get("group_id"), str)
+                or intent["group_id"].lower() != self.spec["resource_group_id"].lower()
+                or not isinstance(intent.get("group_delete_action_id"), str)
+                or not intent["group_delete_action_id"].startswith("azure-")
+                or not isinstance(intent.get("started_at_utc"), str)
+                or not isinstance(intent.get("operation_deadline_utc"), str)
+                or intent.get("intent_sha256") != hashlib.sha256(canonical(
+                    {key: value for key, value in intent.items() if key != "intent_sha256"})).hexdigest()):
+            raise ValueError("Azure auxiliary group-only intent is malformed or foreign")
+        started = datetime.fromisoformat(intent["started_at_utc"].replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(intent["operation_deadline_utc"].replace("Z", "+00:00"))
+        if (started.tzinfo is None or started.utcoffset() is None or deadline.tzinfo is None
+                or deadline.utcoffset() is None or started >= deadline):
+            raise ValueError("Azure auxiliary group-only intent timestamps are invalid")
+        def apply(state: dict[str, Any]) -> None:
+            claim = state.get("claim")
+            if (not isinstance(claim, dict) or claim.get("claim_id") != intent["claim_id"]
+                    or claim.get("state") != "claimed" or state.get("outcomes") != []):
+                raise ValueError("Azure auxiliary group-only intent does not match the untouched leaf claim")
+            prior = state.get("group_only_recovery_intent")
+            if prior is not None:
+                raise ValueError("Azure auxiliary group-only delete intent already exists; DELETE cannot be retried")
+            state["group_only_recovery_intent"] = intent
+        self._mutate(apply)
+
+    def claim_leaf(self, *, now_monotonic: float,
+                   bounded_recovery_deadline_monotonic: float | None = None) -> str | None:
         _finite_monotonic(now_monotonic, "cleanup claim clock")
+        recovery_deadline = self._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
         expected = {owner_key(item) for item in self.spec["owners"]}
         def apply(state: dict[str, Any]) -> str | None:
+            saved_deadline = state.get("bounded_recovery_deadline_monotonic")
+            effective_deadline = (min(recovery_deadline, float(saved_deadline))
+                if recovery_deadline is not None and saved_deadline is not None
+                else recovery_deadline if recovery_deadline is not None else saved_deadline)
             if state["claim"] is not None:
                 claim = state["claim"]
                 return claim.get("claim_id") if claim.get("state") == "leaf_absent" else None
             if set(state["owners"]) != expected:
                 raise RuntimeError("Azure auxiliary cleanup cohort still has an active or unproven peer parent")
             deadlines = [float(state["owners"][key]["deadline_monotonic"]) for key in expected]
-            if now_monotonic >= min(deadlines):
+            original_deadline = min(deadlines)
+            if (now_monotonic >= effective_deadline if effective_deadline is not None
+                    else now_monotonic >= original_deadline):
                 raise TimeoutError("Azure auxiliary cleanup reached the original peer cleanup deadline")
             claim = hashlib.sha256(canonical([self.digest, sorted(expected)])).hexdigest()
             state["claim"] = {"action": "leaf_delete", "claim_id": claim,
-                "state": "claimed", "claimed_at_monotonic": now_monotonic}
+                "state": "claimed", "claimed_at_monotonic": now_monotonic,
+                "late_recovery": now_monotonic >= original_deadline}
+            if effective_deadline is not None:
+                state["claim"]["bounded_recovery_deadline_monotonic"] = effective_deadline
             return claim
         return self._mutate(apply)
 
-    def claim_group(self, claim_id: str, *, now_monotonic: float) -> bool:
+    def claim_group(self, claim_id: str, *, now_monotonic: float,
+                    bounded_recovery_deadline_monotonic: float | None = None) -> bool:
         _finite_monotonic(now_monotonic, "cleanup claim clock")
+        recovery_deadline = self._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
         def apply(state: dict[str, Any]) -> bool:
             claim = state.get("claim")
             if not isinstance(claim, dict) or claim.get("claim_id") != claim_id:
                 raise ValueError("Azure auxiliary cleanup group action does not own the durable claim")
             if claim.get("state") == "leaf_absent":
-                if now_monotonic >= min(float(row["deadline_monotonic"]) for row in state["owners"].values()):
+                original_deadline = min(float(row["deadline_monotonic"]) for row in state["owners"].values())
+                saved_values = [value for value in (recovery_deadline,
+                    claim.get("bounded_recovery_deadline_monotonic"),
+                    state.get("bounded_recovery_deadline_monotonic")) if value is not None]
+                saved_deadline = min(float(value) for value in saved_values) if saved_values else None
+                if (now_monotonic >= saved_deadline if saved_deadline is not None
+                        else now_monotonic >= original_deadline):
                     raise TimeoutError("Azure auxiliary cleanup reached the original peer cleanup deadline")
                 if now_monotonic < state["outcomes"][-1].get("recorded_at_monotonic", 0):
                     raise ValueError("Azure auxiliary cleanup group claim clock moved backwards")
@@ -205,9 +316,12 @@ class AuxiliaryCleanupCohort:
 
     def wait_all_absent(self, *, owner: dict[str, str], baseline_sha256: str,
                         activity_sha256: str,
-                        deadline_monotonic: float, clock: Callable[[], float] = time.monotonic,
+                        deadline_monotonic: float,
+                        bounded_recovery_deadline_monotonic: float | None = None,
+                        clock: Callable[[], float] = time.monotonic,
                         sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
         _finite_monotonic(deadline_monotonic, "cleanup deadline")
+        recovery_deadline = self._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
         self.register_absent(owner, baseline_sha256=baseline_sha256,
             activity_sha256=activity_sha256, deadline_monotonic=deadline_monotonic)
         expected = {owner_key(item) for item in self.spec["owners"]}
@@ -218,23 +332,36 @@ class AuxiliaryCleanupCohort:
                 return snapshot
             if set(snapshot["owners"]) == expected:
                 return snapshot
-            remaining = min(deadline_monotonic - now,
+            saved_deadline = snapshot.get("bounded_recovery_deadline_monotonic")
+            wait_deadline = (min(float(recovery_deadline), float(saved_deadline))
+                if recovery_deadline is not None and saved_deadline is not None else
+                float(recovery_deadline) if recovery_deadline is not None else deadline_monotonic)
+            remaining = min(wait_deadline - now,
                 min((float(row["deadline_monotonic"]) - now
-                     for row in snapshot["owners"].values()), default=deadline_monotonic-now))
+                     for row in snapshot["owners"].values()), default=wait_deadline-now)
+                if recovery_deadline is None else wait_deadline-now)
             if remaining <= 0:
                 raise TimeoutError("Azure auxiliary cleanup peer absence barrier reached the original cleanup deadline")
             sleep(min(0.1, remaining))
 
-    def wait_complete(self, *, deadline_monotonic: float, clock: Callable[[], float] = time.monotonic,
+    def wait_complete(self, *, deadline_monotonic: float,
+                      bounded_recovery_deadline_monotonic: float | None = None,
+                      clock: Callable[[], float] = time.monotonic,
                       sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
         _finite_monotonic(deadline_monotonic, "cleanup deadline")
+        recovery_deadline = self._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
         while True:
             snapshot = self.snapshot()
             claim = snapshot.get("claim")
             now = _finite_monotonic(clock(), "cleanup completion clock")
             owner_deadline = min((float(row["deadline_monotonic"])
                 for row in snapshot.get("owners", {}).values()), default=deadline_monotonic)
-            if now >= min(deadline_monotonic, owner_deadline):
+            saved_values = [value for value in (recovery_deadline,
+                snapshot.get("bounded_recovery_deadline_monotonic"),
+                claim.get("bounded_recovery_deadline_monotonic") if isinstance(claim, dict) else None)
+                if value is not None]
+            wait_deadline = min(float(value) for value in saved_values) if saved_values else min(deadline_monotonic, owner_deadline)
+            if now >= wait_deadline:
                 raise TimeoutError("Azure auxiliary cleanup completion exceeded the original peer cleanup deadline")
             if isinstance(claim, dict) and claim.get("state") == "complete":
                 completed = _finite_monotonic(claim.get("completed_at_monotonic"),
@@ -244,7 +371,7 @@ class AuxiliaryCleanupCohort:
                 return snapshot
             if isinstance(claim, dict) and claim.get("state") in {"failed", "unknown"}:
                 raise RuntimeError("Azure auxiliary cleanup action claim is terminal: " + claim["state"])
-            remaining = min(deadline_monotonic, owner_deadline) - now
+            remaining = wait_deadline - now
             if remaining <= 0:
                 raise TimeoutError("Azure auxiliary cleanup action did not complete within the original deadline")
             sleep(min(0.1, remaining))
@@ -252,8 +379,10 @@ class AuxiliaryCleanupCohort:
     def record_outcome(self, claim_id: str, *, action: str, identity: str,
                        outcome: str, evidence_sha256: str,
                        now_monotonic: float,
-                       typed_404_identity: str | None = None) -> None:
+                       typed_404_identity: str | None = None,
+                       bounded_recovery_deadline_monotonic: float | None = None) -> None:
         now_monotonic = _finite_monotonic(now_monotonic, "cleanup outcome clock")
+        recovery_deadline = self._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
         if action not in {"leaf_delete", "group_delete"} or outcome not in {"succeeded", "failed", "unknown"}:
             raise ValueError("Azure auxiliary cleanup action outcome is invalid")
         if not is_sha256(claim_id) or not is_sha256(evidence_sha256) or not isinstance(identity, str) or not identity:
@@ -281,7 +410,12 @@ class AuxiliaryCleanupCohort:
                     or now_monotonic < earliest_action_clock):
                 raise ValueError("Azure auxiliary cleanup outcome clock moved backwards")
             earliest_deadline = min(float(row["deadline_monotonic"]) for row in state["owners"].values())
-            if now_monotonic >= earliest_deadline:
+            saved_values = [value for value in (recovery_deadline,
+                claim.get("bounded_recovery_deadline_monotonic"),
+                state.get("bounded_recovery_deadline_monotonic")) if value is not None]
+            saved_deadline = min(float(value) for value in saved_values) if saved_values else None
+            if (now_monotonic >= saved_deadline if saved_deadline is not None
+                    else now_monotonic >= earliest_deadline):
                 raise TimeoutError("Azure auxiliary cleanup outcome exceeded the original peer cleanup deadline")
             row = {"action": action, "identity": identity, "outcome": outcome,
                 "evidence_sha256": evidence_sha256, "recorded_at_monotonic": now_monotonic}

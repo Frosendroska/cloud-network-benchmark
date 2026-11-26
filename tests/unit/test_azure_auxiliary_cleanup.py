@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import pytest
 
 from cloud_network_benchmark.azure_auxiliary_cleanup import (AuxiliaryCleanupCohort, authorization_payload,
-    validate_spec)
+    canonical, validate_spec)
 from cloud_network_benchmark.lifecycle_runtime import _validate_azure_auxiliary_owners
 
 
@@ -193,6 +193,43 @@ def test_two_parent_barrier_grants_one_leaf_claim_and_orders_group_after_leaf(tm
     assert winner.wait_complete(deadline_monotonic=90, clock=lambda: 22.0)["claim"]["state"] == "complete"
     with pytest.raises(ValueError, match="moved backwards after completion"):
         winner.wait_complete(deadline_monotonic=90, clock=lambda: 21.0)
+
+
+def test_group_only_intent_and_receipt_leave_original_claim_and_bound_unchanged(tmp_path):
+    spec = _spec(tmp_path)
+    cohort = AuxiliaryCleanupCohort(spec)
+    for index, owner in enumerate(spec["owners"]):
+        cohort.register_absent(owner, baseline_sha256=hashlib.sha256(f"base-{index}".encode()).hexdigest(),
+            activity_sha256=hashlib.sha256(f"events-{index}".encode()).hexdigest(), deadline_monotonic=80.0)
+    claim_id = cohort.claim_leaf(now_monotonic=20.0, bounded_recovery_deadline_monotonic=50.0)
+    before = cohort.snapshot()
+    claim = dict(before["claim"])
+    owners, pin = before["owners"], before["bounded_recovery_deadline_monotonic"]
+    leaf_hash = hashlib.sha256(b"real validated saved leaf receipt").hexdigest()
+    intent = {"schema_version": 1, "spec_sha256": cohort.digest, "claim_id": claim_id,
+        "source_entry_id": spec["owners"][0]["entry_id"], "leaf_receipt_sha256": leaf_hash,
+        "group_id": GROUP, "group_delete_action_id": "azure-group-delete-1",
+        "started_at_utc": "2026-11-26T06:00:00+00:00",
+        "operation_deadline_utc": "2026-11-26T06:11:00+00:00"}
+    intent["intent_sha256"] = hashlib.sha256(canonical(intent)).hexdigest()
+    cohort.record_group_only_recovery_intent(intent)
+    with pytest.raises(ValueError, match="intent already exists"):
+        cohort.record_group_only_recovery_intent(intent)
+    receipt = {"schema_version": 1, "spec_sha256": cohort.digest, "claim_id": claim_id,
+        "source_entry_id": spec["owners"][0]["entry_id"], "leaf_receipt_sha256": leaf_hash,
+        "group_id": GROUP, "group_delete_action_id": intent["group_delete_action_id"],
+        "group_absence_action_id": "azure-group-absence-1", "group_absent": True,
+        "occurred_at_utc": "2026-11-26T06:00:12+00:00",
+        "operation_deadline_utc": intent["operation_deadline_utc"]}
+    receipt["receipt_sha256"] = hashlib.sha256(canonical(receipt)).hexdigest()
+    cohort.record_group_only_recovery_receipt(receipt)
+    after = cohort.snapshot()
+    assert after["claim"] == claim
+    assert after["owners"] == owners
+    assert after["bounded_recovery_deadline_monotonic"] == pin
+    assert after["outcomes"] == []
+    assert after["group_only_recovery_intent"] == intent
+    assert after["group_only_recovery_receipt"] == receipt
 
 
 def test_valid_precreation_baseline_is_persisted_with_its_original_capture_time(tmp_path):

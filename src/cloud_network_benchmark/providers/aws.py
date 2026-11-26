@@ -1325,12 +1325,31 @@ class AwsProviderDriver:
         if any(network.get("InterfaceType") == "efa" for network in networks):
             raise AwsProviderError("EFA network interfaces are not part of the selected protocol", category="acceleration_mismatch")
         zone = self._aws_json("ec2", "describe-instance-topology", "--instance-ids", expected["instance_id"], "--region", region, "--output", "json")
-        topology = zone.get("Instances") or []
+        topology = zone.get("Instances")
         self._record_topology_diagnostic(expected, zone, topology)
-        if (not isinstance(topology, list) or len(topology) != 1
-                or not isinstance(topology[0], dict)
-                or topology[0].get("ZoneId") != expected["zone_id"]):
+        if not isinstance(topology, list):
             raise AwsProviderError("physical AWS zone ID differs from observed instance topology", category="zone_identity_mismatch")
+        if topology:
+            if (len(topology) != 1 or not isinstance(topology[0], dict)
+                    or topology[0].get("ZoneId") != expected["zone_id"]):
+                raise AwsProviderError("physical AWS zone ID differs from observed instance topology", category="zone_identity_mismatch")
+            actual_zone_id = topology[0]["ZoneId"]
+        else:
+            # DescribeInstanceTopology can return no rows for a valid, running instance.
+            # Resolve the physical ID using AWS's account-scoped AZ mapping, bound to
+            # the AvailabilityZone independently observed from DescribeInstances.
+            availability = self._aws_json(
+                "ec2", "describe-availability-zones", "--all-availability-zones",
+                "--region", region, "--output", "json",
+            ).get("AvailabilityZones")
+            if not isinstance(availability, list):
+                raise AwsProviderError("authoritative AWS AZ mapping is unavailable", category="zone_identity_unavailable")
+            matches = [item for item in availability if isinstance(item, dict)
+                       and item.get("ZoneName") == placement.get("AvailabilityZone")]
+            if (len(matches) != 1 or not matches[0].get("ZoneId")
+                    or matches[0].get("ZoneId") != expected["zone_id"]):
+                raise AwsProviderError("physical AWS zone ID differs from authoritative AZ mapping", category="zone_identity_mismatch")
+            actual_zone_id = matches[0]["ZoneId"]
 
         images = self._aws_json("ec2", "describe-images", "--image-ids", instance["ImageId"], "--region", region, "--output", "json").get("Images", [])
         if len(images) != 1:
@@ -1369,7 +1388,6 @@ class AwsProviderDriver:
         if type_data.get("VCpuInfo", {}).get("DefaultVCpus") != 4 or type_data.get("MemoryInfo", {}).get("SizeInMiB") != 16384:
             raise AwsProviderError("authenticated instance-type vCPU/memory metadata differs from selected shape", category="shape_metadata_mismatch")
 
-        actual_zone_id = topology[0]["ZoneId"]
         return {
             "instance_id": instance["InstanceId"],
             "private_ipv4": instance["PrivateIpAddress"],

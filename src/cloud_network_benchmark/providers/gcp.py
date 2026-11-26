@@ -177,6 +177,8 @@ class GcpProviderError(RuntimeError):
 
 
 class GcpProviderDriver:
+    GUEST_ATTRIBUTE_POLL_INTERVAL_SECONDS = 1.0
+
     def __init__(self, runner: CommandRunner, settings: GcpRuntimeSettings,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), *,
                  monotonic_clock: Callable[[], float] = time.monotonic) -> None:
@@ -1519,9 +1521,18 @@ class GcpProviderDriver:
             "cleanup_mode": False,
         }
 
-    def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any]:
+    def _gcloud_json(self, args: list[str], action: str) -> dict[str, Any] | list[Any]:
         result = self._run(action, [self.settings.gcloud, *args], self.settings.private_state_root)
-        if result.outcome != "succeeded" or result.exit_code != 0: raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
+        if result.outcome != "succeeded" or result.exit_code != 0:
+            if (action == "gcp-guest-hostkeys"
+                    and "get-guest-attributes" in args
+                    and "--query-path=hostkeys/" in args
+                    and result.outcome == "failed"
+                    and result.exit_code == 1
+                    and self._is_hostkeys_guest_attribute_not_found(result.stderr)):
+                raise GcpProviderError("requested GCP hostkeys guest attribute is not yet available",
+                    category="guest_attribute_not_found", action_id=action)
+            raise GcpProviderError("authenticated GCP readback failed", category="gcp_api_read", action_id=action)
         if args[:1] == ["compute"] and "list" in args and "--format=json" in args:
             if result.stderr.strip():
                 raise GcpProviderError(f"inventory scope {action} returned a completeness warning", category="inventory_unknown", action_id=action)
@@ -1529,6 +1540,17 @@ class GcpProviderDriver:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise GcpProviderError(f"authenticated GCP response for {action} was malformed", category="gcp_api_read", action_id=action) from exc
+
+    @staticmethod
+    def _is_hostkeys_guest_attribute_not_found(stderr: str) -> bool:
+        """Recognize only the canonical one-line gcloud diagnostic for hostkeys/."""
+        return bool(re.fullmatch(
+            r"ERROR:\s+\(gcloud\.compute\.instances\.get-guest-attributes\) "
+            r"HTTPError 404: The resource 'hostkeys/' of type 'Guest Attribute' "
+            r"was not found\."
+            r"(?: This command is authenticated as [^\s]+ which is the active "
+            r"account specified by the \[core/account\] property\.)?",
+            stderr.strip()))
 
     @staticmethod
     def _outputs(value: dict[str, Any]) -> dict[str, Any]:
@@ -1786,11 +1808,28 @@ class GcpProviderDriver:
         before = self._gcloud_json(["compute", "instances", "describe", name, "--zone", zone, "--project", self.settings.project_id, "--format=json"], "gcp-hostkey-instance-before")
         if not self._same_vm_identity(before, initial, name, zone) or self._public_ip(before) != self._public_ip(initial):
             raise GcpProviderError("instance identity changed before host-key read", category="hostkey_identity_mismatch")
-        response = self._gcloud_json(["compute", "instances", "get-guest-attributes", name, "--zone", zone, "--project", self.settings.project_id, "--query-path=hostkeys/", "--format=json"], "gcp-guest-hostkeys")
+        guest_args = ["compute", "instances", "get-guest-attributes", name, "--zone", zone, "--project", self.settings.project_id, "--query-path=hostkeys/", "--format=json"]
+        while True:
+            try:
+                response = self._gcloud_json(guest_args, "gcp-guest-hostkeys")
+                break
+            except GcpProviderError as exc:
+                if exc.category != "guest_attribute_not_found" or self._deadline is None:
+                    raise
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GcpProviderError("GCP host-key readiness exceeded the original provision deadline",
+                        category="command_timeout", action_id="gcp-guest-hostkeys") from exc
+                time.sleep(min(self.GUEST_ATTRIBUTE_POLL_INTERVAL_SECONDS, remaining))
         after = self._gcloud_json(["compute", "instances", "describe", name, "--zone", zone, "--project", self.settings.project_id, "--format=json"], "gcp-hostkey-instance-after")
         if not self._same_vm_identity(after, initial, name, zone) or self._public_ip(after) != self._public_ip(initial):
             raise GcpProviderError("instance identity changed after host-key read", category="hostkey_identity_mismatch")
-        items = response.get("queryValue", {}).get("items", [])
+        # The installed gcloud command's YAML spec selects `queryValue.items`
+        # as its result attribute. With --format=json, stdout is therefore the
+        # item list itself, not the Compute API response envelope.
+        if not isinstance(response, list):
+            raise GcpProviderError("authenticated GCP guest-attribute response was malformed", category="gcp_api_read", action_id="gcp-guest-hostkeys")
+        items = response
         key = None
         for entry in items:
             if not isinstance(entry, dict) or entry.get("namespace") != "hostkeys":

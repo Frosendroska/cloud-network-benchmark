@@ -349,7 +349,12 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
     ("instance", "instance identity"),
     ("account", "account differs"),
     ("zone", "physical AWS zone ID"),
-    ("empty_topology", "physical AWS zone ID"),
+    ("empty_topology", None),
+    ("empty_topology_wrong_mapping", "physical AWS zone ID"),
+    ("empty_topology_ambiguous_mapping", "physical AWS zone ID"),
+    ("missing_topology", "physical AWS zone ID"),
+    ("null_topology", "physical AWS zone ID"),
+    ("object_topology", "physical AWS zone ID"),
     ("malformed_topology", "physical AWS zone ID"),
     ("secret_topology", "physical AWS zone ID"),
     ("diagnostic_write_failure", "physical AWS zone ID"),
@@ -374,6 +379,7 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         "get-caller-identity": {"Account": "123456789012"},
         "describe-instances": {"Reservations": [{"Instances": [instance]}]},
         "describe-instance-topology": {"Instances": [{"ZoneId": "euc1-az2"}]},
+        "describe-availability-zones": {"AvailabilityZones": [{"ZoneName": "eu-central-1a", "ZoneId": "euc1-az2"}]},
         "describe-images": {"Images": [{"ImageId": instance["ImageId"], "OwnerId": "099720109477",
             "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
             "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]},
@@ -390,6 +396,19 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         responses["describe-instance-topology"]["Instances"][0]["ZoneId"] = "wrong-zone"
     elif mutation == "empty_topology":
         responses["describe-instance-topology"]["Instances"] = []
+    elif mutation == "empty_topology_wrong_mapping":
+        responses["describe-instance-topology"]["Instances"] = []
+        responses["describe-availability-zones"]["AvailabilityZones"][0]["ZoneId"] = "euc1-az1"
+    elif mutation == "empty_topology_ambiguous_mapping":
+        responses["describe-instance-topology"]["Instances"] = []
+        responses["describe-availability-zones"]["AvailabilityZones"].append(
+            {"ZoneName": "eu-central-1a", "ZoneId": "euc1-az2"})
+    elif mutation == "missing_topology":
+        del responses["describe-instance-topology"]["Instances"]
+    elif mutation == "null_topology":
+        responses["describe-instance-topology"]["Instances"] = None
+    elif mutation == "object_topology":
+        responses["describe-instance-topology"]["Instances"] = {}
     elif mutation == "malformed_topology":
         responses["describe-instance-topology"]["Instances"] = ["unexpected-row"]
     elif mutation == "secret_topology":
@@ -429,7 +448,7 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
     if match:
         with pytest.raises(AwsProviderError, match=match):
             driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
-        if mutation in {"zone", "empty_topology", "malformed_topology", "secret_topology"}:
+        if mutation in {"zone", "empty_topology_wrong_mapping", "empty_topology_ambiguous_mapping", "missing_topology", "null_topology", "object_topology", "malformed_topology", "secret_topology"}:
             saved = json.loads((driver._active_attempt / "attempt.json").read_text())
             diagnostic = saved["topology_diagnostics"][0]
             assert diagnostic["expected_instance_id"] == expected["instance_id"]
@@ -440,9 +459,13 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
                 assert diagnostic["observations"][0]["zone_id"] is None
                 assert diagnostic["observations"][0]["zone_id_valid"] is False
                 assert diagnostic["observations"][0]["field_types"]["ZoneId"] == "str"
-            elif mutation == "empty_topology":
+            elif mutation.startswith("empty_topology"):
                 assert diagnostic["instance_count"] == 0
                 assert diagnostic["observations"] == []
+            elif mutation in {"missing_topology", "null_topology", "object_topology"}:
+                assert diagnostic["instance_count"] is None
+                assert diagnostic["observations"] == []
+                assert runner.commands.count("describe-availability-zones") == 0
             elif mutation == "malformed_topology":
                 assert diagnostic["observations"] == [{"row_type": "str"}]
             elif mutation == "secret_topology":
@@ -461,6 +484,8 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         actual = driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
         assert actual["zone_id"] == "euc1-az2"
         assert actual["boot_volume_type"] == "gp3"
+        if mutation == "empty_topology":
+            assert runner.commands.count("describe-availability-zones") == 1
 
 
 def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_path):
