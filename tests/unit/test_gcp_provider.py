@@ -274,30 +274,35 @@ def test_guest_hostkey_readiness_stops_at_original_deadline_and_on_other_errors(
     identity = {"id": "123456789", "name": "attempt-a", "zone": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a", "selfLink": "https://compute.googleapis.com/compute/v1/projects/cnb-test-12345/zones/europe-west3-a/instances/attempt-a", "networkInterfaces": [{"networkIP": "10.80.1.10", "accessConfigs": [{"natIP": "8.8.8.8"}]}]}
 
     class Runner:
-        def __init__(self, stderr): self.stderr, self.guest_reads = stderr, 0
+        def __init__(self, stderr, outcome="failed", exit_code=1):
+            self.stderr, self.outcome, self.exit_code, self.guest_reads = stderr, outcome, exit_code, 0
         def run(self, request):
             now = datetime.now(timezone.utc)
             if request.action_id == "gcp-guest-hostkeys":
                 self.guest_reads += 1
-                return CommandResult(action_id=request.action_id, outcome="failed", started_at=now,
-                    finished_at=now, duration_seconds=0.0, exit_code=1, stdout="", stderr=self.stderr)
+                return CommandResult(action_id=request.action_id, outcome=self.outcome, started_at=now,
+                    finished_at=now, duration_seconds=0.0, exit_code=self.exit_code, stdout="", stderr=self.stderr)
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=now,
                 finished_at=now, duration_seconds=0.0, exit_code=0, stdout=json.dumps(identity), stderr="")
 
     exact_404 = ("ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: "
                  "The resource 'hostkeys/' of type 'Guest Attribute' was not found.")
-    for stderr, timeout, expected_category in (
-        (exact_404, 0.01, "command_timeout"),
-        ("ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 403: access denied", 5.0, "gcp_api_read"),
-    ):
-        runner = Runner(stderr)
-        driver = GcpProviderDriver(runner, settings(tmp_path / expected_category))
+    cases = (
+        ("exact-404-deadline", exact_404, "failed", 1, 0.01, "command_timeout"),
+        ("permission-403", "ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 403: access denied", "failed", 1, 5.0, "gcp_api_read"),
+        ("mixed-403-and-404", exact_404 + "\nERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 403: access denied", "failed", 1, 5.0, "gcp_api_read"),
+        ("wrong-resource-path", "ERROR: (gcloud.compute.instances.get-guest-attributes) HTTPError 404: The resource 'hostkeys/key' of type 'Guest Attribute' was not found.", "failed", 1, 5.0, "gcp_api_read"),
+        ("timeout-with-404", exact_404, "timed_out", None, 5.0, "gcp_api_read"),
+    )
+    for case, stderr, outcome, exit_code, timeout, expected_category in cases:
+        runner = Runner(stderr, outcome=outcome, exit_code=exit_code)
+        driver = GcpProviderDriver(runner, settings(tmp_path / case))
         driver._deadline = time.monotonic() + timeout
         with pytest.raises(GcpProviderError) as failure:
             driver._trusted_hostkey("attempt-a", "europe-west3-a", identity)
         assert failure.value.category == expected_category
         assert runner.guest_reads == 1
-        assert not (tmp_path / expected_category / "state" / "attempt" / "known_hosts").exists()
+        assert not (tmp_path / case / "state" / "attempt" / "known_hosts").exists()
 
 
 def test_guest_hostkey_readiness_does_not_accept_a_different_vm_after_poll(tmp_path):

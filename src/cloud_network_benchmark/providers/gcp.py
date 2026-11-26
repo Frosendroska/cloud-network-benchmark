@@ -1527,6 +1527,8 @@ class GcpProviderDriver:
             if (action == "gcp-guest-hostkeys"
                     and "get-guest-attributes" in args
                     and "--query-path=hostkeys/" in args
+                    and result.outcome == "failed"
+                    and result.exit_code == 1
                     and self._is_hostkeys_guest_attribute_not_found(result.stderr)):
                 raise GcpProviderError("requested GCP hostkeys guest attribute is not yet available",
                     category="guest_attribute_not_found", action_id=action)
@@ -1541,11 +1543,14 @@ class GcpProviderDriver:
 
     @staticmethod
     def _is_hostkeys_guest_attribute_not_found(stderr: str) -> bool:
-        """Recognize only the exact gcloud 404 for the requested hostkeys namespace."""
-        return bool(re.search(
-            r"HTTPError\s+404:\s+The resource\s+['\"]hostkeys/['\"]\s+"
-            r"of type\s+['\"]Guest Attribute['\"]\s+was not found\.",
-            stderr, re.IGNORECASE))
+        """Recognize only the canonical one-line gcloud diagnostic for hostkeys/."""
+        return bool(re.fullmatch(
+            r"ERROR:\s+\(gcloud\.compute\.instances\.get-guest-attributes\) "
+            r"HTTPError 404: The resource 'hostkeys/' of type 'Guest Attribute' "
+            r"was not found\."
+            r"(?: This command is authenticated as [^\s]+ which is the active "
+            r"account specified by the \[core/account\] property\.)?",
+            stderr.strip()))
 
     @staticmethod
     def _outputs(value: dict[str, Any]) -> dict[str, Any]:
