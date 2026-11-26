@@ -1030,8 +1030,9 @@ def test_profile_public_cleanup_uses_fresh_absence_and_sticky_timing_failure(
 
 @pytest.mark.parametrize("cohort_profile", ["normal_pair", "calibration_self"])
 @pytest.mark.parametrize("auxiliary_state", ["created", "never_created"])
+@pytest.mark.parametrize("cleanup_late", [False, True])
 def test_public_destroy_cleans_authorized_shared_watcher_cohort(
-        repository_root: Path, tmp_path: Path, cohort_profile, auxiliary_state):
+        repository_root: Path, tmp_path: Path, cohort_profile, auxiliary_state, cleanup_late):
     """Exercise the public cleanup lifecycle with provider I/O replaced only at CommandRunner.run."""
     from concurrent.futures import ThreadPoolExecutor
     from urllib.parse import unquote
@@ -1122,23 +1123,54 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
         d = d.model_copy(update={"expiry": Evidence(value=expiry)})
         ready.append((d, o))
 
+    from cloud_network_benchmark.lifecycle_cleanup import save_cleanup_settings
+    from cloud_network_benchmark.orchestration import SavedLifecycleRecovery, SavedProviderRecovery
+    for (d, o), owner in zip(ready, spec["owners"]):
+        private_entry = tmp_path / owner["entry_id"]
+        saved = save_cleanup_settings(provider="azure", deployment=d,
+            request=expiry_request(d, o, trigger), reservation=d.reservation.value,
+            provider_lead_seconds=120.0, settings=o, private_root=private_entry)
+        recovery = SavedLifecycleRecovery(schema_version=1, attempt_id=d.run_id,
+            controller_session_id="fixture-cleanup-session",
+            reservation_id=d.reservation.value.reservation_id.value,
+            providers=[SavedProviderRecovery(provider="azure", deployment_id=d.deployment_id,
+                journal_reference=str(o.attempt_root / "recovery.json"), expiry_registered=True,
+                creation_may_have_started=True, cleanup_open=True,
+                cleanup_settings_reference=str(saved))])
+        recovery_path = private_entry / "lifecycle-recovery.json"
+        recovery_path.parent.mkdir(parents=True, exist_ok=True)
+        recovery_path.write_text(recovery.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        recovery_path.chmod(0o600)
+
     event_owner = spec["owners"][0]
     fixture = json.loads((Path(__file__).parents[1] /
         "fixtures/azure/shared-watcher-activity-retained-schema.json").read_text(encoding="utf-8"))
 
     class PublicCleanupRunner(ProfileCleanupRunner):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, timeout_expiry_once=False, timeout_clock=None,
+                timeout_at=None, **kwargs):
             super().__init__(*args, role_pages=True, **kwargs)
             self.watcher_deleted = False
             self.group_deleted = False
+            self.timeout_expiry_once = timeout_expiry_once
+            self.timeout_clock = timeout_clock
+            self.timeout_at = timeout_at
 
         def _result(self, request, *, outcome=CommandOutcome.SUCCEEDED, stdout="", stderr=""):
             return CommandResult(action_id=request.action_id, outcome=outcome, started_at=now,
-                finished_at=now, duration_seconds=0, exit_code=0 if outcome == CommandOutcome.SUCCEEDED else 1,
+                finished_at=now, duration_seconds=0,
+                exit_code=(0 if outcome == CommandOutcome.SUCCEEDED else
+                    None if outcome == CommandOutcome.TIMED_OUT else 1),
                 stdout=stdout, stderr=stderr)
 
         def run(self, request):
             if not request.action_type.startswith("azure_auxiliary_"):
+                if request.action_type == "expiry_destroy" and self.timeout_expiry_once:
+                    self.timeout_expiry_once = False
+                    self.timeout_clock["mono"] = self.timeout_at
+                    self.requests.append(request)
+                    return self._result(request, outcome=CommandOutcome.TIMED_OUT,
+                        stderr="bounded offline timeout")
                 return super().run(request)
             self.requests.append(request)
             action = request.action_type
@@ -1203,11 +1235,28 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
                 rows = []
             return self._result(request, stdout=json.dumps({"value": rows}))
 
+    routine_elapsed = cap_seconds - 660.0
+    original_cap_mono = 880.0 + cap_seconds
+    late_mono = original_cap_mono - 580.0
+    late_utc = start + timedelta(seconds=cap_seconds - 580.0)
+    failed_clocks = [{"mono": 1100.0} for _ in ready]
+    initial_runners = [PublicCleanupRunner(d, o, now, timeout_expiry_once=cleanup_late,
+        timeout_clock=failed_clocks[i], timeout_at=880.0 + routine_elapsed + 1.0)
+        for i, (d, o) in enumerate(ready)]
+    if cleanup_late:
+        for i, (d, o) in enumerate(ready):
+            failed = destroy(d, o, initial_runners[i], clock=lambda i=i: failed_clocks[i]["mono"],
+                utc_now=lambda i=i: start + timedelta(seconds=failed_clocks[i]["mono"] - 880.0))
+            assert failed.cleanup_state == "failed" and failed.timing_status == "late"
+            assert any(action.action_type == "expiry_destroy" for action in initial_runners[i].requests)
+            assert not any(action.action_type == "azure_auxiliary_watcher_delete"
+                for action in initial_runners[i].requests)
     runners = [PublicCleanupRunner(d, o, now) for d, o in ready]
-    cleanup_utc = now + timedelta(seconds=100)
+    cleanup_utc = late_utc if cleanup_late else now + timedelta(seconds=100)
+    cleanup_mono = late_mono if cleanup_late else 1100.0
     def invoke(index):
         d, o = ready[index]
-        return destroy(d, o, runners[index], clock=lambda: 1100.0,
+        return destroy(d, o, runners[index], clock=lambda: cleanup_mono,
             utc_now=lambda: cleanup_utc)
     if count == 2:
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1217,7 +1266,8 @@ def test_public_destroy_cleans_authorized_shared_watcher_cohort(
 
     for result, runner in zip(results, runners):
         assert result.cleanup_state == "succeeded" and not result.launch_blocked, result.failures
-        assert result.timing_status == "within_deadline" and result.timing_failure is None
+        assert result.timing_status == ("late" if cleanup_late else "within_deadline")
+        assert (result.timing_failure is not None) == cleanup_late
         assert any(request.action_type == "profile_absence_resources" for request in runner.requests)
         assert any(request.action_type == "profile_absence_groups" for request in runner.requests)
         assert any(request.action_type == "azure_auxiliary_inventory_resources" for request in runner.requests)
@@ -2091,7 +2141,9 @@ def test_cleanup_provider_commands_bind_the_earliest_registered_parent_deadline(
     assert bound.workflow_stage_deadline_monotonic == 700.0
 
 
-@pytest.mark.parametrize("corruption", ["wrong_caller", "ambiguous_create", "missing_nic_write"])
+@pytest.mark.parametrize("corruption", ["wrong_caller", "ambiguous_create", "missing_nic_write", "blank_only",
+    "foreign_completion_caller", "wrong_completion_correlation", "before_completion",
+    "duplicate_completion", "contradictory_completion"])
 def test_watcher_activity_ownership_requires_exact_caller_and_unique_correlated_vm_nic_writes(
         repository_root: Path, tmp_path: Path, monkeypatch, corruption):
     now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
@@ -2121,14 +2173,22 @@ def test_watcher_activity_ownership_requires_exact_caller_and_unique_correlated_
             "properties": {"statusCode": "Created"} if created else {}}
     watcher_event = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher", created=True,
         event_caller="foreign-caller" if corruption == "wrong_caller" else caller)
+    completion = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher-completion")
+    completion["eventTimestamp"] = "2026-11-25T11:31:00Z"
+    if corruption == "foreign_completion_caller": completion["caller"] = "foreign-caller"
+    if corruption == "wrong_completion_correlation": completion["correlationId"] = "other-correlation"
+    if corruption == "before_completion": completion["eventTimestamp"] = "2026-11-25T11:29:00Z"
+    if corruption == "contradictory_completion": completion["subStatus"]["value"] = "Updated"
     vm_event = event(owner["vm_ids"][0], "Microsoft.Compute/virtualMachines/write", "vm")
     nic_event = event(owner["nic_ids"][0], "Microsoft.Network/networkInterfaces/write", "nic")
-    target_map = {watcher_id.lower(): [watcher_event],
+    target_map = {watcher_id.lower(): [watcher_event, completion],
         owner["vm_ids"][0].lower(): [vm_event], owner["vm_ids"][1].lower(): [],
         owner["nic_ids"][0].lower(): [nic_event], owner["nic_ids"][1].lower(): []}
     if corruption == "ambiguous_create":
         target_map[watcher_id.lower()].append(event(watcher_id,
             "Microsoft.Network/networkWatchers/write", "watcher-two", created=True))
+    if corruption == "duplicate_completion": target_map[watcher_id.lower()].append(dict(completion))
+    if corruption == "blank_only": target_map[watcher_id.lower()] = [completion]
     if corruption == "missing_nic_write":
         target_map[owner["nic_ids"][0].lower()] = []
     targets = [watcher_id, *sorted(target_map.keys() - {watcher_id.lower()})]
@@ -2140,8 +2200,9 @@ def test_watcher_activity_ownership_requires_exact_caller_and_unique_correlated_
             watcher_id, caller, caller, lambda: 1100.0, lambda: now)
 
 
+@pytest.mark.parametrize("with_completion", [False, True])
 def test_watcher_activity_accepts_one_exact_successful_correlated_create(
-        repository_root: Path, tmp_path: Path, monkeypatch):
+        repository_root: Path, tmp_path: Path, monkeypatch, with_completion):
     now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
     d, options, _ = profile_attempt(repository_root, tmp_path, now)
     subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
@@ -2166,9 +2227,11 @@ def test_watcher_activity_accepts_one_exact_successful_correlated_create(
             "operationName": {"value": operation},
             "properties": {"statusCode": "Created"} if created else {}}
     watcher = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher", created=True)
+    completion = event(watcher_id, "Microsoft.Network/networkWatchers/write", "watcher-completion")
+    completion["eventTimestamp"] = "2026-11-25T11:31:00Z"
     vm = event(owner["vm_ids"][0], "Microsoft.Compute/virtualMachines/write", "vm")
     nic = event(owner["nic_ids"][0], "Microsoft.Network/networkInterfaces/write", "nic")
-    data = {watcher_id.lower(): [watcher], owner["vm_ids"][0].lower(): [vm],
+    data = {watcher_id.lower(): [watcher, *([completion] if with_completion else [])], owner["vm_ids"][0].lower(): [vm],
         owner["vm_ids"][1].lower(): [], owner["nic_ids"][0].lower(): [nic],
         owner["nic_ids"][1].lower(): []}
     targets = [watcher_id, *sorted(data.keys() - {watcher_id.lower()})]
@@ -2178,7 +2241,7 @@ def test_watcher_activity_accepts_one_exact_successful_correlated_create(
     evidence, pages = azure_provider._azure_watcher_activity(d, options, object(), tmp_path,
         baseline, watcher_id, caller, caller, lambda: 1100.0, lambda: now)
     assert evidence["correlation_id"] == corr
-    assert len(evidence["events"]) == 3
+    assert len(evidence["events"]) == (4 if with_completion else 3)
     assert pages == []
 
 

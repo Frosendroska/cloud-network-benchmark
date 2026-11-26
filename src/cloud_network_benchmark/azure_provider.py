@@ -98,6 +98,7 @@ class AzureRuntimeOptions(StrictModel):
     # Per-operation stage ceiling, derived from the immutable cap start. It is
     # transient and never replaces the original cap binding above.
     workflow_stage_deadline_monotonic: Optional[float] = Field(default=None, exclude=True)
+    bounded_recovery_deadline_utc: Optional[datetime] = Field(default=None, exclude=True)
     admission_evidence: dict[str, Any]
     retry_end_at: datetime
     poll_seconds: int = Field(ge=1, le=300)
@@ -143,6 +144,13 @@ class AzureRuntimeOptions(StrictModel):
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("retry_end_at must be timezone-aware")
         return v.astimezone(UTC)
+
+    @field_validator("bounded_recovery_deadline_utc")
+    @classmethod
+    def aware_bounded_recovery_deadline(cls, v: datetime | None) -> datetime | None:
+        if v is not None and (v.tzinfo is None or v.utcoffset() is None):
+            raise ValueError("bounded Azure recovery deadline must be timezone-aware")
+        return v.astimezone(UTC) if v is not None else None
 
     @field_validator("selected_image")
     @classmethod
@@ -1137,13 +1145,21 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
              expected_missing_resource_url: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
+    timing_observation = None
     if options.cleanup_timing_active:
-        _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
+        timing_observation = _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
             phase=options.cleanup_timing_phase or "routine")
+    if options.bounded_recovery_deadline_utc is not None:
+        if timing_observation is None or timing_observation.get("timing_status") == "unknown":
+            raise TimeoutError("bounded Azure auxiliary cleanup timing is unknown")
     operation_deadline = min(options.cap_deadline_monotonic,
         options.workflow_stage_deadline_monotonic
         if options.workflow_stage_deadline_monotonic is not None else options.cap_deadline_monotonic)
     remaining = operation_deadline-clock()
+    if options.bounded_recovery_deadline_utc is not None:
+        utc_remaining = (options.bounded_recovery_deadline_utc
+            - _utc_from_clock(clock)().astimezone(UTC)).total_seconds()
+        remaining = min(remaining, utc_remaining)
     if options.cleanup_timing_active and options.cleanup_timing_phase == "routine":
         try:
             timing = json.loads(options.cleanup_timing_path.read_text(encoding="utf-8"))
@@ -1201,14 +1217,20 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
                 _atomic_private(journal,state)
             raise RuntimeError(_redact(options, exc)) from exc
         result = result.model_copy(update={"redactions":list(set(result.redactions + req.redactions))})
+        timing_observation = None
         if options.cleanup_timing_active:
-            _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
+            timing_observation = _observe_profile_cleanup_clock(options, clock=clock, utc_now=_utc_from_clock(clock),
                 phase=options.cleanup_timing_phase or "routine")
         journal = root / "recovery.json"
         if journal.is_file() and not journal.is_symlink():
             state=json.loads(journal.read_text(encoding="utf-8"))
             state.setdefault("actions", []).append({"request":req.durable_view(),"result":_safe_result_view(options,result)})
             _atomic_private(journal,state)
+        if options.bounded_recovery_deadline_utc is not None:
+            if (timing_observation is None or timing_observation.get("timing_status") == "unknown"
+                    or clock() >= operation_deadline
+                    or _utc_from_clock(clock)().astimezone(UTC) >= options.bounded_recovery_deadline_utc):
+                raise TimeoutError("bounded Azure auxiliary cleanup timing became unknown or elapsed")
         return result
     if "apply" in argv and any(arg.startswith("-chdir=") for arg in argv):
         from .terraform_plan import reviewed_apply
@@ -1712,7 +1734,8 @@ def _verify_profile_absence(deployment: ProviderDeploymentInput, options: AzureR
 
 def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,
         runner: CommandRunner, root: Path, clock: Callable[[], float], utc_now: Callable[[], datetime],
-        state: dict[str, Any], actions: list[dict[str, Any]]) -> None:
+        state: dict[str, Any], actions: list[dict[str, Any]], *,
+        bounded_recovery_deadline_monotonic: float | None = None) -> None:
     """Delete one auto-created watcher only after exact parent and activity proof."""
     spec = options.azure_auxiliary_cleanup
     if spec is None:
@@ -1745,6 +1768,10 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
     peer_deadline = timing.get("routine_deadline_monotonic") if timing else None
     if isinstance(peer_deadline, bool) or not isinstance(peer_deadline, (int, float)) or not isfinite(float(peer_deadline)):
         raise TimeoutError("original Azure cleanup deadline is unavailable")
+    if (bounded_recovery_deadline_monotonic is not None
+            and (not isfinite(float(bounded_recovery_deadline_monotonic))
+                or clock() >= float(bounded_recovery_deadline_monotonic))):
+        raise TimeoutError("bounded Azure auxiliary recovery deadline is unavailable or elapsed")
     cohort = AuxiliaryCleanupCohort(spec)
     cohort_state = cohort.snapshot()
     baseline = cohort.precreation_baseline()
@@ -1757,10 +1784,12 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
     existing = cohort_state.get("claim")
     if isinstance(existing, dict):
         if existing.get("state") == "complete":
-            cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+            cohort.wait_complete(deadline_monotonic=float(peer_deadline),
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
             return
         if existing.get("state") in {"claimed", "group_claimed"}:
-            cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+            cohort.wait_complete(deadline_monotonic=float(peer_deadline),
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
             return
         if existing.get("state") == "leaf_absent":
             outcomes = cohort.snapshot().get("outcomes", [])
@@ -1773,10 +1802,13 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
             if not isinstance(owner_state, dict):
                 raise RuntimeError("saved shared cleanup owner evidence is missing")
             cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
-                activity_sha256=owner_state["activity_sha256"], deadline_monotonic=float(peer_deadline), clock=clock)
-            options = _bind_azure_cleanup_cohort_deadline(options, cohort)
+                activity_sha256=owner_state["activity_sha256"], deadline_monotonic=float(peer_deadline),
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
+            options = _bind_azure_cleanup_cohort_deadline(options, cohort,
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
             _finish_shared_watcher_group(spec, options, runner, root, clock, utc_now,
-                cohort, existing["claim_id"], float(peer_deadline), actions)
+                cohort, existing["claim_id"], float(peer_deadline), actions,
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
             return
         raise RuntimeError("Azure auxiliary cleanup has a terminal or uncertain prior action")
     resources, ev = _read_arm_collection(runner, options, root,
@@ -1827,11 +1859,15 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
     actions.extend(ev)
     activity_sha = hashlib.sha256(canonical(activity)).hexdigest()
     cohort.wait_all_absent(owner=owner, baseline_sha256=baseline["sha256"],
-        activity_sha256=activity_sha, deadline_monotonic=float(peer_deadline), clock=clock)
-    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
-    claim_id = cohort.claim_leaf(now_monotonic=clock())
+        activity_sha256=activity_sha, deadline_monotonic=float(peer_deadline),
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort,
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
+    claim_id = cohort.claim_leaf(now_monotonic=clock(),
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
     if claim_id is None:
-        cohort.wait_complete(deadline_monotonic=float(peer_deadline), clock=clock)
+        cohort.wait_complete(deadline_monotonic=float(peer_deadline),
+            bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
         return
     for collection in ("flowLogs", "packetCaptures", "connectionMonitors"):
         children, ev = _read_arm_collection(runner, options, root,
@@ -1878,24 +1914,120 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
         if not _is_exact_resource_404(absence, watcher_id):
             cohort.record_outcome(claim_id, action="leaf_delete", identity=watcher_id,
                 outcome="unknown", evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absence))).hexdigest(),
-                now_monotonic=clock())
+                now_monotonic=clock(),
+                bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
             raise RuntimeError("Network Watcher deletion lacks an exact typed 404 identity")
         cohort.record_outcome(claim_id, action="leaf_delete", identity=watcher_id,
             outcome="succeeded", evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absence))).hexdigest(),
             now_monotonic=clock(),
-            typed_404_identity=watcher_id)
+            typed_404_identity=watcher_id,
+            bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
     _finish_shared_watcher_group(spec, options, runner, root, clock, utc_now,
-        cohort, claim_id, float(peer_deadline), actions)
+        cohort, claim_id, float(peer_deadline), actions,
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
+
+
+def _bounded_late_auxiliary_deadline(deployment: ProviderDeploymentInput,
+        options: AzureRuntimeOptions, timing_state: dict[str, Any], *,
+        clock: Callable[[], float], utc_now: Callable[[], datetime]) -> tuple[float, datetime]:
+    """Bound explicitly approved late watcher recovery by both saved owner caps."""
+    spec = options.azure_auxiliary_cleanup
+    if spec is None:
+        raise PermissionError("late Azure auxiliary recovery has no exact approved cohort")
+    from .azure_auxiliary_cleanup import authorization_payload
+    now_mono, now_utc = float(clock()), utc_now().astimezone(UTC)
+    card = authorization_payload(spec, now_utc)
+    if (timing_state.get("clock_identity") != _clock_identity()
+            or timing_state.get("run_id") != deployment.run_id
+            or timing_state.get("deployment_id") != deployment.deployment_id
+            or timing_state.get("config_sha256") != deployment.config_sha256):
+        raise ValueError("late Azure auxiliary recovery timing identity differs from this attempt")
+    cap_deadline = min(float(options.cap_deadline_monotonic),
+        float(options.workflow_stage_deadline_monotonic)
+        if options.workflow_stage_deadline_monotonic is not None else float(options.cap_deadline_monotonic))
+    cap_deadline_utc: datetime | None = None
+    from .lifecycle_cleanup import load_cleanup_settings
+    from .orchestration import SavedLifecycleRecovery
+    for owner in spec["owners"]:
+        entry_root = Path(spec["state_root"]).parent / owner["entry_id"]
+        recovery_path = entry_root / "lifecycle-recovery.json"
+        if (recovery_path.is_symlink() or not recovery_path.is_file()
+                or any(parent.is_symlink() for parent in recovery_path.parents)):
+            raise ValueError("both original Azure owner recovery references are required")
+        recovery = SavedLifecycleRecovery.validate_unique(json.loads(recovery_path.read_text(encoding="utf-8")))
+        provider_record = next((row for row in recovery.providers if row.provider == "azure"), None)
+        if provider_record is None or provider_record.deployment_id != owner["deployment_id"]:
+            raise ValueError("Azure auxiliary owner recovery identity differs from its frozen cohort")
+        saved = load_cleanup_settings(Path(provider_record.cleanup_settings_reference or ""))
+        peer_options = AzureRuntimeOptions.model_validate(saved.settings)
+        if (saved.provider != Provider.AZURE or saved.deployment.run_id != owner["run_id"]
+                or saved.deployment.deployment_id != owner["deployment_id"]
+                or saved.deployment.config_sha256 != owner["config_sha256"]
+                or peer_options.azure_auxiliary_cleanup != spec):
+            raise ValueError("saved Azure cleanup settings differ from the exact frozen auxiliary owner")
+        timer_path = peer_options.cleanup_timing_path
+        if timer_path is None:
+            raise ValueError("original Azure auxiliary owner cleanup timer is missing")
+        if (timer_path.is_symlink() or not timer_path.is_file()
+                or any(parent.is_symlink() for parent in timer_path.parents)
+                or timer_path.stat().st_mode & 0o077):
+            raise ValueError("both original Azure auxiliary owner cap anchors are required")
+        peer = json.loads(timer_path.read_text(encoding="utf-8"))
+        peer_cap = peer.get("cap_deadline_monotonic")
+        peer_expiry = peer.get("cap_expires_at")
+        source_cap = _source_cap_deadline(peer_options, saved.reservation)
+        if (peer.get("sha256") != _profile_timing_digest(peer)
+                or peer.get("profile") != _profile_name(deployment)
+                or peer.get("clock_identity") != _clock_identity()
+                or peer.get("run_id") != owner["run_id"]
+                or peer.get("deployment_id") != owner["deployment_id"]
+                or peer.get("config_sha256") != owner["config_sha256"]
+                or peer.get("reservation_id") != saved.reservation.reservation_id.value
+                or peer.get("cap_started_at") != saved.reservation.cap_started_at.value.isoformat()
+                or peer.get("cap_expires_at") != saved.reservation.expires_at.value.isoformat()
+                or peer.get("cap_started_monotonic") != peer_options.cap_started_monotonic
+                or peer_cap != peer_options.cap_deadline_monotonic
+                or peer.get("source_cap_deadline_monotonic") != source_cap
+                or isinstance(peer_cap, bool) or not isinstance(peer_cap, (int, float))
+                or not isfinite(float(peer_cap))
+                or not isinstance(source_cap, (int, float)) or not isfinite(float(source_cap))
+                or float(peer_cap) > float(source_cap) + 1e-6
+                or not isinstance(peer_expiry, str)):
+            raise ValueError("original Azure auxiliary owner cap anchor is invalid or foreign")
+        previous_mono, previous_utc = peer.get("last_monotonic"), peer.get("last_utc")
+        if (peer.get("timing_status") == "unknown"
+                or isinstance(previous_mono, bool) or not isinstance(previous_mono, (int, float))
+                or not isfinite(float(previous_mono)) or now_mono < float(previous_mono)
+                or not isinstance(previous_utc, str)
+                or now_utc < datetime.fromisoformat(previous_utc.replace("Z", "+00:00")).astimezone(UTC)):
+            raise ValueError("original Azure auxiliary owner timing anchor moved backwards or became unknown")
+        expiry_utc = datetime.fromisoformat(peer_expiry.replace("Z", "+00:00"))
+        if expiry_utc.tzinfo is None:
+            raise ValueError("original Azure auxiliary owner UTC cap is invalid")
+        cap_deadline = min(cap_deadline, float(peer_cap),
+            now_mono + (expiry_utc.astimezone(UTC) - now_utc).total_seconds())
+        cap_deadline_utc = expiry_utc.astimezone(UTC) if cap_deadline_utc is None else min(
+            cap_deadline_utc, expiry_utc.astimezone(UTC))
+    card_end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00"))
+    cap_deadline = min(cap_deadline, now_mono + (card_end.astimezone(UTC) - now_utc).total_seconds())
+    cap_deadline_utc = min(cap_deadline_utc, card_end.astimezone(UTC)) if cap_deadline_utc else card_end.astimezone(UTC)
+    if cap_deadline <= now_mono or cap_deadline_utc <= now_utc:
+        raise TimeoutError("original Azure owner or approval-card deadline has elapsed")
+    return cap_deadline, cap_deadline_utc
 
 
 def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOptions,
         runner: CommandRunner, root: Path, clock: Callable[[], float], utc_now: Callable[[], datetime],
-        cohort: Any, claim_id: str, peer_deadline: float, actions: list[dict[str, Any]]) -> None:
+        cohort: Any, claim_id: str, peer_deadline: float, actions: list[dict[str, Any]], *,
+        bounded_recovery_deadline_monotonic: float | None = None) -> None:
     from .azure_auxiliary_cleanup import authorization_payload, canonical
-    options = _bind_azure_cleanup_cohort_deadline(options, cohort)
+    options = _bind_azure_cleanup_cohort_deadline(options, cohort,
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
     group_id = spec["resource_group_id"].lower()
-    if not cohort.claim_group(claim_id, now_monotonic=clock()):
-        cohort.wait_complete(deadline_monotonic=peer_deadline, clock=clock)
+    if not cohort.claim_group(claim_id, now_monotonic=clock(),
+            bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic):
+        cohort.wait_complete(deadline_monotonic=peer_deadline,
+            bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic, clock=clock)
         return
     authorization_payload(spec, utc_now().astimezone(UTC))
     grouped, ev = _read_arm_collection(runner, options, root,
@@ -1942,15 +2074,22 @@ def _finish_shared_watcher_group(spec: dict[str, Any], options: AzureRuntimeOpti
     if absent.stderr.strip() or absent.stdout.strip().lower() != "false":
         cohort.record_outcome(claim_id, action="group_delete", identity=group_id, outcome="unknown",
             evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absent))).hexdigest(),
-            now_monotonic=clock())
+            now_monotonic=clock(),
+            bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
         raise RuntimeError("NetworkWatcherRG deletion is not confirmed absent")
     cohort.record_outcome(claim_id, action="group_delete", identity=group_id, outcome="succeeded",
         evidence_sha256=hashlib.sha256(canonical(_safe_cleanup_action(options, absent))).hexdigest(),
-        now_monotonic=clock())
+        now_monotonic=clock(),
+        bounded_recovery_deadline_monotonic=bounded_recovery_deadline_monotonic)
 
 
-def _bind_azure_cleanup_cohort_deadline(options: AzureRuntimeOptions, cohort: Any) -> AzureRuntimeOptions:
-    deadline = cohort.earliest_deadline()
+def _bind_azure_cleanup_cohort_deadline(options: AzureRuntimeOptions, cohort: Any, *,
+        bounded_recovery_deadline_monotonic: float | None = None) -> AzureRuntimeOptions:
+    if bounded_recovery_deadline_monotonic is None:
+        deadline = cohort.earliest_deadline()
+    else:
+        persisted = cohort._pin_bounded_recovery_deadline(bounded_recovery_deadline_monotonic)
+        deadline = min(float(bounded_recovery_deadline_monotonic), float(persisted))
     current = options.workflow_stage_deadline_monotonic
     if current is not None:
         deadline = min(deadline, float(current))
@@ -2064,6 +2203,7 @@ def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureR
         events.extend(rows)
         evidence.extend(page_evidence)
     watcher_create = []
+    watcher_completions = []
     peer_writes = {}
     for row in events:
         details = row.get("properties", {})
@@ -2105,8 +2245,14 @@ def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureR
             and isinstance(substatus, str) and substatus.lower() == "created"
             and str(details.get("statusCode", "")).lower() == "created"
             and str(raw_substatus.get("localizedValue", "")).lower() == "created (http status code: 201)")
+        blank_substatus = (raw_substatus in (None, "") or isinstance(raw_substatus, dict)
+            and raw_substatus.get("value") in (None, "")
+            and raw_substatus.get("localizedValue") in (None, ""))
+        blank_watcher_completion = (watcher_write and status.lower() == "succeeded"
+            and caller == expected_create_caller and blank_substatus
+            and details.get("statusCode") in (None, ""))
         is_owned_write = is_owned_write and status.lower() == "succeeded"
-        if watcher_write and not is_watcher_create:
+        if watcher_write and not is_watcher_create and not blank_watcher_completion:
             raise RuntimeError("successful Network Watcher write is not an exact HTTP 201 creation")
         if (is_watcher_create and caller != expected_create_caller) or (is_owned_write and caller != expected_owned_caller):
             raise RuntimeError("Azure Activity Log caller differs from the exact authorized principal")
@@ -2118,7 +2264,16 @@ def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureR
                 raise RuntimeError("Network Watcher Activity Log timestamp is malformed") from exc
             if observed.tzinfo is None or not start < observed.astimezone(UTC) <= end:
                 raise RuntimeError("Network Watcher creation event is outside the cohort baseline and cleanup window")
-            watcher_create.append(corr)
+            watcher_create.append((corr, observed.astimezone(UTC), caller))
+        elif blank_watcher_completion:
+            timestamp = row.get("eventTimestamp")
+            try:
+                observed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except (AttributeError, ValueError) as exc:
+                raise RuntimeError("Network Watcher completion timestamp is malformed") from exc
+            if observed.tzinfo is None or not start < observed.astimezone(UTC) <= end:
+                raise RuntimeError("Network Watcher completion is outside the cohort baseline and cleanup window")
+            watcher_completions.append((corr, observed.astimezone(UTC), caller))
         if is_owned_write:
             timestamp = row.get("eventTimestamp")
             try:
@@ -2131,7 +2286,10 @@ def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureR
             peer_writes.setdefault((owner["run_id"], corr), set()).add(resource.lower())
     if len(watcher_create) != 1:
         raise RuntimeError("Activity Log does not prove one exact successful Network Watcher creation")
-    correlation = watcher_create[0]
+    correlation, created_at, create_caller = watcher_create[0]
+    if (len(watcher_completions) > 1 or any(corr != correlation or caller != create_caller
+            or completed_at <= created_at for corr, completed_at, caller in watcher_completions)):
+        raise RuntimeError("Network Watcher blank completion is ambiguous or unbound to its exact creation")
     matches = [(run_id, writes) for (run_id, corr), writes in peer_writes.items() if corr == correlation]
     if len(matches) != 1:
         raise RuntimeError("Network Watcher creation correlation does not uniquely match owned NIC and VM writes")
@@ -3093,6 +3251,17 @@ def _destroy_impl(deployment: ProviderDeploymentInput, options: AzureRuntimeOpti
             if timing_state is not None and timing_state.get("timing_status") == "within_deadline":
                 _cleanup_shared_network_watcher(deployment, routine_options, runner, root, clock, utc_now,
                     state, actions)
+            elif (timing_state is not None and timing_state.get("timing_status") == "late"
+                    and options.azure_auxiliary_cleanup is not None):
+                late_deadline, late_deadline_utc = _bounded_late_auxiliary_deadline(deployment, options, timing_state,
+                    clock=clock, utc_now=utc_now)
+                options = options.model_copy(update={
+                    "cap_deadline_monotonic": late_deadline,
+                    "workflow_stage_deadline_monotonic": late_deadline,
+                    "bounded_recovery_deadline_utc": late_deadline_utc,
+                    "cleanup_timing_phase": "emergency"})
+                _cleanup_shared_network_watcher(deployment, options, runner, root, clock, utc_now,
+                    state, actions, bounded_recovery_deadline_monotonic=late_deadline)
             phase="emergency"
             if timing_state is not None:
                 try:
