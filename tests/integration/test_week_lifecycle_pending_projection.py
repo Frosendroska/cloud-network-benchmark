@@ -167,10 +167,14 @@ def test_week_shape_only_capsule_is_not_projected_as_pending(tmp_path, monkeypat
 def test_genuine_producer_capsule_is_projected_pending_after_strict_binding(tmp_path, monkeypatch):
     from tests.integration.week_archive_fixture import build_single_provider_week_archive_fixture
 
-    fixture = build_single_provider_week_archive_fixture(tmp_path=tmp_path / "producer",
+    producer_root = tmp_path / "producer"
+    producer_root.mkdir()
+    fixture = build_single_provider_week_archive_fixture(tmp_path=producer_root,
         monkeypatch=monkeypatch, repository_root=ROOT)
     try:
-        stage, entry = _stage_entry(tmp_path / "driver")
+        driver_root = tmp_path / "driver"
+        driver_root.mkdir()
+        stage, entry = _stage_entry(driver_root)
         parent_doc = fixture.capsule["parent_manifest"]
         campaign_id = parent_doc["campaign_id"]
         reservation_id = fixture.capsule["reservation"]["reservation_id"]["value"]
@@ -188,7 +192,8 @@ def test_genuine_producer_capsule_is_projected_pending_after_strict_binding(tmp_
         provider_result = fixture.capsule["provider_results"]["aws"]
         capsule_ref = {"status": "archive_pending_replay", "path": str(capsule_path),
             "sha256": hashlib.sha256(capsule_bytes).hexdigest(), "bytes": len(capsule_bytes),
-            "providers": ["aws"], "manifest_sha256": fixture.capsule["manifest_sha256"]}
+            "providers": ["aws"], "manifest_sha256": {"aws":
+                fixture.capsule["archives"]["aws"]["manifest_sha256"]}}
         report = {"status": "archive_pending_validation", "campaign_id": campaign_id,
             "reservation_id": reservation_id, "run_ids": entry["run_ids"],
             "providers": {"aws": {"execution_state": provider_result["execution_state"],
