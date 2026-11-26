@@ -369,6 +369,43 @@ def _week_ledger_settled(runtime: dict[str, Any], capsule_ref: dict[str, Any] | 
         return False
 
 
+def _week_replay_quota_policy(sink: dict[str, Any]) -> dict[str, int]:
+    """Read frozen storage headroom policy without changing its source bytes."""
+    from .storage_admission import validate_controller_quota_evidence
+    path = Path(sink["controller_quota_evidence_path"])
+    validate_controller_quota_evidence(sink["controller_quota_free_bytes"], path,
+        sink["controller_quota_evidence_sha256"])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    policy = {key: document.get(key) for key in (
+        "metadata_headroom_bytes", "projected_other_growth_bytes", "reserve_bytes")}
+    if any(type(value) is not int or value <= 0 for value in policy.values()):
+        raise ValueError("frozen quota evidence lacks positive metadata, growth, and reserve bounds")
+    if policy["reserve_bytes"] < sink["minimum_controller_free_bytes"]:
+        raise ValueError("frozen replay reserve is below the runtime controller minimum")
+    return policy
+
+
+def _week_replay_quota_paths(runtime: dict[str, Any], stage: dict[str, Any],
+                             scope: dict[str, Any]) -> list[str]:
+    """Bind every local replay/result/journal root to the pinned quota mount."""
+    sink = runtime.get("archive_sink")
+    if not isinstance(sink, dict):
+        raise ValueError("WEEK quota refresh requires the source-bound archive sink")
+    staging = Path(sink["staging_directory"])
+    restore = Path(sink.get("restore_path") or staging.parent)
+    expected = {
+        str((Path(stage["state_root"]) / stage["stage_id"]).absolute()),
+        str(Path(stage["results_root"]).absolute()),
+        str((Path(stage["repository_root"]) / "results").absolute()),
+        str(Path(sink["archive_root"]).absolute()),
+        str(staging.absolute()), str(restore.absolute()), scope["mountpoint"],
+    }
+    paths = scope.get("filesystem_paths")
+    if not isinstance(paths, list) or set(paths) != expected:
+        raise ValueError("frozen quota filesystem_paths differ from this stage's state, results, archive, staging, restore, or mount roots")
+    return list(paths)
+
+
 def _replay_payload_from_receipt(path: Path, expected_sha256: str) -> int:
     """Read previously allocated replay payload only from its bound successful receipt."""
     if path.is_symlink() or not path.is_file() or _digest(path) != expected_sha256:
@@ -456,6 +493,81 @@ class CampaignDriver:
         self.reconcile = reconcile if reconcile is not None else (self._reconcile_lifecycle if launch is None else None)
         self.clock = clock or _SystemClock()
         self.sleep = sleep
+
+    def _fresh_week_quota_observation(self, entry: dict[str, Any], stage: dict[str, Any],
+                                      runtime: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Sample and hash-bind one quota receipt for an opted-in WEEK entry."""
+        runtime_path = Path(entry["runtime_config_path"])
+        runtime_digest = _digest(runtime_path)
+        if runtime_digest != entry.get("runtime_config_sha256"):
+            raise ValueError("source-bound runtime changed before fresh WEEK quota observation")
+        if runtime is None:
+            from .lifecycle_runtime import load_runtime_config
+            runtime = load_runtime_config(runtime_path,
+                selected_providers=set(entry.get("run_ids", {})))
+        sink = runtime.get("archive_sink")
+        scope = sink.get("replay_quota_refresh") if isinstance(sink, dict) else None
+        if not isinstance(scope, dict):
+            raise ValueError("WEEK quota refresh is enabled but the entry runtime lacks its explicit scope")
+        frozen_policy = _week_replay_quota_policy(sink)
+        scoped_paths = _week_replay_quota_paths(runtime, stage, scope)
+        from .replay_quota import (load_replay_quota_receipt,
+            replay_quota_scope_sha256, sample_replay_quota)
+        observation = sample_replay_quota(scope_value=scope,
+            entry_id=entry["entry_id"], runtime_config_sha256=runtime_digest,
+            frozen_policy=frozen_policy, filesystem_paths=scoped_paths,
+            receipt_directory=Path(stage["state_root"]) / stage["stage_id"],
+            now=lambda: _now(self.clock))
+        payload = load_replay_quota_receipt(path=Path(observation["path"]),
+            expected_sha256=observation["sha256"], scope_value=scope,
+            entry_id=entry["entry_id"], runtime_config_sha256=runtime_digest,
+            frozen_policy=frozen_policy, filesystem_paths=scoped_paths,
+            now=_now(self.clock))
+        return {"ref": {"path": observation["path"], "sha256": observation["sha256"]},
+            "payload": payload, "scope": scope, "policy": frozen_policy,
+            "scope_sha256": replay_quota_scope_sha256(scope)}
+
+    def _preflight_week_quota_group(self, group: list[dict[str, Any]], stage: dict[str, Any],
+            journal: dict[str, Any], journal_path: Path) -> bool:
+        """Refresh quota before any pair reservation or provider launch."""
+        if stage.get("week_replay_quota_refresh_enabled") is not True:
+            return True
+        try:
+            from .lifecycle_runtime import load_runtime_config
+            observations = []
+            for entry in group:
+                runtime = load_runtime_config(Path(entry["runtime_config_path"]),
+                    selected_providers=set(entry.get("run_ids", {})))
+                observation = self._fresh_week_quota_observation(entry, stage, runtime)
+                observations.append((entry, observation))
+                record = journal["entries"][entry["entry_id"]]
+                refs = list(record.get("week_quota_observations", []))
+                refs.append(observation["ref"])
+                record["week_quota_observations"] = refs
+                record["prelaunch_quota_observation"] = observation["ref"]
+                record["prelaunch_quota_minimum_bytes"] = observation["scope"]["minimum_available_bytes"]
+                _write_json(journal_path, journal)
+                if observation["payload"]["measured_free_bytes"] < observation["scope"]["minimum_available_bytes"]:
+                    raise OSError("fresh Halle user quota is below the frozen WEEK controller storage floor")
+            if len({item[1]["scope_sha256"] for item in observations}) != 1:
+                raise ValueError("paired WEEK entries do not share one frozen replay quota scope")
+            if len({tuple(sorted(item[1]["policy"].items())) for item in observations}) != 1:
+                raise ValueError("paired WEEK entries do not share one frozen storage policy")
+            return True
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            message = f"fresh WEEK user-quota preflight failed before reservation/provider calls: {type(exc).__name__}: {exc}"
+            for entry in group:
+                entry_id = entry["entry_id"]
+                record = journal["entries"][entry_id]
+                if record.get("state") == "scheduled":
+                    result = record.get("result") or {}
+                    self._transition(journal, entry_id, "missed",
+                        finished_at=_now(self.clock).isoformat(), error=message,
+                        result={**result, "cleanup_open": False,
+                            "quota_preflight_failed": True, "provider_calls": 0})
+            _write_json(journal_path, journal)
+            _append_log(stage, message)
+            return False
 
     def check(self, plan_path: Path, *, settings_path: Path | None = None,
               root: Path | None = None) -> dict[str, Any]:
@@ -942,6 +1054,10 @@ class CampaignDriver:
                     groups = [pending]
                 for group in groups:
                     aggregate_reservation_ids: list[str] = []
+                    if (stage.get("stage") == "week"
+                            and stage.get("week_replay_quota_refresh_enabled") is True
+                            and not self._preflight_week_quota_group(group, stage, journal, journal_path)):
+                        continue
                     if stage.get("stage") == "acceptance" and self.pre_admit is not None:
                         try:
                             aggregate_reservation_ids = self.pre_admit(group, stage) or []
@@ -1410,6 +1526,33 @@ class CampaignDriver:
                 else:
                     if result.get("archive_replay_attempted"):
                         raise ValueError("prior replay attempt has no successful receipt; automatic retry is disabled")
+                    scope = sink.get("replay_quota_refresh")
+                    if scope is not None:
+                        from .archive_replay import check_batch_replay_storage_admission
+                        observation = self._fresh_week_quota_observation(entry, stage, runtime)
+                        refs = list(record.get("replay_quota_observations", []))
+                        ref = observation["ref"]
+                        refs.append(ref)
+                        record["replay_quota_observations"] = refs
+                        record["active_replay_quota_observation"] = ref
+                        record["result"] = result
+                        _write_json(journal_path, journal)
+                        payload = observation["payload"]
+                        projection = check_batch_replay_storage_admission(
+                            capsule_path=capsule_path,
+                            expected_capsule_sha256=capsule_digest,
+                            additional_raw_copies_at_peak=1,
+                            prior_replay_payload_bytes=replay_payload_used,
+                            controller_quota_free_bytes=payload["measured_free_bytes"],
+                            controller_quota_evidence_path=Path(ref["path"]),
+                            controller_quota_evidence_sha256=ref["sha256"],
+                            metadata_headroom_bytes=observation["policy"]["metadata_headroom_bytes"],
+                            projected_other_growth_bytes=observation["policy"]["projected_other_growth_bytes"],
+                            minimum_free_bytes=observation["policy"]["reserve_bytes"],
+                            evaluated_at=_now(self.clock))
+                        result = {**result, "replay_quota_storage_projection": projection}
+                        record["result"] = result
+                        _write_json(journal_path, journal)
                     record["result"] = {**result, "archive_replay_attempted": True,
                         "prior_replay_payload_bytes": replay_payload_used}
                     _write_json(journal_path, journal)
@@ -1538,19 +1681,45 @@ class CampaignDriver:
             raise ValueError("runtime observer does not bind this prepared entry")
         from .gcs_archive import google_cloud_storage_backend
         from .archive_replay import restore_and_finalize_batch_capsule
-        quota_path = Path(sink["controller_quota_evidence_path"])
-        if quota_path.is_symlink() or not quota_path.is_file():
-            raise ValueError("fresh user quota evidence is required before archive backend access")
-        quota_doc = json.loads(quota_path.read_text(encoding="utf-8"))
-        quota_free = sink["controller_quota_free_bytes"]
-        metadata_headroom = quota_doc.get("metadata_headroom_bytes")
-        other_growth = quota_doc.get("projected_other_growth_bytes")
-        reserve = quota_doc.get("reserve_bytes")
-        if any(type(value) is not int or value <= 0 for value in
-                (metadata_headroom, other_growth, reserve)):
-            raise ValueError("fresh replay quota evidence lacks positive metadata, growth, and reserve bounds")
-        if reserve < sink["minimum_controller_free_bytes"]:
-            raise ValueError("fresh replay reserve is below the frozen runtime controller minimum")
+        quota_scope = sink.get("replay_quota_refresh")
+        if quota_scope is None:
+            quota_path = Path(sink["controller_quota_evidence_path"])
+            if quota_path.is_symlink() or not quota_path.is_file():
+                raise ValueError("fresh user quota evidence is required before archive backend access")
+            quota_doc = json.loads(quota_path.read_text(encoding="utf-8"))
+            quota_free = sink["controller_quota_free_bytes"]
+            quota_digest = sink["controller_quota_evidence_sha256"]
+            metadata_headroom = quota_doc.get("metadata_headroom_bytes")
+            other_growth = quota_doc.get("projected_other_growth_bytes")
+            reserve = quota_doc.get("reserve_bytes")
+            if any(type(value) is not int or value <= 0 for value in
+                    (metadata_headroom, other_growth, reserve)):
+                raise ValueError("fresh replay quota evidence lacks positive metadata, growth, and reserve bounds")
+            if reserve < sink["minimum_controller_free_bytes"]:
+                raise ValueError("fresh replay reserve is below the frozen runtime controller minimum")
+        else:
+            runtime_digest = _digest(Path(entry["runtime_config_path"]))
+            if runtime_digest != entry.get("runtime_config_sha256"):
+                raise ValueError("source-bound runtime changed before replay quota receipt validation")
+            frozen_policy = _week_replay_quota_policy(sink)
+            scoped_paths = _week_replay_quota_paths(runtime, stage, quota_scope)
+            quota_ref = record.get("active_replay_quota_observation")
+            if not isinstance(quota_ref, dict):
+                raise ValueError("fresh source-bound replay quota receipt is missing from the owned journal")
+            quota_path = Path(quota_ref.get("path", ""))
+            journal_directory = (Path(stage["state_root"]) / stage["stage_id"]).resolve(strict=True)
+            if quota_path.parent.resolve(strict=True) != journal_directory:
+                raise ValueError("replay quota receipt is outside the owned campaign journal directory")
+            from .replay_quota import load_replay_quota_receipt
+            quota_doc = load_replay_quota_receipt(path=quota_path,
+                expected_sha256=quota_ref.get("sha256"), scope_value=quota_scope,
+                entry_id=entry["entry_id"], runtime_config_sha256=runtime_digest,
+                frozen_policy=frozen_policy, filesystem_paths=scoped_paths)
+            quota_free = quota_doc["measured_free_bytes"]
+            quota_digest = quota_ref["sha256"]
+            metadata_headroom = frozen_policy["metadata_headroom_bytes"]
+            other_growth = frozen_policy["projected_other_growth_bytes"]
+            reserve = frozen_policy["reserve_bytes"]
         output = restore_and_finalize_batch_capsule(capsule_path=capsule_path,
             expected_capsule_sha256=capsule_sha256, backend=None,
             backend_factory=lambda: google_cloud_storage_backend(sink), bucket=sink["bucket"],
@@ -1563,7 +1732,7 @@ class CampaignDriver:
             prior_replay_payload_bytes=(record.get("result") or {}).get("prior_replay_payload_bytes", 0),
             controller_quota_free_bytes=quota_free,
             controller_quota_evidence_path=quota_path,
-            controller_quota_evidence_sha256=sink["controller_quota_evidence_sha256"],
+            controller_quota_evidence_sha256=quota_digest,
             metadata_headroom_bytes=metadata_headroom,
             projected_other_growth_bytes=other_growth)
         if output.get("status") != "replayed":

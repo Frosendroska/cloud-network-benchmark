@@ -215,6 +215,72 @@ def _check_fresh_replay_quota(*, free_bytes: int, evidence_path: Path,
             raise ValueError(f"replay quota evidence does not bind the planned {field}")
 
 
+def check_batch_replay_storage_admission(*, capsule_path: Path,
+        expected_capsule_sha256: str, additional_raw_copies_at_peak: int,
+        prior_replay_payload_bytes: int, controller_quota_free_bytes: int,
+        controller_quota_evidence_path: Path, controller_quota_evidence_sha256: str,
+        metadata_headroom_bytes: int, projected_other_growth_bytes: int,
+        minimum_free_bytes: int, evaluated_at: datetime | None = None) -> dict[str, Any]:
+    """Pure preflight for WEEK replay; creates no roots and opens no backend."""
+    capsule_path = Path(capsule_path)
+    if capsule_path.is_symlink() or not capsule_path.is_file():
+        raise ValueError("replay capsule must be a regular non-symlink file")
+    encoded = capsule_path.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != expected_capsule_sha256:
+        raise ValueError("replay capsule bytes differ from their separately bound digest")
+    capsule = json.loads(encoded)
+    if capsule.get("schema_version") != 2 or capsule.get("status") != "archive_pending_replay":
+        raise ValueError("capsule is not a batch archive-pending replay capsule")
+    archives = capsule.get("archives")
+    if not isinstance(archives, dict) or not archives:
+        raise ValueError("capsule has no provider archive receipts")
+    if (type(additional_raw_copies_at_peak) is not int or additional_raw_copies_at_peak < 0
+            or type(prior_replay_payload_bytes) is not int or prior_replay_payload_bytes < 0
+            or type(controller_quota_free_bytes) is not int or controller_quota_free_bytes < 0
+            or type(metadata_headroom_bytes) is not int or metadata_headroom_bytes <= 0
+            or type(projected_other_growth_bytes) is not int or projected_other_growth_bytes <= 0
+            or type(minimum_free_bytes) is not int or minimum_free_bytes <= 0):
+        raise ValueError("replay storage admission bounds must be positive integers")
+    raw_bytes = compressed_bytes = 0
+    for receipt in archives.values():
+        if not isinstance(receipt, dict):
+            raise ValueError("replay archive receipt must be an object")
+        manifest = receipt.get("manifest")
+        if not isinstance(manifest, dict):
+            raise ValueError("replay archive receipt lacks its immutable manifest")
+        from .retrieval import RetrievalManifest
+        closed = RetrievalManifest.model_validate(manifest.get("closed_inventory"))
+        raw_bytes += sum(item.expected_size_bytes for item in closed.items)
+        roles = manifest.get("roles")
+        if not isinstance(roles, list) or {row.get("role") for row in roles if isinstance(row, dict)} != {"vm_a", "vm_b"}:
+            raise ValueError("replay archive does not contain both complete role inventories")
+        archive_values = [row.get("archive_bytes") for row in roles if isinstance(row, dict)]
+        if len(archive_values) != 2 or any(type(value) is not int or value <= 0 for value in archive_values):
+            raise ValueError("replay archive role sizes are invalid")
+        compressed_bytes += sum(archive_values)
+    raw_copy_count = 3 + additional_raw_copies_at_peak
+    payload_bytes = compressed_bytes + raw_copy_count * raw_bytes
+    peak = (prior_replay_payload_bytes + payload_bytes
+        + metadata_headroom_bytes + projected_other_growth_bytes)
+    required = peak + minimum_free_bytes
+    _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
+        evidence_path=Path(controller_quota_evidence_path),
+        evidence_sha256=controller_quota_evidence_sha256,
+        metadata_headroom_bytes=metadata_headroom_bytes,
+        projected_other_growth_bytes=projected_other_growth_bytes,
+        reserve_bytes=minimum_free_bytes, now=evaluated_at or datetime.now(timezone.utc))
+    if controller_quota_free_bytes < required:
+        raise OSError(f"user quota cannot cover bounded replay peak: need {required} bytes, have {controller_quota_free_bytes}")
+    return {"raw_bytes": raw_bytes, "compressed_archive_bytes": compressed_bytes,
+        "raw_copy_count_at_peak": raw_copy_count,
+        "metadata_headroom_bytes": metadata_headroom_bytes,
+        "projected_other_growth_bytes": projected_other_growth_bytes,
+        "prior_replay_payload_bytes": prior_replay_payload_bytes,
+        "payload_bytes": payload_bytes, "reserve_bytes": minimum_free_bytes,
+        "required_free_bytes": required,
+        "observed_user_quota_free_bytes": controller_quota_free_bytes}
+
+
 def write_batch_replay_capsule(path: Path, *, archives: Mapping[str, Mapping[str, Any]],
         parent_manifest_path: Path, child_manifest_paths: Mapping[str, Path],
         result_roots: Mapping[str, Path], provider_results: Mapping[str, Any],
@@ -576,40 +642,18 @@ def restore_and_finalize_batch_capsule(*, capsule_path: Path, expected_capsule_s
             if (closed_export_results_root.is_symlink() or not closed_export_results_root.is_dir()
                     or closed_export_results_root.resolve(strict=True) != closed_export_results_root.absolute()):
                 raise ValueError("verified stage results root must be an existing real directory")
-        raw_bytes = compressed_bytes = 0
-        for receipt in archives.values():
-            manifest = receipt.get("manifest")
-            if not isinstance(manifest, dict):
-                raise ValueError("replay archive receipt lacks its immutable manifest")
-            from .retrieval import RetrievalManifest
-            closed = RetrievalManifest.model_validate(manifest.get("closed_inventory"))
-            raw_bytes += sum(item.expected_size_bytes for item in closed.items)
-            roles = manifest.get("roles")
-            if not isinstance(roles, list) or {row.get("role") for row in roles if isinstance(row, dict)} != {"vm_a", "vm_b"}:
-                raise ValueError("replay archive does not contain both complete role inventories")
-            compressed_bytes += sum(row.get("archive_bytes", 0) for row in roles)
-        # Base peak includes restored scratch, canonical results and the closed
-        # F12 export. A campaign-owned closed export may add one more raw copy.
-        raw_copy_count = 3 + additional_raw_copies_at_peak
-        payload_bytes = compressed_bytes + raw_copy_count * raw_bytes
-        peak = (prior_replay_payload_bytes + payload_bytes
-            + metadata_headroom_bytes + projected_other_growth_bytes)
-        required = peak + minimum_free_bytes
-        _check_fresh_replay_quota(free_bytes=controller_quota_free_bytes,
-            evidence_path=Path(controller_quota_evidence_path),
-            evidence_sha256=controller_quota_evidence_sha256,
+        # This remains the final admission consumer immediately before replay
+        # roots and the lazy archive backend can be created.
+        replay_storage_projection = check_batch_replay_storage_admission(
+            capsule_path=capsule_path, expected_capsule_sha256=expected_capsule_sha256,
+            additional_raw_copies_at_peak=additional_raw_copies_at_peak,
+            prior_replay_payload_bytes=prior_replay_payload_bytes,
+            controller_quota_free_bytes=controller_quota_free_bytes,
+            controller_quota_evidence_path=Path(controller_quota_evidence_path),
+            controller_quota_evidence_sha256=controller_quota_evidence_sha256,
             metadata_headroom_bytes=metadata_headroom_bytes,
             projected_other_growth_bytes=projected_other_growth_bytes,
-            reserve_bytes=minimum_free_bytes, now=datetime.now(timezone.utc))
-        if controller_quota_free_bytes < required:
-            raise OSError(f"user quota cannot cover bounded replay peak: need {required} bytes, have {controller_quota_free_bytes}")
-        replay_storage_projection = {"raw_bytes": raw_bytes, "compressed_archive_bytes": compressed_bytes,
-            "raw_copy_count_at_peak": raw_copy_count, "metadata_headroom_bytes": metadata_headroom_bytes,
-            "projected_other_growth_bytes": projected_other_growth_bytes,
-            "prior_replay_payload_bytes": prior_replay_payload_bytes,
-            "payload_bytes": payload_bytes,
-            "reserve_bytes": minimum_free_bytes, "required_free_bytes": required,
-            "observed_user_quota_free_bytes": controller_quota_free_bytes}
+            minimum_free_bytes=minimum_free_bytes)
     repository_root = Path(repository_root).resolve(strict=True)
     archive_staging_root, materialization_root = Path(archive_staging_root), Path(materialization_root)
     if prepare_replay_roots:

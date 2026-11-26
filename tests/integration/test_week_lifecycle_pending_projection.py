@@ -141,7 +141,7 @@ def _report(entry, *, status="archive_pending_validation", capsule_ref=None, run
     return report
 
 
-def test_week_pending_projection_preserves_capsule_without_validation(tmp_path, monkeypatch):
+def test_week_shape_only_capsule_is_not_projected_as_pending(tmp_path, monkeypatch):
     stage, entry = _stage_entry(tmp_path)
     reservation_id, book, _runtime_path = _runtime_ledger_fixture(tmp_path, stage, entry, settle=True)
     capsule_path = tmp_path / "archive-pending.json"
@@ -154,14 +154,57 @@ def test_week_pending_projection_preserves_capsule_without_validation(tmp_path, 
     result = _run_projection(monkeypatch, tmp_path, stage, entry,
         _report(entry, capsule_ref=capsule_ref, reservation_id=reservation_id, admission_status="reserved"))
 
-    assert result["status"] == "archive_pending_validation"
+    assert result["status"] == "failed"
     assert result["cleanup_open"] is False
     assert result["validated_outputs_present"] is False
     assert result["lifecycle_status_complete"] is False
-    assert result["replay_capsule"] == capsule_ref
+    assert "replay_capsule" not in result
     assert result["ledger_reconciliation_required"] is False
     assert not any((Path(stage["results_root"]) / "raw" / run_id / "validation").exists()
                    for run_id in entry["run_ids"].values())
+
+
+def test_genuine_producer_capsule_is_projected_pending_after_strict_binding(tmp_path, monkeypatch):
+    from tests.integration.week_archive_fixture import build_single_provider_week_archive_fixture
+
+    fixture = build_single_provider_week_archive_fixture(tmp_path=tmp_path / "producer",
+        monkeypatch=monkeypatch, repository_root=ROOT)
+    try:
+        stage, entry = _stage_entry(tmp_path / "driver")
+        parent_doc = fixture.capsule["parent_manifest"]
+        campaign_id = parent_doc["campaign_id"]
+        reservation_id = fixture.capsule["reservation"]["reservation_id"]["value"]
+        archive_root = tmp_path / "bound-archive"
+        capsule_path = archive_root / "replay-capsules" / f"{campaign_id}-{reservation_id}.json"
+        capsule_path.parent.mkdir(parents=True)
+        capsule_bytes = fixture.capsule_path.read_bytes()
+        capsule_path.write_bytes(capsule_bytes)
+        runtime_path = tmp_path / "bound-runtime.json"
+        runtime_path.write_text(json.dumps({"archive_sink": {"archive_root": str(archive_root),
+            "maximum_capsule_bytes": len(capsule_bytes) + 1}}) + "\n")
+        entry.update(run_ids={"aws": fixture.capsule["child_manifests"]["aws"]["run_id"]},
+            parent_manifest_path=str(fixture.parent_path), runtime_config_path=str(runtime_path))
+        stage["repository_root"] = str(fixture.repository_root)
+        provider_result = fixture.capsule["provider_results"]["aws"]
+        capsule_ref = {"status": "archive_pending_replay", "path": str(capsule_path),
+            "sha256": hashlib.sha256(capsule_bytes).hexdigest(), "bytes": len(capsule_bytes),
+            "providers": ["aws"], "manifest_sha256": fixture.capsule["manifest_sha256"]}
+        report = {"status": "archive_pending_validation", "campaign_id": campaign_id,
+            "reservation_id": reservation_id, "run_ids": entry["run_ids"],
+            "providers": {"aws": {"execution_state": provider_result["execution_state"],
+                "cleanup_state": provider_result["cleanup_state"],
+                "archive_status": fixture.receipt}}, "replay_capsule": capsule_ref}
+        from cloud_network_benchmark import lifecycle_runtime
+        monkeypatch.setattr(lifecycle_runtime, "load_runtime_config", lambda *_a, **_k: {})
+        monkeypatch.setattr(campaign_module, "_week_ledger_settled", lambda *_a, **_k: True)
+
+        result = _run_projection(monkeypatch, tmp_path, stage, entry, report)
+
+        assert result["status"] == "archive_pending_validation"
+        assert result["replay_capsule"] == capsule_ref
+        assert result["ledger_reconciliation_required"] is False
+    finally:
+        fixture.cleanup()
 
 
 @pytest.mark.parametrize("bad_case", ["malformed_digest", "wrong_run_ids", "wrong_capsule_status"])

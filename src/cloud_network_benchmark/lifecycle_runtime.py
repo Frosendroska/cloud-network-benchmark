@@ -133,12 +133,16 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
     if type(root["copy_retry_seconds"]) not in {int, float} or not math.isfinite(root["copy_retry_seconds"]) or root["copy_retry_seconds"] <= 0:
         raise ValueError("copy_retry_seconds must be positive and finite")
     if "archive_sink" in root:
-        sink = _keys(root["archive_sink"], {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+        sink_value = root["archive_sink"]
+        sink_keys = {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
             "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
             "controller_quota_free_bytes", "controller_quota_evidence_path",
             "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
             "source_credentials_file", "expected_source_principal", "expected_project_id",
-            "expected_service_account_email"},
+            "expected_service_account_email"}
+        if isinstance(sink_value, dict) and "replay_quota_refresh" in sink_value:
+            sink_keys.add("replay_quota_refresh")
+        sink = _keys(sink_value, sink_keys,
             "archive_sink")
         from .gcs_archive import valid_archive_identity, valid_archive_source, valid_bucket_name
         if (not valid_bucket_name(sink["bucket"])
@@ -164,6 +168,17 @@ def load_runtime_config(path: Path, *, selected_providers: set[str] | None = Non
         from .storage_admission import validate_controller_quota_evidence
         validate_controller_quota_evidence(sink["controller_quota_free_bytes"],
             sink["controller_quota_evidence_path"], sink["controller_quota_evidence_sha256"])
+        if "replay_quota_refresh" in sink:
+            from .replay_quota import validate_replay_quota_scope
+            scope = validate_replay_quota_scope(sink["replay_quota_refresh"])
+            for raw_path in scope["filesystem_paths"]:
+                candidate = Path(raw_path)
+                if any(part.is_symlink() for part in (candidate, *candidate.parents)):
+                    raise ValueError("replay quota filesystem_paths cannot traverse symlinks")
+            mount = Path(scope["mountpoint"])
+            if any(part.is_symlink() for part in (mount, *mount.parents)):
+                raise ValueError("replay quota mountpoint cannot traverse symlinks")
+            sink["replay_quota_refresh"] = scope
     if "observer" in root:
         observer = _keys(root["observer"], {"stage_id", "campaign_id", "entry_id", "workspace",
             "state_path", "journal_path", "prepared_stage_path", "bindings_path", "launch_receipt_root"},

@@ -348,6 +348,12 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
         archive_sink = settings.get("archive_sink")
         if archive_sink is not None:
             from .gcs_archive import valid_bucket_name
+            archive_sink_allowed = {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
+                "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
+                "controller_quota_free_bytes", "controller_quota_evidence_path",
+                "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
+                "source_credentials_file", "expected_source_principal", "expected_project_id",
+                "expected_service_account_email", "replay_quota_refresh"}
             if (not isinstance(archive_sink, dict)
                     or not {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
                         "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
@@ -355,12 +361,7 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                         "controller_quota_evidence_sha256", "archive_root", "staging_directory",
                         "source_credentials_file", "expected_source_principal", "expected_project_id",
                         "expected_service_account_email"}.issubset(archive_sink)
-                    or set(archive_sink) - {"bucket", "maximum_staging_bytes", "maximum_archive_bytes",
-                        "minimum_controller_free_bytes", "minimum_guest_free_bytes", "maximum_capsule_bytes",
-                        "controller_quota_free_bytes", "controller_quota_evidence_path",
-                        "controller_quota_evidence_sha256", "restore_path", "archive_root", "staging_directory",
-                        "source_credentials_file", "expected_source_principal", "expected_project_id",
-                        "expected_service_account_email"}
+                    or set(archive_sink) - archive_sink_allowed
                     or not valid_bucket_name(archive_sink.get("bucket"))
                     or type(archive_sink.get("maximum_staging_bytes")) is not int
                     or archive_sink["maximum_staging_bytes"] <= 0
@@ -375,6 +376,23 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
                     or type(archive_sink.get("controller_quota_free_bytes")) is not int
                     or archive_sink["controller_quota_free_bytes"] < 0):
                 raise ValueError("archive_sink requires measured guest/controller bounds and capsule state maximum")
+            if "replay_quota_refresh" in archive_sink:
+                if stage != "week":
+                    raise ValueError("replay_quota_refresh is an explicit WEEK-only runtime opt-in")
+                from .replay_quota import validate_replay_quota_scope
+                quota_scope = validate_replay_quota_scope(archive_sink["replay_quota_refresh"])
+                expected_quota_paths = {
+                    str(Path(settings["state_root"]).absolute()),
+                    str(Path(settings["results_root"]).absolute()),
+                    str((Path(root) / "results").absolute()),
+                    str(Path(archive_sink["archive_root"]).absolute()),
+                    str(Path(archive_sink["staging_directory"]).absolute()),
+                    str(Path(archive_sink.get("restore_path") or
+                        (Path(archive_sink["staging_directory"]).parent)).absolute()),
+                    quota_scope["mountpoint"],
+                }
+                if set(quota_scope["filesystem_paths"]) != expected_quota_paths:
+                    raise ValueError("replay_quota_refresh filesystem_paths must exactly bind state, results, replay exports, archive, staging, restore, and the pinned mountpoint")
             from .gcs_archive import valid_archive_identity, valid_archive_source
             if (not valid_archive_source(archive_sink.get("expected_source_principal"))
                     or not valid_archive_identity(archive_sink.get("expected_project_id"),
@@ -561,6 +579,10 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
             * review.get("maximum_archive_part_bytes", 0)
             + review.get("capsule_state_manifest_bytes", 0)
             + review.get("controller_reserve_bytes", 0)) if stage in {"day", "week"} and archive_sink is not None else minimum
+        if (stage == "week" and isinstance(archive_sink, dict)
+                and "replay_quota_refresh" in archive_sink
+                and archive_sink["replay_quota_refresh"].get("minimum_available_bytes") != storage_floor):
+            raise ValueError("replay_quota_refresh minimum_available_bytes must equal the frozen WEEK storage-review controller floor")
         observed_storage_free = (archive_sink["controller_quota_free_bytes"]
             if stage in {"day", "week"} and archive_sink is not None
             else shutil.disk_usage(disk_path).free)
@@ -1417,6 +1439,27 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 review = _gate_rows(settings, stage)["size_export_review"].get("fields", {})
                 runtime["archive_sink"]["controller_quota_free_bytes"] = review["controller_quota_free_bytes"]
                 runtime["archive_sink"]["controller_quota_evidence_sha256"] = review["controller_quota_evidence_sha256"]
+            if stage == "week" and "replay_quota_refresh" in runtime["archive_sink"]:
+                # Validation pins the operator-reviewed base roots. Each prepared
+                # stage receives private child roots, so bind the generated runtime
+                # to those exact children before hashing it into the entry.
+                scope = runtime["archive_sink"]["replay_quota_refresh"]
+                from .replay_quota import validate_replay_quota_scope
+                scope = validate_replay_quota_scope(scope)
+                base_state = Path(settings["state_root"]).absolute()
+                base_results = Path(settings["results_root"]).absolute()
+                generated_state = stage_private.absolute()
+                generated_results = result.absolute()
+                if (generated_state.parent != base_state or generated_results.parent != base_results
+                        or generated_state.is_symlink() or generated_results.is_symlink()):
+                    raise ValueError("generated WEEK quota roots are not exact children of the reviewed base roots")
+                replacements = {
+                    str(base_state): str(generated_state),
+                    str(base_results): str(generated_results),
+                }
+                paths = [replacements.get(path, path) for path in scope["filesystem_paths"]]
+                scope["filesystem_paths"] = paths
+                runtime["archive_sink"]["replay_quota_refresh"] = validate_replay_quota_scope(scope)
         runtime_path = private / entry["entry_id"] / "runtime.json"
         runtime_path.parent.mkdir(exist_ok=True, mode=0o700)
         atomic_write_json(runtime_path, runtime)
@@ -1438,6 +1481,9 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
         "approval_refs": approvals, "cost_input_path": str(cost_path),
         "cost_input_sha256": _sha(cost_path),
         "backup_destination": settings.get("backup_destination"), "notification_hook": settings.get("notification_hook")}
+    stage_data["week_replay_quota_refresh_enabled"] = bool(stage == "week"
+        and isinstance(settings.get("archive_sink"), dict)
+        and "replay_quota_refresh" in settings["archive_sink"])
     if stage in {"day", "acceptance", "calibration", "week"}:
         stage_data.update(campaign_id=stage_id,
             observer_bindings_path=str(private / "observer-bindings.json"),

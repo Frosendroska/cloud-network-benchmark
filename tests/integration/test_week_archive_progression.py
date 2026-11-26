@@ -31,6 +31,141 @@ def _admitted_args(fixture, quota_path: Path, quota_sha: str, free: int) -> dict
         "minimum_free_bytes": 16384}
 
 
+def _prepared_opt_in_week(tmp_path, monkeypatch, *, free_kib: int):
+    from types import SimpleNamespace
+    from cloud_network_benchmark import replay_quota
+    from cloud_network_benchmark.campaign_inputs import prepare_stage
+    from tests.integration.test_campaign_admission import operator_settings
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    class Clock:
+        def __init__(self): self.current = now
+        def utc_now(self): return self.current
+        def monotonic(self): return (self.current - now).total_seconds()
+        def sleep(self, seconds): self.current += timedelta(seconds=seconds)
+    clock = Clock()
+    root = Path.cwd()
+    (tmp_path / "settings").mkdir()
+    settings = operator_settings(tmp_path / "settings", root, monkeypatch)
+    settings["state_root"] = str(tmp_path / "state")
+    settings["results_root"] = str(tmp_path / "results")
+    settings["minimum_free_bytes"] = 5_000_000
+    future_day = (now + timedelta(days=2)).date().isoformat()
+    settings["stage_inputs"]["week"]["first_day_utc"] = future_day
+    settings["stage_inputs"]["week"]["start_utc"] = f"{future_day}T06:00:00+00:00"
+    review = settings["approvals"]["size_export_review"]["fields"]
+    review.update(capsule_state_manifest_bytes=65_536, controller_reserve_bytes=16_384,
+        expected_concurrent_archive_part_count=2, maximum_archive_part_bytes=2_000_000,
+        maximum_guest_archive_bytes=2_000_000, max_guest_raw_bytes=2_000_000,
+        measured_guest_free_bytes=5_000_000, guest_headroom_bytes=100_000,
+        controller_quota_free_bytes=10**12)
+    quota_path = tmp_path / "frozen-controller-quota.json"
+    quota_doc = {"measured_free_bytes": 10**12, "measured_at": now.isoformat(),
+        "metadata_headroom_bytes": 4096, "projected_other_growth_bytes": 8192,
+        "reserve_bytes": 16_384}
+    quota_bytes = (json.dumps(quota_doc, sort_keys=True) + "\n").encode()
+    quota_path.write_bytes(quota_bytes)
+    quota_hash = hashlib.sha256(quota_bytes).hexdigest()
+    review.update(controller_quota_evidence_path=str(quota_path),
+        controller_quota_evidence_sha256=quota_hash)
+    archive_root, staging, restore = (tmp_path / "archive", tmp_path / "staging", tmp_path / "restore")
+    for path in (archive_root, staging, restore): path.mkdir()
+    adc = tmp_path / "fake-adc.json"
+    adc.write_text("{}\n")
+    settings["archive_sink"] = {"bucket": "synthetic-archive", "maximum_staging_bytes": 2_000_000,
+        "maximum_archive_bytes": 16_000_000, "minimum_controller_free_bytes": 1024,
+        "minimum_guest_free_bytes": 0, "maximum_capsule_bytes": 65_536,
+        "controller_quota_free_bytes": 10**12, "controller_quota_evidence_path": str(quota_path),
+        "controller_quota_evidence_sha256": quota_hash, "source_credentials_file": str(adc),
+        "expected_source_principal": "katyabraun0@gmail.com",
+        "expected_project_id": "project-a70f8497-3463-4ef2-9cd",
+        "expected_service_account_email": "cnb-archive-halle@project-a70f8497-3463-4ef2-9cd.iam.gserviceaccount.com",
+        "restore_path": str(restore), "archive_root": str(archive_root),
+        "staging_directory": str(staging)}
+    mountpoint = str(tmp_path)
+    scope = {"user": "brek", "uid": 25357,
+        "device": "nashalle.in.tum.de:/srv/halle/drec", "mountpoint": mountpoint,
+        "filesystem_paths": sorted({str(Path(settings["state_root"]).absolute()),
+            str(Path(settings["results_root"]).absolute()), str((root / "results").absolute()),
+            str(archive_root.absolute()), str(staging.absolute()), str(restore.absolute()), mountpoint}),
+        "minimum_available_bytes": 2 * 2_000_000 + 65_536 + 16_384}
+    settings["archive_sink"]["replay_quota_refresh"] = scope
+    monkeypatch.setattr(replay_quota, "QUOTA_BINARY", Path("/usr/bin/quota"))
+    monkeypatch.setattr(replay_quota, "_current_identity", lambda: (25357, 25357, "brek"))
+    output = ("Disk quotas for user brek (uid 25357):\n"
+        "     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace\n"
+        f"{scope['device']} {mountpoint} 20 {free_kib} {free_kib} 0 10 0 0 0\n")
+    calls = []
+    monkeypatch.setattr(replay_quota, "_run_quota", lambda argv, **kwargs:
+        (calls.append(list(argv)) or SimpleNamespace(returncode=0, stdout=output.encode())))
+    stage = prepare_stage({"stage": "week"}, settings, root,
+        Path(settings["state_root"]), Path(settings["results_root"]), clock)
+    stage["entries"] = stage["entries"][:4]
+    return stage, clock, calls, quota_path, quota_bytes
+
+
+def test_factory_generated_week_scope_refreshes_each_original_pair_before_launch(
+        tmp_path, monkeypatch, request):
+    stage, clock, quota_calls, frozen_path, frozen_bytes = _prepared_opt_in_week(
+        tmp_path, monkeypatch, free_kib=52_428_800)
+    from tests.integration.test_campaign_admission import register_generated_cleanup
+    register_generated_cleanup(stage, request)
+    assert len({item["launch_at"] for item in stage["entries"]}) == 2
+    slot_times = sorted({datetime.fromisoformat(item["launch_at"]) for item in stage["entries"]})
+    assert (slot_times[1] - slot_times[0]).total_seconds() > 900
+    original_hashes = {item["entry_id"]: hashlib.sha256(
+        Path(item["runtime_config_path"]).read_bytes()).hexdigest() for item in stage["entries"]}
+    launched = []
+    outcome = driver(clock, lambda entry, _stage: (launched.append(entry["entry_id"]) or
+        {"status": "complete", "cleanup_open": False})).run(stage)
+    saved = journal(stage)
+    assert outcome["counts"]["complete"] == 4
+    assert len(launched) == 4
+    assert len(quota_calls) == 4
+    assert all(len(saved["entries"][entry["entry_id"]]["week_quota_observations"]) == 1
+        for entry in stage["entries"])
+    refs = [saved["entries"][entry["entry_id"]]["week_quota_observations"][0]
+        for entry in stage["entries"]]
+    assert len({ref["path"] for ref in refs}) == len({ref["sha256"] for ref in refs}) == 4
+    payloads = [json.loads(Path(ref["path"]).read_text(encoding="utf-8")) for ref in refs]
+    slot_receipts = {}
+    for entry, payload in zip(stage["entries"], payloads):
+        slot_receipts.setdefault(entry["launch_at"], []).append(
+            datetime.fromisoformat(payload["measured_at"]))
+    receipt_times = sorted(min(values) for values in slot_receipts.values())
+    assert (receipt_times[1] - receipt_times[0]).total_seconds() > 900
+    assert all(payload["command_argv"] == ["/usr/bin/quota", "--user", "--verbose",
+        "--no-wrap", "--raw-grace", "--show-mntpoint",
+        f"--filesystem={payload['mountpoint']}", payload["user"]]
+        for payload in payloads)
+    assert all(hashlib.sha256(Path(entry["runtime_config_path"]).read_bytes()).hexdigest()
+        == original_hashes[entry["entry_id"]] for entry in stage["entries"])
+    assert frozen_path.read_bytes() == frozen_bytes
+    driver(clock, lambda *_: pytest.fail("completed WEEK entry was relaunched")).run(stage)
+    assert len(quota_calls) == 4
+
+
+def test_factory_generated_week_fresh_low_user_quota_stops_before_paid_launch(
+        tmp_path, monkeypatch, request):
+    stage, clock, quota_calls, _frozen_path, _frozen_bytes = _prepared_opt_in_week(
+        tmp_path, monkeypatch, free_kib=21)
+    from tests.integration.test_campaign_admission import register_generated_cleanup
+    register_generated_cleanup(stage, request)
+    launched = []
+    monkeypatch.setattr("cloud_network_benchmark.campaign.CampaignDriver._free_disk",
+        lambda *_args, **_kwargs: 10**12)
+    outcome = driver(clock, lambda entry, _stage: (launched.append(entry["entry_id"]) or
+        {"status": "complete", "cleanup_open": False})).run(stage)
+    saved = journal(stage)
+    assert launched == []
+    assert len(quota_calls) == 2
+    assert all(saved["entries"][entry["entry_id"]]["state"] == "missed"
+        and saved["entries"][entry["entry_id"]]["result"]["quota_preflight_failed"]
+        and saved["entries"][entry["entry_id"]]["result"]["provider_calls"] == 0
+        for entry in stage["entries"])
+    assert outcome["counts"]["missed"] == 4
+
+
 def test_replay_admission_precedes_backend_and_sealed_export_stays_verified(tmp_path, monkeypatch):
     fixture = build_single_provider_week_archive_fixture(tmp_path=tmp_path,
         monkeypatch=monkeypatch, repository_root=Path.cwd())
