@@ -922,47 +922,13 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         check_shared_finances(ledger_state, second_batch_snapshot, remaining_usd=Decimal("0"))
     assert financial_ledger_path.read_bytes() == financial_ledger_bytes
 
-    # Build the conditional CAL admission request only from the closed,
-    # replayed normal acceptance stage and its real source-bound outputs.
-    acceptance_prepared_path = Path(stage["state_root"]) / stage["stage_id"] / "prepared-stage.json"
-    assert acceptance_prepared_path.is_file() and not acceptance_prepared_path.is_symlink()
-    acceptance_prepared_sha256 = hashlib.sha256(acceptance_prepared_path.read_bytes()).hexdigest()
-    settings["approvals"]["paid_acceptance"] = {"confirmed": True,
-        "source": str(acceptance_prepared_path), "sha256": acceptance_prepared_sha256}
-    activated_stage = json.loads(acceptance_prepared_path.read_text(encoding="utf-8"))
-    for key in ("f10_offline", "quota_review"):
-        settings["approvals"][key] = {"confirmed": True,
-            "source": activated_stage["approval_refs"][key], "fields": {}}
-    # The one-time O2 reserve policy is acceptance-only. Prepare the offline
-    # CAL request without that input, then verify its financial binding is
-    # rejected by the same real guard before any admission or provider boundary.
-    settings["pricing"].pop("pending_eur_reserve_release", None)
-    calibration_stage = prepare_stage({"stage": "calibration"}, settings, repository_root,
-        Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
-    generated_calibration = Path(calibration_stage["entries"][0]["config_path"]).parent
-    request.addfinalizer(lambda: shutil.rmtree(generated_calibration, ignore_errors=True))
-    cal_entry = calibration_stage["entries"][0]
-    cal_runtime = load_runtime_config(Path(cal_entry["runtime_config_path"]),
-        selected_providers={"aws", "azure", "gcp"})
-    cal_parent, cal_children = load_initialized_campaign(Path(cal_entry["parent_manifest_path"]),
-        repository_root=repository_root, config_path=Path(cal_entry["config_path"]))
-    cal_campaign, _ = resolve_campaign(Path(cal_entry["config_path"]), repository_root)
-    cal_costs = load_cost_inputs(Path(cal_entry["cost_inputs_path"]))
-    cal_admission, cal_plan = build_admission_request(campaign=cal_campaign,
-        parent=cal_parent, children=cal_children, costs=cal_costs, runtime=cal_runtime,
-        controller_session_id=calibration_stage["controller_session_id"])
-    from cloud_network_benchmark.financial_controls import FinancialError, validate_paid_financial_plan
-    with pytest.raises(FinancialError, match="financial_scope_mismatch"):
-        validate_paid_financial_plan(cal_plan, cal_admission, scope_id=stage["scope_id"],
-            now=Clock().utc_now())
-    cal_evidence = cal_plan.prerequisites["paid_acceptance"]
-    from tests.support.reduced_cal_gate import check_actual_calibration_acceptance_prerequisite
-    cal_gate = check_actual_calibration_acceptance_prerequisite(evidence=cal_evidence,
-        campaign=cal_campaign)
-    assert cal_gate["accepted"] is True
-    assert cal_gate["accepted_campaign_count"] == 2
-    assert set(cal_gate["rejected_cases"]) >= {"missing", "pending_incomplete",
-        "source_mismatch", "accepted_manifest_source_mismatch"}
+    # O2 reserve authority is limited to the normal acceptance batch. Verify
+    # CAL is stopped by the actual stage-input guard before creating a stage,
+    # entering provider boundaries, or changing the already-closed ledger.
+    with pytest.raises(ValueError, match="O2 reserve-release authority is limited to the one normal acceptance batch"):
+        prepare_stage({"stage": "calibration"}, settings, repository_root,
+            Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
+    assert financial_ledger_path.read_bytes() == financial_ledger_bytes
     assert len(router.runtime_roots["aws"]) == 2
     assert len(router.runtime_roots["azure"]) == 2
     assert len(router.runtime_roots["gcp"]) == 2
