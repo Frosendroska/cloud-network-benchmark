@@ -187,6 +187,32 @@ def _required_gate_keys(stage):
     return required
 
 
+def _generated_week_replay_quota_scope(scope_value: dict[str, Any], *,
+        base_state: Path, base_results: Path, generated_state: Path,
+        generated_results: Path, repository_root: Path,
+        archive_sink: dict[str, Any]) -> dict[str, Any]:
+    """Bind generated stage roots while retaining the distinct export base role."""
+    from .replay_quota import validate_replay_quota_scope
+    scope = validate_replay_quota_scope(scope_value)
+    base_state, base_results = Path(base_state).absolute(), Path(base_results).absolute()
+    generated_state, generated_results = Path(generated_state).absolute(), Path(generated_results).absolute()
+    repository_root = Path(repository_root).absolute()
+    if (generated_state.parent != base_state or generated_results.parent != base_results
+            or generated_state.is_symlink() or generated_results.is_symlink()):
+        raise ValueError("generated WEEK quota roots are not exact children of the reviewed base roots")
+    staging = Path(archive_sink["staging_directory"]).absolute()
+    restore = Path(archive_sink.get("restore_path") or staging.parent).absolute()
+    # Construct the frozen runtime scope by role. In particular, when the
+    # reviewed results base aliases repository/results, retain both its export
+    # role and the newly generated stage-results child.
+    scope["filesystem_paths"] = sorted({
+        str(generated_state), str(generated_results), str(repository_root / "results"),
+        str(Path(archive_sink["archive_root"]).absolute()), str(staging), str(restore),
+        scope["mountpoint"],
+    })
+    return validate_replay_quota_scope(scope)
+
+
 def _gate_rows(settings, stage, *, draft=False):
     declarations = {**settings.get("approvals", {}),
                     **settings.get("stage_inputs", {}).get(stage, {}).get("approvals", {})}
@@ -1443,23 +1469,12 @@ def prepare_stage(plan: dict, settings: dict, root: Path, state_root: Path,
                 # Validation pins the operator-reviewed base roots. Each prepared
                 # stage receives private child roots, so bind the generated runtime
                 # to those exact children before hashing it into the entry.
-                scope = runtime["archive_sink"]["replay_quota_refresh"]
-                from .replay_quota import validate_replay_quota_scope
-                scope = validate_replay_quota_scope(scope)
-                base_state = Path(settings["state_root"]).absolute()
-                base_results = Path(settings["results_root"]).absolute()
-                generated_state = stage_private.absolute()
-                generated_results = result.absolute()
-                if (generated_state.parent != base_state or generated_results.parent != base_results
-                        or generated_state.is_symlink() or generated_results.is_symlink()):
-                    raise ValueError("generated WEEK quota roots are not exact children of the reviewed base roots")
-                replacements = {
-                    str(base_state): str(generated_state),
-                    str(base_results): str(generated_results),
-                }
-                paths = [replacements.get(path, path) for path in scope["filesystem_paths"]]
-                scope["filesystem_paths"] = paths
-                runtime["archive_sink"]["replay_quota_refresh"] = validate_replay_quota_scope(scope)
+                runtime["archive_sink"]["replay_quota_refresh"] = _generated_week_replay_quota_scope(
+                    runtime["archive_sink"]["replay_quota_refresh"],
+                    base_state=Path(settings["state_root"]),
+                    base_results=Path(settings["results_root"]),
+                    generated_state=stage_private, generated_results=result,
+                    repository_root=root, archive_sink=runtime["archive_sink"])
         runtime_path = private / entry["entry_id"] / "runtime.json"
         runtime_path.parent.mkdir(exist_ok=True, mode=0o700)
         atomic_write_json(runtime_path, runtime)

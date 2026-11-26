@@ -150,3 +150,47 @@ def test_quota_receipt_tampering_and_frozen_policy_change_are_rejected(tmp_path,
             scope_value=_scope(tmp_path), entry_id="P0-01", runtime_config_sha256="a" * 64,
             frozen_policy=POLICY, filesystem_paths=[str(tmp_path)], now=now)
 
+
+def test_generated_runtime_scope_retains_export_root_when_results_base_aliases_repository(
+        tmp_path):
+    from cloud_network_benchmark.campaign_inputs import _generated_week_replay_quota_scope
+
+    state_base = tmp_path / "state"
+    results_base = tmp_path / "repository" / "results"
+    generated_state = state_base / "week-123"
+    generated_results = results_base / "week-123"
+    archive_root, staging, restore = (tmp_path / "archive", tmp_path / "staging", tmp_path / "restore")
+    mountpoint = tmp_path
+    for path in (state_base, results_base, generated_state, generated_results,
+                 archive_root, staging, restore):
+        path.mkdir(parents=True, exist_ok=True)
+    sink = {"archive_root": str(archive_root), "staging_directory": str(staging),
+        "restore_path": str(restore)}
+    base_paths = sorted({str(state_base), str(results_base), str(archive_root),
+        str(staging), str(restore), str(mountpoint)})
+    scope = {"user": USER, "uid": UID, "device": DEVICE, "mountpoint": str(mountpoint),
+        "filesystem_paths": base_paths, "minimum_available_bytes": 1_000_000}
+
+    generated = _generated_week_replay_quota_scope(scope, base_state=state_base,
+        base_results=results_base, generated_state=generated_state,
+        generated_results=generated_results, repository_root=results_base.parent,
+        archive_sink=sink)
+
+    assert set(generated["filesystem_paths"]) == {
+        str(generated_state), str(generated_results), str(results_base),
+        str(archive_root), str(staging), str(restore), str(mountpoint)}
+    assert generated["minimum_available_bytes"] == scope["minimum_available_bytes"]
+    assert generated["user"] == scope["user"] and generated["uid"] == scope["uid"]
+
+
+def test_quota_scope_rejects_a_source_root_on_another_filesystem(tmp_path, monkeypatch):
+    other = tmp_path / "other"
+    other.mkdir()
+    scope = _scope(tmp_path)
+    scope["filesystem_paths"] = [str(tmp_path), str(other)]
+    monkeypatch.setattr(replay_quota, "_filesystem_device",
+        lambda path: 1 if Path(path) == tmp_path else 2)
+
+    with pytest.raises(replay_quota.ReplayQuotaError, match="different filesystem device"):
+        replay_quota.validate_filesystem_devices(scope)
+
