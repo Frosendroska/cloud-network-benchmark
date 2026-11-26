@@ -242,13 +242,14 @@ def test_second_parallel_replay_counts_retained_first_replay_payload(tmp_path, m
         fixture.cleanup()
 
 
+@pytest.mark.parametrize("native_fault", [None, "invalid_native", "partial_native"])
 def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_owned_lock(
-        tmp_path, monkeypatch, request):
+        tmp_path, monkeypatch, request, native_fault):
     from cloud_network_benchmark import archive_replay, gcs_archive
     from cloud_network_benchmark.campaign_inputs import prepare_stage
     from tests.integration.test_campaign_admission import operator_settings, register_generated_cleanup
     fixture = build_single_provider_week_archive_fixture(tmp_path=tmp_path,
-        monkeypatch=monkeypatch, repository_root=Path.cwd())
+        monkeypatch=monkeypatch, repository_root=Path.cwd(), native_fault=native_fault)
     try:
         now = datetime.now(timezone.utc).replace(microsecond=0)
         class Clock:
@@ -338,7 +339,9 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         capsule_ref = {"status": "archive_pending_replay", "path": str(fixture.capsule_path),
             "sha256": fixture.capsule_sha256}
 
+        launched = []
         def launch(item, _stage):
+            launched.append(item["entry_id"])
             if item["entry_id"] == entry["entry_id"]:
                 return {"status": "archive_pending_validation", "cleanup_open": False,
                     "run_ids": {"aws": run_id}, "reservation_id": fixture.lifecycle.reservation_evidence.reservation_id.value,
@@ -348,15 +351,27 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         engine = driver(clock, launch)
         outcome = engine.run(stage)
         saved = journal(stage)["entries"][entry["entry_id"]]
-        assert saved["state"] == "complete", saved.get("result")
-        assert saved["result"]["archive_validation"] == "valid"
+        expected_state = "failed" if native_fault else "complete"
+        expected_validity = "invalid" if native_fault == "invalid_native" else (
+            "partial" if native_fault == "partial_native" else "valid")
+        assert saved["state"] == expected_state, saved.get("result")
+        assert saved["result"]["archive_validation"] == ("invalid" if native_fault else "valid")
+        assert saved["result"]["archive_validation_results"]["aws"]["data_validity"] == expected_validity
         assert saved["result"].get("ledger_reconciliation_required") is None
         assert saved.get("blocked_reason") is None
         assert saved["export_status"] == "verified"
         from cloud_network_benchmark.campaign_export import verify_export
         assert verify_export(Path(stage["results_root"]) / "closed" / entry["entry_id"] / "export")
         assert fixture.backend.deleted == []
-        assert outcome["counts"]["complete"] == 4
+        assert outcome["counts"]["failed"] == (1 if native_fault else 0)
+        assert outcome["counts"]["complete"] == (3 if native_fault else 4)
+        assert set(launched) == {item["entry_id"] for item in stage["entries"]}
+        assert len(launched) == len(set(launched))
+        later_pair = [item for item in stage["entries"] if item["launch_at"] != entry["launch_at"]]
+        assert len(later_pair) == 2
+        assert {(item["priority"], item["scenario"]) for item in later_pair} == {("P0", "S1"), ("P1", "S3")}
+        assert all(journal(stage)["entries"][item["entry_id"]]["state"] == "complete"
+            and launched.count(item["entry_id"]) == 1 for item in later_pair)
         assert set(outcome["entries"]) == {item["entry_id"] for item in stage["entries"]}
 
         # Emulate controller loss after the immutable successful receipt was
@@ -368,7 +383,8 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         receipt_path = Path(saved_entry["result"]["archive_replay_receipt"])
         receipt_bytes = receipt_path.read_bytes()
         pending_result = dict(saved_entry["result"])
-        for key in ("archive_validation", "archive_replay_receipt", "archive_replay_receipt_sha256"):
+        for key in ("archive_validation", "archive_validation_results", "archive_replay_receipt",
+                    "archive_replay_receipt_sha256"):
             pending_result.pop(key, None)
         saved_entry.update(state="archive_pending_validation", result=pending_result)
         journal_path.write_text(json.dumps(saved_journal, sort_keys=True) + "\n", encoding="utf-8")
@@ -382,8 +398,9 @@ def test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_ow
         receipt_path.write_bytes(receipt_bytes)
         driver(clock, lambda *_: pytest.fail("receipt recovery relaunched a WEEK entry")).run(stage)
         recovered = journal(stage)["entries"][entry["entry_id"]]
-        assert recovered["state"] == "complete"
-        assert recovered["result"]["archive_validation"] == "valid"
+        assert recovered["state"] == expected_state
+        assert recovered["result"]["archive_validation"] == ("invalid" if native_fault else "valid")
+        assert recovered["result"]["archive_validation_results"]["aws"]["data_validity"] == expected_validity
         assert verify_export(Path(stage["results_root"]) / "closed" / entry["entry_id"] / "export")
     finally:
         fixture.cleanup()

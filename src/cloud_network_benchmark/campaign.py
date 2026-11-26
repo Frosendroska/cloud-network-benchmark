@@ -1754,8 +1754,8 @@ class CampaignDriver:
             controller_quota_evidence_sha256=quota_digest,
             metadata_headroom_bytes=metadata_headroom,
             projected_other_growth_bytes=other_growth)
-        if output.get("status") != "replayed":
-            raise ValueError("archive replay failed canonical validation or analysis")
+        if output.get("status") not in {"replayed", "replayed_invalid"}:
+            raise ValueError("archive replay did not complete canonical validation or analysis")
         return Path(output["replay_receipt"]["path"])
 
     def reconcile_export(self, state_root: Path, stage_id: str, entry_id: str,

@@ -571,6 +571,8 @@ class FakePreparedAwsRunner(FakeAwsRunner):
                                 f"[Total Run] RunTime={duration + late_tail:.3f} sec; Warm up time=5000 msec; SentMessages={int((duration + late_tail) * 1000)}; ReceivedMessages=2\n"
                                 f"[Valid Duration] RunTime={duration + late_tail - .45:.3f} sec; SentMessages={int((duration + late_tail - .45) * 1000)}; ReceivedMessages=2\n",
                                 encoding="utf-8")
+                            if getattr(self, "native_fault", None) == "invalid_native":
+                                csv_path.write_text("this is not a Sockperf CSV\n", encoding="utf-8")
                         elif executable == "iperf3":
                             duration = int(native_request.argv[native_request.argv.index("-t") + 1])
                             streams = int(native_request.argv[native_request.argv.index("-P") + 1])
@@ -1530,6 +1532,9 @@ def test_actual_lifecycle_archive_sink_bounded_receive_and_pending_capsule_fake_
     runner = ArchiveSinkAwsRunner()
     runner.region, runner.zone, runner.complete_cleanup = "eu-north-1", "eu-north-1a", True
     runner.full_native, runner.late_tail = True, True
+    runner.native_fault = getattr(request, "native_fault", None)
+    if runner.native_fault == "partial_native":
+        runner.late_tail = False
     runner.workspace_roots = {"vm_a": tmp_path / "remote-vm-a", "vm_b": tmp_path / "remote-vm-b"}
     runner.native_root = runner.workspace_roots["vm_a"]
     runner.run_id, runner.deployment_id = child.run_id, child.deployment_id

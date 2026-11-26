@@ -36,7 +36,8 @@ class WeekArchiveFixture:
 
 
 def build_single_provider_week_archive_fixture(*, tmp_path: Path, monkeypatch: Any,
-                                              repository_root: Path) -> WeekArchiveFixture:
+                                              repository_root: Path,
+                                              native_fault: str | None = None) -> WeekArchiveFixture:
     """Return generated native/archive evidence from production F09 code paths.
 
     This reuses the existing lifecycle integration scenario rather than
@@ -99,6 +100,7 @@ def build_single_provider_week_archive_fixture(*, tmp_path: Path, monkeypatch: A
             self.finalizers.append(callback)
 
     request = Request()
+    request.native_fault = native_fault
 
     def cleanup() -> None:
         for finalizer in reversed(request.finalizers):
