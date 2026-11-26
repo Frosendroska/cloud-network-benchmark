@@ -387,6 +387,55 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     production_common_n = campaign_inputs._common_n
     production_binary_lookup = shutil.which
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    native_history_source = os.environ.get("CNB_NATIVE_CLOSED_LEDGER_SNAPSHOT_PATH")
+    native_history = native_history_source is not None
+    native_history_bytes = None
+    native_funding_base = None
+    native_funding_totals = None
+    continuation_source_path = os.environ.get("CNB_O3_CONTINUATION_SOURCE_PATH")
+    guard_correction_path = os.environ.get("CNB_O3_LEGACY_USD_GUARD_SOURCE_PATH")
+    native_history_sha256 = "607c3419063ed7ffca718b59b6aa7217c84e49e0103aad9f4ecb83947bef168c"
+    if native_history:
+        snapshot_path = Path(native_history_source)
+        if (not snapshot_path.is_absolute() or snapshot_path.is_symlink()
+                or not snapshot_path.is_file()):
+            raise AssertionError("native O3 history snapshot must be an existing absolute non-symlink file")
+        native_history_bytes = snapshot_path.read_bytes()
+        if hashlib.sha256(native_history_bytes).hexdigest() != native_history_sha256:
+            raise AssertionError("native O3 history snapshot differs from the reviewed closed-ledger pin")
+        copied_ledger_path = Path(settings["ledger"]["path"])
+        if copied_ledger_path.resolve() == snapshot_path.resolve() or copied_ledger_path.exists():
+            raise AssertionError("native O3 snapshot must be copied into a fresh temporary ledger path")
+        copied_ledger_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        settings["ledger"]["scope_id"] = "thesis-primary"
+        if not continuation_source_path or not guard_correction_path:
+            raise AssertionError("native O3 history qualification requires both genuine continuation and guard-correction sources")
+        continuation_path = Path(continuation_source_path)
+        continuation_sha256 = "3d30cf5eeb0b59714ffca6fd91cb315e87e9ae68caa232a11282e71d3d9ed49e"
+        guard_path = Path(guard_correction_path)
+        guard_sha256 = "1d273f0a82aafa5f9aa92a5dd8a021d4a5582fb3963a2b76acadff4e8d9e9228"
+        if (not continuation_path.is_absolute() or continuation_path.is_symlink()
+                or not continuation_path.is_file()
+                or hashlib.sha256(continuation_path.read_bytes()).hexdigest() != continuation_sha256
+                or not guard_path.is_absolute() or guard_path.is_symlink()
+                or not guard_path.is_file()
+                or hashlib.sha256(guard_path.read_bytes()).hexdigest() != guard_sha256):
+            raise AssertionError("native O3 source pins differ from reviewed bytes")
+        settings["pricing"]["continuation_authorization"] = {
+            "path": str(continuation_path), "sha256": continuation_sha256}
+        settings["pricing"]["legacy_usd_guard_correction"] = {
+            "path": str(guard_path), "sha256": guard_sha256}
+        retained = json.loads(native_history_bytes)
+        consumed = {}
+        for record in retained["reservations"].values():
+            for bucket, amount in record.get("funding_moves", {}).items():
+                released = Decimal(record.get("released_by_bucket", {}).get(bucket, "0"))
+                consumed[bucket] = consumed.get(bucket, Decimal("0")) + max(
+                    Decimal(amount) - released, Decimal("0"))
+        native_funding_base = {
+            bucket: Decimal(retained.get("funding_remaining", {}).get(bucket, "0"))
+                + consumed.get(bucket, Decimal("0"))
+            for bucket in ("primary", "replacements", "tax", "uncertainty")}
     # Northern-region image selection is source-bound in this reduced profile;
     # use an explicitly synthetic canonical-shaped value at the input layer.
     settings["providers"]["aws"]["ami_ids"]["eu-north-1"] = "ami-0123456789abcdef0"
@@ -461,18 +510,68 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     settings["approvals"]["paired_acceptance"]["fields"].update(
         execution_window_utc=window, dispatch_window_utc=dict(window))
     settings["pricing"]["workflow_profiles"] = [ACCEPTANCE_PROFILE, CALIBRATION_PROFILE]
-    reserve_request = {"status": "pending", "currency": "EUR",
-        "prior_release_eur": "37", "additional_release_eur": "13",
-        "cumulative_release_eur": "50"}
-    settings["pricing"]["pending_eur_reserve_release"] = reserve_request
-    settings["pricing"]["funding"].update(primary="230", replacements="0", tax="20",
-        uncertainty="25", total_limit="300", working_limit="250", protected_buffer="50")
+    if native_history:
+        # Start from exact retained funding moves, then add only the six
+        # candidate provider envelopes built by production cost code.
+        settings["pricing"].pop("pending_eur_reserve_release", None)
+        settings["pricing"]["funding"].update(
+            {bucket: str(amount) for bucket, amount in native_funding_base.items()})
+        settings["pricing"]["funding"].update(
+            total_limit="300", working_limit="250", protected_buffer="50")
+        candidate_cost_payload = campaign_inputs._cost_payload(settings, repository_root,
+            stage="acceptance", draft=True)
+        candidate_additions = dict.fromkeys(native_funding_base, Decimal("0"))
+        for config_id in ("exp-903-acceptance", "exp-003-acceptance"):
+            for provider_row in candidate_cost_payload["provider_run_envelope_templates"][config_id].values():
+                for component in provider_row["components"].values():
+                    bucket = component["funding_bucket"]
+                    if bucket not in candidate_additions:
+                        raise AssertionError("candidate run envelope names an unconfigured funding bucket")
+                    candidate_additions[bucket] += Decimal(component["amount_usd"])
+        native_funding_totals = {bucket: native_funding_base[bucket] + candidate_additions[bucket]
+            for bucket in native_funding_base}
+        settings["pricing"]["funding"].update(
+            {bucket: str(amount) for bucket, amount in native_funding_totals.items()})
+    else:
+        reserve_request = {"status": "pending", "currency": "EUR",
+            "prior_release_eur": "37", "additional_release_eur": "13",
+            "cumulative_release_eur": "50"}
+        settings["pricing"]["pending_eur_reserve_release"] = reserve_request
+        settings["pricing"]["funding"].update(primary="230", replacements="0", tax="20",
+            uncertainty="25", total_limit="300", working_limit="250", protected_buffer="50")
     declared_funding = sum(Decimal(settings["pricing"]["funding"][key])
         for key in ("primary", "replacements", "tax", "uncertainty"))
-    assert Decimal("250") < declared_funding <= Decimal("300")
+    assert (declared_funding == sum(native_funding_totals.values(), Decimal("0"))
+            and declared_funding > Decimal("250") if native_history
+            else Decimal("250") < declared_funding <= Decimal("300"))
 
     stage = prepare_stage({"stage": "acceptance"}, settings, repository_root,
         Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=True)
+    if native_history:
+        # Create the lock marker through the production initializer, restore the
+        # exact closed native history into this TEMP ledger, then switch only its
+        # active cost source through the production reconciliation boundary.
+        # The review artifact is visibly synthetic and exists only to qualify
+        # the offline operator fixture; it is not an O3 price review or authority.
+        from cloud_network_benchmark.admission import BudgetLedger, load_cost_inputs
+        candidate_costs = load_cost_inputs(Path(stage["cost_input_path"]))
+        temp_ledger = BudgetLedger(Path(stage["ledger_path"]), scope_id=stage["scope_id"],
+            utc_now=lambda: now, monotonic_now=time.monotonic,
+            controller_session_id=stage["controller_session_id"])
+        temp_ledger.initialize(candidate_costs)
+        copied_ledger_path = Path(stage["ledger_path"])
+        copied_ledger_path.write_bytes(native_history_bytes)
+        copied_ledger_path.chmod(0o600)
+        reconciliation_source = tmp_path / "SYNTHETIC-OFFLINE-COST-SOURCE-RECONCILIATION.txt"
+        reconciliation_source.write_text(
+            "SYNTHETIC OFFLINE TEST ONLY; not a price review or launch authority.\n",
+            encoding="utf-8")
+        review_evidence = {"evidence_id": "SYNTHETIC-OFFLINE-COST-SOURCE-RECONCILIATION",
+            "source_path": str(reconciliation_source),
+            "source_sha256": hashlib.sha256(reconciliation_source.read_bytes()).hexdigest(),
+            "reviewed_payload_sha256": candidate_costs.payload_sha256,
+            "scope_id": stage["scope_id"], "status": "reviewed"}
+        temp_ledger.reconcile_cost_source(candidate_costs, review_evidence)
     stage_results = Path(stage["results_root"])
     if stage_results.parent != isolated_results or stage_results.exists() is False:
         raise AssertionError("generated acceptance results must occupy one unique results/<stage-id> directory")
@@ -518,9 +617,12 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         approved_at=now.isoformat(), valid_from=(now - timedelta(minutes=1)).isoformat(),
         valid_until=valid_until.isoformat(), approved_run_count=6,
         entries=[value for _entry, value in bindings])
-    card["caps"].update(project_eur="400", working_eur="302", protected_eur="0",
-        personal_cash_eur="400", run_eur="8", batch_eur="233", stage_eur="16",
-        providers_eur={provider: "16" for provider in ("aws", "azure", "gcp")})
+    card["caps"].update(project_eur="400",
+        working_eur="400" if native_history else "302", protected_eur="0",
+        personal_cash_eur="400", run_eur="8",
+        batch_eur="400" if native_history else "233", stage_eur="16",
+        providers_eur={provider: "400" if native_history else "16"
+            for provider in ("aws", "azure", "gcp")})
     cost_file = Path(stage["cost_input_path"])
     from cloud_network_benchmark.admission import load_cost_inputs
     costs_hash = load_cost_inputs(cost_file).payload_sha256
@@ -538,6 +640,10 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         reference.update(sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
             checked_at=now.isoformat(), valid_until=valid_until.isoformat())
     private_policy_path = os.environ.get("CNB_O2_PRIVATE_POLICY_PATH")
+    if native_history and not private_policy_path:
+        raise AssertionError("native O3 history qualification requires the genuine O2 EUR400 policy source")
+    if native_history and not continuation_source_path:
+        raise AssertionError("native O3 history qualification requires the genuine continuation source")
     if private_policy_path:
         private_policy = Path(private_policy_path)
         if (not private_policy.is_absolute() or private_policy.is_symlink()
@@ -554,11 +660,20 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         # production SHA pin unchanged.
         monkeypatch.setattr(financial_controls, "_O2_AMENDMENT_SHA256", amendment_ref["sha256"])
     card["financial_policy_amendment"] = amendment_ref
+    if native_history:
+        continuation_path = Path(continuation_source_path)
+        continuation_sha256 = "3d30cf5eeb0b59714ffca6fd91cb315e87e9ae68caa232a11282e71d3d9ed49e"
+        if (not continuation_path.is_absolute() or continuation_path.is_symlink()
+                or not continuation_path.is_file()
+                or hashlib.sha256(continuation_path.read_bytes()).hexdigest() != continuation_sha256):
+            raise AssertionError("native O3 continuation source differs from its reviewed byte pin")
+        card["continuation_authorization"] = {"path": str(continuation_path),
+            "sha256": continuation_sha256}
     # Exercise the production financial validator against the genuine native
     # EUR400 source as a negative boundary: the overall cap rose, but existing
     # working headroom did not. The normal card below uses the approved EUR302.
     over_working = copy.deepcopy(card)
-    over_working["caps"]["working_eur"] = "303"
+    over_working["caps"]["working_eur"] = "401" if native_history else "303"
     over_working_path = auth_root / "SYNTHETIC-O2-over-working-cap.json"
     over_working_path.write_text(json.dumps(over_working, sort_keys=True) + "\n")
     over_working_ref = {"source_path": str(over_working_path),
@@ -569,7 +684,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     except financial_controls.FinancialError as exc:
         assert exc.reason == "financial_ceiling_exceeded"
     else:
-        raise AssertionError("EUR400 policy must reject working headroom above the retained EUR302 allocation")
+        raise AssertionError("source policy must reject working headroom above its authorized whole-project ceiling")
     card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
     settings["approvals"]["paid_authorization"] = {"confirmed": True,
         "source": str(card_path), "sha256": hashlib.sha256(card_path.read_bytes()).hexdigest()}
@@ -587,7 +702,10 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     assert draft["stages"][0]["failure_waiver"]["not_tested"] == [
         "V-A-FAIL", "V-Z-FAIL", "V-G-FAIL"]
     cost_payload = json.loads(Path(stage["cost_input_path"]).read_text())
-    assert cost_payload["normalization"]["reserve_release"] == reserve_request
+    if native_history:
+        assert "normalization" not in cost_payload
+    else:
+        assert cost_payload["normalization"]["reserve_release"] == reserve_request
 
     # The generated Azure cleanup cohort is a source-bound auxiliary input to
     # actual frozen activation. Its synthetic card authorizes only this offline
@@ -933,17 +1051,24 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         settings["approvals"][key] = {"confirmed": True,
             "source": activated_stage["approval_refs"][key], "fields": {}}
 
-    # O2 reserve authority is acceptance-only; reject a real CAL preparation
-    # before any CAL stage or provider work and without changing the closed ledger.
-    with pytest.raises(ValueError, match="O2 reserve-release authority is limited to the one normal acceptance batch"):
-        prepare_stage({"stage": "calibration"}, settings, repository_root,
-            Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
+    # O3 continuation and O2 reserve authorities are acceptance-only; reject
+    # CAL before any CAL stage or provider work and without changing the ledger.
+    if native_history:
+        with pytest.raises(ValueError, match="limited to normal acceptance pricing"):
+            prepare_stage({"stage": "calibration"}, settings, repository_root,
+                Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
+    else:
+        with pytest.raises(ValueError, match="O2 reserve-release authority is limited to the one normal acceptance batch"):
+            prepare_stage({"stage": "calibration"}, settings, repository_root,
+                Path(settings["state_root"]), Path(settings["results_root"]), Clock(), draft=False)
     assert financial_ledger_path.read_bytes() == financial_ledger_bytes
 
     # Separately build only a typed, nonauthorizing CAL plan under the retained
     # USD 250 limit so the production financial scope guard can reject CAL.
     cal_settings = copy.deepcopy(settings)
     cal_settings["pricing"].pop("pending_eur_reserve_release", None)
+    cal_settings["pricing"].pop("continuation_authorization", None)
+    cal_settings["pricing"].pop("legacy_usd_guard_correction", None)
     cal_settings["pricing"]["funding"]["uncertainty"] = "0"
     cal_settings["state_root"] = str(tmp_path / "calibration-private")
     cal_settings["ledger"]["path"] = str(Path(cal_settings["state_root"]) / "ledger.json")
@@ -995,3 +1120,5 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     assert all(row.environment.get("TF_CLI_CONFIG_FILE") == str(mirror_config)
         for row in terraform_requests)
     assert reviewer.disclosures
+    if native_history:
+        assert Path(native_history_source).read_bytes() == native_history_bytes

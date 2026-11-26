@@ -210,9 +210,17 @@ class AuxiliaryCleanupCohort:
             raise ValueError("Azure auxiliary group-only receipt timestamps are invalid or late")
         def apply(state: dict[str, Any]) -> None:
             claim = state.get("claim")
+            outcomes = state.get("outcomes")
+            untouched = isinstance(claim, dict) and claim.get("state") == "claimed" and outcomes == []
+            continued = (isinstance(claim, dict) and claim.get("state") == "group_claimed"
+                and isinstance(outcomes, list) and len(outcomes) == 1
+                and outcomes[0].get("action") == "leaf_delete" and outcomes[0].get("outcome") == "succeeded"
+                and outcomes[0].get("identity", "").lower() == self.spec["watcher_id"].lower()
+                and outcomes[0].get("typed_404_identity", "").lower() == self.spec["watcher_id"].lower()
+                and outcomes[0].get("evidence_sha256") == receipt["leaf_receipt_sha256"])
             if (not isinstance(claim, dict) or claim.get("claim_id") != receipt["claim_id"]
-                    or claim.get("state") != "claimed" or state.get("outcomes") != []):
-                raise ValueError("Azure auxiliary group-only receipt does not match the untouched leaf claim")
+                    or not (untouched or continued)):
+                raise ValueError("Azure auxiliary group-only receipt does not match the saved leaf claim")
             intent = state.get("group_only_recovery_intent")
             if (not isinstance(intent, dict) or intent.get("group_delete_action_id") != receipt["group_delete_action_id"]
                     or intent.get("source_entry_id") != receipt["source_entry_id"]
@@ -251,9 +259,17 @@ class AuxiliaryCleanupCohort:
             raise ValueError("Azure auxiliary group-only intent timestamps are invalid")
         def apply(state: dict[str, Any]) -> None:
             claim = state.get("claim")
+            outcomes = state.get("outcomes")
+            untouched = isinstance(claim, dict) and claim.get("state") == "claimed" and outcomes == []
+            continued = (isinstance(claim, dict) and claim.get("state") == "group_claimed"
+                and isinstance(outcomes, list) and len(outcomes) == 1
+                and outcomes[0].get("action") == "leaf_delete" and outcomes[0].get("outcome") == "succeeded"
+                and outcomes[0].get("identity", "").lower() == self.spec["watcher_id"].lower()
+                and outcomes[0].get("typed_404_identity", "").lower() == self.spec["watcher_id"].lower()
+                and outcomes[0].get("evidence_sha256") == intent["leaf_receipt_sha256"])
             if (not isinstance(claim, dict) or claim.get("claim_id") != intent["claim_id"]
-                    or claim.get("state") != "claimed" or state.get("outcomes") != []):
-                raise ValueError("Azure auxiliary group-only intent does not match the untouched leaf claim")
+                    or not (untouched or continued)):
+                raise ValueError("Azure auxiliary group-only intent does not match the saved leaf claim")
             prior = state.get("group_only_recovery_intent")
             if prior is not None:
                 raise ValueError("Azure auxiliary group-only delete intent already exists; DELETE cannot be retried")

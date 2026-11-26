@@ -210,6 +210,10 @@ class AwsProviderDriver:
         self._cleanup_deadline: float | None = None
         self._cleanup_acceptance_deadlines: list[datetime] = []
         self._precreate_deadline: float | None = None
+        self._identity_trigger: datetime | None = None
+        self._identity_precreate_deadline: float | None = None
+        self._identity_stop_wall_deadline: float | None = None
+        self._identity_pair_deadline: float | None = None
         self._active_primary_failure: FailureEvidence | None = None
         self._initialized_terraform: set[str] = set()
 
@@ -471,6 +475,19 @@ class AwsProviderDriver:
         # Bound pair apply by reserving all source-declared work after provisioning.
         # This leaves the full provision allowance available to apply itself.
         self._precreate_deadline = time.monotonic() + max(0, (trigger - now).total_seconds() - self.settings.post_provision_workflow_seconds)
+        self._identity_trigger = trigger
+        stop_sample_started = time.monotonic()
+        stop_sample_utc = self.clock().astimezone(timezone.utc)
+        stop_sample_finished = time.monotonic()
+        if stop_sample_finished < stop_sample_started:
+            raise AwsProviderError("monotonic clock moved backwards while capturing the AWS STOP deadline",
+                category="cap_order")
+        self._identity_stop_wall_deadline = (stop_sample_finished
+            + (trigger - stop_sample_utc).total_seconds()
+            - self.settings.post_provision_workflow_seconds)
+        self._identity_precreate_deadline = min(self._precreate_deadline,
+            self._identity_stop_wall_deadline)
+        self._identity_pair_deadline = None
 
         variables = self._pair_variables(deployment)
         vars_path = attempt / "pair.tfvars.json"
@@ -482,6 +499,7 @@ class AwsProviderDriver:
         self._save_journal(attempt, journal)
         apply_result: CommandResult | None = None
         try:
+            pair_deadline = None
             pair_timeout = _pair_apply_timeout_seconds(provision_phase_seconds,
                 self.settings.command_timeout_seconds, self.settings.plan_review_timeout_seconds,
                 (trigger - self.clock().astimezone(timezone.utc)).total_seconds())
@@ -496,6 +514,7 @@ class AwsProviderDriver:
                     stage="provision", overall_deadline=self.settings.workflow_cap_started_monotonic
                         + self.settings.complete_workflow_remaining_seconds,
                     stop_deadline=time.monotonic() + max(0.0, stop_fit))
+                self._identity_pair_deadline = pair_deadline
                 pair_timeout = max(0, min(provision_phase_seconds, int(pair_deadline - time.monotonic())))
                 if pair_timeout <= 0:
                     raise AwsProviderError("AWS pair review has no remaining original provision-stage budget",
@@ -1250,36 +1269,97 @@ class AwsProviderDriver:
 
     def _verify_host_key(self, detail: dict[str, Any]) -> dict[str, str]:
         region, instance_id = detail["region"], detail["instance_id"]
-        response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id, "--latest", "--region", region, "--output", "json")
-        if response.get("InstanceId") != instance_id:
-            raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
-        console = response.get("Output")
-        if not isinstance(console, str):
-            raise AwsProviderError("console output is malformed", category="host_identity_unavailable")
-        boots = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
-        fingerprints = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", console)
-        timestamp = response.get("Timestamp")
-        launch_time = detail.get("launch_time")
-        try:
-            timestamp_value = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-            launch_value = launch_time if isinstance(launch_time, datetime) else datetime.fromisoformat(str(launch_time).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            timestamp_value = launch_value = None
-        if timestamp_value is None or launch_value is None or timestamp_value < launch_value or len(boots) != 1 or len(fingerprints) != 1:
-            raise AwsProviderError("authenticated console lacks one current boot and ED25519 host fingerprint", category="host_identity_unavailable")
+        poll_deadline = self._host_identity_poll_deadline()
+        command_deadline = (time.monotonic() + self.settings.command_timeout_seconds
+                            if poll_deadline is not None else None)
+        poll_cutoff = [poll_deadline]
+
+        def remaining_identity_budget() -> float | None:
+            if poll_cutoff[0] is None or command_deadline is None:
+                return None
+            refreshed = self._host_identity_poll_deadline()
+            if refreshed is None:
+                raise AwsProviderError("AWS identity deadline mapping disappeared during trust verification",
+                    category="host_identity_budget_invalid")
+            poll_cutoff[0] = min(poll_cutoff[0], refreshed)
+            remaining = min(poll_cutoff[0], command_deadline) - time.monotonic()
+            if remaining < 1.0:
+                raise AwsProviderError("AWS console identity polling exhausted its original bounded allowance",
+                    category="host_identity_budget_exhausted")
+            return remaining
+
+        def bounded_command_timeout(original: int) -> int:
+            remaining = remaining_identity_budget()
+            return original if remaining is None else min(original, int(remaining))
+
+        launch_value = self._identity_timestamp(detail.get("launch_time"))
+        if launch_value is None:
+            raise AwsProviderError("instance launch timestamp is invalid", category="host_identity_unavailable")
+        response: dict[str, Any]
+        while True:
+            remaining_identity_budget()
+            timeout = (None if poll_cutoff[0] is None
+                       else bounded_command_timeout(self.settings.command_timeout_seconds))
+            try:
+                response = self._aws_json("ec2", "get-console-output", "--instance-id", instance_id,
+                    "--latest", "--region", region, "--output", "json", timeout=timeout)
+            except AwsProviderError as exc:
+                self._record_host_identity_diagnostic(detail, {}, str(exc.category))
+                raise
+            remaining_identity_budget()  # Detect STOP/clock movement during the API call.
+            if response.get("InstanceId") != instance_id:
+                self._record_host_identity_diagnostic(detail, response, "host_identity_mismatch")
+                raise AwsProviderError("console response is not bound to the expected instance", category="host_identity_mismatch")
+            timestamp_value = self._identity_timestamp(response.get("Timestamp"))
+            if timestamp_value is None or timestamp_value < launch_value:
+                reason = ("console_timestamp_invalid" if timestamp_value is None
+                          else "console_timestamp_precedes_launch")
+                self._record_host_identity_diagnostic(detail, response, reason)
+                raise AwsProviderError("authenticated console timestamp is invalid or predates instance launch",
+                    category="host_identity_unavailable")
+            console = response.get("Output")
+            if console is None:
+                boots, fingerprints = [], []
+            elif isinstance(console, str):
+                boots = re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", console)
+                fingerprints = re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", console)
+            else:
+                self._record_host_identity_diagnostic(detail, response, "console_output_malformed")
+                raise AwsProviderError("console output is malformed", category="host_identity_unavailable")
+            if len(boots) > 1 or len(fingerprints) > 1:
+                reason = ("console_boot_marker_count_invalid" if len(boots) > 1
+                          else "console_fingerprint_count_invalid")
+                self._record_host_identity_diagnostic(detail, response, reason,
+                    boot_count=len(boots), fingerprint_count=len(fingerprints))
+                raise AwsProviderError("authenticated console contains ambiguous boot or fingerprint markers",
+                    category="host_identity_unavailable")
+            if len(boots) == 1 and len(fingerprints) == 1:
+                remaining_identity_budget()
+                break
+            self._record_host_identity_diagnostic(detail, response, "console_markers_incomplete",
+                boot_count=len(boots), fingerprint_count=len(fingerprints))
+            if poll_cutoff[0] is None:
+                raise AwsProviderError("authenticated console lacks one current boot and ED25519 host fingerprint",
+                    category="host_identity_unavailable")
+            remaining = remaining_identity_budget()
+            self.sleeper(min(1.0, remaining))
+        self._record_host_identity_diagnostic(detail, response, "console_identity_validated",
+            boot_count=len(boots), fingerprint_count=len(fingerprints))
         keyscan = self._run(
             f"aws-host-keyscan-{instance_id}",
             ["ssh-keyscan", "-T", "10", "-t", "ed25519", detail["public_ipv4"]],
-            15,
+            bounded_command_timeout(15),
         )
+        remaining_identity_budget()  # A slow keyscan cannot consume time reserved for later work.
         if not _succeeded(keyscan):
             raise AwsProviderError("host keyscan failed", category="host_keyscan", action_id=keyscan.action_id)
         parsed = self._run(
             f"aws-host-key-fingerprint-{instance_id}",
             ["ssh-keygen", "-E", "sha256", "-lf", "-"],
-            10,
+            bounded_command_timeout(10),
             stdin=keyscan.stdout,
         )
+        remaining_identity_budget()  # Recheck after key parsing and before trusting its result.
         if not _succeeded(parsed):
             raise AwsProviderError("candidate host key fingerprint could not be parsed", category="host_keyscan", action_id=parsed.action_id)
         candidates = re.findall(r"SHA256:[A-Za-z0-9+/]+", parsed.stdout)
@@ -1291,9 +1371,109 @@ class AwsProviderDriver:
         if not host_lines:
             raise AwsProviderError("keyscan produced no host key", category="host_keyscan")
         self._write_private(known_hosts, ("\n".join(host_lines) + "\n").encode())
-        trust = {"known_hosts_path": str(known_hosts), "boot_id": boots[0], "fingerprint": fingerprints[0], "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(timestamp)}
-        self._write_private(private_dir / f"{instance_id}.host-trust.json", json.dumps(trust, sort_keys=True).encode())
+        trust = {"known_hosts_path": str(known_hosts), "boot_id": boots[0], "fingerprint": fingerprints[0], "account_id": self.settings.account_id, "region": region, "instance_id": instance_id, "console_timestamp": str(response.get("Timestamp"))}
+        trust_path = private_dir / f"{instance_id}.host-trust.json"
+        self._write_private(trust_path, json.dumps(trust, sort_keys=True).encode())
+        try:
+            remaining_identity_budget()  # Trust is accepted only before the fixed source-bound cutoff.
+        except AwsProviderError:
+            known_hosts.unlink(missing_ok=True)
+            trust_path.unlink(missing_ok=True)
+            raise
         return trust
+
+    @staticmethod
+    def _identity_timestamp(value: Any) -> datetime | None:
+        try:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def _host_identity_poll_deadline(self) -> float | None:
+        """Return only a monotone-clamped deadline captured by the original create path."""
+        original_stop = self._identity_precreate_deadline
+        original_pair = self._identity_pair_deadline
+        trigger = self._identity_trigger
+        if original_stop is None or original_pair is None or trigger is None:
+            return None
+        mono_before = time.monotonic()
+        utc_now = self.clock().astimezone(timezone.utc)
+        mono_now = time.monotonic()
+        wall_stop = mono_now + (trigger - utc_now).total_seconds() - self.settings.post_provision_workflow_seconds
+        wall_baseline = self._identity_stop_wall_deadline or original_stop
+        clock_tolerance = max(0.05, mono_now - mono_before + 0.005)
+        if wall_stop < wall_baseline - clock_tolerance:
+            raise AwsProviderError("wall clock advanced beyond the original AWS identity deadline mapping",
+                category="host_identity_budget_clock_advanced")
+        if mono_now < mono_before:
+            raise AwsProviderError("monotonic clock moved backwards during AWS identity deadline mapping",
+                category="host_identity_budget_clock_invalid")
+        return min(original_stop, original_pair, wall_stop)
+
+    def _record_host_identity_diagnostic(self, detail: dict[str, Any], response: dict[str, Any],
+                                         reason: str, *, boot_count: int | None = None,
+                                         fingerprint_count: int | None = None) -> None:
+        """Persist bounded safe identity facts and hashes, never console text."""
+        attempt = getattr(self, "_active_attempt", None)
+        deployment = getattr(self, "_active_deployment", None)
+        if attempt is None or deployment is None:
+            return
+        command = next((row for row in reversed(getattr(self, "_active_commands", []))
+                        if row.get("action_id") == "aws-get-console-output---instance-id"), {})
+        output = response.get("Output")
+        if boot_count is None:
+            boot_count = len(re.findall(r"CNB_HOSTKEY_BOOT_ID=([0-9a-f-]{36})", output)) if isinstance(output, str) else None
+        if fingerprint_count is None:
+            fingerprint_count = len(re.findall(r"CNB_ED25519_HOST_FINGERPRINT=(SHA256:[A-Za-z0-9+/]+)", output)) if isinstance(output, str) else None
+
+        def safe_timestamp(value: Any) -> str | None:
+            try:
+                parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    return None
+                return parsed.astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                return None
+
+        instance_pattern = r"i-(?:[a-f0-9]{8}|[a-f0-9]{17})"
+        expected_id = detail.get("instance_id")
+        response_id = response.get("InstanceId")
+        allowed_reasons = {
+            "host_identity_mismatch", "console_output_malformed", "aws_api",
+            "aws_api_response", "console_timestamp_invalid", "console_timestamp_precedes_launch",
+            "console_boot_marker_count_invalid", "console_fingerprint_count_invalid",
+            "console_identity_validated", "console_markers_incomplete",
+        }
+        record = {
+            "expected_instance_id": expected_id if isinstance(expected_id, str) and re.fullmatch(instance_pattern, expected_id) else None,
+            "launch_time": safe_timestamp(detail.get("launch_time")),
+            "response_instance_id": response_id if isinstance(response_id, str) and re.fullmatch(instance_pattern, response_id) else None,
+            "response_timestamp": safe_timestamp(response.get("Timestamp")),
+            "stdout_sha256": command.get("diagnostic", {}).get("stdout_sha256"),
+            "stdout_bytes": command.get("diagnostic", {}).get("stdout_bytes"),
+            "boot_marker_count": boot_count,
+            "fingerprint_count": fingerprint_count,
+            "reason": reason if reason in allowed_reasons else "console_response_unavailable",
+        }
+        if len(json.dumps(record, separators=(",", ":")).encode("utf-8")) > 2048:
+            return
+        try:
+            journal = getattr(self, "_active_journal", None)
+            if not isinstance(journal, dict):
+                journal = self._load_journal(attempt, deployment)
+                self._active_journal = journal
+            diagnostics = journal.setdefault("host_identity_diagnostics", [])
+            if len(diagnostics) < 4:
+                diagnostics.append(record)
+            else:
+                journal["host_identity_diagnostics_truncated"] = True
+            self._save_journal(attempt, journal)
+        except Exception:
+            # A failed diagnostic write must never turn an invalid identity into success.
+            return
 
     def _verify_observed_instance(self, expected: dict[str, Any], scenario: Any, role: str, run_id: str, deployment_id: str) -> dict[str, Any]:
         region = expected["region"]
@@ -1859,6 +2039,12 @@ class AwsProviderDriver:
                 "exit_code": result.exit_code,
                 "redactions_applied": bool(result.redactions),
             }
+            if action_id == "aws-get-console-output---instance-id":
+                console_bytes = result.stdout.encode("utf-8")
+                record["diagnostic"] = {
+                    "stdout_sha256": hashlib.sha256(console_bytes).hexdigest(),
+                    "stdout_bytes": len(console_bytes),
+                }
             if action_id.startswith(("aws-expiry-start-", "aws-expiry-recover-", "aws-expiry-confirm-")):
                 diagnostic = {}
                 for field in ("stdout", "stderr"):
@@ -1888,9 +2074,10 @@ class AwsProviderDriver:
                 review_admission_path=self.settings.plan_review_admission_path)
         return execute(request)
 
-    def _aws_json(self, *argv: str) -> dict[str, Any]:
+    def _aws_json(self, *argv: str, timeout: int | None = None) -> dict[str, Any]:
         action_id = "aws-" + "-".join(argv[1:3]).replace("_", "-")
-        result = self._run(action_id, [self.settings.aws_cli, *argv], self.settings.command_timeout_seconds)
+        result = self._run(action_id, [self.settings.aws_cli, *argv],
+            timeout if timeout is not None else self.settings.command_timeout_seconds)
         if not _succeeded(result):
             error_match = re.search(r"\(?(Invalid(?:InstanceID|Volume|NetworkInterfaceID)\.NotFound)\)?", result.stderr)
             region_match = re.search(r"--region\s+([a-z0-9-]+)", " ".join(argv))

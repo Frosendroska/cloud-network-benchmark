@@ -1143,6 +1143,7 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
              expected_missing_automation_account_id: str | None = None,
              expected_missing_resource_id: str | None = None,
              expected_missing_resource_url: str | None = None,
+             expected_missing_watcher_parent_id: str | None = None,
              action_id: str | None = None,
              apply_timeout_seconds: float | None = None,
              before_apply: Callable[[], float] | None = None) -> CommandResult:
@@ -1289,13 +1290,32 @@ def _command(runner: CommandRunner, options: AzureRuntimeOptions, root: Path, ar
             or (account_cli_request and account_parts is not None
                 and _is_exact_missing_attempt_resource_group(result,account_parts["group"]))))
     exact_resource_absence = (expected_missing_resource_id is not None
-        and expected_missing_resource_url is not None and action == "azure_auxiliary_watcher_absence"
+            and expected_missing_resource_url is not None
+            and action in {"azure_auxiliary_watcher_absence", "azure_auxiliary_group_only_leaf_absence"}
         and argv[:2] == ["az", "rest"] and method_values == ["GET"]
         and url_values == [expected_missing_resource_url] and output_values == ["json"]
         and subscription_values == [options.subscription_id]
         and not any(flag in argv for flag in ("--body", "--headers", "--query", "--resource"))
-        and _is_exact_resource_404(result, expected_missing_resource_id))
-    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_resource_absence or exact_automation_child_absence or exact_automation_account_absence or (
+        and (_is_exact_watcher_resource_404(result, expected_missing_resource_id)
+            if action in {"azure_auxiliary_watcher_absence", "azure_auxiliary_group_only_leaf_absence"}
+            else _is_exact_resource_404(result, expected_missing_resource_id)))
+    watcher_child_collections = {
+        "azure_auxiliary_group_only_flowLogs_inventory": "flowLogs",
+        "azure_auxiliary_group_only_packetCaptures_inventory": "packetCaptures",
+        "azure_auxiliary_group_only_connectionMonitors_inventory": "connectionMonitors",
+    }
+    watcher_child_collection = watcher_child_collections.get(action)
+    expected_child_url = ("https://management.azure.com" + expected_missing_watcher_parent_id
+        + f"/{watcher_child_collection}?api-version=2023-09-01"
+        if expected_missing_watcher_parent_id and watcher_child_collection else None)
+    exact_watcher_child_absence = (expected_child_url is not None
+        and argv[:2] == ["az", "rest"] and method_values == ["GET"]
+        and url_values == [expected_child_url] and output_values == ["json"]
+        and subscription_values == [options.subscription_id]
+        and not any(flag in argv for flag in ("--body", "--headers", "--query", "--resource"))
+        and _is_exact_watcher_child_parent_404(result, expected_missing_watcher_parent_id,
+            watcher_child_collection))
+    accepted_absence = (allow_not_found and _is_exact_not_found(result)) or exact_resource_absence or exact_watcher_child_absence or exact_automation_child_absence or exact_automation_account_absence or (
         allow_missing_resource_group is not None
         and _is_exact_missing_attempt_resource_group(result, allow_missing_resource_group))
     if result.outcome != "succeeded" and not accepted_absence:
@@ -1391,7 +1411,8 @@ def _prove_vm_absent(runner: CommandRunner, options: AzureRuntimeOptions, root: 
 
 def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, root: Path,
                          endpoint: str, action: str, clock: Callable[[],float],
-                         required_fields: tuple[str,...]) -> tuple[list[dict[str,Any]],list[dict[str,Any]]]:
+                         required_fields: tuple[str,...], *,
+                         expected_missing_watcher_parent_id: str | None = None) -> tuple[list[dict[str,Any]],list[dict[str,Any]]]:
     """Read all ARM continuation pages; malformed, repeated, or foreign links fail closed."""
     next_url="https://management.azure.com"+endpoint
     scope_prefix=next_url.split("?",1)[0]
@@ -1401,8 +1422,13 @@ def _read_arm_collection(runner: CommandRunner, options: AzureRuntimeOptions, ro
             raise RuntimeError(f"{action} returned a repeated or non-ARM continuation URL")
         seen_urls.add(next_url)
         result=_command(runner,options,root,["az","rest","--method","GET","--url",next_url,"--output","json"],
-            action if page==0 else f"{action}_page_{page+1}",clock)
+            action if page==0 else f"{action}_page_{page+1}",clock,
+            expected_missing_watcher_parent_id=expected_missing_watcher_parent_id)
         evidence.append(_safe_cleanup_action(options,result))
+        if (result.outcome == "failed" and expected_missing_watcher_parent_id is not None
+                and _is_exact_watcher_child_parent_404(result,
+                    expected_missing_watcher_parent_id, action)):
+            return [], evidence
         if result.stderr.strip(): raise RuntimeError(f"{action} returned an inventory diagnostic; completeness is unproved")
         if not result.stdout.strip(): raise RuntimeError(f"{action} returned blank collection output")
         try: payload=json.loads(result.stdout)
@@ -1930,7 +1956,8 @@ def _cleanup_shared_network_watcher(deployment: ProviderDeploymentInput, options
 
 def _bounded_late_auxiliary_deadline(deployment: ProviderDeploymentInput,
         options: AzureRuntimeOptions, timing_state: dict[str, Any], *,
-        clock: Callable[[], float], utc_now: Callable[[], datetime]) -> tuple[float, datetime]:
+        clock: Callable[[], float], utc_now: Callable[[], datetime],
+        _allow_expired_owner_caps: bool = False) -> tuple[float, datetime]:
     """Bound explicitly approved late watcher recovery by both saved owner caps."""
     spec = options.azure_auxiliary_cleanup
     if spec is None:
@@ -2005,14 +2032,17 @@ def _bounded_late_auxiliary_deadline(deployment: ProviderDeploymentInput,
         expiry_utc = datetime.fromisoformat(peer_expiry.replace("Z", "+00:00"))
         if expiry_utc.tzinfo is None:
             raise ValueError("original Azure auxiliary owner UTC cap is invalid")
-        cap_deadline = min(cap_deadline, float(peer_cap),
-            now_mono + (expiry_utc.astimezone(UTC) - now_utc).total_seconds())
+        cap_deadline = min(cap_deadline, float(peer_cap))
+        if not _allow_expired_owner_caps:
+            cap_deadline = min(cap_deadline,
+                now_mono + (expiry_utc.astimezone(UTC) - now_utc).total_seconds())
         cap_deadline_utc = expiry_utc.astimezone(UTC) if cap_deadline_utc is None else min(
             cap_deadline_utc, expiry_utc.astimezone(UTC))
     card_end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00"))
-    cap_deadline = min(cap_deadline, now_mono + (card_end.astimezone(UTC) - now_utc).total_seconds())
-    cap_deadline_utc = min(cap_deadline_utc, card_end.astimezone(UTC)) if cap_deadline_utc else card_end.astimezone(UTC)
-    if cap_deadline <= now_mono or cap_deadline_utc <= now_utc:
+    if not _allow_expired_owner_caps:
+        cap_deadline = min(cap_deadline, now_mono + (card_end.astimezone(UTC) - now_utc).total_seconds())
+        cap_deadline_utc = min(cap_deadline_utc, card_end.astimezone(UTC)) if cap_deadline_utc else card_end.astimezone(UTC)
+    if not _allow_expired_owner_caps and (cap_deadline <= now_mono or cap_deadline_utc <= now_utc):
         raise TimeoutError("original Azure owner or approval-card deadline has elapsed")
     return cap_deadline, cap_deadline_utc
 
@@ -2185,8 +2215,81 @@ def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
     })
 
 
+def _is_exact_watcher_resource_404(result: CommandResult, watcher_id: str) -> bool:
+    """Accept Azure's canonical watcher type/name/group 404 for this exact ARM ID."""
+    if _is_exact_resource_404(result, watcher_id):
+        return True
+    match = re.fullmatch(r"/subscriptions/[^/]+/resourceGroups/(?P<group>[^/]+)/providers/"
+        r"Microsoft\.Network/networkWatchers/(?P<name>[^/]+)", watcher_id, flags=re.IGNORECASE)
+    if match is None or result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
+        return False
+    wrapped = re.fullmatch(r"ERROR: Not Found\((\{.*\})\)\s*", result.stderr, flags=re.DOTALL)
+    if wrapped is None:
+        return False
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate error field")
+            value[key] = item
+        return value
+    try:
+        payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {"error"}:
+        return False
+    error = payload["error"]
+    expected = (f"The Resource 'Microsoft.Network/networkWatchers/{match.group('name')}' under resource group "
+        f"'{match.group('group')}' was not found. For more details please go to "
+        "https://aka.ms/ARMResourceNotFoundFix")
+    return (isinstance(error, dict) and set(error) == {"code", "message"}
+        and error.get("code") == "ResourceNotFound"
+        and isinstance(error.get("message"), str)
+        and error["message"].casefold() == expected.casefold())
+
+
+def _is_exact_watcher_child_parent_404(result: CommandResult, watcher_id: str,
+        collection_or_action: str) -> bool:
+    action_to_collection = {
+        "azure_auxiliary_group_only_flowLogs_inventory": "flowLogs",
+        "azure_auxiliary_group_only_packetCaptures_inventory": "packetCaptures",
+        "azure_auxiliary_group_only_connectionMonitors_inventory": "connectionMonitors",
+    }
+    collection = action_to_collection.get(collection_or_action, collection_or_action)
+    if collection not in {"flowLogs", "packetCaptures", "connectionMonitors"}:
+        return False
+    if collection == "packetCaptures":
+        return _is_exact_watcher_resource_404(result, watcher_id)
+    if result.outcome != "failed" or result.stdout.strip() or not result.stderr.strip():
+        return False
+    wrapped = re.fullmatch(r"ERROR: Not Found\((\{.*\})\)\s*", result.stderr, flags=re.DOTALL)
+    if wrapped is None:
+        return False
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate error field")
+            value[key] = item
+        return value
+    try:
+        payload = json.loads(wrapped.group(1), object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {"error"}:
+        return False
+    error = payload["error"]
+    expected = (f"Failed to perform 'read' on resource(s) of type 'networkWatchers/{collection}', "
+        f"because the parent resource '{watcher_id}' could not be found.")
+    return (isinstance(error, dict) and set(error) == {"code", "message"}
+        and error.get("code") == "ParentResourceNotFound"
+        and isinstance(error.get("message"), str)
+        and error["message"].casefold() == expected.casefold())
+
+
 def _saved_watcher_leaf_receipt(state: dict[str, Any], options: AzureRuntimeOptions,
-        spec: dict[str, Any]) -> dict[str, Any]:
+        spec: dict[str, Any], *, persisted_result_binding: bool = False) -> dict[str, Any]:
     """Validate the original ETag DELETE + exact 404 receipt without replaying the leaf."""
     from .azure_auxiliary_cleanup import canonical
 
@@ -2262,18 +2365,28 @@ def _saved_watcher_leaf_receipt(state: dict[str, Any], options: AzureRuntimeOpti
             or delete_result.outcome != "succeeded" or delete_result.exit_code != 0
             or delete_result.stderr.strip()):
         raise ValueError("saved Azure watcher DELETE lacks the exact successful ETag precondition")
-    if (not _is_exact_resource_404(absence_result, watcher_id)
+    if (not _is_exact_watcher_resource_404(absence_result, watcher_id)
             or absence_result.stdout.strip()
             or absence_result.finished_at < delete_result.finished_at
             or delete_result.finished_at < etag_result.finished_at):
         raise ValueError("saved Azure watcher receipt lacks its chronologically exact typed 404")
     absence_action = _safe_cleanup_action(options, absence_result)
+    absence_digest = hashlib.sha256(canonical(absence_action)).hexdigest()
+    if persisted_result_binding:
+        # A cohort leaf outcome is bound to the exact durable result row. Its
+        # redaction metadata is lost when CommandResult is reconstructed, so
+        # preserve that original digest while independently validating the
+        # reconstructed command semantics above.
+        raw_absence_result = selected[2][1].get("result")
+        if not isinstance(raw_absence_result, dict):
+            raise ValueError("saved Azure watcher absence lacks its original durable result")
+        absence_digest = hashlib.sha256(canonical(raw_absence_result)).hexdigest()
     return {"claim_id": None, "watcher_id": watcher_id,
         "etag_action_id": etag_command.action_id, "delete_action_id": delete_command.action_id,
         "absence_action_id": absence_command.action_id,
         "delete_started_at_utc": delete_result.started_at.isoformat(),
         "delete_finished_at_utc": delete_result.finished_at.isoformat(),
-        "absence_evidence_sha256": hashlib.sha256(canonical(absence_action)).hexdigest(),
+        "absence_evidence_sha256": absence_digest,
         "finished_at_utc": absence_result.finished_at.isoformat()}
 
 
@@ -2369,7 +2482,7 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
     journal = root / "recovery.json"
     if spec is None or journal.is_symlink() or not journal.is_file():
         return None
-    from .azure_auxiliary_cleanup import AuxiliaryCleanupCohort, canonical, validate_spec
+    from .azure_auxiliary_cleanup import AuxiliaryCleanupCohort, canonical, is_sha256, owner_key, validate_spec
     from .contracts.common import CleanupState
     from .orchestration import SavedLifecycleRecovery
     from .lifecycle_cleanup import load_cleanup_settings
@@ -2394,10 +2507,25 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
     if prior_group_receipt is None and intent is None:
         if isinstance(claim, dict) and claim.get("state") in {"leaf_absent", "complete"}:
             return None
-        if not isinstance(claim, dict) or claim.get("state") != "claimed":
+        outcomes = saved_cohort.get("outcomes")
+        initial_leaf = isinstance(claim, dict) and claim.get("state") == "claimed" and outcomes == []
+        continued_leaf = (isinstance(claim, dict) and claim.get("state") == "group_claimed"
+            and isinstance(outcomes, list) and len(outcomes) == 1
+            and outcomes[0].get("action") == "leaf_delete"
+            and outcomes[0].get("outcome") == "succeeded"
+            and outcomes[0].get("identity", "").lower() == spec["watcher_id"].lower()
+            and outcomes[0].get("typed_404_identity", "").lower() == spec["watcher_id"].lower())
+        if not (initial_leaf or continued_leaf):
             raise ValueError("Azure group-only recovery has an unknown auxiliary cohort claim")
-    if (not isinstance(claim, dict) or claim.get("state") != "claimed"
-            or saved_cohort.get("outcomes") != []
+    outcomes = saved_cohort.get("outcomes")
+    initial_leaf = isinstance(claim, dict) and claim.get("state") == "claimed" and outcomes == []
+    continued_leaf = (isinstance(claim, dict) and claim.get("state") == "group_claimed"
+        and isinstance(outcomes, list) and len(outcomes) == 1
+        and outcomes[0].get("action") == "leaf_delete"
+        and outcomes[0].get("outcome") == "succeeded"
+        and outcomes[0].get("identity", "").lower() == spec["watcher_id"].lower()
+        and outcomes[0].get("typed_404_identity", "").lower() == spec["watcher_id"].lower())
+    if (not isinstance(claim, dict) or not (initial_leaf or continued_leaf)
             or not isinstance(saved_cohort.get("bounded_recovery_deadline_monotonic"), (int, float))):
         raise ValueError("Azure group-only recovery requires the unchanged original leaf claim and cap")
     watcher_id, group_id = spec["watcher_id"].lower(), spec["resource_group_id"].lower()
@@ -2405,12 +2533,29 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
     validate_spec(spec)
     card = json.loads(Path(spec["authorization"]["card_path"]).read_text(encoding="utf-8"))
     now_mono = float(clock())
-    # The original approval remains a source/scope binding for cleanup after
-    # expiry. This separate emergency operation gets its own short bound.
+    # Preserve the original late cohort and owner timing. The one permitted
+    # group-only operation is separately bounded by the original source-bound
+    # owner cap/card and the existing 660-second operation limit.
     ttl = 660.0
-    if ttl <= 0:
-        raise TimeoutError("Azure group-only operation window expired; DELETE will not be repeated")
-    operation_deadline, operation_deadline_utc = now_mono + ttl, now + timedelta(seconds=ttl)
+    timing_state = _require_profile_timing_anchor(deployment, options, require_stop=False)
+    hard_deadline, hard_deadline_utc = _bounded_late_auxiliary_deadline(deployment, options,
+        timing_state or {}, clock=clock, utc_now=utc_now, _allow_expired_owner_caps=True)
+    card_end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00")).astimezone(UTC)
+    mono_cap_expired, utc_cap_expired = hard_deadline <= now_mono, hard_deadline_utc <= now
+    if mono_cap_expired != utc_cap_expired:
+        raise ValueError("original Azure owner monotonic and UTC cap anchors disagree")
+    if mono_cap_expired:
+        # Owner VM/profile caps remain immutable historical evidence. The
+        # separately authorized, non-billable group-only operation is bounded
+        # by its one-shot 660-second limit and the original card expiry.
+        operation_deadline = min(now_mono + ttl, now_mono + (card_end - now).total_seconds())
+        operation_deadline_utc = min(now + timedelta(seconds=ttl), card_end)
+    else:
+        operation_deadline = min(now_mono + ttl, hard_deadline,
+            now_mono + (card_end - now).total_seconds())
+        operation_deadline_utc = min(now + timedelta(seconds=ttl), hard_deadline_utc, card_end)
+    if operation_deadline <= now_mono or operation_deadline_utc <= now:
+        raise TimeoutError("Azure group-only operation reached the original owner/card cap")
     op = options.model_copy(update={"cap_deadline_monotonic": operation_deadline,
         "workflow_stage_deadline_monotonic": operation_deadline,
         "bounded_recovery_deadline_utc": operation_deadline_utc,
@@ -2435,7 +2580,18 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
     if group_delete_count > 1:
         raise ValueError("Azure auxiliary cohort exceeded its one approved parent-group DELETE")
     if prior_group_receipt is None:
-        leaf = _saved_watcher_leaf_receipt(state, options, spec)
+        leaf = _saved_watcher_leaf_receipt(state, options, spec,
+            persisted_result_binding=continued_leaf)
+        if continued_leaf and outcomes[0].get("evidence_sha256") != leaf["absence_evidence_sha256"]:
+            raise ValueError("saved Azure cohort leaf outcome differs from its exact ETag/404 action receipt")
+        expected_owners = {owner_key(owner) for owner in spec["owners"]}
+        owner_states = saved_cohort.get("owners")
+        if (not isinstance(owner_states, dict) or set(owner_states) != expected_owners
+                or any(not isinstance(row, dict) or row.get("state") != "parent_absent"
+                    or not is_sha256(row.get("baseline_sha256"))
+                    or not is_sha256(row.get("activity_sha256"))
+                    for row in owner_states.values())):
+            raise ValueError("saved Azure group continuation lacks exact absence proof for every original parent")
         card_start = datetime.fromisoformat(card["not_before_utc"].replace("Z", "+00:00")).astimezone(UTC)
         card_end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00")).astimezone(UTC)
         approved_at = datetime.fromisoformat(card["approved_at_utc"].replace("Z", "+00:00")).astimezone(UTC)
@@ -2496,7 +2652,8 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
         if source_journal.is_symlink() or not source_journal.is_file():
             raise ValueError("saved Azure group-only action journal is unavailable")
         source_state = json.loads(source_journal.read_text(encoding="utf-8"))
-        source_leaf = _saved_watcher_leaf_receipt(source_state, source_options, spec)
+        source_leaf = _saved_watcher_leaf_receipt(source_state, source_options, spec,
+            persisted_result_binding=continued_leaf)
         leaf_time = datetime.fromisoformat(source_leaf["finished_at_utc"])
         card_start = datetime.fromisoformat(card["not_before_utc"].replace("Z", "+00:00")).astimezone(UTC)
         card_end = datetime.fromisoformat(card["not_after_utc"].replace("Z", "+00:00")).astimezone(UTC)
@@ -2532,15 +2689,46 @@ def _recover_shared_watcher_group_only_impl(deployment: ProviderDeploymentInput,
         actions.extend([_safe_cleanup_action(options, delete_result),
             _safe_cleanup_action(options, absent_result)])
 
-    resources, evidence = _read_arm_collection(runner, op, root,
-        f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
-        "azure_auxiliary_group_only_subscription_resources", clock, ("id", "type"))
-    actions.extend(evidence)
-    groups, evidence = _read_arm_collection(runner, op, root,
-        f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
-        "azure_auxiliary_group_only_subscription_groups", clock, ("id", "name"))
-    actions.extend(evidence)
-    _require_cleanup_cohort_parents_absent(spec, groups, resources)
+    if prior_group_receipt is None:
+        for collection in ("flowLogs", "packetCaptures", "connectionMonitors"):
+            children, evidence = _read_arm_collection(runner, op, root,
+                f"{watcher_id}/{collection}?api-version=2023-09-01",
+                f"azure_auxiliary_group_only_{collection}_inventory", clock, ("id",),
+                expected_missing_watcher_parent_id=watcher_id)
+            actions.extend(evidence)
+            if children:
+                raise RuntimeError(f"saved Network Watcher {collection} inventory is nonempty")
+        leaf_absence = _command(runner, op, root,
+            _azure_rest("GET", watcher_id + "?api-version=2023-09-01"),
+            "azure_auxiliary_group_only_leaf_absence", clock, allow_not_found=True,
+            expected_missing_resource_id=watcher_id,
+            expected_missing_resource_url=watcher_id + "?api-version=2023-09-01")
+        actions.append(_safe_cleanup_action(options, leaf_absence))
+        if not _is_exact_watcher_resource_404(leaf_absence, watcher_id):
+            raise RuntimeError("fresh exact Network Watcher readback does not prove leaf absence")
+    # Azure can briefly retain a deleted leaf in list results. Retry only those
+    # exact stale rows; any foreign/additional child or live owned parent fails
+    # closed. The loop uses the already pinned one-shot operation deadline.
+    while True:
+        resources, evidence = _read_arm_collection(runner, op, root,
+            f"/subscriptions/{options.subscription_id}/resources?api-version=2021-04-01",
+            "azure_auxiliary_group_only_subscription_resources", clock, ("id", "type"))
+        actions.extend(evidence)
+        groups, evidence = _read_arm_collection(runner, op, root,
+            f"/subscriptions/{options.subscription_id}/resourcegroups?api-version=2021-04-01",
+            "azure_auxiliary_group_only_subscription_groups", clock, ("id", "name"))
+        actions.extend(evidence)
+        _require_cleanup_cohort_parents_absent(spec, groups, resources)
+        children = [row for row in resources if row["id"].lower().startswith(group_id + "/")]
+        if children and (len(children) != 1 or children[0]["id"].lower() != watcher_id
+                or children[0].get("type", "").lower() != "microsoft.network/networkwatchers"):
+            raise RuntimeError("fresh inventory found a foreign child under NetworkWatcherRG")
+        if not children:
+            break
+        remaining = operation_deadline - float(clock())
+        if remaining <= 0:
+            raise TimeoutError("stale NetworkWatcherRG leaf inventory exceeded the original operation cap")
+        time.sleep(min(0.25, remaining))
     exact_groups = [row for row in groups if row["id"].lower() == group_id]
     children = [row for row in resources if row["id"].lower().startswith(group_id + "/")]
     if prior_group_receipt is None:

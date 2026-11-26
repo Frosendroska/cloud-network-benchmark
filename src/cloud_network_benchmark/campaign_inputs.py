@@ -610,8 +610,61 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
                             now: datetime) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
     """Return non-authorizing draft metadata and, only after approval, the source-bound guard snapshot."""
     request = settings.get("pricing", {}).get("pending_eur_reserve_release")
+    continuation_ref = settings.get("pricing", {}).get("continuation_authorization")
+    guard_correction_ref = settings.get("pricing", {}).get("legacy_usd_guard_correction")
     if request is None:
-        return None, None
+        if continuation_ref is None and guard_correction_ref is None:
+            return None, None
+        if continuation_ref is None or guard_correction_ref is None:
+            raise ValueError("the S1/S3 USD guard correction requires both exact source-bound approvals")
+        if stage != "acceptance":
+            raise ValueError("the source-bound S1/S3 continuation is limited to normal acceptance pricing")
+        from .financial_controls import (FinancialAuthorization, Source,
+            _validate_o2_amendment, stamp, validate_o3_continuation_source,
+            validate_o3_legacy_usd_guard_source)
+        try:
+            continuation = Source.model_validate(continuation_ref)
+            correction = Source.model_validate(guard_correction_ref)
+            validate_o3_continuation_source(continuation, now=now, end=now)
+            validate_o3_legacy_usd_guard_source(correction)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pricing S1/S3 guard sources do not match the exact approved continuation and correction") from exc
+        scope_id = settings.get("ledger", {}).get("scope_id")
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ValueError("the S1/S3 continuation pricing source requires the existing shared ledger scope")
+        planning_snapshot = {"continuation_authorization": continuation.model_dump(),
+            "legacy_usd_guard_correction": correction.model_dump(), "scope_id": scope_id}
+        if draft:
+            return None, planning_snapshot
+
+        declaration = settings.get("approvals", {}).get("paid_authorization", {})
+        if declaration.get("confirmed") is not True:
+            raise ValueError("non-draft S1/S3 continuation pricing requires its exact typed paid_authorization")
+        card_path = _path(declaration.get("source"), "approvals.paid_authorization.source", file=True)
+        expected_hash = declaration.get("sha256")
+        if (not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+                or _sha(card_path) != expected_hash):
+            raise ValueError("paid_authorization requires its exact declared source sha256")
+        card_source = Source(path=str(card_path), sha256=expected_hash)
+        try:
+            card = FinancialAuthorization.model_validate(card_source.json())
+            current = stamp(now)
+            if (card.ledger_scope_id != scope_id
+                    or card.continuation_authorization != continuation
+                    or stamp(card.approved_at) > current
+                    or not stamp(card.valid_from) <= current < stamp(card.valid_until)):
+                raise ValueError("typed continuation authority identity or window differs")
+            _validate_o2_amendment(card, now=current, end=current)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("non-draft continuation requires the exact current EUR400 typed card") from exc
+        return None, {"authority": card_source.model_dump(),
+            "continuation_authorization": card.continuation_authorization.model_dump(),
+            "financial_policy_amendment": card.financial_policy_amendment.model_dump(),
+            "legacy_usd_guard_correction": correction.model_dump(),
+            "caps": card.caps.model_dump(), "batch_id": card.batch_id,
+            "stage_id": card.stage_id, "scope_id": scope_id}
+    if continuation_ref is not None or guard_correction_ref is not None:
+        raise ValueError("the zero-new-reserve continuation cannot be combined with a reserve-release request")
     if not isinstance(request, dict):
         raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")
     o2_request = request == _O2_RESERVE_RELEASE_REQUEST
@@ -715,13 +768,27 @@ def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[
             or amounts.get("working_limit", Decimal(250)) != 250):
         raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
     if commitment > amounts.get("total_limit", Decimal(300)):
-        raise ValueError("pricing.funding commitment exceeds its unchanged $300 USD total limit")
+        from .financial_controls import (has_o3_continuation_cost_source,
+            _has_source_bound_o3_continuation)
+        if draft and has_o3_continuation_cost_source(release_snapshot, now=now):
+            pass  # A DRAFT is non-authorizing; typed O3 and EUR ledger checks follow.
+        elif not draft and _has_source_bound_o3_continuation(release_snapshot, now=now):
+            pass  # The exact card is checked again against retained exposure at admission.
+        else:
+            raise ValueError("pricing.funding commitment exceeds the unchanged $300 USD limit without source-bound O3 continuation")
     if commitment > Decimal("250"):
         if pending_release is None:
-            raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+            from .financial_controls import (has_o3_continuation_cost_source,
+                legacy_usd_budget_exceeded)
+            if draft and has_o3_continuation_cost_source(release_snapshot, now=now):
+                pass
+            elif draft:
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+            elif release_snapshot is None or legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without a current source-bound continuation")
         if not draft:
             from .financial_controls import legacy_usd_budget_exceeded
-            if legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+            if pending_release is not None and legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
                 if pending_release == _EUR_RESERVE_RELEASE_REQUEST:
                     raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
                 raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound reserve-release approval")

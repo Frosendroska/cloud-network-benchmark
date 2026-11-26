@@ -2025,6 +2025,55 @@ def test_shared_watcher_cleanup_refuses_nonempty_child_collection_before_any_del
     assert not any("delete" in request.action_type for request in runner.calls)
 
 
+@pytest.mark.parametrize(("collection", "error_code", "message"), [
+    ("flowLogs", "ParentResourceNotFound",
+        "Failed to perform 'read' on resource(s) of type 'networkWatchers/flowLogs', because the parent resource '{watcher}' could not be found."),
+    ("packetCaptures", "ResourceNotFound",
+        "The Resource 'Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral' under resource group 'NetworkWatcherRG' was not found. For more details please go to https://aka.ms/ARMResourceNotFoundFix"),
+    ("connectionMonitors", "ParentResourceNotFound",
+        "Failed to perform 'read' on resource(s) of type 'networkWatchers/connectionMonitors', because the parent resource '{watcher}' could not be found."),
+])
+def test_group_only_child_inventory_accepts_only_saved_exact_missing_watcher_responses(
+        repository_root, tmp_path, collection, error_code, message):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    _d, o, _ = profile_attempt(repository_root, tmp_path, now)
+    subscription = "188a5848-76fb-4d57-8f2a-32c09284d486"
+    watcher = (f"/subscriptions/{subscription}/resourceGroups/NetworkWatcherRG/providers/"
+        "Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral")
+    message = message.format(watcher=watcher)
+    stderr = "ERROR: Not Found(" + json.dumps({"error": {"code": error_code,
+        "message": message}}, separators=(",", ":")) + ")\n"
+
+    class Runner:
+        def __init__(self, error): self.error = error; self.requests = []
+        def run(self, request):
+            self.requests.append(request)
+            return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                started_at=now, finished_at=now, duration_seconds=0.0, exit_code=1,
+                stdout="", stderr=self.error)
+
+    lookup_watcher = watcher.lower()
+    endpoint = f"{lookup_watcher}/{collection}?api-version=2023-09-01"
+    action = f"azure_auxiliary_group_only_{collection}_inventory"
+    values, evidence = azure_provider._read_arm_collection(Runner(stderr), o.model_copy(update={
+        "subscription_id": subscription}), tmp_path, endpoint, action,
+        lambda: 100.0, ("id",), expected_missing_watcher_parent_id=lookup_watcher)
+    assert values == [] and len(evidence) == 1
+
+    wrong_parent = (stderr.replace(watcher, watcher + "-foreign") if collection != "packetCaptures"
+        else stderr.replace("NetworkWatcher_swedencentral", "NetworkWatcher_foreign"))
+    with pytest.raises(RuntimeError):
+        azure_provider._read_arm_collection(Runner(wrong_parent), o.model_copy(update={
+            "subscription_id": subscription}), tmp_path, endpoint, action,
+            lambda: 100.0, ("id",), expected_missing_watcher_parent_id=lookup_watcher)
+    forbidden = "ERROR: Not Found(" + json.dumps({"error": {
+        "code": "AuthorizationFailed", "message": message}}) + ")\n"
+    with pytest.raises(RuntimeError):
+        azure_provider._read_arm_collection(Runner(forbidden), o.model_copy(update={
+            "subscription_id": subscription}), tmp_path, endpoint, action,
+            lambda: 100.0, ("id",), expected_missing_watcher_parent_id=lookup_watcher)
+
+
 def test_preexisting_watcher_and_parent_group_are_never_deleted(
         repository_root: Path, tmp_path: Path, monkeypatch):
     from cloud_network_benchmark.azure_auxiliary_cleanup import AuxiliaryCleanupCohort
@@ -2413,14 +2462,15 @@ def _group_only_recovery_fixture(repository_root, tmp_path, now):
     root = o.attempt_root
     root.mkdir(mode=0o700, parents=True)
 
-    def saved_row(action, argv, *, outcome=CommandOutcome.SUCCEEDED, stdout="", stderr="", seconds=0):
+    def saved_row(action, argv, *, outcome=CommandOutcome.SUCCEEDED, stdout="", stderr="", seconds=0,
+            redactions=None):
         stamp = now - timedelta(seconds=3-seconds)
         command = CommandRequest(action_id=f"azure-saved-{action}", action_type=action, argv=argv,
             cwd=str(root), timeout_seconds=30, environment_classification="none")
         result = CommandResult(action_id=command.action_id, outcome=outcome, started_at=stamp,
             finished_at=stamp + timedelta(seconds=0.5), duration_seconds=0.5,
             exit_code=0 if outcome == CommandOutcome.SUCCEEDED else 1,
-            stdout=stdout, stderr=stderr)
+            stdout=stdout, stderr=stderr, redactions=redactions or [])
         return {"request": command.durable_view(), "result": result.durable_view()}
     etag = 'W/"saved-etag"'
     prefix = ["az", "rest", "--subscription", sub]
@@ -2437,7 +2487,7 @@ def _group_only_recovery_fixture(repository_root, tmp_path, now):
                 "--output", "json"], outcome=CommandOutcome.FAILED,
             stderr="ERROR: Not Found(" + json.dumps({"error": {"code": "NotFound",
                 "message": f"Resource {watcher_id.lower()} not found.", "details": []}}) + ")",
-            seconds=2),
+            seconds=2, redactions=["fixture-private-token"]),
     ]
     state = {"run_id": d.run_id, "deployment_id": d.deployment_id,
         "config_sha256": d.config_sha256,
@@ -2454,26 +2504,135 @@ def _group_only_recovery_fixture(repository_root, tmp_path, now):
     return d, o, spec, cohort, journal, group_id, watcher_id, owner
 
 
-def test_group_only_recovery_uses_existing_cleanup_hook_and_source_receipt(repository_root, tmp_path, monkeypatch):
+def _stub_group_only_recovery_cap(monkeypatch, deployment, clock, utc_now):
+    monkeypatch.setattr(azure_provider, "_require_profile_timing_anchor",
+        lambda *_args, **_kwargs: {"clock_identity": azure_provider._clock_identity(),
+            "run_id": deployment.run_id, "deployment_id": deployment.deployment_id,
+            "config_sha256": deployment.config_sha256})
+    monkeypatch.setattr(azure_provider, "_bounded_late_auxiliary_deadline",
+        lambda *_args, **_kwargs: (clock() + 600.0, utc_now() + timedelta(seconds=600)))
+
+
+def test_group_claimed_continuation_rejects_leaf_outcome_not_bound_to_saved_etag_receipt(
+        repository_root, tmp_path, monkeypatch):
+    now = datetime(2026, 11, 25, 12, 1, tzinfo=timezone.utc)
+    d, o, spec, cohort, _journal, _group_id, watcher_id, _owner = _group_only_recovery_fixture(
+        repository_root, tmp_path, now)
+    claim = cohort.snapshot()["claim"]
+    cohort.record_outcome(claim["claim_id"], action="leaf_delete", identity=watcher_id,
+        outcome="succeeded", evidence_sha256=hashlib.sha256(b"wrong leaf evidence").hexdigest(),
+        now_monotonic=41.0, typed_404_identity=watcher_id,
+        bounded_recovery_deadline_monotonic=50.0)
+    assert cohort.claim_group(claim["claim_id"], now_monotonic=42.0,
+        bounded_recovery_deadline_monotonic=50.0)
+    _stub_group_only_recovery_cap(monkeypatch, d, lambda: 100.0, lambda: now)
+    with pytest.raises(ValueError, match="outcome differs from its exact ETag/404"):
+        azure_provider.recover_shared_watcher_group_only(d, o, object(), o.attempt_root,
+            clock=lambda: 100.0, utc_now=lambda: now)
+    after = cohort.snapshot()
+    assert after["claim"]["state"] == "group_claimed"
+    assert after["outcomes"][0]["evidence_sha256"] == hashlib.sha256(b"wrong leaf evidence").hexdigest()
+    assert after.get("group_only_recovery_intent") is None
+
+
+def test_group_claimed_roundtrip_binds_raw_durable_result_and_rejects_tampering(
+        repository_root, tmp_path, monkeypatch):
+    from cloud_network_benchmark.azure_auxiliary_cleanup import canonical
+    now = datetime(2026, 11, 25, 12, 1, tzinfo=timezone.utc)
+    d, o, spec, cohort, journal, _group_id, watcher_id, _owner = _group_only_recovery_fixture(
+        repository_root, tmp_path, now)
+    state = json.loads(journal.read_text())
+    state["actions"].pop()
+    journal.write_text(json.dumps(state, indent=2) + "\n")
+    class AbsenceRunner:
+        def run(self, request):
+            stamp = now
+            return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                started_at=stamp, finished_at=stamp + timedelta(seconds=0.5),
+                duration_seconds=0.5, exit_code=1, stdout="",
+                stderr="ERROR: Not Found(" + json.dumps({"error": {"code": "NotFound",
+                    "message": f"Resource {watcher_id.lower()} not found.", "details": []}}) + ")")
+    azure_provider._command(AbsenceRunner(), o, o.attempt_root,
+        ["az", "rest", "--method", "GET", "--url", watcher_id + "?api-version=2023-09-01",
+            "--output", "json"], "azure_auxiliary_watcher_absence", lambda: 100.0,
+        allow_not_found=True, expected_missing_resource_id=watcher_id,
+        expected_missing_resource_url=watcher_id + "?api-version=2023-09-01")
+    state = json.loads(journal.read_text())
+    raw_absence_result = state["actions"][2]["result"]
+    assert raw_absence_result["redactions_applied"] is True
+    raw_digest = hashlib.sha256(canonical(raw_absence_result)).hexdigest()
+    claim = cohort.snapshot()["claim"]
+    cohort.record_outcome(claim["claim_id"], action="leaf_delete", identity=watcher_id,
+        outcome="succeeded", evidence_sha256=raw_digest, now_monotonic=41.0,
+        typed_404_identity=watcher_id, bounded_recovery_deadline_monotonic=50.0)
+    assert cohort.claim_group(claim["claim_id"], now_monotonic=42.0,
+        bounded_recovery_deadline_monotonic=50.0)
+    raw_absence_result["redactions_applied"] = False
+    journal.write_text(json.dumps(state, indent=2) + "\n")
+    _stub_group_only_recovery_cap(monkeypatch, d, lambda: 100.0, lambda: now)
+    with pytest.raises(ValueError, match="differs from its exact ETag/404 action receipt"):
+        azure_provider.recover_shared_watcher_group_only(d, o, object(), o.attempt_root,
+            clock=lambda: 100.0, utc_now=lambda: now)
+    assert cohort.snapshot().get("group_only_recovery_intent") is None
+
+
+def test_group_only_rejects_disagreeing_expired_owner_cap_clocks(repository_root, tmp_path, monkeypatch):
+    now = datetime(2026, 11, 25, 23, 59, tzinfo=timezone.utc)
+    d, o, _spec, cohort, _journal, _group_id, _watcher_id, _owner = _group_only_recovery_fixture(
+        repository_root, tmp_path, now - timedelta(minutes=2))
+    _stub_group_only_recovery_cap(monkeypatch, d, lambda: 100.0, lambda: now)
+    monkeypatch.setattr(azure_provider, "_bounded_late_auxiliary_deadline",
+        lambda *_args, **_kwargs: (99.0, now + timedelta(seconds=60)))
+    with pytest.raises(ValueError, match="monotonic and UTC cap anchors disagree"):
+        azure_provider.recover_shared_watcher_group_only(d, o, object(), o.attempt_root,
+            clock=lambda: 100.0, utc_now=lambda: now)
+    assert cohort.snapshot().get("group_only_recovery_intent") is None
+
+
+@pytest.mark.parametrize("continued", [False, True], ids=["original-claimed", "group-claimed-leaf-receipt"])
+@pytest.mark.parametrize("stale_leaf_inventory", [False, True], ids=["fresh-list", "stale-list-once"])
+@pytest.mark.parametrize("expired_owner_caps", [False, True], ids=["owner-cap-live", "owner-cap-expired"])
+def test_group_only_recovery_uses_existing_cleanup_hook_and_source_receipt(
+        repository_root, tmp_path, monkeypatch, continued, stale_leaf_inventory, expired_owner_caps):
     from types import SimpleNamespace
     from cloud_network_benchmark.azure_auxiliary_cleanup import canonical
     from cloud_network_benchmark.lifecycle_cleanup import (cleanup_saved_provider,
         reconcile_saved_cleanup_result, save_cleanup_settings)
     from cloud_network_benchmark.contracts.common import Evidence
 
-    # The bound card expires at 00:00 UTC; cleanup remains available afterward
-    # because the saved original leaf action is within that card window.
-    now = datetime(2026, 11, 26, 0, 1, tzinfo=timezone.utc)
+    # The card expires in one minute, earlier than the live owner's 660-second
+    # bound, so both owner-cap branches must clip the operation to the card.
+    now = datetime(2026, 11, 25, 23, 59, tzinfo=timezone.utc)
     d, o, spec, cohort, journal, group_id, watcher_id, owner = _group_only_recovery_fixture(
         repository_root, tmp_path, now - timedelta(minutes=2))
+    saved_state = json.loads(journal.read_text())
+    saved_leaf = azure_provider._saved_watcher_leaf_receipt(saved_state, o, spec,
+        persisted_result_binding=continued)
+    claim = cohort.snapshot()["claim"]
+    if continued:
+        cohort.record_outcome(claim["claim_id"], action="leaf_delete", identity=watcher_id,
+            outcome="succeeded", evidence_sha256=saved_leaf["absence_evidence_sha256"],
+            now_monotonic=41.0, typed_404_identity=watcher_id,
+            bounded_recovery_deadline_monotonic=50.0)
+        assert cohort.claim_group(claim["claim_id"], now_monotonic=42.0,
+            bounded_recovery_deadline_monotonic=50.0)
     clock_value = [100.0]
     def clock(): return clock_value[0]
     def utc_now(): return now + timedelta(seconds=clock_value[0]-100.0)
+    _stub_group_only_recovery_cap(monkeypatch, d, clock, utc_now)
+    if expired_owner_caps:
+        monkeypatch.setattr(azure_provider, "_bounded_late_auxiliary_deadline",
+            lambda *_args, **_kwargs: (clock() - 1.0, utc_now() - timedelta(seconds=1)))
     monkeypatch.setattr(azure_provider, "_observe_profile_cleanup_clock",
         lambda *args, **kwargs: {"timing_status": "late", "timing_failure": "original deadline elapsed"})
-    def inventory(_runner, _options, _root, endpoint, action, _clock, _required):
+    inventory_reads = [0]
+    def inventory(_runner, _options, _root, endpoint, action, _clock, _required, **_kwargs):
         if "resourcegroups?" in endpoint:
             rows = [{"id": group_id, "name": "NetworkWatcherRG"}]
+        elif action == "azure_auxiliary_group_only_subscription_resources":
+            inventory_reads[0] += 1
+            rows = ([{"id": watcher_id, "type": "Microsoft.Network/networkWatchers"}]
+                if stale_leaf_inventory and inventory_reads[0] == 1 else [])
         else:
             rows = []
         if action.endswith("immediate_children"):
@@ -2490,6 +2649,11 @@ def test_group_only_recovery_uses_existing_cleanup_hook_and_source_receipt(repos
                 stdout = json.dumps({"id": group_id})
             elif request.action_type == "azure_auxiliary_group_absence":
                 stdout = "false"
+            elif request.action_type == "azure_auxiliary_group_only_leaf_absence":
+                return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                    started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=1,
+                    stdout="", stderr="ERROR: Not Found(" + json.dumps({"error": {
+                        "code": "NotFound", "message": f"Resource {watcher_id} not found."}}) + ")")
             else:
                 stdout = ""
             outcome = CommandOutcome.TIMED_OUT if request.action_type == "azure_auxiliary_group_delete" and False else CommandOutcome.SUCCEEDED
@@ -2509,10 +2673,17 @@ def test_group_only_recovery_uses_existing_cleanup_hook_and_source_receipt(repos
     assert physical.cleanup_state == "succeeded" and physical.timing_status == "late"
     assert sum(row.action_type == "azure_auxiliary_group_delete" for row in runner.requests) == 1
     assert not any(row.action_type == "azure_auxiliary_watcher_delete" for row in runner.requests)
+    assert inventory_reads[0] == (2 if stale_leaf_inventory else 1)
     after = cohort.snapshot()
-    assert after["claim"]["state"] == "claimed" and after["outcomes"] == []
+    if continued:
+        assert after["claim"]["state"] == "group_claimed" and len(after["outcomes"]) == 1
+        assert after["outcomes"][0]["action"] == "leaf_delete"
+        assert after["outcomes"][0]["evidence_sha256"] == saved_leaf["absence_evidence_sha256"]
+    else:
+        assert after["claim"]["state"] == "claimed" and after["outcomes"] == []
     assert after["bounded_recovery_deadline_monotonic"] == 50.0
     assert after["group_only_recovery_receipt"]["group_absent"] is True
+    assert after["group_only_recovery_intent"]["operation_deadline_utc"] == "2026-11-26T00:00:00+00:00"
 
     reservation_id = d.reservation.value.reservation_id.value
     ledger_path = tmp_path / "original-ledger-copy.json"
@@ -2544,9 +2715,10 @@ def test_group_only_unknown_intent_never_dispatches_a_second_delete(repository_r
     clock_value = [100.0]
     def clock(): return clock_value[0]
     def utc_now(): return now + timedelta(seconds=clock_value[0]-100.0)
+    _stub_group_only_recovery_cap(monkeypatch, d, clock, utc_now)
     monkeypatch.setattr(azure_provider, "_observe_profile_cleanup_clock",
         lambda *args, **kwargs: {"timing_status": "late", "timing_failure": "original deadline elapsed"})
-    def inventory(_runner, _options, _root, endpoint, action, _clock, _required):
+    def inventory(_runner, _options, _root, endpoint, action, _clock, _required, **_kwargs):
         rows = [{"id": group_id, "name": "NetworkWatcherRG"}] if "resourcegroups?" in endpoint else []
         if action.endswith("immediate_children"):
             rows = []
@@ -2561,6 +2733,11 @@ def test_group_only_unknown_intent_never_dispatches_a_second_delete(repository_r
                 return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
                     started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=0,
                     stdout=json.dumps({"id": group_id}), stderr="")
+            if request.action_type == "azure_auxiliary_group_only_leaf_absence":
+                return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                    started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=1,
+                    stdout="", stderr="ERROR: Not Found(" + json.dumps({"error": {
+                        "code": "NotFound", "message": f"Resource {watcher_id} not found."}}) + ")")
             if request.action_type == "azure_auxiliary_group_delete":
                 return CommandResult(action_id=request.action_id, outcome=CommandOutcome.TIMED_OUT,
                     started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=None,
@@ -2608,7 +2785,7 @@ def test_group_only_hook_delegates_legacy_leaf_absent_claim(repository_root, tmp
 
 
 @pytest.mark.parametrize("case", ["before_window", "crosses_window_end"])
-def test_group_only_rejects_leaf_delete_outside_card_even_if_absence_is_inside(repository_root, tmp_path, case):
+def test_group_only_rejects_leaf_delete_outside_card_even_if_absence_is_inside(repository_root, tmp_path, case, monkeypatch):
     from types import SimpleNamespace
     from cloud_network_benchmark.lifecycle_cleanup import cleanup_saved_provider, save_cleanup_settings
 
@@ -2637,6 +2814,7 @@ def test_group_only_rejects_leaf_delete_outside_card_even_if_absence_is_inside(r
         private_root=tmp_path / "saved")
     record = SimpleNamespace(provider="azure", deployment_id=d.deployment_id,
         cleanup_settings_reference=str(settings_path), journal_reference=str(journal))
+    _stub_group_only_recovery_cap(monkeypatch, d, lambda: 100.0, lambda: now)
     with pytest.raises(PermissionError, match="leaf DELETE was not authorized"):
         cleanup_saved_provider(record, runner=object(), utc_now=lambda: now,
             monotonic_now=lambda: 100.0)
@@ -2732,7 +2910,12 @@ def test_group_only_peer_replays_source_receipt_without_second_delete(repository
     assert claim and old_snapshot["claim"]["state"] == "claimed"
 
     group_exists = [True]
-    def inventory(_runner, _options, _root, endpoint, action, _clock, _required):
+    descendant_reads = [0]
+    def inventory(_runner, _options, _root, endpoint, action, _clock, _required, **_kwargs):
+        if action in {"azure_auxiliary_group_only_flowLogs_inventory",
+                "azure_auxiliary_group_only_packetCaptures_inventory",
+                "azure_auxiliary_group_only_connectionMonitors_inventory"}:
+            descendant_reads[0] += 1
         if "resourcegroups?" in endpoint:
             rows = [{"id": group_id, "name": "NetworkWatcherRG"}] if group_exists[0] else []
         else:
@@ -2741,6 +2924,7 @@ def test_group_only_peer_replays_source_receipt_without_second_delete(repository
     monkeypatch.setattr(azure_provider, "_read_arm_collection", inventory)
     monkeypatch.setattr(azure_provider, "_observe_profile_cleanup_clock",
         lambda *args, **kwargs: {"timing_status": "late", "timing_failure": "original deadline elapsed"})
+    _stub_group_only_recovery_cap(monkeypatch, d1, lambda: 100.0, lambda: now)
     class Runner:
         def __init__(self): self.requests = []
         def run(self, request):
@@ -2752,6 +2936,11 @@ def test_group_only_peer_replays_source_receipt_without_second_delete(repository
                 stdout = ""; group_exists[0] = False
             elif request.action_type in {"azure_auxiliary_group_absence", "azure_auxiliary_group_only_receipt_absence"}:
                 stdout = "false"
+            elif request.action_type == "azure_auxiliary_group_only_leaf_absence":
+                return CommandResult(action_id=request.action_id, outcome=CommandOutcome.FAILED,
+                    started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=1,
+                    stdout="", stderr="ERROR: Not Found(" + json.dumps({"error": {
+                        "code": "NotFound", "message": f"Resource {watcher_id} not found."}}) + ")")
             else: raise AssertionError(request.action_type)
             return CommandResult(action_id=request.action_id, outcome=CommandOutcome.SUCCEEDED,
                 started_at=stamp, finished_at=stamp, duration_seconds=0.0, exit_code=0, stdout=stdout, stderr="")
@@ -2762,9 +2951,13 @@ def test_group_only_peer_replays_source_receipt_without_second_delete(repository
     first, *_ = cleanup_saved_provider(records[0], runner=runner, utc_now=lambda: now,
         monotonic_now=lambda: 100.0)
     assert first.cleanup_state == "succeeded" and first.timing_status == "late"
+    first_descendant_reads = descendant_reads[0]
+    first_descendant_requests = sum("group_only_leaf_absence" in row.action_type for row in runner.requests)
     second, *_ = cleanup_saved_provider(records[1], runner=runner, utc_now=lambda: now,
         monotonic_now=lambda: 101.0)
     assert second.cleanup_state == "succeeded" and second.timing_status == "late"
+    assert descendant_reads[0] == first_descendant_reads
+    assert sum("group_only_leaf_absence" in row.action_type for row in runner.requests) == first_descendant_requests
     assert sum(row.action_type == "azure_auxiliary_group_delete" for row in runner.requests) == 1
     assert not any(row.action_type == "azure_auxiliary_watcher_delete" for row in runner.requests)
     after = cohort.snapshot()

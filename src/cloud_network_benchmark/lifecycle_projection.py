@@ -10,9 +10,10 @@ from threading import Lock
 from typing import Any, Mapping
 
 
-def _failure(message: str, occurred_at: datetime, category: str) -> Any:
+def _failure(message: str, occurred_at: datetime, category: str, *, details: Mapping[str, Any] | None = None) -> Any:
     from .contracts.common import FailureEvidence
-    return FailureEvidence(category=category, message=message, occurred_at=occurred_at)
+    return FailureEvidence(category=category, message=message, occurred_at=occurred_at,
+        details=dict(details or {}))
 
 
 def _value(value: Any) -> Any:
@@ -212,7 +213,18 @@ def _sync_manifest(*, parent_path: Path, child_path: Path, root: Path, child: An
             provider = getattr(child.provider, "value", child.provider)
             cause = result.primary_failure or f"{provider} lifecycle failed"
             observed_failure = getattr(result.values.get("protect"),"failure",None)
-            failure = observed_failure or _failure(cause, observed_at, "lifecycle_failure")
+            failure = observed_failure
+            if failure is None:
+                prepare_outcome = result.values.get("prepare")
+                if prepare_outcome is not None:
+                    from .lifecycle_cli import _prepare_failure_projection
+                    provider = getattr(child.provider, "value", child.provider)
+                    prepare_evidence = _prepare_failure_projection(child.run_id, provider, prepare_outcome)
+                else:
+                    prepare_evidence = None
+                failure = _failure(cause, observed_at, "lifecycle_failure",
+                    details=({"prepare_failure_evidence": prepare_evidence}
+                        if prepare_evidence is not None else {}))
             if observed_failure is not None:
                 observed_at = observed_failure.occurred_at
             target = ExecutionState.INTERRUPTED if result.interrupted else ExecutionState.FAILED
