@@ -1739,9 +1739,98 @@ class CampaignDriver:
             item.get("cleanup_state") not in {"succeeded", "not_required"} for item in providers.values())
         lifecycle_complete = return_code == 0 and report.get("status") == "complete"
         success = return_code == 0 and valid_outputs and lifecycle_complete
-        return {"status": "complete" if success else "failed", "returncode": return_code,
+        archive_pending = False
+        if return_code == 0 and report.get("status") == "archive_pending_validation" and not cleanup_open:
+            try:
+                expected_providers = set(entry.get("run_ids", {}))
+                reported_run_ids = report.get("run_ids")
+                capsule_ref = report.get("replay_capsule")
+                runtime_path = Path(entry["runtime_config_path"])
+                if runtime_path.is_symlink() or not runtime_path.is_file():
+                    raise ValueError("source-bound runtime config is missing or unsafe")
+                runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+                sink = runtime.get("archive_sink")
+                if (not expected_providers or set(providers) != expected_providers
+                        or not isinstance(reported_run_ids, dict)
+                        or set(reported_run_ids) != expected_providers
+                        or any(reported_run_ids[key] != entry["run_ids"][key]
+                            for key in expected_providers)
+                        or not isinstance(capsule_ref, dict)
+                        or capsule_ref.get("status") != "archive_pending_replay"
+                        or set(capsule_ref.get("providers", [])) != expected_providers
+                        or report.get("finalization_failure") is not None
+                        or not isinstance(sink, dict)):
+                    raise ValueError("archive-pending report is not bound to the exact launched provider batch")
+                for provider in expected_providers:
+                    item = providers[provider]
+                    archive = item.get("archive_status")
+                    if (item.get("execution_state") != "succeeded"
+                            or item.get("cleanup_state") != "succeeded"
+                            or not isinstance(archive, dict)
+                            or archive.get("status") != "verified"
+                            or archive.get("verified") is not True
+                            or not archive.get("completion_generation")
+                            or not archive.get("manifest_sha256")):
+                        raise ValueError("archive-pending provider lacks verified archive and closed cleanup evidence")
+                capsule_path = Path(capsule_ref["path"])
+                archive_root = Path(sink["archive_root"]).resolve(strict=True)
+                expected_capsule_path = (archive_root / "replay-capsules"
+                    / f"{report['campaign_id']}-{report['reservation_id']}.json")
+                if (not capsule_path.is_absolute() or capsule_path.is_symlink()
+                        or not capsule_path.is_file()
+                        or capsule_path.resolve(strict=True) != expected_capsule_path.resolve(strict=False)):
+                    raise ValueError("archive-pending capsule is outside the configured source-bound capsule root")
+                capsule_stat_size = capsule_path.stat().st_size
+                maximum_capsule_bytes = sink["maximum_capsule_bytes"]
+                if (type(capsule_ref.get("bytes")) is not int or type(maximum_capsule_bytes) is not int
+                        or capsule_ref["bytes"] <= 0 or capsule_stat_size != capsule_ref["bytes"]
+                        or capsule_stat_size > maximum_capsule_bytes):
+                    raise ValueError("archive-pending capsule size exceeds or differs from its measured bound")
+                capsule_bytes = capsule_path.read_bytes()
+                if (len(capsule_bytes) != capsule_stat_size
+                        or hashlib.sha256(capsule_bytes).hexdigest() != capsule_ref.get("sha256")):
+                    raise ValueError("archive-pending capsule bytes differ from the producer report or measured bound")
+                capsule = json.loads(capsule_bytes)
+                if (capsule.get("schema_version") != 2
+                        or capsule.get("status") != "archive_pending_replay"
+                        or set(capsule.get("archives", {})) != expected_providers
+                        or set(capsule.get("provider_results", {})) != expected_providers):
+                    raise ValueError("archive-pending capsule does not contain the exact typed provider batch")
+                reservation = capsule.get("reservation")
+                if (not isinstance(report.get("campaign_id"), str)
+                        or not isinstance(report.get("reservation_id"), str)
+                        or not isinstance(reservation, dict)
+                        or reservation.get("campaign_id") != report["campaign_id"]
+                        or not isinstance(reservation.get("reservation_id"), dict)
+                        or reservation["reservation_id"].get("value") != report["reservation_id"]):
+                    raise ValueError("archive-pending capsule is not bound to the producer reservation identity")
+                repository_root = Path(stage.get("repository_root", Path.cwd())).resolve(strict=True)
+                parent_manifest = Path(entry["parent_manifest_path"]).resolve(strict=True)
+                if capsule.get("parent_path") != parent_manifest.relative_to(repository_root).as_posix():
+                    raise ValueError("archive-pending capsule parent manifest differs from the activated source")
+                if capsule.get("parent_manifest", {}).get("campaign_id") != report["campaign_id"]:
+                    raise ValueError("archive-pending capsule parent campaign differs from the producer report")
+                capsule_hashes = capsule_ref.get("manifest_sha256")
+                for provider in expected_providers:
+                    receipt = capsule["archives"][provider]
+                    replay_result = capsule["provider_results"][provider]
+                    if (receipt.get("status") != "verified" or receipt.get("verified") is not True
+                            or receipt.get("run_id") != entry["run_ids"][provider]
+                            or receipt.get("manifest_sha256") != providers[provider]["archive_status"]["manifest_sha256"]
+                            or replay_result.get("execution_state") != "succeeded"
+                            or replay_result.get("cleanup_state") != "succeeded"
+                            or not isinstance(capsule_hashes, dict)
+                            or capsule_hashes.get(provider) != receipt.get("manifest_sha256")):
+                        raise ValueError("archive-pending capsule receipt differs from actual provider report")
+                archive_pending = True
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                archive_pending = False
+        return {"status": "complete" if success else
+                    "archive_pending_validation" if archive_pending else "failed",
+                "returncode": return_code,
                 "validated_outputs_present": valid_outputs, "lifecycle_status_complete": lifecycle_complete,
                 "cleanup_open": cleanup_open, "provider_results": providers,
+                **({"replay_capsule": report["replay_capsule"]} if archive_pending else {}),
                 "log": str(run_log), "peak_process_rss_bytes": memory_peak,
                 "free_disk_bytes_start": free_start, "free_disk_bytes_end": free_end,
                 "minimum_free_disk_bytes_during_run": minimum_free,
