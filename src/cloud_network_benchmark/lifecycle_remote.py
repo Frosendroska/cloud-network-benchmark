@@ -314,7 +314,8 @@ def build_provider_remote_stages(*, provider: str, campaign: Any, parent: Any, c
             return item.prepared
         except Exception as exc:
             return ProviderStageOutcome("prepare", False,
-                {"failure": "remote preparation failed", "failure_type": type(exc).__name__})
+                {"failure": "remote preparation failed", "failure_type": type(exc).__name__,
+                 "failure_message": str(exc)[:240]})
 
     def stabilize(deployment: Any, provision: Any):
         try:

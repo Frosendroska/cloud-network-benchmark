@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
@@ -588,11 +589,26 @@ def test_terraform_output_failure_attempts_destroy_and_retains_output_failure(tm
 @pytest.mark.parametrize("scenario", ["same_zone", "cross_zone", "placement_optimization", "inter_region"])
 def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_path, scenario):
     deployment, settings = make_inter_region_attempt(tmp_path, scenario)
+    original_reservation = deployment.reservation.value.model_copy(update={
+        "expires_at": Evidence[datetime](value=NOW + timedelta(seconds=4000))})
+    deployment = deployment.model_copy(update={
+        "reservation": Evidence[ReservationEvidence](value=original_reservation)})
+    settings = settings.model_copy(update={
+        "complete_workflow_remaining_seconds": 3535,
+        "workflow_profile": "cloud_acceptance_v1",
+        "workflow_cap_started_monotonic": max(0.0, time.monotonic() - 1.0),
+        "registration_allowance_seconds": 900,
+        "provision_allowance_seconds": 900,
+        "post_registration_workflow_seconds": 2635,
+        "post_provision_workflow_seconds": 1735,
+    })
     sequence = []
 
     class SuccessRunner:
         def __init__(self):
             self.actions = []
+            self.console_reads = {}
+            self.console_timeouts = []
 
         def run(self, request):
             identity = legacy_cleanup_read_reply(request)
@@ -633,6 +649,24 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
                         "placement_group_strategy": "cluster" if placement_group else None},
                 }
                 stdout = json.dumps({"deployment": {"value": {"vms": roles, "network": {"peering_id": "pcx-fake"}, "placement": {"strategy": None}}}})
+            elif request.action_id == "aws-get-console-output---instance-id":
+                self.console_timeouts.append(request.timeout_seconds)
+                instance_id = request.argv[request.argv.index("--instance-id") + 1]
+                count = self.console_reads.get(instance_id, 0)
+                self.console_reads[instance_id] = count + 1
+                if scenario == "same_zone" and instance_id == "i-vm-a" and count == 0:
+                    output = ""
+                else:
+                    boot_id = ("f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a" if instance_id == "i-vm-a"
+                               else "a429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a")
+                    output = (f"CNB_HOSTKEY_BOOT_ID={boot_id}\n"
+                              "CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n")
+                stdout = json.dumps({"InstanceId": instance_id, "Output": output,
+                    "Timestamp": (NOW + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")})
+            elif request.argv[0] == "ssh-keyscan":
+                stdout = "8.8.8.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey\n"
+            elif request.argv[0] == "ssh-keygen":
+                stdout = "256 SHA256:abc123 host (ED25519)\n"
             else:
                 stdout = ""
             return CommandResult(action_id=request.action_id, outcome="succeeded", started_at=NOW,
@@ -646,7 +680,7 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
         provider="aws", action="stop", state="registered",
         registration_id=Evidence[str](value="aws-ssm:campaign-aws-deployment"),
         registered_at=Evidence[datetime](value=NOW - timedelta(seconds=1)),
-        expires_at=Evidence[datetime](value=NOW + timedelta(seconds=840)),
+        expires_at=Evidence[datetime](value=NOW + timedelta(seconds=4000)),
         target_selector=driver._target_selector(deployment, regions),
         provider_metadata=StructuredEvidence(value={"regional_execution_ids": {region: f"exec-{region}" for region in regions}}),
     )
@@ -665,10 +699,18 @@ def test_scenario_apply_output_materializes_exact_roles_and_private_state(tmp_pa
         "cap_started_at": deployment.reservation.value.cap_started_at.value.isoformat(), "cap_expires_at": deployment.reservation.value.expires_at.value.isoformat(), "expiry_trigger": expiry.expires_at.value.isoformat(),
     })
     driver._confirm_automation = lambda region, *_args: sequence.append(f"expiry-confirm-{region}")
-    driver._verify_observed_instance = lambda expected, *_args: expected
-    driver._verify_host_key = lambda detail: {"known_hosts_path": str(attempt / f"{detail['instance_id']}.known_hosts")}
+    driver._verify_observed_instance = lambda expected, *_args: {
+        **expected, "launch_time": (NOW - timedelta(seconds=5)).isoformat().replace("+00:00", "Z")}
     result = driver.provision(deployment)
-    assert runner.actions == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output"]
+    assert runner.actions[:3] == ["terraform-init-aws-pair-apply", "aws-pair-apply", "aws-pair-output"]
+    console_actions = [action for action in runner.actions
+        if action == "aws-get-console-output---instance-id"]
+    assert len(console_actions) == (3 if scenario == "same_zone" else 2)
+    assert all(0 < timeout <= 120 for timeout in runner.console_timeouts)
+    if scenario == "same_zone":
+        assert runner.console_reads == {"i-vm-a": 2, "i-vm-b": 1}
+    assert driver._identity_pair_deadline is not None
+    assert driver._identity_precreate_deadline is not None
     assert sequence[:len(regions)] == [f"expiry-confirm-{region}" for region in regions]
     assert sequence.index("aws-pair-apply") > len(regions) - 1
     assert str(result.scenario) == scenario

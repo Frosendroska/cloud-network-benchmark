@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import Field, field_validator, model_validator
 
-from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure
+from .access import AccessFailureEvidence, ConnectionOutput, RemoteActionEvidence, RemoteDeadline, _action, _execute as _run_command, _failure, _identity_references_available, _request as _build_request, _request_failure, _scrub
 from .contracts.common import CommandOutcome, IdentityContext, StrictModel
 from .contracts.execution import CommandRequest, CommandRunner
 from .contracts.artifacts import ArtifactRecord
@@ -31,6 +31,14 @@ def _request(action_id, connection, argv, timeout, action_type="ssh") -> Command
             argv=["scp" if action_type == "scp" else "ssh", "[request-construction-failed]"], cwd=".",
             environment_classification="contains_secret_references", timeout_seconds=safe_timeout,
             redactions=[connection.authentication_reference, connection.host_key_reference])
+
+
+def _redact_systemd_environment(value: str) -> str:
+    sensitive = re.compile(r"password|token|secret|private[_-]?key|authorization|api[_-]?key|access[_-]?key|client[_-]?secret|sig", re.I)
+    def redact(match: re.Match[str]) -> str:
+        keys = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", match.group(2))
+        return match.group(1) + ("[REDACTED]" if any(sensitive.search(key) for key in keys) else match.group(2))
+    return re.sub(r"(?im)^(\s*Environment\s*=)([^\r\n]*)", redact, value)
 
 
 def _execute(runner: CommandRunner, request: CommandRequest):
@@ -361,24 +369,51 @@ def _capabilities_observed(text: str, tool: str, *, required: List[str] | None =
 
 
 def _unit_matches(text: str, config_text: str, tool: str, address: str, port: int, prefix: str, stdout_path: str, stderr_path: str,
-                  observation_id: str | None = None) -> bool:
+                  observation_id: str | None = None, *, _failed_predicate: list[str] | None = None) -> bool:
+    """Validate the same strict unit identity, optionally naming its first failed check."""
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     match = re.search(r"argv\[\]=(.*?);", fields.get("ExecStart", ""))
-    if not match:
-        return False
-    try:
-        argv = shlex.split(match.group(1))
-    except ValueError:
-        return False
+    argv = None
+    if match:
+        try:
+            argv = shlex.split(match.group(1))
+        except ValueError:
+            pass
     binary = f"{prefix}/bin/{tool}"
     expected = [binary, "server", "-i", address, "-p", str(port)] if tool == "sockperf" else [binary, "-s", "-B", address, "-p", str(port), "--json-stream", "--forceflush"]
-    return (fields.get("LoadState") == "loaded" and fields.get("ActiveState") == "active"
-            and fields.get("MainPID", "0").isdigit() and int(fields.get("MainPID", "0")) > 0
-            and argv == expected and fields.get("Restart") == "no"
-            and fields.get("StandardOutput") == "append"
-            and fields.get("StandardError") == "append"
-            and _unit_log_destinations_match(config_text, stdout_path, stderr_path)
-            and (observation_id is None or _unit_environment_matches(text, config_text, observation_id)))
+    pid = fields.get("MainPID", "0")
+
+    def checked(name: str, passed: bool) -> bool:
+        if not passed and _failed_predicate is not None:
+            _failed_predicate.append(name)
+        return passed
+
+    if (not checked("systemctl_show.active_process", fields.get("LoadState") == "loaded"
+        and fields.get("ActiveState") == "active" and pid.isdigit() and int(pid) > 0)
+        or not checked("systemctl_show.exec_start", argv == expected)
+        or not checked("systemctl_show.restart_policy", fields.get("Restart") == "no")
+        or not checked("systemctl_show.stdout_mode", fields.get("StandardOutput") == "append")
+        or not checked("systemctl_show.stderr_mode", fields.get("StandardError") == "append")
+        or not checked("systemctl_cat.log_destinations",
+            _unit_log_destinations_match(config_text, stdout_path, stderr_path))):
+        return False
+    if observation_id is not None:
+        expected_environment = f"CNB_ACQUISITION_ID={observation_id}"
+        if not checked("systemctl_show.acquisition_environment",
+                _unit_environment_value_matches(fields.get("Environment", ""), expected_environment)):
+            return False
+        if not checked("systemctl_cat.acquisition_environment",
+                _unit_config_environment_matches(config_text, expected_environment)):
+            return False
+    return True
+
+
+def _unit_match_diagnostic(text: str, config_text: str, tool: str, address: str, port: int, prefix: str,
+                           stdout_path: str, stderr_path: str, observation_id: str | None = None) -> dict[str, object]:
+    failed: list[str] = []
+    matches = _unit_matches(text, config_text, tool, address, port, prefix, stdout_path, stderr_path,
+        observation_id, _failed_predicate=failed)
+    return {"matches": matches, "first_failed_predicate": failed[0] if failed else None}
 
 
 def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) -> bool:
@@ -401,18 +436,27 @@ def _unit_log_destinations_match(text: str, stdout_path: str, stderr_path: str) 
     return effective == {"StandardOutput": f"append:{stdout_path}", "StandardError": f"append:{stderr_path}"}
 
 
-def _unit_environment_matches(show_text: str, config_text: str, observation_id: str) -> bool:
-    expected = f"CNB_ACQUISITION_ID={observation_id}"
-    fields = dict(line.split("=", 1) for line in show_text.splitlines() if "=" in line)
-    effective = None
+def _unit_environment_value_matches(value: str, expected: str) -> bool:
+    return value in {expected, f'"{expected}"'}
+
+
+def _unit_config_environment_matches(config_text: str, expected: str) -> bool:
+    observed = []
     section = None
     for raw in config_text.splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
         elif section == "Service" and line.startswith("Environment="):
-            effective = line.split("=", 1)[1]
-    return expected in fields.get("Environment", "") and effective == expected
+            observed.append(line.split("=", 1)[1])
+    return len(observed) == 1 and _unit_environment_value_matches(observed[0], expected)
+
+
+def _unit_environment_matches(show_text: str, config_text: str, observation_id: str) -> bool:
+    expected = f"CNB_ACQUISITION_ID={observation_id}"
+    fields = dict(line.split("=", 1) for line in show_text.splitlines() if "=" in line)
+    return (_unit_environment_value_matches(fields.get("Environment", ""), expected)
+            and _unit_config_environment_matches(config_text, expected))
 
 
 def _process_identity_command(unit: str, binary: str) -> list[str]:
@@ -1246,10 +1290,34 @@ def run_bootstrap(connection: ConnectionOutput, config: BootstrapConfig, runner:
                     return BootstrapResult(succeeded=False, identity=connection.identity, deployment_id=connection.deployment_id, actions=actions, failure=AccessFailureEvidence(stage="bootstrap", vm_id=vm.host, role=role, category="readiness_deadline_exhausted", message="deadline exhausted before service output path verification", occurred_at=datetime.now(timezone.utc)), builds=builds, listeners=listeners)
                 cat_request = _request(f"f02r-vm_b-listener-config-{tool}", vm, ["systemctl", "cat", unit], min(connection.timeouts.server_seconds, cat_remaining))
                 cat_result = _execute(command_runner, cat_request); actions.append(_action(cat_request.action_id, "ssh", vm, cat_request, cat_result))
+                observation_id = "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None
+                unit_diagnostic = _unit_match_diagnostic(verify_result.stdout, cat_result.stdout, tool, address, port,
+                    prefix, stdout_abs, stderr_abs, observation_id)
                 if (verify_result.outcome != CommandOutcome.SUCCEEDED or cat_result.outcome != CommandOutcome.SUCCEEDED
-                        or not _unit_matches(verify_result.stdout, cat_result.stdout, tool, address, port, prefix, stdout_abs, stderr_abs,
-                            "f02r-vm_b-listener-iperf3" if tool == "iperf3" and sources[tool].observation_patch_path else None)):
-                    return _failure_result(connection, actions, vm, verify_request, verify_result, "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
+                        or not unit_diagnostic["matches"]):
+                    failed = _failure_result(connection, actions, vm, verify_request, verify_result,
+                        "listener_identity_unverified", f"{tool} process or listener identity was not observed", builds, listeners)
+                    details = dict(failed.failure.details)
+                    if verify_result.outcome != CommandOutcome.SUCCEEDED:
+                        first_failed = "systemctl_show.command_succeeded"
+                    elif cat_result.outcome != CommandOutcome.SUCCEEDED:
+                        first_failed = "systemctl_cat.command_succeeded"
+                    else:
+                        first_failed = unit_diagnostic["first_failed_predicate"]
+                    cat_stdout = _redact_systemd_environment(cat_result.stdout)
+                    for secret in (vm.authentication_reference, vm.host_key_reference):
+                        if secret:
+                            cat_stdout = _scrub(cat_stdout, secret)
+                    details["listener_identity"] = {
+                        "first_failed_predicate": first_failed,
+                        "systemctl_show_outcome": str(verify_result.outcome),
+                        "systemctl_show_exit_code": verify_result.exit_code,
+                        "systemctl_cat_outcome": str(cat_result.outcome),
+                        "systemctl_cat_exit_code": cat_result.exit_code,
+                        "systemctl_cat_source_bytes": len(cat_result.stdout.encode("utf-8")),
+                        "systemctl_cat_stdout": cat_stdout,
+                    }
+                    return failed.model_copy(update={"failure": failed.failure.model_copy(update={"details": details})})
                 proc_id = f"f02r-vm_b-listener-process-{tool}"
                 proc_remaining = deadline.remaining(clock, readiness=True)
                 if proc_remaining <= 0:

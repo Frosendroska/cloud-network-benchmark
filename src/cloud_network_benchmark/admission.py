@@ -1795,7 +1795,8 @@ class BudgetLedger:
         if stage != "cleanup":
             try:
                 revalidate_financial_record(rec, state=state, now=self.utc_now(),
-                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]),
+                    existing_retrieval=(stage == "retrieval"))
             except FinancialError as exc:
                 return StageDecision(False, (exc.reason,), None)
         originals = rec.get("allowance_fields", {})
@@ -1876,7 +1877,8 @@ class BudgetLedger:
                 return False
             try:
                 revalidate_financial_record(rec, state=state, now=self.utc_now(),
-                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]))
+                    end=datetime.fromisoformat(rec["evidence"]["expires_at"]["value"]),
+                    existing_retrieval=True)
             except FinancialError:
                 return False
             transfer = rec["result_transfer"][name]

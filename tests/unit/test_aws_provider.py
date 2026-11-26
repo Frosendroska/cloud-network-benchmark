@@ -5,6 +5,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -344,12 +345,218 @@ def test_console_host_fingerprint_is_bound_to_current_instance_and_scan(tmp_path
         assert trust["account_id"] == "123456789012" and trust["region"] == fixture["region"]
 
 
+def test_incomplete_console_failure_retains_hash_bound_private_diagnostics(tmp_path):
+    console = "synthetic incomplete console; diagnostic fixture only"
+    payload = {"InstanceId": "i-0123456789abcdef0", "Output": console,
+               "Timestamp": "2026-10-22T12:01:00Z"}
+    stdout = json.dumps(payload)
+
+    class Runner:
+        def run(self, request):
+            return CommandResult(action_id=request.action_id, outcome="succeeded",
+                started_at=NOW, finished_at=NOW, duration_seconds=0, exit_code=0,
+                stdout=stdout, stderr="")
+
+    deployment = make_deployment()
+    driver = AwsProviderDriver(Runner(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    attempt = driver._attempt_dir(deployment)
+    driver._active_attempt = attempt
+    driver._active_deployment = deployment
+    detail = {"region": "eu-central-1", "instance_id": payload["InstanceId"],
+        "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"}
+    with pytest.raises(AwsProviderError) as raised:
+        driver._verify_host_key(detail)
+    assert raised.value.category == "host_identity_unavailable"
+
+    command_log = (attempt / "commands.jsonl").read_text(encoding="utf-8")
+    command = json.loads(command_log)
+    assert command["action_id"] == "aws-get-console-output---instance-id"
+    assert command["exit_code"] == 0
+    assert command["diagnostic"] == {
+        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stdout_bytes": len(stdout.encode()),
+    }
+    assert console not in command_log and payload["Output"] not in command_log
+
+    journal = json.loads((attempt / "attempt.json").read_text(encoding="utf-8"))
+    diagnostic = journal["host_identity_diagnostics"][0]
+    assert diagnostic == {
+        "expected_instance_id": payload["InstanceId"],
+        "launch_time": "2026-10-22T11:58:00+00:00",
+        "response_instance_id": payload["InstanceId"],
+        "response_timestamp": "2026-10-22T12:01:00+00:00",
+        "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stdout_bytes": len(stdout.encode()),
+        "boot_marker_count": 0,
+        "fingerprint_count": 0,
+        "reason": "console_markers_incomplete",
+    }
+    assert console not in json.dumps(journal)
+    assert (attempt / "attempt.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_console_poll_aborts_on_forward_clock_jump_and_exhausted_original_deadline(tmp_path):
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    detail = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
+        "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"}
+    calls = []
+    driver._aws_json = lambda *_args, **_kwargs: calls.append(True) or {}
+
+    mono = time.monotonic()
+    driver._identity_trigger = NOW + timedelta(seconds=220)
+    driver._identity_precreate_deadline = mono + 120
+    driver._identity_stop_wall_deadline = mono + 120
+    driver._identity_pair_deadline = mono + 120
+    driver.clock = lambda: NOW + timedelta(seconds=10)
+    with pytest.raises(AwsProviderError) as advanced:
+        driver._verify_host_key(detail)
+    assert advanced.value.category == "host_identity_budget_clock_advanced"
+    assert calls == []
+
+    driver.clock = lambda: NOW
+    expired = time.monotonic() - 1
+    driver._identity_precreate_deadline = expired
+    driver._identity_stop_wall_deadline = expired
+    driver._identity_pair_deadline = expired
+    with pytest.raises(AwsProviderError) as exhausted:
+        driver._verify_host_key(detail)
+    assert exhausted.value.category == "host_identity_budget_exhausted"
+    assert calls == []
+
+
+def test_console_response_rechecks_forward_clock_before_host_keyscan(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import cloud_network_benchmark.providers.aws as aws_module
+
+    deployment = make_deployment()
+    wall = [NOW]
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: wall[0])
+    mono = [1000.0]
+    monkeypatch.setattr(aws_module, "time", SimpleNamespace(monotonic=lambda: mono[0]))
+    driver._identity_trigger = NOW + timedelta(seconds=160)
+    driver._identity_precreate_deadline = 1060.0
+    driver._identity_stop_wall_deadline = 1060.0
+    driver._identity_pair_deadline = 1060.0
+    detail = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
+        "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"}
+    key_commands = []
+
+    def completed_read(*_args, **_kwargs):
+        wall[0] = NOW + timedelta(seconds=10)
+        return {"InstanceId": detail["instance_id"],
+            "Output": "CNB_HOSTKEY_BOOT_ID=f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a\n"
+                "CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n",
+            "Timestamp": "2026-10-22T12:00:01Z"}
+
+    driver._aws_json = completed_read
+    driver._run = lambda action_id, *_args, **_kwargs: key_commands.append(action_id)
+    with pytest.raises(AwsProviderError) as advanced:
+        driver._verify_host_key(detail)
+    assert advanced.value.category == "host_identity_budget_clock_advanced"
+    assert key_commands == []
+
+
+def test_keyscan_and_fingerprint_work_cannot_outlive_original_identity_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import cloud_network_benchmark.providers.aws as aws_module
+
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    mono = [2000.0]
+    monkeypatch.setattr(aws_module, "time", SimpleNamespace(monotonic=lambda: mono[0]))
+    driver._identity_trigger = NOW + timedelta(seconds=120)
+    driver._identity_precreate_deadline = 2020.0
+    driver._identity_stop_wall_deadline = 2020.0
+    driver._identity_pair_deadline = 2020.0
+    detail = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
+        "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"}
+    driver._active_attempt = driver._attempt_dir(deployment)
+    command_timeouts = []
+    driver._aws_json = lambda *_args, **kwargs: (
+        command_timeouts.append(kwargs.get("timeout")) or {
+            "InstanceId": detail["instance_id"],
+            "Output": "CNB_HOSTKEY_BOOT_ID=f429b8b5-1b1f-4b54-8a42-cbfdd46f9b2a\n"
+                "CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n",
+            "Timestamp": "2026-10-22T12:00:01Z"})
+    key_commands = []
+
+    def run_key_command(action_id, _argv, timeout, **_kwargs):
+        key_commands.append((action_id, timeout))
+        mono[0] += timeout
+        stdout = ("203.0.113.8 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey\n"
+                  if "keyscan" in action_id else "256 SHA256:abc123 host (ED25519)\n")
+        return CommandResult(action_id=action_id, outcome="succeeded", started_at=NOW,
+            finished_at=NOW + timedelta(seconds=timeout), duration_seconds=timeout,
+            exit_code=0, stdout=stdout, stderr="")
+
+    driver._run = run_key_command
+    with pytest.raises(AwsProviderError) as exhausted:
+        driver._verify_host_key(detail)
+    assert exhausted.value.category == "host_identity_budget_exhausted"
+    assert command_timeouts == [20]
+    assert [timeout for _action, timeout in key_commands] == [15, 5]
+    attempt = driver._attempt_dir_for_details(detail)
+    assert not (attempt / f"{detail['instance_id']}.known_hosts").exists()
+    assert not (attempt / f"{detail['instance_id']}.host-trust.json").exists()
+
+
+def test_console_poll_retries_only_incomplete_markers_within_original_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import cloud_network_benchmark.providers.aws as aws_module
+
+    deployment = make_deployment()
+    driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
+    detail = {"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
+        "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"}
+    now = [1000.0]
+    monkeypatch.setattr(aws_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    trigger = NOW + timedelta(seconds=110)
+    deadline = now[0] + 10
+    driver._identity_trigger = trigger
+    driver._identity_precreate_deadline = deadline
+    driver._identity_stop_wall_deadline = deadline
+    driver._identity_pair_deadline = deadline
+    driver.sleeper = lambda seconds: now.__setitem__(0, now[0] + seconds)
+    calls = []
+
+    def incomplete(*_args, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        return {"InstanceId": detail["instance_id"], "Output": "",
+            "Timestamp": "2026-10-22T12:00:00Z"}
+
+    driver._aws_json = incomplete
+    with pytest.raises(AwsProviderError) as exhausted:
+        driver._verify_host_key(detail)
+    assert exhausted.value.category == "host_identity_budget_exhausted"
+    assert calls == list(range(10, 0, -1))
+
+    now[0] = 2000.0
+    deadline = now[0] + 10
+    driver._identity_trigger = trigger
+    driver._identity_precreate_deadline = deadline
+    driver._identity_stop_wall_deadline = deadline
+    driver._identity_pair_deadline = deadline
+    calls.clear()
+    driver._aws_json = lambda *_args, **kwargs: calls.append(kwargs.get("timeout")) or {
+        "InstanceId": "i-foreign", "Output": "", "Timestamp": "2026-10-22T12:00:00Z"}
+    with pytest.raises(AwsProviderError) as mismatch:
+        driver._verify_host_key(detail)
+    assert mismatch.value.category == "host_identity_mismatch"
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("mutation,match", [
     (None, None),
     ("instance", "instance identity"),
     ("account", "account differs"),
     ("zone", "physical AWS zone ID"),
-    ("empty_topology", "physical AWS zone ID"),
+    ("empty_topology", None),
+    ("empty_topology_wrong_mapping", "physical AWS zone ID"),
+    ("empty_topology_ambiguous_mapping", "physical AWS zone ID"),
+    ("missing_topology", "physical AWS zone ID"),
+    ("null_topology", "physical AWS zone ID"),
+    ("object_topology", "physical AWS zone ID"),
     ("malformed_topology", "physical AWS zone ID"),
     ("secret_topology", "physical AWS zone ID"),
     ("diagnostic_write_failure", "physical AWS zone ID"),
@@ -374,6 +581,7 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         "get-caller-identity": {"Account": "123456789012"},
         "describe-instances": {"Reservations": [{"Instances": [instance]}]},
         "describe-instance-topology": {"Instances": [{"ZoneId": "euc1-az2"}]},
+        "describe-availability-zones": {"AvailabilityZones": [{"ZoneName": "eu-central-1a", "ZoneId": "euc1-az2"}]},
         "describe-images": {"Images": [{"ImageId": instance["ImageId"], "OwnerId": "099720109477",
             "Architecture": "x86_64", "VirtualizationType": "hvm", "RootDeviceType": "ebs",
             "State": "available", "Name": "ubuntu-noble-24.04-amd64-server-20261001", "EnaSupport": True}]},
@@ -390,6 +598,19 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         responses["describe-instance-topology"]["Instances"][0]["ZoneId"] = "wrong-zone"
     elif mutation == "empty_topology":
         responses["describe-instance-topology"]["Instances"] = []
+    elif mutation == "empty_topology_wrong_mapping":
+        responses["describe-instance-topology"]["Instances"] = []
+        responses["describe-availability-zones"]["AvailabilityZones"][0]["ZoneId"] = "euc1-az1"
+    elif mutation == "empty_topology_ambiguous_mapping":
+        responses["describe-instance-topology"]["Instances"] = []
+        responses["describe-availability-zones"]["AvailabilityZones"].append(
+            {"ZoneName": "eu-central-1a", "ZoneId": "euc1-az2"})
+    elif mutation == "missing_topology":
+        del responses["describe-instance-topology"]["Instances"]
+    elif mutation == "null_topology":
+        responses["describe-instance-topology"]["Instances"] = None
+    elif mutation == "object_topology":
+        responses["describe-instance-topology"]["Instances"] = {}
     elif mutation == "malformed_topology":
         responses["describe-instance-topology"]["Instances"] = ["unexpected-row"]
     elif mutation == "secret_topology":
@@ -429,7 +650,7 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
     if match:
         with pytest.raises(AwsProviderError, match=match):
             driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
-        if mutation in {"zone", "empty_topology", "malformed_topology", "secret_topology"}:
+        if mutation in {"zone", "empty_topology_wrong_mapping", "empty_topology_ambiguous_mapping", "missing_topology", "null_topology", "object_topology", "malformed_topology", "secret_topology"}:
             saved = json.loads((driver._active_attempt / "attempt.json").read_text())
             diagnostic = saved["topology_diagnostics"][0]
             assert diagnostic["expected_instance_id"] == expected["instance_id"]
@@ -440,9 +661,13 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
                 assert diagnostic["observations"][0]["zone_id"] is None
                 assert diagnostic["observations"][0]["zone_id_valid"] is False
                 assert diagnostic["observations"][0]["field_types"]["ZoneId"] == "str"
-            elif mutation == "empty_topology":
+            elif mutation.startswith("empty_topology"):
                 assert diagnostic["instance_count"] == 0
                 assert diagnostic["observations"] == []
+            elif mutation in {"missing_topology", "null_topology", "object_topology"}:
+                assert diagnostic["instance_count"] is None
+                assert diagnostic["observations"] == []
+                assert runner.commands.count("describe-availability-zones") == 0
             elif mutation == "malformed_topology":
                 assert diagnostic["observations"] == [{"row_type": "str"}]
             elif mutation == "secret_topology":
@@ -461,6 +686,8 @@ def test_provider_observation_authenticates_account_topology_image_and_disk(tmp_
         actual = driver._verify_observed_instance(expected, "same_zone", "vm_a", deployment.run_id, deployment.deployment_id)
         assert actual["zone_id"] == "euc1-az2"
         assert actual["boot_volume_type"] == "gp3"
+        if mutation == "empty_topology":
+            assert runner.commands.count("describe-availability-zones") == 1
 
 
 def test_terraform_output_from_wrong_region_is_rejected_before_host_trust(tmp_path):
@@ -502,15 +729,17 @@ def test_topology_diagnostics_bound_total_records_and_row_summaries(tmp_path):
 
 
 @pytest.mark.parametrize("response,match", [
-    ({"InstanceId": "i-foreign", "Output": ""}, "not bound to the expected instance"),
-    ({"InstanceId": "i-0123456789abcdef0", "Output": base64.b64encode(b"CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n").decode()}, "lacks one current boot"),
+    ({"InstanceId": "i-foreign", "Output": "", "Timestamp": "2026-10-22T12:00:00Z"}, "not bound to the expected instance"),
+    ({"InstanceId": "i-0123456789abcdef0", "Output": base64.b64encode(b"CNB_ED25519_HOST_FINGERPRINT=SHA256:abc123\n").decode(),
+      "Timestamp": "2026-10-22T12:00:00Z"}, "lacks one current boot"),
 ])
 def test_console_rejects_wrong_instance_or_missing_current_boot(response, match, tmp_path):
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
-    driver._aws_json = lambda *_args: response
+    driver._aws_json = lambda *_args, **_kwargs: response
     with pytest.raises(AwsProviderError, match=match):
-        driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0", "public_ipv4": "8.8.8.8"})
+        driver._verify_host_key({"region": "eu-central-1", "instance_id": "i-0123456789abcdef0",
+            "public_ipv4": "8.8.8.8", "launch_time": "2026-10-22T11:58:00Z"})
 
 
 @pytest.mark.parametrize("timestamp,boots", [
@@ -523,8 +752,10 @@ def test_console_rejects_stale_timestamp_and_replayed_boot_markers(tmp_path, tim
     deployment = make_deployment()
     driver = AwsProviderDriver(object(), make_settings(tmp_path, deployment), clock=lambda: NOW)
     driver._active_attempt = driver._attempt_dir(deployment)
-    driver._aws_json = lambda *_args: {"InstanceId": fixture["instance_id"], "Output": console, "Timestamp": timestamp}
-    with pytest.raises(AwsProviderError, match="lacks one current boot"):
+    driver._aws_json = lambda *_args, **_kwargs: {"InstanceId": fixture["instance_id"], "Output": console, "Timestamp": timestamp}
+    expected = ("timestamp is invalid or predates" if timestamp == "2026-10-22T11:57:00Z"
+                else "ambiguous boot or fingerprint")
+    with pytest.raises(AwsProviderError, match=expected):
         driver._verify_host_key({"region": fixture["region"], "instance_id": fixture["instance_id"], "public_ipv4": "8.8.8.8", "launch_time": fixture["launch_time"]})
 
 

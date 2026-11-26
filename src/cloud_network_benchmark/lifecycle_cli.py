@@ -31,6 +31,136 @@ def _archive_status_projection(result: Any) -> dict[str, Any]:
     return {key: status[key] for key in sorted(keys & status.keys())}
 
 
+def _redact_diagnostic(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    value = re.sub(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", "[REDACTED_KEY]", value, flags=re.S)
+    value = re.sub(r"-----BEGIN [^-]+-----.*\Z", "[REDACTED_KEY]", value, flags=re.S)
+    value = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", value)
+    sensitive_env = r"(?:password|token|secret|private[_-]?key|authorization|api[_-]?key|access[_-]?key|client[_-]?secret|sig)"
+    def redact_systemd_environment(match: re.Match[str]) -> str:
+        line = match.group(0)
+        keys = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", match.group(2))
+        if any(re.search(sensitive_env, key, re.I) for key in keys):
+            ending = "\n" if line.endswith("\n") else ""
+            return match.group(1) + "[REDACTED]" + ending
+        return match.group(0)
+    value = re.sub(r"(?im)(\bEnvironment\s*=)(.*?)(?=(?:\s+Environment\s*=)|[\r\n]|$)",
+                   redact_systemd_environment, value)
+    sensitive = r"password|token|secret|private[_ -]?key|authorization|api[_ -]?key|access[_ -]?key|client[_ -]?secret|sig"
+    value = re.sub(rf"(?i)([\"']?\b(?:{sensitive})\b[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,}}]+)",
+                   r"\1[REDACTED]", value)
+    value = re.sub(rf"(?i)(\b(?:{sensitive})\b\s*:\s*)(?:Bearer\s+)?[^\s,;}}]+",
+                   r"\1[REDACTED]", value)
+    environment_secret = (r"(?i)(\b[A-Za-z_][A-Za-z0-9_]*(?:password|token|secret|private[_-]?key|"
+        r"authorization|api[_-]?key|access[_-]?key|client[_-]?secret|sig)[A-Za-z0-9_]*\s*=\s*)"
+        r"(\"[^\"]*\"|'[^']*'|[^\s,;}}]+)")
+    value = re.sub(environment_secret, r"\1[REDACTED]", value)
+    value = re.sub(r"[\r\n\t]+", " ", value)
+    return value
+
+
+def _bounded_diagnostic(value: Any, limit: int = 240) -> str | None:
+    redacted = _redact_diagnostic(value)
+    return redacted[:limit] if redacted else None
+
+
+def _safe_diagnostic_payload(value: Any, *, byte_limit: int = 512) -> dict[str, Any]:
+    """Retain a bounded redacted diagnostic with explicit source and retained sizes."""
+    source = value if isinstance(value, str) else ""
+    source_bytes = len(source.encode("utf-8"))
+    source_prefix = source.encode("utf-8")[:4096]
+    scan = source_prefix.decode("utf-8", errors="ignore")
+    sanitized = _redact_diagnostic(scan) or ""
+    sanitized_bytes = sanitized.encode("utf-8")
+    retained = sanitized_bytes[:byte_limit].decode("utf-8", errors="ignore")
+    retained_bytes = retained.encode("utf-8")
+    return {"diagnostic": retained or None,
+        "retained_diagnostic_sha256": hashlib.sha256(retained_bytes).hexdigest() if retained else None,
+        "source_bytes": source_bytes, "scanned_source_bytes": len(source_prefix),
+        "sanitized_bytes": len(sanitized_bytes), "retained_bytes": len(retained_bytes),
+        "diagnostic_truncated": len(sanitized_bytes) > byte_limit,
+        "source_scan_truncated": len(source_prefix) < source_bytes}
+
+
+def _prepare_failure_projection(run_id: str, provider: str, outcome: Any) -> dict[str, Any] | None:
+    """Project bounded failed-prepare diagnostics, never raw console/request data."""
+    evidence = getattr(outcome, "evidence", None)
+    if getattr(outcome, "stage", None) != "prepare" or getattr(outcome, "succeeded", None) is not False:
+        return None
+    components = evidence if isinstance(evidence, dict) else {}
+    command_rows, failures = [], []
+    for component_name in ("bootstrap", "readiness"):
+        component = components.get(component_name)
+        if component is None:
+            continue
+        failure = getattr(component, "failure", None)
+        if failure is not None:
+            occurred = getattr(failure, "occurred_at", None)
+            details = getattr(failure, "details", {}) or {}
+            last = details.get("last_observation")
+            raw_diagnostic = next((value for value in (details.get("stderr"), details.get("stdout"))
+                if isinstance(value, str) and value), "")
+            if not raw_diagnostic and isinstance(last, dict):
+                raw_diagnostic = last.get("observation", "")
+            diagnostic = _safe_diagnostic_payload(raw_diagnostic)
+            failure_row = {"component": component_name,
+                "category": _bounded_diagnostic(getattr(failure, "category", None), 80),
+                "message": _bounded_diagnostic(getattr(failure, "message", None)),
+                "action_id": _bounded_diagnostic(getattr(failure, "action_id", None), 120),
+                "occurred_at": occurred.isoformat() if occurred is not None else None,
+                **diagnostic}
+            listener_identity = details.get("listener_identity")
+            if isinstance(listener_identity, dict):
+                cat_diagnostic = _safe_diagnostic_payload(listener_identity.get("systemctl_cat_stdout"))
+                source_bytes = listener_identity.get("systemctl_cat_source_bytes")
+                if type(source_bytes) is int and source_bytes >= 0:
+                    cat_diagnostic["source_bytes"] = source_bytes
+                failure_row["listener_identity"] = {
+                    "first_failed_predicate": _bounded_diagnostic(
+                        listener_identity.get("first_failed_predicate"), 120),
+                    "systemctl_show_outcome": _bounded_diagnostic(
+                        listener_identity.get("systemctl_show_outcome"), 40),
+                    "systemctl_show_exit_code": listener_identity.get("systemctl_show_exit_code"),
+                    "systemctl_cat_outcome": _bounded_diagnostic(
+                        listener_identity.get("systemctl_cat_outcome"), 40),
+                    "systemctl_cat_exit_code": listener_identity.get("systemctl_cat_exit_code"),
+                    "systemctl_cat": cat_diagnostic,
+                }
+            if isinstance(last, dict):
+                failure_row["last_observation"] = {
+                    "predicate": _bounded_diagnostic(last.get("predicate"), 120),
+                    "outcome": _bounded_diagnostic(last.get("outcome"), 40),
+                    "healthy": last.get("healthy") if type(last.get("healthy")) is bool else None,
+                    "remaining_seconds": last.get("remaining_seconds")}
+            failures.append(failure_row)
+        actions = list(getattr(component, "actions", ()) or ())
+        failure_action_id = _bounded_diagnostic(getattr(failure, "action_id", None), 120)
+        for index, action in enumerate(actions):
+            result = getattr(action, "result", {}) or {}
+            if hasattr(result, "model_dump"):
+                result = result.model_dump(mode="json")
+            if not isinstance(result, dict):
+                result = {}
+            row = {"action_id": _bounded_diagnostic(getattr(action, "action_id", None), 120),
+                "action_type": _bounded_diagnostic(getattr(action, "action_type", None), 40),
+                "role": _bounded_diagnostic(getattr(action, "role", None), 40),
+                "outcome": _bounded_diagnostic(result.get("outcome"), 40),
+                "exit_code": result.get("exit_code"), "started_at": result.get("started_at"),
+                "finished_at": result.get("finished_at"), "duration_seconds": result.get("duration_seconds"),
+                "diagnostic": _bounded_diagnostic(result.get("diagnostic") or result.get("error"))}
+            referenced = failure_action_id is not None and row["action_id"] == failure_action_id
+            failed = row["outcome"] not in (None, "succeeded")
+            command_rows.append((referenced or failed, component_name == "readiness", index, row))
+    command_rows.sort(key=lambda entry: (not entry[0], not entry[1], -entry[2]))
+    commands = [entry[3] for entry in command_rows[:32]]
+    return {"run_id": run_id, "provider": provider, "stage": "prepare",
+        "failure_type": _bounded_diagnostic(components.get("failure_type"), 80),
+        "failure_message": _bounded_diagnostic(components.get("failure_message")),
+        "failures": failures[:8], "failures_truncated": len(failures) > 8,
+        "commands": commands, "commands_truncated": len(command_rows) > 32}
+
+
 def _verified_replay_entry(*, capsule_path: Path, capsule_sha256: str,
                            observer: dict[str, Any], repository_root: Path) -> tuple[str, Path]:
     """Bind replay export reuse to this runtime's registered archive-pending entry."""
@@ -350,6 +480,9 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                         if lifecycle.reservation_evidence is not None else None),
                     providers={provider: {"execution_state": item.execution_state,
                         "cleanup_state": item.cleanup_state, "primary_failure": item.primary_failure,
+                        "prepare_failure_evidence": _prepare_failure_projection(
+                            children[provider].run_id, provider, item.values.get("prepare"))
+                            if provider in children else None,
                         "archive_status": _archive_status_projection(item),
                         "secondary_failures": item.secondary_failures,
                         "validation_status": (validations[provider][0].validation_status.model_dump(mode="json")
@@ -492,6 +625,8 @@ def main(argv: Sequence[str] | None = None, *, cleanup_actions=None, reconcile=N
                 campaign_id=initialized.campaign_id,run_ids={key:value.run_id for key,value in children.items()},
                 providers={key:{"execution_state":value.execution_state,"cleanup_state":value.cleanup_state,
                     "primary_failure":value.primary_failure,"secondary_failures":value.secondary_failures,
+                    "prepare_failure_evidence":_prepare_failure_projection(
+                        children[key].run_id,key,value.values.get("prepare")) if key in children else None,
                     "archive_status":_archive_status_projection(value)}
                     for key,value in lifecycle.provider_results.items()})
         print(json.dumps(error_report,sort_keys=True),file=sys.stderr)

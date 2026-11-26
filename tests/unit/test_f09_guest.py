@@ -100,6 +100,131 @@ def test_remote_pair_preparation_composes_bootstrap_readiness_and_guest_staging(
     assert outcome.succeeded is False and called == ["bootstrap", "readiness"]
 
 
+def test_failed_prepare_evidence_survives_lifecycle_boundary_as_bounded_manifest_projection(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from cloud_network_benchmark import access
+    from cloud_network_benchmark.lifecycle_adapters import prepare_remote_pair
+    from cloud_network_benchmark.lifecycle_cli import _prepare_failure_projection
+    from cloud_network_benchmark.orchestration import ProviderLifecycleResult, _call
+
+    stamp = datetime(2026, 11, 26, tzinfo=timezone.utc)
+    action = SimpleNamespace(action_id="azure-bootstrap-vm-b-install", action_type="ssh", role="vm_b",
+        result={"outcome": "failed", "exit_code": 17, "started_at": stamp.isoformat(),
+                "finished_at": stamp.isoformat(), "duration_seconds": 2.5,
+                "stdout": "MUST NOT PERSIST", "stderr": "Permission denied while installing test package; token=do-not-persist"})
+    failure = SimpleNamespace(category="bootstrap_command_failed",
+        message="Permission denied while installing test package; token=do-not-persist", action_id=action.action_id,
+        occurred_at=stamp, details={"stdout": "MUST NOT PERSIST",
+            "stderr": "Permission denied while installing test package; token=do-not-persist"})
+    bootstrap = SimpleNamespace(succeeded=False, actions=[action], failure=failure, builds=[])
+    monkeypatch.setattr(access, "prepare", lambda *a, **k: bootstrap)
+    outcome = prepare_remote_pair(object(), bootstrap_config=object(), readiness_config=object(),
+        runner=object(), deadline=object(), source_root=tmp_path, source_revision="a"*40,
+        remote_root="/var/tmp/cnb")
+    result = ProviderLifecycleResult("azure")
+    assert not _call("azure", "prepare", lambda: outcome, result)
+    assert result.primary_failure == "azure prepare failed (adapter reported prepare unsuccessful)"
+
+    projected = _prepare_failure_projection("acceptance-exp-003-azure", "azure", result.values["prepare"])
+    assert projected["run_id"] == "acceptance-exp-003-azure"
+    assert projected["provider"] == "azure" and projected["stage"] == "prepare"
+    assert projected["failures"][0]["category"] == "bootstrap_command_failed"
+    assert "[REDACTED]" in projected["failures"][0]["message"]
+    assert "Permission denied" in projected["failures"][0]["diagnostic"]
+    assert projected["failures"][0]["retained_diagnostic_sha256"]
+    assert projected["failures"][0]["source_bytes"] > 0
+    assert projected["failures"][0]["retained_bytes"] <= 512
+    assert projected["commands"][0]["action_id"] == action.action_id
+    assert projected["commands"][0]["exit_code"] == 17
+    serialized = __import__("json").dumps(projected)
+    assert "MUST NOT PERSIST" not in serialized and "do-not-persist" not in serialized
+
+
+def test_failed_readiness_cause_and_referenced_command_survive_command_cap(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from cloud_network_benchmark import access
+    from cloud_network_benchmark.lifecycle_adapters import prepare_remote_pair
+    from cloud_network_benchmark.lifecycle_cli import _prepare_failure_projection
+
+    stamp = datetime(2026, 11, 26, tzinfo=timezone.utc)
+    bootstrap = SimpleNamespace(succeeded=True, actions=[SimpleNamespace(action_id=f"bootstrap-{i}",
+        action_type="ssh", role="vm_b", result={"outcome": "succeeded", "exit_code": 0,
+        "started_at": stamp.isoformat(), "finished_at": stamp.isoformat(), "duration_seconds": 1})
+        for i in range(40)])
+    failed_action = SimpleNamespace(action_id="readiness-listener-vm-b", action_type="ssh", role="vm_b",
+        result={"outcome": "failed", "exit_code": 255, "started_at": stamp.isoformat(),
+            "finished_at": stamp.isoformat(), "duration_seconds": 2})
+    failure = SimpleNamespace(category="readiness_predicate_failed", message="readiness predicate service-iperf3 was not observed",
+        action_id=failed_action.action_id, occurred_at=stamp,
+        details={"last_observation": {"predicate": "service-iperf3", "outcome": "failed",
+            "healthy": False, "observation": "unit exited: Permission denied; token=readiness-secret",
+            "remaining_seconds": 12}})
+    readiness = SimpleNamespace(ready=False, actions=[failed_action], failure=failure)
+    monkeypatch.setattr(access, "prepare", lambda *a, **k: bootstrap)
+    monkeypatch.setattr(access, "check_readiness", lambda *a, **k: readiness)
+    outcome = prepare_remote_pair(object(), bootstrap_config=object(), readiness_config=object(),
+        runner=object(), deadline=object(), source_root=tmp_path, source_revision="a"*40,
+        remote_root="/var/tmp/cnb")
+    projected = _prepare_failure_projection("synthetic-run-azure", "azure", outcome)
+    assert projected["commands_truncated"]
+    assert projected["commands"][0]["action_id"] == failed_action.action_id
+    assert projected["commands"][0]["exit_code"] == 255
+    readiness_failure = next(row for row in projected["failures"] if row["component"] == "readiness")
+    assert readiness_failure["category"] == "readiness_predicate_failed"
+    assert readiness_failure["last_observation"]["predicate"] == "service-iperf3"
+    assert "Permission denied" in readiness_failure["diagnostic"]
+    assert "readiness-secret" not in __import__("json").dumps(projected)
+
+
+@pytest.mark.parametrize(("source", "cause"), [
+    ("Permission denied; Authorization: Bearer header-secret", "Permission denied"),
+    ('bootstrap failed: {"token": "json-secret", "password": "two words secret"}', "bootstrap failed"),
+    ("bootstrap failed: password='two words secret'", "bootstrap failed"),
+    ("bootstrap failed: -----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----", "bootstrap failed"),
+])
+def test_bounded_diagnostic_redacts_common_secret_shapes_without_losing_cause(source, cause):
+    from cloud_network_benchmark.lifecycle_cli import _bounded_diagnostic
+    redacted = _bounded_diagnostic(source)
+    assert cause in redacted
+    for secret in ("header-secret", "json-secret", "two words secret", "private-material"):
+        assert secret not in redacted
+
+
+def test_diagnostic_sizes_and_hash_describe_the_retained_redacted_text():
+    from cloud_network_benchmark.lifecycle_cli import _safe_diagnostic_payload
+    projected = _safe_diagnostic_payload("cause token=" + "x"*600)
+    assert projected["diagnostic"] == "cause token=[REDACTED]"
+    assert projected["source_bytes"] == len(("cause token=" + "x"*600).encode())
+    assert projected["retained_bytes"] == len(projected["diagnostic"].encode())
+    assert projected["sanitized_bytes"] == projected["retained_bytes"]
+    assert not projected["diagnostic_truncated"]
+    assert projected["retained_diagnostic_sha256"] == __import__("hashlib").sha256(
+        projected["diagnostic"].encode()).hexdigest()
+
+
+def test_diagnostic_scan_boundary_drops_incomplete_pem_material():
+    from cloud_network_benchmark.lifecycle_cli import _safe_diagnostic_payload
+    source = "ordinary diagnostic " + "x"*400 + "-----BEGIN PRIVATE KEY-----\n" + "dummy-private-key-material"*200
+    projected = _safe_diagnostic_payload(source)
+    assert projected["source_scan_truncated"]
+    assert "dummy-private-key-material" not in (projected["diagnostic"] or "")
+    assert "[REDACTED_KEY]" in (projected["diagnostic"] or "")
+
+
+def test_truncated_exception_pem_drops_all_material_after_begin_marker():
+    from types import SimpleNamespace
+    from cloud_network_benchmark.lifecycle_cli import _prepare_failure_projection
+    source = "bootstrap error: " + "x"*180 + "-----BEGIN PRIVATE KEY-----\ndummy-private-key-material"
+    outcome = SimpleNamespace(stage="prepare", succeeded=False, evidence={
+        "failure_type": "RuntimeError", "failure_message": source[:240]})
+    projected = _prepare_failure_projection("run-azure", "azure", outcome)
+    assert "bootstrap error" in projected["failure_message"]
+    assert "dummy-private-key-material" not in projected["failure_message"]
+    assert projected["failure_message"].endswith("[REDACTED_KEY]")
+
+
 def test_remote_f03_handoff_uses_staged_module_and_validates_downloaded_identity(repository_root, tmp_path):
     import json
     from datetime import datetime, timezone

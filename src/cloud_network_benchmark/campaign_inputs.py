@@ -580,25 +580,121 @@ def validate_stage_inputs(plan: dict, settings: dict, root: Path, *, local_prepa
 _EUR_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR", "release_eur": "14"}
 _EUR15_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
     "prior_release_eur": "14", "additional_release_eur": "15", "cumulative_release_eur": "29"}
+_O2_RESERVE_RELEASE_REQUEST = {"status": "pending", "currency": "EUR",
+    "prior_release_eur": "37", "additional_release_eur": "13", "cumulative_release_eur": "50"}
 _EUR14_AUTHORITY_SHA256 = "97deee1289455535dad654b6618ebd6f32e562175d55da4f5b4bfd612d0e0aa6"
+_EUR29_AUTHORITY_SHA256 = "f12175ff678980460894e91d489d9d408c95d6b644dc4dd5395cd4006d3552d0"
+
+
+def _cumulative_reserve_release_request(request: dict[str, Any]) -> tuple[Decimal, dict[str, str]] | None:
+    """Recognize a positive additional release against the pinned EUR 29 history."""
+    if (set(request) != {"status", "currency", "prior_release_eur", "additional_release_eur",
+            "cumulative_release_eur"} or request.get("status") != "pending"
+            or request.get("currency") != "EUR" or request.get("prior_release_eur") != "29"):
+        return None
+    try:
+        additional = Decimal(request["additional_release_eur"])
+        cumulative = Decimal(request["cumulative_release_eur"])
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (not additional.is_finite() or not cumulative.is_finite()
+            or additional <= 0 or additional > 21 or cumulative != 29 + additional
+            or additional != additional.quantize(Decimal("0.01"))
+            or str(additional) != request["additional_release_eur"]
+            or str(cumulative) != request["cumulative_release_eur"]):
+        return None
+    return additional, dict(request)
 
 
 def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
                             now: datetime) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
     """Return non-authorizing draft metadata and, only after approval, the source-bound guard snapshot."""
     request = settings.get("pricing", {}).get("pending_eur_reserve_release")
+    continuation_ref = settings.get("pricing", {}).get("continuation_authorization")
+    guard_correction_ref = settings.get("pricing", {}).get("legacy_usd_guard_correction")
+    exposure_amendment_ref = settings.get("pricing", {}).get("continuation_exposure_amendment")
     if request is None:
-        return None, None
-    if stage not in {"acceptance", "calibration"} or not isinstance(request, dict):
+        if continuation_ref is None and guard_correction_ref is None and exposure_amendment_ref is None:
+            return None, None
+        if continuation_ref is None or guard_correction_ref is None:
+            raise ValueError("the S1/S3 USD guard correction requires both exact source-bound approvals")
+        if stage != "acceptance":
+            raise ValueError("the source-bound S1/S3 continuation is limited to normal acceptance pricing")
+        from .financial_controls import (FinancialAuthorization, Source,
+            _validate_o2_amendment, stamp, validate_o3_continuation_source,
+            validate_o3_legacy_usd_guard_source, validate_o4_retry_cap_removal_source)
+        try:
+            continuation = Source.model_validate(continuation_ref)
+            correction = Source.model_validate(guard_correction_ref)
+            exposure_amendment = (Source.model_validate(exposure_amendment_ref)
+                if exposure_amendment_ref is not None else None)
+            validate_o3_continuation_source(continuation, now=now, end=now)
+            validate_o3_legacy_usd_guard_source(correction)
+            if exposure_amendment is not None:
+                validate_o4_retry_cap_removal_source(exposure_amendment)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pricing S1/S3 guard sources do not match the exact approved continuation and correction") from exc
+        scope_id = settings.get("ledger", {}).get("scope_id")
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ValueError("the S1/S3 continuation pricing source requires the existing shared ledger scope")
+        planning_snapshot = {"continuation_authorization": continuation.model_dump(),
+            "legacy_usd_guard_correction": correction.model_dump(), "scope_id": scope_id}
+        if exposure_amendment is not None:
+            planning_snapshot["continuation_exposure_amendment"] = exposure_amendment.model_dump()
+        if draft:
+            return None, planning_snapshot
+
+        declaration = settings.get("approvals", {}).get("paid_authorization", {})
+        if declaration.get("confirmed") is not True:
+            raise ValueError("non-draft S1/S3 continuation pricing requires its exact typed paid_authorization")
+        card_path = _path(declaration.get("source"), "approvals.paid_authorization.source", file=True)
+        expected_hash = declaration.get("sha256")
+        if (not isinstance(expected_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_hash)
+                or _sha(card_path) != expected_hash):
+            raise ValueError("paid_authorization requires its exact declared source sha256")
+        card_source = Source(path=str(card_path), sha256=expected_hash)
+        try:
+            card = FinancialAuthorization.model_validate(card_source.json())
+            current = stamp(now)
+            if (card.ledger_scope_id != scope_id
+                    or card.continuation_authorization != continuation
+                    or card.continuation_exposure_amendment != exposure_amendment
+                    or stamp(card.approved_at) > current
+                    or not stamp(card.valid_from) <= current < stamp(card.valid_until)):
+                raise ValueError("typed continuation authority identity or window differs")
+            _validate_o2_amendment(card, now=current, end=current)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("non-draft continuation requires the exact current EUR400 typed card") from exc
+        paid_snapshot = {"authority": card_source.model_dump(),
+            "continuation_authorization": card.continuation_authorization.model_dump(),
+            "financial_policy_amendment": card.financial_policy_amendment.model_dump(),
+            "legacy_usd_guard_correction": correction.model_dump(),
+            "caps": card.caps.model_dump(), "batch_id": card.batch_id,
+            "stage_id": card.stage_id, "scope_id": scope_id}
+        if card.continuation_exposure_amendment is not None:
+            paid_snapshot["continuation_exposure_amendment"] = card.continuation_exposure_amendment.model_dump()
+        return None, paid_snapshot
+    if continuation_ref is not None or guard_correction_ref is not None or exposure_amendment_ref is not None:
+        raise ValueError("the zero-new-reserve continuation cannot be combined with a reserve-release request")
+    if not isinstance(request, dict):
         raise ValueError("pricing.pending_eur_reserve_release must be an exact supported pending request for acceptance or calibration")
-    if request == _EUR_RESERVE_RELEASE_REQUEST:
+    o2_request = request == _O2_RESERVE_RELEASE_REQUEST
+    if o2_request:
+        if stage != "acceptance":
+            raise ValueError("the O2 reserve-release authority is limited to the one normal acceptance batch")
+        working_eur, protected_eur = Decimal("302"), Decimal("0")
+        requested_release = dict(_O2_RESERVE_RELEASE_REQUEST)
+    elif stage in {"acceptance", "calibration"} and request == _EUR_RESERVE_RELEASE_REQUEST:
         working_eur, protected_eur = Decimal("264"), Decimal("36")
         requested_release = dict(_EUR_RESERVE_RELEASE_REQUEST)
-    elif request == _EUR15_RESERVE_RELEASE_REQUEST:
+    elif stage in {"acceptance", "calibration"} and request == _EUR15_RESERVE_RELEASE_REQUEST:
         working_eur, protected_eur = Decimal("279"), Decimal("21")
         requested_release = dict(_EUR15_RESERVE_RELEASE_REQUEST)
+    elif stage in {"acceptance", "calibration"} and (cumulative := _cumulative_reserve_release_request(request)):
+        additional, requested_release = cumulative
+        working_eur, protected_eur = Decimal("279") + additional, Decimal("21") - additional
     else:
-        raise ValueError("pricing.pending_eur_reserve_release must be the exact EUR 14 legacy request or EUR 15 additional / EUR 29 cumulative request")
+        raise ValueError("pricing.pending_eur_reserve_release must be an exact supported cumulative EUR reserve-release request")
     if draft:
         return requested_release, None
 
@@ -618,6 +714,20 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     card = FinancialAuthorization.model_validate(source.json())
     scope_id = settings.get("ledger", {}).get("scope_id")
     caps = Caps.model_validate(card.caps.model_dump())
+    if o2_request:
+        from .financial_controls import _validate_o2_amendment
+        if (card.ledger_scope_id != scope_id
+                or Decimal(caps.project_eur) != Decimal("400")
+                or Decimal(caps.working_eur) != Decimal("302")
+                or Decimal(caps.protected_eur) != Decimal("0")
+                or Decimal(caps.personal_cash_eur) != Decimal("400")):
+            raise ValueError("paid_authorization must bind the exact O2 policy, ledger scope, EUR 13 previously approved release and EUR 400 whole/cash ceilings")
+        try:
+            _validate_o2_amendment(card, now=now, end=now)
+        except ValueError as exc:
+            raise ValueError("paid_authorization is missing, changed, stale or outside the O2 amendment scope") from exc
+        snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
+        return requested_release, snapshot
     if (card.ledger_scope_id != scope_id
             or Decimal(caps.project_eur) != Decimal("300")
             or Decimal(caps.working_eur) != working_eur
@@ -629,26 +739,33 @@ def _reserve_release_policy(settings, stage: str | None, *, draft: bool,
     snapshot = {"authority": source.model_dump(), "caps": caps.model_dump(), "scope_id": scope_id}
     if not has_explicit_eur_reserve_release(snapshot, now=now):
         raise ValueError("paid_authorization is missing, changed, stale, out of scope, or does not authorize the requested reserve release")
-    if request == _EUR15_RESERVE_RELEASE_REQUEST:
+    if request == _EUR15_RESERVE_RELEASE_REQUEST or _cumulative_reserve_release_request(request):
+        cumulative_request = _cumulative_reserve_release_request(request) is not None
         prior = declarations.get("prior_paid_authorization")
         if not isinstance(prior, dict) or prior.get("confirmed") is not True:
-            raise ValueError("the EUR 15 additional release requires the exact source-bound prior EUR 14 paid_authorization")
+            raise ValueError("the additional release requires its exact source-bound prior reserve-release authorization")
         prior_path = _path(prior.get("source"), "approvals.prior_paid_authorization.source", file=True)
         prior_hash = prior.get("sha256")
-        if (prior_hash != _EUR14_AUTHORITY_SHA256
+        expected_prior_hash = _EUR29_AUTHORITY_SHA256 if cumulative_request else _EUR14_AUTHORITY_SHA256
+        if (prior_hash != expected_prior_hash
                 or hashlib.sha256(prior_path.read_bytes()).hexdigest() != prior_hash):
-            raise ValueError("prior_paid_authorization must match the pinned, source-bound EUR 14 authority")
+            raise ValueError("prior_paid_authorization must match the pinned, source-bound cumulative reserve-release authority")
         prior_source = Source(path=str(prior_path), sha256=prior_hash)
         prior_card = FinancialAuthorization.model_validate(prior_source.json())
         prior_caps = Caps.model_validate(prior_card.caps.model_dump())
         prior_snapshot = {"authority": prior_source.model_dump(), "caps": prior_caps.model_dump(),
             "scope_id": scope_id}
-        if (prior_card.ledger_scope_id != scope_id
-                or Decimal(prior_caps.project_eur) != Decimal("300")
-                or Decimal(prior_caps.working_eur) != Decimal("264")
-                or Decimal(prior_caps.protected_eur) != Decimal("36")
-                or not has_explicit_eur_reserve_release(prior_snapshot, now=now)):
-            raise ValueError("prior_paid_authorization is expired, out of scope, or does not prove the exact EUR 14 release")
+        expected_working, expected_protected = ((Decimal("279"), Decimal("21")) if cumulative_request
+            else (Decimal("264"), Decimal("36")))
+        expected_scope_caps = (prior_snapshot["scope_id"] == prior_card.ledger_scope_id
+            and prior_caps == prior_card.caps
+            and Decimal(prior_caps.project_eur) == Decimal("300")
+            and Decimal(prior_caps.working_eur) == expected_working
+            and Decimal(prior_caps.protected_eur) == expected_protected)
+        prior_check_time = prior_card.approved_at if cumulative_request else now
+        if (prior_card.ledger_scope_id != scope_id or not expected_scope_caps
+                or not has_explicit_eur_reserve_release(prior_snapshot, now=prior_check_time)):
+            raise ValueError("prior_paid_authorization is invalid for its pinned historical reserve-release proof")
     return requested_release, snapshot
 
 
@@ -662,13 +779,27 @@ def _validate_funding_budget(amounts: dict[str, Decimal], pending_release: dict[
             or amounts.get("working_limit", Decimal(250)) != 250):
         raise ValueError("pricing.funding must preserve the $300 cap, $250 working limit and $50 protected buffer")
     if commitment > amounts.get("total_limit", Decimal(300)):
-        raise ValueError("pricing.funding commitment exceeds its unchanged $300 USD total limit")
+        from .financial_controls import (has_o3_continuation_cost_source,
+            _has_source_bound_o3_continuation)
+        if draft and has_o3_continuation_cost_source(release_snapshot, now=now):
+            pass  # A DRAFT is non-authorizing; typed O3 and EUR ledger checks follow.
+        elif not draft and _has_source_bound_o3_continuation(release_snapshot, now=now):
+            pass  # The exact card is checked again against retained exposure at admission.
+        else:
+            raise ValueError("pricing.funding commitment exceeds the unchanged $300 USD limit without source-bound O3 continuation")
     if commitment > Decimal("250"):
         if pending_release is None:
-            raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+            from .financial_controls import (has_o3_continuation_cost_source,
+                legacy_usd_budget_exceeded)
+            if draft and has_o3_continuation_cost_source(release_snapshot, now=now):
+                pass
+            elif draft:
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without an explicit EUR 14 reserve-release request")
+            elif release_snapshot is None or legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+                raise ValueError("pricing.funding exceeds the $250 USD working limit without a current source-bound continuation")
         if not draft:
             from .financial_controls import legacy_usd_budget_exceeded
-            if legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
+            if pending_release is not None and legacy_usd_budget_exceeded(commitment, release_snapshot, now=now):
                 if pending_release == _EUR_RESERVE_RELEASE_REQUEST:
                     raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound EUR 14 approval")
                 raise ValueError("pricing.funding exceeds the $250 USD working limit without current source-bound reserve-release approval")
