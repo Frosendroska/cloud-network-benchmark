@@ -2172,9 +2172,13 @@ def _is_exact_resource_404(result: CommandResult, resource_id: str) -> bool:
     if targets:
         return all(value.lower() == resource_id.lower() for value in targets)
     message = error.get("message")
-    # A code-only 404 is ambiguous. Accept the known exact-message form only
-    # when it names the exact resource requested by the caller.
-    return isinstance(message, str) and message == f"Resource not found for exact {resource_id}"
+    # A code-only 404 is ambiguous. Accept only message forms that name the
+    # entire exact resource requested by the caller; Azure ARM emits the
+    # canonical ID with provider-defined casing in its NotFound message.
+    return (isinstance(message, str) and message.casefold() in {
+        f"Resource not found for exact {resource_id}".casefold(),
+        f"Resource {resource_id} not found.".casefold(),
+    })
 
 
 def _azure_watcher_activity(deployment: ProviderDeploymentInput, options: AzureRuntimeOptions,

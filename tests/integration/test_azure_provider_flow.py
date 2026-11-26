@@ -2308,6 +2308,22 @@ def test_watcher_absence_requires_complete_exact_resource_404(body, accepted):
     assert azure_provider._is_exact_resource_404(result, "/watcher") is accepted
 
 
+@pytest.mark.parametrize("message,accepted", [
+    ("Resource /subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/networkwatcherrg/providers/Microsoft.Network/networkWatchers/networkwatcher_swedencentral not found.", True),
+    ("resource /SUBSCRIPTIONS/188A5848-76FB-4D57-8F2A-32C09284D486/RESOURCEGROUPS/NETWORKWATCHERRG/PROVIDERS/MICROSOFT.NETWORK/NETWORKWATCHERS/NETWORKWATCHER_SWEDENCENTRAL NOT FOUND.", True),
+    ("Resource /subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/networkwatcherrg/providers/Microsoft.Network/networkWatchers/foreign not found.", False),
+    ("Resource /subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/networkwatcherrg/providers/Microsoft.Network/networkWatchers/networkwatcher_swedencentral not found. extra", False),
+])
+def test_watcher_absence_accepts_only_exact_arm_full_id_message(message, accepted):
+    now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    resource_id = "/subscriptions/188a5848-76fb-4d57-8f2a-32c09284d486/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_swedencentral"
+    result = CommandResult(action_id="watcher-404", outcome=CommandOutcome.FAILED,
+        started_at=now, finished_at=now, duration_seconds=0.0, exit_code=1,
+        stdout="", stderr="ERROR: Not Found(" + json.dumps({"error": {
+            "code": "NotFound", "message": message, "details": []}}) + ")")
+    assert azure_provider._is_exact_resource_404(result, resource_id) is accepted
+
+
 def test_profile_cleanup_rejects_attempt_group_listed_after_exists_false(
         repository_root: Path,tmp_path: Path):
     now=datetime(2026,11,20,12,1,40,tzinfo=timezone.utc)
