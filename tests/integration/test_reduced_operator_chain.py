@@ -394,14 +394,18 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     native_funding_totals = None
     continuation_source_path = os.environ.get("CNB_O3_CONTINUATION_SOURCE_PATH")
     guard_correction_path = os.environ.get("CNB_O3_LEGACY_USD_GUARD_SOURCE_PATH")
-    native_history_sha256 = "607c3419063ed7ffca718b59b6aa7217c84e49e0103aad9f4ecb83947bef168c"
+    retry_cap_removal_path = os.environ.get("CNB_O4_RETRY_CAP_REMOVAL_SOURCE_PATH")
+    native_history_sha256 = None
     if native_history:
         snapshot_path = Path(native_history_source)
         if (not snapshot_path.is_absolute() or snapshot_path.is_symlink()
                 or not snapshot_path.is_file()):
             raise AssertionError("native O3 history snapshot must be an existing absolute non-symlink file")
         native_history_bytes = snapshot_path.read_bytes()
-        if hashlib.sha256(native_history_bytes).hexdigest() != native_history_sha256:
+        native_history_sha256 = hashlib.sha256(native_history_bytes).hexdigest()
+        if native_history_sha256 not in {
+                "607c3419063ed7ffca718b59b6aa7217c84e49e0103aad9f4ecb83947bef168c",
+                "497e552e6eab32822cffcf4ad857616d3693b04492a45c87d3e50160d6b5513e"}:
             raise AssertionError("native O3 history snapshot differs from the reviewed closed-ledger pin")
         copied_ledger_path = Path(settings["ledger"]["path"])
         if copied_ledger_path.resolve() == snapshot_path.resolve() or copied_ledger_path.exists():
@@ -410,6 +414,9 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         settings["ledger"]["scope_id"] = "thesis-primary"
         if not continuation_source_path or not guard_correction_path:
             raise AssertionError("native O3 history qualification requires both genuine continuation and guard-correction sources")
+        if (native_history_sha256 == "497e552e6eab32822cffcf4ad857616d3693b04492a45c87d3e50160d6b5513e"
+                and not retry_cap_removal_path):
+            raise AssertionError("native closed-645 history qualification requires the genuine O4 cap-removal source")
         continuation_path = Path(continuation_source_path)
         continuation_sha256 = "3d30cf5eeb0b59714ffca6fd91cb315e87e9ae68caa232a11282e71d3d9ed49e"
         guard_path = Path(guard_correction_path)
@@ -425,6 +432,15 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
             "path": str(continuation_path), "sha256": continuation_sha256}
         settings["pricing"]["legacy_usd_guard_correction"] = {
             "path": str(guard_path), "sha256": guard_sha256}
+        if retry_cap_removal_path:
+            retry_cap_path = Path(retry_cap_removal_path)
+            retry_cap_sha256 = "d42f4e3c76454e5946f73483d57d37c22a88d90e03595701b03c806c4cadf576"
+            if (not retry_cap_path.is_absolute() or retry_cap_path.is_symlink()
+                    or not retry_cap_path.is_file()
+                    or hashlib.sha256(retry_cap_path.read_bytes()).hexdigest() != retry_cap_sha256):
+                raise AssertionError("native O4 retry-cap removal source differs from its reviewed byte pin")
+            settings["pricing"]["continuation_exposure_amendment"] = {
+                "path": str(retry_cap_path), "sha256": retry_cap_sha256}
         retained = json.loads(native_history_bytes)
         consumed = {}
         for record in retained["reservations"].values():
@@ -669,6 +685,9 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
             raise AssertionError("native O3 continuation source differs from its reviewed byte pin")
         card["continuation_authorization"] = {"path": str(continuation_path),
             "sha256": continuation_sha256}
+        if retry_cap_removal_path:
+            card["continuation_exposure_amendment"] = {
+                "path": str(retry_cap_path), "sha256": retry_cap_sha256}
     # Exercise the production financial validator against the genuine native
     # EUR400 source as a negative boundary: the overall cap rose, but existing
     # working headroom did not. The normal card below uses the approved EUR302.
@@ -1025,10 +1044,22 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     financial_ledger_path = Path(settings["ledger"]["path"])
     financial_ledger_bytes = financial_ledger_path.read_bytes()
     ledger_state = json.loads(financial_ledger_bytes)
-    authorized_record = next(row for row in ledger_state["reservations"].values()
-        if row.get("financial", {}).get("financial_policy_amendment", {}).get("sha256")
-            == amendment_ref["sha256"])
-    second_batch_snapshot = copy.deepcopy(authorized_record["financial"])
+    if native_history and retry_cap_removal_path:
+        active_authority_sha = hashlib.sha256(card_path.read_bytes()).hexdigest()
+        authorized_record = next(row for row in ledger_state["reservations"].values()
+            if row.get("financial", {}).get("authority", {}).get("sha256") == active_authority_sha
+            and row.get("financial", {}).get("stage_id") == stage["stage_id"])
+    else:
+        authorized_record = next(row for row in ledger_state["reservations"].values()
+            if row.get("financial", {}).get("financial_policy_amendment", {}).get("sha256")
+                == amendment_ref["sha256"])
+    if native_history:
+        consumed_o2_record = next(row for row in ledger_state["reservations"].values()
+            if row.get("financial", {}).get("authority", {}).get("sha256")
+                == "f013ad7f437b7dde16bd3b9067f3e1307d0e4653ae602f2496600d49ddaa418f")
+        second_batch_snapshot = copy.deepcopy(consumed_o2_record["financial"])
+    else:
+        second_batch_snapshot = copy.deepcopy(authorized_record["financial"])
     second_batch_snapshot["authority"]["sha256"] = "0" * 64
     second_batch_snapshot["stage_id"] = "SYNTHETIC-SECOND-O2-STAGE"
     second_batch_snapshot["gross_eur"] = "0"
@@ -1039,6 +1070,36 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     with pytest.raises(FinancialError, match="financial_amendment_batch_consumed"):
         check_shared_finances(ledger_state, second_batch_snapshot, remaining_usd=Decimal("0"))
     assert financial_ledger_path.read_bytes() == financial_ledger_bytes
+
+    if native_history and retry_cap_removal_path:
+        # Negative only: derive the candidate shape from the production snapshot,
+        # then prove a real retained predecessor with reopened cleanup blocks it.
+        successor_snapshot = copy.deepcopy(authorized_record["financial"])
+        successor_snapshot["authority"]["sha256"] = "f" * 64
+        successor_snapshot["stage_id"] = "SYNTHETIC-O4-CLEANUP-NEGATIVE"
+        successor_snapshot["gross_eur"] = successor_snapshot["cash_eur"] = "0"
+        successor_snapshot["providers_eur"] = dict.fromkeys(
+            successor_snapshot["providers_eur"], "0")
+        predecessor_id, _predecessor = next((rid, record) for rid, record
+            in ledger_state["reservations"].items()
+            if record.get("financial", {}).get("continuation_authorization", {}).get("sha256")
+                == financial_controls._O3_CONTINUATION_SHA256
+            and record.get("financial", {}).get("stage_id") != authorized_record["financial"].get("stage_id"))
+        reopened = copy.deepcopy(ledger_state)
+        reopened["reservations"][predecessor_id]["cleanup_open"] = True
+        reopened.setdefault("cleanup_open", []).append(predecessor_id)
+        with pytest.raises(FinancialError, match="financial_continuation_predecessor_open"):
+            check_shared_finances(reopened, successor_snapshot, remaining_usd=Decimal("0"))
+        current_o4_rows = [(rid, record) for rid, record in ledger_state["reservations"].items()
+            if record.get("financial", {}).get("authority", {}).get("sha256") == active_authority_sha
+            and record.get("financial", {}).get("stage_id") == stage["stage_id"]]
+        assert len(current_o4_rows) == 2, "the typed O4 card must bind both parent reservation rows"
+        partially_unbound = copy.deepcopy(ledger_state)
+        partially_unbound["reservations"][current_o4_rows[1][0]]["financial"].pop(
+            "continuation_exposure_amendment", None)
+        with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
+            check_shared_finances(partially_unbound, authorized_record["financial"], remaining_usd=Decimal("0"))
+        assert financial_ledger_path.read_bytes() == financial_ledger_bytes
 
     # Bind the conditional CAL prerequisite to the real closed acceptance output.
     acceptance_prepared_path = Path(stage["state_root"]) / stage["stage_id"] / "prepared-stage.json"
@@ -1069,6 +1130,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     cal_settings["pricing"].pop("pending_eur_reserve_release", None)
     cal_settings["pricing"].pop("continuation_authorization", None)
     cal_settings["pricing"].pop("legacy_usd_guard_correction", None)
+    cal_settings["pricing"].pop("continuation_exposure_amendment", None)
     cal_settings["pricing"]["funding"]["uncertainty"] = "0"
     cal_settings["state_root"] = str(tmp_path / "calibration-private")
     cal_settings["ledger"]["path"] = str(Path(cal_settings["state_root"]) / "ledger.json")

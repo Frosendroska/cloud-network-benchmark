@@ -227,6 +227,16 @@ def _private_o3_sources():
     return continuation, amendment, guard
 
 
+def _private_o4_retry_cap_removal_source():
+    import os
+    from pathlib import Path
+    source = Path(os.environ.get("CNB_O4_RETRY_CAP_REMOVAL_SOURCE_PATH",
+        "/private/tmp/cnb-o4-authority-inputs-20261126/genuine-human-retry-cap-removal-01.json"))
+    if not source.is_file():
+        pytest.skip("private, byte-verified O4 authority source is not available")
+    return source
+
+
 def _o3_test_card(tmp_path, monkeypatch):
     import hashlib
     import json
@@ -444,3 +454,133 @@ def test_o3_reissued_exact_card_may_share_amendment_only_with_pinned_continuatio
     with pytest.raises(fc.FinancialError, match="financial_amendment_batch_consumed"):
         fc._validate_o2_batch_identity([prior], {**successor,
             "batch_id": "SYNTHETIC-NEW-FAMILY"})
+
+
+def test_o4_exact_source_removes_only_the_separate_48_epoch_cap(tmp_path):
+    import hashlib
+    import json
+    from decimal import Decimal
+
+    source_path = _private_o4_retry_cap_removal_source()
+    source = fc.Source(path=str(source_path), sha256=hashlib.sha256(source_path.read_bytes()).hexdigest())
+    assert fc.validate_o4_retry_cap_removal_source(source).sha256 == fc._O4_RETRY_CAP_REMOVAL_SHA256
+
+    # Legacy O3 remains at 48. The genuine amendment removes only that separate
+    # allocation epoch; the EUR400 inclusive ledger ceiling still governs admission.
+    fc._validate_o3_epoch_allocation(Decimal("48"), Decimal("16"), None)
+    with pytest.raises(fc.FinancialError, match="financial_continuation_exposure_exceeded"):
+        fc._validate_o3_epoch_allocation(Decimal("49"), Decimal("16"), None)
+    fc._validate_o3_epoch_allocation(Decimal("64"), Decimal("16"), source)
+    with pytest.raises(fc.FinancialError, match="financial_continuation_exposure_exceeded"):
+        fc._validate_o3_epoch_allocation(Decimal("65"), Decimal("17"), source)
+
+    changed = json.loads(source_path.read_text())
+    changed["authority_change"]["new_reserve_release_eur"] = "1"
+    changed_path = tmp_path / "mutated-o4-source.json"
+    changed_path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+    changed_ref = fc.Source(path=str(changed_path), sha256=hashlib.sha256(changed_path.read_bytes()).hexdigest())
+    with pytest.raises(fc.FinancialError, match="financial_amendment_invalid"):
+        fc._validate_o3_epoch_allocation(Decimal("64"), Decimal("16"), changed_ref)
+
+
+def test_o4_source_must_be_bound_to_the_typed_continuation_card(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    card, _reference, binding = _o3_test_card(tmp_path, monkeypatch)
+    source_path = _private_o4_retry_cap_removal_source()
+    source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    card["continuation_exposure_amendment"] = {"path": str(source_path), "sha256": source_sha}
+    path = tmp_path / "SYNTHETIC-O3-O4-financial-card.json"
+    path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    reference = {"source_path": str(path), "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    _source, parsed = _validate(reference, binding)
+    assert parsed.continuation_exposure_amendment.sha256 == fc._O4_RETRY_CAP_REMOVAL_SHA256
+
+    card["continuation_exposure_amendment"]["sha256"] = "0" * 64
+    path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    reference["source_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(fc.FinancialError, match="financial_amendment_invalid"):
+        _validate(reference, binding)
+
+
+def test_o4_pricing_requires_the_exact_typed_paid_card_source(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import cloud_network_benchmark.campaign_inputs as inputs
+
+    card, _card_ref, _binding = _o3_test_card(tmp_path, monkeypatch)
+    continuation_path, _amendment_path, guard_path = _private_o3_sources()
+    exposure_path = _private_o4_retry_cap_removal_source()
+    continuation = {"path": str(continuation_path),
+        "sha256": hashlib.sha256(continuation_path.read_bytes()).hexdigest()}
+    guard = {"path": str(guard_path),
+        "sha256": hashlib.sha256(guard_path.read_bytes()).hexdigest()}
+    exposure = {"path": str(exposure_path),
+        "sha256": hashlib.sha256(exposure_path.read_bytes()).hexdigest()}
+    pricing = {"continuation_authorization": continuation,
+        "legacy_usd_guard_correction": guard,
+        "continuation_exposure_amendment": exposure}
+    settings = {"pricing": pricing, "ledger": {"scope_id": card["ledger_scope_id"]}}
+    _pending, draft_snapshot = inputs._reserve_release_policy(settings, "acceptance",
+        draft=True, now=NOW)
+    assert draft_snapshot["continuation_exposure_amendment"] == exposure
+
+    card["continuation_exposure_amendment"] = exposure
+    card_path = tmp_path / "O4-typed-card.json"
+    card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    paid_settings = {**settings, "approvals": {"paid_authorization": {
+        "confirmed": True, "source": str(card_path),
+        "sha256": hashlib.sha256(card_path.read_bytes()).hexdigest()}}}
+    _pending, paid_snapshot = inputs._reserve_release_policy(paid_settings,
+        "acceptance", draft=False, now=NOW)
+    assert paid_snapshot["continuation_exposure_amendment"] == exposure
+
+    card.pop("continuation_exposure_amendment")
+    card_path.write_text(json.dumps(card, sort_keys=True) + "\n")
+    paid_settings["approvals"]["paid_authorization"]["sha256"] = hashlib.sha256(card_path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="exact current EUR400 typed card"):
+        inputs._reserve_release_policy(paid_settings, "acceptance", draft=False, now=NOW)
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("wrong_exposure_source", "financial_amendment_invalid"),
+    ("wrong_ceiling_amendment", "financial_amendment_invalid"),
+    ("over_project", "financial_ceiling_exceeded"),
+    ("over_stage", "financial_ceiling_exceeded"),
+    ("over_run", "financial_ceiling_exceeded"),
+    ("new_reserve", "financial_ceiling_exceeded"),
+    ("changed_case", "financial_scope_mismatch"),
+])
+def test_o4_source_does_not_expand_existing_card_limits(
+        tmp_path, monkeypatch, mutation, expected):
+    import copy
+    import hashlib
+    import json
+
+    card, _reference, binding = _o3_test_card(tmp_path, monkeypatch)
+    exposure_path = _private_o4_retry_cap_removal_source()
+    card["continuation_exposure_amendment"] = {
+        "path": str(exposure_path), "sha256": hashlib.sha256(exposure_path.read_bytes()).hexdigest()}
+    changed = copy.deepcopy(card)
+    if mutation == "wrong_exposure_source":
+        changed["continuation_exposure_amendment"]["sha256"] = "0" * 64
+    elif mutation == "wrong_ceiling_amendment":
+        changed["financial_policy_amendment"]["sha256"] = "0" * 64
+    elif mutation == "over_project":
+        changed["caps"]["project_eur"] = "401"
+        changed["caps"]["personal_cash_eur"] = "401"
+    elif mutation == "over_stage":
+        changed["caps"]["stage_eur"] = "17"
+    elif mutation == "over_run":
+        changed["caps"]["run_eur"] = "9"
+    elif mutation == "new_reserve":
+        changed["caps"]["protected_eur"] = "1"
+    elif mutation == "changed_case":
+        changed["entries"][0]["config_id"] = "exp-004-acceptance"
+        binding = changed["entries"][0]
+    path = tmp_path / f"SYNTHETIC-O4-{mutation}.json"
+    path.write_text(json.dumps(changed, sort_keys=True) + "\n")
+    reference = {"source_path": str(path), "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    with pytest.raises(fc.FinancialError, match=expected):
+        _validate(reference, binding)
