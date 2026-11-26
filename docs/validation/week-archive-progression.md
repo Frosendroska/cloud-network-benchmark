@@ -18,22 +18,33 @@ A distinct controlled-driver characterization returns `archive_pending_validatio
 
 ## Qualification evidence
 
-Candidate: branch `codex/week-archive-progression-20261125`, commit `e656fdc0c9605f658e8bf00cf00708b618e7040a`, tree `787c37a1e574ba9e73dde21735dee1ed914509af`. The two production files are pinned by SHA-256: `campaign.py` `b9ab83a8cec08747e5276bca0420035b1cb9f8cc3a2898c3c4d89dc92b03076d`; `archive_replay.py` `94d6e108b2f3e4bfbedeb0ca8ddf6537d8acc1593b579cee3e5ce2cec1b2d14e`.
+Qualified implementation/test candidate: branch `codex/week-archive-progression-20261125`, commit `e656fdc0c9605f658e8bf00cf00708b618e7040a`, tree `787c37a1e574ba9e73dde21735dee1ed914509af`. The final docs-only commits do not change that qualified code/test tree. Production files are pinned by SHA-256: `campaign.py` `b9ab83a8cec08747e5276bca0420035b1cb9f8cc3a2898c3c4d89dc92b03076d`; `archive_replay.py` `94d6e108b2f3e4bfbedeb0ca8ddf6537d8acc1593b579cee3e5ce2cec1b2d14e`.
 
-Linux tests used Halle's existing Python 3.12.3 environment, `env -i`, and `unshare -Urn`; no provider, credentials, cloud calls, paid actions or live ledger operations occurred.
+Linux tests used Halle's existing Python 3.12.3 environment, `env -i`, and `unshare -Urn`; no provider, credentials, cloud calls, paid actions or operational/live ledger mutations occurred. The logical traversal uses a temporary synthetic `BudgetLedger`.
 
-| Selection | Result | Scope |
-|---|---:|---|
-| Archive/guard/fixture/logical WEEK/lifecycle projection/continuation/F09 bundle/campaign driver; owner case excluded | 99 passed, 1 deselected in 34.33 s | Fresh Git checkout at the candidate commit; JUnit at `/var/tmp/cnb-week-archive-final-e656fdc/core.xml` |
-| Genuine owner-held replay, receipt corruption and successful receipt restart | 1 passed in 14.68 s | Fresh generated WEEK stage/runtime; genuine AWS-only F09 pending capsule; the later original pair dispatched. Restore/backend/launch were forbidden on restart. |
-| F09 invalid native result, missing archive part, mutated part, wrong generation | 4 passed, 17 deselected in 10.42 s | Existing fake-only lifecycle/archive factory fault cases |
-| F09 bundle replay plus generated WEEK observer chain | 17 passed in 101.71 s | Fresh Git checkout at `5a9afdb`; production files and these test files are byte-identical to the candidate. No schedule/source change was used to revive a missed window. |
+| Selection | Result | JUnit SHA-256 | Log SHA-256 |
+|---|---:|---|---|
+| Archive/guard/fixture/logical WEEK/lifecycle projection/continuation/F09 bundle/campaign driver; owner case excluded | 99 passed, 1 deselected in 34.33 s | `2d8f5841d86f4cd66276ca131de841dc9f20f8030e14ce9997d4b1426dc2f772` | `95b64c93562224d79184769ad6ff693b285c04eac629e8bbfdde55c6993baa73` |
+| Genuine owner-held replay, receipt corruption and successful receipt restart | 1 passed in 14.84 s | `2b82d4a237b06f350cd6548fc3272777a40fd05b3a6d5c1fe2f4b5fbfdca1fe7` | `f1741882850bd5e7e3d511fc685d0dd95039397d9cead1a32c101d7b0e2f61ee` |
+| F09 invalid native result, missing archive part, mutated part, wrong generation | 4 passed, 17 deselected in 9.87 s | `b6dfc703f3117802994165ee7a201c884fd4c0f1b0c2c573e236ee19da860a88` | `19119df66cd9d6997494bfc32cbd2462c228bbb581abd7d198f8e51cd53b9f67` |
+| F09 bundle replay plus generated WEEK observer chain | 17 passed in 101.71 s | No JUnit was emitted | `560ceb182cc8b589c8e3ce5f0fbf5fb967819da881fe206b9cba5fa93bdf41e5` |
+
+The commands below ran in a fresh Git checkout. Each command was prefixed with `env -i PATH=/usr/bin:/bin PYTHONPATH=src:. unshare -Urn /u/halle/brek/home_at/cnb/venv/bin/python -m pytest`:
+
+- Core: `-q --junitxml=core.xml -k "not test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_owned_lock" tests/integration/test_week_archive_progression.py tests/integration/test_week_archive_guard_negatives.py tests/integration/test_week_archive_fixture.py tests/integration/test_week_archive_baseline.py tests/integration/test_week_archive_logical_run.py tests/integration/test_week_lifecycle_pending_projection.py tests/integration/test_week_failure_continuation.py tests/integration/test_f09_bundle_replay.py tests/integration/test_campaign_driver.py`
+- Owner: `-q --junitxml=owner.xml tests/integration/test_week_archive_progression.py::test_campaign_driver_replays_and_reconciles_genuine_pending_capsule_under_owned_lock`
+- Invalid archive/native: `-q --junitxml=native-invalid.xml -k "invalid_native or missing_part or mutated_part or wrong_generation" tests/integration/test_f09_aws_runtime_factory.py`
+- Observer/bundle: `-vv -o faulthandler_timeout=30 tests/integration/test_f09_bundle_replay.py tests/integration/test_week_observer_chain.py`
+
+The core batch's four F09 bundle cases overlap four tests in the observer/bundle batch. Across the four passing batches, there are 117 distinct passing node IDs; raw batch totals include those four repeated cases.
+
+Logs and JUnit files are retained at `/u/halle/brek/home_at/cnb/qualification/week-archive-progression-e656fdc/`; a verified local copy is in `/private/tmp/week-archive-progression-evidence/`.
 
 The full logical WEEK test ran all 28 frozen paired slots through `CampaignDriver`, the journal and `BudgetLedger`: 56 logical IDs and 168 child IDs remained bound; 54 lifecycle callbacks settled, one pair remained permanently missed, one measurement failure stayed terminal, and the existing verified P0-00 export retained its exact tree hash after restart. Lifecycle and provider results in this traversal are controlled test boundaries; it is not an elapsed seven-day run or native three-provider archive proof.
 
 The owner-held positive test uses a real pending F09 AWS capsule and receipt source, the production runtime loader, replay, native validator, analysis, export verification and reconciliation. Its GCS backend and lifecycle source are fakes. The logical WEEK and observer suites also use synthetic lifecycle/provider boundaries. The evidence does not establish S3/Azure/GCP archive replay as a full WEEK, live quota availability for 28 slots, or WEEK launch authority.
 
-The test harness once generated stage output outside its temporary root and allowed a fixed start date to expire during a long combined selection. The fixture now keeps generated outputs under pytest's temporary root and schedules its test-only stage two days ahead. A combined run made before that correction is incomplete and is not counted above. The observer selection passed separately before its setup window expired; no production timing or dispatch window was widened.
+The test harness initially generated stage output outside its temporary root and allowed a fixed start date to expire during a long combined selection. The fixture now keeps generated outputs under pytest's temporary root and schedules its test-only stage two days ahead. Those incomplete mixed runs are not counted above. The observer selection passed separately before its setup window expired; no production timing or dispatch window was widened.
 
 ## Limits
 
