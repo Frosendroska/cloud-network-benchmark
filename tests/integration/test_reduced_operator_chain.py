@@ -1137,13 +1137,19 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
         partially_unbound = copy.deepcopy(ledger_state)
         partially_unbound["reservations"][current_o4_rows[1][0]]["financial"].pop(
             "continuation_exposure_amendment", None)
-        with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
-            check_shared_finances(partially_unbound, authorized_record["financial"], remaining_usd=Decimal("0"))
+        if o9_native_history:
+            with pytest.raises(FinancialError, match="financial_ledger_invalid"):
+                check_shared_finances(partially_unbound, authorized_record["financial"],
+                    remaining_usd=Decimal("0"))
+        else:
+            with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
+                check_shared_finances(partially_unbound, authorized_record["financial"],
+                    remaining_usd=Decimal("0"))
         if o9_native_history:
             partially_unbound_o9 = copy.deepcopy(ledger_state)
             partially_unbound_o9["reservations"][current_o4_rows[1][0]]["financial"].pop(
                 "continuation_budget_amendment", None)
-            with pytest.raises(FinancialError, match="financial_continuation_history_invalid"):
+            with pytest.raises(FinancialError, match="financial_ledger_invalid"):
                 check_shared_finances(partially_unbound_o9, authorized_record["financial"],
                     remaining_usd=Decimal("0"))
         assert financial_ledger_path.read_bytes() == financial_ledger_bytes
