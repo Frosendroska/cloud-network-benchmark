@@ -387,6 +387,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     production_common_n = campaign_inputs._common_n
     production_binary_lookup = shutil.which
     settings = operator_settings(tmp_path, repository_root, monkeypatch)
+    synthetic_cal_funding = copy.deepcopy(settings["pricing"]["funding"])
     native_history_source = os.environ.get("CNB_NATIVE_CLOSED_LEDGER_SNAPSHOT_PATH")
     native_history = native_history_source is not None
     native_history_bytes = None
@@ -1187,7 +1188,7 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     cal_settings["pricing"].pop("continuation_resume_source", None)
     cal_settings["pricing"].pop("continuation_budget_amendment", None)
     cal_settings["pricing"].pop("continuation_timing_proposal", None)
-    cal_settings["pricing"]["funding"]["uncertainty"] = "0"
+    cal_settings["pricing"]["funding"] = copy.deepcopy(synthetic_cal_funding)
     cal_settings["state_root"] = str(tmp_path / "calibration-private")
     cal_settings["ledger"]["path"] = str(Path(cal_settings["state_root"]) / "ledger.json")
     calibration_stage = prepare_stage({"stage": "calibration"}, cal_settings,
