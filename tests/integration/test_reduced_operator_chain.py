@@ -493,6 +493,10 @@ def test_reduced_operator_chain_generates_and_activates_typed_draft(
     # Keep the synthetic authorization inside O2's historical dispatch window;
     # no wall-clock time is used as a live readiness or dispatch claim.
     now = datetime(2026, 11, 26, 22, 0, tzinfo=timezone.utc)
+    # operator_settings seeds this synthetic price fixture from wall time.
+    # Rebind only that synthetic observation date to the same frozen epoch used
+    # by prepare_stage and the actual CLI/lifecycle clock below.
+    settings["pricing"]["checked_on"] = now.date().isoformat()
     monkeypatch.setattr(Clock, "__init__", lambda self: setattr(self, "now", now))
     class FrozenDateTime(datetime):
         @classmethod
